@@ -200,11 +200,12 @@ class SchedulerInternalStateController:
     def _validate_accept_threshold(self, key: str, value: Any) -> None:
         # A relaxed threshold stops acceptance from sampling exactly from the
         # target policy, which is what a captured sampling mask describes.
-        if not self.scheduler.spec_algorithm.is_dflash() or float(value) == 1.0:
+        algorithm = self.scheduler.spec_algorithm
+        if not (algorithm.is_dflash() or algorithm.is_ngram()) or float(value) == 1.0:
             return
         if self._has_active_sampling_mask_request():
             raise UpdateRejected(
-                f"Updating {key} is rejected while DFlash sampling-mask "
+                f"Updating {key} is rejected while {algorithm.name} sampling-mask "
                 "requests are active."
             )
 

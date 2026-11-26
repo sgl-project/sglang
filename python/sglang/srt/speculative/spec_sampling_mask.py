@@ -12,6 +12,7 @@ from sglang.srt.speculative.dflash_utils import (
     build_speculative_verify_target_probs,
     is_dflash_sampling_verify_available,
 )
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -23,8 +24,14 @@ def validate_spec_sampling_mask_request(
 ) -> Optional[str]:
     """Reject configurations whose committed tokens are not exact samples from
     the captured target distribution."""
-    if not spec_algorithm.is_dflash_family():
+    is_ngram = spec_algorithm.is_ngram()
+    if not (spec_algorithm.is_dflash_family() or is_ngram):
         return "return_sampling_mask is not supported with speculative decoding."
+
+    if is_ngram and (
+        not is_cuda() or envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+    ):
+        return "return_sampling_mask with NGRAM requires the CUDA tree verifier."
 
     if req.sampling_params.min_p > 0:
         return "return_sampling_mask with speculative decoding does not support min_p."
@@ -35,17 +42,21 @@ def validate_spec_sampling_mask_request(
             "acceptance."
         )
 
-    if spec_algorithm.is_dflash():
+    if spec_algorithm.is_dflash() or is_ngram:
         if (
             get_spec().speculative_accept_threshold_single != 1.0
             or get_spec().speculative_accept_threshold_acc != 1.0
         ):
             return (
-                "return_sampling_mask with DFlash requires acceptance thresholds "
+                f"return_sampling_mask with {spec_algorithm.name} requires acceptance thresholds "
                 "of 1.0."
             )
         # Without the kernel DFlash verifies non-greedy rows by greedy argmax.
-        if req.sampling_params.top_k > 1 and not is_dflash_sampling_verify_available():
+        if (
+            spec_algorithm.is_dflash()
+            and req.sampling_params.top_k > 1
+            and not is_dflash_sampling_verify_available()
+        ):
             return (
                 "return_sampling_mask with non-greedy DFlash decoding requires "
                 "sampling verification support."
@@ -99,6 +110,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
         *,
         out_tokens: torch.Tensor,
         commit_lens: torch.Tensor,
+        accept_index: torch.Tensor | None = None,
     ) -> SamplingMaskOutput:
         batch_indices = self.batch_indices
         output_tokens = out_tokens.index_select(0, batch_indices).clone()
@@ -124,12 +136,24 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
                 raise ValueError(
                     "Sampling-mask capture requires a positive finite top_k."
                 )
-            target_probs = self.target_probs.index_select(0, batch_indices)
-            support_probs, support_tokens = torch.topk(
-                target_probs, k=max_top_k, dim=-1
+            if accept_index is None:
+                target_probs = self.target_probs.index_select(0, batch_indices)
+            else:
+                # NGRAM tree slots can skip siblings. Each accepted index identifies
+                # both the committed token and the target row that emitted it.
+                rows = accept_index.index_select(0, batch_indices)
+                target_probs = self.target_probs.flatten(0, 1)[rows]
+            # A tree verifier can keep cutoff ties beyond the packing limit.
+            # One extra value detects overflow without scanning the whole row.
+            pack_width = min(
+                max_top_k + int(accept_index is not None), target_probs.shape[-1]
             )
-            support_tokens = support_tokens.to(torch.int32)
+            support_probs, support_tokens = torch.topk(
+                target_probs, k=pack_width, dim=-1
+            )
             support_lens = (support_probs > 0).sum(dim=-1, dtype=torch.int32)
+            support_probs = support_probs[..., :max_top_k]
+            support_tokens = support_tokens[..., :max_top_k].to(torch.int32)
             selected_logprobs = torch.log(
                 target_probs.gather(-1, output_tokens.unsqueeze(-1)).squeeze(-1)
             )
@@ -168,6 +192,11 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
             int(SamplingMaskStatus.OK),
             int(SamplingMaskStatus.INVALID),
         ).to(torch.int8)
+        if accept_index is not None:
+            statuses.masked_fill_(
+                (statuses == SamplingMaskStatus.OK) & (support_lens > self.max_top_k),
+                SamplingMaskStatus.OVERFLOW,
+            )
         return SamplingMaskOutput(
             token_ids=support_tokens,
             lengths=support_lens,
