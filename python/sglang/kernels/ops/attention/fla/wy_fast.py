@@ -40,6 +40,8 @@ def recompute_w_u_fwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    v_stride_t=0,
+    STRIDED_V: tl.constexpr = False,
     HEAD_MAJOR: tl.constexpr = False,
 ):
     # HEAD_MAJOR: heads vary fastest across the grid, so the programs running at once read
@@ -75,7 +77,16 @@ def recompute_w_u_fwd_kernel(
     for i_v in range(tl.cdiv(V, BV)):
         o_v = i_v * BV + tl.arange(0, BV)
         m_v = m_t[:, None] & (o_v[None, :] < V)
-        p_v = v + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
+        if STRIDED_V:
+            p_v = (
+                v
+                + bos.to(tl.int64) * v_stride_t
+                + i_h * V
+                + o_t[:, None] * v_stride_t
+                + o_v[None, :]
+            )
+        else:
+            p_v = v + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
         p_u = u + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
         b_v = tl.load(p_v, mask=m_v, other=0.0)
         b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
@@ -116,7 +127,15 @@ def recompute_w_u_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64
-    u = torch.empty_like(v)
+    # A single-batch v whose heads are contiguous rows of V (e.g. a split of a
+    # packed projection) is read in place; other layouts are copied.
+    strided_v_args = {}
+    if not v.is_contiguous():
+        if B == 1 and v.stride(-1) == 1 and v.stride(-2) == V:
+            strided_v_args = {"v_stride_t": v.stride(1), "STRIDED_V": True}
+        else:
+            v = v.contiguous()
+    u = v.new_empty(B, T, H, V)
     w = k.new_empty(B, T, H, K)
     head_major = use_gfx115_kernels()
     recompute_w_u_fwd_kernel[(B * H, NT) if head_major else (NT, B * H)](
@@ -141,6 +160,7 @@ def recompute_w_u_fwd(
         IS_VARLEN=cu_seqlens is not None,
         num_warps=4,
         num_stages=3,
+        **strided_v_args,
     )
     return w, u
 

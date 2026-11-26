@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.linear import gdn_backend
+from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -326,14 +327,29 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
         ):
             run_gdn_eagle_verify_case(self, case, topk=topk, spec_kind=spec_kind)
 
-    def test_triton_prefill_keeps_contiguous_qkv_materialization(self):
-        with patch.object(
-            gdn_backend,
-            "fused_qkv_split_gdn_prefill",
-            wraps=gdn_backend.fused_qkv_split_gdn_prefill,
-        ) as split_spy:
+    def test_triton_prefill_qkv_layout(self):
+        # CUDA reads the q/k/v split views in place; other platforms keep the
+        # fused split copy. run_gdn_attention_case checks the outputs either way.
+        decisions = []
+        reads_strided = TritonGDNKernel.extend_reads_strided_qkv
+
+        def record(kernel, q, k):
+            decisions.append(reads_strided(kernel, q, k))
+            return decisions[-1]
+
+        with (
+            patch.object(TritonGDNKernel, "extend_reads_strided_qkv", record),
+            patch.object(
+                gdn_backend,
+                "fused_qkv_split_gdn_prefill",
+                wraps=gdn_backend.fused_qkv_split_gdn_prefill,
+            ) as split_spy,
+        ):
             run_gdn_attention_case(self, self.CASES[0])
-        split_spy.assert_called()
+        if torch.cuda.is_available() and not is_hip():
+            self.assertTrue(any(decisions), "Triton extend did not read q/k/v views")
+        else:
+            split_spy.assert_called()
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
         for case, topk, spec_kind in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
