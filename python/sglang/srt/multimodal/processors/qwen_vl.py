@@ -827,6 +827,12 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 feature_offset : feature_offset + feature_length
             ].contiguous()
             feature_offset += feature_length
+            if len(entries) > 1 and self.mm_preprocess_cache.enabled:
+                # contiguous() is a no-op on an already contiguous slice, so it
+                # keeps the whole batch alive and the cache charges every image
+                # of the request for all of it. Nothing is retained with the
+                # cache off, which is how qwen3_vl runs this path.
+                feature = feature.clone()
             # hash typed encoder inputs once on a miss; retain the complete
             # digest even when cache_value drops the device feature
             feature_hash = resolve_multimodal_item_hash(
