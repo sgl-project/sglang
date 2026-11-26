@@ -399,15 +399,17 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
     takes the prefill result path, which commits them per-req instead of
     through the batch decode fold, and member rows carry no req."""
 
-    def _vote(self, *, beam):
+    def _vote(self, *, beam, backend_vote=None):
         runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
         runner.enable_lora = False
         runner.max_context_size = None
         runner.max_seq_len = None
+        runner._backend_vote_prefill_cuda_graph = backend_vote
         runner.can_replay_locally.return_value = True
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             batch_size=lambda: 2,
+            seq_lens_cpu=torch.tensor([300, 41], dtype=torch.int64),
             return_logprob=False,
             has_grammar=False,
             multimodal_inputs=None,
@@ -450,6 +452,25 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
 
     def test_beam_request_blocks_conversion(self):
         self.assertFalse(self._vote(beam=True))
+
+    def test_backend_vote_sees_the_converted_one_token_extend(self):
+        """The backend judges a decode batch as the extend `convert_decode_to_extend`
+        builds: one token per request, with `seq_len - 1` as its prefix."""
+        backend_vote = Mock(return_value=True)
+
+        self.assertTrue(self._vote(beam=False, backend_vote=backend_vote))
+
+        backend_vote.assert_called_once()
+        view = backend_vote.call_args.args[0]
+        self.assertEqual(view.extend_lens, [1, 1])
+        self.assertEqual(view.prefix_lens, [299, 40])
+        self.assertEqual(view.extend_logprob_start_lens, [0, 0])
+        self.assertFalse(view.return_logprob)
+
+    def test_backend_veto_keeps_a_decode_rank_eager(self):
+        """A backend that refuses the converted batch makes this rank vote eager, so
+        it cannot fall back after the sync while a peer replays the graph."""
+        self.assertFalse(self._vote(beam=False, backend_vote=Mock(return_value=False)))
 
 
 class TestPrefillCudaGraphVote(CustomTestCase):
