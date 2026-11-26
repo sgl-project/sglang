@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib
+import importlib.metadata
 import io
 import json
 import multiprocessing as mp
@@ -143,6 +144,22 @@ class TestTqdmThreadLock(unittest.TestCase):
             "tqdm no longer creates its multiprocessing lock; drop the workaround",
         )
         self.assertFalse(self._mp_lock_created(apply_fix=True))
+
+
+class TestPackageDistributionsCache(unittest.TestCase):
+    def test_transformers_and_diffusers_share_one_mapping(self):
+        from sglang.multimodal_gen.runtime.utils.process import (
+            cache_package_distributions,
+        )
+
+        with patch.object(
+            importlib.metadata, "packages_distributions", return_value={}
+        ) as build:
+            cache_package_distributions()
+            importlib.metadata.packages_distributions()
+            importlib.metadata.packages_distributions()
+
+        build.assert_called_once()
 
 
 class TestBootstrapImportBoundary(unittest.TestCase):

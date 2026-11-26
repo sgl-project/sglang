@@ -136,6 +136,7 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
     # Arm PDEATHSIG before any vendor code runs: everything below can block,
     # and a child that hangs there would outlive a dead launcher.
     from sglang.multimodal_gen.runtime.utils.process import (
+        cache_package_distributions,
         defer_full_gc_for_imports,
         kill_itself_when_parent_died,
         use_thread_lock_for_tqdm,
@@ -143,6 +144,7 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
 
     kill_itself_when_parent_died()
     use_thread_lock_for_tqdm()
+    cache_package_distributions()
 
     # Every rank re-executes the same script, so one rank reporting is enough.
     if spec.rank == 0:
