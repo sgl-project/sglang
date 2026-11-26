@@ -969,7 +969,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             is_draft_runner=self.runner is not None and self.runner.is_draft_worker,
             skip_prefill=False,
             max_bs=max_bs,
-            max_context_len=self.req_to_token_pool.row_width,
+            max_kv_len=self.req_to_token_pool.row_width,
             num_draft_tokens=get_spec().speculative_num_draft_tokens,
             device=self.device,
             is_read=False,

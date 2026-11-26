@@ -2489,7 +2489,7 @@ class DeepseekV4HipRadixBackend(
             is_draft_runner=self.is_draft_worker,
             skip_prefill=False,
             max_bs=max_bs,
-            max_context_len=self.model_runner.model_config.context_len,
+            max_kv_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
             is_read=False,

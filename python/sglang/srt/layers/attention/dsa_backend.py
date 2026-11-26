@@ -968,7 +968,7 @@ class DeepseekSparseAttnBackend(
                 (
                     self.dsa_prefill_impl,
                     self.local_num_q_heads,
-                    _prims_ts_prefill_max_rows(self.max_context_len),
+                    _prims_ts_prefill_max_rows(model_runner.model_config.context_len),
                 ),
                 (
                     self.dsa_decode_impl,
