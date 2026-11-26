@@ -132,6 +132,32 @@ class TestLayerNormSPGating(CustomTestCase):
                 )
                 self.assertEqual(gather.called, gathered)
 
+    def test_qwen3_embedding_pools_global_last_rows(self):
+        from sglang.srt.layers.pooler import Pooler, PoolingType
+        from sglang.srt.models.qwen3 import Qwen3ForCausalLM
+
+        _initialize()
+        rows = torch.arange(15, dtype=torch.float32).reshape(5, 3)
+        shard = rows[:3]
+        input_ids = torch.arange(5)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens=torch.tensor([2, 3]),
+            dimensions=None,
+        )
+        model = SimpleNamespace(
+            model=MagicMock(return_value=shard),
+            capture_aux_hidden_states=False,
+            pp_group=SimpleNamespace(is_last_rank=True),
+            pooler=Pooler(PoolingType.LAST, normalize=False),
+        )
+        with patch.object(layernorm_sp, "sp_exit_gather", return_value=rows) as gather:
+            result = Qwen3ForCausalLM.forward(
+                model, input_ids, input_ids, batch, get_embedding=True
+            )
+        gather.assert_called_once_with(shard, num_tokens=5)
+        torch.testing.assert_close(result.embeddings, rows[[1, 4]])
+
     def test_runs_sp_ignores_the_active_flag(self):
         """Regression: the exit gather must not key off ``sp_active``.
 

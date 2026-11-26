@@ -18,6 +18,7 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm_sp import maybe_exit_gather
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -866,6 +867,12 @@ class Qwen3ForCausalLM(nn.Module):
                     aux_hidden_states,
                 )
             else:
+                hidden_states, _ = maybe_exit_gather(
+                    hidden_states=hidden_states,
+                    hidden_states_before_norm=None,
+                    input_ids=input_ids,
+                    forward_mode=forward_batch.forward_mode,
+                )
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
