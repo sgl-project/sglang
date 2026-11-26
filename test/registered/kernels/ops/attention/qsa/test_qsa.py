@@ -418,7 +418,9 @@ def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
     runner = SimpleNamespace(
         device="cpu",
         token_to_kv_pool=routed(pool),
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=req_to_token, max_context_len=64
+        ),
         model_config=SimpleNamespace(
             context_len=64,
             hf_config=SimpleNamespace(indexer_compress_ratio=COMPRESS_RATIO),
@@ -563,6 +565,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
         )
         indexer = SimpleNamespace(
             layer_id=0,
+            index_n_heads=1,
             project_qk=lambda hidden, rope_positions, **kwargs: (
                 hidden.reshape(-1, 1, 2),
                 hidden.reshape(-1, 1, 2),
@@ -753,7 +756,9 @@ def _make_qsa_runner_and_pool(num_reqs=4):
     runner = SimpleNamespace(
         device="cpu",
         token_to_kv_pool=routed(pool),
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=req_to_token, max_context_len=64
+        ),
         model_config=SimpleNamespace(
             context_len=64,
             hf_config=SimpleNamespace(indexer_compress_ratio=COMPRESS_RATIO),
