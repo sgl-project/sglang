@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 MISS_CAPACITY = 32768
 MAX_QUERY_WIDTH = 14
 
+_SLOT_MAP_DTYPE = torch.int32
+_SLOT_MAP_EXTRA_ROWS = 1
+
 
 class BufferSpec(msgspec.Struct, frozen=True):
     """Shape, dtype and multiplicity of a persistent tensor allocation."""
@@ -98,7 +101,9 @@ class BudgetPlan:
                 num_layers,
             ),
             "device_slot_map": BufferSpec(
-                (resident_rows + 1, context_len), metadata_dtype, num_layers
+                (resident_rows + _SLOT_MAP_EXTRA_ROWS, context_len),
+                _SLOT_MAP_DTYPE,
+                num_layers,
             ),
             "short_resident_end": BufferSpec(
                 (num_layers, request_rows), metadata_dtype
@@ -183,6 +188,9 @@ class BudgetPlan:
                 self.num_layers * self.kv_cache_dim * self.kv_dtype.itemsize
             ),
             native_kv_bytes_per_token=native_kv_bytes_per_token,
+            slot_map_bytes_per_request=_slot_map_row_bytes(
+                self.context_len, self.num_layers
+            ),
         )
 
     @property
@@ -301,17 +309,23 @@ def get_sparse_kv_cache_tokens(
     return configured_cache_tokens or max_query_width * top_k
 
 
+def _slot_map_row_bytes(context_len: int, num_layers: int) -> int:
+    return context_len * num_layers * _SLOT_MAP_DTYPE.itemsize
+
+
 def get_sparse_kv_full_context_bytes_per_request(
     *,
     cache_tokens: int,
     context_len: int,
     resident_kv_bytes_per_token: int,
     native_kv_bytes_per_token: int,
+    slot_map_bytes_per_request: int,
 ) -> int:
-    """Price the resident window and native context at their respective rates."""
+    """Estimate one request's resident KV, native context, and slot map."""
     return (
         cache_tokens * resident_kv_bytes_per_token
         + context_len * native_kv_bytes_per_token
+        + slot_map_bytes_per_request
     )
 
 
@@ -326,17 +340,24 @@ def fit_pd_sparse_running_requests(
     native_kv_bytes_per_token: int,
 ) -> int:
     """Return the P/D Decode concurrency that fits the full-context budget."""
+    slot_map_bytes_per_request = _slot_map_row_bytes(context_len, num_layers)
     bytes_per_request = get_sparse_kv_full_context_bytes_per_request(
         cache_tokens=cache_tokens,
         context_len=context_len,
         resident_kv_bytes_per_token=num_layers * kv_bytes_per_token,
         native_kv_bytes_per_token=native_kv_bytes_per_token,
+        slot_map_bytes_per_request=slot_map_bytes_per_request,
     )
-    fitting_rows = min(requested_rows, available_bytes // bytes_per_request)
+    # The map includes the dummy resident row and one additional row.
+    fixed_slot_map_bytes = (1 + _SLOT_MAP_EXTRA_ROWS) * slot_map_bytes_per_request
+    fitting_rows = min(
+        requested_rows, (available_bytes - fixed_slot_map_bytes) // bytes_per_request
+    )
     if fitting_rows < 1:
         raise RuntimeError(
             "Cannot fit one sparse KV resident row: "
-            f"need {bytes_per_request} bytes per request, have {available_bytes} bytes "
+            f"need {bytes_per_request + fixed_slot_map_bytes} bytes including fixed "
+            f"slot-map rows, have {available_bytes} bytes "
             f"(C={cache_tokens}, context_len={context_len})."
         )
     return fitting_rows

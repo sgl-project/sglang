@@ -1433,20 +1433,23 @@ class TestEagleConfigurator(CustomTestCase):
                 mr.model_config.context_len + get_req_to_token_extra_context_len()
             )
             aligned_context_len = (context_len + page_size - 1) // page_size * page_size
+            slot_map_bytes_per_request = aligned_context_len * 4 * torch.int32.itemsize
+            fixed_slot_map_bytes = 2 * slot_map_bytes_per_request
             request_bytes = (
                 cache_tokens * 4 * 576 * 2
                 + aligned_context_len * native_bytes_per_token
+                + slot_map_bytes_per_request
             )
 
             # A cap that aligns to one page limits admission independently of residency.
             native_bs_limit = page_size // 2
             for available, cap, resident_bs, bs in (
-                (2 * request_bytes - 1, None, 1, 1),
-                (2 * request_bytes, None, 2, 2),
-                (3 * request_bytes, token_limit, 3, 3),
-                (5 * request_bytes, None, 4, 4),
+                (2 * request_bytes + fixed_slot_map_bytes - 1, None, 1, 1),
+                (2 * request_bytes + fixed_slot_map_bytes, None, 2, 2),
+                (3 * request_bytes + fixed_slot_map_bytes, token_limit, 3, 3),
+                (5 * request_bytes + fixed_slot_map_bytes, None, 4, 4),
                 (
-                    (native_bs_limit + 1) * request_bytes,
+                    (native_bs_limit + 1) * request_bytes + fixed_slot_map_bytes,
                     page_size + 1,
                     native_bs_limit + 1,
                     native_bs_limit,
@@ -1499,13 +1502,21 @@ class TestEagleConfigurator(CustomTestCase):
                         resident_bs + 2,
                     )
                     self.assertEqual(
+                        plan.slot_map_bytes,
+                        (resident_bs + 2) * slot_map_bytes_per_request,
+                    )
+                    self.assertEqual(
                         plan.adapter_buffers["last_prefix"].shape[0], resident_bs + 2
                     )
 
-            # The estimate excludes the dummy C row and manager metadata.
+            # The estimate includes two fixed slot-map rows in addition to the
+            # per-request rows.
             for available, error in (
-                (request_bytes - 1, "one sparse KV resident row"),
-                (request_bytes, "Not enough memory"),
+                (
+                    request_bytes + fixed_slot_map_bytes - 1,
+                    "one sparse KV resident row",
+                ),
+                (request_bytes + fixed_slot_map_bytes, "Not enough memory"),
             ):
                 with self.subTest(available=available):
                     mr.sparse_kv_budget_plan = None
