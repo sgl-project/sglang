@@ -92,6 +92,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         self.pp_group = get_parallel().pp_group
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
+        self.language_model_only = bool(getattr(config, "language_model_only", False))
 
         # The weight loader reads this after the build.
         self.num_fused_shared_experts = get_num_fused_shared_experts()
@@ -111,19 +112,21 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         assert text_hidden_size is not None, "text_hidden_size is required"
         projector_hidden_size = getattr(config, "projector_hidden_size", None)
 
-        # Vision model skips quantization: CLIP dimensions (head_dim=80) are not
-        # compatible with MXFP8 kernel alignment requirements (128).
-        self.vision_tower = MiniMaxVLVisionModel(
-            config=vision_config,
-            text_hidden_size=text_hidden_size,
-            projector_hidden_size=projector_hidden_size,
-            quant_config=None,
-            prefix=add_prefix("vision_tower", prefix),
-            multimodal_projector_bias=getattr(
-                config, "multimodal_projector_bias", True
-            ),
-            patch_merge_bias=getattr(config, "patch_merge_bias", True),
-        )
+        self.vision_tower = None
+        if not self.language_model_only:
+            # Vision model skips quantization: CLIP dimensions (head_dim=80) are not
+            # compatible with MXFP8 kernel alignment requirements (128).
+            self.vision_tower = MiniMaxVLVisionModel(
+                config=vision_config,
+                text_hidden_size=text_hidden_size,
+                projector_hidden_size=projector_hidden_size,
+                quant_config=None,
+                prefix=add_prefix("vision_tower", prefix),
+                multimodal_projector_bias=getattr(
+                    config, "multimodal_projector_bias", True
+                ),
+                patch_merge_bias=getattr(config, "patch_merge_bias", True),
+            )
 
         self.encoder_processor = None
         if config.encoder_only:
@@ -154,8 +157,12 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             self.lm_head = PPMissingLayer()
 
         _, text_rope_scaling = get_rope_config(text_config)
+        # ModelConfig keeps model_is_mrope off under --language-model-only, so no
+        # mrope positions reach the forward batch.
         self.is_mrope_enabled = (
-            text_rope_scaling is not None and "mrope_section" in text_rope_scaling
+            not self.language_model_only
+            and text_rope_scaling is not None
+            and "mrope_section" in text_rope_scaling
         )
 
         self.logits_processor = LogitsProcessor(text_config)
@@ -390,6 +397,11 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                     llm_stacked_params_mapping,
                     expert_params_mapping,
                 )
+                continue
+
+            if self.language_model_only:
+                # No tower to fill, and the qkv shards would otherwise be held in
+                # host memory until the merge below.
                 continue
 
             load_vision_weight(

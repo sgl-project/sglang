@@ -54,6 +54,11 @@ import { benchmarks } from "/src/snippets/configs/MiniMaxAI/minimax-m3-benchmark
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+<Tip>
+Add `--language-model-only` to serve text requests without constructing the vision tower.
+Text weights load normally; image and video inputs are rejected.
+</Tip>
+
 ## Playground
 
 The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
