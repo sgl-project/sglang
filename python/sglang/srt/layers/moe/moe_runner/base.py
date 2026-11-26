@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, TypeGuard
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
 import torch
 
@@ -15,11 +15,6 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.runtime_context import get_forward
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner.triton import (
-        TritonRunnerCore,
-        TritonRunnerInput,
-        TritonRunnerOutput,
-    )
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         CombineInputFormat,
@@ -110,17 +105,11 @@ class RunnerInput(ABC):
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
 
-    def runner_backend_is_triton(self) -> TypeGuard[TritonRunnerInput]:
-        return self.runner_backend == MoeRunnerBackend.TRITON
-
 
 class RunnerOutput(ABC):
     @property
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
-
-    def runner_backend_is_triton(self) -> TypeGuard[TritonRunnerOutput]:
-        return self.runner_backend == MoeRunnerBackend.TRITON
 
 
 @dataclass
@@ -147,9 +136,6 @@ class MoeRunnerCore(ABC):
     @property
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
-
-    def runner_backend_is_triton(self) -> TypeGuard[TritonRunnerCore]:
-        return self.runner_backend == MoeRunnerBackend.TRITON
 
 
 class DispatchMoeRunnerCore(ABC):
@@ -179,9 +165,6 @@ class FusedOpPool:
     def register_fused_func(
         cls, a2a_backend_name: str, runner_backend_name: str, fused_func: Callable
     ):
-        # Key by the canonical value, which is what lookups pass, so a
-        # deprecated alias such as "flashinfer" still registers correctly.
-        a2a_backend_name = MoeA2ABackend(a2a_backend_name).value
         key = (a2a_backend_name, runner_backend_name)
         if key in cls._fused_funcs:
             raise ValueError(

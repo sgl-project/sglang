@@ -72,7 +72,7 @@ from sglang.srt.speculative.spec_utils import (
     fill_draft_window_rail,
     resolve_draft_decode_window,
 )
-from sglang.srt.utils import get_int_env_var, is_flashinfer_available, next_power_of_2
+from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -439,7 +439,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
         )
-        self.max_context_len = model_runner.model_config.context_len
+        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         self.page_size = model_runner.page_size
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -481,11 +481,11 @@ class FlashInferAttnBackend(AttentionBackend):
         self.disable_cuda_graph_kv_split = False
         if self.enable_deterministic:
             self.decode_use_tensor_cores = True
-            self.prefill_split_tile_size = get_int_env_var(
-                "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096
+            self.prefill_split_tile_size = (
+                envs.SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE.get()
             )
-            self.decode_split_tile_size = get_int_env_var(
-                "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
+            self.decode_split_tile_size = (
+                envs.SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE.get()
             )
             self.disable_cuda_graph_kv_split = True
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
@@ -1851,7 +1851,6 @@ class FlashInferIndicesUpdaterDecode:
         plan: IterationIds,
         req_pool_indices: torch.Tensor,
     ):
-        decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
             decode_wrappers[0],
             seq_lens,

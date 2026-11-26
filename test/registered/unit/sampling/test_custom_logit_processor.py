@@ -3,16 +3,16 @@
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 from array import array
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import UocrReqState
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_THINKING,
@@ -27,6 +27,7 @@ from sglang.srt.sampling.custom_logit_processor import (
     DisallowedTokensLogitsProcessor,
     InklingThinkingBudgetLogitProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
+    apply_custom_logit_processor,
 )
 from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
@@ -82,9 +83,7 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
         )
         logits = torch.zeros(batch_size * num_tokens, 4)
 
-        apply_custom_logit_processor(
-            logits, sampling_info, num_tokens_in_batch=num_tokens
-        )
+        apply_custom_logit_processor(logits, sampling_info, rows_per_request=num_tokens)
 
         expected = torch.tensor(
             [[1.0] * 4, [1.0] * 4, [0.0] * 4, [0.0] * 4, [3.0] * 4, [3.0] * 4]
@@ -92,88 +91,48 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
         self.assertTrue(torch.equal(logits, expected))
 
 
-class TestCustomLogitProcessorRows(CustomTestCase):
-    """The recorded row list must select the same rows as the device indices.
-
-    Rows and indices are two representations of one selection, rebuilt at three
-    separate sites. Every other case here constructs the entry by hand, so only
-    a filtered or merged batch exercises both representations at once -- drift
-    between them would process the wrong rows with nothing turning red.
-    """
-
-    KEY = 0
-
-    @staticmethod
-    def _mark_row(logits, custom_params):
-        logits[:, 1] = 1.0
+class _WriteRowId(CustomLogitProcessor):
+    def __call__(self, logits, custom_param_list=None):
+        for i, params in enumerate(custom_param_list):
+            logits[i, 0] = params["row"]
         return logits
 
-    def _info(self, batch_size, rows):
-        return SamplingBatchInfo(
-            temperatures=torch.ones(batch_size, 1),
-            top_ps=torch.ones(batch_size),
-            top_ks=torch.zeros(batch_size, dtype=torch.int32),
-            min_ps=torch.zeros(batch_size),
-            is_all_greedy=False,
-            is_any_greedy=False,
-            need_top_p_sampling=False,
-            need_top_k_sampling=False,
-            need_min_p_sampling=False,
-            vocab_size=4,
-            penalizer_orchestrator=MagicMock(is_required=False),
-            has_custom_logit_processor=True,
-            custom_params=[{"row": i} for i in range(batch_size)],
-            custom_logit_processor={
-                self.KEY: ProcessorEntry(
-                    processor=self._mark_row,
-                    rows=list(rows),
-                    indices=torch.tensor(rows, dtype=torch.long),
-                )
-            },
-            device="cpu",
+
+class TestCustomLogitProcessorRows(CustomTestCase):
+    def test_a_reordered_batch_keeps_each_row_on_its_own_params(self):
+        """Retraction reorders the running batch in keep-preference order, not
+        ascending. A row then fed another request's params, so the page guard
+        forced or allowed EOS on the wrong document. Covers both the all-rows
+        and the gathered-rows path."""
+        processor_str = _WriteRowId.to_str()
+        exec_context = SimpleNamespace(
+            features=SimpleNamespace(enable_custom_logit_processor=True)
         )
-
-    def test_rows_track_the_mask_and_both_paths_agree(self):
-        # Rows [0, 2] of 3; keep [0, 2] remaps them to [0, 1] of 2.
-        info = self._info(3, [0, 2])
-        info.filter_batch([0, 2], torch.tensor([0, 2]))
-        # Merge a 2-row batch whose only opted-in row is old index 1.
-        info.merge_batch(self._info(2, [1]))
-
-        entry = info.custom_logit_processor[self.KEY]
-        self.assertEqual(entry.rows, entry.indices.tolist())
-
-        expected = torch.zeros(4, 4)
-        expected[[0, 1, 3], 1] = 1.0
-        logits = torch.zeros(4, 4)
-        apply_custom_logit_processor(logits, info)
-        self.assertTrue(torch.equal(logits, expected))
-
-    def test_a_reordering_filter_keeps_each_row_on_its_own_params(self):
-        """Retraction filters the running batch in keep-preference order, not
-        ascending. The rows path then fed every row another request's params,
-        so the page guard forced or allowed EOS on the wrong document."""
-
-        def write_row_id(logits, custom_params):
-            for i, params in enumerate(custom_params):
-                logits[i, 0] = params["row"]
-            return logits
-
+        # Row j holds request order[j].
+        order = [2, 0, 1]
         for opted_in in ([0, 1, 2], [0, 2]):
             with self.subTest(opted_in=opted_in):
-                info = self._info(3, opted_in)
-                entry = info.custom_logit_processor[self.KEY]
-                info.custom_logit_processor = {
-                    self.KEY: ProcessorEntry(
-                        processor=write_row_id, rows=entry.rows, indices=entry.indices
+                reqs = [
+                    SimpleNamespace(
+                        custom_logit_processor=(
+                            processor_str if rid in opted_in else None
+                        ),
+                        grammar=None,
+                        sampling_params=SimpleNamespace(
+                            custom_params={"row": rid}, logit_bias=None
+                        ),
                     )
-                }
-                # New row j holds old request keep[j].
-                keep = [2, 0, 1]
-                info.filter_batch(keep, torch.tensor(keep))
+                    for rid in order
+                ]
+                info = SamplingBatchInfo(vocab_size=4, device="cpu")
+                with patch(
+                    "sglang.srt.sampling.sampling_batch_info.get_exec",
+                    return_value=exec_context,
+                ):
+                    info.set_plugin_state(reqs)
                 logits = torch.full((3, 4), -1.0)
                 apply_custom_logit_processor(logits, info)
-                want = [float(old) if old in opted_in else -1.0 for old in keep]
+                want = [float(rid) if rid in opted_in else -1.0 for rid in order]
                 self.assertEqual(logits[:, 0].tolist(), want)
 
 

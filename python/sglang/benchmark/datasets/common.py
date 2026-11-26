@@ -3,9 +3,11 @@ from abc import ABC, abstractmethod
 from argparse import Namespace
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+
+from sglang.benchmark.utils import remove_suffix
 
 ASSISTANT_SUFFIX = "Assistant:"
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
@@ -105,3 +107,83 @@ def gen_mm_prompt(tokenizer, image_pad_id, token_num):
     all_available_tokens = get_available_multimodal_text_tokens(tokenizer, image_pad_id)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
+
+
+def first_two_sharegpt_turns(dataset: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    # Filter out the conversations with less than 2 turns.
+    dataset = [
+        data
+        for data in dataset
+        if len(data.get("conversations", data.get("conversation", []))) >= 2
+    ]
+    # Only keep the first two turns of each conversation.
+    return [
+        (
+            data.get("conversations", data.get("conversation", []))[0]["value"],
+            data.get("conversations", data.get("conversation", []))[1]["value"],
+        )
+        for data in dataset
+    ]
+
+
+def tokenize_and_filter_turn_pairs(
+    dataset: List[Tuple[str, str]],
+    num_requests: int,
+    tokenizer: Any,
+    fixed_output_len: Optional[int],
+    context_len: Optional[int],
+    prompt_suffix: Optional[str],
+    apply_chat_template: bool,
+) -> List[DatasetRow]:
+    # Filter out sequences that are too long or too short
+    filtered_dataset: List[DatasetRow] = []
+    for i in range(len(dataset)):
+        if len(filtered_dataset) == num_requests:
+            break
+
+        # Tokenize the prompts and completions.
+        prompt = dataset[i][0]
+        if prompt_suffix:
+            prompt = (
+                remove_suffix(prompt, ASSISTANT_SUFFIX)
+                + prompt_suffix
+                + ASSISTANT_SUFFIX
+            )
+
+        if apply_chat_template:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+                return_dict=False,
+            )
+            if tokenizer.bos_token:
+                prompt = prompt.replace(tokenizer.bos_token, "")
+
+        prompt_token_ids = tokenizer.encode(prompt)
+        completion = dataset[i][1]
+        completion_token_ids = tokenizer.encode(completion)
+        prompt_len = len(prompt_token_ids)
+        output_len = (
+            len(completion_token_ids) if fixed_output_len is None else fixed_output_len
+        )
+
+        if prompt_len < 2 or output_len < 2:
+            # Prune too short sequences.
+            continue
+
+        if context_len and prompt_len + output_len > context_len:
+            # Prune too long sequences.
+            continue
+
+        filtered_dataset.append(
+            DatasetRow(
+                prompt=prompt,
+                prompt_len=prompt_len,
+                output_len=output_len,
+            )
+        )
+
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
+    return filtered_dataset

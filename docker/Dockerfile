@@ -5,6 +5,9 @@ ARG ENABLE_SGL_NVIDIA_MEGA=1
 ARG CUDA_VERSION=13.0.3
 ARG UV_VERSION=latest
 ARG PYTHON_VERSION=3.12
+# AWS EFA userspace (libfabric, aws-ofi-nccl), see scripts/install_efa.sh.
+ARG EFA_INSTALLER_VERSION=1.51.0
+ARG EFA_INSTALLER_SHA256=83993044fa4df3dc2f8b5c2f7051d61b9689441be023a2c92ea51d3f53f2465c
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
@@ -17,7 +20,7 @@ ARG SGL_KERNEL_VERSION=0.4.11
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
-ARG SGL_NCCL_VERSION=2.30.7
+ARG SGL_NCCL_VERSION=2.31.2
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
@@ -83,8 +86,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     patchelf \
     ccache \
     git-lfs \
-    # MPI and NUMA
-    libopenmpi-dev \
+    # NUMA
     libnuma1 \
     libnuma-dev \
     numactl \
@@ -107,7 +109,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libgtest-dev \
     libjsoncpp-dev \
     libunwind-dev \
-    libboost-all-dev \
+    libboost-dev \
     libssl-dev \
     libgrpc-dev \
     libgrpc++-dev \
@@ -119,7 +121,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libcurl4-openssl-dev \
     libczmq4 \
     libczmq-dev \
-    libfabric-dev \
     linux-libc-dev \
     # Package building tools
     devscripts \
@@ -172,7 +173,7 @@ ENV LANG=en_US.UTF-8 \
 #     |                  \-> halops_wheel (prebuilt wheel download)
 #     |
 #     +-- devtools_builder (independent)
-#     +-- gateway_builder  (independent, only needs gateway source)
+#     +-- router_builder   (independent, only needs router source)
 #     |
 #     v
 #   framework (combines all artifacts)
@@ -373,33 +374,19 @@ RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.
     && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
 ########################################################
-# PARALLEL STAGE 5: Gateway Builder (starts from base)
+# PARALLEL STAGE 5: Router Builder (starts from base)
 ########################################################
-# Builds sgl-model-gateway in isolation so Python-only changes
+# Builds sgl-router in isolation so Python-only changes
 # don't trigger a full Rust recompilation.
-FROM base AS gateway_builder
-
-ARG GITHUB_ARTIFACTORY
-ARG BRANCH_TYPE
-ARG SGL_VERSION
-ARG USE_LATEST_SGLANG
+FROM base AS router_builder
 
 WORKDIR /build
 
-# Copy ONLY the gateway source (not the full repo)
-COPY sgl-model-gateway /build/sgl-model-gateway
+# sgl-router and the rust/ workspace that holds its path dependencies
+COPY sgl-router /build/sgl-router
+COPY rust /build/rust
 
-# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
-RUN --mount=type=cache,target=/root/.cache/uv \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && export PATH="/root/.cargo/bin:${PATH}" \
-    && uv pip install maturin \
-    && cd /build/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
-    && cd /build/sgl-model-gateway \
-    && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
-    && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
-    && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
+RUN bash /build/sgl-router/scripts/build.sh /build/sgl-router-bin
 
 ########################################################
 ########## Final Framework Image ######################
@@ -559,6 +546,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --prerelease=allow --index-strategy unsafe-best-match \
         --extra-index-url https://pypi.nvidia.com/ ai-dynamo
 
+# Install the AWS EFA userspace for NIXL's LIBFABRIC backend, Mooncake's EFA
+# transport and NCCL over aws-ofi-nccl.
+ARG EFA_INSTALLER_VERSION
+ARG EFA_INSTALLER_SHA256
+RUN --mount=type=bind,source=scripts/install_efa.sh,target=/tmp/install_efa.sh \
+    bash /tmp/install_efa.sh
+# LD_LIBRARY_PATH is required: under `--gpus` the NVIDIA toolkit reruns
+# ldconfig, which puts the distro libfabric first in the cache.
+ENV LD_LIBRARY_PATH="/opt/amazon/efa/lib:${LD_LIBRARY_PATH}" \
+    PATH="/opt/amazon/efa/bin:${PATH}"
+
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
 
@@ -670,12 +668,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ENV SGLANG_RUST_BUILD_MODE=never
 
 
-# Install pre-built gateway artifacts from parallel builder
-COPY --from=gateway_builder /build/sgl-model-gateway-bin /opt/sglang/bin/sgl-model-gateway
-COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --reinstall /tmp/gateway_wheels/*.whl \
-    && rm -rf /tmp/gateway_wheels
+# Install the pre-built router from the parallel builder
+COPY --from=router_builder /build/sgl-router-bin /opt/sglang/bin/sgl-router
 
 # sgl-nvidia-mega: the NVIDIA megakernel plugin, inert unless a server passes
 # --enable-nvidia-megakernel. Installed with CUDA >= 12.9 only (its kernels are
