@@ -483,10 +483,6 @@ class AttentionBackend(ABC):
         """Run a forward for mix."""
         raise NotImplementedError()
 
-    def support_triton(self):
-        """Check if the current backend supports triton."""
-        return True
-
     def get_indexer_metadata(
         self,
         layer_id: int,

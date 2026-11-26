@@ -104,6 +104,7 @@ def _storage_and_host(band, *, mla_draft=False):
             state_slots=4,
             max_running_requests=1,
             context_len=64,
+            req_to_token_row_width=64,
             alignment=1,
         ),
     )
@@ -117,7 +118,6 @@ def _storage_and_host(band, *, mla_draft=False):
             enable_memory_saver=False,
             need_sort=False,
             max_num_reqs=1,
-            model_context_len=64,
             state_cache_params=SimpleNamespace(layers=(1,)),
         ),
     )
