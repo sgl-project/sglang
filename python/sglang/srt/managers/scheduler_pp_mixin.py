@@ -1609,9 +1609,9 @@ class SchedulerPPMixin:
             if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
                 seq_lens_sum = 0  # preallocated / bs-sized -> kernel ignores it
             else:
-                # Conservative upper bound; backend-agnostic (not every
-                # attention backend exposes max_context_len).
-                seq_lens_sum = bs * self.tp_worker.model_runner.model_config.context_len
+                # Conservative upper bound: no request outgrows its row.
+                req_to_token_pool = self.tp_worker.model_runner.req_to_token_pool
+                seq_lens_sum = bs * req_to_token_pool.row_width
 
         (
             tree_mask,
