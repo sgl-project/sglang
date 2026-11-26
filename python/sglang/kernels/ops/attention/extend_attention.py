@@ -454,6 +454,7 @@ def _fwd_kernel(
     SKIP_EXTEND: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    HAS_WINDOW_KV_OFFSETS: tl.constexpr,
     USE_COMPACT_TILE_GRID: tl.constexpr,
     USE_EXP2: tl.constexpr,
     USE_FP8_PREFIX: tl.constexpr,
@@ -520,7 +521,11 @@ def _fwd_kernel(
 
     # For SWA, we should only load the mask in the sliding window
     window_kv_offset = 0
-    if USE_CUSTOM_MASK and SLIDING_WINDOW_SIZE > 0:
+    if (
+        (USE_CUSTOM_MASK or USE_BLOCK_MASK)
+        and SLIDING_WINDOW_SIZE > 0
+        and HAS_WINDOW_KV_OFFSETS
+    ):
         window_kv_offset = tl.load(window_kv_offset_ptr + cur_seq)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
@@ -797,10 +802,17 @@ def _fwd_kernel(
                 start_n + offs_n[None, :]
             )
             if USE_BLOCK_MASK:
-                # state keys are visible to every row;
-                # question rows see every key of the prompt, never a generated one
-                q_abs = cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
-                k_abs = cur_seq_len_prefix + start_n + offs_n[None, :]
+                # state keys are visible to every row, and question rows see
+                # every prompt key without seeing generated tokens
+                q_abs = (
+                    window_kv_offset
+                    + cur_seq_len_prefix
+                    + cur_block_m * BLOCK_M
+                    + offs_m[:, None]
+                )
+                k_abs = (
+                    window_kv_offset + cur_seq_len_prefix + start_n + offs_n[None, :]
+                )
                 mask_causual |= (block_boundary >= 0) & (
                     (k_abs < block_boundary)
                     | ((q_abs >= block_boundary) & (k_abs < block_end))
@@ -812,7 +824,7 @@ def _fwd_kernel(
             final_mask &= mask_non_causal
 
         if SLIDING_WINDOW_SIZE > 0:
-            if not IS_CAUSAL:
+            if not IS_CAUSAL or USE_BLOCK_MASK:
                 window_mask = (
                     (cur_block_m * BLOCK_M + offs_m[:, None])
                     <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
@@ -984,7 +996,6 @@ def extend_attention_fwd(
     sliding_window_size=-1,
     sinks=None,
     window_kv_offsets=None,
-    block_boundaries=None,
     xai_temperature_len=-1,
     lse_extend=None,
     skip_prefix=False,
@@ -995,6 +1006,7 @@ def extend_attention_fwd(
     extend_seq_lens_cpu=None,
     identity_kv_indices: bool = False,
     bf16_dot: bool = False,
+    block_boundaries=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -1267,12 +1279,15 @@ def extend_attention_fwd(
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
-        USE_BLOCK_MASK=block_boundaries is not None,
+        USE_BLOCK_MASK=(
+            block_boundaries is not None and is_causal and custom_mask is None
+        ),
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
         STORE_LSE=STORE_LSE,
         SKIP_PREFIX=skip_prefix,
         SKIP_EXTEND=skip_extend,
         HAS_SINK=HAS_SINK,
+        HAS_WINDOW_KV_OFFSETS=window_kv_offsets is not None,
         IS_GFX1250=_is_gfx1250,
         STORE_TRANSPOSE=_is_hip,
         USE_COMPACT_TILE_GRID=use_compact_tile_grid,
