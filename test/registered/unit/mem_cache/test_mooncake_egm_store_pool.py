@@ -160,6 +160,29 @@ class TestMooncakeEgmStorePoolSetup(CustomTestCase):
                 store = _build_store(_EgmMooncakeStore, _make_storage_config())
                 self.assertEqual(store.setup_calls[0][0][0]["egm_numa_nodes"], expected)
 
+    def test_numa_probe_failure_falls_back_to_auto(self):
+        """A missing cuda-bindings package or a driver that rejects the
+        attribute must not abort setup; the segment falls back to "auto"."""
+        fake_torch_cuda = SimpleNamespace(current_device=lambda: 0)
+        cases = {
+            "no cuda-bindings": {"cuda.bindings": None},
+            "driver rejects the attribute": {
+                "cuda": types.ModuleType("cuda"),
+                "cuda.bindings": types.ModuleType("cuda.bindings"),
+                "cuda.bindings.driver": SimpleNamespace(
+                    CUdevice_attribute=SimpleNamespace(),  # no HOST_NUMA_ID
+                ),
+            },
+        }
+        for name, modules in cases.items():
+            with (
+                self.subTest(case=name),
+                patch.dict("sys.modules", modules),
+                patch(f"{_MODULE}.torch.cuda", fake_torch_cuda),
+            ):
+                store = _build_store(_EgmMooncakeStore, _make_storage_config())
+                self.assertEqual(store.setup_calls[0][0][0]["egm_numa_nodes"], "auto")
+
     def test_egm_pool_requires_mooncake_support(self):
         """A Mooncake without EGM support ignores unknown setup keys, so SGLang
         must refuse instead of silently building an ordinary pool."""
