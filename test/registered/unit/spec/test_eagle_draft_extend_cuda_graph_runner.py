@@ -132,11 +132,7 @@ class TestEagleDraftExtendCudaGraphRunner(unittest.TestCase):
             )
             stack.enter_context(
                 mock.patch.object(
-                    npu,
-                    "get_parallel",
-                    return_value=SimpleNamespace(
-                        tp_group=SimpleNamespace(world_size=1)
-                    ),
+                    npu, "get_parallel", return_value=SimpleNamespace(tp_group=object())
                 )
             )
             stack.enter_context(
