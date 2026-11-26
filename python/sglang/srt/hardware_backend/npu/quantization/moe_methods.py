@@ -19,6 +19,10 @@ from sglang.srt.hardware_backend.npu.moe.matmul import (
     GroupedMatmul,
     GroupedMatmulSwigluQuant,
 )
+from sglang.srt.hardware_backend.npu.moe.mega_moe import (
+    prepare_mega_moe_arch22_weights,
+    release_mega_moe_stacked_weight,
+)
 from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.quantization.dtype_utils import (
     _get_float4_e2m1fn_x2_dtype,
@@ -643,7 +647,12 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
 
         # Process weight
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight.data.transpose(1, 2).contiguous())
+        weight.data = weight.data.transpose(1, 2).contiguous()
+        if prepare_mega_moe_arch22_weights(layer, weight_prefix, weight.data):
+            # fused_op owns the per-expert list; the grouped-matmul copy is dead.
+            release_mega_moe_stacked_weight(layer, weight_prefix)
+        else:
+            weight.data = npu_format_cast(weight.data)
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
@@ -747,8 +756,14 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         # Process weight
         weight = getattr(layer, f"{weight_prefix}_weight")
         weight.data = weight.data.transpose(1, 2).contiguous()
-        weight.data = npu_format_cast(weight.data)
-        weight.data = self._pack_to_int32(weight.data)
+        if prepare_mega_moe_arch22_weights(
+            layer, weight_prefix, weight.data, packed_int4=True
+        ):
+            # fused_op owns the per-expert list; the grouped-matmul copy is dead.
+            release_mega_moe_stacked_weight(layer, weight_prefix)
+        else:
+            weight.data = npu_format_cast(weight.data)
+            weight.data = self._pack_to_int32(weight.data)
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
@@ -1012,7 +1027,13 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight)
+        if prepare_mega_moe_arch22_weights(
+            layer, weight_prefix, weight.data.transpose(1, 2)
+        ):
+            # fused_op owns the per-expert list; the grouped-matmul copy is dead.
+            release_mega_moe_stacked_weight(layer, weight_prefix)
+        else:
+            weight.data = npu_format_cast(weight)
 
         if weight_prefix == "w13":
             self._set_moe_dispatch_dtype(layer, "bf16")

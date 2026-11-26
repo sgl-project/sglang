@@ -101,7 +101,7 @@ sgl-eval run aime25 \\
   ],
 
   dockerImages: {
-    a3: "quay.io/ascend/sglang:v0.5.22-cann9.1.0-a3",
+    a3: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051",
     h200:  "lmsysorg/sglang:latest",
     b200:  "lmsysorg/sglang:latest",
     gb300: "lmsysorg/sglang:latest",
@@ -290,7 +290,7 @@ sgl-eval run aime25 \\
     const router = { port: 30000, command: config.npuRouterCommand(s.hw === "a5" ? "glm52" : "glm-5") };
     if (s.pdMode === "router") return { ...cell, pd: true, pdMode: "router",
       nnodes: 1, verified: false, env: [], flags: [], warn: undefined,
-      commands: { python: router.command, docker: `docker run --network host --rm ${s.hw === "a5" ? "<your-compatible-950pr-dt-series-image>" : "quay.io/ascend/sglang:v0.5.22-cann9.1.0-a3"} ${router.command}` }, router };
+      commands: { python: router.command, docker: `docker run --network host --rm ${s.hw === "a5" ? "<your-compatible-950pr-dt-series-image>" : "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051"} ${router.command}` }, router };
     const recipe = config.npuPdRecipes.find((r) => r.hw === s.hw && r.pdMode === s.pdMode);
     if (!recipe) return cell;
     const flags = recipe.flags.map((flag) => flag.startsWith("--port ")

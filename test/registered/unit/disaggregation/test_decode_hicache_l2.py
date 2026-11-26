@@ -129,7 +129,7 @@ class TestDecodeHiCacheL2(CustomTestCase):
             size=1024, dtype=torch.float32, device="cpu", kvcache=None, need_sort=False
         )
         self.pool = ReqToTokenPool(
-            size=8, max_context_len=1024, device="cpu", enable_memory_saver=False
+            size=8, row_width=1024, device="cpu", enable_memory_saver=False
         )
         self.cache = UnifiedRadixCache(
             CacheInitParams(
