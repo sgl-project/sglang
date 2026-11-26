@@ -529,6 +529,7 @@ SAMPLES = {
         suffix="\n<｜tool_calls_end｜>",
     ),
     "step3p5": _QWEN3_CODER,
+    "step5": _QWEN3_CODER,
     # arcee-ai/Trinity-Mini
     "trinity": Sample(calls=_HERMES.calls, separator="\n"),
     # XingChen-AGI/Xing4.0-29B-A4B
