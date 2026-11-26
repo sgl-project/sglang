@@ -1251,6 +1251,11 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             use_triton_causal_conv or get_memory().enable_page_major_kv_layout
         )
         layer_cache = self.state_layer_cache(layer_id)
+        beam = forward_batch.beam
+        read_only_rows = None if beam is None else beam.read_only_state_rows
+        state_write_options = (
+            {} if read_only_rows is None else {"read_only_state_rows": read_only_rows}
+        )
         mixer_out, intermediate_states, track_states = mixer.forward(
             hidden_states=hidden_states,
             output=output,
@@ -1258,6 +1263,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             metadata=self.forward_metadata,
             mup_vector=mup_vector,
             use_triton_causal_conv=use_triton_causal_conv,
+            **state_write_options,
         )
 
         if forward_batch.mamba_track_mask is not None:

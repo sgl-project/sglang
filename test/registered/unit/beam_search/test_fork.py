@@ -110,6 +110,79 @@ class TestAliasMembersPromptKV(CustomTestCase):
 
 
 class TestRecurrentStateFork(CustomTestCase):
+    def test_terminal_siblings_reuse_parent_slots_only_for_read_only_rows(self):
+        from sglang.srt.beam_search.batch_tail import BeamTail, BeamTailEntry
+        from sglang.srt.beam_search.beam_group import BeamGroup
+        from sglang.srt.beam_search.coordinator import BeamCoordinator
+        from sglang.srt.beam_search.recurrent import (
+            build_gdn_beam_replay_inputs,
+            build_read_only_state_mask,
+        )
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+        pool = HybridReqToTokenPool.__new__(HybridReqToTokenPool)
+        pool.device = "cpu"
+        pool.req_to_token = torch.arange(8 * 5, dtype=torch.int32).view(8, 5)
+        pool.req_index_to_mamba_index_mapping = torch.arange(8, dtype=torch.int32)
+        coordinator = BeamCoordinator(
+            model_config=_DenseModelConfig,
+            spec_algorithm=None,
+            dllm_enabled=False,
+            max_req_len=0,
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=SimpleNamespace(state=object()),
+            tree_cache=None,
+            future_map=SimpleNamespace(stash=lambda *_: None),
+        )
+        group = BeamGroup(
+            beam_width=3,
+            max_new_tokens=3,
+            read_only_terminal_state=True,
+            use_gdn_beam_replay=True,
+        )
+        group.leader = SimpleNamespace(
+            kv=ReqKvInfo(
+                kv_committed_len=4,
+                mamba_pool_idx=torch.tensor([1]),
+                beam_mamba_slots=torch.tensor([3, 5]),
+            ),
+            output_ids=[],
+        )
+        group.prompt_len = 3
+        group.all_rows = torch.tensor([1, 3, 5])
+        tail = BeamTail(
+            num_base_rows=3,
+            entries=[BeamTailEntry(group=group, leader_idx=1, start=0, end=2)],
+        )
+
+        group.num_generated = 1
+        tokens = torch.tensor([11, 12, 13])
+        parents = torch.tensor([0, 0, 2])
+        fork = coordinator._apply_survivors(group, tokens, parents, 1)
+        self.assertIsNotNone(fork)
+        self.assertEqual(
+            pool.req_index_to_mamba_index_mapping[group.all_rows].unique().numel(), 3
+        )
+        device = torch.device("cpu")
+        self.assertIsNone(
+            build_read_only_state_mask(tail=tail, num_rows=5, device=device)
+        )
+
+        group.num_generated = 2
+        mapping = pool.req_index_to_mamba_index_mapping
+        expected = mapping[group.all_rows[parents]]
+        target = coordinator._apply_survivors(group, tokens, parents, 2)
+        self.assertIsNone(target)
+        torch.testing.assert_close(mapping[group.all_rows], expected)
+        self.assertEqual(
+            build_read_only_state_mask(tail=tail, num_rows=5, device=device).tolist(),
+            [False, True, False, True, True],
+        )
+        replay = build_gdn_beam_replay_inputs(tail=tail, num_rows=5, device=device)
+        self.assertIsNotNone(replay)
+        self.assertEqual(replay.group_ids.tolist(), [-1, 0, -1, 0, 0])
+        self.assertEqual(replay.slots.tolist(), [1, 3])
+
     def test_repeated_parents_inherit_private_state(self):
         # The first reparent changes which slot the leader runs in. The next
         # step must read that remap, not the leader's original slot.

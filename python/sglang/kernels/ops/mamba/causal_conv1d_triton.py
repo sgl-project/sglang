@@ -733,6 +733,7 @@ def _causal_conv1d_update_kernel(
     retrieve_next_token_ptr,
     retrieve_next_sibling_ptr,
     retrieve_parent_token_ptr,
+    read_only_state_rows,
     o_ptr,  # (batch, dim, seqlen)
     # Matrix dimensions
     batch: int,
@@ -777,6 +778,7 @@ def _causal_conv1d_update_kernel(
     USE_PAD_SLOT: tl.constexpr,
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
+    HAS_READ_ONLY_STATE_ROWS: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     USE_GDC: tl.constexpr = False,
     DEDUP_CONV_WINDOW: tl.constexpr = False,
@@ -899,6 +901,8 @@ def _causal_conv1d_update_kernel(
         conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
     )  # [BLOCK_M, BLOCK_N]
     mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+    if HAS_READ_ONLY_STATE_ROWS:
+        mask &= ~tl.load(read_only_state_rows + idx_seq)
     tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
@@ -1179,6 +1183,8 @@ def causal_conv1d_update(
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
+    *,
+    read_only_state_rows: Optional[torch.Tensor] = None,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -1217,6 +1223,14 @@ def causal_conv1d_update(
         # make it (batch, dim, seqlen) with seqlen == 1
         x = x.unsqueeze(-1)
     batch, dim, seqlen = x.shape
+    if read_only_state_rows is not None:
+        assert seqlen == 1 and intermediate_conv_window is None
+        assert read_only_state_rows.shape == (batch,)
+        assert read_only_state_rows.dtype == torch.bool
+        assert (
+            read_only_state_rows.is_contiguous()
+            and read_only_state_rows.device == x.device
+        )
     _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
@@ -1336,6 +1350,7 @@ def causal_conv1d_update(
         retrieve_next_token,
         retrieve_next_sibling,
         retrieve_parent_token,
+        read_only_state_rows,
         out,
         # Matrix dimensions
         batch,
@@ -1380,6 +1395,7 @@ def causal_conv1d_update(
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
+        HAS_READ_ONLY_STATE_ROWS=read_only_state_rows is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
         DEDUP_CONV_WINDOW=dedup_conv_window,
         NP2_WINDOW_COLS=(

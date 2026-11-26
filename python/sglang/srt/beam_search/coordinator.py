@@ -94,6 +94,7 @@ _MAX_BATCHED_TOPK_CANDIDATES = 1 << 22
 class _StateFork(NamedTuple):
     src: torch.Tensor
     dst: torch.Tensor
+    conv_only: bool = False
 
 
 def _streamed_topk_logprobs(
@@ -145,6 +146,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     tree_cache: BasePrefixCache
     future_map: FutureMap
 
+    read_only_terminal_state: bool = False
+    use_gdn_beam_replay: bool = False
     trie_constraint: Optional[BeamTrieConstraint] = None
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
@@ -310,6 +313,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                     "Trie-conditioned beam output does not support stop tokens "
                     "inside the configured SID codebooks."
                 )
+        read_only_terminal_state = (
+            self.read_only_terminal_state
+            and state is not None
+            and not stop_token_ids
+            and self.trie_constraint is None
+        )
         group = BeamGroup(
             beam_width=beam_width,
             stop_token_ids=stop_token_ids,
@@ -319,6 +328,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             # tensors in place; only k-sized results ever reach the host.
             device=self.req_to_token_pool.device,
             device_history=fixed_length,
+            read_only_terminal_state=read_only_terminal_state,
+            use_gdn_beam_replay=(
+                self.use_gdn_beam_replay
+                and read_only_terminal_state
+                and max_new_tokens == 3
+            ),
         )
         if self.trie_constraint is not None:
             group.trie_prefix_codes = torch.empty(
@@ -495,10 +510,16 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             member_slots = leader.kv.beam_mamba_slots
             leader_slot = leader.kv.mamba_pool_idx
             assert member_slots is not None and leader_slot is not None
-            pool.req_index_to_mamba_index_mapping[member_rows] = member_slots.to(
-                torch.int32
+            mapping = pool.req_index_to_mamba_index_mapping
+            if group.terminal_state_is_read_only():
+                mapping[member_rows] = leader_slot.to(torch.int32)
+                return None
+            mapping[member_rows] = member_slots.to(torch.int32)
+            return _StateFork(
+                leader_slot.expand_as(member_slots),
+                member_slots,
+                conv_only=group.use_gdn_beam_replay,
             )
-            return _StateFork(leader_slot.expand_as(member_slots), member_slots)
         return None
 
     def select_and_relay_decode(
@@ -710,10 +731,14 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 pool = self.req_to_token_pool
                 assert isinstance(pool, HybridReqToTokenPool)
                 mapping = pool.req_index_to_mamba_index_mapping
-                slots, src, dst = plan_state_forks(
-                    slots=mapping[rows], parents=parent_idx
-                )
-                state_fork = _StateFork(src, dst)
+                if group.terminal_state_is_read_only():
+                    # The upcoming decode reads shared parents without updating them.
+                    slots = mapping[rows[parent_idx]]
+                else:
+                    slots, src, dst = plan_state_forks(
+                        slots=mapping[rows], parents=parent_idx
+                    )
+                    state_fork = _StateFork(src, dst)
                 # The leader's original slot remains its allocation for teardown;
                 # only the working row-to-slot bindings follow the new frontier.
                 mapping[rows] = slots
@@ -728,13 +753,17 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return
         state = self.token_to_kv_pool_allocator.state
         assert state is not None
-        if len(forks) == 1:
-            src, dst = forks[0]
-        else:
-            src = torch.cat([fork.src for fork in forks])
-            dst = torch.cat([fork.dst for fork in forks])
         # Distinct groups own disjoint slots, so one copy can precede the next forward.
-        state.pool.copy_beam_slots(src=src, dst=dst)
+        for conv_only in (False, True):
+            subset = [fork for fork in forks if fork.conv_only == conv_only]
+            if not subset:
+                continue
+            if len(subset) == 1:
+                src, dst = subset[0].src, subset[0].dst
+            else:
+                src = torch.cat([fork.src for fork in subset])
+                dst = torch.cat([fork.dst for fork in subset])
+            state.pool.copy_beam_slots(src=src, dst=dst, conv_only=conv_only)
 
     def _reclaim_orphans(
         self, group: BeamGroup, up_to_tick: Optional[int] = None

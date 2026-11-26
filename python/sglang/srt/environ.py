@@ -760,6 +760,8 @@ class Envs:
     # ===================================================================
     # Shared-prompt decode attention for wide beam batches (FlashInfer MHA only).
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
+    SGLANG_ENABLE_BEAM_TERMINAL_READ_ONLY_STATE = EnvBool(False)
+    SGLANG_ENABLE_BEAM_GDN_RANK_ONE_REPLAY = EnvBool(False)
     # Replay the trie beam selection step as a CUDA graph.
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
 

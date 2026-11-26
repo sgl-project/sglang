@@ -671,6 +671,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
 
+    @property
+    def supports_terminal_read_only_state(self) -> bool:
+        return (
+            isinstance(self.kernel_dispatcher.decode_kernel, TritonGDNKernel)
+            and self.kernel_dispatcher.supports_packed_decode
+            and not _fused_decode_verify_real_tensors
+        )
+
     def _create_kernel_dispatcher(self, backends):
         self._round_beta_to_input_dtype = (
             not is_cpu()
@@ -1067,6 +1075,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+        beam = forward_batch.beam
+        read_only_rows = None if beam is None else beam.read_only_state_rows
+        beam_replay = None if beam is None else beam.gdn_replay
         # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
         # per-row write cursor. All None unless --enable-linear-replayssm, so the
         # legacy dispatch below is byte-identical when the flag is off.
@@ -1167,6 +1178,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     num_v_heads=layer.num_v_heads,
                     head_v_dim=layer.head_v_dim,
                     activation=layer.activation,
+                    read_only_state_rows=read_only_rows,
                 )
                 if verify_real_tensors:
                     candidate_state = torch.index_select(
@@ -1221,6 +1233,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             assert isinstance(mixed_qkv, torch.Tensor)
 
+        state_write_options = (
+            {} if read_only_rows is None else {"read_only_state_rows": read_only_rows}
+        )
         if not conv_already_applied:
             mixed_qkv = causal_conv1d_update(
                 mixed_qkv,
@@ -1229,11 +1244,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.bias,
                 layer.activation,
                 conv_state_indices=cache_indices,
+                **state_write_options,
             )
 
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
         if self.kernel_dispatcher.supports_packed_decode:
+            if beam_replay is not None:
+                state_write_options["beam_replay_group_ids"] = beam_replay.group_ids
+                state_write_options["beam_replay_slots"] = beam_replay.slots
             core_attn_out = self.kernel_dispatcher.packed_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -1250,6 +1269,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                **state_write_options,
             )
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id

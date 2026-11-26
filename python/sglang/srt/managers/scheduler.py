@@ -2998,6 +2998,15 @@ class Scheduler(
         self.deferred_responses.defer(req, completion)
 
     def init_beam_coordinator(self) -> None:
+        from sglang.srt.beam_search.recurrent import resolve_beam_state_optimizations
+
+        read_only_terminal_state, use_gdn_beam_replay = (
+            resolve_beam_state_optimizations(
+                model_runner=self.tp_worker.model_runner,
+                state=self.token_to_kv_pool_allocator.state,
+                static_storage=self.token_to_kv_pool_allocator.storage is None,
+            )
+        )
         self.beam_coordinator = BeamCoordinator(
             model_config=self.model_config,
             spec_algorithm=self.spec_algorithm,
@@ -3007,6 +3016,8 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             future_map=self.future_map,
+            read_only_terminal_state=read_only_terminal_state,
+            use_gdn_beam_replay=use_gdn_beam_replay,
         )
 
     def init_request_retirer(self) -> None:

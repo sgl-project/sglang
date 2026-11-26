@@ -101,6 +101,7 @@ def _selective_scan_update_kernel(
     retrieve_parent_token_ptr,
     intermediate_state_indices_ptr,
     rand_seed_ptr,
+    read_only_state_rows,
     # Matrix dimensions
     batch,
     T,
@@ -155,6 +156,7 @@ def _selective_scan_update_kernel(
     HAS_Z: tl.constexpr,
     HAS_STATE_BATCH_INDICES: tl.constexpr,
     DISABLE_STATE_UPDATE: tl.constexpr,
+    HAS_READ_ONLY_STATE_ROWS: tl.constexpr,
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     HAS_INTERMEDIATE_STATE_INDICES: tl.constexpr,
@@ -342,6 +344,8 @@ def _selective_scan_update_kernel(
             )
         else:
             state_to_store = state.to(state_ptrs.dtype.element_ty)
+        if HAS_READ_ONLY_STATE_ROWS:
+            mask &= ~tl.load(read_only_state_rows + pid_b)
         tl.store(state_ptrs, state_to_store, mask=mask)
 
     if USE_GDC:
@@ -369,6 +373,8 @@ def selective_state_update(
     intermediate_state_indices=None,
     enable_stochastic_rounding=False,
     cache_philox_rounds=0,
+    *,
+    read_only_state_rows: torch.Tensor | None = None,
 ):
     """
     Argument:
@@ -412,6 +418,14 @@ def selective_state_update(
         x = x.unsqueeze(1)
     if x.dim() == 3:
         x = x.unsqueeze(1)
+    if read_only_state_rows is not None:
+        assert x.shape[1] == 1 and intermediate_states_buffer is None
+        assert read_only_state_rows.shape == (x.shape[0],)
+        assert read_only_state_rows.dtype == torch.bool
+        assert (
+            read_only_state_rows.is_contiguous()
+            and read_only_state_rows.device == x.device
+        )
     if dt.dim() == 2:
         dt = dt.unsqueeze(1)
     if dt.dim() == 3:
@@ -518,6 +532,7 @@ def selective_state_update(
             retrieve_parent_token,
             intermediate_state_indices,
             rand_seed,
+            read_only_state_rows,
             batch,
             T,
             nheads,
@@ -563,6 +578,7 @@ def selective_state_update(
             tie_hdim,
             BLOCK_SIZE_M,
             DISABLE_STATE_UPDATE=disable_state_update,
+            HAS_READ_ONLY_STATE_ROWS=read_only_state_rows is not None,
             USE_RS_ROUNDING=enable_stochastic_rounding,
             PHILOX_ROUNDS=cache_philox_rounds,
             num_warps=num_warps,

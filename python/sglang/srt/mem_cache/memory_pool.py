@@ -1276,12 +1276,18 @@ class MambaPool:
         for sibling in self._slot_siblings:
             sibling.copy_slots(src_indices, dst_indices)
 
-    def copy_beam_slots(self, *, src: torch.Tensor, dst: torch.Tensor) -> None:
+    def copy_beam_slots(
+        self, *, src: torch.Tensor, dst: torch.Tensor, conv_only: bool = False
+    ) -> None:
         from sglang.kernels.ops.kvcache.copy_pages import copy_layered_pages
 
         cache = self.mamba_cache
-        for tensor in (*cache.conv, cache.temporal):
+        for tensor in cache.conv:
             copy_layered_pages(tensor, src=src, dst=dst)
+        if conv_only:
+            assert self.replayssm_write_pos is None and not self._slot_siblings
+            return
+        copy_layered_pages(cache.temporal, src=src, dst=dst)
         if self.replayssm_write_pos is not None:
             # A live ReplaySSM slot also owns updates not yet folded into temporal.
             for tensor in (

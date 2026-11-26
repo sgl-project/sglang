@@ -71,6 +71,8 @@ class BeamGroup:
         num_return: Optional[int] = None,
         device: torch.device | str = "cpu",
         device_history: bool = False,
+        read_only_terminal_state: bool = False,
+        use_gdn_beam_replay: bool = False,
     ):
         self.beam_width = beam_width
         self.num_candidates = 2 * beam_width
@@ -91,6 +93,8 @@ class BeamGroup:
         self.completed: List[CompletedBeam] = []
         self.state = BeamGroupState.DECODING
         self.device_history = device_history
+        self.read_only_terminal_state = read_only_terminal_state
+        self.use_gdn_beam_replay = use_gdn_beam_replay
         self._device_tokens: List[torch.Tensor] = []
         self._device_parents: List[torch.Tensor] = []
         self._device_final_tokens: Optional[torch.Tensor] = None
@@ -147,6 +151,9 @@ class BeamGroup:
     def next_step_is_final(self) -> bool:
         """The upcoming selection hits max_new_tokens (decided host-side)."""
         return self.num_generated + 1 >= self.max_new_tokens
+
+    def terminal_state_is_read_only(self) -> bool:
+        return self.read_only_terminal_state and self.next_step_is_final()
 
     def launch_complete(self) -> bool:
         """Whether the launch half has already staged the terminal selection."""
