@@ -774,6 +774,12 @@ class Scheduler(
         self.init_dsa_kpool_truncation_align()
         self.init_mamba_truncation_align()
         self.check_truncation_align_fits_chunk()
+        if self.disaggregation_mode != DisaggregationMode.DECODE:
+            InputLogprobChunkCap.check_fits_alignment(
+                chunked_prefill_size=self.chunked_prefill_size,
+                page_size=self.page_size,
+                truncation_align_size=self.truncation_align_size,
+            )
 
         self.init_weight_updater()
 

@@ -1371,6 +1371,35 @@ class TestPrefillAdder(CustomTestCase):
         with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(1024):
             self.assertIsNone(InputLogprobChunkCap.for_batch(1024).room)
 
+    def test_input_logprob_cap_below_the_page_is_rejected_at_startup(self):
+        """A cap below the page size cuts a longer input-logprob prompt to an empty
+        chunk, so it would wait forever; the smallest cap accepted admits a page."""
+        self.mock_token_allocator.available_size.return_value = 100000
+
+        def admit(cap_tokens):
+            with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(cap_tokens):
+                InputLogprobChunkCap.check_fits_alignment(
+                    chunked_prefill_size=4096, page_size=64, truncation_align_size=None
+                )
+                cap = InputLogprobChunkCap.for_batch(4096)
+            adder = self.create_adder(
+                self.create_running_batch(),
+                page_size=64,
+                rem_input_tokens=100000,
+                rem_chunk_tokens=4096,
+            )
+            req = self._create_delayer_req(128, rid=f"lp_{cap_tokens}")
+            req.return_logprob, req.logprob_start_len = True, 0
+            req.origin_input_ids = req.full_untruncated_fill_ids
+            cap.add_one_req(
+                adder, req, has_chunked_req=False, truncation_align_size=None
+            )
+            return [r.extend_len for r in adder.can_run_list]
+
+        with self.assertRaises(ValueError):
+            admit(32)
+        self.assertEqual(admit(64), [64])
+
     @patch(
         "sglang.srt.managers.schedule_policy.page_interleave_shard_size",
         return_value=4,
