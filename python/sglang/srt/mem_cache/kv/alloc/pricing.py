@@ -10,7 +10,7 @@ serves every chain shape.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, FrozenSet, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, FrozenSet, List, Optional, Tuple
 
 import msgspec
 
@@ -493,27 +493,16 @@ def _gap_weights(
     return tuple(weights)
 
 
-def plan(
+def _place_fixed_bands(
     snapshot: ChainSnapshot,
     demands: Dict[str, int],
     step: str,
-    *,
-    growth: Optional[Dict[str, int]] = None,
-    keep_ends: FrozenSet[str] = frozenset(),
-) -> Optional[TakePlan]:
-    """A layout of the chain serving ``demands`` (pages per band) with the
-    rearrangement ``step`` allows, or None; ends in ``keep_ends`` are never
-    compacted.
-
-    Counts and frontiers only: a band in place reuses holes anywhere and
-    extends one side, never relying on releasing boundary holes. Bands in place
-    are fixed points; the floats between two are packed leftmost in their
-    segment. A fit only gets easier as a segment's low frontier falls, so
-    keeping each fixed band's take with the lowest high byte makes the walk
-    exact and linear in the number of bands.
-    Bytes held for a network send (``held``) bound it too, so a plan never
-    waits for a send.
-    """
+    keep_ends: FrozenSet[str],
+) -> Optional[Tuple[Dict[str, PlanTake], List[tuple]]]:
+    """The walk that decides whether `plan` finds a layout: each band left in
+    place takes its lowest-ending fit, and the floats between two must fit
+    their segment. The takes of the bands in place and the segments, or None
+    when no layout serves ``demands``; `plan` lays the segments out."""
     if step not in PLAN_STEPS:
         raise ValueError(f"unknown plan step {step!r}")
     if any(name not in snapshot.positions or n < 0 for name, n in demands.items()):
@@ -521,7 +510,6 @@ def plan(
     total = snapshot.total_bytes
     held = snapshot.held
     takes: Dict[str, PlanTake] = {}
-    targets: Dict[str, Tuple[int, int]] = {}
     movers = []
     segments = []
     frontier = 0
@@ -560,6 +548,36 @@ def plan(
     if not _segment_fits(frontier, movers_here, total, held):
         return None
     segments.append((frontier, movers_here, total, None))
+    return takes, segments
+
+
+def plan(
+    snapshot: ChainSnapshot,
+    demands: Dict[str, int],
+    step: str,
+    *,
+    growth: Optional[Dict[str, int]] = None,
+    keep_ends: FrozenSet[str] = frozenset(),
+) -> Optional[TakePlan]:
+    """A layout of the chain serving ``demands`` (pages per band) with the
+    rearrangement ``step`` allows, or None; ends in ``keep_ends`` are never
+    compacted.
+
+    Counts and frontiers only: a band in place reuses holes anywhere and
+    extends one side, never relying on releasing boundary holes. Bands in place
+    are fixed points; the floats between two are packed leftmost in their
+    segment. A fit only gets easier as a segment's low frontier falls, so
+    keeping each fixed band's take with the lowest high byte makes the walk
+    exact and linear in the number of bands.
+    Bytes held for a network send (``held``) bound it too, so a plan never
+    waits for a send.
+    """
+    placed = _place_fixed_bands(snapshot, demands, step, keep_ends)
+    if placed is None:
+        return None
+    takes, segments = placed
+    held = snapshot.held
+    targets: Dict[str, Tuple[int, int]] = {}
     growth = growth or {}
     left = None
     for low_byte, segment, high_byte, right in segments:
@@ -600,7 +618,8 @@ def feasible(snapshot: ChainSnapshot, demands: Dict[str, int]) -> bool:
     held for a network send too: a layout that needs them waits for it."""
     if snapshot.held:
         snapshot = msgspec.structs.replace(snapshot, held=())
-    return plan(snapshot, demands, RELAYOUT) is not None
+    # `plan`'s own walk decides: laying the segments out never refuses.
+    return _place_fixed_bands(snapshot, demands, RELAYOUT, frozenset()) is not None
 
 
 def first_plan(

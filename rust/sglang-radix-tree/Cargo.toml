@@ -39,3 +39,7 @@ sha2 = { version = "0.10", features = ["asm"] }
 default = []
 python-extension = ["dep:pyo3", "pyo3/extension-module", "tch/python-extension"]
 inspection = []
+
+# Outside the rust/ workspace, so the workspace's ci profile does not apply here.
+[profile.ci]
+inherits = "release"

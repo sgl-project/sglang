@@ -95,6 +95,7 @@ def _bundle(
         post_capture_active=post_capture_active,
         need_sort=False,
         model_context_len=256,
+        req_to_token_row_width=256,
         sliding_window_size=64,
     )
 
@@ -106,6 +107,7 @@ def _final_config(bundle):
         KVSizingInputs(
             budget_bytes=_FINAL_BYTES,
             context_len=256,
+            req_to_token_row_width=256,
             floor_window=64,
             max_running_requests=1,
             state_slots=16,
@@ -208,6 +210,7 @@ def _mla_draft_bundle(
         total_bytes=total_bytes,
         max_num_reqs=2,
         model_context_len=512,
+        req_to_token_row_width=512,
         fused_draft=placement,
         lazy_compaction=True,
         post_capture_active=post_capture_active,
@@ -231,7 +234,7 @@ def _flashinfer_draft_backend(reader, max_context_len, steps=3):
     multi.speculative_num_steps = steps
     multi.runner_ids = reader
     multi.page_size = 64
-    multi.max_context_len = max_context_len
+    multi.req_to_token_pool = SimpleNamespace(row_width=max_context_len)
     multi.kv_indptr = torch.zeros((steps, 3), dtype=torch.int32, device="cuda")
     multi.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
     multi.attn_backends = []
@@ -1079,6 +1082,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
             max_running_requests=4,
             radix_cache=False,
             context_len=16,
+            req_to_token_row_width=16,
             alignment=1,
         )
         captured = size_plan(plan, inputs)
@@ -1092,7 +1096,6 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 enable_memory_saver=False,
                 need_sort=False,
                 max_num_reqs=4,
-                model_context_len=16,
                 state_cache_params=SimpleNamespace(layers=(1,)),
                 speculative_num_draft_tokens=3,
                 post_capture_active=True,
@@ -1158,6 +1161,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 max_running_requests=10,
                 radix_cache=False,
                 context_len=16,
+                req_to_token_row_width=16,
                 alignment=1,
             ),
         )
@@ -1171,7 +1175,6 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 enable_memory_saver=False,
                 need_sort=False,
                 max_num_reqs=10,
-                model_context_len=16,
                 state_cache_params=SimpleNamespace(layers=(1,)),
                 speculative_num_draft_tokens=3,
                 post_capture_active=True,
@@ -1207,6 +1210,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 max_running_requests=10,
                 radix_cache=False,
                 context_len=16,
+                req_to_token_row_width=16,
                 alignment=1,
             ),
             frozen=captured,
@@ -1265,6 +1269,24 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
             for table in (sub.ids.virtual_to_physical, sub.ids.physical_to_virtual)
         ]
         table_ptrs = [table.data_ptr() for table in tables]
+        # The memory clip prices an empty pool of the reserved size, then of
+        # the final size: what it priced before the resize is not kept.
+        clip = dict(
+            token_capacity=10**7,
+            sliding_window_size=64,
+            chunk_size=None,
+            prefill_retire_lag=0,
+            eviction_interval=1,
+        )
+        prompts = (1000, 60000, 120000, 250000)
+
+        def clipped(allocator):
+            return [
+                allocator.max_new_tokens_for_memory(prompt, 100000, **clip)
+                for prompt in prompts
+            ]
+
+        reserved = clipped(allocator)
 
         config = _final_config(bundle)
         bundle.token_to_kv_pool.finalize_backing(config)
@@ -1283,6 +1305,9 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
         eager = _bundle(total_bytes=_FINAL_BYTES, post_capture_active=False)
         self.assertEqual(_capacities(bundle), _capacities(eager))
         self.assertEqual(allocator.verify_byte_accounting(), [])
+        final = clipped(allocator)
+        self.assertEqual(final, clipped(eager.token_to_kv_pool_allocator))
+        self.assertNotEqual(final, reserved)
 
         # The resized capacity is fully allocatable and accounted.
         n = largest_take(allocator)

@@ -7,6 +7,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs as _envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_local_dp_buffer,
@@ -28,18 +29,11 @@ from sglang.srt.layers.moe.utils import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.runtime_context import get_lora, get_parallel
-from sglang.srt.utils.common import get_bool_env_var
-from sglang.srt.utils.device import get_device, is_hip
-
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-from sglang.srt.environ import envs as _envs
+from sglang.srt.utils.device import get_device
 
 _MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.moe.utils import MoeRunnerBackendLike
 
 
@@ -120,12 +114,6 @@ class StandardDispatcher(BaseDispatcher):
         self.enable_flashinfer_cutlass_moe = (
             backend is not None and backend.is_flashinfer_cutlass()
         )
-        self.enable_flashinfer_mxfp4_moe = (
-            backend is not None and backend.is_flashinfer_mxfp4()
-        )
-        self.enable_flashinfer_trtllm_routed_moe = (
-            backend is not None and backend.is_flashinfer_trtllm_routed()
-        )
         self.use_aiter_moe_runner = backend is not None and backend.is_aiter()
         self.skip_local_expert_mapping = _keeps_global_expert_ids(backend)
         if (
@@ -149,6 +137,39 @@ class StandardDispatcher(BaseDispatcher):
         self.moe_ep_rank = get_parallel().moe_ep_rank
         self.local_expert_mapping = None
         self.expert_mask_gpu = None
+
+    @property
+    def prebuild_pending(self) -> bool:
+        # Not for aiter, whose expert_mask_gpu follows the mapping;
+        # the lazy build skips both for non-standard top-k, known only at dispatch.
+        return (
+            self.moe_ep_size > 1
+            and not self.skip_local_expert_mapping
+            and not self.use_aiter_moe_runner
+            and self.local_expert_mapping is None
+        )
+
+    def prebuild(self) -> None:
+        if self.prebuild_pending:
+            self.local_expert_mapping = self._build_local_expert_mapping()
+
+    def _build_local_expert_mapping(self) -> torch.Tensor:
+        # Global expert id -> local slot, -1 for experts held elsewhere;
+        # fused shared experts take the last ids, behind the routed slots.
+        device = get_device()
+        routed = self.num_local_routed_experts
+        mapping = torch.full((self.num_experts,), -1, dtype=torch.int32, device=device)
+        mapping[self.moe_ep_rank * routed : (self.moe_ep_rank + 1) * routed] = (
+            torch.arange(0, routed, dtype=torch.int32, device=device)
+        )
+        if self.num_local_shared_experts > 0:
+            mapping[-self.num_local_shared_experts :] = torch.arange(
+                routed,
+                routed + self.num_local_shared_experts,
+                dtype=torch.int32,
+                device="cpu",
+            )
+        return mapping
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -216,38 +237,15 @@ class StandardDispatcher(BaseDispatcher):
                 router_logits=topk_output.router_logits,  # never tested
             )
         else:
-            hidden_states = hidden_states
             hidden_states_scale = None
 
         if (
             self.moe_ep_size > 1
             and not self.skip_local_expert_mapping
             and TopKOutputChecker.format_is_standard(topk_output)
+            and self.local_expert_mapping is None
         ):
-            if self.local_expert_mapping is None:
-                device = get_device()
-                self.local_expert_mapping = torch.full(
-                    (self.num_experts,), -1, dtype=torch.int32, device=device
-                )
-                self.local_expert_mapping[
-                    self.moe_ep_rank * self.num_local_routed_experts : (
-                        self.moe_ep_rank + 1
-                    )
-                    * self.num_local_routed_experts
-                ] = torch.arange(
-                    0, self.num_local_routed_experts, dtype=torch.int32, device=device
-                )
-
-                if self.num_local_shared_experts > 0:
-                    self.local_expert_mapping[-self.num_local_shared_experts :] = (
-                        torch.arange(
-                            self.num_local_routed_experts,
-                            self.num_local_routed_experts
-                            + self.num_local_shared_experts,
-                            dtype=torch.int32,
-                            device="cpu",
-                        )
-                    )
+            self.local_expert_mapping = self._build_local_expert_mapping()
 
         if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
             if self.use_aiter_moe_runner and self.expert_mask_gpu is None:
