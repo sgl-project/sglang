@@ -119,12 +119,19 @@ def _mooncake_supports_egm_store_pool(store_cls) -> bool:
 
 
 def _current_gpu_host_numa_node() -> Optional[int]:
-    from cuda.bindings import driver
+    # Only a hint for the default egm_numa_nodes: the caller falls back to
+    # Mooncake's "auto" on None, so a missing cuda-bindings package, a driver
+    # too old to know the attribute, or a failed query must not abort setup.
+    try:
+        from cuda.bindings import driver
 
-    err, node = driver.cuDeviceGetAttribute(
-        driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID,
-        torch.cuda.current_device(),
-    )
+        err, node = driver.cuDeviceGetAttribute(
+            driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID,
+            torch.cuda.current_device(),
+        )
+    except Exception as e:
+        logger.debug("Host NUMA probe of the current GPU failed: %r", e)
+        return None
     if err != driver.CUresult.CUDA_SUCCESS or node < 0:
         return None
     return node
