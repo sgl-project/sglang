@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -219,6 +220,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
+        *,
+        accumulator_factory: Callable[[ExpertLocationMetadata, int], _Accumulator]
+        | None = None,
     ):
         self._expert_location_metadata = expert_location_metadata
 
@@ -228,7 +232,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
+        create_accumulator = accumulator_factory or _Accumulator.init_new
+        self._accumulator = create_accumulator(expert_location_metadata, rank)
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
@@ -427,10 +432,15 @@ class _SinglePassGatherer(ABC):
         if get_exec().moe.moe_a2a_backend == "mori":
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
-        if get_exec().moe.expert_distribution_recorder_mode == "stat_approx":
-            if get_exec().moe.moe_a2a_backend != "none" and (
-                get_exec().moe.deepep_mode == "normal"
+        moe = get_exec().moe
+        if moe.expert_distribution_recorder_mode == "stat_approx":
+            # Async Ascend scores source locality, so count at TopK before
+            # dispatch. DeepEP receive counts no longer identify the source.
+            if moe.moe_a2a_backend in ("ascend_ops", "ascend_fuseep") or (
+                moe.moe_a2a_backend == "deepep" and moe.eplb_async_rebalance
             ):
+                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
+            if moe.moe_a2a_backend != "none" and moe.deepep_mode == "normal":
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
@@ -1008,12 +1018,17 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
 
-    def dump(self, output_mode: _OutputMode):
-        logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
-            self._global_physical_count_of_buffered_step.get_all(),
+    def _logical_counts(self, physical_counts: torch.Tensor) -> torch.Tensor:
+        return _convert_global_physical_count_to_logical_count(
+            physical_counts,
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+        )
+
+    def dump(self, output_mode: _OutputMode):
+        logical_count_of_buffered_step = self._logical_counts(
+            self._global_physical_count_of_buffered_step.get_all()
         )
 
         if self._first_dump:

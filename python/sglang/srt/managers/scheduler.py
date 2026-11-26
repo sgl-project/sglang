@@ -2254,6 +2254,13 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        should_process_early = self.should_process_last_batch_early
+        if _is_npu and get_exec().moe.eplb_async_rebalance:
+            from sglang.srt.hardware_backend.npu.eplb.manager import (
+                make_prefill_release_policy,
+            )
+
+            should_process_early = make_prefill_release_policy(self)
         self.enable_skip_finishing_decode = True
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
@@ -2275,9 +2282,7 @@ class Scheduler(
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
-            process_last_batch_early = self.should_process_last_batch_early(
-                self.last_batch
-            )
+            process_last_batch_early = should_process_early(self.last_batch)
             if process_last_batch_early:
                 pop_and_process()
                 # Opportunistic flush at the early-processing sync boundary:
@@ -7002,6 +7007,10 @@ class Scheduler(
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         action = recv_req.action
+        if _is_npu and get_exec().moe.eplb_async_rebalance:
+            # Manual dumps and resets run on the scheduler stream; counts and
+            # routing updates from the last forward must be visible here.
+            self.wait_for_launched_forward()
         if action == ExpertDistributionReqType.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
         elif action == ExpertDistributionReqType.STOP_RECORD:
@@ -7265,6 +7274,16 @@ def run_scheduler_process(
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
+        if (
+            scheduler.gracefully_exit
+            and _is_npu
+            and get_exec().moe.eplb_async_rebalance
+        ):
+            # Joining the EPLB worker is collective and must use live groups.
+            # An exception in the event loop skips this drain.
+            manager = scheduler.tp_worker.model_runner.eplb_manager
+            if manager is not None:
+                manager.close()
 
     except Exception:
         logger.error(f"Scheduler hit an exception: {traceback.format_exc()}")
@@ -7290,7 +7309,7 @@ def run_scheduler_process(
                 scheduler.async_d2h_worker = None
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
-            if scheduler.gracefully_exit:
+            if scheduler.gracefully_exit and not hit_exception:
                 scheduler.release_host_resources()
                 close_custom_all_reduce()
                 # Last: anything above may still need a working communicator.

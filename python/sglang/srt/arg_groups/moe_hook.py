@@ -357,6 +357,10 @@ def validate_ascend_ops_config(view: Any) -> dict:
         raise ValueError(
             f"Invalid --moe-ascend-ops-config for ascend_ops MoE backend: {exc}"
         ) from exc
+    if main_uses_ascend_ops and view.enable_eplb:
+        from sglang.srt.hardware_backend.npu.eplb.config import validate_ascend_ops_eplb
+
+        validate_ascend_ops_eplb(parsed_moe_ascend_ops_config)
     logger.info(
         "ascend_ops MoE backend enabled for main=%s, draft=%s with "
         "prefill=%s, decode=%s, low_latency comm_alg dispatch=%r combine=%r.",

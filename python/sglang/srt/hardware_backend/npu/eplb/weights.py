@@ -20,15 +20,17 @@ Import torch_npu only when an NPU operation actually needs it.
 
 from __future__ import annotations
 
+import hashlib
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 import torch
 import torch.distributed as dist
-
-from sglang.srt.eplb.expert_location import get_eplb_group
+from sglang.srt.hardware_backend.npu.eplb.transport import _validate_migration_topology
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+    from sglang.srt.hardware_backend.npu.eplb.coordinator import WeightWriteback
 
 # ACL format IDs, kept here so importing this module does not load torch_npu.
 _FORMAT_NCHW = 0
@@ -50,8 +52,7 @@ _SUPPORTED_NZ_FORMATS = (
 )
 # NZ expert weights retain the logical axes [experts, M, N].
 _NZ_EXPERT_WEIGHT_NDIM = 3
-# Per-peer warmup payload in bytes, independent of HCCL buffer capacity.
-_EPLB_WARMUP_BYTES_PER_PEER = 4 << 20
+_MAX_PACKED_FIELD_BYTES = 16 * 1024
 
 
 def migrate_expert_weights(
@@ -70,6 +71,8 @@ def migrate_expert_weights(
     )
     if not changed_layer_ids:
         return {}
+
+    from sglang.srt.eplb.expert_location import get_eplb_group
 
     group = get_eplb_group()
     world_size = dist.get_world_size(group)
@@ -103,22 +106,6 @@ def migrate_expert_weights(
         if missing_experts:
             missing_experts_by_layer[layer] = missing_experts
     return missing_experts_by_layer
-
-
-def _validate_migration_topology(group_size: int) -> None:
-    from sglang.srt.runtime_context import get_parallel
-
-    parallel = get_parallel()
-    world_size = dist.get_world_size()
-    # TP and WORLD must have the same members and rank numbering.
-    if parallel.pp_size != 1 or not (
-        parallel.tp_size == parallel.moe_ep_size == group_size == world_size
-    ):
-        raise ValueError(
-            "NPU EPLB requires PP=1 and TP size = EP size = EPLB group size = "
-            f"WORLD size; got PP={parallel.pp_size}, TP={parallel.tp_size}, "
-            f"EP={parallel.moe_ep_size}, EPLB group={group_size}, WORLD={world_size}."
-        )
 
 
 def _select_expert_weight_updates(
@@ -176,9 +163,13 @@ def _rank_may_send_experts(
 
 
 def _validate_migration_weights(
-    weights_by_layer: dict[int, list[torch.Tensor]], layer_ids: list[int], rank: int
-) -> list[_ExpertStorageLayout]:
-    """Validate the whole chunk once and return reusable per-weight layouts."""
+    weights_by_layer: dict[int, list[torch.Tensor]],
+    layer_ids: list[int],
+    rank: int,
+    *,
+    compute_format_digest: bool,
+) -> tuple[list[_ExpertStorageLayout], bytes | None]:
+    """Validate the chunk and optionally digest the wire format of each layer."""
     sample_layer = layer_ids[0]
     num_weights = len(weights_by_layer[sample_layer])
     if not num_weights:
@@ -186,6 +177,7 @@ def _validate_migration_weights(
             f"[NPU EPLB] rank={rank} layer={sample_layer}: no expert weights"
         )
     layouts = []
+    format_digest = hashlib.sha256() if compute_format_digest else None
     for layer_index, layer in enumerate(layer_ids):
         weights = weights_by_layer[layer]
         if len(weights) != num_weights:
@@ -193,9 +185,10 @@ def _validate_migration_weights(
                 f"[NPU EPLB] rank={rank} layer={layer}: expected {num_weights} "
                 f"weight tensors as in layer {sample_layer}, got {len(weights)}"
             )
+        layer_signature = []
         for weight_index, weight in enumerate(weights):
             try:
-                layout = _expert_storage_layout(weight)
+                layout, backing = _inspect_expert_storage(weight)
             except ValueError as error:
                 raise ValueError(
                     f"[NPU EPLB] rank={rank} layer={layer} "
@@ -209,7 +202,13 @@ def _validate_migration_weights(
                     f"weight_index={weight_index}: storage layout {layout} "
                     f"does not match layer {sample_layer}: {layouts[weight_index]}"
                 )
-    return layouts
+            if format_digest is not None:
+                layer_signature.append(
+                    _transfer_field_signature(weight, layout, backing)
+                )
+        if format_digest is not None:
+            format_digest.update(repr(tuple(layer_signature)).encode("ascii"))
+    return layouts, format_digest.digest() if format_digest is not None else None
 
 
 class _ExpertStorageLayout(NamedTuple):
@@ -235,10 +234,8 @@ class _ExpertStorageLayout(NamedTuple):
         return self.shape[0], self.storage_bytes // self.total_experts
 
 
-def _validated_full_storage_tensor(weight: torch.Tensor) -> torch.Tensor:
-    """Validate dense expert rows and recover the backing storage's metadata."""
-    import torch_npu
-
+def _validate_routed_expert_view(weight: torch.Tensor) -> None:
+    """Require a prefix of complete, densely stored expert rows."""
     if weight.numel() == 0 or weight.ndim == 0 or weight.storage_offset() != 0:
         raise ValueError("NPU EPLB requires a full expert tensor or its expert prefix.")
     # Expert rows must occupy independent contiguous blocks. Inner transposes
@@ -251,82 +248,96 @@ def _validated_full_storage_tensor(weight: torch.Tensor) -> torch.Tensor:
             expert_elements *= size
     if weight.stride(0) != expert_elements:
         raise ValueError("NPU EPLB requires an outermost, contiguous expert axis.")
-    # Recover allocation metadata without copying data. For ND, dtype views and
-    # reshapes can change the exported tensor's dtype and expert axis. NZ still
-    # needs the original expert axis to account for physical padding.
-    return torch_npu._C._tensor_construct_from_storage(weight.untyped_storage())
 
 
-def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
+def _inspect_expert_storage(
+    weight: torch.Tensor,
+) -> tuple[_ExpertStorageLayout, torch.Tensor]:
     """Check that raw storage can be split into equal, complete expert blocks."""
     import torch_npu
 
-    full_storage_tensor = _validated_full_storage_tensor(weight)
-    storage_elements = torch_npu.get_storage_size(full_storage_tensor)
-    npu_format = torch_npu.get_npu_format(full_storage_tensor)
+    _validate_routed_expert_view(weight)
+    # Recover the allocation descriptor without copying. The routed view can
+    # differ from it in shape or dtype.
+    backing = torch_npu._C._tensor_construct_from_storage(weight.untyped_storage())
+    physical_elements = torch_npu.get_storage_size(backing)
+    npu_format = torch_npu.get_npu_format(backing)
+    is_base_format = npu_format in _BASE_FORMATS
     # Check the actual storage format: requesting NZ (29) can produce a C0
     # variant, such as 50 for packed FP4. Expert-block checks below still apply.
-    if npu_format not in _BASE_FORMATS and npu_format not in _SUPPORTED_NZ_FORMATS:
+    if not is_base_format and npu_format not in _SUPPORTED_NZ_FORMATS:
         raise ValueError(f"NPU EPLB does not support storage format {npu_format}.")
     # The byte view must stay within the original allocation, including NZ padding.
-    storage_bytes = storage_elements * full_storage_tensor.element_size()
-    allocated_bytes = full_storage_tensor.untyped_storage().nbytes()
+    physical_bytes = physical_elements * backing.element_size()
+    allocated_bytes = backing.untyped_storage().nbytes()
+    logical_elements = backing.numel()
     if (
-        storage_elements <= 0
-        or storage_elements < full_storage_tensor.numel()
-        or storage_bytes > allocated_bytes
+        physical_elements <= 0
+        or physical_elements < logical_elements
+        or physical_bytes > allocated_bytes
     ):
         raise ValueError(
-            f"NPU EPLB has invalid storage capacity: {storage_elements} elements "
-            f"for shape {tuple(full_storage_tensor.shape)} and "
+            f"NPU EPLB has invalid storage capacity: {physical_elements} elements "
+            f"for shape {tuple(backing.shape)} and "
             f"{allocated_bytes} allocated bytes."
         )
-    if npu_format in _BASE_FORMATS:
-        if storage_elements != full_storage_tensor.numel():
+    if is_base_format:
+        if physical_elements != logical_elements:
             raise ValueError("NPU EPLB requires base-format storage without padding.")
         # ND packing/reshaping may retain a different allocation dtype or shape.
         # Derive expert boundaries from the exported tensor, in bytes.
         bytes_per_expert = weight.stride(0) * weight.element_size()
-        if storage_bytes % bytes_per_expert:
+        if physical_bytes % bytes_per_expert:
             raise ValueError("NPU EPLB requires complete expert blocks in ND storage.")
-        total_experts = storage_bytes // bytes_per_expert
+        total_experts = physical_bytes // bytes_per_expert
     else:
-        total_experts = _validate_nz_expert_blocks(
-            weight, full_storage_tensor, storage_elements
-        )
+        total_experts = _validate_nz_expert_blocks(weight, backing, physical_elements)
     if weight.shape[0] > total_experts:
         raise ValueError("NPU EPLB expert prefix exceeds the backing storage.")
-    return _ExpertStorageLayout(
+    layout = _ExpertStorageLayout(
         shape=tuple(weight.shape),
         dtype=weight.dtype,
         device=weight.device,
         total_experts=total_experts,
-        storage_bytes=storage_bytes,
+        storage_bytes=physical_bytes,
         npu_format=npu_format,
-        needs_storage_alias=(
-            npu_format not in _BASE_FORMATS or not weight.is_contiguous()
-        ),
+        needs_storage_alias=not is_base_format or not weight.is_contiguous(),
+    )
+    return layout, backing
+
+
+def _transfer_field_signature(
+    weight: torch.Tensor, layout: _ExpertStorageLayout, backing: torch.Tensor
+) -> tuple:
+    """Describe how a rank interprets an expert's bytes, independent of device ID."""
+    nz_backing_row = None
+    if layout.npu_format not in _BASE_FORMATS:
+        nz_backing_row = (backing.dtype, tuple(backing.shape[1:]))
+    return (
+        layout.shape,
+        weight.stride(),
+        layout.dtype,
+        layout.npu_format,
+        layout.expert_byte_shape,
+        nz_backing_row,
     )
 
 
 def _validate_nz_expert_blocks(
-    weight: torch.Tensor, full_storage_tensor: torch.Tensor, storage_elements: int
+    weight: torch.Tensor, backing: torch.Tensor, physical_elements: int
 ) -> int:
     """Validate NZ expert boundaries and return the full storage's expert count."""
-    if (
-        full_storage_tensor.ndim != _NZ_EXPERT_WEIGHT_NDIM
-        or weight.ndim != _NZ_EXPERT_WEIGHT_NDIM
-    ):
+    if backing.ndim != _NZ_EXPERT_WEIGHT_NDIM or weight.ndim != _NZ_EXPERT_WEIGHT_NDIM:
         raise ValueError("NPU EPLB requires 3D batched NZ expert weights.")
+    elements_per_expert = weight.stride(0)
+    total_experts = backing.shape[0]
     if (
-        weight.element_size() != full_storage_tensor.element_size()
-        or weight.stride(0) != full_storage_tensor.stride(0)
-        or full_storage_tensor.numel()
-        != full_storage_tensor.shape[0] * weight.stride(0)
+        weight.element_size() != backing.element_size()
+        or elements_per_expert != backing.stride(0)
+        or backing.numel() != total_experts * elements_per_expert
     ):
         raise ValueError("NPU EPLB requires the original NZ expert blocks.")
-    total_experts = full_storage_tensor.shape[0]
-    if total_experts <= 0 or storage_elements % total_experts:
+    if total_experts <= 0 or physical_elements % total_experts:
         raise ValueError("NPU EPLB requires equal physical NZ expert blocks.")
     return total_experts
 
@@ -335,8 +346,9 @@ def _expert_storage_view(
     weight: torch.Tensor, layout: _ExpertStorageLayout
 ) -> torch.Tensor:
     """Return a writable byte alias, preserving the original tensor's descriptor."""
+    byte_shape = layout.expert_byte_shape
     if not layout.needs_storage_alias:
-        return weight.view(torch.uint8).view(layout.expert_byte_shape)
+        return weight.view(torch.uint8).view(byte_shape)
 
     import torch_npu
 
@@ -347,11 +359,11 @@ def _expert_storage_view(
         weight.device,
         layout.storage_bytes,
     )
-    _, bytes_per_expert = layout.expert_byte_shape
+    _, bytes_per_expert = byte_shape
     view = torch_npu._C._construct_NPU_Tensor_From_Storage_And_Metadata(
         {
             "dtype": torch.uint8,
-            "size": layout.expert_byte_shape,
+            "size": byte_shape,
             "stride": (bytes_per_expert, 1),
             "storage_offset": 0,
             "npu_format": _FORMAT_ND,
@@ -372,8 +384,8 @@ class _ExpertWeightAdapter:
     original weight. Independent ND descriptors preserve NZ padding and packed
     values. Only routed expert rows are exposed; shared experts retain their
     original storage.
-    The updater stages sources before overwriting any destination, so no full
-    weight snapshot or separate writeback is needed.
+    The same one-layer scratch buffers can stage sources before writeback for
+    each layer in the chunk.
     """
 
     def __init__(
@@ -381,8 +393,15 @@ class _ExpertWeightAdapter:
         weights_by_layer: dict[int, list[torch.Tensor]],
         layer_ids: list[int],
         rank: int,
+        *,
+        compute_format_digest: bool = False,
     ):
-        self._layouts = _validate_migration_weights(weights_by_layer, layer_ids, rank)
+        self._layouts, self.weight_format_digest = _validate_migration_weights(
+            weights_by_layer,
+            layer_ids,
+            rank,
+            compute_format_digest=compute_format_digest,
+        )
 
     def create_temp_buffers(self) -> list[torch.Tensor]:
         return [
@@ -402,31 +421,102 @@ class _ExpertWeightAdapter:
         ]
 
 
-def prewarm_eplb_communication() -> None:
-    """Warm TP transports for enabled, non-elastic NPU EPLB before KV sizing."""
-    from sglang.srt.runtime_context import get_parallel
+@dataclass(frozen=True)
+class _PackedExpertFields:
+    """Send narrow fields together and expose their original views for writeback."""
 
-    parallel = get_parallel()
-    tp = parallel.tp_group
-    group = tp.device_group
-    _validate_migration_topology(dist.get_world_size(group))
-    if tp.world_size == 1:
-        return
-    send = torch.empty(_EPLB_WARMUP_BYTES_PER_PEER, dtype=torch.uint8, device="npu")
-    recv = torch.empty(
-        (tp.world_size - 1, send.numel()), dtype=send.dtype, device=send.device
-    )
-    ops = []
-    for slot, peer in enumerate(p for p in tp.ranks if p != tp.rank):
-        ops.extend(
-            [
-                dist.P2POp(dist.isend, send, peer, group=group),
-                dist.P2POp(dist.irecv, recv[slot], peer, group=group),
-            ]
+    packed_indices: tuple[int, ...]
+    direct_indices: tuple[int, ...]
+    send_buffer: torch.Tensor
+    receive_buffers: list[torch.Tensor]
+
+    @classmethod
+    def create(cls, staging: list[torch.Tensor]) -> _PackedExpertFields | None:
+        # The weight adapter exposes contiguous [expert, bytes] tensors.
+        packed_indices = tuple(
+            i
+            for i, field in enumerate(staging)
+            if 0 < field.size(1) <= _MAX_PACKED_FIELD_BYTES
         )
-    for work in dist.batch_isend_irecv(ops):
-        work.wait()
-    dist.all_reduce(send.view(torch.int32), group=group)
-    torch.npu.synchronize()
-    del ops, send, recv
-    torch.npu.empty_cache()
+        if len(packed_indices) < 2:
+            return None
+        direct_indices = tuple(
+            i for i in range(len(staging)) if i not in packed_indices
+        )
+        widths = [staging[i].size(1) for i in packed_indices]
+        receive_buffer = staging[0].new_empty((staging[0].size(0), sum(widths)))
+        for i, view in zip(
+            packed_indices, receive_buffer.split(widths, dim=1), strict=True
+        ):
+            staging[i] = view
+        return cls(
+            packed_indices=packed_indices,
+            direct_indices=direct_indices,
+            send_buffer=torch.empty_like(receive_buffer),
+            receive_buffers=[staging[i] for i in direct_indices] + [receive_buffer],
+        )
+
+    def pack(self, weights: list[torch.Tensor]) -> None:
+        torch.cat(
+            [weights[i] for i in self.packed_indices], dim=1, out=self.send_buffer
+        )
+
+    def pack_for_local_copies(
+        self,
+        weights: list[torch.Tensor],
+        old_local_layout: list[int],
+        new_local_layout: list[int],
+    ) -> bool:
+        """Pack early if the updater will copy a resident expert before P2P."""
+        resident_experts = set(old_local_layout)
+        if any(
+            old != new and new in resident_experts
+            for old, new in zip(old_local_layout, new_local_layout, strict=True)
+        ):
+            self.pack(weights)
+            return True
+        return False
+
+
+def _make_weight_writeback(weights, buffers, rows) -> WeightWriteback:
+    # The NPU adapter exposes dense byte rows. Merge adjacent copies only
+    # when they are contiguous in both the staging and live storage.
+    ranges = []
+    for source, destination in rows:
+        if ranges:
+            prev_source, prev_dest, length = ranges[-1]
+            if source == prev_source + length and destination == prev_dest + length:
+                ranges[-1] = (prev_source, prev_dest, length + 1)
+                continue
+        ranges.append((source, destination, 1))
+
+    # Slice on the staging worker. The forward thread only submits the copies.
+    copies = [
+        (
+            weight[destination : destination + length],
+            buffer[source : source + length],
+        )
+        for source, destination, length in ranges
+        for weight, buffer in zip(weights, buffers, strict=True)
+    ]
+
+    # Batched copy helps fragmented writeback. Reused staging rows can be
+    # faster as separate copies, especially when each row is large.
+    if (
+        len(ranges) >= 8
+        and weights[0].device.type == "npu"
+        and hasattr(torch, "_foreach_copy_")
+        and len({source for source, _ in rows}) == len(rows)
+    ):
+        destinations, sources = zip(*copies, strict=True)
+
+        def batch_writeback():
+            torch._foreach_copy_(destinations, sources, non_blocking=True)
+
+        return batch_writeback
+
+    def writeback():
+        for destination, source in copies:
+            destination.copy_(source)
+
+    return writeback
