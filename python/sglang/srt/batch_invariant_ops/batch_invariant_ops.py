@@ -567,6 +567,16 @@ def matmul_persistent(
     return _matmul_persistent_triton(a=a, b=b, bias=bias, out_dtype=out_dtype)
 
 
+def _row_launch_config(n_cols: int) -> Tuple[int, int]:
+    """BLOCK_SIZE and num_warps for the one-program-per-row kernels.
+
+    Depends only on n_cols, never on the number of rows, so a row's result does
+    not depend on the batch it is in.
+    """
+    block_size = min(triton.next_power_of_2(n_cols), 8192)
+    return block_size, max(1, min(16, block_size // 512))
+
+
 @triton.jit
 def _log_softmax_kernel(
     input_ptr,
@@ -587,45 +597,26 @@ def _log_softmax_kernel(
     row_start_ptr = input_ptr + row_idx * input_row_stride
     output_row_start_ptr = output_ptr + row_idx * output_row_stride
 
-    # Step 1: Find maximum value in the row for numerical stability
-    # Load first block to infer dtype and initialize max_val with correct type
-    col_idx_init = tl.arange(0, BLOCK_SIZE)
-    mask_init = col_idx_init < n_cols
-    vals_init = tl.load(
-        row_start_ptr + col_idx_init, mask=mask_init, other=-float("inf")
-    )
-    max_val = tl.max(vals_init)
-
-    # Continue with remaining blocks
-    for col_offset in range(BLOCK_SIZE, n_cols, BLOCK_SIZE):
-        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
-        mask = col_idx < n_cols
-
-        # Load values
-        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=-float("inf"))
-
-        # Update maximum
-        max_val = tl.max(tl.maximum(vals, max_val))
-
-    # Step 2: Compute sum of exp(x - max_val)
-    # Initialize sum_exp with correct dtype by using tl.sum on a zero vector
-    sum_exp = tl.sum(tl.zeros([1], dtype=max_val.dtype))
-
+    # Step 1: one pass for the max and the sum of exp(x - max). Each lane keeps a
+    # running max and a running sum rescaled to it; the lanes are combined once
+    # after the loop, so the order depends only on n_cols and BLOCK_SIZE.
+    # The running max starts at the lowest finite float, not -inf, so a lane that
+    # has seen only -inf (masked logits) adds exp(-inf) = 0, never exp(-inf - -inf).
+    max_vec = tl.full([BLOCK_SIZE], -3.4028234663852886e38, dtype=tl.float32)
+    sum_vec = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     for col_offset in range(0, n_cols, BLOCK_SIZE):
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols
+        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=-float("inf")).to(
+            tl.float32
+        )
+        new_max = tl.maximum(max_vec, vals)
+        sum_vec = sum_vec * tl.exp(max_vec - new_max) + tl.exp(vals - new_max)
+        max_vec = new_max
+    max_val = tl.max(max_vec)
+    log_sum_exp = tl.log(tl.sum(sum_vec * tl.exp(max_vec - max_val)))
 
-        # Load values
-        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
-
-        # Compute exp(x - max_val) and accumulate
-        exp_vals = tl.exp(vals - max_val)
-        sum_exp += tl.sum(tl.where(mask, exp_vals, 0.0))
-
-    # Compute log(sum_exp)
-    log_sum_exp = tl.log(sum_exp)
-
-    # Step 3: Compute final log_softmax values: x - max_val - log_sum_exp
+    # Step 2: Compute final log_softmax values: x - max_val - log_sum_exp
     for col_offset in range(0, n_cols, BLOCK_SIZE):
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols
@@ -666,8 +657,7 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     # Allocate output tensor
     output = torch.empty_like(input_2d)
 
-    # Choose block size based on the number of columns
-    BLOCK_SIZE = 1024
+    BLOCK_SIZE, num_warps = _row_launch_config(n_cols)
 
     # Launch kernel with one block per row
     grid = (n_rows,)
@@ -678,6 +668,7 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
         output.stride(0),
         n_cols,
         BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
     )
     # Reshape output back to original shape
     return output.reshape(original_shape)
@@ -1160,7 +1151,7 @@ def rms_norm(
     n_rows, n_cols = input_2d.shape
 
     output = torch.empty_like(input_2d)
-    BLOCK_SIZE = 1024
+    BLOCK_SIZE, num_warps = _row_launch_config(n_cols)
     grid = (n_rows,)
     _rms_norm_kernel[grid](
         input_2d,
@@ -1171,6 +1162,7 @@ def rms_norm(
         n_cols,
         eps,
         BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
     )
     return output.reshape(original_shape)
 
@@ -1316,7 +1308,7 @@ def fused_add_rms_norm_batch_invariant(
     n_rows, n_cols = input_2d.shape
     output = torch.empty_like(input_2d, dtype=out_dtype or input.dtype)
     residual_out = torch.empty_like(input_2d, dtype=residual_dtype or input.dtype)
-    BLOCK_SIZE = 1024
+    BLOCK_SIZE, num_warps = _row_launch_config(n_cols)
     grid = (n_rows,)
     _fused_add_rms_norm_kernel[grid](
         input_2d,
@@ -1334,6 +1326,7 @@ def fused_add_rms_norm_batch_invariant(
         eps,
         HAS_ADDEND=addend is not None,
         BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
     )
     return output.reshape(original_shape), residual_out.reshape(original_shape)
 
