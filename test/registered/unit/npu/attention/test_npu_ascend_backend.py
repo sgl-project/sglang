@@ -13,6 +13,7 @@ import torch
 # accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.
 import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=5, suite="extra-a-test-npu")
 
@@ -562,7 +563,7 @@ class TestGenerateAlibiBias(unittest.TestCase):
         self.assertEqual(result.dtype, torch.bfloat16)
 
 
-class TestMlaPrefixCacheDcp(unittest.TestCase):
+class TestMlaPrefixCacheDcp(CustomTestCase):
     def test_fp8_prefix_dequantized_before_projection_or_dcp_gather(self):
         from sglang.srt.hardware_backend.npu.attention.mla_cache import (
             build_mla_prefix_token_indices,
@@ -833,7 +834,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
                                 )
 
 
-class TestMlaPrefixFia(unittest.TestCase):
+class TestMlaPrefixFia(CustomTestCase):
     @staticmethod
     def _fia_reference(**kwargs):
         q, k, v = (kwargs[name] for name in ("query", "key", "value"))
