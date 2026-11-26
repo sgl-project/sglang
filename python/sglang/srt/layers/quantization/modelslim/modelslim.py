@@ -187,6 +187,7 @@ class ModelSlimConfig(QuantizationConfig):
     # Hardcoded compatibility for models missing an MLA fusion declaration.
     _HARDCODED_PACKED_MODULES = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "wqkv_a": ["wq_a", "wkv"],
     }
     # Legacy vision aliases: runtime path fragment -> checkpoint path fragment.
     # Apply only within the matching vision scope and when the description exists.
@@ -293,10 +294,6 @@ class ModelSlimConfig(QuantizationConfig):
         if scheme_class is None:
             raise ValueError(f"Unsupported ModelSlim KV quant_type: {quant_type!r}")
         return scheme_class
-
-    def supports_fused_projection(self, prefix: str) -> bool:
-        # Separately exported projections have independent quantization scales.
-        return f"{prefix}.weight" in self.quant_description
 
     def get_engram_table_dtype(
         self, layer_id: int, num_embeddings: int, dim: int, default: torch.dtype
@@ -842,6 +839,16 @@ class ModelSlimConfig(QuantizationConfig):
         quant_prefixes = self._resolve_linear_quant_prefixes(
             prefix, output_sizes=getattr(layer, "output_sizes", None)
         )
+        if (
+            prefix.endswith(".wqkv_a")
+            and len(quant_prefixes) > 1
+            and self.quant_description[quant_prefixes[0] + ".weight"] != "FLOAT"
+        ):
+            # The target loader joins weight rows, not ModelSlim scales/offsets.
+            raise ValueError(
+                f"Cannot fuse separately quantized ModelSlim projections for {prefix}. "
+                "Set SGLANG_OPT_FUSE_WQA_WKV=0 or use a pre-fused checkpoint."
+            )
         prefix = quant_prefixes[
             0
         ]  # All components were checked to use the same scheme.

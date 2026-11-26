@@ -302,10 +302,6 @@ class QuantizationConfig(ABC):
             UnquantizedLinearMethod,
         )
 
-    def supports_fused_projection(self, prefix: str) -> bool:
-        """Whether a model may construct its fused projection for these weights."""
-        return True
-
     @abstractmethod
     def get_scaled_act_names(self) -> List[str]:
         """Returns the activation function names that should be post-scaled.

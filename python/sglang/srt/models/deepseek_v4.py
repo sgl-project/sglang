@@ -1076,8 +1076,6 @@ class MqaAttentionBase(nn.Module):
         fuse: bool = (
             envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
         )
-        if fuse and quant_config is not None:
-            fuse = quant_config.supports_fused_projection(add_prefix("wqkv_a", prefix))
         fp8: bool = (
             wo_a_fp8_gemm_enabled(quant_config) if wo_a_fp8 is None else wo_a_fp8
         )
@@ -5553,6 +5551,7 @@ class DeepseekV4ForCausalLM(
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
+        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
         skipped_by_group: dict[str, int] = {}
         # V4 checkpoints must load every compressor / indexer tensor.
@@ -5787,12 +5786,9 @@ class DeepseekV4ForCausalLM(
                                     loaded_params.add(param_name)
                                     cache_compressor_weight.pop(key)
                             elif (
-                                ".compressor." not in name
+                                fuse_wqa_wkv
+                                and ".compressor." not in name
                                 and ".engram." not in name
-                                and name.replace(".wq_a.", ".wqkv_a.").replace(
-                                    ".wkv.", ".wqkv_a."
-                                )
-                                in params_dict
                                 and (
                                     name.endswith(".wq_a.weight")
                                     or name.endswith(".wq_a.weight_scale_inv")

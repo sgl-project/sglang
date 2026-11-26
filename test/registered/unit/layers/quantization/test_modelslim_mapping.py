@@ -84,19 +84,19 @@ class TestModelSlimMapping(CustomTestCase):
             self.assertNotIn(target, other.quant_description)
             self.assertIn(target, ModelSlimConfig.from_config(desc).quant_description)
 
-    def make_linear(self, config, prefix):
-        """Build a small CPU layer: input width 4, output width 6."""
+    def make_linear(self, config, prefix, output_size=6):
+        """Build a small CPU layer with input width 4."""
         with torch.device("cpu"):
             return ReplicatedLinear(
                 4,
-                6,
+                output_size,
                 bias=False,
                 params_dtype=torch.bfloat16,
                 quant_config=config,
                 prefix=prefix,
             )
 
-    def test_engram_table_and_projection_follow_checkpoint_entries(self):
+    def test_engram_table_follows_its_own_checkpoint_entry(self):
         table = {
             "format": "int8_sym",
             "weight_dtype": "I8",
@@ -112,13 +112,10 @@ class TestModelSlimMapping(CustomTestCase):
         for scheme in ("W4A8_DYNAMIC", "W8A8_DYNAMIC"):
             cfg = ModelSlimConfig(
                 {
-                    "x.wqkv_a.weight": scheme,
-                    "y.wq_a.weight": scheme,
+                    "model.layers.0.mlp.experts.0.gate_proj.weight": scheme,
                     "optional": {"embedding_storage": {"modules": modules}},
                 }
             )
-            self.assertTrue(cfg.supports_fused_projection("x.wqkv_a"))
-            self.assertFalse(cfg.supports_fused_projection("y.wqkv_a"))
             native = torch.float8_e4m3fn
             with patch(
                 "sglang.srt.layers.quantization.modelslim.modelslim.is_npu",
@@ -132,6 +129,73 @@ class TestModelSlimMapping(CustomTestCase):
                     cfg.get_engram_table_dtype(1, 8, 96, native)
                 with self.assertRaisesRegex(ValueError, "MXFP4"):
                     cfg.get_engram_table_dtype(1, 8, 64, torch.uint8)
+
+    def test_split_int8_wqkv_requires_separate_projections(self):
+        prefix = "model.layers.0.self_attn."
+
+        def desc(parts):
+            return ModelSlimConfig(
+                {
+                    prefix + part + field: "W8A8_DYNAMIC"
+                    for part in parts
+                    for field in (".weight", ".weight_scale")
+                }
+            )
+
+        split = desc(("wq_a", "wkv"))
+        for part in ("wq_a", "wkv"):
+            self.assertEqual(
+                self.make_linear(split, prefix + part).weight.dtype, torch.int8
+            )
+        with self.assertRaisesRegex(ValueError, "SGLANG_OPT_FUSE_WQA_WKV=0"):
+            self.make_linear(split, prefix + "wqkv_a")
+        self.assertEqual(
+            self.make_linear(desc(("wqkv_a",)), prefix + "wqkv_a").weight_scale.shape,
+            (6, 1),
+        )
+
+    def test_v4_loads_split_float_weights_with_fusion_on_and_off(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        # The 1017 W8A8 export has FLOAT attention inputs despite its INT8 experts.
+        q, kv = torch.arange(24, dtype=torch.bfloat16).view(6, 4).split((2, 4))
+        source = [("layers.0.attn.wkv.weight", kv), ("layers.0.attn.wq_a.weight", q)]
+        x = torch.eye(4, dtype=q.dtype)
+        prefix = "model.layers.0.self_attn."
+        cfg = ModelSlimConfig(
+            {prefix + part + ".weight": "FLOAT" for part in ("wq_a", "wkv")}
+        )
+        for fused in (False, True):
+            parts = {"wqkv_a": 6} if fused else {"wq_a": 2, "wkv": 4}
+            weights = {
+                part: self.make_linear(cfg, prefix + part, rows).weight
+                for part, rows in parts.items()
+            }
+            model = SimpleNamespace(
+                named_parameters=lambda: [
+                    (prefix + p + ".weight", w) for p, w in weights.items()
+                ],
+                config=SimpleNamespace(num_hidden_layers=1, n_routed_experts=0),
+                model=SimpleNamespace(layers=[]),
+                pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+                quant_config=cfg,
+                wo_a_fp8=False,
+                use_npu_arch35_mxfp8_wo_a=False,
+                num_fused_shared_experts=0,
+                remap_weight_name_to_dpsk_hf_format=DeepseekV4ForCausalLM.remap_weight_name_to_dpsk_hf_format,
+                post_load_weights=lambda **_: None,
+                _prewarm_mhc_kernels=lambda: None,
+            )
+            with (
+                self.subTest(fused=fused),
+                envs.SGLANG_OPT_FUSE_WQA_WKV.override(fused),
+            ):
+                DeepseekV4ForCausalLM.load_weights(model, source)
+                actual = torch.cat([x @ w.T for w in weights.values()], dim=-1)
+                torch.testing.assert_close(
+                    actual, torch.cat((x @ q.T, x @ kv.T), dim=-1)
+                )
 
     def test_engram_gate_basis_comes_from_weight_snapshot(self):
         from safetensors.torch import save_file
