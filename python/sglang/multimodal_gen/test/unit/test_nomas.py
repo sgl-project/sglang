@@ -276,6 +276,41 @@ def condition(device="cpu", dtype=torch.float32, padded=True):
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires CUDA graph capture",
+)
+@torch.inference_mode()
+def test_offline_graph_replays_with_current_action_mask():
+    from functools import partial
+
+    from msgspec.structs import replace
+
+    model = tiny_model("cuda", "flex").bfloat16()
+    runner = model.offline_graph(warmup=True)
+    results = []
+    shape = (2, 2, 2)
+    for index, padded in enumerate((True, False, True)):
+        event = condition("cuda", torch.bfloat16, padded)
+        event = replace(event, camera_embedding=None, camera_has_mask=None)
+
+        def generate(graph_predict=None):
+            session = NomasLatentSession(model, cache_capacity=0, seed=11, steps=2)
+            return session.generate_segment(
+                shape, event, cache_segment=False, graph_predict=graph_predict
+            )
+
+        expected = generate()
+        result = generate(partial(runner.predict, warmup=index == 0))
+        assert len(runner.entries) == 1
+        assert torch.equal(result, expected)
+        results.append(result)
+    assert torch.equal(results[0], results[2])
+    assert not torch.equal(results[0], results[1])
+    model.release_cuda_graphs()
+    assert not runner.entries and model.offline_graph(warmup=False) is None
+
+
 def tiny_decoder():
     torch.manual_seed(5)
     arch = NomasVAEArchConfig(
@@ -1161,6 +1196,56 @@ def test_latent_preparation_preserves_offline_noise_and_skips_online_draw(online
         expected = LatentPreparationStage(scheduler, None).forward(request(), args)
         torch.testing.assert_close(result.latents, expected.latents, atol=0, rtol=0)
         assert torch.equal(result.generator.get_state(), expected.generator.get_state())
+
+
+def test_offline_request_with_several_outputs_runs_one_sample_per_output():
+    from sglang.multimodal_gen.configs.sample.nomas import NomasSamplingParams
+    from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
+        SyncExecutor,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.stages import (
+        NomasInputValidationStage,
+        NomasLatentPreparationStage,
+    )
+
+    args = SimpleNamespace(
+        pipeline_config=NomasPipelineConfig(), enable_cfg_parallel=False
+    )
+    stages = [
+        object.__new__(NomasInputValidationStage),
+        NomasLatentPreparationStage(FlowMatchEulerDiscreteScheduler(shift=5.0), None),
+    ]
+    executor = object.__new__(SyncExecutor)
+    executor.execute_group = lambda stages, batches, server_args: [
+        stages[0].forward(batch, server_args) for batch in batches
+    ]
+    executor.execute = lambda stages, batch, server_args: stages[0].forward(
+        batch, server_args
+    )
+
+    def run(num_outputs):
+        batch = Req(
+            sampling_params=NomasSamplingParams(
+                request_id="job",
+                prompt="road",
+                num_frames=17,
+                height=64,
+                width=64,
+                seed=42,
+                num_outputs_per_prompt=num_outputs,
+            )
+        )
+        batch.prompt_embeds = [torch.zeros(1, 8, 128)]
+        return list(executor.execute_group_sequentially(stages, [batch], args))
+
+    (single,) = run(1)
+    outputs = run(2)
+    assert [getattr(out, "error", None) for out in outputs] == [None, None]
+    assert [out.seed for out in outputs] == [42, 43]
+    assert [out.latents.shape for out in outputs] == [(1, 32, 5, 2, 2)] * 2
+    torch.testing.assert_close(outputs[0].latents, single.latents, atol=0, rtol=0)
+    assert not torch.equal(outputs[0].latents, outputs[1].latents)
 
 
 def _fp8_linear(in_features, out_features, device=None):

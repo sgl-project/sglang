@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_mlx_ci(est_time=5, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=5, suite="extra-unit-test-mlx")
 
 _HAS_MLX = (
     importlib.util.find_spec("mlx") is not None
@@ -81,7 +81,7 @@ def _runner(req_to_token_pool):
 class TestDecodeKvRelease(CustomTestCase):
     def _decoded_runner(self):
         req_to_token_pool = ReqToTokenPool(
-            size=2, max_context_len=64, device="cpu", enable_memory_saver=False
+            size=2, row_width=64, device="cpu", enable_memory_saver=False
         )
         row = req_to_token_pool.req_to_token[0]
         row[: len(OWN_SLOTS)] = torch.tensor(OWN_SLOTS)

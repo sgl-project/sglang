@@ -79,7 +79,7 @@ def deep_gemm_deep_select(q_fp4, q_sf, weights, kv_fp4, kv_sf, ks, ke, topk):
 @marker.parametrize("heads,topk,ratio", [(64, 1024, 4), (32, 512, 2)], [(64, 1024, 4)])
 @marker.parametrize("rows", [2048, 8192], [2048])
 @marker.parametrize("ctx", [262144, 1048576], [262144])
-@marker.benchmark("impl", ["ours", "deep_gemm_bf16+deep_select"])
+@marker.benchmark("impl", ["ours", "deep_gemm_bf16+deep_select"], gate=["ours"])
 def benchmark(heads, topk, ratio, rows, ctx, impl):
     if not is_fp4_indexer_supported():
         marker.skip("the fp4 prefill indexer needs SM100")

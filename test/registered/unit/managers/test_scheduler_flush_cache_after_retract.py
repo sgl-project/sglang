@@ -47,6 +47,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
+        object.__setattr__(scheduler.request_receiver, "input_blocker", None)
         scheduler.pause_state = PauseState()
         scheduler.pause_state.pause()
         scheduler.enable_overlap = False
@@ -87,6 +88,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.draft_worker = None
         scheduler.metrics_reporter = MagicMock()
         scheduler.invariant_checker = MagicMock()
+        scheduler.gc_freezer = MagicMock()
         return scheduler
 
     def test_flush_cache_succeeds_when_only_retracted_reqs_are_waiting(self):
@@ -95,6 +97,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
         self.assertTrue(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_called_once()
+        scheduler.gc_freezer.on_cache_reset.assert_called_once()
         scheduler.req_to_token_pool.clear.assert_called_once()
         scheduler.token_to_kv_pool_allocator.clear.assert_called_once()
 

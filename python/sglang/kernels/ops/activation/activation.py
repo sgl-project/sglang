@@ -63,12 +63,12 @@ def activation_module(dtype: torch.dtype, *, fast_math: bool) -> Module:
 
 @cache_once
 def _silu_rounding_table_supported(device_index: int) -> bool:
-    # measured on sm_10x, where the expf + divide made the kernel ALU-bound; the
-    # 128 KiB shared-memory table needs the opt-in carve-out
+    # measured on sm_90 and sm_10x, where the expf + divide made the kernel
+    # ALU-bound; the 128 KiB shared-memory table needs the opt-in carve-out
     props = torch.cuda.get_device_properties(device_index)
     return (
         torch.version.hip is None
-        and props.major == 10
+        and props.major in (9, 10)
         and props.shared_memory_per_block_optin >= (1 << 16) * 2
     )
 

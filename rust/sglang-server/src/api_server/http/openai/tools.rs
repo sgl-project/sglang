@@ -72,7 +72,7 @@ pub(super) fn chat_delta(
 /// the content passes through untouched. With a parser, a successful parse
 /// returns the leftover non-tool text and the calls; `parallel_tool_calls`
 /// false truncates the batch to the first call, mirroring Python.
-pub(super) async fn parse_chat_tool_calls(
+pub(crate) async fn parse_chat_tool_calls(
     content: String,
     parser: Option<&str>,
     tools: Option<&[ToolDefinition]>,
@@ -98,6 +98,7 @@ pub(super) async fn parse_chat_tool_calls(
                                 name: call.function.name,
                                 arguments: call.function.arguments,
                             },
+                            custom: None,
                         })
                         .collect(),
                 ),
@@ -110,7 +111,7 @@ pub(super) async fn parse_chat_tool_calls(
 /// Map the scheduler's finish kind onto the OpenAI wire values. Length and
 /// content-filter keep their names; everything else (including a bare abort)
 /// reports as `stop`, matching Python's fallback.
-pub(super) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReason> {
+pub(crate) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReason> {
     let kind = output
         .finish_reason
         .as_ref()
@@ -340,7 +341,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(text, "Before <|python_");
         assert_eq!(
-            choice(&items[1]).finish_reason,
+            choice(items.last().expect("terminal chunk")).finish_reason,
             Some(OpenAIFinishReason::Stop)
         );
     }
@@ -446,6 +447,7 @@ mod tests {
                     name: Some("get_weather".into()),
                     arguments: Some("{}".into()),
                 }),
+                custom: None,
             }]),
             Some("thinking".into()),
         );

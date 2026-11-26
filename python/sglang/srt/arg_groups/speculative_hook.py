@@ -174,7 +174,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if (
         cfg.disaggregation_mode == "decode"
         and cfg.disaggregation_decode_enable_radix_cache
-        and cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE", "EAGLE3")
+        and cfg.speculative_algorithm
+        not in (None, "DFLASH", "DSPARK", "EAGLE", "EAGLE3")
     ):
         raise ValueError(
             "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -326,9 +327,10 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=0."
             )
 
-    if cfg.pp_size != 1:
+    if cfg.pp_size != 1 and cfg.disaggregation_mode != "prefill":
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "DFLASH pipeline parallelism requires PD prefill; decode and "
+            "non-disaggregated serving require pp_size == 1."
         )
 
     if cfg.speculative_draft_model_path is None:
@@ -338,7 +340,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
-    # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
+    # RoPE reservation). Keep them at 1 to avoid surprising memory behavior.
     #
     # For DFlash, the natural unit is `block_size` (verify window length).
     if cfg.speculative_num_steps is None:
@@ -348,14 +350,9 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             speculative_num_steps=1,
         )
     elif int(cfg.speculative_num_steps) != 1:
-        logger.warning(
-            "DFLASH only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
-            cfg.speculative_num_steps,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_dflash",
-            speculative_num_steps=1,
+        raise ValueError(
+            "DFLASH only supports --speculative-num-steps 1, "
+            f"got {cfg.speculative_num_steps}."
         )
 
     if cfg.speculative_eagle_topk is None:
@@ -436,7 +433,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
-    _reject_dflash_sliding_mla_draft_window(server_args)
+    _resolve_dflash_mla_draft_window(server_args)
     _resolve_dflash_draft_kv_ring(server_args)
 
     if cfg.max_running_requests is None:
@@ -715,7 +712,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                     "DSpark DP MoE or prefill coordination requires "
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
-        if cfg.attn_cp_size > 1:
+
+        if not _is_npu and cfg.attn_cp_size > 1:
             raise ValueError(
                 "DSpark with dp attention does not support context parallel "
                 f"(attn_cp_size={cfg.attn_cp_size})."
@@ -781,14 +779,9 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             speculative_num_steps=1,
         )
     elif int(cfg.speculative_num_steps) != 1:
-        logger.warning(
-            "DSpark only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
-            cfg.speculative_num_steps,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_dspark",
-            speculative_num_steps=1,
+        raise ValueError(
+            "DSpark only supports --speculative-num-steps 1, "
+            f"got {cfg.speculative_num_steps}."
         )
 
     if cfg.speculative_eagle_topk is None:
@@ -1049,6 +1042,14 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 fallback_backend,
             )
             draft_backend = fallback_backend
+    if get_platform().is_gfx95:
+        from sglang.srt.layers.attention.triton_draft_hip import check_dcp_mla_draft
+        from sglang.srt.speculative.dflash_draft_ring import (
+            dflash_draft_reads_rows_by_position,
+        )
+
+        if dflash_draft_reads_rows_by_position(draft_backend, cfg.dcp_size):
+            check_dcp_mla_draft(_load_draft_hf_config(cfg))
     # FIXME: avoid overriding server args directly; pass the resolved draft
     # backend to the draft worker explicitly instead.
     declare_resolution(
@@ -1058,28 +1059,46 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     )
 
 
-def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
+def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
+    """Runs after the draft backend is final, which it reads."""
+    from sglang.srt.speculative.dflash_draft_ring import (
+        dflash_draft_reads_rows_by_position,
+    )
     from sglang.srt.speculative.dflash_utils import (
-        get_dflash_layer_types,
         parse_dflash_draft_config,
+        resolve_mla_draft_compact_window,
     )
 
     cfg = resolving_view(server_args)
-    draft_backend = cfg.speculative_draft_attention_backend
-    if (
-        cfg.speculative_draft_window_size is None
-        or draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS
+    window_size = cfg.speculative_draft_window_size
+    if window_size is None:
+        return
+    if not dflash_draft_reads_rows_by_position(
+        cfg.speculative_draft_attention_backend, cfg.dcp_size
     ):
         return
     draft_hf_config = _load_draft_hf_config(cfg)
     if not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
         return
-    layer_types = get_dflash_layer_types(draft_hf_config)
-    if layer_types and "sliding_attention" in layer_types:
-        raise ValueError(
-            "--speculative-draft-window-size is not supported for an MLA draft "
-            f"with sliding-window layers on {draft_backend}: the backend applies "
-            "the draft's own window."
+    kept = resolve_mla_draft_compact_window(
+        draft_hf_config,
+        window_size=window_size,
+        dcp_size=cfg.dcp_size,
+        page_size=cfg.page_size,
+        megakernel=bool(cfg.enable_nvidia_megakernel),
+    )
+    if kept is None:
+        logger.warning(
+            "DFLASH: --speculative-draft-window-size %d is dropped on %s: every "
+            "draft layer is sliding_attention and the backend applies that window "
+            "itself over the full request table.",
+            window_size,
+            cfg.speculative_draft_attention_backend,
+        )
+        declare_resolution(
+            server_args,
+            "_resolve_dflash_mla_draft_window",
+            speculative_draft_window_size=None,
         )
 
 
@@ -1089,9 +1108,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         draft_kv_ring_unsupported_reason,
     )
 
-    switch = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
-    if not switch.get():
-        logger.info("DFLASH draft KV ring: off, SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.")
+    if not envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING.get():
         return
     cfg = resolving_view(server_args)
     reason = draft_kv_ring_unsupported_reason(
@@ -1104,12 +1121,13 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         ),
         enable_unified_memory=cfg.enable_unified_memory,
         dcp_size=cfg.dcp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        enable_dp_attention=attn_dp_enabled_of(cfg),
+        draft_window_size=cfg.speculative_draft_window_size,
+        is_cuda=current_platform.is_cuda(),
     )
     if reason is not None:
-        if switch.is_set():
-            raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
-        logger.info("DFLASH draft KV ring: off, %s.", reason)
-        return
+        raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
     logger.info("DFLASH draft KV ring: on.")
     declare_resolution(
         server_args,
@@ -1300,6 +1318,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "GigaChat35ForCausalLM",
+        "GigaChat4ForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "BailingMoeV2_5ForCausalLM",
@@ -1348,6 +1368,14 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             speculative_num_steps=steps,
             speculative_eagle_topk=topk,
             speculative_num_draft_tokens=draft_tokens,
+        )
+
+    if cfg.speculative_eagle_topk > 1 and getattr(
+        model_config_of(server_args).hf_config, "dsa_draft_attends_to_own_chain", False
+    ):
+        raise ValueError(
+            "DSA draft attention to its own chain requires "
+            "--speculative-eagle-topk 1; tree drafting is not supported."
         )
 
     if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
@@ -1615,23 +1643,6 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
         return (3, 1, 4)
     if model_arch in ["LlamaForCausalLM"]:
         return (5, 4, 8)
-    elif model_arch in [
-        "DeepseekV32ForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "DeepseekV2ForCausalLM",
-        "GptOssForCausalLM",
-        "Glm4MoeForCausalLM",
-        "Glm4MoeLiteForCausalLM",
-        "GlmMoeDsaForCausalLM",
-        "BailingMoeForCausalLM",
-        "BailingMoeV2ForCausalLM",
-        "BailingMoeV2_5ForCausalLM",
-        "MistralLarge3ForCausalLM",
-        "PixtralForConditionalGeneration",
-        "MiMoV2ForCausalLM",
-        "MiMoV2FlashForCausalLM",
-    ]:
-        return (3, 1, 4)
     elif model_arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
     elif model_arch == ERNIE5_5_MOE_ARCH:
