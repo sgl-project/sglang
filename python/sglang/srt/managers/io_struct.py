@@ -2610,9 +2610,20 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
     internal_state: Dict[str, Any]
 
 
+class EplbIntervalUpdate(msgspec.Struct, kw_only=True, forbid_unknown_fields=True):
+    policy: Literal["fixed", "recommend", "auto"]
+    interval: Optional[int] = None
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source, handler):
+        return msgspec_struct_pydantic_core_schema(cls, handler)
+
+
 class SetInternalStateReq(BaseReq, kw_only=True):
     # Only numeric scheduler knobs are accepted (see Scheduler.set_internal_state).
-    server_args: Dict[str, Union[int, float]]
+    server_args: Dict[str, Union[int, float]] = msgspec.field(default_factory=dict)
+    # A separate typed command keeps strings out of numeric scheduler knobs.
+    eplb_interval: Optional[EplbIntervalUpdate] = None
 
 
 class SetInternalStateReqOutput(BaseReq, kw_only=True):

@@ -41,7 +41,6 @@ import torch.distributed
 from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_eplb_group
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -60,6 +59,7 @@ from sglang.srt.utils import Withable, get_device, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -386,10 +386,23 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._recording = False
 
     def dump_record(self, output_mode: _OutputMode = "file"):
-        """Dump the expert distribution record and reset the recorder after dumping."""
+        """The interval adviser shares its rolling history with file and manager reads."""
         output = self._accumulator.dump(output_mode=output_mode)
-        self._reset()
+        if not self._accumulator.preserve_window_on_dump:
+            self._reset()
         return output
+
+    def peek_interval_window(self):
+        """Borrow this rank's rolling logical counts until the next forward."""
+        return self._accumulator.interval_window()
+
+    def counts_for_interval_rebalance(self):
+        """DeepSeek placement consumes only the sum over forwards."""
+        counts = self.peek_interval_window().sum_steps()
+        torch.distributed.all_reduce(
+            counts, group=self._accumulator._communication_group
+        )
+        return counts
 
     @property
     def recording(self):
@@ -758,6 +771,8 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 
 
 class _Accumulator(ABC):
+    preserve_window_on_dump = False
+
     @staticmethod
     def init_new(
         expert_location_metadata: ExpertLocationMetadata,
@@ -979,16 +994,23 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._global_physical_count_of_buffered_step = _Buffer.init_new(
-            item_shape=(
-                self._expert_location_metadata.num_layers,
-                # Cannot use local_physical_count to support select_experts
-                self._expert_location_metadata.num_physical_experts,
-            ),
-            buffer_size=get_exec().moe.expert_distribution_recorder_buffer_size,
-            dtype=torch.int32,
-            device=get_device_namespace().device,
-        )
+        self.preserve_window_on_dump = get_exec().moe.eplb_interval_policy != "fixed"
+        metadata = self._expert_location_metadata
+        size = get_exec().moe.expert_distribution_recorder_buffer_size
+        device = get_device_namespace().device
+        if self.preserve_window_on_dump:
+            from sglang.srt.hardware_backend.npu.eplb_interval.window import (
+                IntervalWindow,
+            )
+
+            self._counts = IntervalWindow(metadata, size, device)
+        else:
+            self._counts = _Buffer.init_new(
+                (metadata.num_layers, metadata.num_physical_experts),
+                size,
+                torch.int32,
+                device,
+            )
         self._first_dump = True
 
     def append(
@@ -998,22 +1020,33 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         single_pass_data: Dict,
         outputs: Dict[str, Any],
     ):
+        if self.preserve_window_on_dump and _is_model_capture_mode():
+            return
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
-        # Can optimize if overhead here is large
-        self._global_physical_count_of_buffered_step.append(
-            single_pass_data["global_physical_count"]
-        )
+        self._counts.append(single_pass_data["global_physical_count"])
 
     def reset(self):
         super().reset()
-        self._global_physical_count_of_buffered_step.reset()
+        self._counts.reset()
+
+    def interval_window(self):
+        assert self.preserve_window_on_dump
+        return self._counts
+
+    def _to_logical(self, counts):
+        return _convert_global_physical_count_to_logical_count(
+            counts,
+            self._expert_location_metadata.num_layers,
+            self._expert_location_metadata.num_logical_experts,
+            self._expert_location_metadata.physical_to_logical_map,
+        )
 
     def dump(self, output_mode: _OutputMode):
-        logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
-            self._global_physical_count_of_buffered_step.get_all(),
-            num_layers=self._expert_location_metadata.num_layers,
-            num_logical_experts=self._expert_location_metadata.num_logical_experts,
-            physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+        # all_reduce is in-place. A peek must keep the rank-local ring intact.
+        logical_count_of_buffered_step = (
+            self._counts.snapshot()
+            if self.preserve_window_on_dump
+            else self._to_logical(self._counts.get_all())
         )
 
         if self._first_dump:
@@ -1031,6 +1064,10 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
+        if self.preserve_window_on_dump:
+            output["valid_steps"] = min(
+                self._counts.samples_written, len(logical_count_of_buffered_step)
+            )
 
         if output_mode == "file":
             if self._rank == 0:

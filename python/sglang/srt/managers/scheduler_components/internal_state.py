@@ -73,6 +73,13 @@ class SchedulerInternalStateController:
         state["startup_time"] = scheduler.startup_time
         state["effective_max_running_requests_per_dp"] = scheduler.max_running_requests
         state["last_gen_throughput"] = scheduler.metrics_reporter.last_gen_throughput
+        controller = self._eplb_interval_controller()
+        if controller is not None:
+            state["eplb_interval"] = controller.status()
+
+    def _eplb_interval_controller(self):
+        manager = getattr(self.scheduler.tp_worker.model_runner, "eplb_manager", None)
+        return getattr(manager, "interval_controller", None)
 
     def _add_memory_usage(self, state: Dict[str, Any]) -> None:
         scheduler = self.scheduler
@@ -149,6 +156,21 @@ class SchedulerInternalStateController:
     # ------------------------------------------------------------------ update
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
+        if recv_req.eplb_interval is not None:
+            controller = self._eplb_interval_controller()
+            if controller is None or recv_req.server_args:
+                logger.warning(
+                    "Send an isolated EPLB command to a worker started with recommend or auto"
+                )
+                return SetInternalStateReqOutput(updated=False)
+            try:
+                controller.request(
+                    recv_req.eplb_interval.policy, recv_req.eplb_interval.interval
+                )
+            except ValueError as exc:
+                logger.warning("EPLB interval update rejected: %s", exc)
+                return SetInternalStateReqOutput(updated=False)
+            return SetInternalStateReqOutput(updated=True)
         handlers = self._update_handlers()
         requested = recv_req.server_args
         try:

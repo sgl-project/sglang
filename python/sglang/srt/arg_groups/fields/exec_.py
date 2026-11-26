@@ -1056,8 +1056,12 @@ class ExecMoe(msgspec.Struct):
     enable_eplb: A[bool, "Enable EPLB algorithm"] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm"] = "auto"
     eplb_rebalance_num_iterations: A[
-        int, "Number of iterations to automatically trigger a EPLB re-balance."
-    ] = 1000
+        Optional[int], "Target forwards between EPLB checks (fixed default: 1000)."
+    ] = None
+    eplb_interval_policy: A[
+        Literal["fixed", "recommend", "auto"],
+        "Use a fixed EPLB interval, evaluate alternatives, or apply supported recommendations.",
+    ] = "fixed"
     eplb_rebalance_layers_per_chunk: A[
         Optional[int],
         "Number of layers to rebalance per forward pass.",

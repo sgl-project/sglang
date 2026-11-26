@@ -664,13 +664,27 @@ def compute_logical_to_rank_dispatch_physical_map(
     seed: int = 42,
 ):
 
-    r = random.Random(seed)
+    maps = compute_static_dispatch_maps(
+        logical_to_all_physical_map, ep_size, num_physical_experts, seed
+    )
+    return maps[:, :, ep_rank].contiguous().to(logical_to_all_physical_map)
 
-    device = logical_to_all_physical_map.device
+
+def compute_static_dispatch_maps(
+    logical_to_all_physical_map,
+    ep_size,
+    num_physical_experts,
+    seed=42,
+    *,
+    prefer_same_node=None,
+):
+    """Build all source ranks' static physical-slot maps on CPU, in shared RNG order."""
+    r = random.Random(seed)
     logical_to_all_physical_map = logical_to_all_physical_map.cpu()
 
     num_local_gpu_physical_experts = num_physical_experts // ep_size
-    prefer_same_node = _prefer_same_node_experts()
+    if prefer_same_node is None:
+        prefer_same_node = _prefer_same_node_experts()
     num_gpus_per_node = (
         get_parallel().ep_size // get_parallel().nnodes if prefer_same_node else None
     )
@@ -679,7 +693,6 @@ def compute_logical_to_rank_dispatch_physical_map(
         if num_gpus_per_node is not None
         else None
     )
-    dtype = logical_to_all_physical_map.dtype
 
     candidates, num_valid = _compact_candidates(logical_to_all_physical_map)
     # [layer, logical expert, rank]; -1 where no same-GPU / narrowing same-node replica exists.
@@ -709,7 +722,7 @@ def compute_logical_to_rank_dispatch_physical_map(
         )
 
     assert torch.all(result != -1)
-    return result[:, :, ep_rank].contiguous().to(dtype=dtype, device=device)
+    return result
 
 
 def _compact_candidates(

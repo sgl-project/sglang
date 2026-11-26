@@ -635,9 +635,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
-    # For MLU mixed batches: number of leading prefill requests, derived from
-    # scheduler identity rather than query lengths. None on other platforms
-    # and for non-mixed batches.
+    # Leading prefill requests in a mixed batch (MLU attention and NPU EPLB).
+    # NPU EPLB also uses zero for a decode batch scheduled as a one-token extend.
     mixed_prefill_reqs: Optional[int] = None
 
     # For DP attention (MLP sync sizes)
@@ -1024,6 +1023,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         watermark = (
             model_runner.watermark if isinstance(model_runner, ModelRunner) else None
         )
+        mixed_prefill_reqs = None
+        if batch.forward_mode.is_mixed() and (_is_npu or is_mlu()):
+            mixed_prefill_reqs = len(batch.reqs) - len(batch.decoding_reqs or ())
+        elif (
+            _is_npu and batch.forward_mode == ForwardMode.EXTEND and batch.decoding_reqs
+        ):
+            mixed_prefill_reqs = len(batch.reqs) - len(batch.decoding_reqs)
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -1033,12 +1039,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
-            # MLU mixed request boundary derived from scheduler identity
-            mixed_prefill_reqs=(
-                len(batch.reqs) - len(batch.decoding_reqs or ())
-                if is_mlu() and batch.forward_mode.is_mixed()
-                else None
-            ),
+            mixed_prefill_reqs=mixed_prefill_reqs,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
             max_seq_len_host=getattr(batch, "max_seq_len_host", None),

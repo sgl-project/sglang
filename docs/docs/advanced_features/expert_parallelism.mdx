@@ -245,7 +245,40 @@ SGLang introduces a dispatcher-hook system for Single-Batch Overlap (SBO), enabl
 
 SGLang integrates the [Expert Parallelism Load Balancer (EPLB)](https://github.com/deepseek-ai/EPLB) from DeepSeek to address routing imbalances in MoE models. By analyzing expert activation statistics, EPLB computes an optimal expert arrangement, strategically placing or replicating experts to minimize GPU utilization variance, reduce idle cycles, and enhance scalability.
 
-To enable EPLB, use the flags `--enable-eplb`. For optimal performance, increase batch sizes to stabilize activation statistics and configure periodic rebalancing (e.g., every 1000 requests) to adapt to evolving workloads. Simulations demonstrate significant improvements in load balancedness (ratio of mean to max computation time), correlating strongly with throughput gains.
+Enable EPLB with `--enable-eplb`. By default the manager checks the placement every 1000 eligible target forwards. Each prefill or decode endpoint counts its own forwards. The recorder window defaults to the configured check interval.
+
+### Choosing a check interval on Ascend
+
+Add `--eplb-interval-policy recommend` to your existing EPLB launch to compare your current interval with shorter and longer alternatives. A worker serving both prefill and decode (the default `--disaggregation-mode null`) uses one layout and one check interval. It starts at 1000 forwards unless you set `--eplb-rebalance-num-iterations`. On separate prefill and decode workers, each endpoint chooses its own interval. The [Ascend 910C DeepSeek-V4-Flash EP16 profile](https://github.com/sgl-project/sglang/pull/49701) starts from interval/window 50/50 on prefill and 4000/1000 on decode. An explicit recorder window takes precedence and stays fixed during serving.
+
+Experimental interval replay supports single-node, synchronous TP=EP, PP1 with static Ascend Ops, FuseEP or DeepEP dispatch, the exact `stat` recorder and the DeepSeek placement algorithm. Use the default rebalance threshold and full-model updates. Workers outside this scope log their fixed fallback. In recommend and auto deployments, reading or exporting statistics preserves the rolling window. Counts retain the logical expert IDs used when each step ran. A worker can check every 25 forwards using the last 50 forwards each time. It waits for 50 rows before its first check.
+
+Query the endpoint directly. Each candidate fits a layout using only past rows. The controller then scores all candidates on the same subsequent forwards, sampling up to eight per block. The replay reports busiest-rank demand, peak share, checks and changed slots in two successive observation spans. For each span, `identical_layout_and_dispatch` is true only if the candidate and current interval used the same physical layout and every source rank selected the same replica throughout the span. This comparison covers the steps between installations, including forwards outside the load sample.
+
+The controller discards a replay if the reference disagrees with the installed slots or dispatch table. One background CPU worker computes candidate-only layouts from a snapshot. The scheduler still gathers statistics and distributes finished layouts. If a plan is late, all ranks discard that observation and keep the current interval. Check `shadow_plan_deadlines_missed` in the endpoint state. A foreground wall-time budget pauses expensive replays. When available, the state reports the estimated extra check time per forward.
+
+```bash
+curl -fsS http://localhost:30000/server_info | jq '.internal_states[].eplb_interval'
+```
+
+Use `--eplb-interval-policy auto` to allow bounded live trials. The controller compares matching batch shapes across ranks and adds the mean measured check cost per forward, including occasional expensive migrations. For prefill and mixed batches, the match also accounts for how new tokens are divided among requests and their cached prefixes. It groups the average number of visible keys per new query in buckets of 128. Each trial runs for four complete periods, extended to at least 32 forwards for short intervals. All ranks sample the same jittered forward in each timing block. Retaining the interval requires at least 32 matched active timings, matching shapes and complete timings for at least 75% of all scheduled non-idle samples on each side, and more than 1% improvement in both the amortized mean and the amortized median. The controller restores the prior interval on insufficient coverage, insufficient gain, or a material forward P95 regression.
+
+On a colocated worker, short trials run for at least 60 forwards. In `last_trial.by_phase`, inspect the matched timing coverage and device forward P95 for each phase seen in either window. Target verification counts as decode. A batch containing both prefill and decode, or a step where different active ranks serve different phases, counts once as mixed. Each observed phase needs at least 20 matched timings and 75% coverage on both sides. A phase P95 increase above 2% can veto a faster overall mean. A phase that disappears or has too few samples makes the trial inconclusive. The controller also restores the previous interval when the overlap between phase proportions (`phase_mix_overlap`) falls below 0.75. Only phases actually observed are compared. Runtime PD role switching still uses fixed checks.
+
+Read `last_trial` for the two intervals, the decision, sampling coverage, and the check cost per forward. The baseline and trial timing coverage show scheduled steps, fully idle steps, complete active timings, and incomplete timings. In `last_trial`, `matched_fraction` reports the coverage used for the decision on each side. The `missing_batch_metadata` count shows how many incomplete steps lacked host-side shape information on at least one rank. The controller excludes fully idle steps from the coverage denominator and starts a new baseline after a recorder reset.
+
+Compare `baseline_forward_p95_ms` and `trial_forward_p95_ms` in `last_trial` when the trial has enough matched samples. These percentiles pool sampled target forwards across matched batch shapes. The controller weights baseline samples to match the trial's batch-shape frequencies. Monitor request TTFT and TPOT separately.
+
+The controller also compares sampled logical expert traffic by source rank and layer. `last_trial.routing_overlap` is the shared fraction of the two normalized route distributions during the baseline replay and the trial. A value of 1 means the same proportions. Below 0.75, or with no routed traffic to compare, the controller restores the previous interval. You can inspect `timing_outcome` when this routing check changes the decision. A rejected candidate can be tried again when comparable timings are available and either the batch-shape overlap or the routing overlap with the earlier workload drops below 0.75.
+
+To pin an interval on a running recommend or auto worker, send an administrator command. A successful response acknowledges the request. Read back `effective_interval` and `applied_at_step` to verify application. Workers process commands at shared forward boundaries (at most 32 eligible steps apart), including when an interval is pinned. Repeating the active policy without an interval preserves any trial in progress. Switching policies during a trial without supplying a number restores the last confirmed interval. Supplying an explicit interval applies that value. Interrupted trials record their outcome in `last_trial`. A fixed pin overrides a trial and lasts until the next command or restart. To resume, send the same request with `{"eplb_interval":{"policy":"auto"}}`.
+
+```bash
+curl -fsS -X POST http://localhost:30000/set_internal_state \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"eplb_interval":{"policy":"fixed","interval":4000}}'
+```
 
 For more details, refer to the [EPLB Section in the Large-Scale EP Blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/#expert-parallelism-load-balancer) and the [EPLB Repository](https://github.com/deepseek-ai/eplb).
 

@@ -863,6 +863,24 @@ def handle_eplb_and_dispatch(server_args: Any):
 
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
+    if (
+        cfg.enable_eplb
+        and cfg.eplb_rebalance_num_iterations is not None
+        and cfg.eplb_rebalance_num_iterations < 1
+    ):
+        raise ValueError("The EPLB interval must be a positive integer.")
+    if cfg.eplb_interval_policy != "fixed":
+        from sglang.srt.hardware_backend.npu.eplb_interval.config import (
+            resolve_interval,
+        )
+
+        resolve_interval(server_args, cfg)
+    elif cfg.eplb_rebalance_num_iterations is None:
+        declare_resolution(
+            server_args,
+            "_handle_expert_distribution_metrics",
+            eplb_rebalance_num_iterations=1000,
+        )
     if should_report_expert_balancedness(server_args) and (
         cfg.expert_distribution_recorder_mode is None
     ):
@@ -873,18 +891,11 @@ def handle_expert_distribution_metrics(server_args: Any):
         )
 
     if cfg.expert_distribution_recorder_buffer_size is None:
-        if (x := cfg.eplb_rebalance_num_iterations) is not None:
-            declare_resolution(
-                server_args,
-                "_handle_expert_distribution_metrics",
-                expert_distribution_recorder_buffer_size=x,
-            )
-        elif cfg.expert_distribution_recorder_mode is not None:
-            declare_resolution(
-                server_args,
-                "_handle_expert_distribution_metrics",
-                expert_distribution_recorder_buffer_size=1000,
-            )
+        declare_resolution(
+            server_args,
+            "_handle_expert_distribution_metrics",
+            expert_distribution_recorder_buffer_size=cfg.eplb_rebalance_num_iterations,
+        )
 
 
 def validate_prefill_cp_platform(server_args: Any):

@@ -51,10 +51,17 @@ class EPLBManager:
         self._rebalance_num_iterations = get_exec().moe.eplb_rebalance_num_iterations
         self._rebalance_disabled_reason = None
         self._rebalance_disabled_logged = False
+        self.interval_controller = None
+        if get_exec().moe.eplb_interval_policy != "fixed":
+            from sglang.srt.hardware_backend.npu.eplb_interval.controller import (
+                IntervalController,
+            )
 
-        # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
+            self.interval_controller = IntervalController(model_config)
+
         assert (
-            get_exec().moe.eplb_rebalance_num_iterations
+            self.interval_controller is not None
+            or get_exec().moe.eplb_rebalance_num_iterations
             >= get_exec().moe.expert_distribution_recorder_buffer_size
         ), (
             "eplb_rebalance_num_iterations must be greater than expert_distribution_recorder_buffer_size"
@@ -72,7 +79,17 @@ class EPLBManager:
     def on_forward_pass_end(self):
         next(self._main_generator)
 
+    @property
+    def active_interval_controller(self):
+        return (
+            self.interval_controller
+            if self._rebalance_disabled_reason is None
+            else None
+        )
+
     def reset_generator(self):
+        if self.interval_controller is not None:
+            self.interval_controller.restart()
         self._main_generator = self._entrypoint()
 
     def disable_rebalance(self, reason: str):
@@ -87,11 +104,28 @@ class EPLBManager:
 
     # can be more complex if needed
     def _entrypoint(self):
+        if self.interval_controller is not None:
+            yield from self._adaptive_entrypoint()
+            return
         while True:
             for _ in range(self._rebalance_num_iterations):
                 yield
 
             yield from self.rebalance()
+
+    def _adaptive_entrypoint(self):
+        controller = self.interval_controller
+        recorder = get_global_expert_distribution_recorder()
+        controller.set_routed_layers(self._get_model().routed_experts_weights_of_layer)
+        while True:
+            if self._rebalance_disabled_reason is None and controller.advance(recorder):
+                # Reuse the synchronized timer so pending forward work is not
+                # charged again as interval overhead.
+                result = yield from self.rebalance()
+                if result is not None:
+                    elapsed_ms, proposed = result
+                    controller.finish_check(elapsed_ms, recorder, proposed)
+            yield
 
     def rebalance(self):
         if self._rebalance_disabled_reason is not None:
@@ -118,19 +152,19 @@ class EPLBManager:
 
         if enable_timing:
             torch.get_device_module().synchronize()
-            time_start = time.time()
+            time_start = time.perf_counter()
 
-        dump_record_output = get_global_expert_distribution_recorder().dump_record(
-            output_mode="object"
-        )
-        logical_count = dump_record_output["logical_count"]
-        average_utilization_rate_over_window = dump_record_output[
-            "average_utilization_rate_over_window"
-        ]
-
-        # Check whether rebalancing is needed
-        if not self._check_rebalance_needed(average_utilization_rate_over_window):
-            return
+        recorder = get_global_expert_distribution_recorder()
+        if self.interval_controller is not None:
+            # The supported planner uses the window sum and an unconditional check.
+            logical_count = recorder.counts_for_interval_rebalance()
+        else:
+            record = recorder.dump_record(output_mode="object")
+            if not self._check_rebalance_needed(
+                record["average_utilization_rate_over_window"]
+            ):
+                return
+            logical_count = record["logical_count"]
 
         expert_location_metadata = self._compute_expert_location_metadata(
             logical_count,
@@ -177,12 +211,17 @@ class EPLBManager:
 
         self._log_rebalance_layout_after_update(update_layer_ids=all_update_layer_ids)
 
-        msg = f"[EPLBManager] rebalance end"
+        msg = "[EPLBManager] rebalance end"
+        elapsed_ms = None
         if enable_timing:
             torch.get_device_module().synchronize()
-            time_end = time.time()
-            msg += f" time={time_end - time_start:.3f}s"
+            elapsed = time.perf_counter() - time_start
+            elapsed_ms = elapsed * 1000
+            msg += f" time={elapsed:.3f}s"
         logger.info(msg)
+        if self.interval_controller is not None:
+            return elapsed_ms, expert_location_metadata
+        return elapsed_ms
 
     def _compute_expert_location_metadata(
         self, logical_count, *, broadcast_over_world: bool

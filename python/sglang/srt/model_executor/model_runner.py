@@ -65,6 +65,7 @@ from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionMetrics,
     ExpertDistributionRecorder,
+    _is_model_capture_mode,
     get_global_expert_distribution_recorder,
     set_global_expert_distribution_recorder,
     should_advance_eplb_counter,
@@ -1959,7 +1960,22 @@ class ModelRunner:
             ) as recorder_outputs,
             get_forward().scoped(forward_batch=forward_batch),
         ):
+            interval_controller = getattr(
+                self.eplb_manager, "active_interval_controller", None
+            )
+            interval_capture = (
+                interval_controller is not None and _is_model_capture_mode()
+            )
+            interval_timing = (
+                interval_controller.sample_forward(forward_batch)
+                if interval_controller is not None and not interval_capture
+                else None
+            )
             output = self._forward_raw(forward_batch, pp_proxy_tensors)
+            if interval_timing is not None:
+                interval_controller.timings.finish(
+                    interval_controller.step, interval_timing, output.can_run_graph
+                )
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output, forward_batch, pp_proxy_tensors
@@ -1998,7 +2014,11 @@ class ModelRunner:
         )
 
         # should_advance_eplb_counter is always True on non-hip platform
-        if self.eplb_manager is not None and should_advance_eplb_counter(forward_batch):
+        if (
+            self.eplb_manager is not None
+            and not interval_capture
+            and should_advance_eplb_counter(forward_batch)
+        ):
             self.eplb_manager.on_forward_pass_end()
 
         if dumper.may_enable:
