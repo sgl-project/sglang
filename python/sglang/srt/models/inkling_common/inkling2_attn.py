@@ -21,8 +21,13 @@ from sglang.kernels.ops.gemm.inkling2_linear import (
     linear_k_group_partials_pair,
     uses_k_groups,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    get_bf16_gemm_backend,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -33,7 +38,13 @@ from sglang.srt.models.inkling_common.attn import (
 )
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
 from sglang.srt.models.inkling_common.sconv import SconvType
-from sglang.srt.runtime_context import get_model, get_parallel, get_platform
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_model,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import get_device_core_count
 
 PADDED_DECODE_MIN_TOKENS = 8
@@ -420,8 +431,64 @@ class Inkling2Attention(nn.Module):
         projected, _ = self.qkvr(x)
         return projected.split(self.split_sizes, dim=-1)[:6]
 
+    def _can_use_qkvr_fast_path(self, sources) -> bool:
+        if (
+            type(self.qkvr) is not MergedColumnParallelLinear
+            or type(self.qkvr.quant_method) is not UnquantizedLinearMethod
+            or self.qkvr.gather_output
+            or self.qkvr.skip_bias_add
+            or (get_forward().sp_active and self.tp_size > 1)
+            or torch.compiler.is_compiling()
+            or is_batch_invariant_mode_enabled()
+            or get_exec().deterministic.enable_deterministic_inference
+            or not get_bf16_gemm_backend().is_auto()
+        ):
+            return False
+        weight = self.qkvr.weight
+        bias = self.qkvr.bias
+        return not (
+            torch.is_grad_enabled()
+            and (
+                sources.q.requires_grad
+                or sources.k.requires_grad
+                or sources.v.requires_grad
+                or weight.requires_grad
+                or (bias is not None and bias.requires_grad)
+            )
+        )
+
     def _project_sources(self, sources):
         if len({id(sources.q), id(sources.k), id(sources.v)}) == 3:
+            if get_platform().is_sm120 and self._can_use_qkvr_fast_path(sources):
+                from sglang.kernels.ops.gemm.sm12x_bf16_gemv import (
+                    sm12x_bf16_gemv_3src,
+                    use_sm12x_bf16_gemv_3src,
+                )
+
+                k_lo = self.split_sizes[0]
+                v_lo = k_lo + self.split_sizes[1]
+                r_lo = v_lo + self.split_sizes[2]
+                if use_sm12x_bf16_gemv_3src(
+                    sources.q,
+                    sources.k,
+                    sources.v,
+                    self.qkvr.weight,
+                    k_lo,
+                    v_lo,
+                    r_lo,
+                    self.qkvr.bias,
+                ):
+                    projected = sm12x_bf16_gemv_3src(
+                        sources.q,
+                        sources.k,
+                        sources.v,
+                        self.qkvr.weight,
+                        k_lo,
+                        v_lo,
+                        r_lo,
+                        self.qkvr.bias,
+                    )
+                    return projected.split(self.split_sizes, dim=-1)[:6]
             q_proj, k_proj, v_proj = (
                 projected.split(self.split_sizes, dim=-1)[:6]
                 for projected in self.qkvr(_stacked(sources))[0].chunk(3)
