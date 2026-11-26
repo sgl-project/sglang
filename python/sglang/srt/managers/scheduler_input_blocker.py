@@ -25,20 +25,46 @@ logger = logging.getLogger(__name__)
 class SchedulerInputBlocker:
     def __init__(self, noop: bool):
         self._state = _State.UNBLOCKED
+        self._block_depth = 0
         self._pending_reqs = []
+        self._deferred_reqs = []
         self._noop = noop
         self._global_unblock_barrier = PollBasedBarrier(noop=noop)
+
+    def has_pending(self) -> bool:
+        return (
+            self._state != _State.UNBLOCKED
+            or bool(self._deferred_reqs)
+            or self._global_unblock_barrier.global_pending
+        )
+
+    def needs_polling(self) -> bool:
+        return (
+            self._state == _State.GLOBAL_UNBLOCK_BARRIER
+            or bool(self._deferred_reqs)
+            or self._global_unblock_barrier.global_polling
+        )
 
     def handle(self, recv_reqs: Optional[List[Any]]):
         assert (recv_reqs is None) == self._noop
 
         if not self._noop:
+            recv_reqs = self._deferred_reqs + recv_reqs
+            self._deferred_reqs = []
             output_reqs = []
-            for recv_req in recv_reqs:
+            for index, recv_req in enumerate(recv_reqs):
+                if self._state == _State.GLOBAL_UNBLOCK_BARRIER:
+                    # Each guard cohort must finish the same barrier on every rank.
+                    self._deferred_reqs.extend(recv_reqs[index:])
+                    break
                 output_reqs += self._handle_recv_req(recv_req)
 
         global_arrived_unblock_barrier = (
-            self._global_unblock_barrier.poll_global_arrived()
+            self._global_unblock_barrier.poll_global_arrived(
+                pending=self._state != _State.UNBLOCKED or bool(self._deferred_reqs),
+                polling=self._state == _State.GLOBAL_UNBLOCK_BARRIER
+                or bool(self._deferred_reqs),
+            )
         )
         if (
             self._state == _State.GLOBAL_UNBLOCK_BARRIER
@@ -68,10 +94,16 @@ class SchedulerInputBlocker:
 
     def _execute_block_req(self):
         logger.info("Handle block req")
-        self._change_state(original=_State.UNBLOCKED, target=_State.BLOCKED)
+        if self._block_depth == 0:
+            self._change_state(original=_State.UNBLOCKED, target=_State.BLOCKED)
+        self._block_depth += 1
 
     def _execute_unblock_req(self):
         logger.info("Handle unblock req")
+        assert self._block_depth > 0
+        self._block_depth -= 1
+        if self._block_depth:
+            return
         self._change_state(
             original=_State.BLOCKED, target=_State.GLOBAL_UNBLOCK_BARRIER
         )
