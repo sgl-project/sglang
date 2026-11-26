@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
+    WAITING_QUEUE_PREFIX_MATCH_MAX,
     CacheAgnosticPolicy,
     CacheAwarePolicy,
     SchedulePolicy,
@@ -130,6 +131,60 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         self.assertEqual(waiting_queue[0].rid, "a")
         self.assertEqual(waiting_queue[1].rid, "b")
         self.assertEqual(waiting_queue[2].rid, "c")
+
+    def test_sort_by_hrrn_orders_by_priority_first_when_enabled(self):
+        r_low_aged = _make_req("low", "x" * 10, list(range(10)), priority=1)
+        r_high_fresh = _make_req("high", "x" * 100, list(range(100)), priority=2)
+        r_high_cached = _make_req("warm", "x" * 100, list(range(100)), priority=2)
+        for r in (r_low_aged, r_high_fresh, r_high_cached):
+            r.num_matched_prefix_tokens = 0
+        r_high_cached.num_matched_prefix_tokens = 100  # no prefill work left
+        r_low_aged.arrival_processed_tokens = 0  # ratio 1000 / 10
+        r_high_fresh.arrival_processed_tokens = 1000  # just arrived, ratio 0
+
+        def order(temporary_deprioritized, priority_sign):
+            waiting_queue = [r_high_fresh, r_low_aged, r_high_cached]
+            SchedulePolicy._sort_by_hrrn(
+                waiting_queue=waiting_queue,
+                temporary_deprioritized=temporary_deprioritized,
+                processed_tokens=1000,
+                priority_sign=priority_sign,
+            )
+            return [r.rid for r in waiting_queue]
+
+        # Priority off: the aged low-priority request wins on ratio.
+        self.assertEqual(order(set(), 0), ["warm", "low", "high"])
+        # Higher values first: priority 2 ahead of 1, ratio order inside it.
+        self.assertEqual(order(set(), -1), ["warm", "high", "low"])
+        self.assertEqual(order(set(), 1), ["low", "warm", "high"])
+        # A deprioritized request moves to the back of its own priority only.
+        self.assertEqual(order({"warm"}, -1), ["high", "warm", "low"])
+
+    def test_calc_priority_hrrn_large_queue_fallback_keeps_priority(self):
+        # The FCFS path reads the disaggregation mode.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+        # Past the prefix-match limit HRRN falls back to FCFS order.
+        reqs = [
+            _make_req(str(index), "x", [index], priority=index % 3)
+            for index in range(WAITING_QUEUE_PREFIX_MATCH_MAX + 1)
+        ]
+        for index, req in enumerate(reqs):
+            req.time_stats.wait_queue_entry_time = float(index)
+        expected = sorted(
+            reqs,
+            key=lambda req: (-req.priority, req.time_stats.wait_queue_entry_time),
+        )
+        policy = SchedulePolicy(
+            policy="hrrn",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=True,
+            schedule_low_priority_values_first=False,
+        )
+        ordered = policy.calc_priority(reqs, processed_tokens=1000)
+        self.assertEqual([req.rid for req in ordered], [req.rid for req in expected])
 
 
 class TestShortestPrefillFirst(CustomTestCase):
