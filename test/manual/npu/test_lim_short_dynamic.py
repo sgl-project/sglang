@@ -105,7 +105,7 @@ def test_prefill_attention_and_short_residency():
             manager = FusedSparseKVCacheManager(
                 pool,
                 2048,
-                paged_kv_cache=index_pool,
+                index_k_pool=index_pool,
             )
             lengths, positions = [129, 65, 0], [127, 128, 63, 64]
             physical = torch.cat((mapping[0, 127:129], mapping[1, 63:65]))
@@ -264,7 +264,7 @@ def test_short_sparse_graph_lifecycle(
             manager = FusedSparseKVCacheManager(
                 pool,
                 2048,
-                paged_kv_cache=index_pool,
+                index_k_pool=index_pool,
             )
             allocations = [
                 tensor

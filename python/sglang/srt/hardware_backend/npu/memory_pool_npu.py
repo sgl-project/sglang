@@ -23,6 +23,9 @@ from sglang.srt.utils.device import is_npu
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
+        HostKVPool,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
 
 if is_npu():
@@ -714,6 +717,7 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
     rows_are_dcp_collapsed = False
+    pd_host_pool: Optional["HostKVPool"] = None
 
     def __init__(
         self,
@@ -1268,11 +1272,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _get_disagg_buffer_entries(self):
         """Return (buffer, uses_global_slots) entries in PD transfer order."""
-        host_pool = getattr(getattr(self, "sparse_kv_manager", None), "host_pool", None)
-        if host_pool is not None:
+        if self.pd_host_pool is not None:
             # Split transfer order is CKV, KPE, indexer K and optional scale.
             entries = [
-                (buf, True) for component in host_pool.buffers for buf in component
+                (buf, True)
+                for component in self.pd_host_pool.buffers
+                for buf in component
             ]
         else:
             self._raise_if_native_kv_cache_disabled()

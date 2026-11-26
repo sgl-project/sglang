@@ -205,7 +205,7 @@ def _run_manager_lifecycle(
             manager = FusedSparseKVCacheManager(
                 pool,
                 K,
-                paged_kv_cache=index_pool,
+                index_k_pool=index_pool,
             )
             if compact_pd:
                 pool.resident_row_lifecycle.admit([4, 5])

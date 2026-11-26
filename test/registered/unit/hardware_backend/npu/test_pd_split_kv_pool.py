@@ -199,9 +199,7 @@ class TestPDSplitKVPool(CustomTestCase):
     def test_export_matches_prefill_page_order(self):
         prefill, decode = _make_pool(), _make_pool()
         k, v = list(decode.k_buffer), list(decode.v_buffer)
-        decode.sparse_kv_manager = SimpleNamespace(
-            host_pool=SimpleNamespace(buffers=(k, v))
-        )
+        decode.pd_host_pool = SimpleNamespace(buffers=(k, v))
         decode.k_buffer = decode.v_buffer = None
 
         ptrs, lens, page_bytes = decode.get_contiguous_buf_infos()

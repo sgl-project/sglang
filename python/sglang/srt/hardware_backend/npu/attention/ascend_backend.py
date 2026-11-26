@@ -472,20 +472,9 @@ class AscendAttnBackend(AttentionBackend):
                     forward_fused_sparse_kv_offload as sparse_kv_attention,
                 )
 
-                self.sparse_kv_manager = getattr(
-                    self.token_to_kv_pool, "sparse_kv_manager", None
+                self.sparse_kv_manager = (
+                    model_runner.get_or_create_fused_sparse_kv_manager(sparse_topk)
                 )
-                if self.sparse_kv_manager is None:
-                    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
-                        FusedSparseKVCacheManager,
-                    )
-
-                    self.sparse_kv_manager = FusedSparseKVCacheManager(
-                        model_runner.req_to_token_pool,
-                        sparse_topk,
-                        paged_kv_cache=self.token_to_kv_pool,
-                    )
-                    self.token_to_kv_pool.sparse_kv_manager = self.sparse_kv_manager
             else:
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
                     forward_sparsity_driven_kv_offload as sparse_kv_attention,

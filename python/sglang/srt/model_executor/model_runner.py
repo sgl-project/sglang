@@ -1053,6 +1053,7 @@ class ModelRunner:
         self.max_running_requests = result.max_running_requests
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool = result.token_to_kv_pool
+        self.fused_sparse_kv_manager = None
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.memory_pool_config = result.memory_pool_config
         if self.is_hybrid_swa:
@@ -1166,6 +1167,18 @@ class ModelRunner:
         )
 
         ElasticEPStateManager.instance().reset()
+
+    def get_or_create_fused_sparse_kv_manager(self, sparse_topk: int):
+        if self.fused_sparse_kv_manager is None:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
+                FusedSparseKVCacheManager,
+            )
+
+            self.fused_sparse_kv_manager = FusedSparseKVCacheManager(
+                self.req_to_token_pool, sparse_topk, index_k_pool=self.token_to_kv_pool
+            )
+            self.token_to_kv_pool.pd_host_pool = self.fused_sparse_kv_manager.host_pool
+        return self.fused_sparse_kv_manager
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""

@@ -42,22 +42,22 @@ class FusedSparseKVCacheManager:
         req_to_token_pool: ReqToTokenPool | DecodeReqToTokenPool,
         sparse_topk: int,
         *,
-        paged_kv_cache: MLATokenToKVPool,
+        index_k_pool: MLATokenToKVPool,
     ) -> None:
         self.actual_request_rows = req_to_token_pool.req_to_token.shape[0]
         self.logical_max_context_len = req_to_token_pool.req_to_token.shape[1]
         self.req_to_token_pool = req_to_token_pool
         self.sparse_topk = sparse_topk
         self.device = req_to_token_pool.device
-        self.start_layer = paged_kv_cache.start_layer
+        self.start_layer = index_k_pool.start_layer
         # MLA params
         self.head_num = MLA_KV_HEAD_NUM
-        self.page_size = paged_kv_cache.page_size
-        self.kv_lora_rank = paged_kv_cache.kv_lora_rank
-        self.qk_rope_head_dim = paged_kv_cache.qk_rope_head_dim
-        self.store_dtype = paged_kv_cache.store_dtype
-        self.layer_num = paged_kv_cache.layer_num
-        self.budget = paged_kv_cache.sparse_kv_budget_plan
+        self.page_size = index_k_pool.page_size
+        self.kv_lora_rank = index_k_pool.kv_lora_rank
+        self.qk_rope_head_dim = index_k_pool.qk_rope_head_dim
+        self.store_dtype = index_k_pool.store_dtype
+        self.layer_num = index_k_pool.layer_num
+        self.budget = index_k_pool.sparse_kv_budget_plan
         self.size = self.budget.request_rows
         self.max_context_len = self.budget.context_len
         self.host_token_capacity = self.budget.host_token_capacity

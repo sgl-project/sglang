@@ -396,7 +396,7 @@ class TestLIMState(CustomTestCase):
             ),
         ):
             manager = fused_manager.FusedSparseKVCacheManager(
-                req_pool, 2048, paged_kv_cache=pool
+                req_pool, 2048, index_k_pool=pool
             )
         request_ids = [5, 4] if compact_pd else [1, 2]
         resident_pool = manager.resident_pool
