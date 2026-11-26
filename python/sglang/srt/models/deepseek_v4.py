@@ -195,7 +195,6 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
     quant_blocks_shared_experts_fusion,
 )
-from sglang.srt.models.deepseek_common.v4_weight_names import remap_v4_weight_name
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
     NonCudaDecoderMixin,
@@ -5376,7 +5375,76 @@ class DeepseekV4ForCausalLM(
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
 
-    remap_weight_name_to_dpsk_hf_format = staticmethod(remap_v4_weight_name)
+    @staticmethod
+    def remap_weight_name_to_dpsk_hf_format(
+        name: str,
+        is_nextn: bool = False,
+        num_hidden_layers: Optional[int] = None,
+    ) -> str:
+        if name.startswith("vision."):
+            return name.replace(".attn.wqkv.", ".attn.qkv_proj.").replace(
+                ".attn.wo.", ".attn.proj."
+            )
+        if name.startswith(("aligner.", "image_")):
+            return name
+        if name.startswith("embed."):
+            return "model.embed_tokens." + name.removeprefix("embed.")
+        if name.startswith("head."):
+            return "lm_head." + name.removeprefix("head.")
+        if name == "norm.weight":
+            return "model.norm.weight"
+        if name.startswith("hc_head_"):
+            return "model." + name
+
+        if is_nextn and name.startswith("mtp."):
+            parts = name.split(".", 2)
+            if len(parts) >= 3:
+                rest = parts[2]
+                nextn_spec_prefixes = [
+                    "e_proj",
+                    "h_proj",
+                    "emb",
+                    "enorm",
+                    "hnorm",
+                    "norm",
+                    "head",
+                    "hc_head",
+                ]
+                is_nextn_spec = any(rest.startswith(p) for p in nextn_spec_prefixes)
+                if is_nextn_spec:
+                    if rest.startswith("emb.tok_emb"):
+                        rest = rest.replace("emb.tok_emb", "embed_tokens")
+                    elif rest == "norm.weight":
+                        rest = "shared_head.norm.weight"
+                    elif rest.startswith("head."):
+                        rest = "shared_head.head.weight"
+                    elif rest == "e_proj.scale":
+                        rest = "e_proj.weight_scale_inv"
+                    elif rest == "h_proj.scale":
+                        rest = "h_proj.weight_scale_inv"
+                name = f"model.layers.{num_hidden_layers}." + rest
+
+        if name.startswith("layers."):
+            name = "model." + name
+        name = name.replace(".attn.", ".self_attn.")
+        name = name.replace(".ffn.", ".mlp.")
+        name = name.replace(".attn_norm.", ".input_layernorm.")
+        name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
+
+        if "self_attn" in name and name.endswith(".scale"):
+            name = name.removesuffix(".scale") + ".weight_scale_inv"
+        if ".engram.wkv." in name and name.endswith(".scale"):
+            name = name.removesuffix(".scale") + ".weight_scale_inv"
+
+        name = name.replace(".gate.tid2eid", ".topk.tid2eid")
+        name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
+        name = name.replace(".w1.", ".gate_proj.")
+        name = name.replace(".w2.", ".down_proj.")
+        name = name.replace(".w3.", ".up_proj.")
+        if "mlp" in name and name.endswith(".scale"):
+            name = name.removesuffix(".scale") + ".weight_scale_inv"
+
+        return name
 
     def _prewarm_mhc_kernels(self) -> None:
         """One-shot MHC JIT prewarm at load time, synced across ranks.

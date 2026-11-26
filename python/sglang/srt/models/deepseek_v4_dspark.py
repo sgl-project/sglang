@@ -42,7 +42,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.deepseek_common.utils import _is_cuda
-from sglang.srt.models.deepseek_common.v4_weight_names import remap_dspark_export_name
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4CudaDecoderLayer,
@@ -975,11 +974,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             num_experts=(n_routed_experts + self.num_fused_shared_experts),
         )
 
-        remap = (
-            remap_dspark_export_name
-            if _uses_stage_local_draft_weights()
-            else self._remap_dspark_weight_name
-        )
+        if _uses_stage_local_draft_weights():
+            from sglang.srt.layers.quantization.modelslim.modelslim import (
+                remap_dspark_weight_name_npu as remap,
+            )
+        else:
+            remap = self._remap_dspark_weight_name
         for name, loaded_weight in weights:
             mapped = remap(name)
             if mapped is None:

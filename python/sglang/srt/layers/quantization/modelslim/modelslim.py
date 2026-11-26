@@ -37,10 +37,6 @@ from sglang.srt.layers.quantization.modelslim.schemes.modelslim_qk_mxfp8_dynamic
     ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.models.deepseek_common.v4_weight_names import (
-    remap_dspark_export_name,
-    remap_v4_weight_name,
-)
 from sglang.srt.utils import apply_module_patch, is_npu
 
 if TYPE_CHECKING:
@@ -121,6 +117,65 @@ def _patch_rmsnorm_with_bias() -> None:
     _rmsnorm_bias_patched = True
 
 
+def remap_dspark_weight_name_npu(
+    name: str, *, for_quant_config: bool = False
+) -> Optional[str]:
+    """Map a checkpoint name without consulting model state.
+
+    The loader selects vocabulary stages and filters disabled confidence-head
+    weights. ModelSlim uses the same names to add quantization-config aliases.
+    Config aliases retain scale suffixes and rotary entries and omit vocabulary
+    weights, matching the original ModelSlim configuration semantics.
+    """
+    if not name.startswith("mtp."):
+        return None
+    if not for_quant_config and "rotary_emb.inv_freq" in name:
+        return None
+    parts = name.split(".", 2)
+    if len(parts) < 3:
+        return None
+    stage_id, rest = parts[1], parts[2]
+    if not stage_id.isdigit():
+        return None
+    if not for_quant_config:
+        # Preserve the loader's integer-stage validation; isdigit() alone also
+        # accepts characters such as superscript digits that int() rejects.
+        int(stage_id)
+
+    if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
+        if not for_quant_config:
+            if rest in ("embed.weight", "embed_tokens.weight"):
+                return "embed_tokens.weight"
+            if rest in ("head.weight", "lm_head.weight"):
+                return "lm_head.weight"
+        return None
+    if rest.startswith("markov_head."):
+        rest = rest.replace("markov_head.embed.", "markov_head.markov_w1.", 1)
+        return rest.replace("markov_head.head.", "markov_head.markov_w2.", 1)
+    if rest.startswith("confidence_head."):
+        return rest
+
+    mapped_rest = rest
+    if mapped_rest.startswith("attn."):
+        mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
+    elif mapped_rest.startswith("ffn."):
+        mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
+    elif mapped_rest.startswith("attn_norm."):
+        mapped_rest = "input_layernorm." + mapped_rest.removeprefix("attn_norm.")
+    elif mapped_rest.startswith("ffn_norm."):
+        mapped_rest = "post_attention_layernorm." + mapped_rest.removeprefix(
+            "ffn_norm."
+        )
+    mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
+    mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
+    mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
+    mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
+    mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
+    if not for_quant_config and mapped_rest.endswith(".scale"):
+        mapped_rest = mapped_rest.removesuffix(".scale") + ".weight_scale_inv"
+    return f"stages.{stage_id}.{mapped_rest}"
+
+
 class ModelSlimConfig(QuantizationConfig):
     """
     Config class for ModelSlim Quantization, a NPU-specific quantization type.
@@ -162,8 +217,11 @@ class ModelSlimConfig(QuantizationConfig):
 
             is_dsv4 = is_deepseek_v4(hf_config)
         if is_dsv4:
+            from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+            remap = DeepseekV4ForCausalLM.remap_weight_name_to_dpsk_hf_format
             quant_config = {
-                (remap_v4_weight_name(k) if isinstance(k, str) else k): v
+                (remap(k) if isinstance(k, str) else k): v
                 for k, v in quant_config.items()
             }
 
@@ -198,7 +256,7 @@ class ModelSlimConfig(QuantizationConfig):
             for name, scheme in quant_config.items():
                 if not isinstance(name, str):
                     continue
-                alias = remap_dspark_export_name(name, for_quant_config=True)
+                alias = remap_dspark_weight_name_npu(name, for_quant_config=True)
                 if alias is not None:
                     dspark_quant_aliases[alias] = scheme
 
