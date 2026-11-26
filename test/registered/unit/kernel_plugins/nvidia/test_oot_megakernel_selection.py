@@ -182,6 +182,22 @@ class TestOutOfTreeMegakernelSelection(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "uses megakernel API version 1"):
             megakernel.validate_oot_megakernel(self.select())
 
+    def test_tokenizer_uses_the_selected_normalized_request_validator(self):
+        self.register_provider()
+        self.provider.SPEC = replace(
+            self.provider.SPEC,
+            request_disable_reasons=lambda request: (
+                ["greedy sampling only", "logprobs are unavailable"]
+                if request.return_logprob
+                else []
+            ),
+        )
+        validate = megakernel.make_oot_megakernel_request_validator(self.select())
+        validate(SimpleNamespace(return_logprob=False))
+        with self.assertRaisesRegex(ValueError, "greedy sampling only") as caught:
+            validate(SimpleNamespace(return_logprob=True))
+        self.assertIn("logprobs are unavailable", str(caught.exception))
+
     def test_child_refuses_missing_registration_changed_path_and_changed_target(self):
         self.register_provider()
         args = self.select()

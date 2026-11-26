@@ -164,6 +164,25 @@ def validate_oot_megakernel(server_args: ServerArgs) -> None:
         )
 
 
+def make_oot_megakernel_request_validator(
+    server_args: ServerArgs,
+) -> Callable[[Any], None] | None:
+    """Resolve the frontend checker once, using the launcher's selected spec."""
+    spec = load_selected_oot_megakernel(server_args)
+    if spec is None or spec.request_disable_reasons is None:
+        return None
+    check = spec.request_disable_reasons
+
+    def validate(request: Any) -> None:
+        reasons = check(request)
+        if reasons:
+            raise ValueError(
+                f"{spec.name} cannot serve this request:\n  - " + "\n  - ".join(reasons)
+            )
+
+    return validate
+
+
 @dataclass
 class _InstalledMegakernel:
     built: BuiltMegakernel
