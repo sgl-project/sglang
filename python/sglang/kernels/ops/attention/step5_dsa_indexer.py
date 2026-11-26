@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Step5 index normalization, compression, scoring and block selection."""
+"""Step5 DSA indexer: index-key compression, scoring and region selection.
+
+Unlike the DeepSeek DSA indexer (dsa/), Step5 scores 8-token regions instead of
+single tokens. A region key is a per-dimension softmax(Z)-weighted sum of its
+eight normalized, rotated index keys, stored as FP8, and each query keeps the
+top 512 completed regions plus its own region. QSA (qsa_indexer.py) also scores
+compressed blocks, but mean-pools raw keys and applies norm and RoPE afterwards.
+"""
 
 import torch
 import triton
@@ -68,7 +75,7 @@ def _indexer_norm_rope(
         tl.store(KOut + token * 256 + channel, result, real_row)
 
 
-def step5_indexer_norm_rope(
+def step5_dsa_indexer_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     *,
@@ -225,7 +232,7 @@ def _build_request_metadata(
     tl.store(QuerySlots + row * WIDTH + depth, tl.where(active, raw, 0), depth < WIDTH)
 
 
-def build_compression_metadata(
+def step5_dsa_build_compression_metadata(
     *,
     request_slots: torch.Tensor,
     positions: torch.Tensor,
@@ -380,7 +387,7 @@ def _admit_row(
     row_ok = (tl.load(count_valid) != 0) & (~live | ok)
     tl.store(success + row, row_ok)
     if ASSERT_SUCCESS:
-        tl.device_assert(row_ok, "Step5 CSA ring history failed")
+        tl.device_assert(row_ok, "Step5 DSA ring history failed")
     return ok
 
 
@@ -593,7 +600,7 @@ def _write(
     )
 
 
-def append_ring(
+def step5_dsa_append_ring(
     *,
     slots: torch.Tensor,
     bases: torch.Tensor,
@@ -747,7 +754,7 @@ def _score_blocks(
         tl.store(Out + row * BLOCKS + num_blocks, score, num_blocks < BLOCKS)
 
 
-def step5_indexer_decode_logits(
+def step5_dsa_indexer_logits(
     q: torch.Tensor,
     weights: torch.Tensor,
     *,
@@ -898,7 +905,7 @@ STEP5_HISTORY_BLOCKS = 512
 _SCORE_STRIDE_ALIGNMENT = 256
 
 
-def can_use_step5_topk_deepselect(device: torch.device) -> bool:
+def can_use_step5_dsa_topk_deepselect(device: torch.device) -> bool:
     return (
         device.type == "cuda"
         and torch.version.hip is None
@@ -911,7 +918,7 @@ def deepselect_score_width(score_width: int) -> int:
     return (score_width + align - 1) // align * align
 
 
-def step5_topk_blocks_deepselect(
+def step5_dsa_topk_blocks_deepselect(
     scores: torch.Tensor,
     *,
     positions: torch.Tensor,
@@ -924,7 +931,7 @@ def step5_topk_blocks_deepselect(
     packed: torch.Tensor,
     causal_lengths: torch.Tensor,
 ) -> None:
-    """SM10x ``step5_topk_blocks`` that also writes the packed attention addresses.
+    """SM10x ``step5_dsa_topk_blocks`` that also writes the packed attention addresses.
 
     ``history_lengths`` is int32 positions // 8 per row, zero for padding rows.
     """
@@ -948,7 +955,7 @@ def step5_topk_blocks_deepselect(
     )
 
 
-def step5_topk_blocks(
+def step5_dsa_topk_blocks(
     scores: torch.Tensor,
     *,
     positions: torch.Tensor,
@@ -1029,7 +1036,7 @@ def _pack_decode_blocks(
     tl.store(Lengths + row, tl.where(live, position + 1, 0))
 
 
-def step5_pack_decode_blocks(
+def step5_dsa_pack_blocks(
     block_indices: torch.Tensor,
     counts: torch.Tensor,
     *,

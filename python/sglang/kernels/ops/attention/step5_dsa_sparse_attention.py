@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Step5 sparse attention over indexer-selected 8-token regions (Triton)."""
+"""Step5 DSA sparse attention over indexer-selected 8-token regions (Triton).
+
+DeepSeek DSA runs MLA over selected tokens; Step5 runs GQA (head_dim 192, one KV
+head per rank) over every token of the selected regions in the paged KV cache.
+"""
 
 from typing import Optional
 
@@ -92,7 +96,7 @@ def _sparse_attention_kernel(
     )
 
 
-def step5_sparse_attention(
+def step5_dsa_sparse_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,

@@ -17,19 +17,34 @@ from torch import nn
 from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
     fused_qk_gemma_rmsnorm_rope_gate,
 )
+from sglang.kernels.ops.attention.step5_dsa_indexer import (
+    step5_dsa_append_ring,
+    step5_dsa_indexer_logits,
+    step5_dsa_indexer_norm_rope,
+    step5_dsa_pack_blocks,
+    step5_dsa_topk_blocks,
+    step5_dsa_topk_blocks_deepselect,
+)
+from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
+    gemma_rmsnorm as mixed_dtype_gemma_rmsnorm,
+)
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.configs.step5 import Step5Config, parse_step5_attention_profile
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.attention.step5.indexer import Step5Indexer
-from sglang.srt.layers.attention.step5.norm import Step5RMSNorm
-from sglang.srt.layers.attention.step5_backend import Step5RadixAttention
+from sglang.srt.layers.attention.step5_backend import (
+    Step5IndexerMetadata,
+    Step5RadixAttention,
+    Step5SelectionWorkspace,
+)
 from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layernorm import GemmaRMSNorm, LayerNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
+    ReplicatedParallelGroup,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -54,6 +69,226 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_model, get_parallel
+
+
+class Step5RMSNorm(GemmaRMSNorm):
+    def __init__(self, hidden_size, eps=1e-6, *, weight_dtype=None):
+        super().__init__(hidden_size, eps=eps)
+        if weight_dtype is not None:
+            self.weight.data = self.weight.data.to(weight_dtype)
+            self.gemma_weight = self.gemma_weight.to(weight_dtype)
+
+    def _forward_impl(self, x, residual=None, post_residual_addition=None):
+        # Idle DP ranks must not launch a zero-grid CUDA norm.
+        if x.numel() == 0:
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return x, residual
+            return x
+        if (
+            residual is None
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.float32
+        ):
+            # Add one before rounding the checkpoint's FP32 weights.
+            original_shape = x.shape
+            if x.dim() != 2:
+                x = x.contiguous().reshape(-1, original_shape[-1])
+            out = mixed_dtype_gemma_rmsnorm(x, self.weight, self.variance_epsilon)
+            return out.reshape(original_shape) if len(original_shape) != 2 else out
+        return super()._forward_impl(x, residual, post_residual_addition)
+
+
+class Step5Indexer(nn.Module):
+    """Provider-sharded Q/W, replicated K/Z, compression and block selection."""
+
+    def __init__(
+        self,
+        *,
+        layer_id: int,
+        hidden_size: int,
+        index_head_dim: int,
+        num_index_heads: int,
+        index_tp_size: int,
+        tp_rank: int,
+        tp_size: int,
+        rotary_dim: int,
+        rope_theta: float,
+        rope_scaling: dict,
+        max_position_embeddings: int,
+        eps: float,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.index_head_dim = index_head_dim
+        self.num_heads = num_index_heads // index_tp_size
+        self.weight_scale = self.num_heads**-0.5
+        self.sparse_indexer_q = ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=num_index_heads * index_head_dim,
+            bias=False,
+            gather_output=False,
+            parallel_group=ReplicatedParallelGroup("attn_tp", tp_size // index_tp_size),
+            params_dtype=torch.bfloat16,
+            quant_config=None,
+            prefix=add_prefix("sparse_indexer_q", prefix),
+        )
+        self.sparse_indexer_k = ReplicatedLinear(
+            input_size=hidden_size,
+            output_size=index_head_dim,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=None,
+            prefix=add_prefix("sparse_indexer_k", prefix),
+        )
+        self.sparse_indexer_z = ReplicatedLinear(
+            input_size=hidden_size,
+            output_size=index_head_dim,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=None,
+            prefix=add_prefix("sparse_indexer_z", prefix),
+        )
+        self.sparse_indexer_w = ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=num_index_heads,
+            bias=False,
+            gather_output=False,
+            parallel_group=ReplicatedParallelGroup("attn_tp", tp_size // index_tp_size),
+            params_dtype=torch.bfloat16,
+            quant_config=None,
+            prefix=add_prefix("sparse_indexer_w", prefix),
+        )
+        self.rotary_emb = get_rope(
+            head_size=index_head_dim,
+            rotary_dim=rotary_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=True,
+            dtype=torch.bfloat16,
+        )
+        self.eps = eps
+        self.sparse_indexer_q_norm = Step5RMSNorm(
+            index_head_dim, eps=eps, weight_dtype=torch.bfloat16
+        )
+        self.sparse_indexer_k_norm = LayerNorm(
+            index_head_dim, eps=eps, dtype=torch.bfloat16
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        metadata: Step5IndexerMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        tokens = hidden_states.shape[0]
+        index_q, _ = self.sparse_indexer_q(hidden_states)
+        index_key, _ = self.sparse_indexer_k(hidden_states)
+        compression_logits, _ = self.sparse_indexer_z(hidden_states)
+        index_weights, _ = self.sparse_indexer_w(hidden_states)
+        index_weights = index_weights.float() * self.weight_scale
+        index_q = index_q.view(tokens, self.num_heads, self.index_head_dim)
+        index_key = index_key.view(tokens, 1, self.index_head_dim)
+        compression_logits = compression_logits.view(tokens, 1, self.index_head_dim)
+        index_q, index_key = step5_dsa_indexer_norm_rope(
+            index_q,
+            index_key,
+            q_weight=self.sparse_indexer_q_norm.weight,
+            k_weight=self.sparse_indexer_k_norm.weight,
+            k_bias=self.sparse_indexer_k_norm.bias,
+            cache=self.rotary_emb.cos_sin_cache_as(torch.bfloat16),
+            positions=positions,
+            eps=self.eps,
+        )
+        state = metadata.layer_states[self.layer_id]
+        # Read the old ring before publishing this forward's pending inputs.
+        step5_dsa_append_ring(
+            slots=metadata.request_slots,
+            bases=metadata.input_start_positions,
+            sources=metadata.input_start_rows,
+            lengths=metadata.input_lengths,
+            active=metadata.request_active,
+            admitted=metadata.request_mapping_valid,
+            count_valid=metadata.request_count_valid,
+            physical_blocks=metadata.compressed_key_write_indices,
+            enabled=metadata.compression_enabled,
+            success=metadata.compression_success,
+            index_key=index_key,
+            compression_logits=compression_logits,
+            index_key_ring=state.index_key_ring,
+            compression_logits_ring=state.compression_logits_ring,
+            ring_positions=state.index_positions,
+            compressed_index_keys=state.compressed_index_keys,
+        )
+        return _topk_blocks(
+            index_q=index_q,
+            index_weights=index_weights,
+            compressed_index_keys=state.compressed_index_keys,
+            req_to_token=metadata.req_to_token,
+            row_to_req=metadata.query_request_slots,
+            positions=metadata.query_positions,
+            workspace=metadata.selection_workspace,
+        )
+
+
+def _topk_blocks(
+    *,
+    index_q: torch.Tensor,
+    index_weights: torch.Tensor,
+    compressed_index_keys: torch.Tensor,
+    req_to_token: torch.Tensor,
+    row_to_req: torch.Tensor,
+    positions: torch.Tensor,
+    workspace: Step5SelectionWorkspace,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    packed, counts, lengths = workspace.packed, workspace.counts, workspace.lengths
+    for start, end in workspace.tiles:
+        tile_scores = workspace.indexer_logits[: end - start]
+        tile_ids = workspace.ids[: end - start]
+        step5_dsa_indexer_logits(
+            q=index_q[start:end],
+            weights=index_weights[start:end],
+            compressed_index_keys=compressed_index_keys,
+            req_to_token=req_to_token,
+            row_to_req=row_to_req[start:end],
+            positions=positions[start:end],
+            out=tile_scores,
+        )
+        if workspace.use_deepselect:
+            step5_dsa_topk_blocks_deepselect(
+                tile_scores,
+                positions=positions[start:end],
+                row_to_req=row_to_req[start:end],
+                history_lengths=workspace.topk_lengths[start:end],
+                req_to_token=req_to_token,
+                topk_ids=workspace.topk_ids[: end - start],
+                block_indices=tile_ids,
+                counts=counts[start:end],
+                packed=packed[start:end],
+                causal_lengths=lengths[start:end],
+            )
+        else:
+            step5_dsa_topk_blocks(
+                tile_scores,
+                positions=positions[start:end],
+                row_to_req=row_to_req[start:end],
+                block_indices=tile_ids,
+                counts=counts[start:end],
+            )
+            step5_dsa_pack_blocks(
+                tile_ids,
+                counts[start:end],
+                req_to_token=req_to_token,
+                row_to_req=row_to_req[start:end],
+                positions=positions[start:end],
+                packed_blocks=packed[start:end],
+                causal_lengths=lengths[start:end],
+            )
+    return packed, counts, lengths
 
 
 class Step5MLP(nn.Module):
