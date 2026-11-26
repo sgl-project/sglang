@@ -2,7 +2,7 @@
 
 import functools
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
 import torch
 
@@ -12,6 +12,9 @@ from sglang.srt.platforms.device_mixin import (
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
+
+if TYPE_CHECKING:
+    from sglang.srt.weight_cache.protocol import QuantIpcSupport
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +83,20 @@ class XpuDeviceMixin(DeviceMixin):
             )
             return ()
         return ("vmm_fd",)
+
+    def weight_cache_quant_support(self) -> "Mapping[str, QuantIpcSupport]":
+        """Unquantized dense BF16 only, verified against a disk load.
+
+        The CUDA table is not inherited. Block-wise FP8 is verified there for
+        CUDA IPC, and nothing establishes that the Level Zero vmm_fd manifest
+        carries what an XPU FP8 post-process leaves behind, so it stays absent
+        and a quantized checkpoint is refused rather than mapped with numerics
+        nobody checked. MoE checkpoints are refused too, until one has been
+        compared with real weights.
+        """
+        from sglang.srt.weight_cache.protocol import XPU_VMM_QUANT_SUPPORT
+
+        return XPU_VMM_QUANT_SUPPORT
 
     def weight_cache_env_stamp(self) -> dict[str, str]:
         """Architecture, driver and kernel-package identity for the weight cache.

@@ -32,7 +32,12 @@ def set_default_torch_dtype(dtype: torch.dtype):
         torch.set_default_dtype(old_dtype)
 
 
-def _is_moe_model(model_config: ModelConfig, architectures: list[str]) -> bool:
+def is_moe_model(model_config: ModelConfig, architectures: list[str]) -> bool:
+    """Whether a checkpoint routes any weight through the MoE expert path.
+
+    Read from the config alone, so a caller that has not built a model yet --
+    the weight-cache quantization gate -- gets the answer the loader will use.
+    """
     lowered_arches = [arch.lower() for arch in architectures]
     if any("moe" in arch or "mixtral" in arch for arch in lowered_arches):
         return True
@@ -83,7 +88,7 @@ def _get_transformers_backend_arch(
     is_multimodal = model_config.is_multimodal or (
         model_config.hf_config is not model_config.hf_text_config
     )
-    is_moe = _is_moe_model(model_config, architectures)
+    is_moe = is_moe_model(model_config, architectures)
     base_arch = "ForCausalLM"
     if is_pooling:
         base_arch = (

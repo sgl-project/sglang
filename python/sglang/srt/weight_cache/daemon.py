@@ -73,6 +73,7 @@ from .protocol import (
     get_ready_path,
     get_socket_path,
     hash_quant_config,
+    is_moe_checkpoint,
     recv_msg,
     send_msg,
 )
@@ -330,9 +331,16 @@ class WeightCacheDaemon:
         if not quant_method and quant_config is not None:
             quant_method = get_quant_method_name(quant_config)
 
-        # Refuse unsupported quant methods before creating distributed groups
-        # or touching model weights.
-        check_ipc_quant_support(quant_method, quant_config, where="daemon")
+        # Refuse quant methods this platform has not verified, before creating
+        # distributed groups or touching model weights. An MoE checkpoint is
+        # gated separately from a dense one: its expert weights take different
+        # create_weights and post-processing branches.
+        check_ipc_quant_support(
+            quant_method,
+            quant_config,
+            where="daemon",
+            is_moe=is_moe_checkpoint(model_config),
+        )
 
         # The initialized groups are the authority for rank identity. This
         # avoids maintaining a second copy of the model-parallel hierarchy.

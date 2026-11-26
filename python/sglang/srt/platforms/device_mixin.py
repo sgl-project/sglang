@@ -30,12 +30,15 @@ import random
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import cached_property
-from typing import NamedTuple, Optional
+from typing import TYPE_CHECKING, Mapping, NamedTuple, Optional
 
 import numpy as np
 import torch
 
 from sglang.srt.environ import envs
+
+if TYPE_CHECKING:
+    from sglang.srt.weight_cache.protocol import QuantIpcSupport
 
 
 class PlatformEnum(enum.Enum):
@@ -192,6 +195,19 @@ class DeviceMixin:
         if self.is_npu():
             return ("torch_ipc",)
         return ()
+
+    def weight_cache_quant_support(self) -> "Mapping[str, QuantIpcSupport]":
+        """[Active] Quantization methods this device verified for weight sharing.
+
+        Keyed by ``quant_method``; a method absent from the mapping fails
+        closed, and an entry gates dense and MoE checkpoints separately. The
+        default is the set verified over CUDA IPC, which is what every platform
+        applied before this was a capability, so a device narrows it by
+        overriding rather than by being added to a condition inside the gate.
+        """
+        from sglang.srt.weight_cache.protocol import CUDA_IPC_QUANT_SUPPORT
+
+        return CUDA_IPC_QUANT_SUPPORT
 
     def validate_weight_cache_allocator(self) -> None:
         """[Active] Reject an allocator config whose memory cannot be exported.

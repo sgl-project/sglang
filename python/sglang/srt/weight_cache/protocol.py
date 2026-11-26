@@ -11,7 +11,7 @@ import os
 import pickle
 import signal
 import struct
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import msgspec
 
@@ -123,22 +123,29 @@ def get_quant_method_name(quant_config: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# IPC quantization-method allowlist
+# Per-platform quantization-method allowlist
 # ---------------------------------------------------------------------------
 #
-# CUDA IPC zero-copy sharing exports ONLY raw tensor data, so it is correct only
-# when process_weights_after_loading's entire effect is captured by that data.
+# Zero-copy sharing exports ONLY raw tensor data, so it is correct only when
+# process_weights_after_loading's entire effect is captured by that data.
 # Methods that stamp Python-side metadata (e.g. block-FP8's format_ue8m0) or
 # repack/transpose weights into shapes the meta-init client can't reproduce
 # (per-tensor FP8, Marlin, AWQ/GPTQ) would serve silently-wrong numerics. Only
 # methods verified to round-trip through pure tensor export are allowed; every
-# other method hard-errors. Extend the registry below only after verifying a
-# method end-to-end.
+# other method hard-errors.
+#
+# Verification is per device, not global: each platform carries the weights over
+# its own transport (CUDA IPC handles, Level Zero dma-buf) and runs its own
+# create_weights branches, so a method proven on one says nothing about another.
+# Each platform therefore names its own table through
+# DeviceMixin.weight_cache_quant_support(), making the key that selects an entry
+# (platform, quant_method). Extend a table only after verifying that pair
+# end-to-end against a disk-loaded model.
 
 
 class UnsupportedQuantForIPCError(RuntimeError):
-    """Raised when a quantization method is not on the verified allowlist for
-    CUDA IPC zero-copy weight sharing."""
+    """Raised when a quantization method is not on the active platform's
+    verified allowlist for zero-copy weight sharing."""
 
 
 def _get_quant_field(quant_config: Any, key: str) -> Any:
@@ -161,45 +168,121 @@ def _fp8_round_trips_via_ipc(quant_config: Any) -> bool:
     return _get_quant_field(quant_config, "weight_block_size") is not None
 
 
-# quant_method name -> predicate(quant_config) -> bool (True == verified safe).
-# A method absent from this registry is unsupported and hard-errors.
-IPC_QUANT_ALLOWLIST = {
-    "": lambda _quant_config: True,  # unquantized
-    "fp8": _fp8_round_trips_via_ipc,  # only block-wise FP8 verified
+class QuantIpcSupport(msgspec.Struct, frozen=True):
+    """One allowlist entry: what a platform has verified for one quant method.
+
+    ``dense`` and ``moe`` gate independently because an MoE checkpoint reaches
+    different create_weights and process_weights_after_loading branches than a
+    dense one -- on XPU those pad expert row strides, on CUDA they repack into
+    block layouts -- so verifying one shape does not verify the other.
+    ``requires`` is an extra condition on the quant config itself, None when the
+    method needs none.
+    """
+
+    dense: bool = True
+    moe: bool = True
+    requires: Optional[Callable[[Any], bool]] = None
+
+    def allows(self, quant_config: Any, *, is_moe: bool) -> bool:
+        if not self.allows_shape(is_moe=is_moe):
+            return False
+        return self.requires is None or bool(self.requires(quant_config))
+
+    def allows_shape(self, *, is_moe: bool) -> bool:
+        return self.moe if is_moe else self.dense
+
+    def shapes_label(self) -> str:
+        shapes = [n for n, ok in (("dense", self.dense), ("MoE", self.moe)) if ok]
+        return "+".join(shapes) if shapes else "nothing"
+
+
+# The table every platform reached before this gate was per-platform. CUDA,
+# ROCm, MUSA, SAIL and NPU all still reach it, through the DeviceMixin default,
+# so their behavior is unchanged. XPU is the one device that overrides.
+CUDA_IPC_QUANT_SUPPORT: Dict[str, QuantIpcSupport] = {
+    "": QuantIpcSupport(),
+    "fp8": QuantIpcSupport(requires=_fp8_round_trips_via_ipc),
+}
+
+# Intel XPU carries weights over the Level Zero vmm_fd transport, not CUDA IPC,
+# and has only been verified for unquantized dense BF16 weights
+# (sgl-project/sglang#49799 phase 5). Every quantized method is absent, so block
+# FP8 -- verified on CUDA -- still fails closed here: its XPU post-processing
+# and the manifest metadata it would need are unestablished.
+#
+# MoE stays off until a real MoE checkpoint has been compared against a disk
+# load. So far only Qwen3Moe with dummy weights has, at TP8.
+XPU_VMM_QUANT_SUPPORT: Dict[str, QuantIpcSupport] = {
+    "": QuantIpcSupport(dense=True, moe=False),
 }
 
 
-def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
-    """Return True if `quant_method` is verified safe for IPC zero-copy sharing."""
-    predicate = IPC_QUANT_ALLOWLIST.get(quant_method)
-    if predicate is None:
+def is_moe_checkpoint(model_config: Any) -> bool:
+    """Whether this checkpoint routes weights through the MoE expert path.
+
+    Imported lazily so protocol.py stays cheap to import and usable without the
+    model loader.
+    """
+    from sglang.srt.model_loader.utils import is_moe_model
+
+    return is_moe_model(model_config, model_config.hf_config.architectures or [])
+
+
+def is_ipc_quant_supported(
+    quant_method: str, quant_config: Any, *, is_moe: bool
+) -> bool:
+    """Return True if this platform verified `quant_method` for zero-copy sharing."""
+    from sglang.srt.platforms import current_platform
+
+    support = current_platform.weight_cache_quant_support().get(quant_method)
+    if support is None:
         return False
-    return bool(predicate(quant_config))
+    return support.allows(quant_config, is_moe=is_moe)
 
 
 def check_ipc_quant_support(
-    quant_method: str, quant_config: Any, *, where: str
+    quant_method: str, quant_config: Any, *, where: str, is_moe: bool
 ) -> None:
-    """Hard-error unless `quant_method` is verified safe for IPC zero-copy sharing.
+    """Hard-error unless this platform verified `quant_method` for zero-copy sharing.
 
     `where` is a short tag (e.g. "daemon"/"client") used only in the error
     message. Raises UnsupportedQuantForIPCError with an actionable message.
     """
-    if is_ipc_quant_supported(quant_method, quant_config):
+    if is_ipc_quant_supported(quant_method, quant_config, is_moe=is_moe):
         return
+    from sglang.srt.platforms import current_platform
+
+    device = current_platform.device_type
+    support_table = current_platform.weight_cache_quant_support()
+    shape = "MoE" if is_moe else "dense"
     verified = ", ".join(
-        (repr(m) if m else "'' (unquantized)") for m in IPC_QUANT_ALLOWLIST
+        f"{method!r} ({support.shapes_label()})"
+        if method
+        else f"'' unquantized ({support.shapes_label()})"
+        for method, support in support_table.items()
     )
+    entry = support_table.get(quant_method)
+    if entry is None:
+        reason = (
+            f"{device!r} has not verified quantization method {quant_method!r} at all"
+        )
+    elif not entry.allows_shape(is_moe=is_moe):
+        reason = f"{device!r} has verified {quant_method!r} but not for a {shape} model"
+    else:
+        reason = (
+            f"{device!r} verified {quant_method!r} only for configs its entry "
+            f"accepts, and this config is not one"
+        )
     raise UnsupportedQuantForIPCError(
-        f"[weight_cache:{where}] quantization method {quant_method!r} is not "
-        f"verified for CUDA IPC zero-copy weight sharing. Its "
-        f"process_weights_after_loading may stamp Python-side metadata "
-        f"(e.g. format_ue8m0) or repack/transpose weights into shapes the "
-        f"meta-initialized client cannot reproduce, which would silently serve "
-        f"wrong-numerics weights. Verified methods: {verified}. Note: FP8 is "
-        f"only verified for block-wise configs (weight_block_size set), not "
-        f"per-tensor FP8. Disable the weight cache (--weight-cache-mode off) "
-        f"for this model."
+        f"[weight_cache:{where}] {reason}, so zero-copy weight sharing is "
+        f"refused for this {shape} model. Its process_weights_after_loading "
+        f"may stamp Python-side metadata (e.g. format_ue8m0) or "
+        f"repack/transpose weights into shapes the meta-initialized client "
+        f"cannot reproduce, which would silently serve wrong-numerics weights. "
+        f"Verified on {device!r}: {verified or 'nothing'}. Note: FP8 is only "
+        f"verified for block-wise configs (weight_block_size set), not "
+        f"per-tensor FP8, and only on CUDA-alike devices. Disable the weight "
+        f"cache (--weight-cache-mode off) for this model."
     )
 
 

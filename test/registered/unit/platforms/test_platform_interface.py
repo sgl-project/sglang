@@ -1312,6 +1312,38 @@ class TestWeightCachePlatformHooks(CustomTestCase):
                 XpuSRTPlatform().validate_weight_cache_allocator()
             FakeXpu().validate_weight_cache_allocator()
 
+    def test_a_platform_without_an_override_keeps_the_cuda_verified_methods(self):
+        """Every device reached this set before the gate was per-platform, so a
+        platform that does not override must still reach it unchanged."""
+        from sglang.srt.weight_cache.protocol import CUDA_IPC_QUANT_SUPPORT
+
+        for platform_cls in (*_TRANSPORT_PLATFORMS, CpuSRTPlatform):
+            with self.subTest(platform=platform_cls.__name__):
+                self.assertIs(
+                    platform_cls().weight_cache_quant_support(),
+                    CUDA_IPC_QUANT_SUPPORT,
+                )
+
+    def test_xpu_verified_only_unquantized_weights(self):
+        """XPU carries weights over Level Zero vmm_fd, not CUDA IPC, so it names
+        its own table; block-wise FP8 is verified for the CUDA transport and must
+        not come along."""
+        from sglang.srt.weight_cache.protocol import XPU_VMM_QUANT_SUPPORT
+
+        table = XpuSRTPlatform().weight_cache_quant_support()
+        self.assertIs(table, XPU_VMM_QUANT_SUPPORT)
+        self.assertEqual(set(table), {""})
+        self.assertTrue(table[""].dense)
+        self.assertFalse(table[""].moe)
+
+    def test_quant_support_is_overridable(self):
+        class FakeXpu(XpuSRTPlatform):
+            def weight_cache_quant_support(self):
+                return {}
+
+        self.assertEqual(FakeXpu().weight_cache_quant_support(), {})
+        self.assertNotEqual(XpuSRTPlatform().weight_cache_quant_support(), {})
+
 
 class TestWeightCacheMemoryAccounting(CustomTestCase):
     def test_platforms_without_an_override_read_the_active_accelerator(self):

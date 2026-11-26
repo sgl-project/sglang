@@ -28,8 +28,13 @@ import torch
 
 import sglang.srt.platforms as platforms_mod
 from sglang.srt.environ import envs
+from sglang.srt.platforms.device_mixin import DeviceMixin
+from sglang.srt.platforms.xpu import XpuDeviceMixin
 from sglang.srt.weight_cache.protocol import (
+    CUDA_IPC_QUANT_SUPPORT,
+    XPU_VMM_QUANT_SUPPORT,
     CacheConfig,
+    QuantIpcSupport,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
@@ -52,7 +57,26 @@ from sglang.srt.weight_cache.transport import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
+BLOCK_FP8 = {"weight_block_size": [128, 128]}
+
+
+def _quant_platform(device_type, support):
+    """Stand in for the active platform with one quantization-support table.
+
+    The gate reads the table off ``current_platform``, so a runner's own device
+    must not decide what these tests assert.
+    """
+    return patch.object(
+        platforms_mod,
+        "current_platform",
+        SimpleNamespace(
+            device_type=device_type,
+            weight_cache_quant_support=lambda: support,
+        ),
+        create=True,
+    )
 
 
 def _make_cache_config(**overrides) -> CacheConfig:
@@ -349,36 +373,168 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
         )
 
 
-class TestIpcQuantAllowlist(CustomTestCase):
-    def test_unquantized_is_supported(self):
-        self.assertTrue(is_ipc_quant_supported("", None))
+class TestIpcQuantAllowlistCudaAlike(CustomTestCase):
+    """The CUDA-alike decisions, which must not change: every platform that does
+    not override the hook reaches this table through the DeviceMixin default."""
+
+    def setUp(self):
+        self.platform = _quant_platform("cuda", CUDA_IPC_QUANT_SUPPORT)
+        self.platform.start()
+        self.addCleanup(self.platform.stop)
+
+    def test_unquantized_is_supported_dense_and_moe(self):
+        self.assertTrue(is_ipc_quant_supported("", None, is_moe=False))
+        self.assertTrue(is_ipc_quant_supported("", None, is_moe=True))
 
     def test_block_fp8_supported_but_per_tensor_fp8_rejected(self):
-        self.assertTrue(
-            is_ipc_quant_supported("fp8", {"weight_block_size": [128, 128]})
-        )
+        self.assertTrue(is_ipc_quant_supported("fp8", BLOCK_FP8, is_moe=False))
+        self.assertTrue(is_ipc_quant_supported("fp8", BLOCK_FP8, is_moe=True))
         # Per-tensor FP8 (no weight_block_size) transposes the weight during
         # post-processing -> not reproducible by the meta-init client.
-        self.assertFalse(is_ipc_quant_supported("fp8", {}))
-        self.assertFalse(is_ipc_quant_supported("fp8", None))
+        self.assertFalse(is_ipc_quant_supported("fp8", {}, is_moe=False))
+        self.assertFalse(is_ipc_quant_supported("fp8", None, is_moe=False))
 
     def test_unknown_method_rejected(self):
-        self.assertFalse(is_ipc_quant_supported("gptq_marlin", None))
-        self.assertFalse(is_ipc_quant_supported("awq", None))
+        self.assertFalse(is_ipc_quant_supported("gptq_marlin", None, is_moe=False))
+        self.assertFalse(is_ipc_quant_supported("awq", None, is_moe=False))
 
     def test_check_raises_on_unsupported(self):
         with self.assertRaises(UnsupportedQuantForIPCError):
-            check_ipc_quant_support("awq", None, where="client")
+            check_ipc_quant_support("awq", None, where="client", is_moe=False)
         # Per-tensor FP8 must also raise even though "fp8" is a known key.
         with self.assertRaises(UnsupportedQuantForIPCError):
-            check_ipc_quant_support("fp8", {}, where="daemon")
+            check_ipc_quant_support("fp8", {}, where="daemon", is_moe=False)
 
     def test_check_passes_on_supported(self):
         # Should not raise.
-        check_ipc_quant_support("", None, where="daemon")
-        check_ipc_quant_support(
-            "fp8", {"weight_block_size": [128, 128]}, where="daemon"
+        check_ipc_quant_support("", None, where="daemon", is_moe=False)
+        check_ipc_quant_support("", None, where="daemon", is_moe=True)
+        check_ipc_quant_support("fp8", BLOCK_FP8, where="daemon", is_moe=True)
+
+
+class TestIpcQuantAllowlistXpu(CustomTestCase):
+    """XPU allows only unquantized dense weights."""
+
+    def setUp(self):
+        self.platform = _quant_platform("xpu", XPU_VMM_QUANT_SUPPORT)
+        self.platform.start()
+        self.addCleanup(self.platform.stop)
+
+    def test_unquantized_dense_is_supported(self):
+        self.assertTrue(is_ipc_quant_supported("", None, is_moe=False))
+        check_ipc_quant_support("", None, where="daemon", is_moe=False)
+
+    def test_unquantized_moe_fails_closed(self):
+        # Dense parity says nothing about MoE expert weights, which take their
+        # own create_weights branch; no real MoE checkpoint has been compared.
+        self.assertFalse(is_ipc_quant_supported("", None, is_moe=True))
+        for where in ("daemon", "client"):
+            with self.assertRaises(UnsupportedQuantForIPCError) as caught:
+                check_ipc_quant_support("", None, where=where, is_moe=True)
+            self.assertIn("not for a MoE model", str(caught.exception))
+
+    def test_every_quantized_method_fails_closed(self):
+        # Block FP8 included, which CUDA has verified: a method is verified per
+        # platform, and nothing establishes that the XPU vmm_fd manifest carries
+        # what an XPU FP8 post-process leaves behind.
+        for method, config in (
+            ("fp8", BLOCK_FP8),
+            ("fp8", {}),
+            ("mxfp4", None),
+            ("w8a8_int8", None),
+            ("awq", None),
+            ("gptq_marlin", None),
+            ("compressed-tensors", None),
+        ):
+            for is_moe in (False, True):
+                with self.subTest(method=method, is_moe=is_moe):
+                    self.assertFalse(
+                        is_ipc_quant_supported(method, config, is_moe=is_moe)
+                    )
+                    with self.assertRaises(UnsupportedQuantForIPCError):
+                        check_ipc_quant_support(
+                            method, config, where="daemon", is_moe=is_moe
+                        )
+
+    def test_error_names_the_platform_and_the_model_shape(self):
+        with self.assertRaises(UnsupportedQuantForIPCError) as caught:
+            check_ipc_quant_support("awq", None, where="client", is_moe=True)
+        message = str(caught.exception)
+        self.assertIn("'xpu'", message)
+        self.assertIn("MoE", message)
+        self.assertIn("'awq'", message)
+
+
+class TestIpcQuantAllowlistPlatformIsolation(CustomTestCase):
+    """A method verified on one device must not become enabled on another."""
+
+    def test_cuda_verification_does_not_enable_xpu(self):
+        with _quant_platform("cuda", CUDA_IPC_QUANT_SUPPORT):
+            self.assertTrue(is_ipc_quant_supported("fp8", BLOCK_FP8, is_moe=False))
+        with _quant_platform("xpu", XPU_VMM_QUANT_SUPPORT):
+            self.assertFalse(is_ipc_quant_supported("fp8", BLOCK_FP8, is_moe=False))
+
+    def test_xpu_entries_cannot_widen_what_a_cuda_alike_device_serves(self):
+        # Every XPU entry is also a CUDA-alike entry, and no narrower there, so
+        # adding to the XPU table can never enable something on another device.
+        for method, support in XPU_VMM_QUANT_SUPPORT.items():
+            with self.subTest(method=method):
+                self.assertIn(method, CUDA_IPC_QUANT_SUPPORT)
+                cuda = CUDA_IPC_QUANT_SUPPORT[method]
+                self.assertTrue(cuda.dense or not support.dense)
+                self.assertTrue(cuda.moe or not support.moe)
+
+    def test_real_platform_classes_hand_out_the_expected_tables(self):
+        # Called off the class: neither override reads self, and instantiating a
+        # platform would need its device present on the runner.
+        self.assertIs(
+            DeviceMixin.weight_cache_quant_support(None), CUDA_IPC_QUANT_SUPPORT
         )
+        self.assertIs(
+            XpuDeviceMixin.weight_cache_quant_support(None), XPU_VMM_QUANT_SUPPORT
+        )
+
+    def test_xpu_allows_nothing_quantized_at_all(self):
+        self.assertEqual(set(XPU_VMM_QUANT_SUPPORT), {""})
+
+
+class TestQuantIpcSupportShapeGating(CustomTestCase):
+    """Dense and MoE gate independently, and an absent entry fails closed."""
+
+    def test_dense_only_entry_refuses_moe(self):
+        table = {"": QuantIpcSupport(dense=True, moe=False)}
+        with _quant_platform("xpu", table):
+            self.assertTrue(is_ipc_quant_supported("", None, is_moe=False))
+            self.assertFalse(is_ipc_quant_supported("", None, is_moe=True))
+            with self.assertRaises(UnsupportedQuantForIPCError) as caught:
+                check_ipc_quant_support("", None, where="daemon", is_moe=True)
+            self.assertIn("not for a MoE model", str(caught.exception))
+
+    def test_moe_only_entry_refuses_dense(self):
+        table = {"": QuantIpcSupport(dense=False, moe=True)}
+        with _quant_platform("xpu", table):
+            self.assertFalse(is_ipc_quant_supported("", None, is_moe=False))
+            self.assertTrue(is_ipc_quant_supported("", None, is_moe=True))
+
+    def test_empty_table_refuses_everything(self):
+        with _quant_platform("npu", {}):
+            self.assertFalse(is_ipc_quant_supported("", None, is_moe=False))
+            with self.assertRaises(UnsupportedQuantForIPCError):
+                check_ipc_quant_support("", None, where="daemon", is_moe=False)
+
+    def test_requires_predicate_runs_after_the_shape_gate(self):
+        calls = []
+
+        def requires(config):
+            calls.append(config)
+            return True
+
+        table = {"fp8": QuantIpcSupport(dense=True, moe=False, requires=requires)}
+        with _quant_platform("cuda", table):
+            self.assertFalse(is_ipc_quant_supported("fp8", BLOCK_FP8, is_moe=True))
+            self.assertEqual(calls, [])
+            self.assertTrue(is_ipc_quant_supported("fp8", BLOCK_FP8, is_moe=False))
+            self.assertEqual(calls, [BLOCK_FP8])
 
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):
@@ -461,14 +617,16 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
     def _model_config(self):
         from types import SimpleNamespace
 
-        # Minimal stand-in: the loader only reads hf_config.quantization_config,
-        # quantization, and (unreached here) hf_config.architectures.
+        # Minimal stand-in: the loader reads hf_config.quantization_config,
+        # quantization, and hf_config.architectures plus hf_text_config, which
+        # the quantization gate walks to tell a dense checkpoint from an MoE one.
         hf_config = SimpleNamespace(
             architectures=["LlamaForCausalLM"], quantization_config=None
         )
         return SimpleNamespace(
             model_path="/models/demo",
             hf_config=hf_config,
+            hf_text_config=hf_config,
             quantization=None,
             revision=None,
             dtype="torch.float16",
