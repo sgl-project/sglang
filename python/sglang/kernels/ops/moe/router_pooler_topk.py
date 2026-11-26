@@ -18,11 +18,14 @@ Router ids follow the unfused routing sequence; the pooler and router projection
 FP32 summation order (and, for the joint form, the two-part BF16 router weights).
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.gemm.bf16_splitk_gemm import bf16_splitk_gemm_partials
 from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
     _bm,
@@ -425,24 +428,38 @@ def _joint_finish(
     return scores, ids, expert_input
 
 
-# FP8 joint form, BM -> (BN, BK, SK, warps, stages): one launch whose first 4096 / BN programs per K split run the
-# pooler tile from the FP8 activation and weight and whose last 512 / BN run the router rows from BF16, all
-# writing the same ``[SK, M, 4608]`` partials. Tuned on MI355X (bench_joint_fp8.py).
+# FP8 joint form: one launch whose first 4096 / BN programs per K split run the pooler tile from the FP8
+# activation and weight and whose remaining programs run the router rows from BF16, all writing the same
+# ``[SK, M, 4608]`` partials. Launch rules from a kernelforge campaign on MI355X, accepted on every M in 17..512
+# with cold (HBM-resident) weights; see joint_router_pooler_topk_fp8.
+# BM -> (TILE_M, BN, BK, SK, warps, stages, BN_R, BK_R, waves_per_eu or 0, R_MS).
+# M <= 128: few wide programs with deep pipelines (1 WG/CU, ~125-150 KB LDS) beat many small ones: BN128 cuts the
+# A-tile re-staging (A L2 traffic ~ 4096/BN * M * K), and the BF16 router gets a narrower tile (BN_R 32, 16 programs
+# per K slice) so router programs stream half the pooler's weight bytes and never sit on the critical path.
+# 192 programs at SK4. Measured (GEMM + SK sum): M24 18.0 -> 14.7 us, M40 21.7 -> 15.7, M128 31.0 -> 21.7.
+# M > 128: one 256-row M tile per weight tile (the 128-row tiles re-streamed every weight byte per M tile from HBM),
+# with the router's 256 rows split R_MS=2 ways so its bf16-A-heavy programs are no longer than the pooler's.
+# Measured (GEMM + SK sum): M168 36.1 -> 25.9 us, M224 40.4 -> 28.2, M320 49.3 -> 42.3, M512 71.3 -> 52.5.
 FP8_JOINT = {
-    32: (64, 256, 4, 8, 3),
-    64: (32, 128, 4, 4, 2),
-    128: (64, 128, 4, 8, 3),
-    256: (64, 128, 4, 8, 3),
-    512: (128, 128, 4, 8, 2),
+    32: (32, 128, 256, 4, 8, 3, 32, 128, 0, 1),
+    64: (64, 128, 256, 4, 8, 3, 32, 128, 0, 1),
+    128: (128, 128, 128, 4, 8, 3, 32, 128, 0, 1),
+    256: (256, 128, 128, 4, 8, 3, 64, 128, 0, 2),
+    512: (256, 128, 128, 4, 8, 3, 64, 128, 0, 2),
 }
-# Measured 10-23 (bench_joint_fp8.py): 21-22 us at 24-32 rows vs 26.9 for the aiter BF16 launch. MI355X, whole
-# front (GEMM + epilogue) in CUDA graphs, vs the BF16 row-major joint: 28.3 -> 25.4 us at 40 rows, 30.0 -> 27.3 at
-# 64, 35.7 -> 30.1 at 72, 41.6 -> 34.9 at 128; vs the unfused router GEMM + routing + BF16 pooler + norm above 128
-# rows: 79.1 -> 38.2 us at 136, 89.2 -> 46.7 at 256, 106.0 -> 54.1 at 384, 131.5 -> 71.5 at 512.
 FP8_JOINT_MIN_M = 17
 FP8_JOINT_MAX_M = 512
-# Largest row tile of the FP8 joint partials; more rows take more tiles along the grid's third axis.
-FP8_JOINT_MAX_TILE_M = 128
+
+
+def _xcd_map(m: int) -> int:
+    # Rules over M from an interleaved GEMM+SK-sum sweep of every multiple of 8 in 24..512 (+17, 23, 33, 41, 97, 217),
+    # 8 cold weight sets, deltas vs canonical: map 1 -0.5..-0.9 us at M <= 40; map 2 -0.1..-0.6 us at 41..96 and
+    # -0.2..-3.2 us above 216. In between (97..216) both maps slow the following SK sum (+0.2..+2.6 us), so canonical.
+    if m <= 40:
+        return 1
+    if m <= 96 or m > 216:
+        return 2
+    return 0
 
 
 @triton.jit
@@ -458,39 +475,81 @@ def _joint_fp8_partial(
     BK: tl.constexpr,
     SK: tl.constexpr,
     POOLER_TILES: tl.constexpr,
+    BN_R: tl.constexpr,
+    BK_R: tl.constexpr,
+    R_MS: tl.constexpr,
+    XCD_MAP: tl.constexpr = 0,
 ):
     N: tl.constexpr = 4608
     K: tl.constexpr = 8192
     KT_PER: tl.constexpr = K // BK // SK
-    pn, pk, pm = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    m = pm * BM + tl.arange(0, BM)
-    kk = pk * KT_PER * BK + tl.arange(0, BK)
-    nn = tl.arange(0, BN)
-    acc = tl.zeros((BM, BN), tl.float32)
-    # Distinct names per branch: Triton merges same-named values across the if / else and the FP8 and BF16
-    # pointers do not share a type.
+    KT_R: tl.constexpr = K // BK_R // SK
+    pid0, pid1, pm = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    # XCD-aware program-ID remap. The hardware deals workgroups round-robin over the 8 XCDs by linear ID
+    # hw = pid0 + G0*pid1 (+ G0*SK*pid2; G0*SK % 8 == 0 keeps hw % 8 the XCD and each pm slab a separate bijection).
+    # Canonically XCD x gets every pk for pn = x mod 8, so every XCD streams the whole activation into its own L2.
+    #   XCD_MAP 1: XCD x owns one K slice (pk = x // 2): activation L2 traffic / 4. Best at small M.
+    #   XCD_MAP 2: each XCD owns 2 K slices, each pk is spread over 4 XCDs, and every XCD keeps the canonical
+    #              16 pooler + 8 router mix with pooler dispatched first. Halves the activation traffic without the
+    #              SK-sum slowdown map 1 causes at larger M.
+    # Every map is a bijection onto (pn, pk), so results are bitwise identical to the canonical order.
+    G0: tl.constexpr = POOLER_TILES + R_MS * (512 // BN_R)
+    if XCD_MAP == 1 and (G0 * SK) % 8 == 0:
+        PER: tl.constexpr = G0 * SK // 8
+        hw = pid0 + G0 * pid1
+        lin = (hw % 8) * PER + hw // 8
+        pn = lin % G0
+        pk = lin // G0
+    elif XCD_MAP == 2 and SK == 4 and G0 % 4 == 0:
+        hw = pid0 + G0 * pid1
+        xcd = hw % 8
+        j = hw // 8
+        pk = 2 * (xcd % 2) + j % 2
+        pn = 4 * (j // 2) + xcd // 2
+    else:
+        pn = pid0
+        pk = pid1
+    k0 = pk * (K // SK)
     if pn < POOLER_TILES:
-        n = pn * BN + nn
+        # FP8 pooler tile: (BM, BN) over this program's K slice.
+        m = pm * BM + tl.arange(0, BM)
+        n = pn * BN + tl.arange(0, BN)
+        kk = k0 + tl.arange(0, BK)
         xq_ptr = XQ + m[:, None] * K + kk[None, :]
         wq_ptr = WQ + n[None, :].to(tl.int64) * K + kk[:, None]
+        acc = tl.zeros((BM, BN), tl.float32)
         for _ in range(KT_PER):
             aq = tl.load(xq_ptr, mask=m[:, None] < M, other=0.0)
             bq = tl.load(wq_ptr, cache_modifier=".cg")
             acc = tl.dot(aq, bq, acc)
             xq_ptr += BK
             wq_ptr += BK
+        tl.store(P + pk * M * N + m[:, None] * N + n[None, :], acc, mask=m[:, None] < M)
     else:
-        n = (pn - POOLER_TILES) * BN + nn
-        x_ptr = X + m[:, None] * K + kk[None, :]
-        wr_ptr = WR + n[None, :].to(tl.int64) * K + kk[:, None]
-        for _ in range(KT_PER):
-            ax = tl.load(x_ptr, mask=m[:, None] < M, other=0.0)
+        # BF16 router tile: its own (BN_R, BK_R) and an R_MS-way row split of the M tile, so router programs (whose
+        # bf16 A slice dominates their bytes) stay no longer than the pooler programs.
+        RT: tl.constexpr = 512 // BN_R
+        BM_R: tl.constexpr = BM // R_MS
+        r = pn - POOLER_TILES
+        nt = r % RT
+        ms = r // RT
+        mr = pm * BM + ms * BM_R + tl.arange(0, BM_R)
+        nr = nt * BN_R + tl.arange(0, BN_R)
+        kr = k0 + tl.arange(0, BK_R)
+        x_ptr = X + mr[:, None] * K + kr[None, :]
+        wr_ptr = WR + nr[None, :].to(tl.int64) * K + kr[:, None]
+        accr = tl.zeros((BM_R, BN_R), tl.float32)
+        for _ in range(KT_R):
+            ax = tl.load(x_ptr, mask=mr[:, None] < M, other=0.0)
             bx = tl.load(wr_ptr, cache_modifier=".cg")
-            acc = tl.dot(ax, bx, acc)
-            x_ptr += BK
-            wr_ptr += BK
-        n += 4096
-    tl.store(P + pk * M * N + m[:, None] * N + n[None, :], acc, mask=m[:, None] < M)
+            accr = tl.dot(ax, bx, accr)
+            x_ptr += BK_R
+            wr_ptr += BK_R
+        tl.store(
+            P + pk * M * N + mr[:, None] * N + (nr + 4096)[None, :],
+            accr,
+            mask=mr[:, None] < M,
+        )
 
 
 def quantize_joint_pooler(packed):
@@ -501,10 +560,19 @@ def quantize_joint_pooler(packed):
     return quantized
 
 
+@functools.lru_cache(maxsize=1)
+def _fp8_joint_runs_here() -> bool:
+    """The FP8 joint kernel targets gfx950: its launch table needs up to ~150 KB of LDS per workgroup (gfx950 has
+    160 KB per CU) and it uses OCP FP8 e4m3. Elsewhere callers fall back to the BF16 joint / shared forms."""
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950"
+
+
 def joint_router_pooler_fp8_applies(xq, packed, pooler_fp8) -> bool:
     """Rows the FP8 joint form serves: the per-row FP8 activation ``xq`` of up to ``FP8_JOINT_MAX_M`` rows."""
     return (
         pooler_fp8 is not None
+        and _fp8_joint_runs_here()
         and xq.dim() == 2
         and xq.is_contiguous()
         and xq.dtype == torch.float8_e4m3fn
@@ -522,10 +590,10 @@ def joint_router_pooler_topk_fp8(
     m, k = x.shape
     assert k == 8192 and packed.shape == (4608, 8192) and xq.shape == x.shape
     wq, ws = pooler_fp8
-    bn, bk, sk, warps, stages = FP8_JOINT[_bm(m)]
-    tile_m = min(_bm(m), FP8_JOINT_MAX_TILE_M)
+    tile_m, bn, bk, sk, warps, stages, bn_r, bk_r, wpe, r_ms = FP8_JOINT[_bm(m)]
     partial = torch.empty((sk, m, 4608), device=x.device, dtype=torch.float32)
-    _joint_fp8_partial[(4608 // bn, sk, triton.cdiv(m, tile_m))](
+    extra = {"waves_per_eu": wpe} if wpe else {}
+    _joint_fp8_partial[(4096 // bn + r_ms * (512 // bn_r), sk, triton.cdiv(m, tile_m))](
         xq,
         x,
         wq,
@@ -537,9 +605,14 @@ def joint_router_pooler_topk_fp8(
         bk,
         sk,
         4096 // bn,
+        bn_r,
+        bk_r,
+        r_ms,
+        _xcd_map(m),
         num_warps=warps,
         num_stages=stages,
         matrix_instr_nonkdim=16,
+        **extra,
     )
     return _joint_finish(
         partial, sk, m, bias, norm, multiplier, scale, eps, quant_out, (xs, ws)
