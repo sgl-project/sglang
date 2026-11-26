@@ -63,7 +63,6 @@ from sglang.srt.utils.log_utils import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
 
-import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
@@ -429,6 +428,7 @@ from sglang.srt.utils import (
     is_hip,
     is_mps,
     kill_itself_when_parent_died,
+    notify_parent_of_failure,
     rank_consensus_checker,
     set_gpu_proc_affinity,
     set_random_seed,
@@ -7300,7 +7300,6 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
-    parent_process = psutil.Process().parent()
 
     # Set up tracing
     if get_observability().enable_trace:
@@ -7334,7 +7333,7 @@ def run_scheduler_process(
         hit_exception = True
         if scheduler is not None:
             scheduler.dump_requests_before_crash()
-        parent_process.send_signal(signal.SIGQUIT)
+        notify_parent_of_failure()
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.
         if envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
