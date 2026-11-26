@@ -28,7 +28,10 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    get_schedule,
     get_spec,
+    max_prefill_buffer_tokens,
+    max_speculative_num_draft_tokens,
 )
 
 logger = logging.getLogger(__name__)
@@ -549,6 +552,27 @@ def _validate_triton_sparse_mla_backend(
             )
 
 
+def _padded_sparse_top_k(top_k: int) -> int:
+    """The top-k width the raw-FP8 sparse MLA kernels read: a multiple of 4."""
+    return (top_k + 3) // 4 * 4
+
+
+def _prims_ts_prefill_max_rows(max_context_len: int) -> int:
+    """Query rows of the largest prefill batch, including PP dynamic-chunk growth."""
+    chunked_limit = max_prefill_buffer_tokens()
+    if chunked_limit > 0:
+        return chunked_limit
+    return max(max_context_len, get_schedule().max_prefill_tokens or 0)
+
+
+def _prims_ts_decode_max_rows(max_running_requests: int) -> int:
+    """Query rows of the largest decode or target-verify batch: one per draft token."""
+    cg_config = get_exec().graph.cuda_graph_config
+    graph_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
+    requests = max(max_running_requests, graph_max_bs, 1)
+    return requests * (max_speculative_num_draft_tokens() or 1)
+
+
 def _validate_prims_ts_dcp(*, dcp_size: int, shards_index_k: bool) -> None:
     # Prims-TS partials carry a natural-log LSE, but the DCP combine merges DSA
     # partials base e only under sharded index-K (is_mla_dcp_lse_base_on_e).
@@ -756,6 +780,7 @@ class DeepseekSparseAttnBackend(
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+    draft_decode_len: int = 0
 
     def _call_flash_mla_sparse_fwd_small_heads(self, *args):
         from sglang.kernels.ops.attention.flash_mla_interface import (
@@ -802,6 +827,10 @@ class DeepseekSparseAttnBackend(
         hf_config = model_runner.model_config.hf_config
         self.use_dsa = is_deepseek_dsa(hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
+        if speculative_num_steps and getattr(
+            hf_config, "dsa_draft_attends_to_own_chain", False
+        ):
+            self.draft_decode_len = speculative_step_id + 1
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
@@ -931,6 +960,32 @@ class DeepseekSparseAttnBackend(
                 qk_rope_head_dim=self.qk_rope_head_dim,
             )
             self._prims_ts = PrimsTSSparseMLA(torch.device(self.device))
+            # Compile before serving, not on first use. Prefill attends with
+            # this rank's heads; decode, target verify and draft extend with
+            # the DCP-gathered heads.
+            prepare_max_rows: dict[int, int] = {}
+            for impl, heads, max_rows in (
+                (
+                    self.dsa_prefill_impl,
+                    self.local_num_q_heads,
+                    _prims_ts_prefill_max_rows(self.max_context_len),
+                ),
+                (
+                    self.dsa_decode_impl,
+                    self.num_q_heads,
+                    _prims_ts_decode_max_rows(model_runner.max_running_requests),
+                ),
+            ):
+                if impl == "prims_ts":
+                    prepare_max_rows[heads] = max(
+                        max_rows, prepare_max_rows.get(heads, 0)
+                    )
+            for heads, max_rows in prepare_max_rows.items():
+                self._prims_ts.prepare(
+                    heads=heads,
+                    max_rows=max_rows,
+                    width=_padded_sparse_top_k(self.dsa_index_topk),
+                )
         self._trtllm_q_pad_graph: Optional[torch.Tensor] = None
         self.flashmla_kv_num_q_heads_prefill = _flashmla_kv_padded_heads(
             self.local_num_q_heads
@@ -1312,7 +1367,7 @@ class DeepseekSparseAttnBackend(
         self, page_table_1: torch.Tensor
     ) -> Tuple[torch.Tensor, int]:
         sparse_mla_top_k = page_table_1.shape[1]
-        padded_top_k = ((sparse_mla_top_k + 3) // 4) * 4
+        padded_top_k = _padded_sparse_top_k(sparse_mla_top_k)
         if padded_top_k == sparse_mla_top_k:
             return page_table_1, sparse_mla_top_k
         padding = torch.full(
@@ -1469,6 +1524,12 @@ class DeepseekSparseAttnBackend(
     def update_verify_buffers_to_fill_after_draft(self, *args, **kwargs):
         return None
 
+    def _with_draft_chain(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        # A chain draft step attends to the prefix plus its own earlier drafts.
+        if self.draft_decode_len:
+            return seq_lens + self.draft_decode_len
+        return seq_lens
+
     def _graph_page_table_width(self, metadata: DSAMetadata) -> int:
         """Column count to scan req_to_token during graph replay. Reads the wide
         page_table_1 width when present, else req_to_token's width (the wide table
@@ -1577,6 +1638,8 @@ class DeepseekSparseAttnBackend(
 
         if forward_batch.forward_mode.is_target_verify():
             draft_token_num = self.speculative_num_draft_tokens
+        elif forward_batch.forward_mode.is_decode_or_idle():
+            draft_token_num = self.draft_decode_len
         else:
             draft_token_num = 0
 
@@ -2144,6 +2207,7 @@ class DeepseekSparseAttnBackend(
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
+            seq_lens = self._with_draft_chain(seq_lens)
             cache_seqlens_int32 = seq_lens.to(torch.int32)
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
 
@@ -2324,6 +2388,7 @@ class DeepseekSparseAttnBackend(
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
+            seq_lens = self._with_draft_chain(seq_lens)
 
             if (
                 (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
@@ -5243,6 +5308,23 @@ class DeepseekSparseAttnMultiStepBackend:
 
     def _init_forward_metadata_replay(self, forward_batch: ForwardBatch) -> None:
         bs = forward_batch.batch_size
+        # Chain steps have different KV lengths and cannot share replay metadata.
+        if self.attn_backends[0].draft_decode_len:
+            for backend in self.attn_backends:
+                precomputed = backend._precompute_replay_metadata(
+                    bs=bs,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                    forward_mode=ForwardMode.DECODE,
+                )
+                backend.init_forward_metadata_replay_cuda_graph_from_precomputed(
+                    bs=bs,
+                    precomputed=precomputed,
+                    forward_mode=ForwardMode.DECODE,
+                )
+            return
+
         # Precompute metadata once (shared across all backends)
         precomputed = self.attn_backends[0]._precompute_replay_metadata(
             bs=bs,

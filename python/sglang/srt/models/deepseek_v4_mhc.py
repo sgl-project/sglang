@@ -42,6 +42,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
@@ -654,6 +655,11 @@ def _combine(
 # ---------------------------------------------------------------------------
 
 
+def combine_premix(x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+    """Collapse ``[T, mult, H]`` with a pre-mix, accumulating in FP32."""
+    return (pre.unsqueeze(-1) * x.float()).sum(dim=1).to(x.dtype)
+
+
 def post(
     cfg: HcConfig,
     x: torch.Tensor,
@@ -667,6 +673,10 @@ def post(
 
     if _is_npu:
         if cfg.pre_from_prev:
+            if not is_npu_arch35():
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import post_torch
+
+                return post_torch(x, residual, post_mix, comb)
             # V4.1 (A5) CANN mhc_post(x, hRes, hOut, hPost): the residual is
             # the base stream, comb its res-mixing matrix, x the sublayer
             # output and post its post-mix.

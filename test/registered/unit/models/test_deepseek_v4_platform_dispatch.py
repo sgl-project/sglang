@@ -277,7 +277,7 @@ class TestNpuMhcSeam(unittest.TestCase):
             rows * self.MULT * self.HIDDEN, dtype=torch.float32
         ).reshape(rows, self.MULT, self.HIDDEN)
 
-    def test_npu_combine_folds_the_previous_premix_and_stashes_the_triplet(self):
+    def test_a3_combine_folds_the_previous_premix_and_stashes_the_triplet(self):
         hc = self._sub_layer()
         x = self._residual()
         pre_prev = torch.full((2, self.MULT), 0.25)
@@ -298,9 +298,11 @@ class TestNpuMhcSeam(unittest.TestCase):
         stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
+            patch.object(mhc, "is_npu_arch35", return_value=False),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
+            self.assertIs(mhc.mix_stats_from_state(hc, x, state), state.stats)
 
         torch.testing.assert_close(out, x.float().mean(1))
         # The residual, the layer's weights and the flow config go in
@@ -344,6 +346,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
+            patch.object(mhc, "is_npu_arch35", return_value=True),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
@@ -391,6 +394,7 @@ class TestNpuMhcSeam(unittest.TestCase):
 
         with (
             patch.object(mhc, "_is_npu", True),
+            patch.object(mhc, "is_npu_arch35", return_value=True),
             patch.object(
                 torch,
                 "ops",
