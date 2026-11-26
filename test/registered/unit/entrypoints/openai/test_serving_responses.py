@@ -3,7 +3,7 @@ import asyncio
 import functools
 import sys
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -2175,6 +2175,130 @@ class StreamingLogprobsRejectionTestCase(CustomTestCase):
         self.assertEqual(result.status_code, 400)
         body = orjson.loads(result.body)
         self.assertIn("streaming mode", body["error"]["message"])
+
+
+class AutoToolStreamingTestCase(CustomTestCase):
+    def setUp(self):
+        self.serving = make_serving()
+        self.serving.reasoning_parser = None
+        self.serving.tool_call_parser = "hermes"
+        self.request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            tool_choice="auto",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+
+    def test_auto_tools_stream_plain_text_before_generation_finishes(self):
+        """Declaring automatic tools must not delay text until generation ends."""
+
+        async def run():
+            release = asyncio.Event()
+
+            async def generate():
+                yield engine_chunk("Hello")
+                await release.wait()
+                yield engine_chunk("Hello world!", 3, finish=True)
+
+            async with aclosing(
+                self.serving.responses_stream_generator_non_harmony(
+                    self.request,
+                    sampling_params={},
+                    result_generator=generate(),
+                    model_name="x",
+                    tokenizer=Mock(),
+                    request_metadata=RequestResponseMetadata(
+                        request_id=self.request.request_id
+                    ),
+                    require_reasoning=False,
+                )
+            ) as stream:
+                opening = event_payloads(
+                    [await asyncio.wait_for(anext(stream), timeout=5) for _ in range(5)]
+                )
+                self.assertEqual(
+                    [event["type"] for event in opening],
+                    [
+                        "response.created",
+                        "response.in_progress",
+                        "response.output_item.added",
+                        "response.content_part.added",
+                        "response.output_text.delta",
+                    ],
+                )
+                self.assertIsNone(opening[2]["item"].get("phase"))
+                self.assertEqual(opening[-1]["delta"], "Hello")
+
+                release.set()
+                closing = event_payloads([event async for event in stream])
+
+            self.assertEqual(
+                [event["type"] for event in closing],
+                [
+                    "response.output_text.delta",
+                    "response.output_text.done",
+                    "response.content_part.done",
+                    "response.output_item.done",
+                    "response.completed",
+                ],
+            )
+            self.assertEqual(opening[-1]["delta"] + closing[0]["delta"], "Hello world!")
+            self.assertEqual(closing[1]["text"], "Hello world!")
+            self.assertEqual(closing[2]["part"]["text"], "Hello world!")
+            (message,) = closing[-1]["response"]["output"]
+            self.assertEqual(closing[3]["item"], message)
+            self.assertEqual(message["phase"], "final_answer")
+            self.assertEqual(message["content"][0]["text"], "Hello world!")
+
+        asyncio.run(run())
+
+    def test_auto_tool_call_arguments_stream(self):
+        text = "I'll check."
+        call_start = text + '<tool_call>{"name": "get_weather",'
+        call_args = call_start + ' "arguments": {"city": "Paris"'
+        payloads = event_payloads(
+            StreamFixture(self.serving, self.request).run(
+                [
+                    engine_chunk(text),
+                    engine_chunk(call_start, 2),
+                    engine_chunk(call_args, 3),
+                    engine_chunk(call_args + "}}</tool_call>", 4, finish=True),
+                ]
+            )
+        )
+
+        added = [
+            p["item"] for p in payloads if p["type"] == "response.output_item.added"
+        ]
+        done = [p["item"] for p in payloads if p["type"] == "response.output_item.done"]
+        self.assertEqual([item["type"] for item in added], ["message", "function_call"])
+        self.assertEqual(payloads[-1]["type"], "response.completed")
+        self.assertEqual(done, payloads[-1]["response"]["output"])
+        message, call = done
+        self.assertEqual(message["phase"], "commentary")
+        self.assertEqual(message["content"][0]["text"], text)
+        self.assertEqual(call["id"], added[1]["id"])
+        self.assertEqual(call["name"], "get_weather")
+        self.assertEqual(call["status"], "completed")
+        arguments = "".join(
+            p["delta"]
+            for p in payloads
+            if p["type"] == "response.function_call_arguments.delta"
+        )
+        (arguments_done,) = [
+            p for p in payloads if p["type"] == "response.function_call_arguments.done"
+        ]
+        self.assertEqual(arguments, arguments_done["arguments"])
+        self.assertEqual(arguments, call["arguments"])
+        self.assertEqual(orjson.loads(arguments), {"city": "Paris"})
 
 
 STORE_DISABLED_MESSAGE = (

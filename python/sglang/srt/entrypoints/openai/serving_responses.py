@@ -2665,11 +2665,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         require_reasoning: bool,
         tool_adapter=None,
     ) -> AsyncGenerator[str, None]:
-        pending: list[dict] = []
-        can_call_tools = (
-            bool(self._response_tools_to_chat_tools(request))
-            and request.effective_tool_choice() != "none"
-        )
         async for event in self._responses_stream_generator_non_harmony(
             request,
             sampling_params,
@@ -2681,36 +2676,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             require_reasoning=require_reasoning,
             tool_adapter=tool_adapter,
         ):
-            if not event:
-                continue
-            if not can_call_tools:
-                yield event
-                continue
-            payload = orjson.loads(event.split("data: ", 1)[1])
-            event_type = payload["type"]
-            item_type = payload.get("item", {}).get("type")
-            opens_item = event_type == "response.output_item.added"
-            if pending or (opens_item and item_type == "message"):
-                pending.append(payload)
-                tool_follows = opens_item and item_type in (
-                    "function_call",
-                    "custom_tool_call",
-                    "shell_call",
-                    "tool_search_call",
-                )
-                terminal = event_type in (
-                    "response.completed",
-                    "response.incomplete",
-                    "response.failed",
-                )
-                if tool_follows or terminal:
-                    phase = "commentary" if tool_follows else "final_answer"
-                    for buffered in pending:
-                        if buffered.get("item", {}).get("type") == "message":
-                            buffered["item"]["phase"] = phase
-                        yield f"event: {buffered['type']}\ndata: {orjson.dumps(buffered).decode()}\n\n"
-                    pending.clear()
-            else:
+            # The tool adapter can suppress events.
+            if event:
                 yield event
 
     async def _responses_stream_generator_non_harmony(
@@ -2742,7 +2709,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             event_type = getattr(event, "type", "unknown")
             payload = event.model_dump()
             if isinstance(getattr(event, "item", None), ResponseOutputMessage):
-                payload["item"] = event.item.model_dump()
+                payload["item"] = event.item.model_dump(
+                    exclude={"phase"} if event.item.phase is None else None
+                )
             if tool_adapter is not None:
                 # An event the adapter suppresses takes no sequence number.
                 payload = tool_adapter.event(payload)
@@ -2776,16 +2745,14 @@ class OpenAIServingResponses(OpenAIServingChat):
         tool_choice = request.effective_tool_choice()
         required_json = self._uses_required_tool_json(request, chat_tools)
         client_tool_search = self._client_tool_search(request)
+        parse_tool_calls = self._tool_call_parsing_enabled(request, chat_tools)
         encoding_output = self._encoding_output()
         token_stream = (
             encoding_output.new_responses_stream(
                 request=request,
                 require_reasoning=require_reasoning,
                 separate_reasoning=bool(self.reasoning_parser),
-                parse_tool_calls=(
-                    self._tool_call_parsing_enabled(request, chat_tools)
-                    and not required_json
-                ),
+                parse_tool_calls=parse_tool_calls and not required_json,
             )
             if encoding_output is not None
             else None
@@ -2795,7 +2762,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             tool_parser = JsonArrayParser()
         elif (
             token_stream is None
-            and self._tool_call_parsing_enabled(request, chat_tools)
+            and parse_tool_calls
             and not request._response_parser_json_response_format
         ):
             tool_parser = FunctionCallParser(
@@ -2809,6 +2776,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request._response_parser_grammar_start,
                 ),
             )
+        # A later call can make this message commentary. Stream it as soon as
+        # it opens, with phase omitted until the output order resolves it.
+        can_call_tools = tool_parser is not None or (
+            token_stream is not None and parse_tool_calls
+        )
+        initial_message_phase = None if can_call_tools else "final_answer"
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if token_stream is None and self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(
@@ -2963,7 +2936,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return item_id
 
-        def _close_message_item():
+        def _close_message_item(*, phase):
             if not message_state["open"]:
                 return []
             text = message_state["text"]
@@ -2976,7 +2949,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 role="assistant",
                 content=[text_content],
                 status="completed",
-                phase="final_answer",
+                phase=phase,
             )
             events = [
                 _send_event(
@@ -3179,7 +3152,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
                 if reasoning_chunk:
                     if message_state["open"]:
-                        for ev in _close_message_item():
+                        for ev in _close_message_item(phase=initial_message_phase):
                             yield ev
                     if not reasoning_state["open"]:
                         item_id = _open_reasoning_item()
@@ -3278,13 +3251,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                             for ev in _close_reasoning_item():
                                 yield ev
                         if message_state["open"]:
-                            for ev in _close_message_item():
+                            for ev in _close_message_item(phase="commentary"):
                                 yield ev
-
-                    if calls:
-                        for item in emitted_items:
-                            if isinstance(item, ResponseOutputMessage):
-                                item.phase = "commentary"
 
                     for call in calls:
                         tool_index = call.tool_index
@@ -3425,7 +3393,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                         role="assistant",
                                         content=[],
                                         status="in_progress",
-                                        phase="final_answer",
+                                        phase=initial_message_phase,
                                     ),
                                 )
                             )
@@ -3496,13 +3464,26 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         for ev in _close_reasoning_item():
             yield ev
-        for ev in _close_message_item():
+        for ev in _close_message_item(phase="final_answer"):
             yield ev
         for tool_index in list(tool_call_states):
             for ev in _close_tool_call_state(tool_index):
                 yield ev
 
-        final_output_items = list(emitted_items)
+        # Messages closed by a reasoning chunk may still need their phase.
+        phase = "final_answer"
+        for item in reversed(emitted_items):
+            if isinstance(
+                item,
+                (
+                    ResponseFunctionToolCall,
+                    ResponseCustomToolCall,
+                    ResponseToolSearchCall,
+                ),
+            ):
+                phase = "commentary"
+            elif isinstance(item, ResponseOutputMessage) and item.phase is None:
+                item.phase = phase
 
         usage = UsageInfo(
             prompt_tokens=prompt_tokens,
@@ -3522,7 +3503,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             tool_adapter=tool_adapter,
             model_name=model_name,
             created_time=created_time,
-            output=final_output_items,
+            output=emitted_items,
             status=self._status_from_finish_reason(finish_reason),
             usage=usage,
         )
