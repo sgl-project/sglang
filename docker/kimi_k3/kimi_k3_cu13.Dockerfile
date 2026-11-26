@@ -27,6 +27,7 @@
 FROM lmsysorg/sglang:v0.5.16 AS base
 
 ARG SGL_DEEP_GEMM_VERSION="0.1.5.post1"
+ARG SGL_KERNEL_VERSION="0.4.6"
 
 # Current Kimi-K3 source auto-discovers and builds its PyO3 extensions.
 ARG RUST_VERSION="1.90.0"
@@ -58,7 +59,7 @@ RUN rm -rf /sgl-workspace/sglang && \
     cd /sgl-workspace/sglang && \
     rm -rf .git && \
     test ! -e .git && \
-    pip install -e python --no-deps && \
+    pip install -e python --no-deps "sglang-kernel==${SGL_KERNEL_VERSION}" && \
     rm -rf \
       rust/target \
       rust/sglang-grpc/target \
