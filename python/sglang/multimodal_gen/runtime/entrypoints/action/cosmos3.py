@@ -201,6 +201,9 @@ def build_cosmos3_action_sampling_params(
     prompt = _action_prompt(prompt, batch_size)
     sampling_kwargs = {
         "request_id": payload.get("request_id") or payload.get("id"),
+        "allow_dynamic_batching": (payload.get("runtime") or {}).get(
+            "allow_dynamic_batching"
+        ),
         "prompt": prompt,
         "image_path": image_path,
         "video_path": video_path,

@@ -620,7 +620,9 @@ class HunyuanImage3AR(PipelineStage):
             per_request_joint_infos.append(joints)
         return per_request_joint_infos
 
-    def _encode_conditions(self, per_request_joint_infos, device):
+    def _encode_conditions(
+        self, per_request_joint_infos, device, *, batch_condition_images: bool
+    ):
         flat_infos = [info for joints in per_request_joint_infos for info in joints]
         request_bounds = []
         offset = 0
@@ -639,7 +641,7 @@ class HunyuanImage3AR(PipelineStage):
         # Batched cond encoding is opt-in: the AR backbone is resident on the
         # same device, so full-batch encoding is memory-tight by default.
         batched = None
-        if envs.SGLANG_HI3_COND_ENCODE_BATCHING:
+        if batch_condition_images:
             try:
                 batched = self._encode_conditions_batched(flat_infos, device)
             except (torch.OutOfMemoryError, RuntimeError) as e:
@@ -1191,6 +1193,7 @@ class HunyuanImage3AR(PipelineStage):
             self._normalize_bot_task(req.bot_task),
             req.system_prompt,
             n_cond,
+            req.batch_condition_images,
             req.output_size_mode,
             req.output_strategy,
             req.output_ratio_policy,
@@ -1295,7 +1298,11 @@ class HunyuanImage3AR(PipelineStage):
                 per_request_vae_embeds,
                 per_request_t,
                 per_request_vit_embeds,
-            ) = self._encode_conditions(per_request_joint_infos, device)
+            ) = self._encode_conditions(
+                per_request_joint_infos,
+                device,
+                batch_condition_images=head.batch_condition_images,
+            )
             has_cond_encoded = True
 
         cond_vae_slices_rows = tok["cond_vae_slices_rows"]

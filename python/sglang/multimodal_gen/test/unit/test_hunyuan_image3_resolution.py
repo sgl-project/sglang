@@ -1,13 +1,17 @@
 """Resolution-contract tests for HunyuanImage-3 image generation and editing."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
 import torch
 from PIL import Image
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan_image3 import (
     HunyuanImage3PipelineConfig,
+)
+from sglang.multimodal_gen.configs.sample.hunyuan_image3 import (
+    HunyuanImage3SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
@@ -26,6 +30,23 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
     build_hunyuan_image3_output_geometry,
     resolve_hunyuan_image3_output_resolution,
 )
+
+
+def test_condition_encoding_selects_path_per_request(monkeypatch):
+    monkeypatch.setenv("SGLANG_HI3_COND_ENCODE_BATCHING", "1")
+    stage = object.__new__(HunyuanImage3AR)
+    outputs = ([0], [torch.zeros(1)], [0])
+    stage._encode_conditions_batched = Mock(return_value=outputs)
+    stage._encode_conditions_sequential = Mock(return_value=outputs)
+    for params in (
+        HunyuanImage3SamplingParams(batch_condition_images=False),
+        HunyuanImage3SamplingParams(),
+    ):
+        stage._encode_conditions(
+            [[0]], "cpu", batch_condition_images=params.batch_condition_images
+        )
+    stage._encode_conditions_sequential.assert_called_once_with([0], "cpu")
+    stage._encode_conditions_batched.assert_called_once_with([0], "cpu")
 
 
 def test_edit_without_explicit_size_follows_reference_aspect_ratio():
@@ -180,7 +201,12 @@ def test_decoding_stage_crops_images_and_trajectories_with_one_plan(monkeypatch)
 
     monkeypatch.setattr(DecodingStage, "forward", fake_decode)
     stage = object.__new__(HunyuanImage3DecodingStage)
-    batch = Req(sampling_params=SamplingParams(prompt="test", width=1000, height=700))
+    monkeypatch.setenv("SGLANG_HI3_OUTPUT_CROP", "0")
+    batch = Req(
+        sampling_params=HunyuanImage3SamplingParams(
+            prompt="test", width=1000, height=700, apply_output_geometry=True
+        )
+    )
     batch.extra[OUTPUT_GEOMETRY_EXTRA_KEY] = build_hunyuan_image3_output_geometry(
         1000, 700
     )
@@ -193,18 +219,25 @@ def test_decoding_stage_crops_images_and_trajectories_with_one_plan(monkeypatch)
     assert batch.extra[OUTPUT_GEOMETRY_EXTRA_KEY]["crop_box"] == [14, 0, 1203, 832]
 
 
-def test_output_crop_env_disable_returns_full_native_bucket(monkeypatch):
+@pytest.mark.parametrize(
+    ("env_value", "overrides"), [("0", {}), ("1", {"apply_output_geometry": False})]
+)
+def test_disable_output_geometry_returns_full_native_bucket(
+    monkeypatch, env_value, overrides
+):
     frames = torch.zeros(2, 3, 1, 832, 1216)
 
     def fake_decode(_stage, _batch, _server_args):
         return OutputBatch(output=frames, trajectory_decoded=None)
 
     monkeypatch.setattr(DecodingStage, "forward", fake_decode)
-    assert envs.SGLANG_HI3_OUTPUT_CROP is True
-    monkeypatch.setenv("SGLANG_HI3_OUTPUT_CROP", "0")
-    assert envs.SGLANG_HI3_OUTPUT_CROP is False
+    monkeypatch.setenv("SGLANG_HI3_OUTPUT_CROP", env_value)
     stage = object.__new__(HunyuanImage3DecodingStage)
-    batch = Req(sampling_params=SamplingParams(prompt="test", width=1000, height=700))
+    batch = Req(
+        sampling_params=HunyuanImage3SamplingParams(
+            prompt="test", width=1000, height=700, **overrides
+        )
+    )
     batch.extra[OUTPUT_GEOMETRY_EXTRA_KEY] = build_hunyuan_image3_output_geometry(
         1000, 700
     )

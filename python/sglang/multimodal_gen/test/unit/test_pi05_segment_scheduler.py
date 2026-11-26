@@ -317,6 +317,8 @@ def test_real_action_requests_can_reach_dynamic_batch_admission(monkeypatch):
     for req in (a, b):
         req._dynamic_batch_sig = None
     assert scheduler._can_dynamic_batch(a, b)
+    b.sampling_params.allow_dynamic_batching = False
+    assert not scheduler._can_dynamic_batch(a, b)
     assert scheduler._has_unbatchable_image_conditioning(a, b) is False
     a.image_path = "image.png"
     assert scheduler._has_unbatchable_image_conditioning(a, b) is True

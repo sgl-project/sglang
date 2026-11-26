@@ -101,6 +101,7 @@ def test_action_request_schema_builds_pi05_sampling_params():
         },
         "runtime": {
             "return_timing": "false",
+            "allow_dynamic_batching": False,
             "prefix_cache": False,
             "cuda_graph": "0",
         },
@@ -114,6 +115,7 @@ def test_action_request_schema_builds_pi05_sampling_params():
     assert params.action_dim == 32
     assert params.num_inference_steps == 4
     assert not params.return_timing
+    assert params.allow_dynamic_batching is False
     assert not params.enable_prefix_cache
     assert not params.enable_cuda_graph
     assert params.return_file_paths_only is False

@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
@@ -331,9 +330,7 @@ class HunyuanImage3DecodingStage(DecodingStage):
         geometry = batch.extra.get(OUTPUT_GEOMETRY_EXTRA_KEY)
         if geometry is None or not isinstance(output_batch.output, torch.Tensor):
             return output_batch
-        if not envs.SGLANG_HI3_OUTPUT_CROP:
-            # Env-gated escape hatch: return the full decoded bucket
-            # uncropped; the geometry contract stays in extra.
+        if not batch.apply_output_geometry:
             batch.width = output_batch.output.shape[-1]
             batch.height = output_batch.output.shape[-2]
             return output_batch
