@@ -239,6 +239,7 @@ def test_aiter_accepts_the_registered_sort(monkeypatch, ep_size, ep_rank, m):
         "get_parallel",
         lambda: SimpleNamespace(moe_ep_size=ep_size, moe_ep_rank=ep_rank),
     )
+    monkeypatch.setattr(glm_aiter_presort, "_block_m_lookup", lambda: lambda *k: 32)
     scores, bias = _inputs(m, torch.float32, seed=m)
     hidden = torch.empty((m, MODEL_DIM), dtype=torch.bfloat16, device="cuda")
     w, ids = glm_aiter_presort.route_and_stage(

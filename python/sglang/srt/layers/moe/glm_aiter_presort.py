@@ -54,24 +54,27 @@ def kernel_ready(router_logits: torch.Tensor, correction_bias: torch.Tensor) -> 
         and get_moe_a2a_backend().is_none()
         and glm_route_sort.covered(router_logits, correction_bias)
         and _registrar() is not None
+        and _block_m(router_logits.shape[0]) is not None
         and glm_route_sort.available()
         and glm_route_sort.ready(router_logits.device, router_logits.shape[0])
     )
 
 
-def _block_m(n_tokens: int) -> int:
-    """The block size fused_moe sorted this many tokens with last time.
+def _block_m(n_tokens: int) -> Optional[int]:
+    """The block size fused_moe gave its general-path sort of this many tokens
+    last time, or None if it has not sorted them on that path.
 
-    fused_moe picks it per token count from its tuned configs. Every GLM MoE
-    layer shares one configuration, so the previous call's choice holds; until
-    a call has been seen (the first layer of the first eager pass) the env
-    default stands, and a wrong guess only makes fused_moe sort for itself."""
+    fused_moe picks the pipeline and block size per token count from its tuned
+    configs, and only its general moe_sorting path takes a plain-layout sort;
+    the BM=16 aux-sort pipeline, its fused sort+quant and FLAT sort for
+    themselves. Every GLM MoE layer shares one configuration, so the previous
+    call's choice holds. A batch size fused_moe has not sorted on that path (the
+    first layer of the first pass at it, or one it serves another way) keeps
+    the unfused router rather than pay for a sort fused_moe would redo."""
     lookup = _block_m_lookup()
-    if lookup is not None:
-        seen = lookup(n_tokens, glm_route_sort.NUM_EXPERTS + 1, glm_route_sort.TOPK)
-        if seen is not None:
-            return seen
-    return envs.SGLANG_OPT_HIP_GLM_ROUTE_SORT_BLOCK_M.get()
+    if lookup is None:
+        return None
+    return lookup(n_tokens, glm_route_sort.NUM_EXPERTS + 1, glm_route_sort.TOPK)
 
 
 @functools.cache

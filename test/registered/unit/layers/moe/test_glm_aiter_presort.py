@@ -187,6 +187,62 @@ class TestAiterRunnerRegistersTheStagedSort(CustomTestCase):
         self.assertIs(output, published)
 
 
+class TestRouteAndStage(CustomTestCase):
+    def setUp(self):
+        self.addCleanup(setattr, glm_aiter_presort, "_staged", None)
+
+    def _stage(self, ep_size, ep_rank, block_m):
+        m = 3
+        launches = []
+
+        def route_sort(scores, bias, **kwargs):
+            launches.append(kwargs)
+            return (
+                torch.zeros((m, TOPK)),
+                torch.zeros((m, TOPK), dtype=torch.int32),
+                {"sorted_token_ids": torch.zeros(1, dtype=torch.int32)},
+            )
+
+        with (
+            patch.object(
+                glm_aiter_presort.glm_route_sort, "glm_route_sort", route_sort
+            ),
+            patch.object(
+                glm_aiter_presort,
+                "get_parallel",
+                lambda: SimpleNamespace(moe_ep_size=ep_size, moe_ep_rank=ep_rank),
+            ),
+            patch.object(
+                glm_aiter_presort, "_block_m_lookup", lambda: lambda *key: block_m
+            ),
+        ):
+            weights, ids = glm_aiter_presort.route_and_stage(
+                torch.zeros((m, MODEL_DIM), dtype=torch.bfloat16),
+                torch.zeros((m, 256)),
+                torch.zeros(256),
+                2.5,
+                1.0,
+                True,
+                None,
+            )
+        (kwargs,) = launches
+        return kwargs, glm_aiter_presort.take_staged(ids, weights)
+
+    def test_sorts_with_the_block_m_fused_moe_last_used(self):
+        kwargs, staged = self._stage(1, 0, block_m=64)
+        self.assertEqual(kwargs["block_m"], 64)
+        self.assertEqual(staged["block_m"], 64)
+        self.assertEqual((kwargs["routed_begin"], kwargs["num_routed"]), (0, 256))
+        self.assertIsNone(staged["ep_layout"])
+
+    def test_describes_an_ep_ranks_experts(self):
+        kwargs, staged = self._stage(4, 2, block_m=32)
+        self.assertEqual((kwargs["routed_begin"], kwargs["num_routed"]), (128, 64))
+        self.assertEqual(staged["ep_layout"], (128, 64, 256, 1))
+        self.assertIs(staged["moe_buf"], kwargs["moe_buf"])
+        self.assertEqual(staged["moe_buf_ptr"], kwargs["moe_buf"].data_ptr())
+
+
 class TestKernelReady(CustomTestCase):
     def setUp(self):
         for target, value in (
@@ -200,15 +256,22 @@ class TestKernelReady(CustomTestCase):
         patcher = patch.object(glm_aiter_presort, "_registrar", lambda: print)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # (M, num_experts, topk) -> block_m, as AITER's plain_sort_block_m notes them.
+        self.plain_sorts = {(4, 257, 9): 32}
 
-    def _ready(self, a2a=MoeA2ABackend.NONE, compiling=False):
+    def _ready(self, a2a=MoeA2ABackend.NONE, compiling=False, m=4, lookup=True):
         with (
             glm_aiter_presort.envs.SGLANG_OPT_HIP_GLM_ROUTE_SORT.override(True),
             patch.object(glm_aiter_presort, "get_moe_a2a_backend", lambda: a2a),
             patch.object(torch.compiler, "is_compiling", lambda: compiling),
+            patch.object(
+                glm_aiter_presort,
+                "_block_m_lookup",
+                lambda: (lambda *key: self.plain_sorts.get(key)) if lookup else None,
+            ),
         ):
             return glm_aiter_presort.kernel_ready(
-                torch.zeros((4, 256)), torch.zeros(256)
+                torch.zeros((m, 256)), torch.zeros(256)
             )
 
     def test_ready_on_the_standard_dispatcher(self):
@@ -220,6 +283,14 @@ class TestKernelReady(CustomTestCase):
 
     def test_off_while_compiling(self):
         self.assertFalse(self._ready(compiling=True))
+
+    def test_off_where_fused_moe_has_not_run_its_general_sort(self):
+        """A batch size fused_moe serves with its BM=16 aux sort, its fused
+        sort+quant or FLAT (or has not seen yet) would sort again."""
+        self.assertFalse(self._ready(m=8))
+
+    def test_off_on_an_aiter_without_the_block_m_record(self):
+        self.assertFalse(self._ready(lookup=False))
 
     def test_off_without_the_env_switch(self):
         with glm_aiter_presort.envs.SGLANG_OPT_HIP_GLM_ROUTE_SORT.override(False):
