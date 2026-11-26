@@ -9,6 +9,7 @@
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
+import io
 import pickle
 import time
 from collections import deque
@@ -210,16 +211,55 @@ class StatelessProcessGroup:
         )
 
 
+class _LocalDeviceUnpickler(pickle.Unpickler):
+    """Unpickles accelerator tensors and generators onto ``device``.
+
+    Plain unpickling restores them on the sender's device index, which is another
+    rank's card when every rank sees every device.
+    """
+
+    def __init__(self, file, device: torch.device):
+        super().__init__(file)
+        self._device = device
+        num_devices = torch.get_device_module(device.type).device_count()
+        # CPU storages (e.g. a generator's state) are left on the CPU.
+        self._map_location = {device.type: str(device)}
+        self._map_location.update(
+            {f"{device.type}:{i}": str(device) for i in range(num_devices)}
+        )
+
+    def find_class(self, module, name):
+        if (module, name) == ("torch.storage", "_load_from_bytes"):
+            return self._load_storage
+        if (module, name) == ("torch._C", "Generator"):
+            return self._make_generator
+        return super().find_class(module, name)
+
+    def _load_storage(self, data: bytes):
+        return torch.load(
+            io.BytesIO(data), weights_only=False, map_location=self._map_location
+        )
+
+    def _make_generator(self, device=None):
+        if device is None:
+            return torch.Generator()
+        if torch.device(device).type == self._device.type:
+            device = self._device
+        return torch.Generator(device=device)
+
+
 def broadcast_pyobj(
     data: List[Any],
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     force_cpu_device: bool = True,
+    local_device: Optional[torch.device] = None,
 ):
     """Broadcast inputs from src rank to all other ranks with torch.dist backend.
     The `rank` here refer to the source rank on global process group (regardless
-    of dist_group argument).
+    of dist_group argument). With ``local_device``, receiving ranks load accelerator
+    tensors and generators onto it instead of onto the sender's device index.
     """
 
     device = torch.device(
@@ -254,8 +294,10 @@ def broadcast_pyobj(
         dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
-        return data
+        if local_device is None:
+            return pickle.loads(serialized_data)
+        unpickler = _LocalDeviceUnpickler(io.BytesIO(serialized_data), local_device)
+        return unpickler.load()
 
 
 def generate_masked_orthogonal_rank_groups(
