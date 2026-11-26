@@ -10,12 +10,14 @@ use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
+use crate::server::routes::chat::Preprocessor;
 use crate::state::kv_events::{
     BlockSizeOracle, KvEventIndex, KvIndexMetrics, RadixTreePrefixProvider,
 };
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::tokenizer::TokenizerRegistry;
+use crate::workers::control::WorkerControlService;
 use crate::workers::{DecodeGate, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -51,9 +53,10 @@ impl ChatRouting {
 
 pub struct AppContext {
     pub config: Config,
-    pub tokenizers: Arc<TokenizerRegistry>,
+    pub preprocessor: Preprocessor,
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
+    pub worker_control: Option<Arc<WorkerControlService>>,
     pub policies: Arc<PolicyRegistry>,
     /// Converts static Bucket configuration into request candidate domains.
     pub bucket_selector: Arc<BucketSelector>,
@@ -132,10 +135,11 @@ impl AppContext {
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
         let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
         Self {
+            preprocessor: Preprocessor::new(&config.model, tokenizers, Arc::clone(&metrics)),
             config,
-            tokenizers,
             proxy,
             registry,
+            worker_control: None,
             policies,
             bucket_selector,
             chat_routing: ChatRouting::Legacy,
@@ -204,53 +208,61 @@ impl AppContext {
 
     #[cfg(test)]
     pub fn stub() -> Self {
-        Self {
-            config: Config {
-                server: crate::config::ServerConfig {
-                    host: "x".into(),
-                    port: 0,
-                    ..Default::default()
-                },
-                observability: Default::default(),
-                model: crate::config::ModelConfig {
-                    aliases: Vec::new(),
-                    id: "stub-model".into(),
-                    tokenizer_path: Some("stub".into()),
-                    disable_input_ids_forwarding: false,
-                    tokenizer: Default::default(),
-                    policy: crate::config::PolicyKind::RoundRobin,
-                    decode_policy: Default::default(),
-                    dp_aware: false,
-                    dp_rank_policy: Default::default(),
-                    bucket_config: None,
-                    reorg_buckets: None,
-                    reorg_admission: Default::default(),
-                    circuit_breaker: None,
-                    cache_aware: None,
-                    sticky: None,
-                    affinity: None,
-                    fused: None,
-                    eligibility: None,
-                    sampling_overrides: Default::default(),
-                    default_chat_template_kwargs: Default::default(),
-                },
-                discovery: crate::config::DiscoveryBackend::StaticUrls(
-                    crate::config::StaticUrlsDiscoveryConfig {
-                        urls: vec!["http://placeholder:0".into()],
-                    },
-                ),
-                proxy: crate::config::ProxyConfig::default(),
-                router_inflight_load: crate::config::InflightLoadConfig::default(),
+        let config = Config {
+            server: crate::config::ServerConfig {
+                host: "x".into(),
+                port: 0,
+                ..Default::default()
             },
-            tokenizers: Arc::new(TokenizerRegistry::default()),
+            observability: Default::default(),
+            model: crate::config::ModelConfig {
+                aliases: Vec::new(),
+                id: "stub-model".into(),
+                tokenizer_path: Some("stub".into()),
+                disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
+                policy: crate::config::PolicyKind::RoundRobin,
+                decode_policy: Default::default(),
+                dp_aware: false,
+                dp_rank_policy: Default::default(),
+                decode_dp_rank_policy: None,
+                bucket_config: None,
+                reorg_buckets: None,
+                reorg_admission: Default::default(),
+                circuit_breaker: None,
+                cache_aware: None,
+                sticky: None,
+                affinity: None,
+                fused: None,
+                eligibility: None,
+                sampling_overrides: Default::default(),
+                default_chat_template_kwargs: Default::default(),
+            },
+            discovery: crate::config::DiscoveryBackend::StaticUrls(
+                crate::config::StaticUrlsDiscoveryConfig {
+                    urls: vec!["http://placeholder:0".into()],
+                },
+            ),
+            proxy: crate::config::ProxyConfig::default(),
+            router_inflight_load: crate::config::InflightLoadConfig::default(),
+        };
+        let metrics = MetricsRegistry::new();
+        Self {
+            preprocessor: Preprocessor::new(
+                &config.model,
+                Arc::new(TokenizerRegistry::default()),
+                Arc::clone(&metrics),
+            ),
+            config,
             proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),
             registry: Arc::new(WorkerRegistry::default()),
+            worker_control: None,
             policies: Arc::new(PolicyRegistry::default()),
             bucket_selector: Arc::new(BucketSelector::new(None)),
             chat_routing: ChatRouting::Legacy,
             router_inflight_load: RouterInflightLoadRegistry::with_defaults(),
             decode_gate: DecodeGate::new(None),
-            metrics: MetricsRegistry::new(),
+            metrics,
             prefix_index: None,
             radix_tree_prefix_provider: None,
             dp_rank_prefix_provider: None,

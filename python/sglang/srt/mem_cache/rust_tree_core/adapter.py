@@ -30,8 +30,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.events import (
     KvEventLoraNames,
     enable_mm_routing_labels,
+    event_namespace_seed,
     mm_routing_spans,
 )
+from sglang.srt.mem_cache.evict_policy import StateCostStrategy
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -379,6 +381,13 @@ class _RustKVCacheEventRecorder:
         self._lora_names = lora_names
         self._dynamo_format = dynamo_format
 
+    def namespace_seed(
+        self, extra_key: Optional[str], cache_salt: Optional[str]
+    ) -> Optional[bytes]:
+        return event_namespace_seed(
+            extra_key, cache_salt, self._dynamo_format, self._lora_names
+        )
+
     def record_all_cleared(self) -> None:
         self._binding.record_all_cleared_event()
 
@@ -592,11 +601,18 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 ),
                 tlru_tail_budget=tlru_tail_budget,
                 tlru_float_config=tlru_float_config,
+                state_cost=(
+                    (eviction_strategy.d, eviction_strategy.e)
+                    if isinstance(eviction_strategy, StateCostStrategy)
+                    else None
+                ),
                 page_size=params.page_size,
                 is_write_back=False,
                 enable_hicache=False,
                 write_through_threshold=256,
-                device=str(self.device),
+                empty_device_indices=torch.empty(
+                    0, dtype=torch.int64, device=self.device
+                ),
                 # The window slot's history, as SWAComponent keeps it, the
                 # fused draft's front rows included.
                 swa_sliding_window_size=window,
@@ -1218,6 +1234,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self._binding.node_backuped(node_id)
+
+    def needs_incremental_component_backup(self, node_id: NodeId) -> bool:
+        return self._binding.needs_incremental_component_backup(node_id)
 
     def is_root(self, node_id: NodeId) -> bool:
         return self._binding.is_root(node_id)

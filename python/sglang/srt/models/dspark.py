@@ -19,6 +19,10 @@ from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.quantization.unquant import (
+    sm12x_bf16_lm_head,
+    sm12x_bf16_lm_head_applies,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
@@ -139,7 +143,10 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
             and weight.shape[0] % 128 == 0
         ):
             return _mxfp8_lm_head_matmul(hidden, lm_head)
-    return torch.matmul(hidden.to(weight.dtype), weight.T)
+    hidden = hidden.to(weight.dtype)
+    if sm12x_bf16_lm_head_applies(x=hidden, weight=weight):
+        return sm12x_bf16_lm_head(x=hidden, weight=weight)
+    return torch.matmul(hidden, weight.T)
 
 
 class VocabShard(msgspec.Struct, frozen=True):
@@ -182,6 +189,10 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         """The w2 weight when the bias is exactly the GEMV of the previous
         token's embedding, for the fused greedy kernel; otherwise None."""
         return None
+
+    # Step logits = softcap(base + bias), masked from step_vocab_limit on.
+    step_softcap: Optional[float] = None
+    step_vocab_limit: Optional[int] = None
 
 
 class VanillaMarkov(BaseDSparkMarkovHead):
@@ -513,6 +524,9 @@ def _has_mla_layers(layers) -> bool:
 
 class DSparkDraftMixin:
     supports_pre_gather_target_hidden_projection = True
+    # project_target_hidden may run before the target's SP gather on rank-local
+    # rows, where the split fc's TP all-reduce does not apply.
+    supports_fc_tp_split = False
     # Drafts whose base logits leave the vocab-parallel lm_head via a TP-sharded
     # VanillaMarkov step (per-shard candidates) or the multimem all-gather.
     supports_vocab_parallel_draft_logits = False
@@ -732,9 +746,7 @@ class DSparkDraftMixin:
         layer-major.
         """
         layers = list(self.layers)
-        if not layers or not (
-            hasattr(pool, "get_key_buffer") and hasattr(pool, "get_value_buffer")
-        ):
+        if not layers:
             return None
         # The fused kernel shares one location vector across every layer.
         if any(

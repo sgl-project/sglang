@@ -76,10 +76,8 @@ def pci_function0_bus_id(properties) -> Optional[str]:
     )
 
 
-def read_ualink_sysfs(
-    pci_bus_id: Optional[str], sysfs_root: Path = Path("/sys/class/drm")
-) -> Optional[dict[str, Optional[str]]]:
-    """The UALink attributes of the DRM card at ``pci_bus_id``, or None."""
+def _find_drm_card(pci_bus_id: Optional[str], sysfs_root: Path) -> Optional[Path]:
+    """The DRM card directory whose device sits at ``pci_bus_id``, or None."""
     if pci_bus_id is None:
         return None
     for card in sorted(sysfs_root.glob("card[0-9]*")):
@@ -87,16 +85,39 @@ def read_ualink_sysfs(
             bus_id = (card / "device").resolve().name
         except OSError:
             continue
-        if bus_id.removeprefix("0000:").lower() != pci_bus_id.removeprefix("0000:"):
-            continue
-        values = {}
-        for name in _UALINK_FIELDS:
-            try:
-                values[name] = (card / "device/ualink" / name).read_text().strip()
-            except (OSError, UnicodeDecodeError):
-                values[name] = None
-        return values
+        if bus_id.removeprefix("0000:").lower() == pci_bus_id.removeprefix("0000:"):
+            return card
     return None
+
+
+def read_ualink_sysfs(
+    pci_bus_id: Optional[str], sysfs_root: Path = Path("/sys/class/drm")
+) -> Optional[dict[str, Optional[str]]]:
+    """The UALink attributes of the DRM card at ``pci_bus_id``, or None."""
+    card = _find_drm_card(pci_bus_id, sysfs_root)
+    if card is None:
+        return None
+    values = {}
+    for name in _UALINK_FIELDS:
+        try:
+            values[name] = (card / "device/ualink" / name).read_text().strip()
+        except (OSError, UnicodeDecodeError):
+            values[name] = None
+    return values
+
+
+def read_compute_partition(
+    pci_bus_id: Optional[str], sysfs_root: Path = Path("/sys/class/drm")
+) -> Optional[str]:
+    """The compute partition mode (``SPX``, ``DPX``, ``CPX``, ...) of the DRM
+    card at ``pci_bus_id``, or None when the card or the attribute is missing."""
+    card = _find_drm_card(pci_bus_id, sysfs_root)
+    if card is None:
+        return None
+    try:
+        return (card / "device/current_compute_partition").read_text().strip().upper()
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def probe_local_fabric_capability(
@@ -214,10 +235,23 @@ def dpx_pairs(accel_ids: List[Optional[int]]) -> Optional[List[List[int]]]:
     return sorted(socs.values())
 
 
-def probe_dpx_pairs(
-    group: ProcessGroup, device: torch.device
-) -> Optional[List[List[int]]]:
-    """``dpx_pairs`` of ``group``; collective, every rank gets the same answer."""
+def accelerator_ring_order(accel_ids: List[Optional[int]]) -> List[int]:
+    """Ranks in ring order: the partitions of each accelerator next to each other.
+
+    ``accel_ids[r]`` is rank r's accelerator ID. Accelerators keep the order of
+    their lowest rank, and ranks within one their own order. A missing ID
+    leaves the group order.
+    """
+    if any(a is None for a in accel_ids):
+        return list(range(len(accel_ids)))
+    accels: dict[int, List[int]] = {}
+    for rank, accel_id in enumerate(accel_ids):
+        accels.setdefault(accel_id, []).append(rank)
+    return [rank for ranks in sorted(accels.values()) for rank in ranks]
+
+
+def _probe_accel_ids(group: ProcessGroup, device: torch.device) -> List[Optional[int]]:
+    """Every rank's accelerator ID (None where unknown); collective."""
     index = device.index if device.index is not None else torch.cuda.current_device()
     try:
         properties = torch.cuda.get_device_properties(index)
@@ -227,4 +261,33 @@ def probe_dpx_pairs(
         local = None
     accel_ids: List[Optional[int]] = [None] * dist.get_world_size(group=group)
     dist.all_gather_object(accel_ids, local, group=group)
-    return dpx_pairs(accel_ids)
+    return accel_ids
+
+
+def probe_spx(group: ProcessGroup, device: torch.device) -> bool:
+    """Whether every rank of ``group`` runs on a whole (SPX) accelerator;
+    collective, every rank gets the same answer. A rank whose mode is unknown
+    makes it False."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    try:
+        properties = torch.cuda.get_device_properties(index)
+        local = read_compute_partition(pci_function0_bus_id(properties))
+    except Exception:
+        local = None
+    modes: List[Optional[str]] = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(modes, local, group=group)
+    return all(mode == "SPX" for mode in modes)
+
+
+def probe_dpx_pairs(
+    group: ProcessGroup, device: torch.device
+) -> Optional[List[List[int]]]:
+    """``dpx_pairs`` of ``group``; collective, every rank gets the same answer."""
+    return dpx_pairs(_probe_accel_ids(group, device))
+
+
+def probe_accelerator_ring_order(
+    group: ProcessGroup, device: torch.device
+) -> List[int]:
+    """``accelerator_ring_order`` of ``group``; collective, every rank gets the same answer."""
+    return accelerator_ring_order(_probe_accel_ids(group, device))

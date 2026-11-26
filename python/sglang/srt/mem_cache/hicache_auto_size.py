@@ -64,19 +64,30 @@ def _leaf_bytes(pool) -> int:
     return sum(sizes) if isinstance(sizes, tuple) else sizes
 
 
-def _draft_bytes(target, draft) -> int:
-    if draft.layer_router.sub_pool(
-        IdSpaceKind.SLIDING_WINDOW
-    ) is not None or isinstance(draft, DeepSeekV4TokenToKVPool):
-        # Match sidecar construction: only SWA drafts follow target SWA slots.
-        target = (
-            target.layer_router.view(IdSpaceKind.SLIDING_WINDOW)
-            if target.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
-            else target.swa_kv_pool
-        )
-        draft = draft.swa_kv_pool
+def _sidecar_bytes(target, draft) -> int:
     # A sidecar has one host slot per target slot, however few slots the draft has.
     return _pool_bytes(draft) * target.size // draft.size
+
+
+def _draft_bytes(target, draft) -> int:
+    router = draft.layer_router
+    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None and not isinstance(
+        draft, DeepSeekV4TokenToKVPool
+    ):
+        return _sidecar_bytes(target, draft)
+    # Match sidecar construction: SWA layers follow target SWA slots, and a
+    # hybrid draft's full-attention layers follow target full slots.
+    target_swa = (
+        target.layer_router.view(IdSpaceKind.SLIDING_WINDOW)
+        if target.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+        else target.swa_kv_pool
+    )
+    total = _sidecar_bytes(target_swa, draft.swa_kv_pool)
+    if not isinstance(draft, DeepSeekV4TokenToKVPool) and router.routes_to(
+        IdSpaceKind.FULL
+    ):
+        total += _sidecar_bytes(target, router.view(IdSpaceKind.FULL))
+    return total
 
 
 def _estimate_hicache_bytes(
@@ -107,16 +118,25 @@ def auto_size_hicache(
 
     Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size.
     """
-    fraction = get_memory().hicache_host_memory_fraction
-    if not enabled or fraction is None:
+    if not enabled:
         yield
         return
-    requested = get_memory().hicache_ratio
-    device_bytes = _estimate_hicache_bytes(params, draft_plan)
+    fraction = get_memory().hicache_host_memory_fraction
     kvcache_device = getattr(
         params.token_to_kv_pool_allocator.get_kvcache(), "device", None
     )
     allocator = get_allocator_class_from_storage(get_allocator_type())
+    if fraction is None:
+        budget = host_memory_budget_plain_hugetlb(allocator, kvcache_device)
+        # Every local rank samples before any rank pins, or a rank sampling late
+        # sees its siblings' pools as used and fails the preflight.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
+        with host_memory_budget_scope(budget):
+            yield
+        return
+    requested = get_memory().hicache_ratio
+    device_bytes = _estimate_hicache_bytes(params, draft_plan)
     plain_budget, hugetlb_budget = host_memory_budget_plain_hugetlb(
         allocator, kvcache_device, auto_size=True
     )

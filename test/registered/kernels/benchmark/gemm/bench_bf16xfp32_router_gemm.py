@@ -58,7 +58,7 @@ FN_MAP = {
 @marker.parametrize(
     "n,k", [(768, 6144), (384, 3072), (256, 4096)], [(768, 6144), (256, 4096)]
 )
-@marker.benchmark("provider", ["cublas", "hpc"])
+@marker.benchmark("provider", ["cublas", "hpc"], gate=["hpc"])
 def benchmark(m, n, k, provider):
     x = create_random(m, k, dtype=torch.bfloat16)
     w = create_random(n, k, dtype=torch.float32)

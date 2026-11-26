@@ -69,6 +69,7 @@ def make_cache(pool, held, release):
 
     return SimpleNamespace(
         supports_mamba=lambda: True,
+        request_mamba_only=False,
         evict_for_alloc=MagicMock(side_effect=evict),
     )
 
@@ -92,7 +93,7 @@ class TestMambaCapacity(unittest.TestCase):
                         size=1,
                         mamba_size=5,
                         mamba_spec_state_size=1,
-                        max_context_len=16,
+                        row_width=16,
                         device="cpu",
                         enable_memory_saver=False,
                         cache_params=None,
@@ -136,7 +137,7 @@ class TestMambaCapacity(unittest.TestCase):
                         size=2,
                         pre_alloc_size=1,
                         mamba_size=1,
-                        max_context_len=16,
+                        row_width=16,
                         device="cpu",
                         enable_memory_saver=False,
                         cache_params=None,
