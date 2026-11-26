@@ -532,6 +532,174 @@ class TestPrefillAdder(CustomTestCase):
                 else:
                     self.assertEqual(req.extend_len, expected)
 
+    def test_continuation_strict_chunk_grid_parks_instead_of_overallocating(self):
+        """When strict chunk grid exceeds available KV, the continuation parks
+        rather than letting grid_continuation_limit exceed allocator capacity."""
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 6144
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=8192
+        )
+        adder.mamba_chunk_grid = 8192
+        adder.strict_chunk_grid = True
+        req = self.create_shared_req("continuation")
+        req.prefix_len = 8192
+        req.full_untruncated_fill_ids = list(range(24576))
+        before_total = adder.memory_budget.total_offset
+        before_current = adder.memory_budget.current_offset
+
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertTrue(adder.chunked_req_waits)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(req.extend_end)
+        self.assertEqual(adder.memory_budget.total_offset, before_total)
+        self.assertEqual(adder.memory_budget.current_offset, before_current)
+
+    def test_continuation_bounds_by_allocatable_kv_overhead_and_state_cost(self):
+        """PrefillBudget continuations leave room for per-request overhead and
+        state-slot cost even when request_slot_reserve == 0."""
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+
+        # Exact-page capacity with overhead: fits 6080 + 64 == 6144, not 6144.
+        self.mock_token_allocator.available_size.return_value = 6144
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=8192
+        )
+        req = self.create_shared_req("tight-overhead")
+        req.prefix_len = 8192
+        req.full_untruncated_fill_ids = list(range(24576))
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertEqual(req.extend_len, 6080)
+        self.assertEqual(adder.memory_budget.remaining_current, 0)
+        self.assertEqual(adder.memory_budget.remaining_total, 0)
+
+        # Tight current_offset vs total_offset: bounds by min(current, total).
+        self.mock_token_allocator.available_size.return_value = 1024
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=1024
+        )
+        adder.memory_budget.current_offset = 832
+        req = self.create_shared_req("tight-current")
+        req.prefix_len = 64
+        req.full_untruncated_fill_ids = list(range(2048))
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertEqual(req.extend_len, 128)
+        self.assertEqual(adder.memory_budget.remaining_current, 0)
+
+        # Single page left (<= page_size overhead): parks cleanly.
+        self.mock_token_allocator.available_size.return_value = 64
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=512
+        )
+        req = self.create_shared_req("one-page-left")
+        req.prefix_len = 64
+        req.full_untruncated_fill_ids = list(range(1024))
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertIsNone(req.extend_end)
+        self.assertEqual(adder.can_run_list, [])
+
+        # Extra per_req_token_overhead beyond page_size (e.g. interleaved shard).
+        self.mock_token_allocator.available_size.return_value = 512
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=512
+        )
+        adder.per_req_token_overhead = 256
+        req = self.create_shared_req("sharded-overhead")
+        req.prefix_len = 64
+        req.full_untruncated_fill_ids = list(range(1024))
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertIsNone(req.extend_end)
+        self.assertEqual(adder.can_run_list, [])
+
+        # SSM / Mamba state_slot_cost deducted against PrefillBudget.
+        self.mock_token_allocator.available_size.return_value = 512
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=512
+        )
+        adder.memory_budget.state_slot_cost = 256
+        adder._state_slots_for_req = lambda req, **kw: 1
+        req = self.create_shared_req("mamba-state")
+        req.prefix_len = 64
+        req.full_untruncated_fill_ids = list(range(1024))
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertEqual(req.extend_len, 192)
+        self.assertEqual(adder.memory_budget.remaining_current, 0)
+
+    def test_swa_continuation_respects_tight_full_pool(self):
+        """SWAPrefillBudget continuations also respect a tight FULL pool."""
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=64,
+            rem_swa=100_000,
+            rem_chunk=2048,
+            extend_input_len=500,
+            is_hybrid_swa=True,
+            full_available=100,
+        )
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertIsNone(req.extend_end)
+        self.assertEqual(adder.can_run_list, [])
+
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=64,
+            rem_swa=100_000,
+            rem_chunk=2048,
+            extend_input_len=500,
+            is_hybrid_swa=True,
+            full_available=256,
+        )
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertEqual(req.extend_len, 192)
+        self.assertEqual(adder.memory_budget.remaining_current, 0)
+
+    def test_cp_sharded_padded_continuation_fits_tail_and_overhead(self):
+        """CP padded continuations count existing prefix tail without exceeding
+        allocatable KV capacity."""
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        strategy = SimpleNamespace(cp_size=4)
+        schedule = SimpleNamespace(page_size=16)
+        with (
+            patch(
+                "sglang.srt.mem_cache.prefill_budget.is_cp_sharded_padded",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_policy.is_cp_sharded_padded",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.mem_cache.prefill_budget.get_cp_strategy",
+                return_value=strategy,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_policy.get_cp_strategy",
+                return_value=strategy,
+            ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_cp_strategy",
+                return_value=strategy,
+            ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_schedule",
+                return_value=schedule,
+            ),
+        ):
+            # 32 per-rank tokens * cp_size(4) = 128 global tokens:
+            # 128 global - 64 overhead = 64 fresh + 14 prefix tail = 78 tokens.
+            self.mock_token_allocator.available_size.return_value = 32
+            adder = self.create_adder(
+                self.create_running_batch(), page_size=16, rem_chunk_tokens=256
+            )
+            adder.per_req_token_overhead = 64
+            req = self.create_shared_req("cp-padded")
+            req.prefix_len = 50
+            req.full_untruncated_fill_ids = list(range(300))
+            self.assertIs(adder.add_chunked_req(req), req)
+            self.assertEqual(req.extend_len, 78)
+            self.assertEqual(adder.memory_budget.remaining_current, 0)
+
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
         # off-grid chunk leaves the rest of the prompt uncacheable. Without

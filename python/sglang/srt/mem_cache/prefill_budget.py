@@ -257,7 +257,7 @@ class PrefillBudget:
         return True
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
-        available_tokens = int(self.remaining_total)
+        available_tokens = int(min(self.remaining_total, self.remaining_current))
         if is_cp_sharded_padded():
             available_tokens = get_cp_sharded_padded_available_tokens(available_tokens)
         available = min(
@@ -278,7 +278,37 @@ class PrefillBudget:
         request_rows: int = 0,
         chunk_align: int | None = None,
     ) -> int | None:
-        return chunk_limit
+        remaining_full = (
+            int(min(self.remaining_current, self.remaining_total))
+            - state_slots * self.state_slot_cost
+        )
+        candidate = min(extend_input_len, chunk_limit)
+        if is_cp_sharded_padded():
+            prefix_tokens = getattr(req, "prefix_len", 0)
+            needed = (
+                get_cp_sharded_padded_allocation_tokens(
+                    candidate, prefix_tokens=prefix_tokens
+                )
+                + self.page_size
+            )
+            if needed <= remaining_full:
+                return chunk_limit
+            if remaining_full < self.page_size:
+                return None
+            groups = (remaining_full - self.page_size) // self.page_size
+            tail = -(-prefix_tokens // self.page_size) * self.page_size - prefix_tokens
+            cap = groups * self.page_size + tail
+        else:
+            if self.ceil_paged_tokens(candidate) + self.page_size <= remaining_full:
+                return chunk_limit
+            cap = max(
+                ((remaining_full - self.page_size) // self.page_size) * self.page_size,
+                0,
+            )
+        if chunk_align:
+            granule = chunk_granule(self.page_size, chunk_align)
+            cap = cap // granule * granule
+        return min(chunk_limit, cap) if cap > 0 else None
 
     def reserve(
         self,
@@ -464,7 +494,7 @@ class SWAPrefillBudget(PrefillBudget):
         return super().has_capacity() and self.remaining_window_tokens > 0
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
-        available_tokens = int(self.remaining_total)
+        available_tokens = int(min(self.remaining_total, self.remaining_current))
         if is_cp_sharded_padded():
             available_tokens = get_cp_sharded_padded_available_tokens(available_tokens)
         available = min(

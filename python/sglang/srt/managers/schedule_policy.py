@@ -1805,15 +1805,24 @@ class PrefillAdder:
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )
-        # The memory budget chose this chunk (`fit_chunk`); only a request
-        # slot reserve, which it does not see, is checked again.
-        if request_slot_reserve and not self.memory_budget.can_allocate_prefill(
+        if is_cp_sharded_padded():
+            storage_input_len = get_cp_sharded_padded_allocation_tokens(
+                new_len, prefix_tokens=prefix_tokens
+            )
+        else:
+            storage_input_len = self.ceil_paged_tokens(new_len)
+        # For fixed/SWA budgets (`not prices_by_demand`), re-check capacity
+        # unconditionally so per-request overhead, state slots, remaining_current,
+        # CP padding, and chunk-grid alignment cannot exceed allocatable KV.
+        # `ChainPrefillBudget` already sizes the continuation in `fit_chunk`
+        # except for any unseen `request_slot_reserve`.
+        if (
+            request_slot_reserve or not self.memory_budget.prices_by_demand
+        ) and not self.memory_budget.can_allocate_prefill(
             state_slots=self._state_slots_for_req(req),
             request_rows=self._request_rows_for_req(req),
             paged_input=(
-                self.ceil_paged_tokens(new_len)
-                + self.per_req_token_overhead
-                + request_slot_reserve
+                storage_input_len + self.per_req_token_overhead + request_slot_reserve
             ),
             extend_input_len=new_len,
             max_new_tokens=self._swa_new_tokens(req) if not truncated else 0,
