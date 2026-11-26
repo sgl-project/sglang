@@ -30,6 +30,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -41,6 +42,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -48,8 +50,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_npu, is_xpu
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils import is_npu, is_xpu
 
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -80,7 +81,6 @@ def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
 
 
 class BaiChuanMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -106,8 +106,7 @@ class BaiChuanMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -223,7 +222,6 @@ class BaiChuanAttention(nn.Module):
 
 
 class BaiChuanDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -284,7 +282,6 @@ class BaiChuanDecoderLayer(nn.Module):
 
 
 class BaiChuanModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

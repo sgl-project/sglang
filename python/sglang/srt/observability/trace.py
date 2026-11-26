@@ -22,8 +22,10 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_resources
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -74,7 +76,6 @@ def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
 
 
 def get_global_trace_level() -> int:
-    from sglang.srt.runtime_context import get_resources
 
     resources = get_resources()
     if resources.trace_level is None:
@@ -83,7 +84,6 @@ def get_global_trace_level() -> int:
 
 
 def set_global_trace_level(level: int):
-    from sglang.srt.runtime_context import get_resources
 
     get_resources().trace_level = level
 
@@ -124,10 +124,29 @@ class TraceThreadContext:
 
 
 class TraceCustomIdGenerator(id_generator.IdGenerator):
+    """Custom ID generator with support for pre-setting the next span ID.
+
+    Why custom IDs are needed:
+      The default IdGenerator may produce duplicate trace IDs across
+      multiple TP scheduler processes.
+
+    Preset mechanism (used by async tracing):
+      When SGLANG_TRACE_ASYNC=1, span creation is deferred to an exporter
+      process while the caller process needs to know span IDs in advance
+      for cross-process span linking.  The caller pre-generates a span ID
+      and sends it to the exporter.  Before calling tracer.start_span(),
+      the exporter calls preset_next_span_id(id) — the next
+      generate_span_id() call consumes it, then falls back to random
+      generation.  This avoids modifying the standard OTel start_span()
+      API while giving the caller full control over span IDs.
+
+      Thread-safety: _preset_local is a threading.local(), so concurrent
+      callers in different threads cannot interfere.  The exporter process
+      is single-threaded, so no additional locking is needed.
     """
-    The default IdGenerator may produce duplicate trace IDs across multiple TP scheduler processes,
-    hence a custom IdGenerator is implemented.
-    """
+
+    # Thread-local storage for the next span ID to use preset.
+    _preset_local = threading.local()
 
     def __init__(self):
         super().__init__()
@@ -138,15 +157,31 @@ class TraceCustomIdGenerator(id_generator.IdGenerator):
         return self.local_random.getrandbits(64)
 
     def generate_span_id(self) -> int:
+        # If a preset span ID was injected, consume it (one-shot).
+        preset = getattr(self._preset_local, "span_id", None)
+        if preset is not None:
+            self._preset_local.span_id = None
+            return preset
         return self.local_random.getrandbits(64)
+
+    @classmethod
+    def preset_next_span_id(cls, span_id: int):
+        """Inject a pre-generated span ID for the next start_span() call.
+
+        The ID is consumed exactly once by generate_span_id() and then
+        cleared.  Call this immediately before tracer.start_span().
+        """
+        cls._preset_local.span_id = span_id
 
 
 # global variables
 threads_info: Dict[int, TraceThreadInfo] = {}
 
-get_cur_time_ns = lambda: int(time.time() * 1e9)
-if hasattr(time, "time_ns"):
-    get_cur_time_ns = lambda: int(time.time_ns())
+# Optional callback invoked when a new thread registers its trace info.
+# Used by trace_async to forward thread info to the exporter process.
+_on_thread_info_set = None
+
+get_cur_time_ns = lambda: int(time.time_ns())
 
 
 def _get_host_id() -> str:
@@ -173,15 +208,10 @@ def _get_host_id() -> str:
 def process_tracing_init(
     otlp_endpoint, server_name, trace_modules: Optional[str] = None
 ):
+    """Initialize OpenTelemetry for this process. Idempotent."""
     global opentelemetry_initialized
-    global get_cur_time_ns
     global tracer
     global global_trace_modules
-
-    if trace_modules is not None:
-        global_trace_modules = [
-            module.strip() for module in trace_modules.split(",") if module.strip()
-        ]
 
     if not opentelemetry_imported:
         opentelemetry_initialized = False
@@ -189,22 +219,29 @@ def process_tracing_init(
             "opentelemetry package is not installed!!! Please not enable tracing or install opentelemetry"
         )
 
+    if opentelemetry_initialized:
+        return
+
+    if trace_modules is not None:
+        global_trace_modules = [
+            module.strip() for module in trace_modules.split(",") if module.strip()
+        ]
+
     try:
+        # Priority: explicit server_name > OTEL_SERVICE_NAME > "sglang"
+        service_name = server_name or os.getenv("OTEL_SERVICE_NAME", "sglang")
+
         resource = Resource.create(
             attributes={
-                SERVICE_NAME: server_name,
+                SERVICE_NAME: service_name,
             }
         )
         tracer_provider = TracerProvider(
             resource=resource, id_generator=TraceCustomIdGenerator()
         )
 
-        schedule_delay_millis = get_int_env_var(
-            "SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS", 500
-        )
-        max_export_batch_size = get_int_env_var(
-            "SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE", 64
-        )
+        schedule_delay_millis = envs.SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS.get()
+        max_export_batch_size = envs.SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE.get()
 
         processor = BatchSpanProcessor(
             span_exporter=get_otlp_span_exporter(otlp_endpoint),
@@ -222,9 +259,20 @@ def process_tracing_init(
     opentelemetry_initialized = True
     tracer = trace.get_tracer("sglang server")
 
+    # Auto-start async trace exporter when SGLANG_TRACE_ASYNC=1
+    if envs.SGLANG_TRACE_ASYNC.get():
+        from sglang.srt.observability.trace_async import start_trace_exporter
+
+        start_trace_exporter(otlp_endpoint, service_name, trace_modules=trace_modules)
+
 
 def get_global_tracing_enabled():
     return opentelemetry_initialized
+
+
+def fastapi_telemetry_disabled_kwargs() -> Dict[str, Any]:
+    # FastAPI traces every request under process_tracing_init's provider by default.
+    return {"telemetry": {"tracing": False, "metrics": False, "logs": False}}
 
 
 def get_otlp_span_exporter(endpoint):
@@ -244,15 +292,18 @@ def get_otlp_span_exporter(endpoint):
 
 
 # Should be called by each tracked thread.
+#
+# The thread_info table is ALWAYS populated (first-write-wins), even when
+# tracing is disabled, so get_thread_caller_info() (caller attribution
+# forwarded to Mooncake) stays readable regardless of the tracing switch. The
+# exporter callback is still gated on `opentelemetry_initialized`, so disabled
+# builds never push thread info.
 def trace_set_thread_info(
     thread_label: str,
     tp_rank: Optional[int] = None,
     dp_rank: Optional[int] = None,
     pp_rank: Optional[int] = None,
 ):
-    if not opentelemetry_initialized:
-        return
-
     pid = threading.get_native_id()
     if pid in threads_info:
         return
@@ -266,6 +317,34 @@ def trace_set_thread_info(
         pp_rank=pp_rank,
     )
 
+    if opentelemetry_initialized and _on_thread_info_set is not None:
+        _on_thread_info_set(threads_info[pid])
+
+
+def get_thread_caller_info() -> Optional[Tuple[str, str]]:
+    """Return the calling thread's ``(caller_id, caller_role)`` if it has
+    registered via ``trace_set_thread_info``; otherwise ``None``.
+
+    ``caller_role`` is the thread's ``thread_label`` (e.g. ``"Prefetch"`` /
+    ``"Backup"``). ``caller_id`` mirrors the rank+host segment of the scheduler
+    thread-span name (without the leading label, so it does not duplicate
+    ``caller_role``) and is forwarded to Mooncake so per-RPC spans attribute to
+    a specific dummy-client / TP rank. Returns ``None`` on threads that never
+    registered, so callers can omit the fields cleanly.
+    """
+    info = threads_info.get(threading.get_native_id())
+    if info is None:
+        return None
+    parts: List[str] = []
+    if info.tp_rank is not None:
+        parts.append(f"[TP {info.tp_rank}]")
+    if info.pp_rank is not None:
+        parts.append(f"[PP {info.pp_rank}]")
+    if info.dp_rank is not None:
+        parts.append(f"[DP {info.dp_rank}]")
+    parts.append(f"(host:{info.host_id[:8]} | pid:{info.pid})")
+    return " ".join(parts), info.thread_label
+
 
 class TraceReqContext:
     def __init__(
@@ -275,9 +354,12 @@ class TraceReqContext:
         role="unified",
         module_name="",
         external_trace_header: Optional[Dict[str, str]] = None,
+        trace_level: Optional[int] = None,
     ):
         self.rid: str = str(rid)
-        self.trace_level = get_global_trace_level()
+        self.trace_level = (
+            trace_level if trace_level is not None else get_global_trace_level()
+        )
         self.tracing_enable: bool = opentelemetry_initialized and self.trace_level > 0
 
         # Filter by --trace-modules only for explicitly named modules; contexts
@@ -310,9 +392,6 @@ class TraceReqContext:
         self.events_cache: List[TraceEvent] = []
 
         self.pid: int = threading.get_native_id()
-
-    def is_tracing_enabled(self) -> bool:
-        return self.tracing_enable
 
     def __create_thread_context(self, ts: int):
         if self.pid not in threads_info:
@@ -453,7 +532,7 @@ class TraceReqContext:
         copied.trace_level = self.trace_level
         copied.module_name = self.module_name
         copied.is_copy = True  # Mark as copy
-        copied.pid = self.pid
+        copied.pid = None
 
         # thread_context is None, will be rebuilt via rebuild_thread_context()
         copied.thread_context = None
@@ -476,11 +555,14 @@ class TraceReqContext:
 
         return copied
 
-    def rebuild_thread_context(self, ts: Optional[int] = None):
+    def rebuild_thread_context(
+        self, ts: Optional[int] = None, pid: Optional[int] = None
+    ):
         if not self.tracing_enable:
             return
 
         ts = ts or get_cur_time_ns()
+        self.pid = pid if pid is not None else threading.get_native_id()
         self.thread_context = self.__create_thread_context(ts)
 
     def trace_req_start(
@@ -723,20 +805,6 @@ class TraceReqContext:
             attrs = {}
         self.events_cache.append(TraceEvent(name, ts, attrs))
 
-    def trace_set_root_attrs(self, attrs: Dict[str, Any]):
-        if not self.tracing_enable:
-            return
-
-        if self.root_span:
-            self.root_span.set_attributes(attrs)
-
-    def trace_set_thread_attrs(self, attrs: Dict[str, Any]):
-        if self.__check_fast_return():
-            return
-
-        if self.thread_context.thread_span:
-            self.thread_context.thread_span.set_attributes(attrs)
-
     def abort(self, ts=None, abort_info: Optional[Dict] = None):
         if self.__check_fast_return():
             return
@@ -751,7 +819,7 @@ class TraceReqContext:
         # set abort info into thread span
         if self.thread_context.thread_span:
             if abort_info:
-                from sglang.srt.managers.schedule_batch import BaseFinishReason
+                from sglang.srt.managers.req_types import BaseFinishReason
 
                 if isinstance(abort_info, BaseFinishReason):
                     abort_info = abort_info.to_json()
@@ -769,6 +837,9 @@ class TraceReqContext:
 
             self.thread_context.thread_span.end(end_time=ts)
         self.thread_context = None
+
+    def flush(self):
+        pass
 
     def __del__(self):
         self.abort(abort_info={"reason": "have unclosed span, auto closed"})

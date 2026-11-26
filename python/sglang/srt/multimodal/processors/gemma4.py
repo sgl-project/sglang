@@ -18,13 +18,16 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 import torch
 
-from sglang.srt.managers.multimodal_processor import (
-    BaseMultimodalProcessor as SGLangBaseProcessor,
-)
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.gemma4_audio import _SSCP_CONV_STRIDE_SIZES
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor as SGLangBaseProcessor,
+)
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 
@@ -39,8 +42,6 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         self.IM_START_TOKEN_ID = hf_config.boi_token_id
         self.IM_END_TOKEN_ID = hf_config.eoi_token_id
 
-        self.AUDIO_START_TOKEN_ID = hf_config.boa_token_id
-        self.AUDIO_END_TOKEN_ID = hf_config.eoa_token_id
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|image|>",
             image_token_id=hf_config.image_token_id,
@@ -145,7 +146,7 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

@@ -15,6 +15,7 @@
 """Inference-only OPT model compatible with HuggingFace weights."""
 
 import logging
+import traceback
 from collections.abc import Iterable
 from typing import Optional, Union
 
@@ -22,20 +23,20 @@ import torch
 from torch import nn
 from transformers import OPTConfig
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -46,8 +47,6 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers
-from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +71,6 @@ def get_activation(name="relu"):
 
 
 class OPTLearnedPositionalEmbedding(nn.Embedding):
-
     def __init__(self, num_embeddings: int, embedding_dim: int):
         # OPT is set up so that if padding_idx is specified then offset the
         # embedding ids by 2 and adjust num_embeddings appropriately. Other
@@ -85,7 +83,6 @@ class OPTLearnedPositionalEmbedding(nn.Embedding):
 
 
 class OPTAttention(nn.Module):
-
     def __init__(
         self,
         embed_dim: int,
@@ -143,7 +140,6 @@ class OPTAttention(nn.Module):
 
 
 class OPTDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: OPTConfig,
@@ -220,11 +216,9 @@ class OPTDecoderLayer(nn.Module):
 
 
 class OPTDecoder(nn.Module):
-
     def __init__(
         self,
         config: OPTConfig,
-        layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -233,7 +227,7 @@ class OPTDecoder(nn.Module):
         self.max_target_positions = config.max_position_embeddings
         self.vocab_size = config.vocab_size
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -280,13 +274,11 @@ class OPTDecoder(nn.Module):
         else:
             self.final_layer_norm = None
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: OPTDecoderLayer(
                 config=config, layer_id=idx, quant_config=quant_config, prefix=prefix
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix="model.layers",
         )
 
@@ -317,14 +309,12 @@ class OPTDecoder(nn.Module):
             return PPProxyTensors({"hidden_states": hidden_states})
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
-            # 没有经过这里
         if self.project_out is not None:
             hidden_states, _ = self.project_out(hidden_states)
         return hidden_states
 
 
 class OPTModel(nn.Module):
-
     def __init__(
         self,
         config: OPTConfig,
@@ -333,12 +323,11 @@ class OPTModel(nn.Module):
     ) -> None:
         super().__init__()
 
-        # config = vllm_config.model_config.hf_config
-        # quant_config = vllm_config.quant_config
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
+        self._kv_cache_parallel_layout = resolve_linear_parallel_group("tp")
 
         self.decoder = OPTDecoder(
             config=config,
@@ -363,8 +352,7 @@ class OPTModel(nn.Module):
         )
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_parallel().tp_size
-        tp_rank = get_parallel().tp_rank
+        tp_rank, tp_size = self._kv_cache_parallel_layout
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,
@@ -380,15 +368,11 @@ class OPTModel(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 
 class OPTForCausalLM(nn.Module):
-    # BitandBytes specific attributes
-    # in TP, these weights are partitioned along the column dimension (dim=-1)
-    column_parallel_weights_modules = [".down_proj.", ".o_proj."]
-
     def __init__(
         self,
         config: OPTConfig,
@@ -413,7 +397,7 @@ class OPTForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.capture_aux_hidden_states = False
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -484,8 +468,6 @@ class OPTForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # if is_pp_missing_parameter(name, self):
-                #     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -494,8 +476,6 @@ class OPTForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # if is_pp_missing_parameter(name, self):
-                #     continue
                 if name not in params_dict:
                     continue
                 if name in params_dict.keys():
@@ -517,19 +497,6 @@ class OPTForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
-
-    def get_module_name_from_weight_name(self, name):
-        for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
-            if weight_name in name:
-                return (
-                    name.replace(weight_name, param_name)[: -len(".weight")],
-                    num_shard,
-                )
-        return name[: -len(".weight")], 1
-
-    def get_num_params(self):
-        params_dict = dict(self.named_parameters())
-        return len(params_dict)
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1
@@ -600,7 +567,7 @@ class OPTForCausalLM(nn.Module):
 
         except Exception:
             logger.error(
-                f"Error getting weights by name {name} in OPTForCausalLM: {get_exception_traceback()}"
+                f"Error getting weights by name {name} in OPTForCausalLM: {traceback.format_exc()}"
             )
             return None
 

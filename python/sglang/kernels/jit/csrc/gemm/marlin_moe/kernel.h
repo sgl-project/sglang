@@ -13,6 +13,8 @@
       bool mul_topk_weights, bool is_ep, int num_groups, int prob_m, int prob_n, int prob_k, int *locks,             \
       bool has_bias, bool use_atomic_add, bool use_fp32_reduce, int max_shared_mem
 
+namespace sglang {
+
 namespace device::marlin_moe {
 template <
     typename scalar_t,                   // compute dtype, half or nv_float16
@@ -32,8 +34,13 @@ template <
                                          // with a separate quantization scale
     const bool is_zp_float,              // is zero point of float16 type?
     const bool kIsEP,                    // expert parallelism
-    const bool kHasBias                  // has per-expert bias
+    const bool kHasBias,                 // has per-expert bias
+    const bool kExpertIdsAreSorted,      // sorted block expert IDs
+    const bool kZeroInactiveOutput,      // zero rows in inactive routing blocks
+    const bool kHasInactivePrefixCount   // producer-published padded-token/prefix pair
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
 }  // namespace device::marlin_moe
+
+}  // namespace sglang

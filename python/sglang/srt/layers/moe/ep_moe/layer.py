@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import (
@@ -15,7 +14,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
-    get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
@@ -42,9 +40,11 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+from sglang.srt.platforms import current_platform
+from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLDispatchOutput,
         DeepEPNormalDispatchOutput,
@@ -53,8 +53,7 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 
 logger = logging.getLogger(__name__)
@@ -65,8 +64,6 @@ class DeepEPMoE(FusedMoE):
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
     Mooncake EP shares the same class, as they expose the same interface.
     """
-
-    _has_printed = False
 
     def __init__(
         self,
@@ -97,13 +94,11 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-        is_humming = (
-            get_moe_runner_backend().is_humming()
-            or get_moe_runner_backend().is_auto()
-            and quant_config is not None
-            and quant_config.get_name() == "humming"
-        )
-        if is_humming:
+        backend = self.runner_backend
+        is_humming = backend is not None and backend.is_humming()
+        if get_moe_a2a_backend().is_deepep_v2():
+            self.deprecate_flag = True
+        elif is_humming:
             self.deprecate_flag = True
         elif _use_aiter:
             self.deprecate_flag = True
@@ -119,15 +114,16 @@ class DeepEPMoE(FusedMoE):
         ):
             self.deprecate_flag = True
         elif (
-            get_moe_runner_backend().is_flashinfer_cutedsl()
+            backend is not None
+            and backend.is_flashinfer_cutedsl()
             and quant_config is not None
-            and quant_config.get_name()
-            in ("modelopt_fp4", "modelopt_mixed", "nvfp4_online")
+            and quant_config.get_name() in ("modelopt_fp4", "modelopt_mixed")
         ):
             self.deprecate_flag = True
         elif (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and get_moe_runner_backend().is_deep_gemm()
+            and backend is not None
+            and backend.is_deep_gemm()
             and quant_config is not None
             and quant_config.get_name() == "mxfp4"
         ):
@@ -137,14 +133,15 @@ class DeepEPMoE(FusedMoE):
         elif (
             quant_config is None
             and self.w13_weight.dtype == torch.bfloat16
-            and get_moe_runner_backend().is_deep_gemm()
+            and backend is not None
+            and backend.is_deep_gemm()
             and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_pplx())
             and not _is_npu
             and not _is_hip
         ):
-            assert (
-                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            ), "Unquantized DeepEP MoE requires DeepGEMM BF16"
+            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, (
+                "Unquantized DeepEP MoE requires DeepGEMM BF16"
+            )
             self.deprecate_flag = True
         else:
             self.deprecate_flag = False
@@ -152,19 +149,7 @@ class DeepEPMoE(FusedMoE):
         if self.deprecate_flag:
             return
 
-        if isinstance(quant_config, Fp8Config):
-            self.use_block_quant = getattr(self.quant_method, "block_quant", False)
-            self.use_fp8_w8a8 = True
-            self.fp8_dtype = torch.float8_e4m3fn
-            self.use_w4afp8 = False
-        elif isinstance(quant_config, W4AFp8Config):
-            self.use_w4afp8 = True
-            self.use_fp8_w8a8 = False
-            self.use_block_quant = False
-        else:
-            self.use_w4afp8 = False
-            self.use_fp8_w8a8 = False
-            self.use_block_quant = False
+        self.use_w4afp8 = isinstance(quant_config, W4AFp8Config)
 
         self.deepep_mode = get_deepep_mode()
         if (
@@ -174,9 +159,9 @@ class DeepEPMoE(FusedMoE):
             and quant_config is not None
         ):
             # AMD HIP and NPU support low_latency DeepEP without DeepGEMM.
-            assert (
-                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, (
+                f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+            )
 
     def _a2a_forward_with_output_impl(
         self,
@@ -199,21 +184,7 @@ class DeepEPMoE(FusedMoE):
         finally:
             set_is_extend_in_batch(saved_is_extend_in_batch)
 
-    def _a2a_forward_capture_stub(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        router_logits: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        # Capture pass only: record the buffer address, skip the
-        # rank-coupled a2a. Warmup and replay run the real body.
-        output.zero_()
-
-    a2a_forward_with_output = eager_on_graph(
-        True, capture_stub=_a2a_forward_capture_stub
-    )(_a2a_forward_with_output_impl)
+    a2a_forward_with_output = eager_on_graph(True)(_a2a_forward_with_output_impl)
 
     def forward(
         self,
@@ -222,9 +193,9 @@ class DeepEPMoE(FusedMoE):
     ):
         # DeepEP NORMAL mode is not capturable; run it as an eager node.
         if is_in_breakable_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for breakable cuda graph"
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "Only standard topk output is supported for breakable cuda graph"
+            )
             output = torch.empty_like(hidden_states)
             self.a2a_forward_with_output(
                 hidden_states,
@@ -235,9 +206,9 @@ class DeepEPMoE(FusedMoE):
             )
             return output
         if is_in_tc_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for piecewise cuda graph"
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "Only standard topk output is supported for piecewise cuda graph"
+            )
             return moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
                 topk_output.topk_weights,
@@ -265,16 +236,6 @@ class DeepEPMoE(FusedMoE):
         )
         combine_input = self.run_moe_core(dispatch_output)
         return self.dispatcher.combine(combine_input=combine_input)
-
-    def dispatch(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-    ):
-        return self.dispatcher.dispatch(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
 
     def run_moe_core(
         self,
@@ -313,20 +274,6 @@ class DeepEPMoE(FusedMoE):
             topk_weights=dispatch_output.topk_weights,
         )
 
-    def combine(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        overlap_args: Optional[Dict[str, Any]] = None,
-    ):
-        return self.dispatcher.combine(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            overlap_args=overlap_args,
-        )
-
     def forward_cutlass_w4afp8(
         self,
         dispatch_output: DeepEPNormalDispatchOutput,
@@ -350,11 +297,25 @@ class DeepEPMoE(FusedMoE):
         )
 
 
-def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
+def get_moe_impl_class(
+    quant_config: Optional[QuantizationConfig],
+    *,
+    context: Optional[MoeExpertExecutorContext] = None,
+) -> type[torch.nn.Module]:
+    """Select an OOT expert executor or SGLang's built-in MoE implementation."""
+    if context is not None and current_platform.is_out_of_tree():
+        executor_cls = current_platform.get_moe_expert_executor_cls(context)
+        if executor_cls is not None:
+            return executor_cls
+
+    if get_moe_a2a_backend().is_mori_epv2():
+        return FusedMoE
+
     # [TODO] kk, temporary solution
     if (
         get_moe_a2a_backend().is_mori()
         or get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_deepep_v2()
         or get_moe_a2a_backend().is_mooncake()
         or get_moe_a2a_backend().is_nixl()
         or get_moe_a2a_backend().is_pplx()

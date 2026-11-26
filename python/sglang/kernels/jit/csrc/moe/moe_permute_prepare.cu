@@ -46,8 +46,8 @@ __global__ void moe_permute_prepare_kernel(
     bool is_ep) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
-  int32_t neg_count = 0;
-  if (is_ep) neg_count = lower_bound(sorted_topk_ids, numel, 0);
+  // Padding and nonlocal routes are both inactive, independently of EP.
+  int32_t neg_count = lower_bound(sorted_topk_ids, numel, 0);
 
   for (int e = tid; e <= num_experts; e += stride) {
     int32_t offset;
@@ -68,8 +68,6 @@ __global__ void moe_permute_prepare_kernel(
     src2dst[reorder_ids[i]] = i - neg_count;
   }
 }
-
-}  // namespace sglang
 
 void moe_permute_prepare(
     TensorView sorted_topk_ids,
@@ -110,7 +108,7 @@ void moe_permute_prepare(
   constexpr int threads = 256;
   int num_blocks = std::max(1, (std::max(numel, num_experts_i32 + 1) + threads - 1) / threads);
 
-  sglang::moe_permute_prepare_kernel<<<num_blocks, threads, 0, stream>>>(
+  moe_permute_prepare_kernel<<<num_blocks, threads, 0, stream>>>(
       static_cast<const int32_t*>(sorted_topk_ids.data_ptr()),
       static_cast<const int64_t*>(reorder_ids.data_ptr()),
       expert_offsets.data_ptr(),
@@ -125,3 +123,5 @@ void moe_permute_prepare(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_permute_prepare, moe_permute_prepare);
+
+}  // namespace sglang

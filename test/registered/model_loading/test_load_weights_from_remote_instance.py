@@ -26,6 +26,9 @@ import torch.multiprocessing as mp
 import sglang as sgl
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
+    ADMIN_API_KEY_FOR_TEST,
+    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -38,8 +41,8 @@ from sglang.utils import terminate_process
 
 mp.set_start_method("spawn", force=True)
 
-register_cuda_ci(est_time=145, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=72, suite="stage-b-test-2-gpu-large-amd")
+register_cuda_ci(est_time=126, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=190, stage="extra-a", runner_config="2-gpu-large-amd")
 
 
 def verify_params_close(params1, params2, error_msg):
@@ -129,6 +132,7 @@ def init_process_seed(
             "--tp-size",
             str(tp_size),
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ),
     )
     torch.cuda.synchronize()
@@ -143,6 +147,7 @@ def init_process_seed(
                     "name": parameter_name,
                     "truncate_size": truncate_size,
                 },
+                headers=ADMIN_HEADERS_FOR_TEST,
             ).json()
         )
     param_queue.put((f"seed_params", seed_params))
@@ -196,6 +201,7 @@ def init_process_dst(
             load_format="remote_instance",
             remote_instance_weight_loader_backend=remote_instance_loader_backend,
             remote_instance_weight_loader_start_seed_via_transfer_engine=False,
+            admin_api_key=ADMIN_API_KEY_FOR_TEST,
         )
     else:
         host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
@@ -228,6 +234,7 @@ def init_process_dst(
                 "--remote-instance-weight-loader-start-seed-via-transfer-engine",
                 "--engine-info-bootstrap-port",
                 str(6789 + rank),
+                *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ),
         )
     torch.cuda.synchronize()
@@ -243,6 +250,7 @@ def init_process_dst(
             else requests.get(
                 f"{url}/get_weights_by_name",
                 json={"name": parameter_name, "truncate_size": truncate_size},
+                headers=ADMIN_HEADERS_FOR_TEST,
             ).json()
         )
 
@@ -350,7 +358,6 @@ def test_load_weights_from_remote_instance(
 
 
 class TestLoadWeightsFromRemoteInstance(CustomTestCase):
-
     def test_load_weights_from_remote_instance(self):
 
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"

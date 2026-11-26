@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""IPC Model Loader — loads model weights from a Weight Cache Daemon via CUDA IPC.
+"""Weight cache model loader — loads model weights from a Weight Cache Daemon.
 
-Zero-copy mode: param.data points directly to IPC-mapped GPU memory. Only 1x GPU
-memory needed — engine and daemon share the same physical GPU memory via CUDA IPC.
-Engine depends on daemon staying alive.
+Zero-copy mode: param.data points directly to transport-mapped GPU memory.
+The daemon picks the backend (--weight-cache-transport) and names it in its
+response. With torch_ipc the engine depends on the daemon staying alive; with
+vmm_fd the engine's own mappings keep the weights valid.
 """
 
 import logging
@@ -12,7 +13,7 @@ import signal
 import stat
 import threading
 import time
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -22,16 +23,25 @@ from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
 )
-from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
     compute_env_stamp,
     get_quant_method_name,
+    get_socket_path,
     hash_quant_config,
     recv_msg,
     send_msg,
+)
+from .transport import (
+    AUTO_BACKEND,
+    TORCH_IPC_BACKEND,
+    WeightCacheTransportBackend,
+    check_served_transport,
+    get_client_transport_backend,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,8 +50,47 @@ logger = logging.getLogger(__name__)
 _DAEMON_LIVENESS_POLL_INTERVAL = 5.0
 
 
-class IpcModelLoader(BaseModelLoader):
-    """Load model weights from a Weight Cache Daemon via CUDA IPC handles.
+def _daemon_alive(pid: int) -> bool:
+    """Whether the daemon process ``pid`` is still running.
+
+    A zombie counts as exited. Where nothing reaps exited processes (e.g. a
+    container whose PID 1 does not), a killed daemon stays a zombie, and
+    signal 0 still succeeds on a zombie.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            proc_stat = f.read()
+    except FileNotFoundError:
+        # Exited since the signal check, unless there is no procfs at all.
+        return not os.path.exists("/proc/self/stat")
+    except OSError:
+        return True  # unreadable: the signal check decides
+    # The command name is in parentheses and may contain spaces and
+    # parentheses itself, so the state is the first field after the last ")".
+    fields = proc_stat[proc_stat.rfind(b")") + 1 :].split()
+    return not fields or fields[0] not in (b"Z", b"X")
+
+
+# Transport backends of loaded models, kept until the process exits. For
+# vmm_fd, a mapping keeps the daemon's memory alive, but the imported tensors
+# sit on non-owning storages and a parameter or view can outlive the model
+# object, so a loaded model's mappings must never be unmapped while this process
+# runs. Keeping the backends here keeps the owner of those mappings reachable;
+# nothing unmaps them on garbage collection, and the driver releases this
+# process's mappings and address reservation when it exits.
+_LOADED_MODEL_TRANSPORTS: List[WeightCacheTransportBackend] = []
+
+
+class WeightCacheModelLoader(BaseModelLoader):
+    """Load model weights from a Weight Cache Daemon through the transport the
+    daemon serves: CUDA IPC handles (torch_ipc) or CUDA VMM allocations passed
+    as file descriptors (vmm_fd).
 
     In daemon mode (weight_cache_mode="daemon"), the engine and daemon share
     the same GPU. Falling back to disk loading would cause OOM because both
@@ -66,16 +115,20 @@ class IpcModelLoader(BaseModelLoader):
     def __init__(
         self,
         load_config: LoadConfig,
-        socket_path: str,
+        socket_path: Optional[str] = None,
         fallback_loader_cls=None,
         weight_cache_mode: str = "client",
         fallback_load_format: str = "auto",
+        weight_cache_transport: str = AUTO_BACKEND,
     ):
         super().__init__(load_config)
         self.socket_path = socket_path
         self.weight_cache_mode = weight_cache_mode
+        self.weight_cache_transport = weight_cache_transport
         self._fallback_loader_cls = fallback_loader_cls
         self._fallback_load_format = fallback_load_format
+        self.preloaded_weights_bytes = 0
+        self._transport_backend = get_client_transport_backend(TORCH_IPC_BACKEND)
 
     def load_model(
         self,
@@ -89,6 +142,7 @@ class IpcModelLoader(BaseModelLoader):
         (fallback to disk loading would cause OOM on shared GPUs).
         In client mode, falls back to DefaultModelLoader.
         """
+        self.preloaded_weights_bytes = 0
         tic = time.perf_counter()
 
         # Hard-gate unsupported quant methods before touching the daemon, so an
@@ -99,12 +153,12 @@ class IpcModelLoader(BaseModelLoader):
         check_ipc_quant_support(quant_method, engine_quant_config, where="client")
 
         # Try to fetch state from daemon
-        cache_data = self._fetch_from_cache(model_config)
+        cache_data = self._fetch_from_cache(model_config, device_config)
 
         if cache_data is None:
             if self.weight_cache_mode == "daemon":
                 raise RuntimeError(
-                    f"[IpcModelLoader] Weight cache daemon not available at "
+                    f"[WeightCacheModelLoader] Weight cache daemon not available at "
                     f"{self.socket_path}. In daemon mode, fallback to disk "
                     f"loading is disabled because the daemon process already "
                     f"holds weights on the same GPU — loading from disk would "
@@ -112,29 +166,50 @@ class IpcModelLoader(BaseModelLoader):
                     f"running and the config matches."
                 )
             logger.warning(
-                "[IpcModelLoader] Weight cache not available or config mismatch, "
-                "falling back to disk load"
+                "[WeightCacheModelLoader] Weight cache not available or config "
+                "mismatch, falling back to disk load"
             )
             return self._fallback_load(model_config, device_config)
 
-        entries = cache_data["entries"]
-        logger.info(
-            f"[IpcModelLoader] Fetched {len(entries)} IPC handles from daemon "
-            f"in {time.perf_counter() - tic:.2f}s"
-        )
+        try:
+            entries = cache_data["entries"]
+            # Older daemons omit this field; missing metadata means no correction.
+            preloaded_weights_bytes = cache_data.get("preloaded_weights_bytes", 0)
+            if preloaded_weights_bytes is None:
+                preloaded_weights_bytes = 0
+            if (
+                isinstance(preloaded_weights_bytes, bool)
+                or not isinstance(preloaded_weights_bytes, int)
+                or preloaded_weights_bytes < 0
+            ):
+                raise RuntimeError(
+                    "[WeightCacheModelLoader] Daemon returned invalid weight-memory "
+                    f"metadata: {preloaded_weights_bytes=}"
+                )
+            logger.info(
+                f"[WeightCacheModelLoader] Fetched {len(entries)} tensors from daemon "
+                f"(transport={self._transport_backend.name}) "
+                f"in {time.perf_counter() - tic:.2f}s"
+            )
 
-        from sglang.srt.model_loader.loader import (
-            _get_quantization_config,
-        )
+            from sglang.srt.model_loader.loader import (
+                _get_quantization_config,
+            )
 
-        quant_config = _get_quantization_config(model_config, self.load_config)
+            quant_config = _get_quantization_config(model_config, self.load_config)
 
-        model = self._load_zero_copy_mode(
-            model_config,
-            device_config,
-            entries,
-            quant_config,
-        )
+            model = self._load_zero_copy_mode(
+                model_config,
+                device_config,
+                entries,
+                quant_config,
+            )
+        except BaseException:
+            # Drop whatever the transport mapped for the failed load. A model
+            # that did load keeps its mappings until the process exits.
+            self._transport_backend.close()
+            raise
+        self.preloaded_weights_bytes = preloaded_weights_bytes
 
         # Skip _post_load_weights: the daemon already ran
         # process_weights_after_loading on the weights before exporting
@@ -148,53 +223,64 @@ class IpcModelLoader(BaseModelLoader):
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
 
-        # The model now points into the daemon's GPU memory via CUDA IPC. If the
-        # daemon dies, those pointers dangle, so watch it and fail loud.
-        self._start_daemon_liveness_watchdog(cache_data.get("pid"))
+        # With torch_ipc the model points into the daemon's GPU memory via CUDA
+        # IPC. If the daemon dies, those pointers dangle, so watch it and fail
+        # loud. vmm_fd mappings keep the memory alive, so a dead daemon is
+        # only logged there.
+        self._start_daemon_liveness_watchdog(
+            cache_data.get("pid"),
+            fatal=self._transport_backend.name == TORCH_IPC_BACKEND,
+        )
 
         logger.info(
-            f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
+            f"[WeightCacheModelLoader] Loaded model via IPC "
+            f"(mode={self.weight_cache_mode}), "
             f"total={time.perf_counter() - tic:.2f}s"
         )
 
         return model.eval()
 
-    def _start_daemon_liveness_watchdog(self, daemon_pid: Optional[int]) -> None:
+    def _start_daemon_liveness_watchdog(
+        self, daemon_pid: Optional[int], *, fatal: bool = True
+    ) -> None:
         """Fail loud if the serving daemon dies while we hold its weights.
 
-        In both client and (engine-spawned) daemon mode, the model's param.data
-        points into the daemon's GPU memory via CUDA IPC, and CUDA graphs may
-        capture those addresses. If the daemon exits, the pointers dangle:
+        With torch_ipc (``fatal=True``), in both client and (engine-spawned)
+        daemon mode, the model's param.data points into the daemon's GPU memory
+        via CUDA IPC, and CUDA graphs may capture those addresses. If the daemon
+        exits, the pointers dangle:
         forward passes would read freed GPU memory -> illegal-address crashes or
         silent garbage. There is no safe in-place recovery, so a background
         thread polls the daemon PID and, on death, SIGKILLs this process with a
         clear message instead of letting it serve corrupt results.
+
+        With ``fatal=False`` (vmm_fd, whose mappings keep the weights valid)
+        the thread only logs that the daemon exited and stops.
         """
         if not daemon_pid or daemon_pid <= 0:
             logger.warning(
-                "[IpcModelLoader] Daemon did not report a PID; skipping the "
+                "[WeightCacheModelLoader] Daemon did not report a PID; skipping the "
                 "daemon-liveness watchdog. A daemon crash will not be detected."
             )
             return
-
-        def _daemon_alive(pid: int) -> bool:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                return True  # exists but owned by another user
-            return True
 
         def _watch() -> None:
             while True:
                 time.sleep(_DAEMON_LIVENESS_POLL_INTERVAL)
                 if not _daemon_alive(daemon_pid):
+                    if not fatal:
+                        logger.warning(
+                            f"[WeightCacheModelLoader] Weight cache daemon "
+                            f"(pid={daemon_pid}) exited. This engine's own VMM "
+                            f"mappings keep its weights valid; serving continues."
+                        )
+                        return
                     logger.critical(
-                        f"[IpcModelLoader] Weight cache daemon (pid={daemon_pid}) "
-                        f"died while this engine holds its weights via CUDA IPC. "
-                        f"The mapped weight pointers are now dangling; continuing "
-                        f"would read freed GPU memory. Terminating this process."
+                        f"[WeightCacheModelLoader] Weight cache daemon "
+                        f"(pid={daemon_pid}) died while this engine holds its "
+                        f"weights via CUDA IPC. The mapped weight pointers are "
+                        f"now dangling; continuing would read freed GPU memory. "
+                        f"Terminating this process."
                     )
                     os.kill(os.getpid(), signal.SIGKILL)
                     return
@@ -203,7 +289,8 @@ class IpcModelLoader(BaseModelLoader):
             target=_watch, name="weight-cache-daemon-watchdog", daemon=True
         ).start()
         logger.info(
-            f"[IpcModelLoader] Started daemon-liveness watchdog for pid={daemon_pid}"
+            f"[WeightCacheModelLoader] Started daemon-liveness watchdog for "
+            f"pid={daemon_pid}"
         )
 
     def _resolve_engine_quant(self, model_config):
@@ -240,15 +327,15 @@ class IpcModelLoader(BaseModelLoader):
             attn = getattr(module, "attn", None)
             if conv1d is not None and isinstance(attn, RadixLinearAttention):
                 if hasattr(conv1d, "weight") and conv1d.weight is not None:
-                    attn.conv_weights = conv1d.weight.view(
-                        conv1d.weight.size(0), conv1d.weight.size(2)
-                    )
+                    attn.refresh_conv_weights(conv1d.weight)
                     if hasattr(conv1d, "bias") and conv1d.bias is not None:
                         attn.bias = conv1d.bias
                     count += 1
 
         if count > 0:
-            logger.info(f"[IpcModelLoader] Rebuilt {count} stale conv_weights views")
+            logger.info(
+                f"[WeightCacheModelLoader] Rebuilt {count} stale conv_weights views"
+            )
 
     @staticmethod
     def _set_module_tensor(model, name, tensor, is_param=True):
@@ -269,8 +356,9 @@ class IpcModelLoader(BaseModelLoader):
             obj = getattr(obj, part)
         leaf_name = parts[-1]
         if is_param:
-            # requires_grad=False: the IPC memory is shared/read-only and SGLang
-            # is inference-only, so autograd must never write into it.
+            # requires_grad=False: the memory is shared with the daemon and must
+            # be treated as read-only, and SGLang is inference-only, so autograd
+            # must never write into it.
             new_param = nn.Parameter(tensor, requires_grad=False)
             setattr(obj, leaf_name, new_param)
         else:
@@ -291,11 +379,12 @@ class IpcModelLoader(BaseModelLoader):
         entries,
         quant_config,
     ) -> nn.Module:
-        """Zero-copy load: map IPC tensors directly as param.data.
+        """Zero-copy load: use the daemon's tensors as the model's weights.
 
         The model is initialized on the meta device (no memory allocation),
-        then each parameter's data is replaced with the IPC-mapped GPU tensor.
-        The engine and daemon share the same physical GPU memory via CUDA IPC.
+        then each parameter and buffer is replaced with, or registered as, the
+        tensor imported through the selected transport. The engine and daemon
+        share the same physical GPU memory.
         """
         from sglang.srt.model_loader.utils import set_default_torch_dtype
 
@@ -337,7 +426,7 @@ class IpcModelLoader(BaseModelLoader):
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
         for name, entry in entries.items():
-            imported_tensor = MultiprocessingSerializer.deserialize(entry["handle"])
+            imported_tensor = self._transport_backend.import_tensor(entry)
             is_param = entry.get("is_param", True)
 
             if name in existing_names:
@@ -367,13 +456,14 @@ class IpcModelLoader(BaseModelLoader):
 
         if mismatched:
             raise RuntimeError(
-                f"[IpcModelLoader] {len(mismatched)} tensor(s) have shape/dtype "
-                f"mismatch between the IPC daemon and the meta-initialized model. "
-                f"The quantization method passed the IPC allowlist gate "
-                f"(check_ipc_quant_support), so this is NOT an unsupported-quant "
-                f"case — it indicates the daemon's weight fingerprint is "
-                f"incomplete or the daemon/client configs drifted (a bug to fix), "
-                f"not merely uninitialized weights:\n" + "\n".join(mismatched)
+                f"[WeightCacheModelLoader] {len(mismatched)} tensor(s) have "
+                f"shape/dtype mismatch between the IPC daemon and the "
+                f"meta-initialized model. The quantization method passed the "
+                f"IPC allowlist gate (check_ipc_quant_support), so this is NOT an "
+                f"unsupported-quant case — it indicates the daemon's weight "
+                f"fingerprint is incomplete or the daemon/client configs drifted "
+                f"(a bug to fix), not merely uninitialized weights:\n"
+                + "\n".join(mismatched)
             )
 
         # After mapping every daemon entry, any tensor still on the meta device
@@ -398,7 +488,7 @@ class IpcModelLoader(BaseModelLoader):
 
         if still_on_meta_params or still_on_meta_buffers:
             raise RuntimeError(
-                f"[IpcModelLoader] After IPC mapping, "
+                f"[WeightCacheModelLoader] After IPC mapping, "
                 f"{len(still_on_meta_params)} parameter(s) and "
                 f"{len(still_on_meta_buffers)} buffer(s) remain on the meta device "
                 f"— the daemon did not export them. Refusing to fill them with "
@@ -413,18 +503,26 @@ class IpcModelLoader(BaseModelLoader):
 
         map_elapsed = time.perf_counter() - map_tic
 
-        # Stash IPC refs on the model to prevent GC (which would unmap the memory)
+        # Keep the imported tensors referenced from the model. With torch_ipc
+        # each one owns its IPC mapping, which GC would close; vmm_fd mappings
+        # are owned by the transport backend kept below.
         if imported_refs:
             model._ipc_imported_tensors = imported_refs
+        # Keep transport backend alive for the model lifetime (VMM backend owns
+        # VA mappings that must stay mapped while tensors are in use). A tensor
+        # can outlive the model object, so the mappings are not released with
+        # the model: they stay until the process exits.
+        model._weight_cache_transport_backend = self._transport_backend
+        _LOADED_MODEL_TRANSPORTS.append(self._transport_backend)
 
         logger.info(
-            f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors "
+            f"[WeightCacheModelLoader] Zero-copy: mapped {imported_count} tensors "
             f"({new_params_count} new post-quant), time={map_elapsed:.3f}s"
         )
 
         return model
 
-    def _fetch_from_cache(self, model_config) -> Optional[dict]:
+    def _fetch_from_cache(self, model_config, device_config) -> Optional[dict]:
         """Connect to daemon, validate config, fetch IPC handles.
 
         Returns the daemon response dict on success, None if the daemon is
@@ -433,6 +531,10 @@ class IpcModelLoader(BaseModelLoader):
         """
         import socket as socket_mod
 
+        if self.socket_path is None:
+            device_uuid = current_platform.get_device_uuid(int(device_config.gpu_id))
+            self.socket_path = get_socket_path(device_uuid)
+
         # Only connect to a real socket node owned by us: reject a symlink, a
         # plain file, or another user's socket planted at this /tmp path. An
         # absent socket means no daemon -> fall back to disk (return None).
@@ -440,13 +542,14 @@ class IpcModelLoader(BaseModelLoader):
             st = os.lstat(self.socket_path)
         except FileNotFoundError:
             logger.info(
-                f"[IpcModelLoader] Daemon socket not found at {self.socket_path}."
+                f"[WeightCacheModelLoader] Daemon socket not found at "
+                f"{self.socket_path}."
             )
             return None
         if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
             raise RuntimeError(
-                f"[IpcModelLoader] Refusing to connect: {self.socket_path} is not "
-                f"a socket owned by this user."
+                f"[WeightCacheModelLoader] Refusing to connect: "
+                f"{self.socket_path} is not a socket owned by this user."
             )
 
         sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
@@ -460,31 +563,32 @@ class IpcModelLoader(BaseModelLoader):
         except ConnectionRefusedError:
             sock.close()
             raise RuntimeError(
-                f"[IpcModelLoader] Daemon socket exists at {self.socket_path} but "
-                f"refused the connection. The daemon may have crashed after "
-                f"creating the socket. Check daemon logs."
+                f"[WeightCacheModelLoader] Daemon socket exists at "
+                f"{self.socket_path} but refused the connection. The daemon may "
+                f"have crashed after creating the socket. Check daemon logs."
             )
         except Exception as e:
             sock.close()
             raise RuntimeError(
-                f"[IpcModelLoader] Failed to connect to daemon at "
+                f"[WeightCacheModelLoader] Failed to connect to daemon at "
                 f"{self.socket_path}: {e}"
             ) from e
 
         try:
             # Build engine's config fingerprint
-            from sglang.srt.runtime_context import get_parallel
+            parallel = get_parallel()
+            tp_size = parallel.tp_size
+            tp_rank = parallel.tp_rank
 
-            ps = get_parallel()
-            tp_size = ps.tp_size
-            tp_rank = ps.tp_rank
+            pp_size = parallel.pp_size
+            pp_rank = parallel.pp_rank
 
-            pp_size = ps.pp_size
-            pp_rank = ps.pp_rank
-
-            ep_size = ps.moe_ep_size
-
-            dp_size = get_parallel().dp_size
+            ep_size = parallel.moe_ep_size
+            # The configured width, as the daemon states it: the MoE
+            # communicator is wider when it aliases attention CP.
+            moe_dp_size = parallel.moe_dp_size
+            moe_dp_rank = parallel.moe_dp_rank
+            moe_ep_rank = parallel.moe_ep_rank
 
             quant_method, quant_config = self._resolve_engine_quant(model_config)
 
@@ -499,8 +603,16 @@ class IpcModelLoader(BaseModelLoader):
                 tp_rank=tp_rank,
                 pp_size=pp_size,
                 pp_rank=pp_rank,
-                dp_size=dp_size,
+                dp_size=parallel.dp_size,
                 ep_size=ep_size,
+                moe_dp_size=moe_dp_size,
+                moe_dp_rank=moe_dp_rank,
+                moe_ep_rank=moe_ep_rank,
+                attn_dp_size=parallel.attn_dp_size,
+                enable_dp_lm_head=parallel.enable_dp_lm_head,
+                attn_cp_size=parallel.attn_cp_size,
+                moe_dense_tp_size=parallel.moe_dense_tp_size,
+                moe_a2a_backend=get_exec().moe.moe_a2a_backend,
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
@@ -509,7 +621,7 @@ class IpcModelLoader(BaseModelLoader):
             )
 
             logger.info(
-                f"[IpcModelLoader] Requesting weights from daemon at "
+                f"[WeightCacheModelLoader] Requesting weights from daemon at "
                 f"{self.socket_path} with config: "
                 f"model={engine_config.model_path}, "
                 f"arch={engine_config.model_arch}, "
@@ -524,18 +636,22 @@ class IpcModelLoader(BaseModelLoader):
             if result.get("status") != "ok":
                 daemon_config = result.get("daemon_config", {})
                 raise RuntimeError(
-                    f"[IpcModelLoader] Daemon config mismatch!\n"
+                    f"[WeightCacheModelLoader] Daemon config mismatch!\n"
                     f"  Engine config: {engine_config.to_dict()}\n"
                     f"  Daemon config: {daemon_config}"
                 )
 
+            backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)
+            check_served_transport(self.weight_cache_transport, backend_name)
+            self._transport_backend = get_client_transport_backend(backend_name)
+            result = self._transport_backend.recv_fetch_state_response(sock, result)
             return result
 
         except RuntimeError:
             raise
         except Exception as e:
             raise RuntimeError(
-                f"[IpcModelLoader] Error communicating with daemon at "
+                f"[WeightCacheModelLoader] Error communicating with daemon at "
                 f"{self.socket_path}: {e}"
             ) from e
         finally:

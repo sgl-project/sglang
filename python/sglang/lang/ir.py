@@ -5,8 +5,8 @@ import inspect
 import warnings
 from typing import List, Optional, Union
 
-from sglang.global_config import global_config
 from sglang.lang.choices import ChoicesSamplingMethod
+from sglang.lang.global_config import global_config
 
 REGEX_INT = r"[-+]?[0-9]+[ \n]*"
 REGEX_FLOAT = r"[-+]?[0-9]*\.?[0-9]+[ \n]*"
@@ -155,7 +155,11 @@ class SglFunction:
         assert all(key in self.arg_names for key in kwargs)
 
         new_bind_dict = {**self.bind_arguments, **kwargs}
-        return SglFunction(self.func, bind_arguments=new_bind_dict)
+        return SglFunction(
+            self.func,
+            num_api_spec_tokens=self.num_api_spec_tokens,
+            bind_arguments=new_bind_dict,
+        )
 
     def run(
         self,
@@ -531,7 +535,6 @@ class SglRoleEnd(SglExpr):
 
 
 class SglSelect(SglExpr):
-
     def __init__(
         self,
         name: str,

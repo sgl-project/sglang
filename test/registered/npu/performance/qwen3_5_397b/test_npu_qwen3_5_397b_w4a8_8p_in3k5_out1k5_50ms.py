@@ -8,12 +8,8 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(
-    est_time=3600,
-    suite="nightly-16-npu-a3",
-    nightly=True,
-    disabled="performance testcase",
-)
+register_npu_ci(est_time=3600, suite="extra-c-perf-test-16-npu-a3")
+register_npu_ci(est_time=3600, suite="nightly-perf-test-16-npu-a3", nightly=True)
 
 QWEN3_5_397B_A17B_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -21,7 +17,8 @@ QWEN3_5_397B_A17B_ENVS = {
     "STREAMS_PER_DEVICE": "32",
     "ASCEND_USE_FIA": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
-    "HCCL_BUFFSIZE": "0",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
+    "DEEPEP_HCCL_BUFFSIZE": "2200",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "6",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "GDN_ATTN_BACKEND_TRITON": "1",
@@ -29,13 +26,8 @@ QWEN3_5_397B_A17B_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_ZBAL_LOCAL_MEM_SIZE": "59648",
     "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
-    "SGLANG_ZBAL_BOOTSTRAP_URL": "tcp://127.0.0.1:24669",
-    "ZBAL_NPU_ALLOC_CONF": "use_vmm_for_static_memory:True",
-    "ZBAL_ENABLE_GRAPH": "1",
 }
 
 QWEN3_5_397B_A17B_3K5_1K5_OTHER_ARGS = [
@@ -57,7 +49,7 @@ QWEN3_5_397B_A17B_3K5_1K5_OTHER_ARGS = [
     432,
     "--mem-fraction-static",
     0.8,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     2,
     4,
     6,
@@ -88,9 +80,8 @@ QWEN3_5_397B_A17B_3K5_1K5_OTHER_ARGS = [
     "bfloat16",
     "--mamba-ssm-dtype",
     "bfloat16",
-    "--dp-size",
+    "--attn-dp-size",
     8,
-    "--enable-dp-attention",
     "--enable-dp-lm-head",
     "--speculative-algorithm",
     "NEXTN",

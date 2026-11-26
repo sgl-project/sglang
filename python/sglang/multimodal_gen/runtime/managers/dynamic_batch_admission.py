@@ -75,7 +75,6 @@ class BatchingRule:
     offload: bool | None = None
     max_batch_size: int = 1
     max_cost: float | None = None
-    source: str = "user"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, source: str) -> BatchingRule:
@@ -97,7 +96,6 @@ class BatchingRule:
             offload=_optional_bool(data.get("offload")),
             max_batch_size=int(data["max_batch_size"]),
             max_cost=_optional_float(data.get("max_cost")),
-            source=source,
         )
         rule.validate()
         return rule
@@ -160,7 +158,7 @@ class BatchAdmissionController:
         self._mode = getattr(server_args, "batching_mode", "dynamic")
         self._user_max_batch_size = max(1, int(server_args.batching_max_size))
         self._model_path = server_args.model_path
-        self._offload = bool(server_args.layerwise_offload_components)
+        self._offload = server_args.has_layerwise_offload_components()
         self._device_memory_gb = self._get_device_memory_gb(gpu_id)
         self._rules = load_batching_config(server_args.batching_config)
         self._pipeline_config = server_args.pipeline_config

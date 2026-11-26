@@ -9,7 +9,7 @@ from sglang.srt.debug_utils.dump_comparator import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=30, stage="weekly", runner_config="cpu")
 
 
 # ----------------------------- Unit tests -----------------------------
@@ -22,8 +22,8 @@ class TestCalcRelDiff:
 
     def test_zero_vectors(self) -> None:
         z: torch.Tensor = torch.zeros(5)
-        result = _calc_rel_diff(z, z)
-        assert not torch.isnan(result) or True  # should not crash
+        # 0 / 0 gives NaN; the case only has to not raise.
+        _calc_rel_diff(z, z)
 
 
 class TestArgmaxCoord:

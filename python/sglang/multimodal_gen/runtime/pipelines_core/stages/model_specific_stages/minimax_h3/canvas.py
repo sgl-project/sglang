@@ -97,6 +97,33 @@ def minimax_h3_stretch_keyframe_canvas(
     return image.resize((target_width, target_height), Image.Resampling.LANCZOS)
 
 
+def minimax_h3_center_crop_keyframe_canvas(
+    image: Any,
+    *,
+    target_width: int,
+    target_height: int,
+) -> Any:
+    """Center-crop to the canvas aspect at source resolution, then resize."""
+
+    from PIL import Image
+
+    image = image.convert("RGB")
+    if image.size == (target_width, target_height):
+        return image
+    aspect = target_width / target_height
+    source_width, source_height = image.size
+    if source_width / source_height > aspect:
+        crop_height = source_height
+        crop_width = max(1, min(source_width, round(source_height * aspect)))
+    else:
+        crop_width = source_width
+        crop_height = max(1, min(source_height, round(source_width / aspect)))
+    left = (source_width - crop_width) // 2
+    top = (source_height - crop_height) // 2
+    cropped = image.crop((left, top, left + crop_width, top + crop_height))
+    return cropped.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+
 def _keyframe_materials(plan: Any) -> list[Any]:
     return [m for m in plan.materials if m.material_chain == "image.target_canvas"]
 
@@ -105,40 +132,44 @@ def _keyframe_canvas_size(shape: Any) -> tuple[int, int]:
     geometry = str(shape["geometry"])
     if geometry != "resolved_v2":
         raise ValueError(
-            "fl2va keyframe preparation requires pre-queue resolved_v2 "
+            "keyframe preparation requires pre-queue resolved_v2 "
             f"geometry, got {geometry!r}"
         )
     return int(shape["width"]), int(shape["height"])
 
 
 def _validate_keyframe_materials(plan: Any, keyframes: list[Any]) -> tuple[int, ...]:
-    if str(plan.task) != "fl2va":
-        raise ValueError("keyframe target-canvas materials require plan.task='fl2va'")
+    if str(plan.task) not in {"fl2va", "ref2va"}:
+        raise ValueError(
+            "keyframe target-canvas materials require plan.task='fl2va' or 'ref2va'"
+        )
     semantic_indices = tuple(material.frame_index for material in keyframes)
     if semantic_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES:
         raise ValueError(
-            "fl2va keyframes must use one of the ordered frame_index signatures "
+            "MiniMax H3 keyframes must use one of the ordered frame_index signatures "
             f"{MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES!r}, got {semantic_indices!r}"
         )
     frame_count = plan.shape.get("frame_count")
     if isinstance(frame_count, bool) or not isinstance(frame_count, int):
-        raise ValueError("fl2va keyframe preparation requires an integer frame_count")
+        raise ValueError("keyframe preparation requires an integer frame_count")
     if frame_count <= 1:
-        raise ValueError("fl2va keyframe preparation requires frame_count > 1")
+        raise ValueError("keyframe preparation requires frame_count > 1")
     expected_pixels = tuple(
         frame_count - 1 if index == -1 else index for index in semantic_indices
     )
     resolved_pixels = tuple(material.resolved_frame_index for material in keyframes)
     if resolved_pixels != expected_pixels:
         raise ValueError(
-            "fl2va keyframe resolved_frame_index values disagree with semantic "
+            "keyframe resolved_frame_index values disagree with semantic "
             f"anchors: expected {expected_pixels!r}, got {resolved_pixels!r}"
         )
     return semantic_indices
 
 
-def minimax_h3_prepared_keyframes(batch: Any, plan: Any) -> dict[str, Any]:
-    """Resolve + prepare one or two fl2va keyframes once per request.
+def minimax_h3_prepared_keyframes(
+    batch: Any, plan: Any, *, keyframe_fit: str = "stretch"
+) -> dict[str, Any]:
+    """Resolve + prepare one or two first/last keyframes once per request.
 
     The target canvas is shared across keyframes and must already be frozen by
     the pre-queue probe/resolve hook.
@@ -146,6 +177,8 @@ def minimax_h3_prepared_keyframes(batch: Any, plan: Any) -> dict[str, Any]:
     first-keyframe payload for compatibility; per-keyframe entries live under
     ``images``.
     """
+    if keyframe_fit not in ("stretch", "source_crop"):
+        raise ValueError(f"unknown keyframe_fit {keyframe_fit!r}")
     keyframes = _keyframe_materials(plan)
     semantic_indices = _validate_keyframe_materials(plan, keyframes)
     cached = batch.extra.get(MINIMAX_H3_PREPARED_KEYFRAMES_EXTRA_KEY)
@@ -154,7 +187,7 @@ def minimax_h3_prepared_keyframes(batch: Any, plan: Any) -> dict[str, Any]:
         cached_images = cached.get("images") or ()
         if cached_indices != semantic_indices or len(cached_images) != len(keyframes):
             raise ValueError(
-                "cached fl2va keyframe preparation disagrees with the resolved plan"
+                "cached keyframe preparation disagrees with the resolved plan"
             )
         return cached
 
@@ -212,20 +245,25 @@ def minimax_h3_prepared_keyframes(batch: Any, plan: Any) -> dict[str, Any]:
         # A request's first semantic keyframe is its geometry anchor, including
         # the single-image last-frame-only signature [-1]. Only the second image in the
         # two-keyframe FL extension is a follower and receives cover-crop.
-        prepared_image = (
-            minimax_h3_stretch_keyframe_canvas(
+        if keyframe_fit == "source_crop":
+            prepared_image = minimax_h3_center_crop_keyframe_canvas(
                 image,
                 target_width=canvas_w,
                 target_height=canvas_h,
             )
-            if keyframe_index == 0
-            else minimax_h3_prepare_keyframe_canvas(
+        elif keyframe_index == 0:
+            prepared_image = minimax_h3_stretch_keyframe_canvas(
+                image,
+                target_width=canvas_w,
+                target_height=canvas_h,
+            )
+        else:
+            prepared_image = minimax_h3_prepare_keyframe_canvas(
                 image,
                 target_width=canvas_w,
                 target_height=canvas_h,
                 allow_upscale=True,
             )
-        )
         entries.append(
             {
                 "image": prepared_image,
@@ -271,6 +309,7 @@ def minimax_h3_prepared_keyframes(batch: Any, plan: Any) -> dict[str, Any]:
 __all__ = [
     "MINIMAX_H3_CANVAS_MULTIPLE",
     "MINIMAX_H3_PREPARED_KEYFRAMES_EXTRA_KEY",
+    "minimax_h3_center_crop_keyframe_canvas",
     "minimax_h3_cover_crop_plan",
     "minimax_h3_prepare_keyframe_canvas",
     "minimax_h3_prepared_keyframes",

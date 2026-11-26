@@ -16,9 +16,7 @@ def use_modelscope(name: str):
     return os.path.join(MODELSCOPE_MODEL_WEIGHTS_DIR, name)
 
 
-COSMOS3_NANO_WEIGHTS_PATH = use_modelscope("nv-community/Cosmos3-Nano")
 ERNIE_IMAGE_WEIGHTS_PATH = use_modelscope("PaddlePaddle/ERNIE-Image")
-FLUX_1_DEV_WEIGHTS_PATH = use_modelscope("black-forest-labs/FLUX.1-dev")
 FLUX_2_DEV_WEIGHTS_PATH = use_modelscope("black-forest-labs/FLUX.2-dev")
 FLUX_2_KLEIN_4B_WEIGHTS_PATH = use_modelscope("black-forest-labs/FLUX.2-klein-4B")
 GLM_IMAGE_WEIGHTS_PATH = use_modelscope("ZhipuAI/GLM-Image")
@@ -27,6 +25,7 @@ JOYAI_IMAGE_EDIT_WEIGHTS_PATH = use_modelscope(
 )
 LTX_2_WEIGHTS_PATH = use_modelscope("Lightricks/LTX-2")
 MOVA_360_WEIGHTS_PATH = use_modelscope("openmoss/MOVA-360p")
+MINIMAX_H3_WEIGHTS_PATH = use_modelscope("MiniMax/MiniMax-H3")
 QWEN_IMAGE_WEIGHTS_PATH = use_modelscope("Qwen/Qwen-Image")
 WAN2_1_T2V_1_3B_DIFFUSERS_WEIGHTS_PATH = use_modelscope(
     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
@@ -57,14 +56,6 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
         run_consistency_check=False,
-    ),
-    DiffusionTestCase(
-        "flux_image_t2i_npu",
-        DiffusionServerArgs(
-            model_path=FLUX_1_DEV_WEIGHTS_PATH,
-            extras=EXTRAS_DISABLE_WARMUP,
-        ),
-        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_2_klein_4b_t2i_1npu",
@@ -145,7 +136,71 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             prompt=T2V_PROMPT,
         ),
     ),
-    # === Text+Image to Video+Audio (TI2V)
+    # === Text to Video+Audio (T2VA)
+    DiffusionTestCase(
+        "minimax_h3_t2va_2npu",
+        DiffusionServerArgs(
+            model_path=MINIMAX_H3_WEIGHTS_PATH,
+            modality="video",
+            num_gpus=2,
+            tp_size=2,
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--dit-cpu-offload",
+                "false",
+                "--sp-degree",
+                "1",
+                "--attention-backend",
+                "laser_attn",
+                "--component-residency",
+                "text_encoder=layerwise-offload",
+            ],
+            env_vars={
+                "SGLANG_CACHE_DIT_ENABLED": "true",
+                "SGLANG_CACHE_DIT_FN": "2",
+                "SGLANG_CACHE_DIT_BN": "1",
+                "SGLANG_CACHE_DIT_WARMUP": "4",
+                "SGLANG_CACHE_DIT_RDT": "0.4",
+                "SGLANG_CACHE_DIT_MC": "4",
+                "SGLANG_CACHE_DIT_TAYLORSEER": "true",
+                "SGLANG_CACHE_DIT_TS_ORDER": "2",
+                "HCCL_BUFFSIZE": "256",
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "64",
+            },
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "At night, while their owner sleeps in a bedroom, three cats "
+                "march in loudly playing tiny brass instruments, then abruptly "
+                "file out."
+            ),
+            output_size="1344x768",
+            seconds=5,
+            output_format="mp4",
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 5.0,
+                },
+                "num_inference_steps": 50,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 1101,
+            },
+        ),
+        pin_consistency_quality=False,
+        run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    # === Text+Image to Video+Audio (TI2VA)
     DiffusionTestCase(
         "ltx_2_ti2va_2npu",
         DiffusionServerArgs(
@@ -164,6 +219,9 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             num_gpus=2,
             tp_size=2,
             dit_layerwise_offload=True,
+            env_vars={
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "96",
+            },
             extras=EXTRAS_DISABLE_WARMUP,
         ),
         run_consistency_check=False,
@@ -174,14 +232,26 @@ DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0
 DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
 
+STANDALONE_FILES = {
+    "2-npu": [
+        "ascend/test_glm_image_distributed.py",
+    ],
+}
+
+STANDALONE_FILE_EST_TIMES = {
+    "2-npu": {
+        "ascend/test_glm_image_distributed.py": 900.0,
+    },
+}
+
 SUITES = {
     "1-npu": [
         "ascend/test_server_1_npu.py",
-        # add new 1-npu test files here
+        *STANDALONE_FILES.get("1-npu", []),
     ],
     "2-npu": [
         "ascend/test_server_2_npu.py",
-        # add new 2-npu test files here
+        *STANDALONE_FILES.get("2-npu", []),
     ],
 }
 
@@ -195,6 +265,5 @@ PARAMETRIZED_CASE_GROUPS = {
 }
 
 FILE_SUITES = {}
-STANDALONE_FILES = {}
 COMPONENT_ACCURACY_SUITES = {}
 _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = None

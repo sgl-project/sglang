@@ -2,6 +2,7 @@ import inspect
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
+from sglang.srt.arg_groups.choices import removed_choice_message
 from sglang.srt.entrypoints.openai.protocol import (
     LegacyStructuralTagResponseFormat,
     StructuralTagResponseFormat,
@@ -13,40 +14,59 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.beam_detector import BeamDetector
 from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
+from sglang.srt.function_call.dots_detector import DotsToolDetector
+from sglang.srt.function_call.ernie55_detector import Ernie5_5Detector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
-from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.gigachat4_detector import GigaChat4Detector
+from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
+from sglang.srt.function_call.glm4_moe_detector import (
+    Glm4MoeDetector,
+    GlmSpecialTokenConfig,
+    generate_glm_grammar,
+)
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.granite_toolcall_detector import GraniteToolCallDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
+from sglang.srt.function_call.inkling2_detector import Inkling2Detector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
+from sglang.srt.function_call.iquest_q1_detector import IQuestQ1Detector
+from sglang.srt.function_call.k2_v3_detector import K2V3Detector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
+from sglang.srt.function_call.ling3_detector import Ling3Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.minimax_m3 import MinimaxM3Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.muse_glimmer_detector import MuseGlimmerDetector
 from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+from sglang.srt.function_call.spark25_detector import Spark25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.trinity_detector import TrinityDetector
 from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.function_call.xing4_0_detector import Xing4_0Detector
+from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 
 logger = logging.getLogger(__name__)
 
@@ -56,47 +76,72 @@ class FunctionCallParser:
     Parser for function/tool calls in model outputs.
 
     This class handles both streaming and non-streaming parsing of function calls using a detector.
-    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_increment
+    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_segments
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
     ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
         "apertus2509": Apertus2509Detector,
+        "beam": BeamDetector,
         "cohere_command4": CohereCommand4Detector,
         "deepseekv3": DeepSeekV3Detector,
         "deepseekv31": DeepSeekV31Detector,
         "deepseekv32": DeepSeekV32Detector,
         "deepseekv4": DeepSeekV4Detector,
+        "deepseekv41": DeepSeekV41Detector,
+        "dots": DotsToolDetector,
+        "ernie55": Ernie5_5Detector,
         "glm": Glm4MoeDetector,
-        "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
+        "flint": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
+        "granite_toolcall_parser": GraniteToolCallDetector,
+        "k2_horizon": K2V3Detector,
         "kimi_k2": KimiK2Detector,
         "kimi_k3": KimiK3Detector,
         "lfm2": Lfm2Detector,
+        "ling3": Ling3Detector,
         "llama3": Llama32Detector,
         "mimo": MiMoDetector,
         "minicpm5": MiniCPM5Detector,
         "mistral": MistralDetector,
+        "muse": MuseGlimmerDetector,
         "poolside_v1": PoolsideV1Detector,
         "pythonic": PythonicDetector,
         "qwen": Qwen25Detector,
-        "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
+        "spark25": Spark25Detector,
         "step3": Step3Detector,
         "step3p5": Qwen3CoderDetector,
+        "xing4_0": Xing4_0Detector,
         "minimax-m2": MinimaxM2Detector,
         "minimax-m3": MinimaxM3Detector,
+        "nanbeige": Qwen3CoderDetector,
         "trinity": TrinityDetector,
         "interns1": InternlmDetector,
         "hermes": HermesDetector,
         "hunyuan": HunyuanDetector,
         "gigachat3": GigaChat3Detector,
+        "gigachat35": GigaChat35Detector,
+        "gigachat4": GigaChat4Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
+        "inkling2": Inkling2Detector,
+        "iquest_q1": IQuestQ1Detector,
+        "response_template": ResponseTemplateToolDetector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
+    def __init__(
+        self,
+        tools: List[Tool],
+        tool_call_parser: str,
+        tokenizer=None,
+        tool_choice=None,
+        prefix: str = "",
+        constrained: bool = False,
+    ):
+        self.tools = tools
+        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -104,13 +149,34 @@ class FunctionCallParser:
                 sig = inspect.signature(detector_class)
                 if "tokenizer" in sig.parameters:
                     kwargs["tokenizer"] = tokenizer
+            if issubclass(detector_class, ResponseTemplateToolDetector):
+                if prefix:
+                    kwargs["prefix"] = prefix
+                kwargs["constrained"] = constrained
+                # Forced calls are parsed in the format of the tag for these tools.
+                kwargs["tools"] = self.structural_tag_tools()
             detector = detector_class(**kwargs)
         else:
-            raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+            message = removed_choice_message("tool_call_parser", tool_call_parser)
+            raise ValueError(
+                message or f"Unsupported tool_call_parser: {tool_call_parser}"
+            )
 
-        self.detector = detector
-        self.tools = tools
-        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+        if isinstance(detector, Glm47MoeDetector):
+            detector.use_full_assistant_constraint = not any(
+                tool.function.strict for tool in tools
+            )
+        if isinstance(tool_choice, dict):
+            tool_choice = ToolChoice(function={"name": tool_choice["name"]})
+        self._required_tool_parser = detector.get_required_tool_parser(tool_choice)
+        self.detector = self._required_tool_parser or detector
+
+    def owns_tool_format(self) -> bool:
+        return (
+            self._required_tool_parser is not None
+            or self.detector.supports_structural_tag()
+            or self.detector.parses_required_natively()
+        )
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -123,24 +189,42 @@ class FunctionCallParser:
         Returns:
             True if the text contains a tool call, False otherwise
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return False
         return self.detector.has_tool_call(text)
 
-    def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
+    def parse_non_stream(
+        self, full_text: str, *, preserve_incomplete: bool = False
+    ) -> Tuple[str, list[ToolCallItem]]:
         """
         One-time parsing of the full text to extract tool calls.
 
         Args:
             full_text: The complete text to parse
+            preserve_incomplete: Keep a call that a response-template parser
+                recognized but the text cut off, as streaming does
 
         Returns:
             A tuple containing:
             - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
             - A list of tool calls parsed from the text
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return full_text, []
+        if preserve_incomplete and isinstance(
+            self.detector, ResponseTemplateToolDetector
+        ):
+            normal_text, streamed = self.parse_stream_chunk(full_text)
+            end_text, end_calls = self.parse_stream_end()
+            calls: dict[int, ToolCallItem] = {}
+            for call in [*streamed, *end_calls]:
+                if call.tool_index not in calls:
+                    calls[call.tool_index] = call.model_copy()
+                else:
+                    merged = calls[call.tool_index]
+                    merged.name = call.name or merged.name
+                    merged.parameters += call.parameters
+            return normal_text + end_text, list(calls.values())
         has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
@@ -149,9 +233,27 @@ class FunctionCallParser:
         else:
             return full_text, []
 
+    def parse_stream_segments(
+        self, chunk_text: str
+    ) -> list[Tuple[str, list[ToolCallItem]]]:
+        """Parse a streamed chunk into (normal_text, calls) segments.
+
+        Each segment is sent text first, then calls; the segments are in
+        generation order.
+        """
+        if not self.tools and not self.detector.parses_without_tools():
+            return [(chunk_text, [])]
+        return [
+            (result.normal_text, result.calls)
+            for result in self.detector.parse_streaming_segments(chunk_text, self.tools)
+        ]
+
     def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
         Streaming incremental parsing of chunks of text as they arrive.
+
+        parse_stream_segments merged into one pair, for callers that do not
+        depend on the order of text and calls.
 
         Args:
             chunk_text: The new chunk of text to parse
@@ -161,19 +263,22 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
-        if not self.tools:
-            return chunk_text, []
-        final_normal_text = ""
-        final_calls = []
+        normal_text, calls = "", []
+        for text, segment_calls in self.parse_stream_segments(chunk_text):
+            normal_text += text
+            calls.extend(segment_calls)
+        return normal_text, calls
 
-        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
-        if sp_result.normal_text:
-            final_normal_text = sp_result.normal_text
-        if sp_result.calls:
-            final_calls.extend(sp_result.calls)
-            final_normal_text = sp_result.normal_text
+    def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
+        """Flush detector state once the stream ends.
 
-        return final_normal_text, final_calls
+        Text a detector held back waiting for a marker (which can no longer
+        arrive) is released as normal text; see BaseFormatDetector.finish().
+        """
+        if not self.tools and not self.detector.parses_without_tools():
+            return "", []
+        sp_result = self.detector.finish(self.tools)
+        return sp_result.normal_text, sp_result.calls
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
@@ -227,6 +332,18 @@ class FunctionCallParser:
             at_least_one=at_least_one,
         )
 
+    def structural_tag_tools(self) -> List[Tool]:
+        """The tools as structural tags constrain them: all strict at the
+        PARAMETER strict level."""
+        if self.tool_strict_level < ToolStrictLevel.PARAMETER or not self.tools:
+            return self.tools
+        return [
+            tool.model_copy(
+                update={"function": tool.function.model_copy(update={"strict": True})}
+            )
+            for tool in self.tools
+        ]
+
     def get_structure_constraint(
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
@@ -249,9 +366,48 @@ class FunctionCallParser:
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
+        structural_tag_tools = self.structural_tag_tools()
+        if isinstance(self.detector, ResponseTemplateToolDetector):
+            structural_tag = self.detector.validate_structure_constraint_request(
+                tool_choice,
+                parallel_tool_calls,
+                should_constrain_auto,
+                tools=structural_tag_tools,
+                thinking_mode=thinking_mode,
+            )
+            if structural_tag is not None:
+                return ("structural_tag", structural_tag)
+            should_constrain_auto = False
 
-        # Highest priority: model-native structural_tag when available.
         try:
+            if (
+                isinstance(self.detector, Glm47MoeDetector)
+                and self.detector.parses_required_natively()
+            ):
+                functions = (
+                    [
+                        tool.function
+                        for tool in self.tools
+                        if not isinstance(tool_choice, ToolChoice)
+                        or tool.function.name == tool_choice.function.name
+                    ]
+                    if self.tools and tool_choice != "none"
+                    else None
+                )
+                return (
+                    "full_assistant_ebnf",
+                    generate_glm_grammar(
+                        enable_thinking=thinking_mode,
+                        functions=functions,
+                        special_tokens=GlmSpecialTokenConfig(),
+                        chat_template_version="glm47",
+                        accommodate_chat_template=True,
+                        allow_multiple_assistant_turns=False,
+                        required=is_required,
+                        parallel_tool_calls=parallel_tool_calls,
+                    ),
+                )
+            # Highest priority: model-native structural_tag when available.
             if tool_choice == "auto" and not should_constrain_auto:
                 structural_tag = self.detector.get_auto_tool_call_structural_tag(
                     tools=self.tools,
@@ -262,18 +418,6 @@ class FunctionCallParser:
                     return ("structural_tag", structural_tag)
 
             if is_required or should_constrain_auto:
-                structural_tag_tools = self.tools
-                if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
-                    structural_tag_tools = [
-                        tool.model_copy(
-                            update={
-                                "function": tool.function.model_copy(
-                                    update={"strict": True}
-                                )
-                            }
-                        )
-                        for tool in self.tools
-                    ]
                 structural_tag = self.detector.get_structural_tag(
                     tools=structural_tag_tools,
                     thinking_mode=thinking_mode,
@@ -295,6 +439,14 @@ class FunctionCallParser:
             if (
                 tool_choice == "required" or isinstance(tool_choice, ToolChoice)
             ) and not self.detector.parses_required_natively():
+                required_parser = self.detector.get_required_tool_parser(tool_choice)
+                if required_parser is not None:
+                    return (
+                        "json_schema",
+                        required_parser.get_json_schema_constraint(
+                            self.tools, tool_choice, parallel_tool_calls
+                        ),
+                    )
                 json_schema = get_json_schema_constraint(
                     self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
                 )

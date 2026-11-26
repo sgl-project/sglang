@@ -5,6 +5,7 @@ processor only handles the special-token contract and content interleaving.
 """
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass
 from typing import List, Literal, Union
@@ -12,12 +13,9 @@ from typing import List, Literal, Union
 import numpy as np
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.mimo_v2_asr import MiMoV2ASRForCausalLM
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -26,7 +24,8 @@ from sglang.srt.multimodal.processors.mimo_audio import (
     AudioInput,
     MiMoAudioPipeline,
 )
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 TextInput = str | list[int]
 
@@ -114,76 +113,6 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
         rope_deltas = torch.zeros((1, 1), dtype=torch.int32)
         return ids, audio_inputs, position_ids, rope_deltas
 
-    def process_mm_data(
-        self, input_text, images=None, videos=None, audios=None, **kwargs
-    ) -> dict:
-        if audios and not self.AUDIO_REGEX.search(input_text or ""):
-            input_text = f"{self.mm_tokens.audio_token}{input_text or ''}"
-
-        processed_audios: List[Union[tuple, torch.Tensor]] = []
-        if audios:
-            for audio in audios:
-                if isinstance(audio, np.ndarray):
-                    audio_tensor = torch.from_numpy(audio).float()
-                elif isinstance(audio, torch.Tensor):
-                    audio_tensor = audio.float()
-                else:
-                    processed_audios.append(audio)
-                    continue
-                if audio_tensor.ndim == 1:
-                    processed_audios.append(
-                        (audio_tensor.cpu().contiguous(), self.audio_sampling_rate)
-                    )
-                else:
-                    processed_audios.append(audio_tensor.cpu().contiguous())
-
-        contents: List[_Content] = []
-        if input_text and processed_audios:
-            multimodal_tokens_pattern = self.mm_tokens.get_combined_regex()
-            text_parts = re.split(multimodal_tokens_pattern, input_text)
-            audio_iter = iter(processed_audios)
-
-            for text_part in text_parts:
-                if multimodal_tokens_pattern.match(text_part):
-                    modality = self.mm_tokens.get_modality_of_token(text_part)
-                    if modality == Modality.AUDIO:
-                        try:
-                            audio = next(audio_iter)
-                            contents.append(
-                                _Content(type="audio", content=AudioInput(audio=audio))
-                            )
-                        except StopIteration:
-                            pass
-                else:
-                    if text_part:
-                        contents.append(_Content(type="text", content=text_part))
-        else:
-            contents.extend(
-                _Content(type="audio", content=AudioInput(audio=audio))
-                for audio in processed_audios
-            )
-
-        if not contents:
-            ids = self.tokenizer(
-                input_text or "",
-                return_tensors="pt",
-                add_special_tokens=True,
-            ).input_ids
-            return {"input_ids": ids}
-
-        input_ids, audio_inputs, position_ids, rope_deltas = self._process_contents(
-            contents
-        )
-
-        ret: dict = {
-            "input_ids": input_ids,
-            "mrope_positions": position_ids,
-            "mrope_position_delta": rope_deltas,
-        }
-        if audio_inputs:
-            ret["audio_features"] = audio_inputs
-        return ret
-
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
@@ -250,11 +179,14 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
 
         loop = asyncio.get_running_loop()
         try:
-            input_ids, audio_inputs, position_ids, rope_deltas = (
-                await loop.run_in_executor(
-                    self.io_executor,
-                    lambda: self._process_contents(contents),
-                )
+            (
+                input_ids,
+                audio_inputs,
+                position_ids,
+                rope_deltas,
+            ) = await loop.run_in_executor(
+                self.io_executor,
+                lambda: self._process_contents(contents),
             )
         except RuntimeError as e:
             logger.error(f"MiMo ASR processor failed in process_mm_data_async: {e}")

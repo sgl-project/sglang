@@ -6,31 +6,40 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import FormatSignature, KernelBackend, KernelSpec
+from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
 
+
+# JIT is the only backend: the AOT kernel it replaced was built for CUDA alone,
+# never by the ROCm / MUSA / Metal extensions. Non-CUDA resolves nothing here --
+# the Triton fallback is picked by the serving wrapper's `_HAS_CONV1D_KERNEL`
+# branch, not by the registry.
 register_kernel(
     KernelSpec(
         op="mamba.causal_conv1d_fwd",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel.mamba:causal_conv1d_fwd",
-        format_signature=FormatSignature(
-            in_place=True, description="causal depthwise conv1d forward (prefill)"
-        ),
-        description="Causal conv1d forward (sgl_kernel wheel).",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.mamba.causal_conv1d:causal_conv1d_fwd",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
     KernelSpec(
         op="mamba.causal_conv1d_update",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel.mamba:causal_conv1d_update",
-        format_signature=FormatSignature(
-            in_place=True, description="causal depthwise conv1d update (decode)"
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.mamba.causal_conv1d:causal_conv1d_update",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.causal_conv1d_fn",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.mamba.causal_conv1d_triton:"
+            "_CAUSAL_CONV1D_OP.forward_triton"
         ),
-        description="Causal conv1d update (sgl_kernel wheel).",
     )
 )
 
@@ -47,7 +56,7 @@ def causal_conv1d_fwd(
     pad_slot_id: int,
 ):
     """Causal depthwise conv1d forward (prefill)."""
-    return get_kernel("mamba.causal_conv1d_fwd", KernelBackend.AOT)(
+    return get_kernel("mamba.causal_conv1d_fwd", KernelBackend.JIT)(
         x,
         weight,
         bias_,
@@ -71,7 +80,7 @@ def causal_conv1d_update(
     pad_slot_id: int,
 ):
     """Causal depthwise conv1d update (decode)."""
-    return get_kernel("mamba.causal_conv1d_update", KernelBackend.AOT)(
+    return get_kernel("mamba.causal_conv1d_update", KernelBackend.JIT)(
         x,
         conv_state,
         weight,
@@ -90,7 +99,6 @@ __all__ = ["causal_conv1d_fwd", "causal_conv1d_update"]
 for _mod, _fn in [
     ("triton_ops.ssd_combined", "mamba_chunk_scan_combined"),
     ("triton_ops.mamba_ssm", "selective_state_update"),
-    ("causal_conv1d_triton", "causal_conv1d_fn"),
     ("mamba_state_scatter_triton", "fused_mamba_state_scatter_with_mask"),
 ]:
     register_kernel(
@@ -101,3 +109,65 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_qwen4_short_conv_state",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_short_conv_state",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_qwen4_varlen_conv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_varlen_conv",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_qwen4_verify_conv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_verify_conv",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_lfm_short_conv_prefill",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.lfm_short_conv:fused_lfm_short_conv_prefill",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_lfm_short_conv_decode",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.lfm_short_conv:fused_lfm_short_conv_decode",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="mamba.fill_track_conv_indices",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.sconv_tracking:fill_track_conv_indices",
+        capabilities=CUDA_ONLY,
+    )
+)
+for _fn in ("kda_track_conv_window", "kda_track_ssm_state"):
+    register_kernel(
+        KernelSpec(
+            op=f"mamba.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.mamba.kda_prefill_track:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn

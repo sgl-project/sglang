@@ -10,34 +10,106 @@ import msgspec
 import torch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskOutput,
+)
 from sglang.srt.managers import io_struct
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.auxiliary_output import append_auxiliary_output
+from sglang.srt.managers.io_struct import AbortReq, FinishReasonDict
+from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_serving,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
+from sglang.srt.utils.device import async_d2h as _async_d2h
+from sglang.srt.utils.device import is_cuda, is_pin_memory_available
+from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
+    from sglang.srt.managers.auxiliary_output import (
+        DeviceAuxiliaryOutput,
+        HostAuxiliaryOutput,
+    )
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+    from sglang.srt.observability.forward_pass_metrics import (
+        FpmTiming,
+        ScheduledRequestMetrics,
+    )
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 logger = logging.getLogger(__name__)
 
 
-def _async_d2h(t: torch.Tensor) -> torch.Tensor:
-    """Async D2H copy for overlap scheduling. On CUDA the dest is pinned (a D2H
-    to pageable host memory blocks the caller until done) and record_stream keeps
-    the source alive until the copy stream drains, so the caching allocator can't
-    recycle it early. Non-CUDA falls back to a plain copy."""
-    if not t.is_cuda:
-        return t.to("cpu", non_blocking=True)
-    cpu_t = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
-    cpu_t.copy_(t, non_blocking=True)
-    t.record_stream(torch.cuda.current_stream(t.device))
-    return cpu_t
+# Async copy of the top logprobs to the host: one copy for the [rows, k] tensor
+# (every row asks the same k), or one batched copy for the per-row list.
+def _async_d2h_top_logprobs(
+    rows: Optional[Union[torch.Tensor, List]],
+) -> Optional[Union[torch.Tensor, List]]:
+    if rows is None:
+        return None
+    if torch.is_tensor(rows):
+        return _async_d2h(rows)
+    return _async_d2h_rows(rows)
+
+
+def allocate_distinct_stream(device_module, avoid_streams):
+    """Draw a stream that aliases none of ``avoid_streams``.
+
+    CUDA/HIP streams come from a fixed round-robin pool, so a fresh ``Stream()``
+    may hand back one that is already in use.
+    """
+    avoid = {stream.cuda_stream for stream in avoid_streams}
+    for _ in range(65):
+        stream = device_module.Stream(priority=0)
+        if stream.cuda_stream not in avoid:
+            return stream
+    raise RuntimeError("Unable to allocate a distinct stream")
+
+
+def is_war_barrier_enabled() -> bool:
+    # On by default on CUDA. Unified memory frees ids and rewrites request rows on the
+    # schedule stream at once, so it needs the barrier on every device.
+    return (
+        is_cuda()
+        or get_memory().enable_unified_memory
+        or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+    )
+
+
+def _async_d2h_rows(rows: List[Any]) -> List[Any]:
+    """`_async_d2h` over per-request rows with one host buffer and one copy.
+
+    The rows come back as host views with their shapes, in order; entries that
+    are not tensors pass through.
+    """
+    tensors = [row for row in rows if torch.is_tensor(row)]
+    if len(tensors) < 2 or len({row.dtype for row in tensors}) > 1:
+        return [_async_d2h(row) if torch.is_tensor(row) else row for row in rows]
+    flat = torch.cat([row.reshape(-1) for row in tensors])
+    device = flat.device
+    if device.type != "cpu" and is_pin_memory_available(device):
+        # use record_stream so rows don't get reused before torch.cat finished
+        stream = torch.get_device_module(device).current_stream()
+        for row in tensors:
+            row.record_stream(stream)
+    host = _async_d2h(flat)
+    host_rows = iter(
+        chunk.view(row.shape)
+        for chunk, row in zip(host.split([row.numel() for row in tensors]), tensors)
+    )
+    return [next(host_rows) if torch.is_tensor(row) else row for row in rows]
 
 
 @dataclasses.dataclass
@@ -66,10 +138,23 @@ class GenerationBatchResult:
     extend_logprob_start_len_per_req: Optional[List[int]] = None
 
     # For overlap scheduling
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # Side-stream work still writing this batch's KV; copy_done is recorded after it.
+    side_stream_done: Optional[torch.cuda.Event] = None
+    # The unified pool's record of this forward; processing the result retires
+    # it, so page moves stop treating its pages as in flight.
+    unified_forward_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
+    # The step's launch record, for the unified pool's processing.
+    forward_launch: Optional[ForwardLaunch] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
+    # Padded row width in flattened speculative output. Existing algorithms
+    # default to speculative_num_draft_tokens; linear UNO emits F + 1 columns.
+    speculative_output_stride: Optional[int] = None
+    # Valid output tokens that are not accepted draft proposals. Existing
+    # algorithms have one bonus token; UNO also emits its clean root.
+    num_non_draft_tokens_per_req: int = 1
 
     # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
     # these once — eagerly via the scheduler's grammar barrier inside verify(), or
@@ -90,7 +175,33 @@ class GenerationBatchResult:
     new_seq_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
-    next_draft_input: Optional[EagleDraftInput] = None
+    next_draft_input: Optional[SpecInput] = None
+
+    # PP+spec: tail-drafted chain tokens (flat bs*num_draft_tokens, root =
+    # bonus) for the NEXT verify round, relayed last stage -> all stages,
+    # with the tree topology the tokens were arranged by (parent_list and
+    # top_scores_index have different widths, so they stay separate).
+    next_verify_chain: Optional[torch.Tensor] = None
+    next_verify_parent_list: Optional[torch.Tensor] = None
+    next_verify_top_scores_index: Optional[torch.Tensor] = None
+
+    # PP+spec: the verify forward's KV slots on a non-last stage. That stage
+    # prepares verify inside forward isolation, which restores
+    # batch.out_cache_loc, so the slots have to travel on the result to survive
+    # until the accepted path comes back over the relay.
+    spec_verify_out_cache_loc: Optional[torch.Tensor] = None
+
+    # The plan the forward wrote its KV through, when the caller asked for it
+    # (`return_iteration_ids`): a speculative worker's own writes into the same
+    # slots take their ids from it.
+    iteration_ids: Optional[IterationIds] = None
+
+    # PP+spec: [bs, spec_steps + 1] global node indices of the accepted path.
+    # Every stage holds the KV for its own layers, so every stage has to compact
+    # that path into its committed prefix; only the last stage can compute it.
+    accept_index: Optional[torch.Tensor] = None
+    # The optional fourth item is the prepared draft-extend layout.
+    prepared_draft_extend_inputs: Optional[tuple] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -100,19 +211,27 @@ class GenerationBatchResult:
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    kv_weight_version_record: Optional[KvWeightVersionRecord] = None
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
-    # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
-    fpm_start_event: Optional[torch.cuda.Event] = None
-    fpm_end_event: Optional[torch.cuda.Event] = None
+    # Forward pass metrics (FPM)
+    fpm_timing: Optional[FpmTiming] = None
+    fpm_scheduled_requests: Optional[ScheduledRequestMetrics] = None
+
+    # ForwardObserver output, copied together with the sampling observer's.
+    forward_auxiliary_output: Optional[DeviceAuxiliaryOutput] = None
+    auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
 
     @property
     def has_sampled_token_ids(self) -> bool:
         """True when this iter sampled token ids; False when none were produced
         this rank/split (a non-last PP rank or a non-final prefill split)."""
         return isinstance(self.next_token_ids, torch.Tensor)
+
+    def get_num_generated_tokens(self, batch_size: int) -> int:
+        return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
@@ -129,21 +248,16 @@ class GenerationBatchResult:
                 self.logits_output.input_token_logprobs = _async_d2h(
                     self.logits_output.input_token_logprobs
                 )
-            if self.logits_output.next_token_top_logprobs_val is not None:
-                self.logits_output.next_token_top_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_top_logprobs_val
-                ]
-            if self.logits_output.next_token_top_logprobs_idx is not None:
-                self.logits_output.next_token_top_logprobs_idx = [
-                    _async_d2h(x) if torch.is_tensor(x) else x
-                    for x in self.logits_output.next_token_top_logprobs_idx
-                ]
+            self.logits_output.next_token_top_logprobs_val = _async_d2h_top_logprobs(
+                self.logits_output.next_token_top_logprobs_val
+            )
+            self.logits_output.next_token_top_logprobs_idx = _async_d2h_top_logprobs(
+                self.logits_output.next_token_top_logprobs_idx
+            )
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
-                self.logits_output.next_token_token_ids_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_token_ids_logprobs_val
-                ]
+                self.logits_output.next_token_token_ids_logprobs_val = _async_d2h_rows(
+                    self.logits_output.next_token_token_ids_logprobs_val
+                )
         if return_hidden_states and self.logits_output.hidden_states is not None:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
@@ -162,36 +276,73 @@ class GenerationBatchResult:
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
         # all device->host copying and lifetime safety lives in one place.
+        sampling_mask_output = (
+            self.logits_output.sampling_mask_output
+            if self.logits_output is not None
+            else None
+        )
         for holder in (
+            sampling_mask_output,
             self.routed_experts_output,
             self.indexer_topk_output,
+            self.kv_weight_version_record,
             self.expert_distribution_metrics,
         ):
             if holder is not None:
                 holder.map_device_tensors(_async_d2h)
 
+        self.copy_auxiliary_output_to_cpu()
+
         self.copy_done.record()
 
-    @classmethod
-    def from_pp_proxy(
-        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
-    ):
-        # TODO(lsyin): refactor PP and avoid using dict
-        proxy_dict = next_pp_outputs.tensors
-        return cls(
-            logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=None,
-            next_token_ids=next_pp_outputs["next_token_ids"],
-            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
-            extend_logprob_start_len_per_req=proxy_dict.get(
-                "extend_logprob_start_len_per_req", None
-            ),
-            can_run_cuda_graph=can_run_cuda_graph,
+    def copy_auxiliary_output_to_cpu(self) -> None:
+        if self.logits_output is None or self.auxiliary_host_output is not None:
+            return
+        device_output = append_auxiliary_output(
+            self.forward_auxiliary_output, self.logits_output.auxiliary_device_output
         )
+        if device_output is not None:
+            self.auxiliary_host_output = device_output.copy_to_host(_async_d2h)
+            self.logits_output.auxiliary_device_output = None
+            self.forward_auxiliary_output = None
+
+
+def get_preserve_last_token_id(tokenizer, is_generation: bool) -> Optional[int]:
+    """Token to keep last when auto-truncating: the separator for embedding models."""
+    if is_generation or tokenizer is None:
+        return None
+    # Non-HF tokenizers (e.g. TiktokenTokenizer) have no sep_token_id.
+    return getattr(tokenizer, "sep_token_id", None)
+
+
+def truncate_input_ids(
+    input_ids: List[int],
+    max_len: int,
+    preserve_last_token_id: Optional[int] = None,
+) -> List[int]:
+    """Head-truncate ``input_ids`` to ``max_len`` tokens.
+
+    If the input ended with ``preserve_last_token_id`` (e.g. a BERT ``[SEP]``),
+    that token stays last, as with Hugging Face ``truncation=True``; encoder
+    embedding models depend on it. ``None`` gives a plain head slice.
+    """
+    truncated = input_ids[:max_len]
+    if (
+        preserve_last_token_id is not None
+        and input_ids
+        and input_ids[-1] == preserve_last_token_id
+        and truncated
+        and truncated[-1] != preserve_last_token_id
+    ):
+        truncated[-1] = preserve_last_token_id
+    return truncated
 
 
 def validate_input_length(
-    req: Req, max_req_input_len: int, allow_auto_truncate: bool
+    req: Req,
+    max_req_input_len: int,
+    allow_auto_truncate: bool,
+    preserve_last_token_id: Optional[int] = None,
 ) -> Optional[str]:
     """Validate and potentially truncate input length.
 
@@ -199,6 +350,7 @@ def validate_input_length(
         req: The request containing input_ids to validate
         max_req_input_len: Maximum allowed input length
         allow_auto_truncate: Whether to truncate long inputs
+        preserve_last_token_id: See ``truncate_input_ids``.
 
     Returns:
         Error message if validation fails, None if successful
@@ -210,12 +362,23 @@ def validate_input_length(
                 "the max context length. Truncated. "
                 f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
             )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            req.origin_input_ids = truncate_input_ids(
+                req.origin_input_ids,
+                max_len=max_req_input_len,
+                preserve_last_token_id=preserve_last_token_id,
+            )
             return None
         else:
+            # OpenAI-compatible clients (e.g. LiteLLM) recognize a context
+            # overflow by OpenAI's "This model's maximum context length is"
+            # sentence; without it this is a generic 400 to them.
+            # Both sentences quote the largest accepted prompt.
+            max_prompt_len = max_req_input_len - 1
             error_msg = (
                 f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                f"the maximum allowed length ({max_req_input_len} tokens). "
+                f"the maximum allowed length ({max_prompt_len} tokens). "
+                f"This model's maximum context length is {max_prompt_len} "
+                f"tokens on this server. "
                 f"Use a shorter input or enable --allow-auto-truncate."
             )
             return error_msg
@@ -224,9 +387,14 @@ def validate_input_length(
 
 
 def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
+    """Build the tensor payload needed to reconstruct PP output processing state."""
 
     logits_output = result.logits_output
     assert logits_output is not None
+    # Nested pinned CPU tensors are serialized as Python metadata by PP, so
+    # their forward-stream copies must be complete before pickling starts.
+    logits_output.finalize_input_logprobs()
+    sampling_mask_output = logits_output.sampling_mask_output
 
     return {
         "extend_input_len_per_req": result.extend_input_len_per_req,
@@ -236,8 +404,30 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
         "next_token_token_ids_logprobs_val": result.logits_output.next_token_token_ids_logprobs_val,
         "next_token_token_ids_logprobs_idx": result.logits_output.next_token_token_ids_logprobs_idx,
-        "next_token_sampling_mask_idx": result.logits_output.next_token_sampling_mask_idx,
-        "next_token_sampling_logprobs": result.logits_output.next_token_sampling_logprobs,
+        "sampling_mask_token_ids": (
+            None if sampling_mask_output is None else sampling_mask_output.token_ids
+        ),
+        "sampling_mask_lengths": (
+            None if sampling_mask_output is None else sampling_mask_output.lengths
+        ),
+        "sampling_mask_selected_logprobs": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.selected_logprobs
+        ),
+        "sampling_mask_support_logprobs": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.support_logprobs
+        ),
+        "sampling_mask_statuses": (
+            None if sampling_mask_output is None else sampling_mask_output.statuses
+        ),
+        "sampling_mask_num_accept_tokens": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.num_accept_tokens
+        ),
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
         "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
@@ -246,9 +436,49 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
     }
 
 
+def pp_output_rows_to_host(tensor_dict: dict) -> bool:
+    """Start one host copy per row list of device tensors (top and token-id logprobs)
+    on the current stream; returns whether any started."""
+    copied = False
+    for key, rows in tensor_dict.items():
+        if isinstance(rows, list) and any(
+            torch.is_tensor(row) and row.device.type != "cpu" for row in rows
+        ):
+            tensor_dict[key] = _async_d2h_rows(rows)
+            copied = True
+    return copied
+
+
+def pp_output_rows_to_lists(tensor_dict: dict, rows_ready: torch.Event) -> None:
+    """Before the output message is pickled: wait for the host copies and turn the rows
+    into Python lists. Pickle stores a view's whole storage, and the rows share one."""
+    if not any(
+        isinstance(rows, list) and any(torch.is_tensor(row) for row in rows)
+        for rows in tensor_dict.values()
+    ):
+        return
+    rows_ready.synchronize()
+    for key, rows in tensor_dict.items():
+        if isinstance(rows, list) and any(torch.is_tensor(row) for row in rows):
+            tensor_dict[key] = [
+                row.tolist() if torch.is_tensor(row) else row for row in rows
+            ]
+
+
 def get_logprob_from_pp_outputs(
     next_pp_outputs: PPProxyTensors,
 ) -> tuple[LogitsProcessorOutput, list[int], list[int]]:
+    """Reconstruct output processing state received from the last PP stage."""
+    sampling_mask_output = None
+    if next_pp_outputs["sampling_mask_token_ids"] is not None:
+        sampling_mask_output = SamplingMaskOutput(
+            token_ids=next_pp_outputs["sampling_mask_token_ids"],
+            lengths=next_pp_outputs["sampling_mask_lengths"],
+            selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
+            support_logprobs=next_pp_outputs["sampling_mask_support_logprobs"],
+            statuses=next_pp_outputs["sampling_mask_statuses"],
+            num_accept_tokens=next_pp_outputs["sampling_mask_num_accept_tokens"],
+        )
     logits_output = LogitsProcessorOutput(
         # Do not send logits and hidden states because they are large
         next_token_logits=None,
@@ -262,8 +492,7 @@ def get_logprob_from_pp_outputs(
         next_token_token_ids_logprobs_idx=next_pp_outputs[
             "next_token_token_ids_logprobs_idx"
         ],
-        next_token_sampling_mask_idx=next_pp_outputs["next_token_sampling_mask_idx"],
-        next_token_sampling_logprobs=next_pp_outputs["next_token_sampling_logprobs"],
+        sampling_mask_output=sampling_mask_output,
         input_token_logprobs=next_pp_outputs["input_token_logprobs"],
         input_top_logprobs_val=next_pp_outputs["input_top_logprobs_val"],
         input_top_logprobs_idx=next_pp_outputs["input_top_logprobs_idx"],
@@ -288,12 +517,18 @@ class EmbeddingBatchResult:
             only when the batch contained ``return_pooled_hidden_states=True``
             requests.  Tensor (uniform shapes) or list of tensors (MIS).
         copy_done: CUDA event recorded after the async CPU copy completes.
+        unified_forward_done: The unified pool's record of an overlapped
+            forward; processing the result retires it.
     """
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    unified_forward_done: Optional[torch.cuda.Event] = None
     can_run_cuda_graph: bool = False
+    fpm_timing: Optional[FpmTiming] = None
+    # The step's launch record, for the unified pool's processing.
+    forward_launch: Optional[ForwardLaunch] = None
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):
@@ -373,23 +608,39 @@ def msgpack_decode_explained(data: bytes) -> Any:
             if m is not None:
                 idx = int(m.group(1))
                 if 1 <= idx <= len(fields):
-                    msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
+                    msg = f"{msg[: m.start()]}$.{fields[idx - 1]}{msg[m.end() :]}"
         raise MsgpackDecodeError(rid, msg) from e
 
 
-def compute_num_reserved_tokens(server_args: ServerArgs) -> int:
+def compute_num_reserved_tokens() -> int:
     """Output token slots reserved per request, on top of its input.
 
     The current eagle implementation stores draft tokens in the output token
     slots, so the context budget has to account for them; every other algorithm
     reserves nothing. Shared by `TokenizerManager` and the rust server's
-    `server_args` blob (`RustServer._build_server_args`), which needs the same
+    `server_args` handoff (`RustServer._build_server_args`), which needs the same
     number to run the total-token check in Rust.
     """
-    algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    spec = get_spec()
+    algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
     if not algorithm.is_eagle():
         return 0
     return max(
-        server_args.speculative_eagle_topk * server_args.speculative_num_steps,
-        server_args.max_speculative_num_draft_tokens,
+        spec.speculative_eagle_topk * spec.speculative_num_steps,
+        max_speculative_num_draft_tokens(),
+    )
+
+
+def make_abort_req(
+    req: Req, finished_reason: Optional[FinishReasonDict] = None
+) -> AbortReq:
+    return AbortReq(
+        rid=req.rid,
+        finished_reason=finished_reason,
+        weight_versions=compute_weight_version_spans(
+            req.weight_version_events,
+            current_version=get_serving().weight_version,
+            num_output_tokens=len(req.output_ids),
+        ),
+        prefill_weight_versions=req.prefill_weight_versions,
     )

@@ -49,6 +49,9 @@ def msgspec_to_builtins(obj: Any) -> Any:
             for f in dataclasses.fields(obj)
         }
 
+    if isinstance(obj, type):
+        return f"{obj.__module__}.{obj.__qualname__}"
+
     if isinstance(obj, dict):
         return {key: msgspec_to_builtins(value) for key, value in obj.items()}
 

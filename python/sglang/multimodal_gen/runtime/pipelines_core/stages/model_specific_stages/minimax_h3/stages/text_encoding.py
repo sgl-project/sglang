@@ -3,10 +3,15 @@ from __future__ import annotations
 
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY,
     MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.replica_broadcast import (
+    minimax_h3_replica_ctx,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
@@ -14,10 +19,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    get_global_server_args,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_copy_text_encode"
 
 
 class MiniMaxH3TextEncodingStage(TextEncodingStage):
@@ -47,13 +58,23 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         plan = minimax_h3_plan_from_batch(batch)
         if plan is not None:
             try:
-                self._encode_from_plan(batch, plan)
+                self._encode_from_plan(
+                    batch,
+                    plan,
+                    pipeline_config=server_args.pipeline_config,
+                    include_video_token_mask=(
+                        server_args.pipeline_config.uses_subblock_attention(server_args)
+                    ),
+                )
                 self._publish_native_text_conditioning(batch)
+                if current_platform.is_mps():
+                    self._finish_active_component_use()
             except Exception:
                 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.material_io import (
                     minimax_h3_cleanup_temp_dirs,
                 )
 
+                batch.extra.pop(MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY, None)
                 minimax_h3_cleanup_temp_dirs(batch)
                 raise
             return batch
@@ -101,13 +122,14 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         batches: list[Req],
         server_args: ServerArgs,
     ) -> list[Req]:
-        """Distribute independent H3 presentations over replicated encoders.
+        """Distribute independent H3 presentations over encoder copies.
 
         H3 presentations have variable multimodal layouts, so they cannot be
         stacked into the generic text batch without changing padding/kernels.
-        Assigning one complete request to a rank preserves the exact
-        single-request encoder path, then broadcasts that request's native
-        payload to the other ranks.
+        Assigning one complete request to a copy preserves the exact
+        single-request encoder path. A copy may itself span a TP group; the
+        orthogonal encoder-DP group then broadcasts that request's native
+        payload to the other copies.
         """
         grouped = self._group_requests_by_fingerprint(
             batches,
@@ -135,7 +157,15 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             payload = None
             if dp_group.rank_in_group == owner:
                 try:
-                    first_result = self(first_batch, server_args)
+                    first_batch.extra[_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY] = (
+                        True
+                    )
+                    try:
+                        first_result = self(first_batch, server_args)
+                    finally:
+                        first_batch.extra.pop(
+                            _MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY, None
+                        )
                     payload = first_result.extra.get(
                         MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY
                     )
@@ -176,7 +206,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         self._dp_choice_logged = True
         logger.info(
             "encoder_parallel: distributing %d independent MiniMax H3 "
-            "presentations over %d replicated encoder ranks",
+            "presentations over %d encoder copies",
             batch_size,
             world_size,
         )
@@ -210,7 +240,14 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         batch.prompt_embeds = [hidden_states]
         batch.prompt_seq_lens = [[text_len]]
 
-    def _encode_from_plan(self, batch: Req, plan) -> None:
+    def _encode_from_plan(
+        self,
+        batch: Req,
+        plan,
+        *,
+        pipeline_config,
+        include_video_token_mask: bool = False,
+    ) -> None:
         """Encode the positive Qwen3VL presentation into layer-50 states.
 
         MiniMax H3 only supports the CFG-distilled model path, so every task
@@ -226,11 +263,11 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         keyframes = [
             m for m in plan.materials if m.material_chain == "image.target_canvas"
         ]
-        if plan.task == "fl2va":
+        if plan.task in {"fl2va", "ref2va"} and keyframes:
             frame_indices = tuple(material.frame_index for material in keyframes)
             if frame_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES:
                 raise ValueError(
-                    "fl2va text encoding requires an ordered keyframe signature "
+                    "MiniMax H3 text encoding requires an ordered keyframe signature "
                     f"in {MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES!r}, got "
                     f"{frame_indices!r}"
                 )
@@ -255,10 +292,23 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             raise ValueError(
                 "MiniMaxH3TextEncodingStage direct encode requires a tokenizer component"
             )
-        self._manage_text_encoder_use(0)
+        if plan.output_modality == "image":
+            batch.extra[MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY] = self._encode_image(
+                batch, plan, pipeline_config
+            )
+            return
+        self._begin_text_encoder_use(0)
         with set_forward_context(current_timestep=0, attn_metadata=None):
+            if batch.is_warmup:
+                # the warm-up request may carry no image
+                self.text_encoder.build_vision_attention_kernels()
             if plan.task == "ref2va":
-                embeddings = self._encode_ref2va(batch, plan, encode_ids)
+                embeddings = self._encode_ref2va(
+                    batch,
+                    plan,
+                    encode_ids,
+                    include_video_token_mask=include_video_token_mask,
+                )
             elif keyframes:
                 embeddings = self._encode_fl2va_keyframes(
                     batch,
@@ -279,6 +329,97 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 }
         batch.extra[MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY] = embeddings
 
+    def _encode_image(self, batch: Req, plan, pipeline_config) -> dict:
+        from sglang.multimodal_gen.runtime.cache.conditioning import (
+            cached_encoder_call,
+        )
+        from sglang.multimodal_gen.runtime.distributed import (
+            get_tp_group,
+            model_parallel_is_initialized,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.reference_encoding import (
+            minimax_h3_prepared_reference_image,
+        )
+
+        images = []
+        if plan.materials:
+            prepared = minimax_h3_prepared_reference_image(batch, plan)
+            images = [item["image"] for item in prepared["images"]]
+        bounds = pipeline_config.edit_reference_short_edge_bounds("qwen")
+        group = getattr(self.text_encoder, "_encoder_tp_group", None)
+        if group is None and model_parallel_is_initialized():
+            group = get_tp_group()
+        # Cache the consumed CPU payload before image resizing/tokenization.
+        # Raw RGB content and reference order stay in the shared cache key;
+        # output canvas and sampling seed do not affect Qwen conditioning.
+        result = cached_encoder_call(
+            self.text_encoder,
+            (plan.prompt, images),
+            {"reference_bounds": bounds},
+            lambda: self._compute_image_conditioning(plan.prompt, images, bounds),
+            group,
+            namespace=self,
+        )
+        self.finish_unused_declared_component(
+            component_name="text_encoder", module=self.text_encoder
+        )
+        return result
+
+    def _compute_image_conditioning(self, prompt, images, bounds) -> dict:
+        """Encode the image release's positive branch.
+
+        Edit references go to Qwen resized to the configured short-edge bounds
+        (the processor then applies its own 32px rounding and pixel limits).
+        """
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
+            minimax_h3_image_presentation,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.reference_encoding import (
+            minimax_h3_bound_image_reference,
+        )
+
+        vision, counts = {}, []
+        if images:
+            low, high = bounds
+            images = [
+                minimax_h3_bound_image_reference(
+                    image, min_short_edge=low, max_short_edge=high
+                )
+                for image in images
+            ]
+            vision = self.processor.image_processor(images=images, return_tensors="pt")
+            vision = {key: vision[key] for key in ("pixel_values", "image_grid_thw")}
+            merge = int(self.processor.image_processor.merge_size) ** 2
+            counts = [int(row.prod()) // merge for row in vision["image_grid_thw"]]
+
+        def encode(encoder, prompt: str, counts: list[int], vision: dict) -> dict:
+            ids, tags, positions = minimax_h3_image_presentation(
+                self.tokenizer,
+                prompt=prompt,
+                image_token_counts=counts,
+                get_rope_index=encoder.model.get_rope_index,
+                image_grid_thw=vision.get("image_grid_thw"),
+            )
+            text_len = int(tags.shape[0])
+            hidden = encoder.encode_ids(ids, position_ids=positions, **vision)
+            # The image loop packs CPU-resident branch inputs.
+            hidden = hidden[:text_len].cpu()
+            return {
+                "hidden_states": hidden,
+                "text_len": text_len,
+                "text_token_tags": tags,
+            }
+
+        # The image release has no residency plan, so nothing else moves the
+        # host-offloaded encoder: hold it across the encode.
+        with (
+            self.use_declared_component(
+                component_name="text_encoder", module=self.text_encoder
+            ) as encoder,
+            set_forward_context(current_timestep=0, attn_metadata=None),
+        ):
+            return {"positive": encode(encoder, prompt, counts, vision)}
+
     def _encode_fl2va_keyframes(
         self,
         batch: Req,
@@ -296,7 +437,11 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
 
         # The SAME prepared target-canvas images feed
         # Qwen and the visual-condition tokenizer; preparation is cached per request.
-        prepared = minimax_h3_prepared_keyframes(batch, plan)
+        prepared = minimax_h3_prepared_keyframes(
+            batch,
+            plan,
+            keyframe_fit=get_global_server_args().pipeline_config.keyframe_fit,
+        )
         images = [item["image"] for item in prepared["images"]]
         frame_indices = tuple(prepared.get("semantic_frame_indices") or ())
         if frame_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES or len(
@@ -334,15 +479,24 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 "hidden_states": pos_hidden,
                 "text_len": int(pos_ids.shape[0]),
                 "text_token_tags": pos_tags,
-            },
+            }
         }
 
-    def _encode_ref2va(self, batch: Req, plan, encode_ids) -> dict:
+    @use_gpu_conditioning_hash()
+    def _encode_ref2va(
+        self,
+        batch: Req,
+        plan,
+        encode_ids,
+        *,
+        include_video_token_mask: bool = False,
+    ) -> dict:
         """Encode the positive ref2va presentation.
 
         Per condition in order — image i: '<Picture i>: ' label +
         vision block (prepared reference image); audio j: '<Audio j>: ' label
-        only — then the verbatim prompt.
+        only — then the verbatim prompt. Hybrid keyframes are deliberately
+        omitted: they are guide latents appended after reference presentation.
         """
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
             minimax_h3_ref2va_presentation,
@@ -360,7 +514,17 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             in ("video.reference_preserve", "video_audio.reference_preserve")
             for material in plan.materials
         ):
-            prepared_videos = minimax_h3_prepared_reference_videos(batch, plan)
+            world, _ = minimax_h3_replica_ctx()
+            prepared_videos = minimax_h3_prepared_reference_videos(
+                batch,
+                plan,
+                share_across_replicas=(
+                    world > 1
+                    and not bool(
+                        batch.extra.get(_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY)
+                    )
+                ),
+            )
         video_has_audio: dict[int, bool] = {}
         for video_index, item in enumerate((prepared_videos or {}).get("videos") or []):
             if item.get("condition_index") is None:
@@ -379,6 +543,8 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         has_image = False
         has_video = False
         for material in plan.materials:
+            if material.material_chain == "image.target_canvas":
+                continue
             if material.material_chain == "image.reference_preserve":
                 counters["image"] += 1
                 condition_labels.append(("image", counters["image"]))
@@ -490,14 +656,20 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 video_block_timestamps.append(timestamps)
 
         if has_video:
-            pos_ids, pos_tags = minimax_h3_ref2va_video_presentation(
+            presentation = minimax_h3_ref2va_video_presentation(
                 self.tokenizer,
                 prompt=plan.prompt,
                 condition_labels=condition_labels,
                 image_token_count=n_image_tokens,
                 video_block_token_counts=video_block_token_counts,
                 video_block_timestamps=video_block_timestamps,
+                return_video_mask=include_video_token_mask,
             )
+            if include_video_token_mask:
+                pos_ids, pos_tags, pos_video_mask = presentation
+            else:
+                pos_ids, pos_tags = presentation
+                pos_video_mask = None
         else:
             pos_ids, pos_tags = minimax_h3_ref2va_presentation(
                 self.tokenizer,
@@ -505,6 +677,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 condition_labels=condition_labels,
                 image_token_count=n_image_tokens,
             )
+            pos_video_mask = None
         pos_hidden = encode_ids(
             pos_ids,
             pixel_values=pixel_values,
@@ -512,13 +685,16 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
         )
-        return {
-            "positive": {
-                "hidden_states": pos_hidden,
-                "text_len": int(pos_ids.shape[0]),
-                "text_token_tags": pos_tags,
-            },
+        if batch.extra.get(_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY):
+            batch.extra.pop(MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY, None)
+        positive = {
+            "hidden_states": pos_hidden,
+            "text_len": int(pos_ids.shape[0]),
+            "text_token_tags": pos_tags,
         }
+        if pos_video_mask is not None:
+            positive["text_video_token_mask"] = pos_video_mask
+        return {"positive": positive}
 
 
 __all__ = ["MiniMaxH3TextEncodingStage"]

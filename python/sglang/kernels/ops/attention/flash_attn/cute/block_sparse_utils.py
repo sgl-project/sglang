@@ -294,8 +294,37 @@ def produce_block_sparse_loads(
     )
 
     mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
-    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
     mask_empty = mask_begin == mask_end
+
+    # Normalization guarantees that the full count and index are both present
+    # or both absent. ``mask_empty`` is a runtime value, so CuTe still traces
+    # both sides of the dynamic branches below; without this specialization,
+    # the full-list side would subscript ``None`` and fail to compile.
+    if const_expr(blocksparse_tensors.full_block_cnt is None):
+        kv_producer_state = load_block_list(
+            curr_mask_block_idx,
+            mask_begin,
+            mask_end,
+            first_block_preloaded=False,
+            kv_producer_state=kv_producer_state,
+            load_K=load_K,
+            load_V=load_V,
+            pipeline_k=pipeline_k,
+            pipeline_v=pipeline_v,
+            intra_wg_overlap=intra_wg_overlap,
+        )
+        if const_expr(intra_wg_overlap) and not mask_empty:
+            kv_producer_state = finish_overlap_v_load(
+                curr_mask_block_idx,
+                mask_begin,
+                mask_end,
+                load_V,
+                pipeline_v,
+                kv_producer_state,
+            )
+        return kv_producer_state
+
+    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
     full_empty = full_begin == full_end
 
     if mask_empty:
@@ -488,7 +517,10 @@ def consume_block_sparse_loads(
             if split_full_block_cnt == 0:
                 warp_scheduler_barrier_arrive()
 
-        if split_full_block_cnt > 0:
+        if (
+            const_expr(blocksparse_tensors.full_block_cnt is not None)
+            and split_full_block_cnt > 0
+        ):
             full_n_block = curr_full_block_idx[full_end - 1]
             if split_mask_block_cnt == 0:
                 warp_scheduler_barrier_sync()
@@ -561,7 +593,10 @@ def consume_block_sparse_loads(
                 )
                 O_should_accumulate = True
 
-        if split_full_block_cnt > 0:
+        if (
+            const_expr(blocksparse_tensors.full_block_cnt is not None)
+            and split_full_block_cnt > 0
+        ):
             full_n_block = curr_full_block_idx[full_end - 1]
             if split_mask_block_cnt == 0:
                 kv_consumer_state = process_first_half_block(

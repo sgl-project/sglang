@@ -2,6 +2,7 @@
 
 import importlib.metadata
 import os
+import platform
 import resource
 import subprocess
 import sys
@@ -10,7 +11,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu
+from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu, is_xpu
 
 
 def is_cuda_v2():
@@ -40,7 +41,6 @@ PACKAGE_LIST = [
     "pydantic",
     "python-multipart",
     "pyzmq",
-    "torchao",
     "uvicorn",
     "uvloop",
     "vllm",
@@ -141,6 +141,19 @@ class BaseEnv:
             print(f"{k}: {v}")
 
 
+class CPUEnv(BaseEnv):
+    """Environment checker for CPU-only systems."""
+
+    def get_info(self):
+        return {
+            "CPU Architecture": platform.machine(),
+            "CPU Count": os.cpu_count(),
+        }
+
+    def get_topology(self):
+        return {}
+
+
 class GPUEnv(BaseEnv):
     """Environment checker for Nvidia GPU"""
 
@@ -194,7 +207,7 @@ class GPUEnv(BaseEnv):
         """
         Get CUDA driver version.
         """
-        from sglang.srt.utils.common import get_nvidia_driver_version_str
+        from sglang.srt.utils.device import get_nvidia_driver_version_str
 
         ver = get_nvidia_driver_version_str()
         if ver is None:
@@ -213,12 +226,8 @@ class GPUEnv(BaseEnv):
                 text=True,
                 check=True,
             )
-            return {
-                "NVIDIA Topology": (
-                    "\n" + result.stdout if result.returncode == 0 else None
-                )
-            }
-        except subprocess.SubprocessError:
+            return {"NVIDIA Topology": "\n" + result.stdout}
+        except (subprocess.SubprocessError, OSError):
             return {}
 
 
@@ -278,7 +287,7 @@ class HIPEnv(BaseEnv):
             ver = ver.replace('"Driver version", ', "").replace('"', "")
 
             return {"ROCM Driver Version": ver}
-        except subprocess.SubprocessError:
+        except (subprocess.SubprocessError, OSError):
             return {"ROCM Driver Version": "Not Available"}
 
     def get_topology(self):
@@ -290,11 +299,34 @@ class HIPEnv(BaseEnv):
                 text=True,
                 check=True,
             )
-            return {
-                "AMD Topology": "\n" + result.stdout if result.returncode == 0 else None
-            }
-        except subprocess.SubprocessError:
+            return {"AMD Topology": "\n" + result.stdout}
+        except (subprocess.SubprocessError, OSError):
             return {}
+
+
+class XPUEnv(BaseEnv):
+    """Environment checker for Intel XPU."""
+
+    def get_info(self):
+        xpu_info = {"XPU available": torch.xpu.is_available()}
+
+        if xpu_info["XPU available"]:
+            xpu_info["XPU count"] = torch.xpu.device_count()
+            xpu_info.update(self.get_device_info())
+
+        return xpu_info
+
+    def get_device_info(self):
+        devices = defaultdict(list)
+        for k in range(torch.xpu.device_count()):
+            devices[torch.xpu.get_device_name(k)].append(str(k))
+
+        return {
+            f"XPU {','.join(device_ids)}": name for name, device_ids in devices.items()
+        }
+
+    def get_topology(self):
+        return {}
 
 
 class NPUEnv(BaseEnv):
@@ -370,7 +402,7 @@ class NPUEnv(BaseEnv):
                 subprocess.check_output([bisheng, "--version"]).decode("utf-8").strip()
             )
             cann_info["BiSheng"] = bisheng_output.split("\n")[0].strip()
-        except subprocess.SubprocessError:
+        except (subprocess.SubprocessError, OSError):
             cann_info["BiSheng"] = "Not Available"
         return cann_info
 
@@ -394,7 +426,7 @@ class NPUEnv(BaseEnv):
                 version = "Not Available"
 
             return {"Ascend Driver Version": version}
-        except subprocess.SubprocessError:
+        except (subprocess.SubprocessError, OSError):
             return {"Ascend Driver Version": "Not Available"}
 
     def get_topology(self):
@@ -406,12 +438,8 @@ class NPUEnv(BaseEnv):
                 text=True,
                 check=True,
             )
-            return {
-                "Ascend Topology": (
-                    "\n" + result.stdout if result.returncode == 0 else None
-                )
-            }
-        except subprocess.SubprocessError:
+            return {"Ascend Topology": "\n" + result.stdout}
+        except (subprocess.SubprocessError, OSError):
             return {}
 
 
@@ -481,7 +509,7 @@ class MUSAEnv(BaseEnv):
                     break
 
             return {"MUSA Driver Version": driver_version}
-        except subprocess.SubprocessError:
+        except (subprocess.SubprocessError, OSError):
             return {"MUSA Driver Version": "Not Available"}
 
     def get_topology(self):
@@ -496,12 +524,8 @@ class MUSAEnv(BaseEnv):
                 text=True,
                 check=True,
             )
-            return {
-                "MTHREADS Topology": (
-                    "\n" + result.stdout if result.returncode == 0 else None
-                )
-            }
-        except subprocess.SubprocessError:
+            return {"MTHREADS Topology": "\n" + result.stdout}
+        except (subprocess.SubprocessError, OSError):
             return {}
 
 
@@ -581,15 +605,21 @@ class MPSEnv(BaseEnv):
         return {}
 
 
-if __name__ == "__main__":
+def _get_env():
     if is_cuda_v2():
-        env = GPUEnv()
-    elif is_hip():
-        env = HIPEnv()
-    elif is_npu():
-        env = NPUEnv()
-    elif is_musa():
-        env = MUSAEnv()
-    elif is_mps():
-        env = MPSEnv()
-    env.check_env()
+        return GPUEnv()
+    if is_hip():
+        return HIPEnv()
+    if is_npu():
+        return NPUEnv()
+    if is_musa():
+        return MUSAEnv()
+    if is_xpu():
+        return XPUEnv()
+    if is_mps():
+        return MPSEnv()
+    return CPUEnv()
+
+
+if __name__ == "__main__":
+    _get_env().check_env()

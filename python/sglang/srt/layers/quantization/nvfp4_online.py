@@ -1,21 +1,25 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Implementation details for online NVFP4 model serving from:
+# - https://humansand.ai/blog/nvfp4-rl#a-pleasant-side-effect-online-nvfp4-serving
+# - https://www.lmsys.org/blog/2026-07-29-mxfp8-nvfp4-rl#online-nvfp4-model-serving
 
 from __future__ import annotations
 
 import logging
 import re
 import threading
-from typing import Any, Dict, List, Optional
+from contextlib import ExitStack, contextmanager
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
     ModelOptNvFp4FusedMoEMethod,
     ModelOptQuantConfig,
 )
@@ -24,17 +28,43 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     per_tensor_dequantize,
 )
+from sglang.srt.utils.common import temp_set_env
 
 logger = logging.getLogger(__name__)
+_nvfp4_weight_quantization_lock = threading.Lock()
+_nvfp4_weight_quantization_users = 0
+_nvfp4_weight_quantization_env = ExitStack()
+
+
+@contextmanager
+def _nvfp4_weight_quantization_scope():
+    """Share the exact-math override across concurrent weight quantizers."""
+    global _nvfp4_weight_quantization_users
+    with _nvfp4_weight_quantization_lock:
+        if _nvfp4_weight_quantization_users == 0:
+            _nvfp4_weight_quantization_env.enter_context(
+                temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1")
+            )
+        _nvfp4_weight_quantization_users += 1
+    # Quantizer work runs outside the lock.
+    try:
+        yield
+    finally:
+        with _nvfp4_weight_quantization_lock:
+            _nvfp4_weight_quantization_users -= 1
+            if _nvfp4_weight_quantization_users == 0:
+                _nvfp4_weight_quantization_env.close()
 
 
 class NvFp4OnlineConfig(ModelOptQuantConfig):
-    """Config for `--quantization nvfp4_online`.
+    """Load-time NVFP4 expert weights with online activation handling.
 
-    This mode is a load-time conversion path, not a serialized NVFP4 checkpoint
-    format. It reuses the ModelOpt NVFP4 MoE parameter layout and fills those
-    parameters by converting BF16/FP16/FP8 expert tensors as they are loaded.
-    Dense layers stay in the source checkpoint precision or quantization path.
+    `--quantization nvfp4_online` uses per-token FP32 activation scales by
+    default. With `SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1`, the flashinfer_cutedsl
+    and flashinfer_megamoe backends keep activations in BF16. Use `modelopt_fp4`
+    for per-tensor FP32 activation scales or serialized NVFP4 checkpoints.
+    This path converts BF16/FP16/FP8 MoE expert weights as they load; dense
+    layers retain their source precision or quantization.
     """
 
     # Marker consumed by the ModelOpt FP4 layout and the model loader. Serialized
@@ -42,6 +72,7 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
     is_nvfp4_online = True
     is_checkpoint_nvfp4_serialized = False
     group_size = 16
+    _use_per_token_activation = True
 
     @staticmethod
     def _normalize_ignored_layers(
@@ -66,7 +97,9 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         use_mxfp8: bool = False,
     ) -> None:
         source_ignored_layers = self._normalize_ignored_layers(exclude_modules)
-        fp4_ignored_layers = list(source_ignored_layers)
+        fp4_ignored_layers = (
+            [] if self._use_per_token_activation else list(source_ignored_layers)
+        )
         if ignored_layers_str := envs.SGLANG_FP4_IGNORED_LAYERS.get():
             fp4_ignored_layers.extend(
                 layer.strip()
@@ -80,9 +113,9 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping or {},
         )
         self.fp4_ignored_layers = fp4_ignored_layers
-        # Weights use static NVFP4 scales, while FlashInfer computes activation
-        # FP32 scales dynamically per token at runtime.
-        self.use_per_token_activation = True
+        # NVFP4 weight scales are fixed at load time; FlashInfer computes one
+        # FP32 activation scale per token at runtime.
+        self.use_per_token_activation = self._use_per_token_activation
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.is_fp4_experts = False
         self.dequant_fp4_to_fp8 = False
@@ -111,8 +144,10 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         quant_method = str(config.get("quant_method", "")).lower()
         use_mxfp8 = "mxfp8" in quant_method
         is_checkpoint_fp8_serialized = "fp8" in quant_method or use_mxfp8
-        ignored_layers = config.get("ignored_layers") or config.get(
-            "modules_to_not_convert"
+        ignored_layers = (
+            config.get("ignore")
+            or config.get("ignored_layers")
+            or config.get("modules_to_not_convert")
         )
         if isinstance(ignored_layers, str):
             ignored_layers = [ignored_layers]
@@ -139,18 +174,52 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
                 return Fp8LinearMethod(self)
             return UnquantizedLinearMethod()
         if isinstance(layer, FusedMoE):
-            if is_layer_skipped(
+            source_layer_ignored = is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
-            ) or self.is_layer_excluded(prefix):
+            ) or self.is_layer_excluded(prefix)
+            if source_layer_ignored and not self.use_per_token_activation:
                 return None
             if is_layer_skipped(
                 prefix, self.fp4_ignored_layers, self.packed_modules_mapping
             ):
-                if self.is_checkpoint_fp8_serialized:
+                if self.is_checkpoint_fp8_serialized and not source_layer_ignored:
                     return Fp8MoEMethod(self)
                 return None
             return ModelOptNvFp4OnlineFusedMoEMethod(self, prefix)
         return None
+
+
+class _ModelOptFp4OnlineConfig(NvFp4OnlineConfig):
+    """`modelopt_fp4` adapter for online per-tensor activation scaling."""
+
+    is_nvfp4_online = False
+    _use_per_token_activation = False
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "modelopt_fp4"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return ModelOptFp4Config.get_supported_act_dtypes()
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return ModelOptFp4Config.get_min_capability()
+
+
+def make_modelopt_fp4_online_config(
+    packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+) -> ModelOptQuantConfig:
+    return _ModelOptFp4OnlineConfig(
+        packed_modules_mapping=packed_modules_mapping,
+    )
+
+
+def make_modelopt_fp4_online_config_from_fp8(
+    config: Dict[str, Any],
+) -> ModelOptQuantConfig:
+    return _ModelOptFp4OnlineConfig.from_config(config)
 
 
 class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
@@ -165,12 +234,39 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             if layer_match is not None
             else layer_prefix
         )
-        if not self.supports_nvfp4_online_moe:
+        if quant_config.use_per_token_activation and not (
+            self.enable_flashinfer_trtllm_moe
+            or self._is_cutedsl_v2_standard
+            or (
+                get_moe_runner_backend().is_flashinfer_megamoe()
+                and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            )
+        ):
             raise ValueError(
                 "--quantization nvfp4_online supports flashinfer_trtllm, "
-                "flashinfer_trtllm_routed, or flashinfer_cutedsl with "
-                "FlashInfer A2A or DeepEP low_latency."
+                "flashinfer_trtllm_routed, or flashinfer_cutedsl with no A2A "
+                "or FlashInfer A2A, or flashinfer_megamoe with "
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1. "
+                "Use --quantization modelopt_fp4 for "
+                "per-tensor FP32 activation scales."
             )
+
+    def prepare_weight_loader(self, layer, weight_loader):
+        """Wrap the MoE weight loader with load-time NVFP4 conversion."""
+        fp8_dequantizer = (
+            self._dequantize_fp8_weight
+            if self.quant_config.is_checkpoint_fp8_serialized
+            else None
+        )
+        return self.get_online_weight_loader(
+            layer,
+            weight_loader,
+            layer_log_name=self.layer_log_name,
+            fp8_dequantizer=fp8_dequantizer,
+        )
+
+    def _uses_serialized_fp8_source(self) -> bool:
+        return self.quant_config.is_checkpoint_fp8_serialized
 
     @staticmethod
     def _quantize_weight_nvfp4(
@@ -183,25 +279,30 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         scale when multiple shards must share one global scale, for example the
         gated w1/w3 pair.
         """
-        from flashinfer import SfLayout, nvfp4_quantize
+        from flashinfer import NVFP44Over6Config, SfLayout, nvfp4_quantize
 
         if weight.ndim != 2:
             raise ValueError(
-                "--quantization nvfp4_online expects 2D expert weights, "
+                "Online NVFP4 weight conversion expects 2D expert weights, "
                 f"got shape {tuple(weight.shape)}."
             )
         if not weight.is_floating_point():
             raise ValueError(
-                "--quantization nvfp4_online expects floating-point source "
+                "Online NVFP4 weight conversion expects floating-point source "
                 f"expert weights, got dtype {weight.dtype}. Serialized packed "
                 "FP4 weights must use --quantization modelopt_fp4."
             )
         if weight.shape[-1] % 16 != 0:
             raise ValueError(
-                "--quantization nvfp4_online requires expert weight K to be "
+                "Online NVFP4 weight conversion requires expert weight K to be "
                 f"a multiple of 16, got shape {tuple(weight.shape)}."
             )
 
+        # Pin the weight recipe independently of the activation quantization
+        # environment, including the E4M3 maximum used by the global scale.
+        nvfp4_4over6_config = NVFP44Over6Config(
+            e4m3_max=448, err_mode="MSE", err_use_fast_math=True
+        )
         if weight_scale_2 is None:
             # weight_scale_2 is the NVFP4 decode scale. FlashInfer consumes its
             # reciprocal as the global encode scale, matching 448 * 6 / amax.
@@ -211,13 +312,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 .amax()
                 .to(device=weight.device, dtype=torch.float32)
             )
-            e4m3_max = (
-                256.0
-                if envs.FLASHINFER_NVFP4_4OVER6.get()
-                and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
-                else float(torch.finfo(torch.float8_e4m3fn).max)
-            )
-            fp8_fp4_max = e4m3_max * 6.0
+            fp8_fp4_max = nvfp4_4over6_config.e4m3_max * 6.0
             weight_scale_2 = torch.where(
                 weight_amax > 0,
                 weight_amax / fp8_fp4_max,
@@ -227,12 +322,15 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             weight_scale_2 = weight_scale_2.to(
                 device=weight.device, dtype=torch.float32
             )
-        fp4_weight, weight_sf = nvfp4_quantize(
-            weight.contiguous(),
-            1.0 / weight_scale_2,
-            sfLayout=SfLayout.layout_linear,
-            backend="cute-dsl",
-        )
+        # FlashInfer still uses an environment flag for exact FP4 math.
+        with _nvfp4_weight_quantization_scope():
+            fp4_weight, weight_sf = nvfp4_quantize(
+                weight.contiguous(),
+                1.0 / weight_scale_2,
+                sfLayout=SfLayout.layout_linear,
+                backend="cute-dsl",
+                nvfp4_4over6=nvfp4_4over6_config,
+            )
         rows, cols = weight.shape
         weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)
         return (
@@ -265,7 +363,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     ) -> torch.Tensor:
         if self.quant_config.use_mxfp8:
             raise ValueError(
-                "--quantization nvfp4_online does not support online "
+                "Online NVFP4 weight conversion does not support "
                 "requantization from MXFP8 expert checkpoints."
             )
 
@@ -324,7 +422,15 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             return f"{prefix}weight_scale_2{suffix}"
         return f"{weight_name}.weight_scale_2"
 
-    def get_online_weight_loader(self, layer, original_weight_loader):
+    @classmethod
+    def get_online_weight_loader(
+        cls,
+        layer,
+        original_weight_loader,
+        *,
+        layer_log_name: str,
+        fp8_dequantizer: Optional[Callable],
+    ):
         """Wrap the normal MoE loader with load-time NVFP4 conversion.
 
         The wrapper quantizes each eligible expert shard as soon as the loader
@@ -332,6 +438,16 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         the full checkpoint. FP8 checkpoints stream weight and scale tensors
         separately, so those pairs are staged until both sides have arrived.
         """
+        from sglang.srt.model_loader.weight_utils import RUNAI_STREAMER_TENSOR_ATTR
+
+        def own_pending_tensor(tensor: torch.Tensor) -> torch.Tensor:
+            # RunAI reuses its buffers between yields; paired tensors can cross files.
+            if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False) or getattr(
+                tensor.untyped_storage(), RUNAI_STREAMER_TENSOR_ATTR, False
+            ):
+                return tensor.detach().to("cpu", copy=True)
+            return tensor
+
         pending_w13_weights = {}
         pending_w13_lock = threading.Lock()
         pending_fp8_weights = {}
@@ -349,7 +465,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                     return
                 logger.info(
                     "Running online NVFP4 quantization for MoE expert weights in %s.",
-                    self.layer_log_name,
+                    layer_log_name,
                 )
                 did_log_quantization = True
 
@@ -378,7 +494,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             original_weight_loader(
                 scale_param,
                 weight_scale,
-                weight_name=self._scale_weight_name(weight_name),
+                weight_name=cls._scale_weight_name(weight_name),
                 shard_id=shard_id,
                 expert_id=expert_id,
             )
@@ -390,7 +506,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             original_weight_loader(
                 scale_2_param,
                 weight_scale_2,
-                weight_name=self._scale_2_weight_name(weight_name),
+                weight_name=cls._scale_2_weight_name(weight_name),
                 shard_id=shard_id,
                 expert_id=expert_id,
             )
@@ -403,9 +519,9 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             expert_id: Optional[int],
         ) -> None:
             log_quantization_start()
-            if shard_id == "w2":
+            if shard_id == "w2" or not layer.moe_runner_config.is_gated:
                 loaded_weight = loaded_weight.to(param.device)
-                fp4_weight, weight_scale, weight_scale_2 = self._quantize_weight_nvfp4(
+                fp4_weight, weight_scale, weight_scale_2 = cls._quantize_weight_nvfp4(
                     loaded_weight
                 )
                 store_quantized_weight(
@@ -420,17 +536,16 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 return
 
             pending_key = expert_id
-            current = (
-                param,
-                loaded_weight,
-                weight_name,
-                shard_id,
-                expert_id,
-            )
             with pending_w13_lock:
                 pending = pending_w13_weights.pop(pending_key, None)
                 if pending is None:
-                    pending_w13_weights[pending_key] = current
+                    pending_w13_weights[pending_key] = (
+                        param,
+                        own_pending_tensor(loaded_weight),
+                        weight_name,
+                        shard_id,
+                        expert_id,
+                    )
                     return
 
             (
@@ -442,7 +557,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             ) = pending
             if pending_shard_id == shard_id:
                 raise ValueError(
-                    "--quantization nvfp4_online expects paired w1/w3 expert "
+                    "Online NVFP4 weight conversion expects paired w1/w3 expert "
                     f"weights, got two {shard_id} tensors for expert {expert_id}."
                 )
             pending_weight = pending_weight.to(param.device)
@@ -451,7 +566,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             loaded_rows = loaded_weight.shape[0]
             # Quantize the gated pair together so w1/w3 share one amax-derived
             # per-tensor FP32 scale, matching the serialized NVFP4 convention.
-            fp4_weight, weight_scale, weight_scale_2 = self._quantize_weight_nvfp4(
+            fp4_weight, weight_scale, weight_scale_2 = cls._quantize_weight_nvfp4(
                 torch.cat([pending_weight, loaded_weight], dim=0)
             )
             pending_fp4_weight, loaded_fp4_weight = fp4_weight.split(
@@ -486,14 +601,14 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             shard_id: str,
             expert_id: Optional[int],
         ) -> None:
-            if not self._is_fp8_weight(loaded_weight):
+            if not cls._is_fp8_weight(loaded_weight):
                 process_loaded_weight(
                     param, loaded_weight, weight_name, shard_id, expert_id
                 )
                 return
-            if not self.quant_config.is_checkpoint_fp8_serialized:
+            if fp8_dequantizer is None:
                 raise ValueError(
-                    "--quantization nvfp4_online received an FP8 expert "
+                    "Online NVFP4 weight conversion received an FP8 expert "
                     "weight, but the checkpoint quantization config does not "
                     "declare serialized FP8 weights."
                 )
@@ -504,7 +619,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 if weight_scale is None:
                     pending_fp8_weights[key] = (
                         param,
-                        loaded_weight,
+                        own_pending_tensor(loaded_weight),
                         weight_name,
                         shard_id,
                         expert_id,
@@ -512,9 +627,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                     return
 
             log_quantization_start()
-            loaded_weight = self._dequantize_fp8_weight(
-                loaded_weight, weight_scale, param.device
-            )
+            loaded_weight = fp8_dequantizer(loaded_weight, weight_scale, param.device)
             process_loaded_weight(
                 param, loaded_weight, weight_name, shard_id, expert_id
             )
@@ -528,7 +641,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             with pending_fp8_lock:
                 pending = pending_fp8_weights.pop(key, None)
                 if pending is None:
-                    pending_fp8_weight_scales[key] = loaded_weight
+                    pending_fp8_weight_scales[key] = own_pending_tensor(loaded_weight)
                     return
 
             log_quantization_start()
@@ -539,7 +652,13 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 pending_shard_id,
                 pending_eid,
             ) = pending
-            loaded_weight = self._dequantize_fp8_weight(
+            if fp8_dequantizer is None:
+                raise ValueError(
+                    "Online NVFP4 weight conversion received an FP8 expert "
+                    "weight, but the checkpoint quantization config does not "
+                    "declare serialized FP8 weights."
+                )
+            loaded_weight = fp8_dequantizer(
                 pending_weight, loaded_weight, pending_param.device
             )
             process_loaded_weight(
@@ -566,10 +685,14 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                     expert_id=expert_id,
                 )
                 return
-            if self._should_skip_loaded_expert(layer, param, expert_id):
+            if cls._should_skip_loaded_expert(layer, param, expert_id):
                 return
 
-            if self._is_fp8_weight_scale_name(weight_name):
+            # FP8 activation scales do not describe the requantized NVFP4 input.
+            if fp8_dequantizer is not None and "input_scale" in weight_name:
+                return
+
+            if cls._is_fp8_weight_scale_name(weight_name):
                 process_fp8_weight_scale(loaded_weight, shard_id, expert_id)
                 return
 
@@ -588,3 +711,17 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             )
 
         return nvfp4_online_weight_loader
+
+
+def make_nvfp4_online_weight_loader(
+    *,
+    layer: torch.nn.Module,
+    original_weight_loader: Callable,
+) -> Callable:
+    """Wrap a MoE weight loader with load-time NVFP4 conversion."""
+    return ModelOptNvFp4OnlineFusedMoEMethod.get_online_weight_loader(
+        layer,
+        original_weight_loader,
+        layer_log_name="MoE layer",
+        fp8_dequantizer=None,
+    )

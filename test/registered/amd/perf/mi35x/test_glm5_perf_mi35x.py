@@ -2,7 +2,7 @@
 
 Tests GLM-5 with DSA attention backend using bench_one_batch on 8 GPUs.
 
-Registry: nightly-perf-8-gpu-mi35x-glm5 suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-glm5 suite
 """
 
 import os
@@ -14,7 +14,12 @@ from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
-register_amd_ci(est_time=5400, suite="nightly-perf-8-gpu-mi35x-glm5", nightly=True)
+register_amd_ci(
+    est_time=5400,
+    suite="nightly-perf-test-8-gpu-amd-mi35x-glm5",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
+)
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
@@ -44,7 +49,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 
 
 GLM5_MODEL_PATH = os.environ.get("GLM5_MODEL_PATH", "zai-org/GLM-5-FP8")
-PROFILE_DIR = "performance_profiles_glm5_mi35x"
+RESULT_DIR = "performance_results_glm5_mi35x"
 
 
 class TestGLM5PerfMI35x(unittest.TestCase):
@@ -94,8 +99,8 @@ class TestGLM5PerfMI35x(unittest.TestCase):
         }
 
         os.environ.setdefault("SGLANG_BENCH_TIMEOUT", "3600")
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_glm5_perf(self):
@@ -114,7 +119,6 @@ class TestGLM5PerfMI35x(unittest.TestCase):
                 other_args=self.model_config["other_args"],
                 variant=self.model_config["name"],
                 extra_bench_args=["--trust-remote-code"],
-                enable_profile=False,
                 timeout=5400,
             )
             results = result_tuple[0]

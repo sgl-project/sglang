@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <vector>
 
+namespace sglang {
+
 struct NgramCorpusObj : public tvm::ffi::Object {
  public:
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("sgl.NgramCorpus", NgramCorpusObj, tvm::ffi::Object);
@@ -27,8 +29,6 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       int64_t external_sam_budget,
       int64_t external_corpus_max_tokens) {
     ngram::Param param;
-    param.enable = true;
-    param.enable_router_mode = false;
     param.max_trie_depth = static_cast<size_t>(max_trie_depth);
     param.min_bfs_breadth = static_cast<size_t>(min_bfs_breadth);
     param.max_bfs_breadth = static_cast<size_t>(max_bfs_breadth);
@@ -169,3 +169,5 @@ void register_ngram_corpus() {
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(register_once, register_ngram_corpus);
+
+}  // namespace sglang

@@ -72,7 +72,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.utils import random_uuid
 
 logger = logging.getLogger(__name__)
@@ -174,19 +174,17 @@ class RealtimeConnection:
         websocket: WebSocket,
         tokenizer_manager: TokenizerManager,
         adapter: TranscriptionAdapter,
-        server_args: ServerArgs,
     ) -> None:
         self.websocket = websocket
         self.tokenizer_manager = tokenizer_manager
         self.adapter = adapter
-        self.server_args = server_args
 
         self.session_id = f"sess_{random_uuid()}"
         self._current_client_event_id: Optional[str] = None
 
         self.model_sample_rate = adapter.model_sample_rate
         self.bytes_per_second = self.model_sample_rate * _SAMPLE_WIDTH
-        self.max_buffer_seconds = server_args.asr_max_buffer_seconds
+        self.max_buffer_seconds = get_serving().asr_max_buffer_seconds
 
         self.config = _SessionConfig()
 

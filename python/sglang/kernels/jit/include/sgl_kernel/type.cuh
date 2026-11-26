@@ -13,6 +13,8 @@
 #include <limits>
 #include <type_traits>
 
+namespace sglang {
+
 template <typename T>
 struct DTypeTrait {};
 
@@ -277,10 +279,10 @@ SGL_DEVICE T reduce_recursive(const T& x, const T& y) {
   constexpr size_t kVecSize = DTypeTrait<T>::kVecSize;
   static_assert(kVecSize > 1, "unsupported scalar type for reduction");
   using Trait = ReductionTrait<Op, U>;
-  auto& x_unpacked = ::device::unpack(x);
-  auto& y_unpacked = ::device::unpack(y);
+  auto& x_unpacked = device::unpack(x);
+  auto& y_unpacked = device::unpack(y);
   T result{};
-  auto& z_unpacked = ::device::unpack(result);
+  auto& z_unpacked = device::unpack(result);
 #pragma unroll
   for (size_t i = 0; i < kVecSize; ++i) {
     z_unpacked[i] = Trait::reduce(x_unpacked[i], y_unpacked[i]);
@@ -352,3 +354,5 @@ inline constexpr float kFP8E4M3Max = 224.0f;
 inline constexpr float kFP8E4M3Max = 448.0f;
 #endif  // HIP_FP8_TYPE_FNUZ
 #endif  // USE_ROCM
+
+}  // namespace sglang

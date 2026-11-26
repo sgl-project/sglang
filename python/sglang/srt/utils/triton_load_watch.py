@@ -28,7 +28,7 @@ import logging
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import get_available_gpu_memory
+from sglang.srt.utils.device import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +46,17 @@ def install() -> None:
         import triton.knobs as knobs
     except ImportError:
         return
-    _prev_compile_listener = knobs.compilation.listener
-    knobs.runtime.kernel_load_start_hook.add(_on_kernel_load)
-    knobs.compilation.listener = _on_compilation
+
+    # Triton 3.4 builds used by ROCm expose triton.knobs without these hooks.
+    runtime = getattr(knobs, "runtime", None)
+    compilation = getattr(knobs, "compilation", None)
+    hook = getattr(runtime, "kernel_load_start_hook", None)
+    if hook is None or compilation is None or not hasattr(compilation, "listener"):
+        return
+
+    _prev_compile_listener = compilation.listener
+    hook.add(_on_kernel_load)
+    compilation.listener = _on_compilation
     _installed = True
 
 

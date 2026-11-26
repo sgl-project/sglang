@@ -22,6 +22,7 @@ spec:
     metadata:
       labels:
         app: sgl-ascend
+        run-id: "{{ run_id }}"
         task: prefill
     spec:
       restartPolicy: Always
@@ -41,8 +42,6 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.hostIP
-        - name: INSTALL_SGLANG_FROM_SOURCE
-          value: "{{ install_sglang_from_source }}"
         - name: KUBECONFIG
           value: "{{ kube_config }}"
         - name: NAMESPACE
@@ -53,8 +52,18 @@ spec:
           value: "https://hf-mirror.com"
         - name: METRICS_DATA_FILE
           value: "{{ metrics_data_file }}"
+        - name: NPU_ACCURACY_DATASET
+          value: "{{ accuracy_dataset }}"
+        - name: RUN_LABEL
+          value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
+        - name: SGLANG_USE_IMAGE
+          value: "{{ use_image_sglang }}"
+        - name: SGLANG_NPU_CONTAINER_PATCHES
+          value: "{{ container_patches }}"
+        - name: NPU_TEST_METHOD
+          value: "{{ test_method }}"
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -77,7 +86,13 @@ spec:
         - name: share
           mountPath: /root/sglang
           subPath: {{ sglang_source_relative_path }}
+        - name: shm-volume
+          mountPath: /dev/shm
       volumes:
+      - name: shm-volume
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
       - name: share
         hostPath:
           path: /home
@@ -123,6 +138,7 @@ spec:
     metadata:
       labels:
         app: sgl-ascend
+        run-id: "{{ run_id }}"
         task: decode
     spec:
       restartPolicy: Always
@@ -142,8 +158,6 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.hostIP
-        - name: INSTALL_SGLANG_FROM_SOURCE
-          value: "{{ install_sglang_from_source }}"
         - name: KUBECONFIG
           value: "{{ kube_config }}"
         - name: NAMESPACE
@@ -154,8 +168,18 @@ spec:
           value: "https://hf-mirror.com"
         - name: METRICS_DATA_FILE
           value: "{{ metrics_data_file }}"
+        - name: NPU_ACCURACY_DATASET
+          value: "{{ accuracy_dataset }}"
+        - name: RUN_LABEL
+          value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
+        - name: SGLANG_USE_IMAGE
+          value: "{{ use_image_sglang }}"
+        - name: SGLANG_NPU_CONTAINER_PATCHES
+          value: "{{ container_patches }}"
+        - name: NPU_TEST_METHOD
+          value: "{{ test_method }}"
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -178,7 +202,13 @@ spec:
         - name: share
           mountPath: /root/sglang
           subPath: {{ sglang_source_relative_path }}
+        - name: shm-volume
+          mountPath: /dev/shm
       volumes:
+      - name: shm-volume
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
       - name: share
         hostPath:
           path: /home
@@ -211,11 +241,11 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ kube_job_name }}-sglang-router
+  name: {{ kube_job_name }}-sgl-router
   namespace: {{ name_space }}
 spec:
   replicas: {{ router_size }}
-  serviceName: {{ kube_job_name }}-sglang-router-headless
+  serviceName: {{ kube_job_name }}-sgl-router-headless
   selector:
     matchLabels:
       app: sgl-ascend
@@ -224,6 +254,7 @@ spec:
     metadata:
       labels:
         app: sgl-ascend
+        run-id: "{{ run_id }}"
         task: router
     spec:
       hostNetwork: True
@@ -242,8 +273,6 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.hostIP
-        - name: INSTALL_SGLANG_FROM_SOURCE
-          value: "{{ install_sglang_from_source }}"
         - name: KUBECONFIG
           value: "{{ kube_config }}"
         - name: NAMESPACE
@@ -254,8 +283,18 @@ spec:
           value: "https://hf-mirror.com"
         - name: METRICS_DATA_FILE
           value: "{{ metrics_data_file }}"
+        - name: NPU_ACCURACY_DATASET
+          value: "{{ accuracy_dataset }}"
+        - name: RUN_LABEL
+          value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
+        - name: SGLANG_USE_IMAGE
+          value: "{{ use_image_sglang }}"
+        - name: SGLANG_NPU_CONTAINER_PATCHES
+          value: "{{ container_patches }}"
+        - name: NPU_TEST_METHOD
+          value: "{{ test_method }}"
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -277,7 +316,13 @@ spec:
         - name: share
           mountPath: /root/sglang
           subPath: {{ sglang_source_relative_path }}
+        - name: shm-volume
+          mountPath: /dev/shm
       volumes:
+      - name: shm-volume
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
       - name: share
         hostPath:
           path: /home
@@ -295,7 +340,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ kube_job_name }}-sglang-router-headless
+  name: {{ kube_job_name }}-sgl-router-headless
   namespace: {{ name_space }}
 spec:
   clusterIP: None

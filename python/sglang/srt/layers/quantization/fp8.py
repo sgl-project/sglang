@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -18,11 +19,11 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -40,6 +41,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_padding_size,
     get_moe_runner_backend,
     get_moe_weight_sizes,
+    route_dropped_experts_to_local,
 )
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -53,21 +55,43 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    _deepgemm_block_fp8_supported,
     _use_aiter_bpreshuffle_gfx95,
+    aiter_mxfp8_gfx1250_block_fp8_linear,
     apply_fp8_linear,
+    block_fp8_scale_to_e8m0_128,
+    block_fp8_scale_to_mxfp8_e8m0,
     can_auto_enable_marlin_fp8,
+    can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
+    deepgemm_w8a8_mxfp8_linear_with_fallback,
+    dense_mxscale_wanted,
+    dispatch_block_fp8_mxfp8_linear,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
-    get_fp8_gemm_runner_backend,
+    gfx1250_mxfp8_prepare_weight,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
+    pack_mxfp8_weight_scale_for_deepgemm,
+    prepare_xpu_block_scale_for_scaled_mm,
     requant_block_scale_ue8m0_for_deepgemm,
+    resolve_block_fp8_mxfp8_backend,
+    resolve_mxfp8_dense_gemm_backend,
+    unshuffle_aiter_fp8_weight,
+    use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_VALUES
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.mxfp8_block_convert import (
+    mxfp8_block_convert_required,
+)
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    batch_invariant_or_deterministic,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -80,28 +104,33 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_capability,
     is_cpu,
     is_cuda,
+    is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
-    is_sm90_supported,
-    is_sm100_supported,
-    is_sm120_supported,
+    is_xpu,
     log_info_on_rank0,
-    mxfp8_block_convert_required,
+    print_info_once,
     print_warning_once,
-    set_weight_attrs,
     use_intel_amx_backend,
-    use_intel_xpu_backend,
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
@@ -113,8 +142,12 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+
+if _is_hip:
+    from sglang.srt.layers.quantization import fp8_hip
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
@@ -127,6 +160,7 @@ _mxfp8_to_block_fp8_required = mxfp8_block_convert_required() or get_bool_env_va
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 def _require_fp4_dtype():
@@ -138,8 +172,17 @@ def _require_fp4_dtype():
     return fp4_dtype
 
 
+def unshuffle_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Restore the logical layout of a backend-shuffled FP8 weight."""
+    if not _use_aiter:
+        raise RuntimeError("FP8 weight unshuffle requires AITER")
+    return unshuffle_aiter_fp8_weight(weight)
+
+
 if _use_aiter or _use_hip_int4:
     from aiter.ops.shuffle import (
+        moe_shuffle_scale,
+        moe_shuffle_weight,
         shuffle_scale,
         shuffle_weight,
     )
@@ -154,28 +197,9 @@ if _use_aiter:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+_DENSE_MXSCALE_LOGGED: set = set()
 
-DSV4_DEQUANT_FP4_TABLE = torch.tensor(
-    [
-        0.0,
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        3.0,
-        4.0,
-        6.0,
-        0.0,
-        -0.5,
-        -1.0,
-        -1.5,
-        -2.0,
-        -3.0,
-        -4.0,
-        -6.0,
-    ],
-    dtype=torch.float32,
-)
+DSV4_DEQUANT_FP4_TABLE = torch.tensor(E2M1_VALUES, dtype=torch.float32)
 
 
 def cast_e2m1fn_to_e4m3fn(
@@ -236,12 +260,14 @@ class Fp8Config(QuantizationConfig):
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
+        scale_fmt: Optional[str] = None,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
         self.dequant_fp4_to_fp8 = False
+        self.is_dsv4_fp4_experts = False
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -260,10 +286,12 @@ class Fp8Config(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
         self.kv_cache_quant_algo = kv_cache_quant_algo
+        # "ue8m0" checkpoints quantize activations with power-of-two scales.
+        self.scale_fmt = scale_fmt
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
-                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
+                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
             if len(weight_block_size) != 2:
                 raise ValueError(
@@ -296,6 +324,9 @@ class Fp8Config(QuantizationConfig):
             return 95
         if self.use_mxfp8 and _mxfp8_to_block_fp8_required:
             return 94
+        # TODO: torch.xpu.get_device_capability
+        if self.use_mxfp8 and is_xpu():
+            return 20
 
         return 100 if self.use_mxfp8 else 80
 
@@ -327,6 +358,7 @@ class Fp8Config(QuantizationConfig):
         kv_cache_quant_algo = cls.get_from_keys_or(
             config, ["kv_cache_quant_algo"], None
         )
+        scale_fmt = cls.get_from_keys_or(config, ["scale_fmt"], None)
         if use_mxfp8:
             # MXFP8 (OCP) spec fixes block size to [1, 32]; ckpt field is metadata only.
             if weight_block_size is not None and weight_block_size != [1, 32]:
@@ -343,6 +375,7 @@ class Fp8Config(QuantizationConfig):
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
             kv_cache_quant_algo=kv_cache_quant_algo,
+            scale_fmt=scale_fmt,
         )
 
     def get_quant_method(
@@ -368,9 +401,7 @@ class Fp8Config(QuantizationConfig):
             if is_layer_skipped(
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
-                return UnquantizedFusedMoEMethod(
-                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
-                )
+                return UnquantizedFusedMoEMethod(layer.use_flashinfer_trtllm_moe)
 
             if is_npu() and self.use_mxfp8:
                 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
@@ -379,13 +410,39 @@ class Fp8Config(QuantizationConfig):
 
                 return NPUMXFP8OnlineMoEMethod(self)
 
+            if (
+                is_npu_arch35()
+                and self.is_checkpoint_fp8_serialized
+                and not self.is_fp4_experts
+                and self.weight_block_size == [128, 128]
+            ):
+                from sglang.srt.hardware_backend.npu.quantization.block_fp8_moe import (
+                    NPUBlockFp8MoEMethod,
+                )
+
+                return NPUBlockFp8MoEMethod(self)
+
             fp8_method = Fp8MoEMethod(self)
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
-                assert (
-                    get_moe_runner_backend().is_auto()
-                ), f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
+                assert get_moe_runner_backend().is_auto(), (
+                    f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
+                )
                 return fp8_method
+
+            if (
+                self.is_fp4_experts
+                and is_npu_arch35()
+                # NPUW4A4Fp4MoEMethod is DSV4-specific (deepep dispatch,
+                # swiglu_limit); other FP4-expert checkpoints fall through
+                # to Fp8MoEMethod.
+                and self.is_dsv4_fp4_experts
+            ):
+                from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
+                    NPUW4A8MXFP4FusedMoEMethod,
+                )
+
+                return NPUW4A8MXFP4FusedMoEMethod(prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
@@ -403,7 +460,7 @@ class Fp8Config(QuantizationConfig):
 
             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
                 # SM100 uses TRT-LLM; SM90 uses W4A16 and SM120 uses MXFP8xMXFP4.
-                if is_sm90_supported() or is_sm120_supported():
+                if get_platform().is_sm90 or get_platform().is_sm120:
                     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
                         Mxfp4FlashinferCutlassMoEMethod,
                     )
@@ -458,7 +515,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = False
         if _is_cuda:
-            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            force_marlin = envs.SGLANG_FORCE_FP8_MARLIN.get()
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
 
@@ -466,14 +523,62 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        per_config = self.quant_config.convert_mxfp8_to_block_fp8
+        self.convert_mxfp8_to_block = self.use_mxfp8 and (
+            (
+                _mxfp8_to_block_fp8_required
+                or (_is_hip and envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.get())
+            )
+            if per_config is None
+            else per_config
+        )
         self.weight_block_size = self.quant_config.weight_block_size
+        self.use_npu_block_fp8 = (
+            is_npu_arch35()
+            and self.quant_config.is_checkpoint_fp8_serialized
+            and not self.use_mxfp8
+            and not getattr(self.quant_config, "is_fp4_experts", False)
+            and self.weight_block_size == [128, 128]
+            and getattr(self.quant_config, "scale_fmt", None) != "ue8m0"
+            and not envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get()
+        )
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
-        if self.use_mxfp8 and not self.convert_mxfp8_to_block:
+        self.mxfp8_dense_backend = None
+        # Set by a model-owned startup hook after opting into prefill tuning.
+        self.mxfp8_prefill_autotune_min_tokens = None
+        if self.use_npu_block_fp8:
+            from sglang.kernels.ops.gemm import npu_w8a8_block_fp8_linear
+
+            self.w8a8_block_fp8_linear = npu_w8a8_block_fp8_linear
+        elif self.use_mxfp8 and not self.convert_mxfp8_to_block:
+            self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
-            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+            # Dispatch on the block size the weight will have after loading: an
+            # MXFP8 checkpoint converted to block-fp8 ends up as [128, 128].
+            effective_block_size = (
+                [128, 128] if self.convert_mxfp8_to_block else self.weight_block_size
+            )
+            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear(
+                weight_block_size=effective_block_size,
+                act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
+                and self.quant_config.scale_fmt == "ue8m0",
+            )
+        # Method-wide gate; a layer that cannot take the MXFP8 view stays on the
+        # block kernel (see _prepare_block_fp8_as_mxfp8).
+        self.block_fp8_as_mxfp8 = (
+            not self.use_mxfp8
+            and not self.use_npu_block_fp8
+            and can_serve_block_fp8_as_mxfp8(
+                self.weight_block_size, getattr(self.quant_config, "scale_fmt", None)
+            )
+        )
+        if self.block_fp8_as_mxfp8:
+            self.mxfp8_dense_backend = resolve_block_fp8_mxfp8_backend()
+            self.w8a8_mxfp8_linear = dispatch_block_fp8_mxfp8_linear(
+                self.mxfp8_dense_backend
+            )
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
@@ -482,6 +587,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
     @staticmethod
     def validate_block_quant_shapes(
+        layer: LinearBase,
         quant_config,
         input_size: int,
         input_size_per_partition: int,
@@ -500,7 +606,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 "Skipping block quantization checks for weight partition."
             )
         else:
-            tp_size = get_parallel().tp_size
+            tp_group = layer.tp_group
+            tp_size = tp_group.world_size if tp_group is not None else 1
             # Required by row parallel
             if tp_size > 1 and input_size // input_size_per_partition == tp_size:
                 if input_size_per_partition % block_k != 0:
@@ -550,6 +657,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if block_quant:
             block_n, block_k = quant_config.weight_block_size
             Fp8LinearMethod.validate_block_quant_shapes(
+                layer,
                 quant_config,
                 input_size,
                 input_size_per_partition,
@@ -652,15 +760,44 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if self.use_npu_block_fp8:
+            # G-B consumes checkpoint-layout E4M3 weights and FP32 scales.
+            return
+        use_deepgemm_runner = (
+            getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
+            is deepgemm_w8a8_block_fp8_linear_with_fallback
+        )
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
+                dequant_mxfp8_2d_to_bf16,
             )
 
+            mx_weight, mx_scale = layer.weight.data, layer.weight_scale_inv.data
             qweight, scale = convert_mxfp8_weight_to_block_fp8(
-                layer.weight.data, layer.weight_scale_inv.data, block=128
+                mx_weight, mx_scale, block=128
             )
             layer.weight = Parameter(qweight, requires_grad=False)
+            if (
+                _use_aiter
+                and _is_gfx95_supported
+                and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+            ):
+                # rowwise-fp8 copy for the small-M path of aiter_w8a8_block_fp8_linear;
+                # the later bpreshuffle is an in-place copy_, so these attrs survive
+                weight_fp32 = dequant_mxfp8_2d_to_bf16(mx_weight, mx_scale).float()
+                fp8_max = torch.finfo(torch.float8_e4m3fn).max
+                row_scale = (
+                    weight_fp32.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+                    / fp8_max
+                )
+                layer.weight._ptpc_weight = shuffle_weight(
+                    (weight_fp32 / row_scale)
+                    .clamp(-fp8_max, fp8_max)
+                    .to(torch.float8_e4m3fn),
+                    (16, 16),
+                )
+                layer.weight._ptpc_scale = row_scale
             layer.weight_scale_inv = Parameter(scale, requires_grad=False)
             self.use_mxfp8 = False
             self.convert_mxfp8_to_block = False
@@ -677,6 +814,28 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
             return
+        elif (
+            _is_npu
+            and is_npu_arch35()
+            and (
+                # UE8M0 checkpoints: lossless MXFP8 re-layout. Plain block-FP8
+                # (fp32 scales): lossy requant, opt-in via
+                # SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8=1. Otherwise the generic
+                # path below keeps the checkpoint layout and numerics.
+                self.quant_config.scale_fmt == "ue8m0"
+                or envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get()
+            )
+        ):
+            from sglang.srt.hardware_backend.npu.quantization.linear_utils import (
+                process_npu_arch35_mxfp8_linear_weights,
+            )
+
+            process_npu_arch35_mxfp8_linear_weights(
+                layer,
+                self.weight_block_size,
+                scale_fmt=self.quant_config.scale_fmt,
+            )
+            return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -687,9 +846,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             layer.input_scale = None
         elif _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
+            assert _is_cpu_amx_available, (
+                "Fp8LinearMethod on CPU requires that CPU has AMX support"
+            )
             _amx_process_weight_after_loading(layer, ["weight"])
             layer.weight_scale_inv = torch.nn.Parameter(
                 layer.weight_scale_inv.data, requires_grad=False
@@ -697,10 +856,6 @@ class Fp8LinearMethod(LinearMethodBase):
             return
         else:
             # Requantize block scales to UE8M0 when DeepGEMM is the active runner.
-            use_deepgemm_runner = (
-                self.w8a8_block_fp8_linear
-                is deepgemm_w8a8_block_fp8_linear_with_fallback
-            )
             requant_block_scale_ue8m0_for_deepgemm(
                 layer.weight,
                 layer.weight_scale_inv,
@@ -713,10 +868,76 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+        if use_deepgemm_runner and self.weight_block_size == [32, 32]:
+            from sglang.srt.layers import deep_gemm_wrapper
 
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                # UE8M0 DeepGEMM casts these fp32 scales in the kernel, which
+                # holds only for powers of two; the linear keeps others on Triton.
+                layer.weight_scale_inv.power_of_two = bool(
+                    (torch.frexp(weight_scale)[0] == 0.5).all().item()
+                )
+        if hasattr(layer, "_block_fp8_bf16_weight"):
+            layer._block_fp8_bf16_weight = None
+            layer._derived_weight_cache_error = None
+        if (
+            _is_cuda
+            and get_platform().is_sm90
+            and envs.SGLANG_OPT_HOPPER_BLOCK_FP8_BF16.get()
+            and not (
+                use_deepgemm_runner
+                and _deepgemm_block_fp8_supported(
+                    weight.shape,
+                    self.weight_block_size,
+                    getattr(layer, "orig_dtype", None),
+                )
+            )
+            and weight.is_cuda
+            and weight.dtype == torch.float8_e4m3fn
+            and self.weight_block_size == [32, 32]
+            and getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
+            and getattr(layer, "orig_dtype", None) == torch.bfloat16
+            and not self.use_marlin
+            and not getattr(layer, "keep_plain_weight_layout", False)
+        ):
+            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+            from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+            # Keep even the smallest/largest finite E4M3 value representable
+            # as normal BF16, and reject mislabeled non-power-of-two scales.
+            exact_bf16_scales = (
+                (weight_scale >= 2.0**-117)
+                & (weight_scale <= 2.0**119)
+                & (torch.frexp(weight_scale)[0] == 0.5)
+            ).all()
+            if not is_batch_invariant_mode_enabled() and exact_bf16_scales.item():
+                # Hopper group32 FP8 accumulates each 32-wide block separately.
+                # Reuse a BF16 weight expansion for larger GEMMs, keeping the
+                # original FP8 weights for decode and weight reloads.
+                layer.register_buffer(
+                    "_block_fp8_bf16_weight",
+                    block_quant_dequant(weight, weight_scale, [32, 32], torch.bfloat16),
+                    persistent=False,
+                )
+                layer._derived_weight_cache_error = (
+                    "Online weight updates are not supported while Hopper FP8 "
+                    "BF16 weight caches are active: captured CUDA graphs retain "
+                    "these derived weights. Restart with "
+                    "SGLANG_OPT_HOPPER_BLOCK_FP8_BF16=0 to allow online updates."
+                )
+        if self.block_fp8_as_mxfp8:
+            self._prepare_block_fp8_as_mxfp8(layer)
+
+        # The preshuffle rewrites the weight into a layout only
+        # aiter_w8a8_block_fp8_linear can read, so it is correct exactly when
+        # this quant method is what consumes the weight. A layer whose weight is
+        # read directly by the model (DeepSeek-V4 wo_a, whose absorb GEMM takes
+        # .weight/.weight_scale_inv and runs its own batched kernel) sets
+        # keep_plain_weight_layout and keeps the plain row-major layout.
         if (
             _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+            and not getattr(layer, "keep_plain_weight_layout", False)
         ):
             n, k = layer.weight.shape
             if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
@@ -725,17 +946,136 @@ class Fp8LinearMethod(LinearMethodBase):
                 t = shuffle_weight(layer.weight, (16, 16))
                 layer.weight.copy_(t)
                 del t
+                # The shuffle is in place and preserves shape, dtype and
+                # strides, so nothing downstream can tell it happened. Record
+                # it so a consumer that needs the row-major layout can assert
+                # instead of silently reading a permuted weight.
+                layer.aiter_bpreshuffled = True
+                layer.weight.is_shuffled = True
+                self._maybe_prepare_dense_mxscale(layer)
 
-    def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
-        if not self.use_mxfp8:
+        if (
+            self.w8a8_block_fp8_linear is aiter_mxfp8_gfx1250_block_fp8_linear
+            and not getattr(layer, "keep_plain_weight_layout", False)
+            and not getattr(layer, "block_fp8_mxfp8_ready", False)
+        ):
+            prepared = gfx1250_mxfp8_prepare_weight(
+                layer.weight.data,
+                layer.weight_scale_inv.data,
+                self.weight_block_size,
+            )
+            if prepared is not None:
+                weight, scale = prepared
+                layer.weight.copy_(weight)
+                layer.weight_scale_inv.data = scale
+                layer.aiter_bpreshuffled = True
+                layer.weight.is_shuffled = True
+
+        if _is_xpu:
+            scale_reordered = prepare_xpu_block_scale_for_scaled_mm(
+                layer.weight_scale_inv.data,
+                self.weight_block_size,
+                self.w8a8_block_fp8_linear,
+            )
+            if scale_reordered is not layer.weight_scale_inv.data:
+                with torch.no_grad():
+                    layer.weight_scale_inv.set_(scale_reordered)
+
+    def _maybe_prepare_dense_mxscale(self, layer: Module) -> None:
+        """SGLANG_DSV4_DENSE_MXSCALE: give a (16, 16)-preshuffled 128x128 block-fp8
+        weight an e8m0 copy of its scale, which routes aiter_w8a8_block_fp8_linear
+        onto aiter's mxscale bpreshuffle GEMM. Lossless only for power-of-two
+        scales (ue8m0 checkpoints); any other layer stays on the fp32 GEMM. The
+        weight bytes are shared, the copy costs N*K/16384 bytes."""
+        if self.weight_block_size != [128, 128] or self.convert_mxfp8_to_block:
+            return
+        if layer.weight.dtype != torch.float8_e4m3fn:
+            return
+        n, k = layer.weight.shape
+        if not dense_mxscale_wanted(n, k):
+            return
+        scale = layer.weight_scale_inv.data
+        if tuple(scale.shape) != (n // 128, k // 128) or n % 128 or k % 128:
+            return
+        e8m0 = block_fp8_scale_to_e8m0_128(scale)
+        if e8m0 is None:
+            logger.warning(
+                "Dense mxscale: %s keeps the fp32 GEMM (scales are not powers of two)",
+                getattr(layer, "prefix", tuple(layer.weight.shape)),
+            )
+            return
+        layer.weight._mxscale_w_scale = e8m0
+        if (n, k) not in _DENSE_MXSCALE_LOGGED:
+            _DENSE_MXSCALE_LOGGED.add((n, k))
+            logger.info(
+                "Dense mxscale (e8m0 bpreshuffle GEMM) enabled for N=%d K=%d", n, k
+            )
+
+    def _prepare_block_fp8_as_mxfp8(self, layer: Module) -> None:
+        layer.block_fp8_mxfp8_ready = False
+        if getattr(layer, "keep_plain_weight_layout", False):
+            # The model reads .weight / .weight_scale_inv directly.
+            return
+        n, k = layer.weight.shape
+        if k % 32 != 0:
+            return
+        try:
+            scale_u8 = block_fp8_scale_to_mxfp8_e8m0(
+                layer.weight_scale_inv.data, (n, k), self.weight_block_size
+            )
+        except ValueError as e:
+            logger.warning("Block-fp8 layer stays on the Triton kernel: %s", e)
+            return
+        # weight_scale_inv stays in place for the Triton fallback and raw readers;
+        # the swizzled copy is stored separately.
+        self._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
+        layer.block_fp8_mxfp8_ready = True
+
+    def prepare_deepgemm_mxfp8_input(self, layer: Module) -> bool:
+        """Pack the weight scale a FlashInfer layer needs for a DeepGEMM-packed input pair."""
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        backend = self.mxfp8_dense_backend
+        if not (
+            _is_cuda
+            and get_platform().is_blackwell
+            and backend is not None
+            and (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass())
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ):
+            return False
+        n, k = layer.weight.shape
+        if n % 64 != 0 or k % 128 != 0:
+            return False
+        if self.use_mxfp8:
+            scale_u8 = layer.weight_scale_inv.data.view(torch.uint8).reshape(n, k // 32)
+        elif self.block_fp8_as_mxfp8 and layer.block_fp8_mxfp8_ready:
+            scale_u8 = block_fp8_scale_to_mxfp8_e8m0(
+                layer.weight_scale_inv.data, (n, k), self.weight_block_size
+            )
+        else:
+            return False
+        copy_or_rebind_param(
+            layer,
+            "weight_scale_inv_deepgemm",
+            pack_mxfp8_weight_scale_for_deepgemm(scale_u8, n, k),
+        )
+        return True
+
+    def _process_mxfp8_linear_weight_scale(
+        self, layer: Module, scale_u8: Optional[torch.Tensor] = None
+    ) -> None:
+        if not (self.use_mxfp8 or scale_u8 is not None):
             return
 
-        backend = get_fp8_gemm_runner_backend()
+        backend = self.mxfp8_dense_backend
         if backend.is_flashinfer_trtllm():
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
             weight = layer.weight.data
-            scale_u8 = layer.weight_scale_inv.data
+            if scale_u8 is None:
+                scale_u8 = layer.weight_scale_inv.data
             n, k = weight.shape
             epilogue_tile_m = 128
             sf_cols = k // 32
@@ -772,10 +1112,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 .reshape_as(scale_u8)
                 .contiguous(),
             )
-        elif backend.is_flashinfer_cutlass():
+        elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
             from flashinfer import block_scale_interleave
 
-            scale_u8 = layer.weight_scale_inv.data
+            if scale_u8 is None:
+                scale_u8 = layer.weight_scale_inv.data
             # block_scale_interleave may pad and/or reshape scales,
             # so store swizzled scales separately to keep weight update working
             copy_or_rebind_param(
@@ -783,36 +1124,89 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
-        elif get_fp8_gemm_runner_backend().is_deep_gemm():
+        elif backend.is_xpu_scaled_mm():
+            # torch scaled_mm reads the canonical [N, K // 32] ue8m0 bytes in
+            # weight_scale_inv directly; no backend-specific layout to prepare.
+            return
+        elif backend.is_gfx95():
+            fp8_hip.process_dense_weights(self, layer, scale_u8)
+        elif backend.is_deep_gemm():
             from sglang.srt.layers.deep_gemm_wrapper.configurer import (
                 DEEPGEMM_SCALE_UE8M0,
             )
 
             n, k = layer.weight.shape
-            scale_u8 = layer.weight_scale_inv.data
-            scale_fp32 = (
-                (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
-                .view(torch.float32)
-                .view(n, k // 32)
-            )
+            if scale_u8 is None:
+                scale_u8 = layer.weight_scale_inv.data
+            layer.weight_scale_inv_swizzled = None
+            if n % 64 != 0 or k % 128 != 0:
+                if not (get_platform().is_blackwell and is_flashinfer_available()):
+                    raise RuntimeError(
+                        f"--fp8-gemm-backend=deep_gemm cannot serve MXFP8 weight shape "
+                        f"({n}, {k}) (needs N % 64 == 0 and K % 128 == 0), and this "
+                        "device has no FlashInfer MXFP8 fallback kernel."
+                    )
+                from flashinfer import block_scale_interleave
+
+                copy_or_rebind_param(
+                    layer,
+                    "weight_scale_inv_swizzled",
+                    block_scale_interleave(scale_u8.contiguous()).contiguous(),
+                )
             if DEEPGEMM_SCALE_UE8M0:
                 # Pre-packed; GEMM must be called with disable_ue8m0_cast=True.
-                import deep_gemm.utils.layout
-
-                scale_packed = (
-                    deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
-                        scale_fp32
-                    )
-                )
+                scale_packed = pack_mxfp8_weight_scale_for_deepgemm(scale_u8, n, k)
             else:
-                scale_packed = scale_fp32
+                scale_packed = (
+                    (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
+                    .view(torch.float32)
+                    .view(n, k // 32)
+                )
             copy_or_rebind_param(layer, "weight_scale_inv_deepgemm", scale_packed)
-        else:
-            # Triton path consumes canonical 2D UE8M0 uint8 scales directly.
-            return
+        elif backend.is_halops():
+            from sglang.srt.layers.quantization.halops_mxfp8 import (
+                swizzle_scale_to_sfatom,
+                weight_supported,
+            )
+
+            n, k = layer.weight.shape
+            if not weight_supported(n=n, k=k):
+                layer.weight_scale_inv_halops = None
+            else:
+                if scale_u8 is None:
+                    scale_u8 = layer.weight_scale_inv.data
+                # Rebuild on every load: a weight update replaces weight_scale_inv,
+                # and copy_or_rebind_param keeps the storage CUDA graphs captured.
+                copy_or_rebind_param(
+                    layer,
+                    "weight_scale_inv_halops",
+                    swizzle_scale_to_sfatom(scale_u8.contiguous().view(torch.uint8)),
+                )
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
+        if self.mxfp8_dense_backend.is_halops():
+            from sglang.srt.layers.quantization.halops_mxfp8 import (
+                quantize_weight,
+                weight_supported,
+            )
+
+            if weight_supported(n=weight.shape[0], k=weight.shape[1]):
+                qweight, sf_sfatom, weight_scale = quantize_weight(weight)
+                copy_or_rebind_param(layer, "weight", qweight)
+                if (
+                    hasattr(layer, "weight_scale_inv")
+                    and layer.weight_scale_inv is not None
+                ):
+                    copy_or_rebind_param(layer, "weight_scale_inv", weight_scale)
+                else:
+                    layer.register_parameter(
+                        "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
+                    )
+                layer.weight_scale_inv.format_ue8m0 = True
+                copy_or_rebind_param(layer, "weight_scale_inv_halops", sf_sfatom)
+                layer.input_scale = None
+                return
         qweight, weight_scale = mxfp8_group_quantize(weight)
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         layer.weight.data = qweight
@@ -832,6 +1226,9 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
+            # Only LinearBase defines this; an MXFP8 ParallelLMHead does not.
+            if getattr(layer, "deepgemm_mxfp8_input", False):
+                layer.deepgemm_mxfp8_input = self.prepare_deepgemm_mxfp8_input(layer)
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -839,6 +1236,7 @@ class Fp8LinearMethod(LinearMethodBase):
             if not self.is_checkpoint_fp8_serialized:
                 if (
                     self.cutlass_fp8_supported
+                    or _is_xpu
                     or self.use_marlin
                     or (_use_aiter and self.use_aiter_fp8_per_token)
                 ):
@@ -850,7 +1248,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale = weight_scale.t().contiguous()
                     if _use_aiter and self.use_aiter_fp8_per_token:
                         self.use_per_token_if_dynamic = True
-                        qweight = shuffle_weight(qweight.contiguous(), (16, 16))
+                        if use_aiter_bpreshuffle_gemm(qweight.shape[0]):
+                            qweight = shuffle_weight(qweight.contiguous(), (16, 16))
                 else:
                     # per-tensor quantization
                     qweight, weight_scale = input_to_float8(layer.weight)
@@ -877,9 +1276,21 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.data, requires_grad=False
                     )
 
+                # On SM120 (Blackwell RTX 50) the per-tensor FP8 path dispatches
+                # to the fast cudnn/nvjet SM120 kernel, which beats the
+                # channelwise cutlass GemmUniversal by ~1.2-2.7x across the
+                # decode/prefill M range (matches vLLM's per-tensor SM120
+                # choice). Requantize per-channel -> per-tensor (max scale)
+                # there instead.
+                use_sm120_fp8_pertensor = (
+                    self.cutlass_fp8_supported
+                    and not self.use_marlin
+                    and get_device_capability()[0] == 12
+                )
                 # cutlass sgl-kernel and marlin only support per-channel scale; aiter supports per-channel scale
                 if (
-                    self.cutlass_fp8_supported
+                    (self.cutlass_fp8_supported and not use_sm120_fp8_pertensor)
+                    or _is_xpu
                     or self.use_marlin
                     or (_use_aiter and self.use_aiter_fp8_per_token)
                 ):
@@ -890,12 +1301,18 @@ class Fp8LinearMethod(LinearMethodBase):
                     if _use_aiter and self.use_aiter_fp8_per_token:
                         # Otherwise, by default, aiter only uses per-tensor quantization
                         self.use_per_token_if_dynamic = True
+                        # This path quantizes activations dynamically per token, which
+                        # is incompatible with a static per-tensor input_scale. Drop it
+                        # so apply_fp8_linear (and the fused RMSNorm+quant path) compute
+                        # the activation scale per token instead of reusing a stale one.
+                        layer.input_scale = None
                         if _is_fp8_fnuz:
                             weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                                 weight=weight,
                                 weight_scale=weight_scale,
                             )
-                        weight = shuffle_weight(weight.contiguous(), (16, 16))
+                        if use_aiter_bpreshuffle_gemm(weight.shape[0]):
+                            weight = shuffle_weight(weight.contiguous(), (16, 16))
                 else:
                     # Dequant -> Quant with max scale so we can run per tensor.
                     weight = layer.weight
@@ -923,20 +1340,51 @@ class Fp8LinearMethod(LinearMethodBase):
                 # Update layer with new values.
                 layer.weight = Parameter(weight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                # input_scale is None when the per-token path above dropped it.
                 if (
-                    hasattr(self.quant_config, "activation_scheme")
-                    and self.quant_config.activation_scheme == "static"
-                ) or (
-                    hasattr(self.quant_config, "linear_activation_scheme")
-                    and self.quant_config.linear_activation_scheme == "static"
-                ):
+                    (
+                        hasattr(self.quant_config, "activation_scheme")
+                        and self.quant_config.activation_scheme == "static"
+                    )
+                    or (
+                        hasattr(self.quant_config, "linear_activation_scheme")
+                        and self.quant_config.linear_activation_scheme == "static"
+                    )
+                ) and layer.input_scale is not None:
                     layer.input_scale = Parameter(
                         layer.input_scale.max(), requires_grad=False
                     )
 
+            if _is_xpu:
+                # A scale is row-wise iff it carries exactly one value per
+                # output channel, regardless of shape ([N], [1, N], [N, 1], ...).
+                num_channels = sum(layer.logical_widths)
+                is_rowwise = layer.weight_scale.numel() == num_channels
+                if is_rowwise and (
+                    layer.weight_scale.shape != (num_channels, 1)
+                    or not layer.weight_scale.t().is_contiguous()
+                ):
+                    with torch.no_grad():
+                        layer.weight_scale.set_(
+                            layer.weight_scale.data.reshape(
+                                num_channels, 1
+                            ).contiguous()
+                        )
+                self.use_per_token_if_dynamic = is_rowwise
+
+            if _is_cpu:
+                assert _is_cpu_amx_available, (
+                    "Fp8LinearMethod on CPU requires that CPU has AMX support"
+                )
+                layer.weight = Parameter(
+                    layer.weight.data.t().contiguous(), requires_grad=False
+                )
+                _amx_process_weight_after_loading(layer, ["weight"])
+                return
+
         if self.use_marlin:
             if self.block_quant:
-                layer.weight_block_size = self.quant_config.weight_block_size
+                layer.weight_block_size = self.weight_block_size
             prepare_fp8_layer_for_marlin(layer, not self.block_quant)
             # Activations not quantized for marlin.
             del layer.input_scale
@@ -958,33 +1406,59 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        if self.use_mxfp8:
-            backend = get_fp8_gemm_runner_backend()
-            if backend.is_flashinfer_cutlass():
+        if _is_hip and self.block_fp8_as_mxfp8 and self.mxfp8_dense_backend.is_gfx95():
+            return fp8_hip.apply_dense(self, layer, x, bias)
+
+        mxfp8_view = self.use_mxfp8 or (
+            self.block_fp8_as_mxfp8 and layer.block_fp8_mxfp8_ready
+        )
+        if isinstance(x, Mxfp8SwizzledInput):
+            if not mxfp8_view or not (
+                self.mxfp8_dense_backend.is_flashinfer_cutlass()
+                or self.mxfp8_dense_backend.is_flashinfer_cutedsl()
+            ):
+                raise ValueError(
+                    "Mxfp8SwizzledInput needs a layer with an MXFP8 view on a "
+                    "FlashInfer CUTLASS / CuTe-DSL backend"
+                )
+        elif (
+            mxfp8_view
+            and isinstance(x, tuple)
+            and x[1].dtype == torch.int32
+            and not self.mxfp8_dense_backend.is_deep_gemm()
+        ):
+            # DeepGEMM-packed activation scales; see LinearBase.deepgemm_mxfp8_input.
+            return deepgemm_w8a8_mxfp8_linear_with_fallback(
+                x[0],
+                layer.weight,
+                layer.weight_scale_inv_deepgemm,
+                input_scale=x[1],
+                bias=bias,
+            )
+        elif self.block_fp8_as_mxfp8 and isinstance(x, tuple):
+            # A legacy (q, scale) block-fp8 pair keeps the block kernel.
+            mxfp8_view = False
+        if mxfp8_view:
+            backend = self.mxfp8_dense_backend
+            extra_kwargs = {}
+            if self.mxfp8_prefill_autotune_min_tokens is not None:
+                input_tensor = x[0] if isinstance(x, tuple) else x
+                num_tokens = input_tensor.numel() // input_tensor.shape[-1]
+                if num_tokens >= self.mxfp8_prefill_autotune_min_tokens:
+                    extra_kwargs["pin_tactic"] = batch_invariant_or_deterministic()
+            if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
                 weight_scale = layer.weight_scale_inv_swizzled
             elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
-            elif get_fp8_gemm_runner_backend().is_deep_gemm():
-                weight_scale = getattr(
-                    layer, "weight_scale_inv_deepgemm", layer.weight_scale_inv
-                )
-                if isinstance(x, tuple):
-                    return self.w8a8_mxfp8_linear(
-                        input=x[0],
-                        weight=layer.weight,
-                        weight_scale=weight_scale,
-                        input_scale=x[1],
-                        bias=bias,
-                        weight_scale_fallback=layer.weight_scale_inv,
-                    )
-                return self.w8a8_mxfp8_linear(
-                    input=x,
-                    weight=layer.weight,
-                    weight_scale=weight_scale,
-                    input_scale=None,
-                    bias=bias,
-                    weight_scale_fallback=layer.weight_scale_inv,
-                )
+            elif backend.is_deep_gemm():
+                weight_scale = layer.weight_scale_inv_deepgemm
+                extra_kwargs["weight_scale_swizzled"] = layer.weight_scale_inv_swizzled
+            elif backend.is_halops():
+                # SfAtom-swizzled weight scale prepared at load time; keep the
+                # canonical UE8M0 scale as the FlashInfer fallback scale. None
+                # means the shape has no SfAtom layout, so the fallback runs.
+                weight_scale = layer.weight_scale_inv_halops
+                extra_kwargs["weight_scale_fallback"] = layer.weight_scale_inv
             else:
                 weight_scale = layer.weight_scale_inv
             if isinstance(x, tuple):
@@ -994,16 +1468,27 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=weight_scale,
                     input_scale=x[1],
                     bias=bias,
+                    **extra_kwargs,
                 )
-            return self.w8a8_mxfp8_linear(
+            out = self.w8a8_mxfp8_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
+                **extra_kwargs,
             )
+            return out
 
         if self.block_quant:
+            if self.use_npu_block_fp8:
+                return self.w8a8_block_fp8_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv,
+                    bias=bias,
+                )
+
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
@@ -1015,6 +1500,10 @@ class Fp8LinearMethod(LinearMethodBase):
                     True,  # is_vnni
                 )
 
+            cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
+            extra_kwargs = (
+                {"weight_bf16": cached_weight} if cached_weight is not None else {}
+            )
             if isinstance(x, tuple):
                 return self.w8a8_block_fp8_linear(
                     input=x[0],
@@ -1023,6 +1512,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=layer.weight_scale_inv,
                     input_scale=x[1],
                     bias=bias,
+                    **extra_kwargs,
                 )
 
             return self.w8a8_block_fp8_linear(
@@ -1032,6 +1522,36 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
+                **extra_kwargs,
+            )
+
+        if use_intel_amx_backend(layer):
+            output = torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                bias,
+                x.dtype,
+                True,  # is_vnni
+            )
+            return output.view(*x.shape[:-1], layer.weight.shape[0])
+
+        if isinstance(x, tuple):
+            # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
+            # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
+            # apply_fp8_linear detects the fp8 dtype and skips re-quantizing;
+            # orig_dtype (when present) sets the GEMM output dtype.
+            qx, x_scale = x[0], x[1]
+            out_dtype = x[2] if len(x) > 2 else None
+            return apply_fp8_linear(
+                input=qx,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=x_scale,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+                pre_quant_output_dtype=out_dtype,
             )
 
         return apply_fp8_linear(
@@ -1043,6 +1563,69 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
         )
+
+
+def _tp_refined_moe_block_sizes(
+    *,
+    weight_block_size: List[int],
+    intermediate_size_per_partition: int,
+    moe_tp_size: int,
+    hidden_size: int,
+    runner_backend: MoeRunnerBackend,
+    activation: str,
+) -> Optional[tuple[List[int], List[int]]]:
+    """Finer w13 and w2 scale blocks for block-FP8 MoE whose TP shard splits blocks.
+
+    TP splits w13 along N and w2 along K, so only those dimensions are refined.
+    Each checkpoint scale covers whole blocks of the finer grid, so repeating it
+    onto that grid is lossless and every rank loads exactly its shard. None when
+    the shard is block-aligned or the runner only takes the checkpoint's block.
+    """
+    block_n, block_k = weight_block_size
+    shard = intermediate_size_per_partition
+    if shard % block_n == 0 and (moe_tp_size == 1 or shard % block_k == 0):
+        return None
+    intermediate_size = shard * moe_tp_size
+    if any(
+        size % block
+        for size in (intermediate_size, hidden_size)
+        for block in (block_n, block_k)
+    ):
+        return None
+    w13_block_n = math.gcd(block_n, shard)
+    w2_block_k = math.gcd(block_k, shard)
+    if runner_backend.is_triton():
+        # Block sizes are runtime arguments; FP8 MMA needs K >= 32.
+        if w2_block_k < 32:
+            return None
+    else:
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        if not (
+            runner_backend.is_deep_gemm() and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ):
+            return None
+        # The fused SiTU quant kernels take 128-wide groups only.
+        if activation == "situ":
+            return None
+        # Per-row UE8M0 scales take a K granularity of 32 or 128 only.
+        if w2_block_k != block_k:
+            if w2_block_k % 32:
+                return None
+            w2_block_k = 32
+    return [w13_block_n, block_k], [block_n, w2_block_k]
+
+
+def _refined_block_scale_loader(weight_loader, *, repeats: tuple[int, int]):
+    """Repeat checkpoint block scales onto the finer grid before TP sharding."""
+
+    def load(param, loaded_weight, *args, **kwargs):
+        loaded_weight = loaded_weight.repeat_interleave(
+            repeats[0], dim=-2
+        ).repeat_interleave(repeats[1], dim=-1)
+        return weight_loader(param, loaded_weight, *args, **kwargs)
+
+    return load
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
@@ -1064,18 +1647,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        per_config = self.quant_config.convert_mxfp8_to_block_fp8
+        self.convert_mxfp8_to_block = self.use_mxfp8 and (
+            _mxfp8_to_block_fp8_required if per_config is None else per_config
+        )
         self.weight_block_size = self.quant_config.weight_block_size
+        # w2's scale block when create_weights refines it apart from
+        # weight_block_size (then w13's) for a TP shard that splits checkpoint
+        # blocks; see _tp_refined_moe_block_sizes. None means weight_block_size.
+        self.w2_weight_block_size: Optional[List[int]] = None
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        # The MxFP4 wrapper methods borrow this instance for weight loading;
+        # they never call create_moe_runner, so moe_runner_config is unset.
+        self._owns_moe_runner = False
+        self._moe_runner_backend = None
         if get_moe_runner_backend().is_cutlass():
-            assert (
-                cutlass_fp8_supported()
-            ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            assert cutlass_fp8_supported(), (
+                "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            )
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert (
-                is_sm100_supported() or is_sm90_supported() or is_sm120_supported()
+                get_platform().is_sm100
+                or get_platform().is_sm90
+                or get_platform().is_sm120
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
     @staticmethod
@@ -1103,6 +1699,44 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         return False
 
+    def _supports_blockwise_fp8_tail(self, layer: Module) -> bool:
+        """Whether this layer can retain partial blocks in native Triton MoE."""
+        if not (_is_cuda and not _is_hip):
+            return False
+        if not getattr(layer, "allow_fp8_blockwise_tail", False):
+            return False
+        if (
+            self.use_mxfp8
+            or self.is_fp4_expert
+            or not self.quant_config.is_checkpoint_fp8_serialized
+        ):
+            return False
+        block_shape = self.quant_config.weight_block_size
+        if block_shape is None or block_shape[0] != block_shape[1]:
+            return False
+
+        parallel = get_parallel()
+        runtime = get_exec()
+        if not (
+            layer.moe_ep_size == 1
+            and parallel.moe_dp_size == 1
+            and layer.moe_tp_size == parallel.tp_size
+            and layer.moe_tp_rank == parallel.tp_rank
+            and get_moe_a2a_backend().is_none()
+            and not runtime.moe.enable_eplb
+            and runtime.moe.ep_num_redundant_experts == 0
+            and runtime.moe.init_expert_location == "trivial"
+            and runtime.offload.cpu_offload_gb == 0
+            and runtime.offload.offload_group_size <= 0
+        ):
+            return False
+
+        moe_runner_backend = get_moe_runner_backend()
+        return moe_runner_backend.is_triton() or (
+            moe_runner_backend.is_auto()
+            and not self.is_deepgemm_moe_runner_backend_enabled()
+        )
+
     @staticmethod
     def create_fp8_moe_weight_(
         layer: Module,
@@ -1117,6 +1751,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         with_bias: bool = False,
         fp4_scale_dtype: Optional[torch.dtype] = None,
+        weight_block_size: Optional[List[int]] = None,
+        w2_weight_block_size: Optional[List[int]] = None,
+        allow_fp8_blockwise_tail: bool = False,
         **extra_weight_attrs,
     ):
         """
@@ -1127,23 +1764,30 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
 
-        tp_size = get_parallel().tp_size
+        tp_size = layer.moe_tp_size
+        w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=_use_aiter,
-            is_concat=True,
+            is_concat=layer.moe_runner_config.is_gated,
             is_packed=False,
         )
 
+        # The grids w13's and w2's block scales are stored on, finer than the
+        # checkpoint's along the dimension a TP shard splits mid-block.
+        if weight_block_size is None:
+            weight_block_size = quant_config.weight_block_size
+        if w2_weight_block_size is None:
+            w2_weight_block_size = weight_block_size
         if block_quant:
-            block_n, block_k = (
-                quant_config.weight_block_size[0],
-                quant_config.weight_block_size[1],
-            )
+            block_n, block_k = weight_block_size[0], w2_weight_block_size[1]
 
             padding_size = get_moe_padding_size(_use_aiter)
-            if not (_use_aiter and padding_size == block_n == block_k):
+            if not (
+                (_use_aiter and padding_size == block_n == block_k)
+                or allow_fp8_blockwise_tail
+            ):
                 # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
                 # Required by column parallel or enabling merged weights
                 if intermediate_size_per_partition % block_n != 0:
@@ -1166,7 +1810,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    w13_num_shards * intermediate_size_per_partition,
                     hidden_size // 2,
                     dtype=torch.int8,
                 ),
@@ -1186,7 +1830,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    w13_num_shards * intermediate_size_per_partition,
                     hidden_size // 8,
                     dtype=params_dtype,
                 ),
@@ -1233,13 +1877,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # BIAS (optional, e.g. GPT-OSS)
         if with_bias:
-            w13_up_dim = (
-                2 * intermediate_size_per_partition
-                if layer.moe_runner_config.is_gated
-                else intermediate_size_per_partition
-            )
             w13_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, w13_up_dim, dtype=torch.float32),
+                torch.empty(
+                    num_experts,
+                    w13_num_shards * intermediate_size_per_partition,
+                    dtype=torch.float32,
+                ),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
@@ -1256,11 +1899,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if is_fp4_expert:
             fp4_block_k = 32
             if fp4_scale_dtype is None:
-                fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
+                fp4_scale_dtype = (
+                    torch.float8_e8m0fnu if _use_aiter or is_xpu() else torch.float32
+                )
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    w13_num_shards * intermediate_size_per_partition,
                     hidden_size // fp4_block_k,
                     dtype=fp4_scale_dtype,
                 ),
@@ -1280,11 +1925,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif block_quant:
             scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
             scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.ones
+            w13_block_n, w13_block_k = weight_block_size
+            w2_block_n, w2_block_k = w2_weight_block_size
+            # A blockwise tail keeps one merged w13 grid of ceil(2 * I / block_n) rows.
+            w13_scale_rows = (
+                (w13_num_shards * intermediate_size_per_partition + w13_block_n - 1)
+                // w13_block_n
+                if allow_fp8_blockwise_tail
+                else w13_num_shards
+                * ((intermediate_size_per_partition + w13_block_n - 1) // w13_block_n)
+            )
             w13_weight_scale = torch.nn.Parameter(
                 scale_init(
                     num_experts,
-                    2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
-                    (hidden_size + block_k - 1) // block_k,
+                    w13_scale_rows,
+                    (hidden_size + w13_block_k - 1) // w13_block_k,
                     dtype=scale_dtype,
                 ),
                 requires_grad=False,
@@ -1292,8 +1947,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w2_weight_scale = torch.nn.Parameter(
                 scale_init(
                     num_experts,
-                    (hidden_size + block_n - 1) // block_n,
-                    (intermediate_size_per_partition + block_k - 1) // block_k,
+                    (hidden_size + w2_block_n - 1) // w2_block_n,
+                    (intermediate_size_per_partition + w2_block_k - 1) // w2_block_k,
                     dtype=scale_dtype,
                 ),
                 requires_grad=False,
@@ -1307,10 +1962,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert quant_config.activation_scheme == "dynamic"
 
         else:
-            # Allocate 2 scales for w1 and w3 respectively.
-            # They will be combined to a single scale after weight loading.
+            # One scale per w13 shard; a gated layer combines its two into a
+            # single scale after weight loading.
             w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+                torch.ones(num_experts, w13_num_shards, dtype=torch.float32),
+                requires_grad=False,
             )
             w2_weight_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
@@ -1323,7 +1979,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_weight_scale1 = torch.nn.Parameter(
                     torch.ones(
                         num_experts,
-                        2 * intermediate_size_per_partition,
+                        w13_num_shards * intermediate_size_per_partition,
                         dtype=torch.float32,
                     ),
                     requires_grad=False,
@@ -1347,8 +2003,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # If loading an fp16 checkpoint, do not (we will quantize in
         #   process_weights_after_loading()
         if quant_config.is_checkpoint_fp8_serialized:
-            set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-            set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+            for weight_scale, scale_block_size in (
+                (w13_weight_scale, weight_block_size),
+                (w2_weight_scale, w2_weight_block_size),
+            ):
+                scale_attrs = extra_weight_attrs
+                if block_quant and scale_block_size != quant_config.weight_block_size:
+                    checkpoint_n, checkpoint_k = quant_config.weight_block_size
+                    scale_attrs = {
+                        **extra_weight_attrs,
+                        "weight_loader": _refined_block_scale_loader(
+                            extra_weight_attrs["weight_loader"],
+                            repeats=(
+                                checkpoint_n // scale_block_size[0],
+                                checkpoint_k // scale_block_size[1],
+                            ),
+                        ),
+                    }
+                set_weight_attrs(weight_scale, scale_attrs)
 
             if _is_hip and _use_hip_int4:
                 extra_weight_attrs.update(
@@ -1391,6 +2063,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        self.weight_block_size, self.w2_weight_block_size = self._tp_weight_block_sizes(
+            layer=layer,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+        )
         Fp8MoEMethod.create_fp8_moe_weight_(
             layer=layer,
             num_experts=num_experts,
@@ -1403,6 +2080,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             is_fp4_expert=self.is_fp4_expert,
             params_dtype=params_dtype,
             with_bias=with_bias,
+            weight_block_size=self.weight_block_size,
+            w2_weight_block_size=self.w2_weight_block_size,
+            allow_fp8_blockwise_tail=self._supports_blockwise_fp8_tail(layer),
             **extra_weight_attrs,
         )
 
@@ -1413,116 +2093,267 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             self._ensure_cutlass_buffers_initialized(layer)
 
+    def _tp_weight_block_sizes(
+        self,
+        *,
+        layer: Module,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+    ) -> tuple[Optional[List[int]], Optional[List[int]]]:
+        unrefined = self.weight_block_size, None
+        if not (
+            self.block_quant
+            and not self.use_mxfp8
+            and not self.is_fp4_expert
+            and self.quant_config.is_checkpoint_fp8_serialized
+            and not layer.use_presharded_weights
+            # A blockwise tail loads the checkpoint grid as is.
+            and not self._supports_blockwise_fp8_tail(layer)
+            # apply() sends these to kernels that take the checkpoint block.
+            and not _is_cpu
+            and not (_is_xpu and not get_moe_runner_backend().is_triton())
+        ):
+            return unrefined
+        refined = _tp_refined_moe_block_sizes(
+            weight_block_size=self.weight_block_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            moe_tp_size=layer.moe_tp_size,
+            hidden_size=hidden_size,
+            runner_backend=self._resolve_moe_runner_backend(),
+            activation=layer.moe_runner_config.activation,
+        )
+        if refined is None:
+            return unrefined
+        print_info_once(
+            f"Block-FP8 MoE scales refined from {self.weight_block_size} to "
+            f"{refined[0]} (w13) and {refined[1]} (w2) blocks for a TP shard "
+            f"of {intermediate_size_per_partition}."
+        )
+        return refined
+
+    def _dequantize_aiter_fp4_experts(self, layer: Module) -> None:
+        """Convert packed FP4 expert weights to block-FP8 in place."""
+        for weight_param, scale_param in [
+            (layer.w13_weight, layer.w13_weight_scale_inv),
+            (layer.w2_weight, layer.w2_weight_scale_inv),
+        ]:
+            num_experts = weight_param.shape[0]
+            new_weights = []
+            new_scales = []
+            for e in range(num_experts):
+                w, s = cast_e2m1fn_to_e4m3fn(weight_param.data[e], scale_param.data[e])
+                new_weights.append(w)
+                new_scales.append(s)
+            weight_param.data = torch.stack(new_weights)
+            scale_param.data = torch.stack(new_scales).float()
+            scale_param.format_ue8m0 = False
+        self.is_fp4_expert = False
+        logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
-        # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
-            gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-            fp4_weight_dtype = _require_fp4_dtype()
-
-            # DeepSeek V4 MoE is implemented by the FlyDSL kernel, which supports
-            # tile_k=128, so we only need to pad dim to 128. This lets DeepSeek-V4-Pro
-            # at TP8 skip padding 384 -> 512, reducing routed-expert memory by ~25%.
-            # shuffle_scale also supports non-256 shapes since aiter PR#4130.
-            fp4_k_align = 128
-            E, w13_N, w13_K_packed = layer.w13_weight.shape
-            _, w2_N, w2_K_packed = layer.w2_weight.shape
-            inter_per_part = w13_N // 2
-            padded_inter = (
-                (inter_per_part + fp4_k_align - 1) // fp4_k_align * fp4_k_align
-            )
-            # Record the padding so fused_moe is told the real intermediate size
-            # (aiter fused_moe needs intermediate_pad = padded - real; ATOM passes
-            # 128, SGLang previously defaulted to 0 -> computed the padded region).
-            layer.intermediate_pad = padded_inter - inter_per_part
-            layer.hidden_pad = 0
-            if padded_inter != inter_per_part:
-                pad_amount = padded_inter - inter_per_part
-                fp4_block_k = 32
-
-                # Pad w13_weight: (E, 2*inter, K_packed) → (E, 2*padded, K_packed)
-                old_w13 = layer.w13_weight.data
-                new_w13 = torch.zeros(
-                    E,
-                    2 * padded_inter,
-                    w13_K_packed,
-                    dtype=old_w13.dtype,
-                    device=old_w13.device,
+            if get_moe_a2a_backend().is_megamoe() and self.dequant_fp4_to_fp8:
+                raise ValueError(
+                    "SGLANG_DSV4_FP4_DEQUANT strips the packed FP4 layout that "
+                    "aiter MegaMoE builds from; unset it, or pick another "
+                    "--moe-a2a-backend."
                 )
-                new_w13[:, :inter_per_part, :] = old_w13[:, :inter_per_part, :]
-                new_w13[:, padded_inter : padded_inter + inter_per_part, :] = old_w13[
-                    :, inter_per_part:, :
-                ]
-                layer.w13_weight = torch.nn.Parameter(new_w13, requires_grad=False)
-
-                # Pad w2_weight: (E, N, inter_packed) → (E, N, padded_packed)
-                old_w2 = layer.w2_weight.data
-                new_w2 = torch.zeros(
-                    E,
-                    w2_N,
-                    padded_inter // 2,
-                    dtype=old_w2.dtype,
-                    device=old_w2.device,
-                )
-                new_w2[:, :, :w2_K_packed] = old_w2
-                layer.w2_weight = torch.nn.Parameter(new_w2, requires_grad=False)
-
-                # Pad w13 scale: (E, 2*inter, K/block_k) → (E, 2*padded, K/block_k)
-                old_s13 = layer.w13_weight_scale_inv.data
-                _, _, s13_K = old_s13.shape
-                new_s13 = torch.zeros(
-                    E,
-                    2 * padded_inter,
-                    s13_K,
-                    dtype=old_s13.dtype,
-                    device=old_s13.device,
-                )
-                new_s13[:, :inter_per_part, :] = old_s13[:, :inter_per_part, :]
-                new_s13[:, padded_inter : padded_inter + inter_per_part, :] = old_s13[
-                    :, inter_per_part:, :
-                ]
-                layer.w13_weight_scale_inv = torch.nn.Parameter(
-                    new_s13, requires_grad=False
+            # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
+            # claim the experts before the native-MXFP4 arm; the gfx1250 MegaMoE
+            # runs aiter fused_moe on that arm's layout.
+            if get_moe_a2a_backend().is_megamoe() and not _is_gfx1250_supported:
+                from sglang.srt.layers.moe.mega_moe import (
+                    build_mega_moe_experts_weights,
                 )
 
-                # Pad w2 scale: (E, N, inter/block_k) → (E, N, padded/block_k)
-                old_s2 = layer.w2_weight_scale_inv.data
-                new_s2 = torch.zeros(
-                    E,
-                    w2_N,
-                    padded_inter // fp4_block_k,
-                    dtype=old_s2.dtype,
-                    device=old_s2.device,
-                )
-                new_s2[:, :, : old_s2.shape[2]] = old_s2
-                layer.w2_weight_scale_inv = torch.nn.Parameter(
-                    new_s2, requires_grad=False
-                )
+                fp4_weight_dtype = _require_fp4_dtype()
+                layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
+                layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
+                build_mega_moe_experts_weights(layer)
+                return
 
-            for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
-                scale = getattr(layer, scale_name)
-                num_experts, num_rows, _ = scale.shape
-                is_w13_scale = scale_name == "w13_weight_scale_inv"
-                scale_2d = scale.reshape(-1, scale.shape[-1])
-                scale.data = shuffle_scale(scale_2d, num_experts, gu_intv, is_w13_scale)
+            # AMD FP4 experts: use aiter's native MXFP4 MoE path.
+            elif not self.dequant_fp4_to_fp8:
+                gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                fp4_weight_dtype = _require_fp4_dtype()
 
-            layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
-            layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
+                # DeepSeek V4 MoE is implemented by the FlyDSL kernel, which supports
+                # tile_k=128, so we only need to pad dim to 128. This lets DeepSeek-V4-Pro
+                # at TP8 skip padding 384 -> 512, reducing routed-expert memory by ~25%.
+                # shuffle_scale also supports non-256 shapes since aiter PR#4130.
+                fp4_k_align = 128
+                E, w13_N, w13_K_packed = layer.w13_weight.shape
+                _, w2_N, w2_K_packed = layer.w2_weight.shape
+                inter_per_part = w13_N // 2
+                padded_inter = (
+                    (inter_per_part + fp4_k_align - 1) // fp4_k_align * fp4_k_align
+                )
+                # Record the padding so fused_moe is told the real intermediate size
+                # (aiter fused_moe needs intermediate_pad = padded - real; ATOM passes
+                # 128, SGLang previously defaulted to 0 -> computed the padded region).
+                layer.intermediate_pad = padded_inter - inter_per_part
+                layer.hidden_pad = 0
+                if padded_inter != inter_per_part:
+                    pad_amount = padded_inter - inter_per_part
+                    fp4_block_k = 32
 
-            is_shuffled = _is_shuffle_moe_mxfp4
-            if is_shuffled:
-                layer.w13_weight.data = shuffle_weight(
-                    layer.w13_weight,
-                    is_guinterleave=gu_intv,
-                    gate_up=True,
+                    # Pad w13_weight: (E, 2*inter, K_packed) → (E, 2*padded, K_packed)
+                    old_w13 = layer.w13_weight.data
+                    new_w13 = torch.zeros(
+                        E,
+                        2 * padded_inter,
+                        w13_K_packed,
+                        dtype=old_w13.dtype,
+                        device=old_w13.device,
+                    )
+                    new_w13[:, :inter_per_part, :] = old_w13[:, :inter_per_part, :]
+                    new_w13[:, padded_inter : padded_inter + inter_per_part, :] = (
+                        old_w13[:, inter_per_part:, :]
+                    )
+                    layer.w13_weight = torch.nn.Parameter(new_w13, requires_grad=False)
+
+                    # Pad w2_weight: (E, N, inter_packed) → (E, N, padded_packed)
+                    old_w2 = layer.w2_weight.data
+                    new_w2 = torch.zeros(
+                        E,
+                        w2_N,
+                        padded_inter // 2,
+                        dtype=old_w2.dtype,
+                        device=old_w2.device,
+                    )
+                    new_w2[:, :, :w2_K_packed] = old_w2
+                    layer.w2_weight = torch.nn.Parameter(new_w2, requires_grad=False)
+
+                    # Pad w13 scale: (E, 2*inter, K/block_k) → (E, 2*padded, K/block_k)
+                    old_s13 = layer.w13_weight_scale_inv.data
+                    _, _, s13_K = old_s13.shape
+                    new_s13 = torch.zeros(
+                        E,
+                        2 * padded_inter,
+                        s13_K,
+                        dtype=old_s13.dtype,
+                        device=old_s13.device,
+                    )
+                    new_s13[:, :inter_per_part, :] = old_s13[:, :inter_per_part, :]
+                    new_s13[:, padded_inter : padded_inter + inter_per_part, :] = (
+                        old_s13[:, inter_per_part:, :]
+                    )
+                    layer.w13_weight_scale_inv = torch.nn.Parameter(
+                        new_s13, requires_grad=False
+                    )
+
+                    # Pad w2 scale: (E, N, inter/block_k) → (E, N, padded/block_k)
+                    old_s2 = layer.w2_weight_scale_inv.data
+                    new_s2 = torch.zeros(
+                        E,
+                        w2_N,
+                        padded_inter // fp4_block_k,
+                        dtype=old_s2.dtype,
+                        device=old_s2.device,
+                    )
+                    new_s2[:, :, : old_s2.shape[2]] = old_s2
+                    layer.w2_weight_scale_inv = torch.nn.Parameter(
+                        new_s2, requires_grad=False
+                    )
+
+                for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+                    scale = getattr(layer, scale_name)
+                    num_experts, num_rows, _ = scale.shape
+                    is_w13_scale = scale_name == "w13_weight_scale_inv"
+                    if _is_gfx1250_supported:
+                        scale.data = moe_shuffle_scale(
+                            scale.contiguous(),
+                            experts_cnt=num_experts,
+                            is_guinterleave=gu_intv,
+                            gate_up=is_w13_scale,
+                        )
+                    else:
+                        scale_2d = scale.reshape(-1, scale.shape[-1])
+                        scale.data = shuffle_scale(
+                            scale_2d, num_experts, gu_intv, is_w13_scale
+                        )
+
+                layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
+                layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
+
+                if _is_gfx1250_supported:
+                    is_shuffled = True
+                    layer.w13_weight.data = moe_shuffle_weight(
+                        layer.w13_weight,
+                        is_guinterleave=gu_intv,
+                        gate_up=True,
+                    )
+                    layer.w2_weight.data = moe_shuffle_weight(
+                        layer.w2_weight,
+                        is_guinterleave=gu_intv,
+                        gate_up=False,
+                    )
+                else:
+                    is_shuffled = _is_shuffle_moe_mxfp4
+                    if is_shuffled:
+                        layer.w13_weight.data = shuffle_weight(
+                            layer.w13_weight,
+                            is_guinterleave=gu_intv,
+                            gate_up=True,
+                        )
+                        layer.w2_weight.data = shuffle_weight(
+                            layer.w2_weight,
+                            is_guinterleave=gu_intv,
+                            gate_up=False,
+                        )
+                layer.w13_weight.is_shuffled = is_shuffled
+                layer.w2_weight.is_shuffled = is_shuffled
+                if get_moe_a2a_backend().is_megamoe():
+                    from sglang.srt.layers.moe.mega_moe import (
+                        build_mega_moe_experts_weights,
+                    )
+
+                    build_mega_moe_experts_weights(layer)
+                return
+
+            # DSV4 dequant requested: convert to block-FP8 and use the standard
+            # block-FP8 MoE path.
+            else:
+                self._dequantize_aiter_fp4_experts(layer)
+                self.weight_block_size = [128, 128]
+
+                # gfx942/gfx950 native FP8 is e4m3fnuz, not e4m3fn.
+                if _is_fp8_fnuz:
+                    w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                        weight=layer.w13_weight,
+                        weight_scale=layer.w13_weight_scale_inv,
+                        input_scale=None,
+                    )
+                    w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                        weight=layer.w2_weight,
+                        weight_scale=layer.w2_weight_scale_inv,
+                        input_scale=None,
+                    )
+                    layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+                    layer.w13_weight_scale_inv = Parameter(
+                        w13_weight_scale, requires_grad=False
+                    )
+                    layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+                    layer.w2_weight_scale_inv = Parameter(
+                        w2_weight_scale, requires_grad=False
+                    )
+                    layer.w13_input_scale = None
+                    layer.w2_input_scale = None
+
+                # Only aiter-shuffle when the MoE runner is aiter; the triton runner
+                # consumes un-shuffled weights (shuffling the wrong runner corrupts output).
+                runner_is_aiter = (
+                    getattr(self, "runner", None) is not None
+                    and self.runner.runner_backend.is_aiter()
                 )
-                layer.w2_weight.data = shuffle_weight(
-                    layer.w2_weight,
-                    is_guinterleave=gu_intv,
-                    gate_up=False,
-                )
-            layer.w13_weight.is_shuffled = is_shuffled
-            layer.w2_weight.is_shuffled = is_shuffled
-            return
+                if _use_aiter and runner_is_aiter:
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight.contiguous(), (16, 16)
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight.contiguous(), (16, 16)
+                    )
+                return
 
         if self.convert_mxfp8_to_block:
             # Only aiter-shuffle when the MoE runner is aiter; the triton runner
@@ -1563,12 +2394,35 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+                layer._aiter_gate_up_interleaved = False
+            return
+        elif self.use_mxfp8 and get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import build_mega_moe_experts_weights
+
+            # DeepGEMM MegaMoE builds its own scale layout (transform_sf_into_required_layout),
+            # so keep the canonical per-32 UE8M0 scales instead of a runner-specific packing.
+            self._process_mxfp8_moe_weights(
+                layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
+            )
+            build_mega_moe_experts_weights(layer)
+            return
+        elif self.use_mxfp8 and get_moe_a2a_backend().is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                prepare_mxfp8_moe_weights_for_flashinfer_megamoe,
+            )
+
+            prepare_mxfp8_moe_weights_for_flashinfer_megamoe(layer)
             return
         elif self.use_mxfp8:
             self._process_mxfp8_moe_weights(
                 layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
             )
             return
+
+        runner_backend = self.get_moe_runner_backend(layer)
+        runner_is_aiter = runner_backend is not None and runner_backend.is_aiter()
 
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
@@ -1594,25 +2448,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale, requires_grad=False
             )
             layer.w2_input_scale = None
-            if _use_aiter:
+            if _use_aiter and runner_is_aiter:
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
                 )
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+                layer._aiter_gate_up_interleaved = False
         elif _use_aiter:
-            # Pre-shuffle weights
-            t = shuffle_weight(layer.w13_weight, (16, 16))
-            layer.w13_weight.copy_(t)
-            del t
-            t = shuffle_weight(layer.w2_weight, (16, 16))
-            layer.w2_weight.copy_(t)
-            del t
+            if runner_is_aiter:
+                # Pre-shuffle weights
+                t = shuffle_weight(layer.w13_weight, (16, 16))
+                layer.w13_weight.copy_(t)
+                del t
+                t = shuffle_weight(layer.w2_weight, (16, 16))
+                layer.w2_weight.copy_(t)
+                del t
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+                layer._aiter_gate_up_interleaved = False
         elif _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
+            assert _is_cpu_amx_available, (
+                "Fp8MoEMethod on CPU requires that CPU has AMX support"
+            )
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
@@ -1642,6 +2503,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 logger.warning_once("Dequantized FP4 expert weights to FP8.")
 
             if self.is_fp4_expert:
+                if _is_npu:
+                    from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+                        process_npu_fp4_expert_weights,
+                    )
+
+                    process_npu_fp4_expert_weights(layer)
+                    return
+
                 if get_moe_runner_backend().is_marlin():
                     layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                     layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
@@ -1657,6 +2526,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
 
                     build_mega_moe_experts_weights(layer)
+                    return
+
+                if get_moe_a2a_backend().is_flashinfer_megamoe():
+                    from sglang.srt.layers.moe.flashinfer_megamoe import (
+                        prepare_fp4_moe_weights_for_flashinfer_megamoe,
+                    )
+
+                    prepare_fp4_moe_weights_for_flashinfer_megamoe(layer)
                     return
 
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
@@ -1679,7 +2556,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True
 
-            if get_moe_a2a_backend().is_megamoe() and is_sm90_supported():
+            if get_moe_a2a_backend().is_megamoe() and get_platform().is_sm90:
                 from sglang.srt.layers.moe.mega_moe_sm90 import (
                     build_sm90_mega_moe_experts_weights,
                 )
@@ -1689,10 +2566,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 return
 
             if not self.is_fp4_expert:
-                weight_block_size = self.quant_config.weight_block_size
-                for weight, weight_scale in (
-                    (layer.w13_weight, layer.w13_weight_scale_inv),
-                    (layer.w2_weight, layer.w2_weight_scale_inv),
+                for weight, weight_scale, weight_block_size in (
+                    (
+                        layer.w13_weight,
+                        layer.w13_weight_scale_inv,
+                        self.weight_block_size,
+                    ),
+                    (
+                        layer.w2_weight,
+                        layer.w2_weight_scale_inv,
+                        self.w2_weight_block_size or self.weight_block_size,
+                    ),
                 ):
                     requant_block_scale_ue8m0_for_deepgemm(
                         weight,
@@ -1701,6 +2585,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         use_deepgemm_runner=will_use_deepgemm,
                         output_dtype=torch.bfloat16,
                         weight_shape=weight.shape[-2:],
+                        grouped_moe=True,
                     )
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
@@ -1732,7 +2617,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
         if not (
-            (_is_cuda and is_sm100_supported()) or (_is_hip and _is_gfx95_supported)
+            (_is_cuda and get_platform().is_sm100) or (_is_hip and _is_gfx95_supported)
         ):
             raise RuntimeError(
                 "MXFP8 MoE quantization requires SM100 or ROCm gfx95 "
@@ -1784,44 +2669,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 scale = scale[:, :m, :]
             return qweight, scale
 
-        def _swizzle_mxfp8_sf(scale, num_warps):
-            from triton_kernels.tensor import convert_layout, wrap_torch_tensor
-            from triton_kernels.tensor_details import layout
-
-            scale_layout, scale_layout_opts = (
-                layout.make_default_matmul_mxfp4_w_scale_layout(
-                    mx_axis=1, num_warps=num_warps
-                )
+        def _unsupported_runner_backend():
+            # Mirrors the check in the Triton MoE runner, which has no NVIDIA
+            # MXFP8 kernel; fail at load time instead of on the first forward.
+            return NotImplementedError(
+                "NVIDIA MXFP8 MoE does not support "
+                f"--moe-runner-backend {get_moe_runner_backend().value}; use "
+                "deep_gemm, cutlass, flashinfer_trtllm or flashinfer_trtllm_routed."
             )
-            scale = scale.transpose(-2, -1)
-            scale = convert_layout(
-                wrap_torch_tensor(scale), scale_layout, **scale_layout_opts
-            )
-            return scale
-
-        def _swizzle_with_triton_kernel(
-            weight_shape: tuple[int, int, int], scale: torch.Tensor
-        ):
-            num_experts, m, k = weight_shape
-            aligned_m = ((m + 127) // 128) * 128
-            scale = scale.view(num_experts, aligned_m, k // 32)
-            num_warps = 8
-            scale = _swizzle_mxfp8_sf(scale, num_warps)
-            # convert_layout may pad for alignment; we can't view back to the
-            # unpadded shape, so return the (possibly padded) swizzled tensor.
-            return scale.data
-
-        def _quantize_and_swizzle_with_triton_kernel(weight: torch.Tensor):
-
-            weight = weight.contiguous()
-            _, _, k = weight.shape
-            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
-
-            weight_flat = weight.view(-1, k).contiguous()
-            qweight, scale = mxfp8_group_quantize(weight_flat)
-            qweight = qweight.view_as(weight)
-            scale = _swizzle_with_triton_kernel(weight.shape, scale)
-            return qweight, scale
 
         def _quantize_with_flashinfer_trtllm(weight: torch.Tensor):
             weight = weight.contiguous()
@@ -1838,9 +2693,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return qweight.view_as(weight), scale_u8
 
-        from sglang.srt.layers.quantization.mxfp8_block_convert import (
-            _ue8m0_to_fp32,
-        )
+        from sglang.srt.layers.quantization.mxfp8_block_convert import _ue8m0_to_fp32
+
+        def _quantize_canonical(weight: torch.Tensor):
+            """MXFP8 with the canonical row-major per-32 UE8M0 scale kept as-is.
+
+            MegaMoE derives its own scale layout from ``w13_weight_scale_inv`` in
+            ``build_mega_moe_experts_weights``, so no runner-specific packing here.
+            """
+            weight = weight.contiguous()
+            num_experts, m, k = weight.shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
+
+            weight_flat = weight.view(-1, k).contiguous()
+            qweight, scale_u8 = mxfp8_group_quantize(weight_flat)
+            return qweight.view_as(weight), scale_u8.view(num_experts, m, k // 32)
 
         def _quantize_for_deepgemm(weight: torch.Tensor):
             weight = weight.contiguous()
@@ -1880,7 +2747,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return _pack_moe_scale_for_deepgemm(scale_fp32)
 
         if quantize:
-            if _is_hip:
+            if get_moe_a2a_backend().is_megamoe():
+                w13_q, w13_s = _quantize_canonical(layer.w13_weight.data)
+                w2_q, w2_s = _quantize_canonical(layer.w2_weight.data)
+            elif _is_hip:
                 w13_q, w13_s_u8 = mxfp8_group_quantize(
                     layer.w13_weight.data.contiguous().view(
                         -1, layer.w13_weight.data.shape[-1]
@@ -1923,14 +2793,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_q, w13_s = _quantize_with_flashinfer_trtllm(layer.w13_weight.data)
                 w2_q, w2_s = _quantize_with_flashinfer_trtllm(layer.w2_weight.data)
             else:
-                w13_q, w13_s = _quantize_and_swizzle_with_triton_kernel(
-                    layer.w13_weight.data
-                )
-                w2_q, w2_s = _quantize_and_swizzle_with_triton_kernel(
-                    layer.w2_weight.data
-                )
+                raise _unsupported_runner_backend()
         else:
             if _is_hip:
+                w13_q = layer.w13_weight.data
+                w2_q = layer.w2_weight.data
+                w13_s = layer.w13_weight_scale_inv.data
+                w2_s = layer.w2_weight_scale_inv.data
+            elif get_moe_a2a_backend().is_megamoe():
+                # Canonical per-32 UE8M0 scales as serialized; MegaMoE re-lays them out.
+                w13_q = layer.w13_weight.data
+                w2_q = layer.w2_weight.data
+                w13_s = layer.w13_weight_scale_inv.data
+                w2_s = layer.w2_weight_scale_inv.data
+            elif get_moe_runner_backend().is_cutlass():
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data
                 w13_s = layer.w13_weight_scale_inv.data
@@ -1953,14 +2829,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_scale_inv.data, layer.w2_weight.data.shape
                 )
             else:
-                w13_q = layer.w13_weight.data
-                w2_q = layer.w2_weight.data
-                w13_s = _swizzle_with_triton_kernel(
-                    layer.w13_weight.data.shape, layer.w13_weight_scale_inv.data
-                )
-                w2_s = _swizzle_with_triton_kernel(
-                    layer.w2_weight.data.shape, layer.w2_weight_scale_inv.data
-                )
+                raise _unsupported_runner_backend()
 
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         # Prefer in-place copy; rebind only when shape/dtype changes (online quantize).
@@ -1995,6 +2864,30 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
+
+        if _is_hip and _is_gfx95_supported and get_moe_runner_backend().is_aiter():
+            from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+            from aiter.utility import fp4_utils
+
+            num_experts = layer.w13_weight.shape[0]
+            layer.w13_weight.data = shuffle_weight_a16w4(
+                layer.w13_weight.data.contiguous(), 16, True
+            )
+            w13_s3d = layer.w13_weight_scale_inv.data
+            layer.w13_weight_scale_inv.data = shuffle_scale_a16w4(
+                w13_s3d.reshape(-1, w13_s3d.shape[-1]).contiguous(),
+                num_experts,
+                True,
+            )
+            layer.w2_weight.data = shuffle_weight_a16w4(
+                layer.w2_weight.data.contiguous(), 16, False
+            )
+            w2_s3d = layer.w2_weight_scale_inv.data
+            layer.w2_weight_scale_inv.data = fp4_utils.e8m0_shuffle(
+                w2_s3d.reshape(-1, w2_s3d.shape[-1]).contiguous()
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
@@ -2093,20 +2986,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # Fp8 moe kernel needs single weight scale for w13 per expert.
             # We take the max then dequant and requant each expert.
             assert layer.w13_weight_scale is not None
+            w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
             shard_size = layer.intermediate_size_per_partition
             max_w13_scales = layer.w13_weight_scale.max(dim=1).values
-            for expert_id in range(layer.num_local_experts):
-                start = 0
-                for shard_id in range(2):
-                    dq_weight = per_tensor_dequantize(
-                        layer.w13_weight[expert_id][start : start + shard_size, :],
-                        layer.w13_weight_scale[expert_id][shard_id],
-                    )
-                    (
-                        layer.w13_weight[expert_id][start : start + shard_size, :],
-                        _,
-                    ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                    start += shard_size
+            # A single shard already carries one scale per expert; nothing to fuse.
+            if w13_num_shards > 1:
+                for expert_id in range(layer.num_local_experts):
+                    start = 0
+                    for shard_id in range(w13_num_shards):
+                        dq_weight = per_tensor_dequantize(
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            layer.w13_weight_scale[expert_id][shard_id],
+                        )
+                        (
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            _,
+                        ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                        start += shard_size
 
             layer.w13_weight_scale = torch.nn.Parameter(
                 max_w13_scales, requires_grad=False
@@ -2126,11 +3022,72 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        # The runner backend is global, so it is also true for a borrowed delegate,
+        # which has no moe_runner_config and whose kernel ignores these params.
+        if (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        ) and self._owns_moe_runner:
+            self._prepare_flashinfer_trtllm_activation_params(layer)
+
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+            from sglang.srt.layers.moe.token_dispatcher.base import (
+                build_dispatcher_quant_config,
+            )
+
+            # Execution kernels may declare the dispatch wire format they
+            # need (DISPATCHER_QUANT_CONFIG, e.g. the NPU W4A8 MXFP GMMs
+            # consume MXFP8 activations); otherwise report the checkpoint
+            # dtype and let the dispatcher pick.
+            kernel_quant_config = getattr(
+                getattr(layer, "w13_kernel", None), "DISPATCHER_QUANT_CONFIG", None
+            )
+            layer.dispatcher.set_quant_config(
+                kernel_quant_config
+                if kernel_quant_config is not None
+                else {
+                    **build_dispatcher_quant_config(
+                        layer,
+                        _require_fp4_dtype()
+                        if self.is_fp4_expert
+                        else layer.w13_weight.dtype,
+                        self._aiter_moe_quant_type(),
+                        gate_up_interleaved=True
+                        if self.use_mxfp8
+                        else getattr(layer, "_aiter_gate_up_interleaved", None),
+                    ),
+                    "use_mxfp8": self.use_mxfp8,
+                }
+            )
+
+    def _prepare_flashinfer_trtllm_activation_params(self, layer: Module) -> None:
+        """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
+        num_experts = int(layer.num_local_experts)
+        device = layer.w13_weight.device
+        clamp_limit = (
+            self.moe_runner_config.gemm1_clamp_limit
+            if self.moe_runner_config.gemm1_clamp_limit is not None
+            else self.moe_runner_config.swiglu_limit
+        )
+        for name, value in (
+            ("gemm1_alpha", self.moe_runner_config.gemm1_alpha),
+            ("gemm1_beta", self.moe_runner_config.gemm1_beta),
+            ("gemm1_clamp_limit", clamp_limit),
+        ):
+            tensor = (
+                None
+                if value is None
+                else torch.full(
+                    (num_experts,),
+                    float(value),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            )
+            setattr(layer, f"_flashinfer_trtllm_{name}", tensor)
 
     def _prepare_hpc_ops_weights(self, layer: Module) -> None:
         """Precompute the scale layouts consumed by the HPC-Ops fused MoE kernels.
@@ -2185,7 +3142,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 block_quant=True,
                 global_num_experts=int(layer.num_experts),
-                moe_ep_rank=int(layer.moe_ep_rank),
                 w13_weight_scale_inv=layer.hpc_ops_w13_weight_scale,
                 w2_weight_scale_inv=layer.hpc_ops_w2_weight_scale,
                 block_shape=self.quant_config.weight_block_size,
@@ -2196,7 +3152,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 block_quant=False,
                 global_num_experts=int(layer.num_experts),
-                moe_ep_rank=int(layer.moe_ep_rank),
                 gate_up_alphas=layer.hpc_ops_gate_up_alphas,
                 down_alphas=layer.hpc_ops_down_alphas,
                 w13_input_scale=layer.w13_input_scale,
@@ -2223,19 +3178,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # We won't do requant each expert's fp8 weight (not direct available),
         # instead we adjust half of INT4 w13_weight_scale1 numbers
         assert layer.w13_weight_scale is not None
+        w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
         shard_size = layer.intermediate_size_per_partition
         max_w13_scales = layer.w13_weight_scale.max(dim=1).values
         for expert_id in range(layer.num_local_experts):
             start = 0
             max_w13_scale_fp8 = max_w13_scales[expert_id]
-            for shard_id in range(2):
+            for shard_id in range(w13_num_shards):
                 if layer.w13_weight_scale[expert_id][shard_id] != max_w13_scale_fp8:
                     int4_rescale = (
                         layer.w13_weight_scale[expert_id][shard_id] / max_w13_scale_fp8
                     )
-                    layer.w13_weight_scale1[expert_id][
-                        start : start + shard_size
-                    ] *= int4_rescale
+                    layer.w13_weight_scale1[expert_id][start : start + shard_size] *= (
+                        int4_rescale
+                    )
                 start += shard_size
 
         layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
@@ -2259,11 +3215,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
+            # The Parameter wrap drops the is_shuffled tag shuffle_weight sets;
+            # aiter's gfx950 fp8 CK MoE rejects untagged per-tensor weights.
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+            layer._aiter_gate_up_interleaved = False
 
             # ROCm (_use_aiter): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
             layer.w2_weight_scale1 *= layer.w2_weight_scale.unsqueeze(-1)
-        elif get_bool_env_var("SGLANG_MOE_PADDING"):
+        elif padding_size:
             # If ROCm, apply weight padding (min. Mem channel contention) only if set
             layer.w13_weight = torch.nn.Parameter(
                 F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
@@ -2276,15 +3237,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             torch.cuda.empty_cache()
 
-    def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
-    ):
-        self.moe_runner_config = moe_runner_config
+    def _resolve_moe_runner_backend(self) -> MoeRunnerBackend:
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+            elif (
+                _is_gfx1250_supported
+                and _use_aiter
+                and not (self.is_fp4_expert or self.use_mxfp8 or _use_hip_int4)
+            ):
+                # aiter's only gfx1250 MoE kernel takes MXFP4 weights.
+                logger.warning_once(
+                    "aiter has no FP8 MoE kernel on gfx1250; using the triton runner."
+                )
+                moe_runner_backend = MoeRunnerBackend.TRITON
             elif (
                 _is_hip
                 and (_use_aiter or _use_hip_int4)
@@ -2295,17 +3263,80 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
+            moe_runner_backend.is_flashinfer_cutlass()
+            or moe_runner_backend.is_flashinfer_cutedsl()
+        ):
+            # Neither runner has an fp8 MoE path; they get pinned globally for
+            # NVFP4 experts on sm120, so run this layer's fp8 experts on triton.
+            moe_runner_backend = MoeRunnerBackend.TRITON
+        return moe_runner_backend
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self._owns_moe_runner = False
+        self.moe_runner_config = moe_runner_config
+
+        # MXFP4 experts on NPU run through the ASCEND runner, which
+        # quantizes activations internally.
+        if _is_npu and self.is_fp4_expert:
+            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                NPUW4A8MXFP4MoEMethod,
+            )
+            from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+                create_ascend_moe_runner,
+            )
+
+            self.runner = create_ascend_moe_runner(
+                layer,
+                moe_runner_config,
+                w13_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w13"),
+                w2_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w2"),
+            )
+            return
+
+        configured_backend = get_moe_runner_backend()
+        moe_runner_backend = self._resolve_moe_runner_backend()
+        if (
+            configured_backend.is_flashinfer_cutlass()
+            or configured_backend.is_flashinfer_cutedsl()
+        ):
+            logger.info(
+                "Fp8MoEMethod has no %s path; using triton for its fp8 experts.",
+                configured_backend.name,
+            )
+
+        if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_aiter()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
             or moe_runner_backend.is_hpc_ops()
+            or moe_runner_backend.is_flashinfer_megamoe()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            self._owns_moe_runner = True
         else:
-            # TODO(cwan): refactor other backends
-            pass
+            # Direct kernels declare the layout they consume.
+            self._moe_runner_backend = moe_runner_backend
+
+    def get_moe_runner_backend(self, layer):
+        if self.runner is not None:
+            return self.runner.runner_backend
+        return self._moe_runner_backend
+
+    def get_moe_routing_method_type(self, layer, requested_method):
+        backend = self.get_moe_runner_backend(layer)
+        if (
+            requested_method is None
+            and backend is not None
+            and (
+                backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed()
+            )
+        ):
+            return RoutingMethodType.DeepSeekV3
+        return requested_method
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         use_rocm_mxfp8 = self.use_mxfp8 and _is_hip and _is_gfx95_supported
@@ -2327,6 +3358,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.weight_block_size,
+            w2_block_shape=self.w2_weight_block_size,
         )
 
     def apply(
@@ -2339,6 +3371,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
+
+        if _is_npu and self.is_fp4_expert:
+            from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+                build_ascend_quant_info,
+            )
+
+            quant_info = build_ascend_quant_info(layer)
+            return self.runner.run(dispatch_output, quant_info)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
@@ -2366,6 +3406,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 None,  # alpha
                 None,  # limit
                 True,  # is_vnni
+                moe_runner_config.activation,  # activation
             )
             return StandardCombineInput(hidden_states=output)
 
@@ -2381,11 +3422,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
-        if use_intel_xpu_backend():
+        if _is_xpu and not get_moe_runner_backend().is_triton():
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
+            topk_weights, topk_ids = route_dropped_experts_to_local(
+                topk_weights=topk_weights, topk_ids=topk_ids
+            )
             assert layer.w13_weight.dtype == layer.w2_weight.dtype
             use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
@@ -2422,7 +3466,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty_like(x)
 
@@ -2453,11 +3497,35 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_mxfp8=use_mxfp8,
                 output=symm_output,
                 enable_es=(use_mxfp8, use_mxfp8),
+                swiglu_limit=self.moe_runner_config.swiglu_limit,
             )
             return StandardCombineInput(hidden_states=output)
 
-        if self.runner.runner_backend.is_deep_gemm():
+        if self.runner.runner_backend.is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                FlashInferMegaMoeQuantInfo,
+                ensure_fp4_moe_layer_for_flashinfer_megamoe,
+                ensure_mxfp8_moe_layer_for_flashinfer_megamoe,
+            )
 
+            if self.use_mxfp8:
+                ensure_megamoe_layer = ensure_mxfp8_moe_layer_for_flashinfer_megamoe
+            elif self.is_fp4_expert:
+                ensure_megamoe_layer = ensure_fp4_moe_layer_for_flashinfer_megamoe
+            else:
+                raise ValueError(
+                    "FlashInfer MegaMOE does not support standard FP8 MoE "
+                    "weights; use MXFP8, NVFP4, or an FP4-expert checkpoint."
+                )
+            mega = ensure_megamoe_layer(layer)
+            quant_info = FlashInferMegaMoeQuantInfo(
+                mega=mega,
+                mega_forward=layer._flashinfer_megamoe_forward,
+                apply_routed_scaling_factor=(
+                    not layer.should_fuse_routed_scaling_factor_in_topk
+                ),
+            )
+        elif self.runner.runner_backend.is_deep_gemm():
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 
@@ -2492,6 +3560,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
+                w2_block_shape=self.w2_weight_block_size,
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,
             )
@@ -2523,10 +3592,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 local_expert_offset=moe_ep_rank * num_local_experts,
                 local_num_experts=num_local_experts,
                 intermediate_size=layer.w2_weight.shape[2],
-                routing_method_type=int(
-                    getattr(layer, "routing_method_type", None)
-                    or RoutingMethodType.DeepSeekV3
-                ),
+                routing_method_type=int(layer.routing_method_type),
                 block_quant=self.block_quant,
                 use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),
                 weight_block_k=(
@@ -2540,6 +3606,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale_inv=(
                     layer.w2_weight_scale_inv if self.block_quant else None
                 ),
+                gemm1_alpha=layer._flashinfer_trtllm_gemm1_alpha,
+                gemm1_beta=layer._flashinfer_trtllm_gemm1_beta,
+                gemm1_clamp_limit=layer._flashinfer_trtllm_gemm1_clamp_limit,
                 w13_input_scale=layer.w13_input_scale if not self.block_quant else None,
                 output1_scales_scalar=(
                     getattr(layer, "output1_scales_scalar", None)
@@ -2577,13 +3646,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         num_experts = layer.w13_weight.shape[0]
         hidden_size = layer.w2_weight.shape[1]
         intermediate_size_per_partition = layer.intermediate_size_per_partition
+        w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
         self.ab_strides1 = torch.full(
             (num_experts,), hidden_size, device=device, dtype=torch.int64
         )
         self.c_strides1 = torch.full(
             (num_experts,),
-            2 * intermediate_size_per_partition,
+            w13_num_shards * intermediate_size_per_partition,
             device=device,
             dtype=torch.int64,
         )
@@ -2614,6 +3684,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         self._cutlass_buffers_ready = True
 
+    def _aiter_moe_quant_type(self):
+        """The quant_type this method hands AITER, which the dispatcher also
+        needs: it separates the two fp8 activation formats."""
+        from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
+
+        if self.use_mxfp8:
+            return AiterQuantType.PER_1X32
+        if not self.block_quant:
+            return AiterQuantType.PER_TOKEN
+        return (
+            AiterQuantType.PER_1X32
+            if self.is_fp4_expert
+            else AiterQuantType.PER_128X128
+        )
+
     def maybe_get_hip_aiter_quant_info(
         self,
         layer: torch.nn.Module,
@@ -2630,6 +3715,34 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         w13_weight = layer.w13_weight
         w2_weight = layer.w2_weight
+
+        if self.use_mxfp8:
+            gemm1_alpha = self.moe_runner_config.gemm1_alpha
+            if gemm1_alpha != 1.702:
+                raise NotImplementedError(
+                    f"AITER MXFP8 MoE only supports swiglu-oai "
+                    f"alpha=1.702, got {gemm1_alpha=}."
+                )
+            from aiter import ActivationType
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            return AiterMoeQuantInfo(
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                quant_type=AiterQuantType.PER_1X32,
+                w13_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
+                swiglu_limit=self.moe_runner_config.swiglu_limit
+                or self.moe_runner_config.gemm1_clamp_limit
+                or 0.0,
+                hidden_pad=getattr(layer, "hidden_pad", 0),
+                intermediate_pad=getattr(layer, "intermediate_pad", 0),
+                fused_moe_kwargs={
+                    "activation": ActivationType.Swiglu,
+                    "gate_mode": GateMode.INTERLEAVE.value,
+                },
+            )
 
         if self.block_quant:
             quant_type = (
@@ -2651,6 +3764,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_type = AiterQuantType.PER_TOKEN
             w13_scale = layer.w13_weight_scale1
             w2_scale = layer.w2_weight_scale1
+
+        fused_moe_kwargs = None
+        gate_up_interleaved = getattr(layer, "_aiter_gate_up_interleaved", None)
+        if (
+            gate_up_interleaved is not None
+            and (self.moe_runner_config.swiglu_limit or 0.0) > 0
+        ):
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            fused_moe_kwargs = {
+                "gate_mode": (
+                    GateMode.INTERLEAVE.value
+                    if gate_up_interleaved
+                    else GateMode.SEPARATED.value
+                )
+            }
+
         return AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
@@ -2661,6 +3791,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            fp8_activations=(
+                self.is_fp4_expert and getattr(layer, "fp8_activations", False)
+            ),
+            fused_moe_kwargs=fused_moe_kwargs,
         )
 
 

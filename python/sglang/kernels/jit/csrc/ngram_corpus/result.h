@@ -1,16 +1,17 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
+
+namespace sglang {
 
 namespace ngram {
 
 struct Result {
   std::vector<int32_t> token;
   std::vector<uint8_t> mask;
-
-  void truncate(size_t n);
 };
 
 struct Node {
@@ -23,3 +24,5 @@ Result buildResultFromLeafPaths_(int last_token, int draft_token_num, const std:
 Result combineRootResults_(int last_token, int draft_token_num, const Result& primary, const Result& secondary);
 
 }  // namespace ngram
+
+}  // namespace sglang

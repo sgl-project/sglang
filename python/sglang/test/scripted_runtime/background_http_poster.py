@@ -4,7 +4,7 @@ import asyncio
 import logging
 import threading
 from concurrent.futures import Future
-from typing import Any, Coroutine, Optional
+from typing import Any, Coroutine, Dict, Optional
 
 import aiohttp
 
@@ -14,7 +14,6 @@ JOIN_TIMEOUT_S: float = 10.0
 
 
 class BackgroundHttpPoster:
-
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
         self._loop = asyncio.new_event_loop()
@@ -40,9 +39,11 @@ class BackgroundHttpPoster:
         except Exception:
             logger.exception("scripted_runtime: background async coroutine failed")
 
-    async def post(self, url: str, json: Any) -> None:
+    async def post(
+        self, url: str, json: Any, headers: Optional[Dict[str, str]] = None
+    ) -> None:
         session = self._ensure_session()
-        async with session.post(url, json=json) as resp:
+        async with session.post(url, json=json, headers=headers) as resp:
             await resp.read()
 
     def _ensure_session(self) -> aiohttp.ClientSession:

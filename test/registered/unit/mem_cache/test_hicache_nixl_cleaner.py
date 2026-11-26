@@ -2,12 +2,13 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import (
     HiCacheL3Cleaner,
@@ -16,6 +17,7 @@ from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import (
 )
 from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
     NixlBackendConfig,
+    NixlBackendSelection,
     NixlFileManager,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -40,20 +42,7 @@ class TestHiCacheL3Cleaner(CustomTestCase):
         os.utime(path, (mtime, mtime))
         return path
 
-    def test_parse_group_key_strips_rank_and_kv_suffix(self):
-        """Keys for TP ranks and zero-copy K/V files share one cleanup group."""
-        self.assertEqual(_parse_group_key("page-a_model_0_8"), "page-a_model")
-        self.assertEqual(_parse_group_key("page-a_model_7_8_k"), "page-a_model")
-        self.assertEqual(_parse_group_key("page-a_model_7_8_v"), "page-a_model")
-        self.assertEqual(_parse_group_key("page-a_model_k"), "page-a_model")
-
-    def test_tick_deletes_oldest_group_across_bucketed_dirs(self):
-        """A cleaner batch deletes all files in the oldest logical key group."""
-        old_keys = ["page-old_model_0_2", "page-old_model_1_2"]
-        new_keys = ["page-new_model_0_2", "page-new_model_1_2"]
-        old_paths = [self._write_key(key, mtime=100.0) for key in old_keys]
-        new_paths = [self._write_key(key, mtime=200.0) for key in new_keys]
-
+    def _run_single_group_cleanup(self) -> None:
         cleaner = HiCacheL3Cleaner(
             self.base_dirs,
             tp_rank=0,
@@ -62,7 +51,6 @@ class TestHiCacheL3Cleaner(CustomTestCase):
             recheck_groups=1,
             unlink_workers=1,
         )
-
         usage_calls: dict[str, int] = {}
 
         def fake_usage(path: str) -> float:
@@ -70,8 +58,107 @@ class TestHiCacheL3Cleaner(CustomTestCase):
             return 90.0 if usage_calls[path] == 1 else 60.0
 
         cleaner._disk_usage_pct = fake_usage
-
         self.assertTrue(cleaner._tick())
+
+    def test_parse_group_key_strips_rank_and_kv_suffix(self):
+        """Keys for TP ranks and zero-copy K/V files share one cleanup group."""
+        self.assertEqual(_parse_group_key("page-a_model_0_8"), "page-a_model")
+        self.assertEqual(_parse_group_key("page-a_model_7_8_k"), "page-a_model")
+        self.assertEqual(_parse_group_key("page-a_model_7_8_v"), "page-a_model")
+        self.assertEqual(_parse_group_key("page-a_model_k"), "page-a_model")
+
+    def test_parse_group_key_strips_hybrid_component_suffix(self):
+        """All hybrid component shapes share the logical page's cleanup group."""
+        names = [
+            "page-a_model_7_8_kv_k",
+            "page-a_model_7_8_swa_k",
+            "page-a_model_7_8_swa_v",
+            "page-a_model_7_8_mamba_temporal",
+            "page-a_model_7_8_mamba_conv_0",
+            "page-a_model_7_8_indexer_2",
+            "page-a_model_7_8_draft_swa",
+            "page-a_model_deepseek_v4_c4_indexer_state_2",
+            "page-a_model_7_8_window",
+            "page-a_model_7_8_window_4096",
+            "page-a_model_7_8_window_4096_k",
+            "page-a_model_7_8_window_128_v",
+            "page-a_model_7_8_window_128_3",
+        ]
+
+        for name in names:
+            with self.subTest(name=name):
+                self.assertEqual(_parse_group_key(name), "page-a_model")
+
+    def test_tick_deletes_oldest_group_across_bucketed_dirs(self):
+        """A cleaner batch deletes all files in the oldest logical key group."""
+        old_keys = ["page-old_model_0_2", "page-old_model_1_2"]
+        new_keys = ["page-new_model_0_2", "page-new_model_1_2"]
+        old_paths = [self._write_key(key, mtime=100.0) for key in old_keys]
+        new_paths = [self._write_key(key, mtime=200.0) for key in new_keys]
+
+        self._run_single_group_cleanup()
+        self.assertFalse(any(os.path.exists(path) for path in old_paths))
+        self.assertTrue(all(os.path.exists(path) for path in new_paths))
+
+    def test_tick_deletes_hybrid_components_atomically(self):
+        """Evict every pool component and TP rank for one logical page."""
+        physical_suffixes = [
+            "",
+            "_k",
+            "_v",
+            "_kv_k",
+            "_kv_v",
+            "_swa_k",
+            "_swa_v",
+            "_mamba_temporal",
+            "_mamba_conv_0",
+        ]
+        old_keys = [
+            f"page-old_model_{rank}_2{suffix}"
+            for rank in range(2)
+            for suffix in physical_suffixes
+        ]
+        new_keys = [
+            f"page-new_model_{rank}_2{suffix}"
+            for rank in range(2)
+            for suffix in physical_suffixes
+        ]
+        old_paths = [self._write_key(key, mtime=100.0) for key in old_keys]
+        new_paths = [self._write_key(key, mtime=200.0) for key in new_keys]
+
+        self._run_single_group_cleanup()
+        self.assertFalse(any(os.path.exists(path) for path in old_paths))
+        self.assertTrue(all(os.path.exists(path) for path in new_paths))
+
+    def test_tick_deletes_named_windows_with_their_page(self):
+        """BUG REGRESSION. Objects of window sub-pools named by length
+        (``window_<n>``) must group with their page's KV across every rank."""
+        physical_suffixes = [
+            "",
+            "_k",
+            "_v",
+            "_window_4096_k",
+            "_window_4096_v",
+            "_window_128",
+            "_window_128_0",
+        ]
+        old_keys = [
+            f"page-old_model_{rank}_4{suffix}"
+            for rank in range(4)
+            for suffix in physical_suffixes
+        ]
+        new_keys = [
+            f"page-new_model_{rank}_4{suffix}"
+            for rank in range(4)
+            for suffix in physical_suffixes
+        ]
+        self.assertEqual(
+            {_parse_group_key(key) for key in old_keys}, {"page-old_model"}
+        )
+        old_paths = [self._write_key(key, mtime=100.0) for key in old_keys]
+        new_paths = [self._write_key(key, mtime=200.0) for key in new_keys]
+
+        self._run_single_group_cleanup()
         self.assertFalse(any(os.path.exists(path) for path in old_paths))
         self.assertTrue(all(os.path.exists(path) for path in new_paths))
 
@@ -139,6 +226,31 @@ class TestHiCacheL3Cleaner(CustomTestCase):
 
         with self.assertRaises(ValueError):
             cfg.get_l3_cleaner_config()
+
+
+class _FailingPluginListAgent:
+    def get_plugin_list(self):
+        raise RuntimeError("plugin discovery failed")
+
+
+class TestNixlPluginSelection(CustomTestCase):
+    _PLUGIN_ENV = "SGLANG_HICACHE_NIXL_BACKEND_PLUGIN"
+
+    def test_no_active_plugin_falls_back_to_env_then_auto(self):
+        """A fully qualified config that marks no plugin active selects the
+        plugin like an empty config does: the env var, else "auto"."""
+        cfg = NixlBackendConfig({"plugin": {"posix": {"active": False}, "gds": {}}})
+        with mock.patch.dict(os.environ):
+            os.environ.pop(self._PLUGIN_ENV, None)
+            self.assertEqual(cfg.get_specified_plugin(), "auto")
+            os.environ[self._PLUGIN_ENV] = "GDS"
+            self.assertEqual(cfg.get_specified_plugin(), "GDS")
+
+    def test_create_backend_reports_plugin_listing_failure(self):
+        """A failure before the plugin list is known is reported as False, not
+        raised out of the error handler."""
+        selection = NixlBackendSelection("auto", None)
+        self.assertFalse(selection.create_backend(_FailingPluginListAgent()))
 
 
 if __name__ == "__main__":

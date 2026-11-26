@@ -1,3 +1,5 @@
+from typing import Optional
+
 # GPU Memory Types
 GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
 GPU_MEMORY_TYPE_WEIGHTS = "weights"
@@ -10,5 +12,21 @@ GPU_MEMORY_ALL_TYPES = [
 ]
 
 HEALTH_CHECK_RID_PREFIX = "HEALTH_CHECK"
+
+# Request header carrying the routing key; must equal ROUTING_KEY_HEADER in
+# rust/sglang-processor/src/openai/mod.rs, which sgl-router's sticky policy reads.
+ROUTING_KEY_HEADER = "x-sgl-routing-key"
+
+
+def is_health_check_request(rid: Optional[str]) -> bool:
+    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+
+
+# Placeholder token inserted between items in Multi-Item Scoring sequences:
+# query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
+# lengths (multi_item_delimiter_indices); the token only exists for FlashInfer
+# attention mask compat and logprob column indexing. Will be removed once the
+# attention backend supports position-only MIS.
+MIS_DELIMITER_TOKEN_ID = 9999
 
 GIB_BYTES = 1073741824  # 1024**3

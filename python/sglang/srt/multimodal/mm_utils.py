@@ -32,11 +32,9 @@ import ast
 import itertools
 import math
 import re
-from io import BytesIO
 from typing import Callable, Literal, Optional, Sequence
 
 import numpy as np
-import pybase64
 import torch
 from PIL import Image
 
@@ -56,6 +54,13 @@ def has_valid_data(data) -> bool:
     if isinstance(data, list):
         return any(has_valid_data(item) for item in flatten_nested_list(data))
     return True
+
+
+def batch_single_media_input(value):
+    """Keep one request's flat media list together when promoting it to a batch."""
+    if isinstance(value, list) and (not value or not isinstance(value[0], list)):
+        return [value]
+    return value
 
 
 def materialize_multimodal_features(
@@ -130,8 +135,9 @@ def select_best_resolution(original_size, possible_resolutions):
     for width, height in possible_resolutions:
         # Calculate the downscaled size to keep the aspect ratio
         scale = min(width / original_width, height / original_height)
-        downscaled_width, downscaled_height = int(original_width * scale), int(
-            original_height * scale
+        downscaled_width, downscaled_height = (
+            int(original_width * scale),
+            int(original_height * scale),
         )
 
         # Calculate effective and wasted resolutions
@@ -316,10 +322,6 @@ def process_anyres_image(image, processor, grid_pinpoints):
     # In transformers v5, image processors may return torch.Tensor instead of numpy arrays
     image_patches = [ensure_numpy(p) for p in image_patches]
     return np.stack(image_patches, axis=0)
-
-
-def load_image_from_base64(image):
-    return Image.open(BytesIO(pybase64.b64decode(image, validate=True)))
 
 
 def expand2square(pil_img, background_color):
@@ -822,3 +824,67 @@ def run_dp_sharded_mrope_vision_model(
             current_idx += count
     out_embeddings = torch.cat(original_order_embeddings, dim=0)
     return out_embeddings
+
+
+def run_dp_presharded_mrope_vision_model(
+    vision_model: torch.nn.Module,
+    pixel_values_local: torch.Tensor,
+    local_grid_thw_list: list,
+    global_grid_thw_list: list,
+    gpu_sample_counts: list,
+) -> torch.Tensor:
+    """Rank-local shards are contiguous, so rank-order concatenation restores global video order."""
+    parallel = get_parallel()
+    tp_size = parallel.attn_tp_size
+    patches_per_unit = [math.prod(grid) for grid in global_grid_thw_list]
+    grouped_patch_counts = []
+    offset = 0
+    for rank in range(tp_size):
+        count = gpu_sample_counts[rank]
+        grouped_patch_counts.append(sum(patches_per_unit[offset : offset + count]))
+        offset += count
+
+    merge_factor = vision_model.spatial_merge_size**2
+    grouped_output_lengths = [
+        patch_count // merge_factor for patch_count in grouped_patch_counts
+    ]
+    max_output_length = max(grouped_output_lengths)
+    try:
+        model_device = vision_model.device
+        model_dtype = vision_model.dtype
+    except AttributeError:
+        parameter = next(vision_model.parameters())
+        model_device, model_dtype = parameter.device, parameter.dtype
+
+    if pixel_values_local.shape[0] > 0:
+        pixel_values_local = pixel_values_local.to(
+            device=model_device, dtype=model_dtype
+        )
+        local_embeddings = vision_model(
+            pixel_values_local,
+            grid_thw=torch.tensor(local_grid_thw_list),
+        )
+    else:
+        local_embeddings = torch.empty(
+            (0, vision_model.out_hidden_size),
+            device=model_device,
+            dtype=model_dtype,
+        )
+
+    if local_embeddings.shape[0] < max_output_length:
+        padding = torch.empty(
+            (
+                max_output_length - local_embeddings.shape[0],
+                local_embeddings.shape[1],
+            ),
+            device=local_embeddings.device,
+            dtype=local_embeddings.dtype,
+        )
+        local_embeddings = torch.cat([local_embeddings, padding], dim=0)
+
+    gathered = parallel.attn_tp_group.all_gather(local_embeddings, dim=0)
+    pieces = []
+    for rank, output_length in enumerate(grouped_output_lengths):
+        start = rank * max_output_length
+        pieces.append(gathered[start : start + output_length])
+    return torch.cat(pieces, dim=0)

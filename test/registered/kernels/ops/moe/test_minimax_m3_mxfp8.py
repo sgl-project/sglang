@@ -27,15 +27,22 @@ if not is_hip():
 if not torch.cuda.is_available():
     pytest.skip("Requires a GPU.", allow_module_level=True)
 
+from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (  # noqa: E402
+    dot_scaled_mxfp8_blockscaled_linear,
+)
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
-    _mxfp8_dot_scaled_linear,
     _mxfp8_e4m3_quantize_torch,
     _mxfp8_e4m3_quantize_triton,
     dequant_mxfp8_to_bf16,
 )
+from sglang.srt.layers.quantization.fp8_utils import (  # noqa: E402
+    mxfp8_group_quantize,
+)
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=20, stage="base-a-jit-kernel-unit", runner_config="amd")
+# backend-specific: the native dot_scaled tests need gfx95x.
+register_amd_ci(est_time=20, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 DEVICE = "cuda"
 
@@ -81,6 +88,24 @@ def test_mxfp8_quant_triton_matches_torch(shape, dtype):
     assert _relerr(deq_k, deq_t) < 1e-2
 
 
+@requires_gfx950
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.inference_mode()
+def test_mxfp8_group_quantize_uses_gfx950_quantizer(dtype):
+    torch.manual_seed(0)
+    x = torch.randn(64, 128, device=DEVICE, dtype=dtype)
+
+    q, scale = mxfp8_group_quantize(x)
+    expected_q, expected_scale = _mxfp8_e4m3_quantize_triton(x)
+
+    assert q.dtype == torch.float8_e4m3fn
+    assert scale.dtype == torch.uint8
+    assert q.shape == x.shape
+    assert scale.shape == (64, 4)
+    torch.testing.assert_close(q.float(), expected_q.float(), rtol=0, atol=0)
+    torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("m,inter", [(8, 512), (65, 2048)])
 @torch.inference_mode()
 def test_minimax_swiglu_mxfp8_quant_matches_unfused_fp32(m, inter):
@@ -89,7 +114,7 @@ def test_minimax_swiglu_mxfp8_quant_matches_unfused_fp32(m, inter):
     # the reference is the unfused fp32 swiglu followed by MXFP8 quant. Not
     # bit-identical because the reference quant runs in torch vs the fused triton
     # path, but numerically equivalent (tight relerr, scales agree within 1 ulp).
-    from sglang.kernels.ops.moe.minimax_m3_swiglu import (
+    from sglang.kernels.ops.activation.minimax_m3_swiglu import (
         swiglu_oai_mxfp8_quant,
         swiglu_oai_split,
     )
@@ -126,7 +151,7 @@ def test_mxfp8_native_linear(m, n, k):
     w_fp8, w_scale = _mxfp8_e4m3_quantize_torch(w_bf16)
     x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16) * 0.5
 
-    got = _mxfp8_dot_scaled_linear(x, w_fp8, w_scale)
+    got = dot_scaled_mxfp8_blockscaled_linear(x, w_fp8, w_scale)
     # Reference consumes the SAME quantized weights (isolates activation-quant
     # noise) -> dequant to bf16, plain matmul.
     w_deq = dequant_mxfp8_to_bf16(w_fp8, w_scale)
@@ -162,7 +187,8 @@ def _ref_moe(x, w13, w2, topk_weights, topk_ids, alpha, beta, limit):
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "T,H,inter,E,top_k", [(8, 256, 512, 8, 2), (1, 512, 256, 16, 4)]
+    "T,H,inter,E,top_k",
+    [(8, 256, 512, 8, 2), (1, 512, 256, 16, 4), (4, 3072, 512, 8, 2)],
 )
 @torch.inference_mode()
 def test_mxfp8_native_moe(T, H, inter, E, top_k):
@@ -204,8 +230,24 @@ def test_mxfp8_native_moe(T, H, inter, E, top_k):
 
 
 @requires_gfx950
+@pytest.mark.parametrize("poison_output", [False, True], ids=["clean", "poisoned"])
+@pytest.mark.parametrize("no_combine", [False, True], ids=["combined", "routes"])
 @torch.inference_mode()
-def test_mxfp8_native_moe_ep_expert_map_filters_non_local_routes():
+def test_mxfp8_native_moe_ep_expert_map_filters_non_local_routes(
+    monkeypatch, poison_output, no_combine
+):
+    import sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 as moe
+
+    if poison_output:
+
+        class PoisonedAllocator:
+            def __getattr__(self, name):
+                return getattr(torch, name)
+
+            def empty(self, *args, **kwargs):
+                return torch.empty(*args, **kwargs).fill_(float("nan"))
+
+        monkeypatch.setattr(moe, "torch", PoisonedAllocator())
     from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
         fused_moe_mxfp8_native,
     )
@@ -252,7 +294,13 @@ def test_mxfp8_native_moe_ep_expert_map_filters_non_local_routes():
         beta=beta,
         limit=limit,
         expert_map=expert_map,
+        no_combine=no_combine,
     )
+    assert torch.isfinite(got).all()
+    if no_combine:
+        filtered = expert_map[topk_ids_global.long()] == -1
+        assert torch.count_nonzero(got[filtered]) == 0
+        got = (got.float() * topk_weights.unsqueeze(-1)).sum(dim=1).to(x.dtype)
 
     topk_ids_local = expert_map[topk_ids_global.long()]
     w13_deq = dequant_mxfp8_to_bf16(w13_fp8, w13_scale)

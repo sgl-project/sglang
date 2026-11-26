@@ -63,7 +63,7 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
 
     def _create_graph(
         self,
-        graph_key: int,
+        graph_key: Hashable,
     ):
 
         graph = torch_npu.npu.NPUGraph()
@@ -132,9 +132,16 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
-    ) -> int:
+        attention_layout_key: Optional[Hashable] = None,
+    ) -> Hashable:
         vit = self.vit
-        graph_key = self._get_graph_key(x_3d)
+        graph_key = self._get_graph_key(
+            x_3d,
+            cu_seqlens,
+            None,
+            attention_layout_key,
+        )
+        seq_len = x_3d.shape[0]
 
         if graph_key in self.block_graphs:
             return graph_key
@@ -153,9 +160,11 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
 
         if graph_key not in self.block_output:
             self.block_output[graph_key] = x_3d
-            self.block_input[graph_key] = x_3d
+            # Vision blocks update their input in place. Capture must not
+            # modify the caller's tensor before the first replay copies it.
+            self.block_input[graph_key] = x_3d.clone()
             self.block_ws[graph_key] = torch.empty(
-                graph_key,
+                seq_len,
                 num_heads,
                 attn_head_dim,
                 device=self.device,
@@ -178,7 +187,7 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
 
     def replay(
         self,
-        graph_key: int,
+        graph_key: Hashable,
         x_3d: torch.Tensor,
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
@@ -201,7 +210,9 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
         if output_indices is not None:
             out = out.index_select(0, output_indices)
 
-        return out
+        # Cache entries and split views outlive this invocation. Graph replay
+        # (including another graph using the shared pool) may overwrite out.
+        return out.clone() if output_indices is None else out
 
     def run(
         self,
@@ -210,16 +221,23 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
         output_indices: Optional[torch.Tensor] = None,
+        attention_layout_key: Optional[Hashable] = None,
     ) -> torch.Tensor:
         # x: [seq_len, hidden] -> [S, B=1, H]
         x_3d = x.unsqueeze(1)
-        graph_key = self._get_graph_key(x_3d)
+        graph_key = self._get_graph_key(
+            x_3d,
+            cu_seqlens,
+            None,
+            attention_layout_key,
+        )
         if graph_key not in self.block_graphs:
             self.create_graph(
                 x_3d=x_3d,
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                attention_layout_key=attention_layout_key,
             )
 
         return self.replay(

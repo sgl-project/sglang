@@ -9,6 +9,9 @@ With SGLANG_MM_AVOID_RETOKENIZE ON (default), the server keeps the user's
 original tokens verbatim and only expands the image placeholder, so prompt_tokens
 stays faithful to what the client sent.
 
+The test uses JPEG so CUDA decoding returns a CHW tensor, covering the same
+exact-token path as PIL-backed images.
+
 For each model we launch a real server twice with the same predefined,
 non-canonical prompt ("Describe" split into "D"+"escribe") plus one image:
 
@@ -16,6 +19,8 @@ non-canonical prompt ("Describe" split into "D"+"escribe") plus one image:
     drift delta.
   * flag ON  -> no drift: prompt_tokens equals the original length (with the
     image placeholder expanded).
+  * --enable-token-space-processor with the flag OFF -> no drift either: the
+    token-space processor never decodes the IDs.
 """
 
 import base64
@@ -27,7 +32,11 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -35,14 +44,16 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=149, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=185, suite="extra-test-cpu-intel")
+register_amd_ci(est_time=230, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 def _data_uri():
     img = Image.new("RGB", (64, 64), (128, 128, 128))
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    img.save(buf, format="JPEG")
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
 def _build_drift_prompt(model, image_token):
@@ -53,9 +64,7 @@ def _build_drift_prompt(model, image_token):
     token), followed by one image placeholder. drift_delta is how many extra
     tokens the non-canonical form carries vs. the canonical re-tokenization.
     """
-    tok = AutoProcessor.from_pretrained(
-        model, trust_remote_code=True, use_fast=True
-    ).tokenizer
+    tok = AutoProcessor.from_pretrained(model, trust_remote_code=True).tokenizer
 
     def enc(text):
         return tok.encode(text, add_special_tokens=False)
@@ -109,6 +118,28 @@ class TestQwenVLTokenIdRetokenize(CustomTestCase):
         # ON keeps the user's original tokens; OFF loses the drift_delta tokens.
         pt_off, pt_on = prompt_tokens["0"], prompt_tokens["1"]
         self.assertEqual(pt_on - pt_off, drift_delta, f"on={pt_on}, off={pt_off}")
+
+    def test_token_space_processor_keeps_input_ids_with_flag_off(self):
+        """Token-space must keep the client's IDs even with the legacy flag off."""
+        input_ids, drift_delta = _build_drift_prompt(self.model, self.image_token)
+        self.assertGreater(drift_delta, 0, "prompt is canonical; no drift to exercise")
+        processor = AutoProcessor.from_pretrained(self.model, trust_remote_code=True)
+        image_tokens = processor._get_num_multimodal_tokens(
+            image_sizes=[(64, 64)]
+        ).num_image_tokens[0]
+        process = popen_launch_server(
+            self.model,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=self.other_args + ["--enable-token-space-processor"],
+            env={"SGLANG_MM_AVOID_RETOKENIZE": "0"},
+        )
+        try:
+            prompt_tokens = _prompt_tokens(DEFAULT_URL_FOR_TEST, input_ids, _data_uri())
+        finally:
+            kill_process_tree(process.pid)
+        # Only the image placeholder is replaced by its image tokens.
+        self.assertEqual(prompt_tokens, len(input_ids) - 1 + int(image_tokens))
 
 
 if __name__ == "__main__":

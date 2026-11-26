@@ -35,22 +35,116 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.kvcache import dsa_index_k_cache
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
-    GPU_MEMORY_TYPE_KV_CACHE,
     DSATokenToKVPool,
-    RadixAttention,
     get_tensor_size_bytes,
-    maybe_detect_oob,
     unwrap_write_loc,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
+
+
+class LayerSplitIndexKeyCache(IndexKeyCache):
+    def __init__(self, pool: LayerSplitDSATokenToKVPool, index_buf_size: int):
+        super().__init__(pool, index_buf_size)
+        num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
+        with (
+            torch.cuda.use_mem_pool(pool.custom_mem_pool)
+            if pool.custom_mem_pool
+            else nullcontext()
+        ):
+            self.remote_buffer = torch.empty(
+                self._buffer_shape(num_pages),
+                dtype=pool.index_k_with_scale_buffer_dtype,
+                device=pool.device,
+            )
+        self.remote_layer_id: Optional[int] = None
+
+    def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
+        layer_id = self.pool.start_layer + layer_idx
+        if not self.pool._is_layer_owned(layer_id):
+            return 0
+        return super()._layer_num_pages(layer_idx, num_pages)
+
+    def clear(self) -> None:
+        super().clear()
+        del self.remote_buffer
+
+    def get_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.pool.layer_transfer_counter is not None:
+            self.pool.layer_transfer_counter.wait_until(
+                layer_id - self.pool.start_layer
+            )
+        return self.get_broadcastable_buffer(layer_id)
+
+    def get_k_and_scale(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ):
+        buf = self.get_buffer(layer_id)
+        self.pool.prefetch_kv_buffer(layer_id)
+        return dsa_index_k_cache.GetKAndS.execute(
+            self.pool,
+            buf,
+            page_indices=page_indices,
+            seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
+        )
+
+    def store_quantized(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        self.invalidate(layer_id)
+        if self.pool._is_layer_owned(layer_id):
+            super().store_quantized(layer_id, loc, index_k, index_k_scale)
+
+    def invalidate(self, layer_id: int) -> None:
+        if self.remote_layer_id == layer_id:
+            self.remote_layer_id = None
+
+    def get_broadcastable_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.remote_layer_id != layer_id:
+            local_idx = layer_id - self.pool.start_layer
+            src_tensor = (
+                self.buffer[local_idx] if self.pool._is_layer_owned(layer_id) else None
+            )
+            self.pool._broadcast_tensor_from_owner(
+                self.remote_buffer,
+                layer_id,
+                src_tensor=src_tensor,
+            )
+            self.remote_layer_id = layer_id
+        return self.remote_buffer
+
+    def state_buf_infos(self):
+        owned_layer_ids = [
+            i
+            for i in range(self.pool.layer_num)
+            if self.pool._is_layer_owned(self.pool.start_layer + i)
+        ]
+        data_ptrs = [self.buffer[i].data_ptr() for i in owned_layer_ids]
+        data_lens = [self.buffer[i].nbytes for i in owned_layer_ids]
+        item_lens = [self._item_len(i) for i in owned_layer_ids]
+        return data_ptrs, data_lens, item_lens
 
 
 class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
@@ -63,9 +157,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         layer_shard_size: int,
         **kwargs,
     ):
-        assert (
-            layer_shard_rank is not None and layer_shard_size > 1
-        ), "LayerSplitDSATokenToKVPool requires layer_shard_size > 1"
+        assert layer_shard_rank is not None and layer_shard_size > 1, (
+            "LayerSplitDSATokenToKVPool requires layer_shard_size > 1"
+        )
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
@@ -114,17 +208,20 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     def _init_layer_broadcast_comm(self) -> None:
         cp_group = get_parallel().attn_cp_group
-        if cp_group.world_size <= 1 or cp_group.pynccl_comm is None:
+        if cp_group.world_size <= 1 or cp_group.get_available_pynccl_comm() is None:
             return
 
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
         )
 
-        self.layer_broadcast_comm = PyNcclCommunicator(
+        layer_broadcast_comm = PyNcclCommunicator(
             group=cp_group.cpu_group,
             device=cp_group.device,
         )
+        if not layer_broadcast_comm.available:
+            return
+        self.layer_broadcast_comm = layer_broadcast_comm
         logger.info(
             "Initialized dedicated layer-shard broadcast NCCL communicator: "
             f"rank={cp_group.rank_in_group}, world_size={cp_group.world_size}"
@@ -147,7 +244,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         comm = (
             self.layer_broadcast_comm
             if use_layer_broadcast_comm and self.layer_broadcast_comm is not None
-            else cp_group.pynccl_comm
+            else cp_group.get_available_pynccl_comm()
         )
         if comm is not None:
             # PyNcclCommunicator defaults to disabled=True (it is only enabled
@@ -165,32 +262,22 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     # ---- buffer allocation (owned-only + remote scratch) ------------------
 
+    def layer_buffer_rows(self, layer_index: int) -> int:
+        # Non-owned layers allocate a 0-row placeholder so ``kv_buffer`` stays
+        # index-aligned by layer.
+        if not self._is_layer_owned(self.start_layer + layer_index):
+            return 0
+        return super().layer_buffer_rows(layer_index)
+
     def _create_buffers(self):
         self._log_layer_shard_plan()
+        super()._create_buffers()
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
                 else nullcontext()
             ):
-                # Owned layers get the full buffer; non-owned layers allocate a
-                # 0-row placeholder so ``kv_buffer`` stays index-aligned by layer.
-                self.kv_buffer = [
-                    torch.zeros(
-                        (
-                            (
-                                (self.size + self.page_size)
-                                if self._is_layer_owned(self.start_layer + i)
-                                else 0
-                            ),
-                            1,
-                            self.kv_cache_dim,
-                        ),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for i in range(self.layer_num)
-                ]
                 self.remote_kv_buffer = torch.empty(
                     (self.size + self.page_size, 1, self.kv_cache_dim),
                     dtype=self.store_dtype,
@@ -203,35 +290,13 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 self.pending_remote_kv_broadcast = False
         self._init_layer_broadcast_comm()
 
-    def _create_index_buffers(self):
-        num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
-        with (
-            torch.cuda.use_mem_pool(self.custom_mem_pool)
-            if self.custom_mem_pool
-            else nullcontext()
-        ):
-            self.index_k_with_scale_buffer = [
-                torch.zeros(
-                    self._index_buffer_shape(
-                        num_pages if self._is_layer_owned(self.start_layer + i) else 0
-                    ),
-                    dtype=self.index_k_with_scale_buffer_dtype,
-                    device=self.device,
-                )
-                for i in range(self.layer_num)
-            ]
-            self.remote_index_k_with_scale_buffer = torch.empty(
-                self._index_buffer_shape(num_pages),
-                dtype=self.index_k_with_scale_buffer_dtype,
-                device=self.device,
-            )
-            self.remote_index_layer_id: Optional[int] = None
+    def _create_index_key_cache(self) -> IndexKeyCache:
+        return LayerSplitIndexKeyCache(self, self.index_buf_size)
 
     def _clear_buffers(self):
         del self.kv_buffer
         del self.remote_kv_buffer
-        del self.remote_index_k_with_scale_buffer
-        del self.index_k_with_scale_buffer
+        self.index_key_cache.clear()
 
     # ---- MLA latent KV: owned-only writes, owner-broadcast reads ----------
 
@@ -306,12 +371,16 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
+        loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         if self.pending_remote_kv_layer_id == layer_id:
             self._finalize_pending_kv_broadcast(set_remote_layer_id=True)
         remote_kv_updatable = self.remote_kv_layer_id == layer_id
@@ -418,101 +487,25 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             if kv_cache.shape[0] == 0:
                 continue
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
-        for index_k in self.index_k_with_scale_buffer:
-            if index_k.shape[0] == 0:
-                continue
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+        self.index_key_cache.move(tgt_loc, src_loc)
 
     # ---- DSA indexer buffer: owned-only writes, owner-broadcast reads -----
 
     def get_broadcastable_index_k_with_scale_buffer(
         self, layer_id: int
     ) -> torch.Tensor:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self._get_broadcastable_index_buffer(layer_id)
-
-    def get_index_k_continuous(self, layer_id, seq_len, page_indices):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self._get_broadcastable_index_buffer(layer_id)
-        return index_buf_accessor.GetK.execute(
-            self, buf, seq_len=seq_len, page_indices=page_indices
-        )
-
-    def get_index_k_scale_continuous(self, layer_id, seq_len, page_indices):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self._get_broadcastable_index_buffer(layer_id)
-        return index_buf_accessor.GetS.execute(
-            self, buf, seq_len=seq_len, page_indices=page_indices
-        )
-
-    def get_index_k_scale_buffer(
-        self, layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
-    ):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self._get_broadcastable_index_buffer(layer_id)
-        # Overlap the latent-KV owner-broadcast with the indexer read.
-        self.prefetch_kv_buffer(layer_id)
-        return index_buf_accessor.GetKAndS.execute(
-            self,
-            buf,
-            page_indices=page_indices,
-            seq_len_tensor=seq_len_tensor,
-            seq_len_sum=seq_len_sum,
-            max_seq_len=max_seq_len,
-        )
-
-    def set_index_k_scale_buffer(self, layer_id, loc, index_k, index_k_scale) -> None:
-        self.invalidate_index_buffer_for_layer(layer_id)
-        if not self._is_layer_owned(layer_id):
-            return
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        index_buf_accessor.SetKAndS.execute(
-            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
-        )
+        return self.index_key_cache.get_buffer(layer_id)
 
     def invalidate_index_buffer_for_layer(self, layer_id: int) -> None:
-        if self.remote_index_layer_id == layer_id:
-            self.remote_index_layer_id = None
+        self.index_key_cache.invalidate(layer_id)
 
     def _get_broadcastable_index_buffer(self, layer_id: int) -> torch.Tensor:
-        if self.remote_index_layer_id != layer_id:
-            local_idx = self._local_layer_idx(layer_id)
-            src_tensor = (
-                self.index_k_with_scale_buffer[local_idx]
-                if self._is_layer_owned(layer_id)
-                else None
-            )
-            self._broadcast_tensor_from_owner(
-                self.remote_index_k_with_scale_buffer,
-                layer_id,
-                src_tensor=src_tensor,
-            )
-            self.remote_index_layer_id = layer_id
-        return self.remote_index_k_with_scale_buffer
-
-    def get_state_buf_infos(self):
-        owned_layer_ids = [
-            i
-            for i in range(self.layer_num)
-            if self._is_layer_owned(self.start_layer + i)
-        ]
-        data_ptrs = [
-            self.index_k_with_scale_buffer[i].data_ptr() for i in owned_layer_ids
-        ]
-        data_lens = [self.index_k_with_scale_buffer[i].nbytes for i in owned_layer_ids]
-        item_lens = [
-            self.index_k_with_scale_buffer[i][0].nbytes for i in owned_layer_ids
-        ]
-        return data_ptrs, data_lens, item_lens
+        return self.index_key_cache.get_broadcastable_buffer(layer_id)
 
     # ---- HiCache CPU offload: skip empty (non-owned) layers ---------------
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        from sglang.srt.utils import current_platform
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        from sglang.srt.platforms import current_platform
 
         current_platform.synchronize()
         kv_cache_cpu = []
@@ -529,25 +522,19 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 kv_cache_cpu[-1].append(kv_cpu)
         current_platform.synchronize()
 
-        page_indices = indices[:: self.page_size] // self.page_size
-        torch.cuda.synchronize()
-        index_k_cpu = []
-        page_chunk_size = max(1, chunk_size // self.page_size)
-        for layer_id in range(self.layer_num):
-            index_k_cpu.append([])
-            if self.index_k_with_scale_buffer[layer_id].shape[0] == 0:
-                continue
-            for i in range(0, len(page_indices), page_chunk_size):
-                chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = self.index_k_with_scale_buffer[layer_id][
-                    chunk_page_indices
-                ].to("cpu", non_blocking=True)
-                index_k_cpu[-1].append(idx_cpu)
-        torch.cuda.synchronize()
-        return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
+        return {
+            "kv": kv_cache_cpu,
+            "index_k": self.index_key_cache.cpu_copy(indices),
+        }
 
-    def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
-        from sglang.srt.utils import current_platform
+    def load_cpu_copy(
+        self,
+        kv_cache_cpu_dict,
+        indices,
+        mamba_indices=None,
+        req_pool_index=None,
+    ):
+        from sglang.srt.platforms import current_platform
 
         kv_cache_cpu = kv_cache_cpu_dict["kv"]
         current_platform.synchronize()
@@ -563,19 +550,4 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         current_platform.synchronize()
 
-        page_indices = indices[:: self.page_size] // self.page_size
-        index_k_cpu = kv_cache_cpu_dict["index_k"]
-        torch.cuda.synchronize()
-        page_chunk_size = max(1, chunk_size // self.page_size)
-        for layer_id in range(self.layer_num):
-            if self.index_k_with_scale_buffer[layer_id].shape[0] == 0:
-                continue
-            for i in range(0, len(page_indices), page_chunk_size):
-                chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
-                assert idx_cpu.shape[0] == len(chunk_page_indices)
-                idx_chunk = idx_cpu.to(
-                    self.index_k_with_scale_buffer[layer_id].device, non_blocking=True
-                )
-                self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
-        torch.cuda.synchronize()
+        self.index_key_cache.load_cpu_copy(kv_cache_cpu_dict["index_k"], indices)

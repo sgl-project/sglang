@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 
 class ScriptedContext:
-
     def __init__(
         self,
         *,
@@ -38,9 +37,9 @@ class ScriptedContext:
         tokenizer_recv_proxy: Optional[ScriptedTokenizerRecvProxy],
         http_poster: BackgroundHttpPoster,
     ) -> None:
-        assert (
-            scheduler_hook._is_driver
-        ), "ScriptedContext only exists on the driver rank"
+        assert scheduler_hook._is_driver, (
+            "ScriptedContext only exists on the driver rank"
+        )
         self.scheduler = scheduler_hook.scheduler
         self._scheduler_hook = scheduler_hook
         self._tokenizer_recv_proxy = tokenizer_recv_proxy
@@ -100,9 +99,9 @@ class ScriptedContext:
         return lifecycle.flush_cache(self)
 
     def evict_radix(self, *, prefix_tokens: Optional[List[int]]) -> None:
-        assert (
-            prefix_tokens is None
-        ), "evict_radix currently supports only full eviction (prefix_tokens=None)"
+        assert prefix_tokens is None, (
+            "evict_radix currently supports only full eviction (prefix_tokens=None)"
+        )
         return lifecycle.flush_cache(self)
 
     def exhaust_kv(self, *, leave_pages: int) -> None:

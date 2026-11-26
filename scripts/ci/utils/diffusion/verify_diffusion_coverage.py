@@ -29,12 +29,22 @@ DYNAMIC_SUITES = {"1-gpu", "2-gpu"}
 
 
 def load_execution_reports(reports_dir: Path) -> list[dict]:
-    """Load all execution report JSON files from the given directory."""
-    reports = []
+    """Load the latest artifact report for each suite partition."""
+    reports = {}
     for json_file in reports_dir.glob("**/execution_report_*.json"):
         with open(json_file, "r", encoding="utf-8") as f:
-            reports.append(json.load(f))
-    return reports
+            report = json.load(f)
+        artifact = json_file.relative_to(reports_dir).parts[0]
+        attempt = (
+            int(artifact.rsplit("-", 1)[1])
+            if artifact.startswith("diffusion-report-")
+            else 0
+        )
+        key = (report["suite"], report["partition_id"])
+        # a rerun replaces the whole partition, including its coverage and failures
+        if key not in reports or attempt > reports[key][0]:
+            reports[key] = (attempt, report)
+    return [report for _, report in reports.values()]
 
 
 def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
@@ -49,11 +59,7 @@ def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
     run_suite_path = repo_root / RUN_SUITE_REL_PATH
     case_config_path = resolve_case_config_path(repo_root, run_suite_path)
 
-    suites = collect_diffusion_suites(
-        case_config_path,
-        run_suite_path,
-        baseline_path,
-    )
+    suites = collect_diffusion_suites(case_config_path, baseline_path)
 
     expected = {}
     for suite_name, suite_info in suites.items():
@@ -156,7 +162,7 @@ def print_missing_standalone_estimates_summary(
     print("\n" + "=" * 60)
     print(
         "Add standalone estimate(s) to "
-        "python/sglang/multimodal_gen/test/run_suite.py"
+        "python/sglang/multimodal_gen/test/runner/diffusion_suite_runner.py"
     )
     print("=" * 60)
     print("The following standalone file(s) used fallback estimate 300.0s.")

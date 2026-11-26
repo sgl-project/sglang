@@ -7,6 +7,7 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -17,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
+register_amd_ci(est_time=600, suite="base-b-disaggregation-test-large-8-gpu-amd-mi35x")
 
 
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
@@ -107,7 +108,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -133,12 +134,12 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         input_logprobs = j["meta_info"]["input_token_logprobs"]
         output_logprobs = j["meta_info"]["output_token_logprobs"]
 
-        assert (
-            len(output_logprobs) == completion_tokens
-        ), f"output_logprobs and completion_tokens should have the same length, but got {len(output_logprobs)} and {completion_tokens}"
-        assert (
-            len(input_logprobs) > 0
-        ), f"input_logprobs should have at least one token, but got {len(input_logprobs)}"
+        assert len(output_logprobs) == completion_tokens, (
+            f"output_logprobs and completion_tokens should have the same length, but got {len(output_logprobs)} and {completion_tokens}"
+        )
+        assert len(input_logprobs) > 0, (
+            f"input_logprobs should have at least one token, but got {len(input_logprobs)}"
+        )
 
     def test_structured_output(self):
         json_schema = json.dumps(
@@ -215,7 +216,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         )
 
 
-# register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large-amd")
+# register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large-amd")
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -231,8 +232,10 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        # set DISAGGREGATION_TEST_FAILURE_PROB to simulate failure
-        os.environ["DISAGGREGATION_TEST_FAILURE_PROB"] = "0.05"
+        # Inject transfer failures so the retry path is actually exercised.
+        # Entered before the servers start so they inherit it.
+        cls._disagg_failure_ctx = envs.SGLANG_TEST_DISAGG_FAILURE_PROB.override(0.05)
+        cls._disagg_failure_ctx.__enter__()
 
         cls.model = "Qwen/Qwen3-8B"
 
@@ -248,7 +251,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("DISAGGREGATION_TEST_FAILURE_PROB")
+        cls._disagg_failure_ctx.__exit__(None, None, None)
         super().tearDownClass()
 
     @classmethod
@@ -308,7 +311,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
 
@@ -329,7 +332,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
                 raise e from health_check_error
 
 
-# register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large-amd")
+# register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large-amd")
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -420,7 +423,7 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval_few_shot_gsm8k(args)

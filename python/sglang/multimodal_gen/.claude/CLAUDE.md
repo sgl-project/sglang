@@ -4,6 +4,20 @@
 
 SGLang's diffusion/multimodal generation subsystem. Separate from the LLM runtime (`srt`). Supports 20+ image/video diffusion models (Wan, FLUX, HunyuanVideo, LTX, Qwen-Image, etc.) with distributed inference, LoRA, and multiple attention backends.
 
+## Serving a specific model — read its cookbook page first
+
+**Before running or deploying any model, read `docs/cookbook/diffusion/<Family>/`.**
+That page carries the deployment command we recommend to users — GPU count,
+parallelism degrees, pipeline class, offload flags — and it is the answer to
+"how should this model be served". Families: Cosmos, Ernie-Image, FLUX,
+Ideogram, JoyEcho, Krea, LTX, LingBot-Video, LingBot-World, LongLive, MOVA,
+MiniMax, Qwen-Image, SANA-Video, SANA-WM, Wan, Z-Image.
+
+The configs under `test/` are a different thing: pinned, reproducible CI setups
+for correctness and regression checks, not deployment advice. Reach for them
+when you need an exact reproducible configuration, and say which cookbook flags
+you diverged from.
+
 ## Quick Start
 
 ```bash
@@ -14,8 +28,8 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers --prompt "A curiou
 sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers --num-gpus 4
 
 # Python API
-from sglang import DiffGenerator
-gen = DiffGenerator.from_pretrained("Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
+from sglang.multimodal_gen import DiffGenerator
+gen = DiffGenerator.from_pretrained(model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
 result = gen.generate(sampling_params_kwargs={"prompt": "A curious raccoon"})
 ```
 
@@ -71,10 +85,14 @@ configs/
 
 ## Adding a New Model
 
+Follow `docs/docs/sglang-diffusion/support_new_models.mdx`; the
+[add-diffusion-model skill](skills/add-diffusion-model/SKILL.md) gives the order
+of work and the checks between steps. In short:
+
 1. Create pipeline in `runtime/pipelines/` extending `ComposedPipelineBase`
-2. Define stages via `create_pipeline_stages()` (TextEncoding → Denoising → Decoding)
+2. Define stages via `create_pipeline_stages()`, reusing native stages before adding model-specific ones
 3. Add config in `configs/pipeline_configs/`
-4. Register in `registry.py` via `register_configs()`
+4. Register with a `register()` function in that config file; it is discovered at startup
 
 ## Multi-GPU
 
@@ -107,6 +125,5 @@ Look for `Pixel data generated successfully in xxxx seconds` in console output. 
 ## Env Vars
 
 Defined in `envs.py` (300+ vars). Key ones:
-- `SGLANG_DIFFUSION_ATTENTION_BACKEND` — attention backend override
 - `SGLANG_CACHE_DIT_ENABLED` — enable Cache-DiT acceleration
 - `SGLANG_CLOUD_STORAGE_TYPE` — cloud output storage (s3, etc.)

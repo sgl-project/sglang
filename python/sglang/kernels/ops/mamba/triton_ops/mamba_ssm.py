@@ -52,8 +52,9 @@ cvt.rs.f16x2.f32 $0, $2, $1, $3;
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
 @triton.heuristics(
     {
-        "HAS_STATE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"]
-        is not None
+        "HAS_STATE_BATCH_INDICES": lambda args: (
+            args["state_batch_indices_ptr"] is not None
+        )
     }
 )
 @triton.heuristics(
@@ -61,24 +62,23 @@ cvt.rs.f16x2.f32 $0, $2, $1, $3;
 )
 @triton.heuristics(
     {
-        "CACHE_INTERMEDIATE_STATES": lambda args: args["intermediate_states_buffer"]
-        is not None
+        "CACHE_INTERMEDIATE_STATES": lambda args: (
+            args["intermediate_states_buffer"] is not None
+        )
     }
 )
 @triton.heuristics(
     {
-        "HAS_EAGLE_TREE_CUSTOM_ATTN_MASK": lambda args: args[
-            "retrieve_parent_token_ptr"
-        ]
-        is not None
+        "HAS_EAGLE_TREE_CUSTOM_ATTN_MASK": lambda args: (
+            args["retrieve_parent_token_ptr"] is not None
+        )
     }
 )
 @triton.heuristics(
     {
-        "HAS_INTERMEDIATE_STATE_INDICES": lambda args: args[
-            "intermediate_state_indices_ptr"
-        ]
-        is not None
+        "HAS_INTERMEDIATE_STATE_INDICES": lambda args: (
+            args["intermediate_state_indices_ptr"] is not None
+        )
     }
 )
 @triton.jit(do_not_specialize=["T"])
@@ -97,7 +97,7 @@ def _selective_scan_update_kernel(
     state_batch_indices_ptr,
     pad_slot_id,
     intermediate_states_buffer,
-    cache_steps,
+    stride_intermediate_batch,
     retrieve_parent_token_ptr,
     intermediate_state_indices_ptr,
     rand_seed_ptr,
@@ -236,7 +236,7 @@ def _selective_scan_update_kernel(
                     step_offset = parent_step_idx * nheads * dim * dstate
                     cache_ptr = (
                         intermediate_states_buffer
-                        + cache_idx * cache_steps * nheads * dim * dstate
+                        + cache_idx * stride_intermediate_batch
                         + step_offset
                         + pid_h * dim * dstate
                         + offs_m[:, None] * dstate
@@ -289,7 +289,7 @@ def _selective_scan_update_kernel(
                 if state_batch_idx != pad_slot_id:
                     cache_ptr_base = (
                         intermediate_states_buffer
-                        + cache_idx * cache_steps * nheads * dim * dstate
+                        + cache_idx * stride_intermediate_batch
                         + current_step_idx * nheads * dim * dstate
                         + pid_h * dim * dstate
                     )
@@ -391,7 +391,7 @@ def selective_state_update(
              In-place updated.
         disable_state_update: If True, don't write back to state (for speculative verify)
         intermediate_states_buffer: Buffer to cache intermediate states
-        cache_steps: Total number of steps in the buffer
+        cache_steps: Active verify steps. The buffer can have capacity for more steps.
         retrieve_parent_token: (batch, T) tensor of parent token indices for EAGLE tree attention
         intermediate_state_indices: (batch,) tensor of indices for intermediate_states_buffer operations.
             If provided, uses these indices instead of state_batch_indices for the buffer.
@@ -474,7 +474,7 @@ def selective_state_update(
         else (
             (16, 4)
             if dstate <= 32
-            else ((8, 4) if dstate <= 64 else ((4, 4) if dstate <= 128 else ((4, 8))))
+            else ((8, 4) if dstate <= 64 else ((8, 1) if dstate <= 128 else ((4, 8))))
         )
     )
     tie_hdim = (
@@ -512,7 +512,9 @@ def selective_state_update(
             state_batch_indices,
             pad_slot_id,
             intermediate_states_buffer,
-            cache_steps if cache_steps is not None else 0,
+            intermediate_states_buffer.stride(0)
+            if intermediate_states_buffer is not None
+            else 0,
             retrieve_parent_token,
             intermediate_state_indices,
             rand_seed,

@@ -24,6 +24,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -32,6 +33,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -51,8 +53,6 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_hip
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -74,7 +74,6 @@ def _get_cla_factor(config: PretrainedConfig) -> int:
 
 
 class HunYuanMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -103,8 +102,7 @@ class HunYuanMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -116,7 +114,6 @@ class HunYuanMLP(nn.Module):
 
 
 class HunYuanSparseMoeBlock(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -157,12 +154,14 @@ class HunYuanSparseMoeBlock(nn.Module):
 
         self.experts = FusedMoE(
             num_experts=config.num_experts,
+            top_k=top_k,
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
             reduce_results=False,
             layer_id=layer_id,
             quant_config=quant_config,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.gate = ReplicatedLinear(
             config.hidden_size, config.num_experts, bias=False, quant_config=None
@@ -244,7 +243,6 @@ def check_head_dim(config):
 
 
 class HunYuanAttention(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -385,7 +383,6 @@ class HunYuanAttention(nn.Module):
 
 
 class HunYuanDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -483,7 +480,6 @@ class HunYuanDecoderLayer(nn.Module):
 
 
 class HunYuanModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -579,6 +575,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
         super().__init__()
 
         self.config = config
+        self._kv_cache_parallel_layout = resolve_linear_parallel_group("tp")
 
         self.model = HunYuanModel(config, quant_config, prefix="model")
         self.unpadded_vocab_size = config.vocab_size
@@ -775,8 +772,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_parallel().tp_size
-        tp_rank = get_parallel().tp_rank
+        tp_rank, tp_size = self._kv_cache_parallel_layout
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,
@@ -787,17 +783,12 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
             if not isinstance(self.model.layers[layer_idx], nn.Identity):
                 layer_self_attn = self.model.layers[layer_idx].self_attn
 
-            if is_hip():
-                # The scaling factor convention we are assuming is
-                # quantized_value * scaling_factor ~= true_value
-                # which is consistent with the practice of setting
-                # scaling_factor = tensor_amax / FPtype_max
-                scaling_factor *= 2
-            if hasattr(layer_self_attn, "kv_scale"):
-                layer_self_attn.attn._kv_scale = scaling_factor
+            if hasattr(layer_self_attn.attn, "k_scale"):
+                layer_self_attn.attn.k_scale = scaling_factor
+                layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 

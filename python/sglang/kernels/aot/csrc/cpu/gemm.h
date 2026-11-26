@@ -73,6 +73,26 @@ enum class CPUActMethod : int {
   gelu_and_mul = 2,
 };
 
+// swiglu is selected by its (alpha, limit) parameters rather than by name and
+// takes precedence; the name is still validated, so it cannot pass silently.
+inline CPUActMethod act_method_from_string(const std::optional<std::string>& activation, bool has_swiglu_params) {
+  const bool unnamed_or_silu = !activation.has_value() || activation.value() == "silu";
+  if (has_swiglu_params) {
+    TORCH_CHECK(
+        unnamed_or_silu || activation.value() == "swiglu",
+        "Unsupported activation with clamped swiglu parameters: ",
+        activation.value());
+    return CPUActMethod::swiglu;
+  }
+  if (unnamed_or_silu) {
+    return CPUActMethod::silu_and_mul;
+  }
+  if (activation.value() == "gelu") {
+    return CPUActMethod::gelu_and_mul;
+  }
+  TORCH_CHECK(false, "Unsupported activation: ", activation.value(), ". Supported: silu, gelu");
+}
+
 enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3, MXFP4 = 4 };
 
 constexpr bool operator==(CPUQuantMethod a, int64_t b) {
@@ -112,8 +132,10 @@ inline int64_t get_4bit_block_k_size(int64_t group_size) {
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
 // pack weight to vnni format for int4
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales);
+// GPTQ: symmetric uses zero point 8; asymmetric decodes stored zero + 1.
+// AWQ: symmetric is unsupported; asymmetric uses checkpoint zero points.
+std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
+    at::Tensor qweight, at::Tensor qzeros, at::Tensor scales, int64_t quant_method_4bit, bool is_symmetric = false);
 
 // moe implementations for int8 w8a8
 template <typename scalar_t>
@@ -223,7 +245,8 @@ void fused_experts_int4_w4a8_kernel_impl(
     int64_t K,
     int64_t E,
     int64_t topk,
-    int64_t num_tokens_post_pad);
+    int64_t num_tokens_post_pad,
+    CPUActMethod activation);
 
 template <typename scalar_t>
 void shared_expert_fp8_kernel_impl(
@@ -304,6 +327,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
     float scale,
     int64_t M,
     int64_t N,
@@ -311,7 +335,8 @@ void tinygemm_kernel(
     int64_t lda,
     int64_t ldb,
     int64_t ldc,
-    bool brg);
+    bool brg,
+    bool do_unpack = true);
 
 // mxfp4
 template <typename scalar_t>

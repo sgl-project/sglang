@@ -2,7 +2,7 @@
 
 This test benchmarks the DeepSeek-R1-MXFP4 quantized model on MI35x with 8 GPUs.
 
-Registry: nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4 suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4 suite
 """
 
 import os
@@ -16,12 +16,14 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - DeepSeek-R1-MXFP4 benchmark on MI35x (~300 min)
 register_amd_ci(
-    est_time=18000, suite="nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4", nightly=True
+    est_time=18000,
+    suite="nightly-perf-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4",
+    nightly=True,
 )
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns.
+    """Generate a simplified markdown report without cost columns.
 
     Skips the first result if it's a warmup run (duplicate batch_size).
     """
@@ -51,7 +53,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
     return summary
 
 
-PROFILE_DIR = "performance_profiles_deepseek_r1_mxfp4_mi35x"
+RESULT_DIR = "performance_results_deepseek_r1_mxfp4_mi35x"
 
 
 class TestDeepseekR1MXFP4PerfMI35x(unittest.TestCase):
@@ -88,9 +90,9 @@ class TestDeepseekR1MXFP4PerfMI35x(unittest.TestCase):
             },
         ]
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
-        # Override full_report to remove traces help text
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
+        # Set the report header for this test
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_one_batch(self):
@@ -108,7 +110,6 @@ class TestDeepseekR1MXFP4PerfMI35x(unittest.TestCase):
                         other_args=variant_config["other_args"],
                         variant=variant_config["name"],
                         extra_bench_args=["--trust-remote-code"],
-                        enable_profile=False,  # Disable profiling for AMD tests
                     )
                     results = result_tuple[0]
                     success = result_tuple[1]
@@ -116,7 +117,7 @@ class TestDeepseekR1MXFP4PerfMI35x(unittest.TestCase):
                     if not success:
                         failed_variants.append(variant_config["name"])
 
-                    # Use simplified report format without traces
+                    # Use the simplified report format
                     if results:
                         self.runner.full_report += (
                             generate_simple_markdown_report(results) + "\n"

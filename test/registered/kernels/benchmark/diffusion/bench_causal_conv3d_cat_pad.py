@@ -3,11 +3,11 @@ from dataclasses import dataclass
 import torch
 
 from sglang.kernels.jit.benchmark import marker
-from sglang.kernels.ops.diffusion.causal_conv3d_cat_pad import (
-    fused_causal_conv3d_cat_pad_cuda,
-)
-from sglang.kernels.ops.diffusion.triton.causal_conv3d_pad import (
+from sglang.kernels.ops.diffusion import (
     fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
+)
+from sglang.kernels.ops.diffusion import (
+    fused_causal_conv3d_cat_pad_cuda,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -17,7 +17,7 @@ register_cuda_ci(
     runner_config="1-gpu-large",
     disabled="standalone benchmark",
 )
-register_amd_ci(est_time=20, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=20, stage="base-a-jit-kernel-benchmark", runner_config="amd")
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -68,7 +68,7 @@ def make_inputs(case: Case) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]
 
 
 @marker.parametrize("case_name", CASE_NAMES, ci_vals=CASE_NAMES[:2])
-@marker.benchmark("provider", ["triton", "cuda"])
+@marker.benchmark("provider", ["triton", "cuda"], gate=["cuda"])
 def benchmark(case_name: str, provider: str) -> marker.BenchResult:
     case = CASE_BY_NAME[case_name]
     x, cache_x, padding = make_inputs(case)

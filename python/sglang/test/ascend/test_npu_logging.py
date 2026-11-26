@@ -25,7 +25,7 @@ class TestNPULoggingBase(CustomTestCase):
     [Test Target] --log-requests; --log-requests-level; --log-requests-target; --uvicorn-access-log-exclude-prefixes;
     --enable-metrics; --enable-metrics-for-all-scheduler;
     --bucket-time-to-first-token; --bucket-inter-token-latency; --bucket-e2e-request-latency;
-    --collect-tokens-histogram; --prompt-tokens-buckets; --generation-tokens-buckets;
+    --prompt-tokens-buckets; --generation-tokens-buckets;
     --tokenizer-metrics-custom-labels-header; --tokenizer-metrics-allowed-custom-labels;
     --gc-warning-threshold-secs
     """
@@ -75,7 +75,8 @@ class TestNPULoggingBase(CustomTestCase):
             "0.8",
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--log-requests",
         ]
         cls.out_log_file_obj = tempfile.NamedTemporaryFile(

@@ -17,8 +17,8 @@ from typing import List, Optional
 import requests
 from tabulate import tabulate
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=122, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=114, stage="nightly", runner_config="1-gpu-large")
 
 NUM_TURNS = 150
 INPUT_LEN = 16

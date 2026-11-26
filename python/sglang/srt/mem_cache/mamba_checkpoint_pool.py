@@ -36,7 +36,7 @@ The scale axis (reduces over d_v) matches the per-k-channel decay diag(alpha), s
 the large state entries keep ~bf16 precision and the error concentrates on small
 entries that barely affect the readout. Storing cached states int8 gives ~2x the
 cached-prefix capacity at fixed memory, and composes with host-offload
-(HiMambaRadixCache) which it also halves.
+(--enable-hierarchical-cache) which it also halves.
 
 This is strategy-agnostic: whether the active slot to be cached was produced by
 the ``no_buffer`` donate (copy_from) or the ``extra_buffer`` ping-pong track
@@ -53,6 +53,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
 
@@ -313,7 +314,6 @@ def maybe_init_int8_mamba_checkpoint_pool(
     allocating, so an oversized ``--int8-mamba-ckpt-size`` fails with an actionable
     message instead of a cryptic mid-allocation CUDA OOM.
     """
-    from sglang.srt.runtime_context import get_exec
 
     try:
         mamba = get_exec().mamba

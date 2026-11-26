@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 SGL_DEVICE int64_t clamp_accept_len(int64_t delta, int64_t max_accept) {
   if (delta < 0) return 0;
@@ -245,7 +245,7 @@ struct OnlineC128MTPWritePrefixKernel {
     using namespace host;
 
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({-1, kHeadDim * 2}).with_dtype<float>().with_device(device).verify(kv_score_input);
     TensorMatcher({-1}).with_dtype<TSeq>().with_device(device).verify(seq_lens);
@@ -311,7 +311,7 @@ struct OnlineC128MTPMarkPendingKernel {
     using namespace host;
 
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({-1}).with_dtype<TSeq>().with_device(device).verify(seq_lens);
     TensorMatcher({-1}).with_dtype<TReq>().with_device(device).verify(req_pool_indices);
@@ -373,7 +373,7 @@ struct OnlineC128MTPCommitPendingKernel {
     using namespace host;
 
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({-1}).with_dtype<TSeq>().with_device(device).verify(cur_seq_lens);
     TensorMatcher({-1}).with_dtype<TReq>().with_device(device).verify(cur_req_pool_indices);
@@ -402,4 +402,4 @@ struct OnlineC128MTPCommitPendingKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

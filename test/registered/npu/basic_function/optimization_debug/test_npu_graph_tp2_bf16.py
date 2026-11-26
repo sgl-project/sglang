@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="full-2-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-test-2-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
     "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct": {
@@ -24,7 +24,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendGraphTp2Bf16(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
@@ -61,7 +60,7 @@ class TestAscendGraphTp2Bf16(CustomTestCase):
                         num_questions=1319,
                         max_new_tokens=512,
                         parallel=128,
-                        host=f"http://{self.url.hostname}",
+                        host=self.url.hostname,
                         port=int(self.url.port),
                     )
 

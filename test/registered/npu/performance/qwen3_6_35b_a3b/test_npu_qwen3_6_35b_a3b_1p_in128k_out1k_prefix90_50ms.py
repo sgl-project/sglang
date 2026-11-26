@@ -9,9 +9,8 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
-    suite="",
+    suite="nightly-perf-test-2-npu-a3",
     nightly=True,
-    disabled="performance testcase",
 )
 
 QWEN3_6_35B_A3B_128K_PREFIX_ENVS = {
@@ -23,7 +22,6 @@ QWEN3_6_35B_A3B_128K_PREFIX_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "ASCEND_USE_FIA": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "30",
 }
 
 QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
@@ -41,7 +39,7 @@ QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
     65536,
     "--trust-remote-code",
     "--enable-prefill-delayer",
-    "--mamba-scheduler-strategy",
+    "--mamba-radix-cache-strategy",
     "extra_buffer",
     "--max-running-requests",
     103,
@@ -49,7 +47,7 @@ QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
     85,
     "--mem-fraction-static",
     0.85,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     2,
     4,
     8,
@@ -79,6 +77,8 @@ QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
     "qwen3",
     "--tool-call-parser",
     "qwen3_coder",
+    "--prefill-delayer-max-delay-passes",
+    "30",
 ]
 
 

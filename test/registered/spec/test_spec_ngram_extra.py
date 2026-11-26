@@ -2,19 +2,33 @@ import unittest
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
+from sglang.test.test_utils import (
+    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
+    admin_post,
+)
 
 # Extra: Triton + Flashinfer NGRAM backends + non-overlap (sync V2) variant.
 # Sibling per-commit file (test_spec_ngram.py) keeps the Paged variant.
-register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=216, stage="extra-a", runner_config="1-gpu-small")
+# AMD: flashinfer is not built in the ROCm sgl_kernel, so only the
+# triton-backend class runs on ROCm.
+register_amd_ci(est_time=130, suite="extra-a-test-1-gpu-large-amd")
+
+_AMD_SKIP_BACKEND = (
+    "flashinfer attention backend is CUDA-only (not in the ROCm sgl_kernel build)"
+)
 
 
 class TestNgramSpeculativeDecodingTriton(NgramServerBase, GSM8KMixin):
     attention_backend = "triton"
 
 
+@unittest.skipIf(is_hip(), _AMD_SKIP_BACKEND)
 class TestNgramSpeculativeDecodingNoOverlap(NgramServerBase, GSM8KMixin):
     """Non-overlap path: the scheduler drives the V2 worker synchronously
     (seq_lens advance via GenerationBatchResult.new_seq_lens, accepted tokens
@@ -24,9 +38,15 @@ class TestNgramSpeculativeDecodingNoOverlap(NgramServerBase, GSM8KMixin):
     extra_args = ["--disable-overlap-schedule"]
 
 
+@unittest.skipIf(is_hip(), _AMD_SKIP_BACKEND)
 class TestNgramSpeculativeDecodingFlashinfer(NgramServerBase, GSM8KMixin):
     attention_backend = "flashinfer"
-    extra_args = ["--speculative-ngram-external-sam-budget", "8"]
+    flush_cache_headers = ADMIN_HEADERS_FOR_TEST
+    extra_args = [
+        "--speculative-ngram-external-sam-budget",
+        "8",
+        *ADMIN_LAUNCH_ARGS_FOR_TEST,
+    ]
 
     def test_output_as_corpus_boosts_accept_length(self):
         """Baseline → HTTP add corpus → verify accept length boost."""
@@ -70,10 +90,10 @@ class TestNgramSpeculativeDecodingFlashinfer(NgramServerBase, GSM8KMixin):
         print(f"\n  Baseline accept length (no SAM): {baseline_accept_len:.2f}")
 
         # Flush cache so phase 2 starts clean
-        requests.post(self.base_url + "/flush_cache", timeout=30)
+        admin_post(self.base_url + "/flush_cache", timeout=30)
 
         # Phase 2: add generated outputs as corpus via HTTP API
-        resp = requests.post(
+        resp = admin_post(
             self.base_url + "/add_external_corpus",
             json={"corpus_id": "bench", "documents": generated_outputs},
             timeout=120,

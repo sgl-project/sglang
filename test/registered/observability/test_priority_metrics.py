@@ -22,11 +22,11 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=60,
-    stage="base-b",
+    stage="extra-a",
     runner_config="1-gpu-small",
 )
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=179, suite="base-c-test-cpu")
+register_cpu_ci(est_time=49, suite="extra-test-cpu-intel")
+register_amd_ci(est_time=95, stage="extra-a", runner_config="1-gpu-small-amd")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 

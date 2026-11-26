@@ -4,12 +4,26 @@
 
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
+    HUNYUAN_QKNORM,
+    BitExactFusionGate,
+    can_use_linear_gelu,
+    fused_linear_gelu_tanh,
+    hunyuan_qkv_rope_pack,
+    tensors_equal,
+    try_hunyuan_qknorm,
+)
 from sglang.multimodal_gen.configs.models.dits import HunyuanVideoConfig
-from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_double_block,
+    is_refiner_block,
+    is_single_block,
+    is_txt_in,
+)
 from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
@@ -18,7 +32,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
     LocalAttention,
-    UlyssesAttention,
+    USPAttention,
 )
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -50,38 +64,134 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.models.dits.common import modulate
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
-    current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+_HUNYUAN_QKV_PACK = BitExactFusionGate("HunyuanVideo QKV RoPE pack", per_signature=True)
+_HUNYUAN_QKV_PACK_SIGS = _HUNYUAN_QKV_PACK.verified_sigs
+assert _HUNYUAN_QKV_PACK_SIGS is not None
 
 
-class MixedRowParallelLinear(RowParallelLinear):
-    def __init__(self, input_sizes: list[int], output_size: int, **kwargs):
-        self.input_sizes = input_sizes
-        super().__init__(sum(input_sizes), output_size, **kwargs)
+def _hunyuan_qknorm(
+    site: nn.Module,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fused = try_hunyuan_qknorm(
+        site,
+        q,
+        k,
+        q_norm.weight,
+        k_norm.weight,
+        q_norm.variance_epsilon,
+    )
+    if fused is not None:
+        return fused
+    return q_norm(q.contiguous()).to(q), k_norm(k.contiguous()).to(k)
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        input_dim = getattr(param, "input_dim", None)
-        if input_dim is not None:
-            shards = []
-            offset = 0
-            for input_size in self.input_sizes:
-                loaded_shard = loaded_weight.narrow(input_dim, offset, input_size)
-                shard_size = input_size // self.tp_size
-                loaded_shard = loaded_shard.narrow(
-                    input_dim, self.tp_rank * shard_size, shard_size
-                )
-                shards.append(loaded_shard)
-                offset += input_size
-            loaded_weight = torch.cat(shards, dim=input_dim)
-        if len(loaded_weight.shape) == 0:
-            loaded_weight = loaded_weight.reshape(1)
-        param.data.copy_(loaded_weight)
 
-    def weight_loader_v2(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        self.weight_loader(param, loaded_weight)
+class HunyuanMLP(MLP):
+    """Hunyuan MLP with a quality-gated cublasLt GELU epilogue."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        FUSED_LINEAR_GELU.mark(self, "fc_in")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(self.fc_in, x):
+            x = fused_linear_gelu_tanh(x, self.fc_in.weight, self.fc_in.bias)
+        else:
+            x, _ = self.fc_in(x)
+            x = self.act(x)
+        x, _ = self.fc_out(x)
+        return x
+
+
+def _hunyuan_pack_qkv(
+    img_q: torch.Tensor,
+    img_k: torch.Tensor,
+    img_v: torch.Tensor,
+    txt_q: torch.Tensor,
+    txt_k: torch.Tensor,
+    txt_v: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply image RoPE and pack image/text QKV in one bit-exact kernel."""
+    if torch.compiler.is_compiling():
+        return _hunyuan_pack_qkv_reference(
+            img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin
+        )
+    sig = (
+        img_q.dtype,
+        img_q.device,
+        img_q.shape[0],
+        img_q.shape[2],
+        img_q.shape[3],
+        tuple(img_q.stride()[2:]),
+        tuple(txt_q.stride()[2:]),
+        cos.dtype,
+        sin.dtype,
+    )
+    verified = sig in _HUNYUAN_QKV_PACK_SIGS
+    can_attempt = (
+        not _HUNYUAN_QKV_PACK.disabled
+        and img_q.is_cuda
+        and img_q.dtype == torch.bfloat16
+        and img_q.shape[-1] <= 128
+        and img_q.shape[-1] % 2 == 0
+        and all(x.stride(-1) == 1 for x in (img_q, img_k, img_v, txt_q, txt_k, txt_v))
+        and (verified or not torch.cuda.is_current_stream_capturing())
+    )
+    if not can_attempt:
+        return _hunyuan_pack_qkv_reference(
+            img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin
+        )
+    try:
+        out = hunyuan_qkv_rope_pack(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin)
+    except Exception as exc:
+        _HUNYUAN_QKV_PACK.on_exception(exc, logger=logger)
+        return _hunyuan_pack_qkv_reference(
+            img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin
+        )
+    if verified:
+        return out
+    return _HUNYUAN_QKV_PACK.accept_or_fallback(
+        out,
+        _hunyuan_pack_qkv_reference(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin),
+        sig=sig,
+        equal=tensors_equal,
+        logger=logger,
+    )
+
+
+def _hunyuan_pack_qkv_reference(
+    img_q: torch.Tensor,
+    img_k: torch.Tensor,
+    img_v: torch.Tensor,
+    txt_q: torch.Tensor,
+    txt_k: torch.Tensor,
+    txt_v: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.cat(
+            (_apply_rotary_emb(img_q, cos, sin, is_neox_style=False), txt_q),
+            dim=1,
+        ),
+        torch.cat(
+            (_apply_rotary_emb(img_k, cos, sin, is_neox_style=False), txt_k),
+            dim=1,
+        ),
+        torch.cat((img_v, txt_v), dim=1),
+    )
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -102,7 +212,6 @@ class MMDoubleStreamBlock(nn.Module):
     ):
         super().__init__()
 
-        self.deterministic = False
         self.num_attention_heads = num_attention_heads
         tp_size = get_tp_world_size()
         self.local_num_attention_heads = divide(num_attention_heads, tp_size)
@@ -151,7 +260,7 @@ class MMDoubleStreamBlock(nn.Module):
             quant_config=quant_config,
         )
 
-        self.img_mlp = MLP(
+        self.img_mlp = HunyuanMLP(
             hidden_size,
             mlp_hidden_dim,
             bias=True,
@@ -203,7 +312,7 @@ class MMDoubleStreamBlock(nn.Module):
             quant_config=quant_config,
         )
 
-        self.txt_mlp = MLP(
+        self.txt_mlp = HunyuanMLP(
             hidden_size,
             mlp_hidden_dim,
             bias=True,
@@ -212,14 +321,14 @@ class MMDoubleStreamBlock(nn.Module):
             quant_config=quant_config,
         )
 
-        # Use UlyssesAttention to replace Distributed attention
-        self.attn = UlyssesAttention(
+        self.attn = USPAttention(
             num_heads=self.local_num_attention_heads,
             head_size=head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn",
         )
+        HUNYUAN_QKNORM.mark(self)
 
     def forward(
         self,
@@ -264,15 +373,10 @@ class MMDoubleStreamBlock(nn.Module):
         img_q, img_k, img_v = img_qkv[:, :, 0], img_qkv[:, :, 1], img_qkv[:, :, 2]
 
         # Apply QK-Norm if needed
-
-        img_q = self.img_attn_q_norm(img_q.contiguous()).to(img_v)
-        img_k = self.img_attn_k_norm(img_k.contiguous()).to(img_v)
-        # Apply rotary embeddings
-        cos, sin = freqs_cis
-        img_q, img_k = (
-            _apply_rotary_emb(img_q, cos, sin, is_neox_style=False),
-            _apply_rotary_emb(img_k, cos, sin, is_neox_style=False),
+        img_q, img_k = _hunyuan_qknorm(
+            self, img_q, img_k, self.img_attn_q_norm, self.img_attn_k_norm
         )
+
         # Prepare text for attention using fused operation
         txt_attn_input = self.txt_attn_norm(txt, txt_attn_shift, txt_attn_scale)
 
@@ -287,20 +391,29 @@ class MMDoubleStreamBlock(nn.Module):
         txt_q, txt_k, txt_v = txt_qkv[:, :, 0], txt_qkv[:, :, 1], txt_qkv[:, :, 2]
 
         # Apply QK-Norm if needed
-        txt_q = self.txt_attn_q_norm(txt_q.contiguous()).to(txt_q.dtype)
-        txt_k = self.txt_attn_k_norm(txt_k.contiguous()).to(txt_k.dtype)
+        txt_q, txt_k = _hunyuan_qknorm(
+            self, txt_q, txt_k, self.txt_attn_q_norm, self.txt_attn_k_norm
+        )
+
+        cos, sin = freqs_cis
+        q, k, v = _hunyuan_pack_qkv(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin)
 
         # Run distributed attention
         if txt_is_sharded:
-            attn, _ = self.attn(
-                torch.cat((img_q, txt_q), dim=1),
-                torch.cat((img_k, txt_k), dim=1),
-                torch.cat((img_v, txt_v), dim=1),
+            attn = self.attn(
+                q,
+                k,
+                v,
                 seq_lens=seq_lens,
             )
-            img_attn, txt_attn = attn.split([image_seq_len, text_seq_len], dim=1)
         else:
-            img_attn, txt_attn = self.attn(img_q, img_k, img_v, txt_q, txt_k, txt_v)
+            attn = self.attn(
+                q,
+                k,
+                v,
+                num_replicated_suffix=text_seq_len,
+            )
+        img_attn, txt_attn = attn.split([image_seq_len, text_seq_len], dim=1)
         img_attn_out, _ = self.img_attn_proj(
             img_attn.reshape(batch_size, image_seq_len, -1)
         )
@@ -348,7 +461,6 @@ class MMSingleStreamBlock(nn.Module):
     ):
         super().__init__()
 
-        self.deterministic = False
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         tp_size = get_tp_world_size()
@@ -371,9 +483,10 @@ class MMSingleStreamBlock(nn.Module):
         )
 
         # Combined projection and MLP output
-        self.linear2 = MixedRowParallelLinear(
-            [hidden_size, mlp_hidden_dim],
+        self.linear2 = RowParallelLinear(
+            hidden_size + mlp_hidden_dim,
             hidden_size,
+            input_sizes=[hidden_size, mlp_hidden_dim],
             bias=True,
             input_is_parallel=True,
             params_dtype=dtype,
@@ -406,14 +519,14 @@ class MMSingleStreamBlock(nn.Module):
             prefix=f"{prefix}.modulation",
         )
 
-        # Use UlyssesAttention to replace Distributed attention
-        self.attn = UlyssesAttention(
+        self.attn = USPAttention(
             num_heads=self.local_num_attention_heads,
             head_size=head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn",
         )
+        HUNYUAN_QKNORM.mark(self)
 
     def forward(
         self,
@@ -447,33 +560,30 @@ class MMSingleStreamBlock(nn.Module):
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
 
         # Apply QK-Norm
-        q = self.q_norm(q.contiguous()).to(v.dtype)
-        k = self.k_norm(k.contiguous()).to(v.dtype)
+        q, k = _hunyuan_qknorm(self, q, k, self.q_norm, self.k_norm)
 
         # Split into image and text parts
         img_q, txt_q = q[:, :-txt_len], q[:, -txt_len:]
         img_k, txt_k = k[:, :-txt_len], k[:, -txt_len:]
         img_v, txt_v = v[:, :-txt_len], v[:, -txt_len:]
-        # Apply rotary embeddings to image parts
         cos, sin = freqs_cis
-        img_q, img_k = (
-            _apply_rotary_emb(img_q, cos, sin, is_neox_style=False),
-            _apply_rotary_emb(img_k, cos, sin, is_neox_style=False),
-        )
+        q, k, v = _hunyuan_pack_qkv(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin)
 
         # Run distributed attention
         if txt_is_sharded:
-            attn_output, _ = self.attn(
-                torch.cat((img_q, txt_q), dim=1),
-                torch.cat((img_k, txt_k), dim=1),
-                torch.cat((img_v, txt_v), dim=1),
+            attn_output = self.attn(
+                q,
+                k,
+                v,
                 seq_lens=seq_lens,
             )
         else:
-            img_attn_output, txt_attn_output = self.attn(
-                img_q, img_k, img_v, txt_q, txt_k, txt_v
+            attn_output = self.attn(
+                q,
+                k,
+                v,
+                num_replicated_suffix=txt_len,
             )
-            attn_output = torch.cat((img_attn_output, txt_attn_output), dim=1)
         attn_output = attn_output.view(batch_size, seq_len, -1)
         # Process MLP activation
         mlp_output = self.mlp_act(mlp)
@@ -503,9 +613,8 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     # PY: we make the input args the same as HF config
 
     # shard single stream, double stream blocks, and refiner_blocks
-    _fsdp_shard_conditions = HunyuanVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = HunyuanVideoConfig()._compile_conditions
-    _supported_attention_backends = HunyuanVideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_double_block, is_single_block, is_refiner_block]
+    _compile_conditions = [is_double_block, is_single_block, is_txt_in]
     param_names_mapping = HunyuanVideoConfig().param_names_mapping
     reverse_param_names_mapping = HunyuanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = HunyuanVideoConfig().lora_param_names_mapping
@@ -524,7 +633,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         self.out_channels = (
             config.in_channels if config.out_channels is None else config.out_channels
         )
-        self.unpatchify_channels = self.out_channels
         self.guidance_embeds = config.guidance_embeds
         self.rope_dim_list = list(config.rope_axes_dim)
         self.rope_theta = config.rope_theta
@@ -661,7 +769,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         """
         forward_context = get_forward_context()
         forward_batch = forward_context.forward_batch
-        enable_teacache = forward_batch is not None and forward_batch.enable_teacache
         enable_spectrum = forward_batch is not None and forward_batch.enable_spectrum
 
         if guidance is None:
@@ -692,16 +799,23 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             ow // self.patch_size[2],
         )
 
-        # Get rotary embeddings
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (tt * get_sp_world_size(), th, tw),
-            self.hidden_size,
-            self.num_attention_heads,
-            self.rope_dim_list,
-            self.rope_theta,
+        # Get rotary embeddings, built on the host and uploaded once per request
+        rope_cache = (
+            {}
+            if forward_batch is None
+            else forward_batch.extra.setdefault("_hunyuanvideo_rope", {})
         )
-        freqs_cos = freqs_cos.to(x.device)
-        freqs_sin = freqs_sin.to(x.device)
+        rope_key = (tt, th, tw, x.device)
+        if rope_key not in rope_cache:
+            freqs_cos, freqs_sin = get_rotary_pos_embed(
+                (tt * get_sp_world_size(), th, tw),
+                self.hidden_size,
+                self.num_attention_heads,
+                self.rope_dim_list,
+                self.rope_theta,
+            )
+            rope_cache[rope_key] = (freqs_cos.to(x.device), freqs_sin.to(x.device))
+        freqs_cos, freqs_sin = rope_cache[rope_key]
         # Prepare modulation vectors
         vec = self.time_in(t)
 
@@ -751,9 +865,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         elif self.should_skip_forward_for_cached_states(img=img, vec=vec):
             img = self.retrieve_cached_states(img)
         else:
-            if enable_teacache:
-                original_img = img.clone()
-
             # Process through double stream blocks
             for index, block in enumerate(self.double_blocks):
                 double_block_args = [
@@ -784,8 +895,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             # Extract image features
             img = x[:, :img_seq_len, ...]
 
-            if enable_teacache:
-                self.maybe_cache_states(img, original_img)
             if enable_spectrum:
                 self.spectrum_record_features(img)
 
@@ -796,111 +905,11 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         return img
 
-    def maybe_cache_states(
-        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
-    ) -> None:
-        self.previous_residual = hidden_states - original_hidden_states
-
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
-        forward_context = get_forward_context()
-        forward_batch = forward_context.forward_batch
-        if forward_batch is None:
-            return False
-        current_timestep = forward_context.current_timestep
-        enable_teacache = forward_batch.enable_teacache
-
-        if not enable_teacache:
+        forward_batch = get_forward_context().forward_batch
+        if forward_batch is None or not forward_batch.enable_teacache:
             return False
         raise NotImplementedError("teacache is not supported yet for HunyuanVideo")
-
-        teacache_params = forward_batch.teacache_params
-        assert teacache_params is not None, "teacache_params is not initialized"
-        assert isinstance(
-            teacache_params, TeaCacheParams
-        ), "teacache_params is not a TeaCacheParams"
-        num_inference_steps = forward_batch.num_inference_steps
-        teache_thresh = teacache_params.teacache_thresh
-
-        coefficients = teacache_params.coefficients
-
-        if current_timestep == 0:
-            self.cnt = 0
-
-        inp = kwargs["img"].clone()
-        vec_ = kwargs["vec"].clone()
-        # convert to DTensor
-        vec_ = torch.distributed.tensor.DTensor.from_local(
-            vec_,
-            torch.distributed.DeviceMesh(
-                current_platform.device_type,
-                list(range(get_sp_world_size())),
-                mesh_dim_names=("dp",),
-            ),
-            [torch.distributed.tensor.Replicate()],
-        )
-
-        inp = torch.distributed.tensor.DTensor.from_local(
-            inp,
-            torch.distributed.DeviceMesh(
-                current_platform.device_type,
-                list(range(get_sp_world_size())),
-                mesh_dim_names=("dp",),
-            ),
-            [torch.distributed.tensor.Replicate()],
-        )
-
-        # txt_ = kwargs["txt"].clone()
-
-        # inp = img.clone()
-        # vec_ = vec.clone()
-        # txt_ = txt.clone()
-        (
-            img_mod1_shift,
-            img_mod1_scale,
-            img_mod1_gate,
-            img_mod2_shift,
-            img_mod2_scale,
-            img_mod2_gate,
-        ) = (
-            self.double_blocks[0].img_mod(vec_).chunk(6, dim=-1)
-        )
-        normed_inp = self.double_blocks[0].img_attn_norm.norm(inp)
-        modulated_inp = modulate(normed_inp, shift=img_mod1_shift, scale=img_mod1_scale)
-        if self.cnt == 0 or self.cnt == num_inference_steps - 1:
-            should_calc = True
-            self.accumulated_rel_l1_distance = 0
-        else:
-            coefficients = [
-                7.33226126e02,
-                -4.01131952e02,
-                6.75869174e01,
-                -3.14987800e00,
-                9.61237896e-02,
-            ]
-            rescale_func = np.poly1d(coefficients)
-            assert (
-                self.previous_modulated_input is not None
-            ), "previous_modulated_input is not initialized"
-            self.accumulated_rel_l1_distance += rescale_func(
-                (
-                    (modulated_inp - self.previous_modulated_input).abs().mean()
-                    / self.previous_modulated_input.abs().mean()
-                )
-                .cpu()
-                .item()
-            )
-            if self.accumulated_rel_l1_distance < teache_thresh:
-                should_calc = False
-            else:
-                should_calc = True
-                self.accumulated_rel_l1_distance = 0
-        self.previous_modulated_input = modulated_inp
-        self.cnt += 1
-
-        return not should_calc
-
-    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return hidden_states + self.previous_residual
 
 
 class SingleTokenRefiner(nn.Module):

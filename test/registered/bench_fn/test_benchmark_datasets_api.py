@@ -1,17 +1,24 @@
+import argparse
 import asyncio
 import base64
+import functools
 import io
+import itertools
 import json
 import pickle
 import random
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 from PIL import Image
@@ -47,13 +54,57 @@ from sglang.benchmark.serving import (
     _BACKEND_API_PATHS,
     _EMBEDDING_BACKENDS,
     ASYNC_REQUEST_FUNCS,
+    _finite_positive_float,
+    _validate_parsed_gsp_args,
     async_request_openai_embeddings,
     flush_server_cache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=40, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+register_cpu_ci(est_time=42, suite="base-a-test-cpu")
+register_cpu_ci(est_time=46, suite="extra-test-cpu-intel")
+
+
+_BENCH_SERVING_CLI_CASES = {
+    "flush_cache_timeout": ["--flush-cache-timeout", "inf"],
+    "zipf_without_alpha": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-group-distribution",
+        "zipf",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "uniform_with_alpha": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-group-distribution",
+        "uniform",
+        "--gsp-zipf-alpha",
+        "1.0",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _bench_serving_cli_results():
+    def run(args):
+        return subprocess.run(
+            [sys.executable, "-m", "sglang.benchmark.serving", *args],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(_BENCH_SERVING_CLI_CASES)) as pool:
+        futures = {
+            name: pool.submit(run, args)
+            for name, args in _BENCH_SERVING_CLI_CASES.items()
+        }
+    return {name: future.result() for name, future in futures.items()}
 
 
 class _DummyTokenTensor:
@@ -95,7 +146,7 @@ def create_lightweight_tokenizer() -> PreTrainedTokenizerFast:
     return hf_tokenizer
 
 
-class TestEmbeddingBenchmarkBackends(unittest.TestCase):
+class TestEmbeddingBenchmarkBackends(CustomTestCase):
     def test_vllm_embedding_reuses_the_openai_embedding_request_path(self):
         self.assertIn("vllm-embedding", _EMBEDDING_BACKENDS)
         self.assertIs(
@@ -103,7 +154,10 @@ class TestEmbeddingBenchmarkBackends(unittest.TestCase):
         )
         self.assertEqual(_BACKEND_API_PATHS["vllm-embedding"], "/v1/embeddings")
 
-    def test_embedding_cache_flush_uses_the_engine_specific_endpoint(self):
+
+class TestBenchmarkCacheFlush(CustomTestCase):
+    def test_cache_flush_uses_the_backend_specific_request(self):
+        """SGLang forwards its timeout without changing other backend requests."""
         with (
             patch("sglang.benchmark.serving.get_auth_headers", return_value={}),
             patch("sglang.benchmark.serving.requests.post") as post,
@@ -114,16 +168,76 @@ class TestEmbeddingBenchmarkBackends(unittest.TestCase):
             post.assert_called_once_with(
                 "http://127.0.0.1:8000/reset_prefix_cache",
                 headers={},
-                params={},
             )
             post.reset_mock()
 
-            flush_server_cache("http://127.0.0.1:30000", "sglang-embedding")
+            flush_server_cache("http://127.0.0.1:30000", "sglang")
             post.assert_called_once_with(
                 "http://127.0.0.1:30000/flush_cache",
                 headers={},
-                params={"timeout": 10.0},
+                params={"timeout": 60.0},
             )
+            post.reset_mock()
+
+            flush_server_cache("http://127.0.0.1:23333", "lmdeploy")
+            post.assert_called_once_with(
+                "http://127.0.0.1:23333/flush_cache", headers={}
+            )
+            post.reset_mock()
+
+            flush_server_cache(
+                "http://127.0.0.1:30000",
+                "sglang-embedding",
+                flush_cache_timeout=7.5,
+            )
+            post.assert_called_once_with(
+                "http://127.0.0.1:30000/flush_cache",
+                headers={},
+                params={"timeout": 7.5},
+            )
+
+    def test_sglang_cache_flush_waits_for_idle(self):
+        """A busy server can become idle before the benchmark's flush times out."""
+        request_received = threading.Event()
+        server_idle = threading.Event()
+
+        class DeferredFlushHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                url = urlparse(self.path)
+                timeout = float(parse_qs(url.query).get("timeout", ["0"])[0])
+                if timeout <= 0:
+                    status = 400
+                    request_received.set()
+                else:
+                    request_received.set()
+                    status = 200 if server_idle.wait(timeout) else 400
+                self.send_response(status)
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), DeferredFlushHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        base_url = f"http://127.0.0.1:{server.server_port}"
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                flush = executor.submit(
+                    flush_server_cache,
+                    base_url,
+                    "sglang",
+                    5.0,
+                )
+                self.assertTrue(request_received.wait(timeout=5))
+                self.assertFalse(flush.done())
+                server_idle.set()
+                flush.result(timeout=5)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
 
 
 class DummyProcessor:
@@ -218,7 +332,7 @@ def make_args(**overrides):
     return SimpleNamespace(**args)
 
 
-class TestBenchmarkDatasetsAPI(unittest.TestCase):
+class TestBenchmarkDatasetsAPI(CustomTestCase):
     def setUp(self):
         self.tokenizer = create_lightweight_tokenizer()
         self.processor = DummyProcessor(self.tokenizer)
@@ -446,6 +560,16 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertIn("temperature", rows[0].extra_request_body)
         self.assertIn("tools", rows[1].extra_request_body)
+
+        for row in rows:
+            rendered = self.tokenizer.apply_chat_template(
+                row.prompt, tokenize=False, add_generation_prompt=True
+            )
+            expected_prompt_len = len(self.tokenizer.encode(rendered))
+            tools = row.extra_request_body.get("tools")
+            if tools:
+                expected_prompt_len += len(self.tokenizer.encode(json.dumps(tools)))
+            self.assertEqual(row.prompt_len, expected_prompt_len)
 
     def test_generated_shared_prefix_sampler(self):
         args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)
@@ -685,6 +809,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
 
     def test_speed_bench_sampler(self):
+        """Each row's prompt_len is the token count of its chat-templated prompt."""
         dataset_path = self._write_speed_bench_jsonl()
         args = make_args(
             dataset_name="speed-bench",
@@ -698,7 +823,24 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.output_len == 512 for row in rows))
-        self.assertTrue(all(row.prompt_len > 0 for row in rows))
+
+        with open(dataset_path) as f:
+            source_prompts = [json.loads(line)["turns"][0] for line in f]
+        templated_lens = {
+            len(
+                self.tokenizer.encode(
+                    self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": text}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    ),
+                    add_special_tokens=False,
+                )
+            )
+            for text in source_prompts
+        }
+        for row in rows:
+            self.assertIn(row.prompt_len, templated_lens)
 
     def test_speed_bench_category_filter(self):
         dataset_path = self._write_speed_bench_jsonl()
@@ -912,6 +1054,66 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(len(agentic_rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in agentic_rows))
 
+    def test_gsp_token_ids_have_exact_lengths_and_statistics(self):
+        args = make_args(
+            tokenize_prompt=True,
+            gsp_system_prompt_len=8,
+            gsp_question_len=4,
+            gsp_range_ratio=1.0,
+            gsp_fast_prepare=True,
+            gsp_send_routing_key=True,
+        )
+        dataset = GeneratedSharedPrefixDataset.from_args(args)
+        with (
+            patch.object(self.tokenizer, "encode", side_effect=AssertionError),
+            patch.object(self.tokenizer, "decode", side_effect=AssertionError),
+            patch("builtins.print") as print_mock,
+        ):
+            rows = dataset.load(self.tokenizer)
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(len(row.prompt), 12)
+            self.assertEqual(row.prompt_len, 12)
+            self.assertTrue(all(isinstance(token, int) for token in row.prompt))
+        printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
+        self.assertIn(f"Total input tokens: {12 * len(rows)}", printed)
+        self.assertIn("Average system prompt length: 8.0 tokens", printed)
+        self.assertIn("Average question length: 4.0 tokens", printed)
+
+    def test_gsp_token_ids_reject_multiple_turns(self):
+        parser = argparse.ArgumentParser()
+        with (
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            self.assertRaises(SystemExit) as error,
+        ):
+            _validate_parsed_gsp_args(
+                parser,
+                make_args(
+                    dataset_name="generated-shared-prefix",
+                    tokenize_prompt=True,
+                    gsp_num_turns=2,
+                ),
+            )
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("--gsp-num-turns=1", stderr.getvalue())
+        with self.assertRaisesRegex(ValueError, "--gsp-num-turns=1"):
+            GeneratedSharedPrefixDataset.from_args(
+                make_args(tokenize_prompt=True, gsp_num_turns=2)
+            )
+        with self.assertRaisesRegex(ValueError, "num_turns=1"):
+            sample_generated_shared_prefix_requests(
+                num_groups=2,
+                prompts_per_group=2,
+                system_prompt_len=8,
+                question_len=4,
+                output_len=2,
+                range_ratio=1.0,
+                tokenizer=self.tokenizer,
+                seed=42,
+                input_ids=True,
+                num_turns=2,
+            )
+
     def test_get_dataset_unknown_dataset(self):
         args = make_args(dataset_name="not-a-dataset")
         with self.assertRaises(ValueError):
@@ -978,24 +1180,23 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(len(rows_a), 3 * 4)
         self.assertEqual(self._row_fields(rows_a), self._row_fields(rows_b))
 
-    def test_gsp_uniform_cache_path_format_unchanged(self):
-        # The uniform-mode cache filename keeps its existing
-        # gen_shared_prefix_<seed>_<N>_<P>_<sysL>_<qL>_<outL>_<TokenizerCls>.pkl
-        # shape. The trailing class name is a transformers/tokenizers internal
-        # detail (TokenizersBackend / PreTrainedTokenizerFast depending on
-        # version), so we only pin the deterministic numeric portion.
-        path = get_gen_prefix_cache_path(
-            seed=7,
-            num_groups=3,
-            prompts_per_group=4,
-            system_prompt_len=16,
-            question_len=8,
-            output_len=4,
-            tokenizer=self.tokenizer,
+    def test_gsp_default_ignores_legacy_fast_cache(self):
+        common = dict(num_groups=3, prompts_per_group=4, seed=7)
+        fast_rows = self._run_gsp(ordered=False, fast_prepare=True, **common)
+        legacy_path = (
+            self.tmpdir_path
+            / ".cache"
+            / "sglang"
+            / "benchmark"
+            / f"gen_shared_prefix_7_3_4_4_3_2_{type(self.tokenizer).__name__}.pkl"
         )
-        self.assertTrue(path.name.startswith("gen_shared_prefix_7_3_4_16_8_4_"))
-        self.assertTrue(path.name.endswith(".pkl"))
-        self.assertEqual(path.parent, Path.home() / ".cache" / "sglang" / "benchmark")
+        with legacy_path.open("wb") as handle:
+            pickle.dump(fast_rows, handle)
+
+        rows = self._run_gsp(ordered=False, fast_prepare=False, **common)
+        self.assertEqual(len(rows), len(fast_rows))
+        for row in rows:
+            self.assertEqual(row.prompt_len, len(self.tokenizer.encode(row.prompt)))
 
     def test_zipf_group_probs_helper(self):
         # Rank-based probability vector: weight(rank) = 1 / rank ** alpha,
@@ -1156,6 +1357,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
                 question_len=common["question_len"],
                 output_len=common["output_len"],
                 tokenizer=self.tokenizer,
+                ordered=common["ordered"],
+                fast_prepare=common["fast_prepare"],
             )
             zipf_path_a = get_gen_prefix_cache_path(
                 seed=common["seed"],
@@ -1167,6 +1370,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
                 tokenizer=self.tokenizer,
                 group_distribution="zipf",
                 zipf_alpha=1.5,
+                ordered=common["ordered"],
+                fast_prepare=common["fast_prepare"],
             )
             zipf_path_b = get_gen_prefix_cache_path(
                 seed=common["seed"],
@@ -1178,6 +1383,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
                 tokenizer=self.tokenizer,
                 group_distribution="zipf",
                 zipf_alpha=2.0,
+                ordered=common["ordered"],
+                fast_prepare=common["fast_prepare"],
             )
             self.assertNotEqual(uniform_path, zipf_path_a)
             self.assertNotEqual(zipf_path_a, zipf_path_b)
@@ -1206,6 +1413,26 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
                 pickle.dump(zipf_sentinel, f)
             reloaded = self._run_gsp(mode="zipf", alpha=1.5, **common)
             self.assertEqual(reloaded, zipf_sentinel)
+
+    def test_gsp_cache_is_keyed_by_ordered_and_fast_prepare(self):
+        """A cached run must not be served to a run that differs in --gsp-ordered
+        or --gsp-fast-prepare: the first decides whether rows are shuffled, the
+        second stores prompt_len=1 in every row."""
+        common = dict(num_groups=3, prompts_per_group=4, seed=11)
+
+        default_rows = self._run_gsp(ordered=False, fast_prepare=False, **common)
+        self.assertTrue(all(row.prompt_len > 1 for row in default_rows))
+
+        ordered_rows = self._run_gsp(ordered=True, fast_prepare=False, **common)
+        system_prompts = [row.prompt.split("\n\n")[0] for row in ordered_rows]
+        runs = [prompt for prompt, _ in itertools.groupby(system_prompts)]
+        self.assertEqual(len(runs), len(set(runs)))
+
+        fast_rows = self._run_gsp(ordered=False, fast_prepare=True, **common)
+        self.assertEqual({row.prompt_len for row in fast_rows}, {1})
+
+        cached_rows = self._run_gsp(ordered=False, fast_prepare=False, **common)
+        self.assertEqual(self._row_fields(cached_rows), self._row_fields(default_rows))
 
     def test_zipf_total_rows_and_unique_prompts(self):
         # Total returned row count under Zipf equals num_groups *
@@ -1289,64 +1516,22 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             with self.assertRaises(ValueError, msg=f"case={case}"):
                 GeneratedSharedPrefixDataset.from_args(args)
 
-    def test_bench_serving_help_and_invalid_choice_argparse(self):
-        # Subprocess-driven coverage of the live CLI: --help advertises both
-        # flags with the rank-based Zipf formula and the alpha constraint,
-        # and argparse rejects an unknown distribution choice.
-        help_res = subprocess.run(
-            [sys.executable, "-m", "sglang.benchmark.serving", "--help"],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-        self.assertEqual(help_res.returncode, 0, help_res.stderr)
-        out = help_res.stdout
-        # Both new flags appear.
-        self.assertIn("--gsp-group-distribution", out)
-        self.assertIn("--gsp-zipf-alpha", out)
-        # Rank-based Zipf formula and alpha constraint are documented.
-        self.assertIn("1/rank**alpha", out)
-        self.assertIn("rank starts at 1", out)
-        self.assertIn("finite float", out)
+    def test_serving_benchmark_cli_rejects_invalid_flush_cache_timeout(self):
+        """Invalid timeouts fail before the benchmark contacts a server or hangs."""
+        res = _bench_serving_cli_results()["flush_cache_timeout"]
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("expected a finite float > 0", res.stderr)
 
-        # Argparse rejects unknown distribution choice.
-        bad_choice_res = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.benchmark.serving",
-                "--dataset-name",
-                "generated-shared-prefix",
-                "--gsp-group-distribution",
-                "invalid_name",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-        self.assertNotEqual(bad_choice_res.returncode, 0)
-        self.assertIn("invalid choice", (bad_choice_res.stderr + bad_choice_res.stdout))
+        for value in ("1e999", "0", "-1"):
+            with self.subTest(value=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    _finite_positive_float(value)
 
     def test_bench_serving_cli_rejects_zipf_without_alpha_before_server(self):
         # Malformed CLI combinations (zipf with no alpha) must fail at
         # argparse time so users see the GSP-flag error directly, not a
         # downstream connection or model-fetch failure.
-        res = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.benchmark.serving",
-                "--dataset-name",
-                "generated-shared-prefix",
-                "--gsp-group-distribution",
-                "zipf",
-                "--ready-check-timeout-sec",
-                "0",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        res = _bench_serving_cli_results()["zipf_without_alpha"]
         # parser.error() exits with code 2 (argparse convention).
         self.assertEqual(res.returncode, 2, res.stderr)
         stderr = res.stderr + res.stdout
@@ -1366,24 +1551,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
     def test_bench_serving_cli_rejects_uniform_with_alpha_before_server(self):
         # The complementary malformation: uniform distribution with an
         # explicit alpha value. Must also fail at argparse time.
-        res = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.benchmark.serving",
-                "--dataset-name",
-                "generated-shared-prefix",
-                "--gsp-group-distribution",
-                "uniform",
-                "--gsp-zipf-alpha",
-                "1.0",
-                "--ready-check-timeout-sec",
-                "0",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        res = _bench_serving_cli_results()["uniform_with_alpha"]
         self.assertEqual(res.returncode, 2, res.stderr)
         stderr = res.stderr + res.stdout
         self.assertIn("--gsp-group-distribution", stderr)

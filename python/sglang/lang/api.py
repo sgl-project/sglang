@@ -3,9 +3,9 @@
 import re
 from typing import Callable, List, Optional, Union
 
-from sglang.global_config import global_config
 from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.choices import ChoicesSamplingMethod, token_length_normalized
+from sglang.lang.global_config import global_config
 from sglang.lang.ir import (
     SglExpr,
     SglExprList,

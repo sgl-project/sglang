@@ -1,12 +1,25 @@
 from __future__ import annotations
 
+import functools
 import inspect
 from typing import Any, Callable, List, Optional, TypeVar, Union, overload
 
 import torch
 import torch.library
+from torch.library import Library
 
-from sglang.kernel_api_logging import debug_torch_op
+from sglang.kernels.kernel_api_logging import _KERNEL_API_LOG_LEVEL, debug_torch_op
+from sglang.srt.platforms import current_platform
+from sglang.srt.utils.common import is_mlu
+from sglang.srt.utils.device import is_musa, is_npu, is_xpu
+
+__all__ = [
+    "register_custom_op",
+    "CustomOpWrapper",
+    "register_custom_op_from_extern",
+    "sglang_lib",
+    "direct_register_custom_op",
+]
 
 F = TypeVar("F", bound=Callable)
 
@@ -103,15 +116,15 @@ def register_custom_op(
     """
     extra_kwarg_keys = set(extra_kwargs.keys())
     expected_kwarg_keys = set({"out_shape", "fake_impl"})
-    assert (
-        expected_kwarg_keys >= extra_kwarg_keys
-    ), f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    assert expected_kwarg_keys >= extra_kwarg_keys, (
+        f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    )
 
     has_out_shape = "out_shape" in extra_kwargs
     has_fake_impl = "fake_impl" in extra_kwargs
-    assert not (
-        has_out_shape and has_fake_impl
-    ), "Only one of `out_shape` or `fake_impl` should be provided."
+    assert not (has_out_shape and has_fake_impl), (
+        "Only one of `out_shape` or `fake_impl` should be provided."
+    )
     # Assume inplace if neither out_shape nor fake_impl is provided
     if not (has_out_shape or has_fake_impl):
         extra_kwargs["out_shape"] = None
@@ -128,6 +141,45 @@ def register_custom_op(
     if fn is not None:
         return decorator(fn)
     return decorator
+
+
+_PLAIN_TENSORS = (torch.Tensor, torch.nn.Parameter)
+# Bound once: these run on every eager call of every op.
+_is_compiling = torch.compiler.is_compiling
+_dispatch_modes = torch._C._len_torch_dispatch_stack
+_function_modes = torch._C._is_torch_function_mode_enabled
+_profiling = torch._C._autograd._profiler_enabled
+_grad_enabled = torch.is_grad_enabled
+
+
+def _call_directly_in_eager(op_func: Callable, op: Callable) -> Callable:
+    """Call ``op_func`` itself in plain eager execution, skipping the dispatcher.
+
+    The op is registered for one device key with no autograd formula, so for plain
+    CUDA tensors under no_grad the dispatcher only re-enters ``op_func``, at several
+    microseconds a call. Everything else keeps the registered op: tracing, dispatch
+    and function modes, the profiler (which records the op), autograd, tensor
+    subclasses, and tensors on other devices (which the op rejects or fakes).
+    """
+
+    @functools.wraps(op_func)
+    def call(*args, **kwargs):
+        if (
+            _is_compiling()
+            or _dispatch_modes()
+            or _function_modes()
+            or _profiling()
+            or _grad_enabled()
+        ):
+            return op(*args, **kwargs)
+        for a in (*args, *kwargs.values()):
+            if isinstance(a, torch.Tensor) and (
+                type(a) not in _PLAIN_TENSORS or not a.is_cuda
+            ):
+                return op(*args, **kwargs)
+        return op_func(*args, **kwargs)
+
+    return call
 
 
 class CustomOpWrapper:
@@ -150,9 +202,8 @@ class CustomOpWrapper:
     @property
     def real_impl(self) -> Callable:
         if self._impl is None:
-            if not hasattr(torch.ops.sglang, self.op_name):
-                from sglang.srt.utils.common import direct_register_custom_op
-
+            registered_here = not hasattr(torch.ops.sglang, self.op_name)
+            if registered_here:
                 # NOTE(dark): if torch compile fail here, mark the decorator as eager
                 # lazy registration does not work with torch compile
                 direct_register_custom_op(
@@ -161,7 +212,14 @@ class CustomOpWrapper:
                     mutates_args=self.mutates_args,
                     fake_impl=self.fake_impl,
                 )
-            self._impl = debug_torch_op(self.op_func, self.op_name)
+            op = debug_torch_op(self.op_func, self.op_name)
+            # Logging wraps the registered op, and a name registered elsewhere first
+            # runs that registration's function; both stay on the dispatcher.
+            self._impl = (
+                _call_directly_in_eager(self.op_func, op)
+                if registered_here and not _KERNEL_API_LOG_LEVEL
+                else op
+            )
             assert self._impl is not None
         return self._impl
 
@@ -261,9 +319,9 @@ def register_custom_op_from_extern(
     name = op_name or fn.__name__
     computed_args = computed_args or {}
 
-    assert not (
-        out_shape is not None and fake_impl is not None
-    ), "Only one of `out_shape` or `fake_impl` should be provided."
+    assert not (out_shape is not None and fake_impl is not None), (
+        "Only one of `out_shape` or `fake_impl` should be provided."
+    )
 
     # If computed_args specified, create a wrapper with a reduced signature
     # that computes the excluded args inside the op body.
@@ -325,8 +383,6 @@ def register_custom_op_from_extern(
     elif fake_impl is None:
         fake_impl = lambda *args, **kwargs: None
 
-    from sglang.srt.utils.common import direct_register_custom_op
-
     direct_register_custom_op(
         op_name=name,
         op_func=fn,
@@ -335,3 +391,92 @@ def register_custom_op_from_extern(
     )
 
     return debug_torch_op(fn, name)
+
+
+sglang_lib = Library("sglang", "FRAGMENT")  # noqa
+
+
+def direct_register_custom_op(
+    op_name: str,
+    op_func: Callable,
+    mutates_args: List[str],
+    fake_impl: Optional[Callable] = None,
+    target_lib: Optional[Library] = None,
+) -> None:
+    """
+    NOTE: Please try to use `register_custom_op` instead of this function.
+    See `python/sglang/srt/utils/custom_op.py` for details.
+
+    `torch.library.custom_op` can have significant overhead because it
+    needs to consider complicated dispatching logic. This function
+    directly registers a custom op and dispatches it to the CUDA backend.
+    See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5
+    for more details.
+
+    By default, the custom op is registered to the vLLM library. If you
+    want to register it to a different library, you can pass the library
+    object to the `target_lib` argument.
+
+    IMPORTANT: the lifetime of the operator is tied to the lifetime of the
+    library object. If you want to bind the operator to a different library,
+    make sure the library object is alive when the operator is used.
+
+    Note: This function will silently skip registration if the operator
+    with the same name is already registered to avoid RuntimeError in
+    multi-engine scenarios (e.g., VERL framework).
+    """
+    import torch.library
+
+    my_lib = target_lib or sglang_lib
+
+    # Check if operator is already registered to avoid duplicate registration
+    # This is important for scenarios where multiple SGLang engines run in the same process
+    try:
+        # Try to access the operator to see if it's already registered
+        lib_name = my_lib.m.name if hasattr(my_lib.m, "name") else "sglang"
+        if hasattr(torch.ops, lib_name) and hasattr(
+            getattr(torch.ops, lib_name), op_name
+        ):
+            # Operator already exists, skip registration
+            return
+    except (AttributeError, RuntimeError):
+        # Operator doesn't exist, proceed with registration
+        pass
+
+    if hasattr(torch.library, "infer_schema"):
+        schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
+    else:
+        # for pytorch 2.4
+        import torch._custom_op.impl
+
+        schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
+
+    try:
+        my_lib.define(op_name + schema_str)
+        if is_npu() or current_platform.is_out_of_tree():
+            # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            # Out-of-tree devices are torch PrivateUse1 backends too.
+            my_lib.impl(op_name, op_func, "PrivateUse1")
+        elif is_xpu():
+            my_lib.impl(op_name, op_func, "XPU")
+        elif is_musa():
+            my_lib.impl(op_name, op_func, "MUSA")
+        elif is_mlu():
+            my_lib.impl(op_name, op_func, "MLU")
+        else:
+            my_lib.impl(op_name, op_func, "CUDA")
+        if fake_impl is not None:
+            my_lib._register_fake(op_name, fake_impl)
+    except RuntimeError as error:
+        if "Tried to register an operator" in str(error) and "multiple times" in str(
+            error
+        ):
+            # Silently ignore duplicate registration errors
+            # This can happen in multi-engine scenarios
+            pass
+        else:
+            # Re-raise other RuntimeErrors
+            raise error
+    except AttributeError as error:
+        # Always re-raise AttributeError as it indicates missing dependencies
+        raise error

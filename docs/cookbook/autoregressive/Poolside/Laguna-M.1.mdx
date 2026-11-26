@@ -23,7 +23,7 @@ uv venv --python 3.12 && source .venv/bin/activate
 # tagged release — install from main. The serving runtime is in the base dependencies, no extra needed:
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
-uv pip install -e python
+uv pip install --prerelease=allow -e python
 ```
 
 Then run the **Python** output of the command panel below in that environment. The **Docker** tab is simpler — `lmsysorg/sglang:latest` bundles the CUDA-13 runtime and the M.1 code.
@@ -273,13 +273,13 @@ sglang serve \
   --host 0.0.0.0 --port 30001
 ```
 
-Then start the PD router, pointing it at the prefill bootstrap (URL plus its `--disaggregation-bootstrap-port`) and the decode endpoint:
+Then start the PD router, pointing it at both endpoints:
 
 ```bash PD router
-python3 -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill http://<prefill-host>:30000 8998 \
-  --decode http://<decode-host>:30001 \
+sgl-router \
+  --model-id poolside/Laguna-M.1 \
+  --no-tokenizer \
+  --worker-urls http://<prefill-host>:30000 http://<decode-host>:30001 \
   --policy round_robin \
   --host 0.0.0.0 --port 8000
 ```

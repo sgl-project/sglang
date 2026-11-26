@@ -14,7 +14,13 @@ transport backends are supported:
     TokenizerManager  ──ShmLoadSnapshotReader───┘  (for /v1/loads)
     DataParallelController  ──ShmLoadSnapshotReader─┘  (for dispatch)
 
-**ZMQ mode** (multi-node DP attention, or ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ=1``)::
+With the embedded Rust server (``SGLANG_RUST_SERVER``), each DP rank's
+listener runs in that rank's scheduler process and reads only that rank's
+slot, so SHM mode also covers multi-node DP attention: every node's ranks
+write a node-local file.
+
+**ZMQ mode** (multi-node DP attention without the Rust server, or
+``SGLANG_LOAD_SNAPSHOT_USE_ZMQ=1``)::
 
     Scheduler (any node)  ──ZmqLoadSnapshotWriter (PUSH)──▶  network
                                                                │
@@ -26,7 +32,7 @@ transport backends are supported:
     TokenizerManager / DataParallelController  ──ShmLoadSnapshotReader──┘
 
 Shared memory does not work across nodes, so multi-node DP attention
-requires the ZMQ transport.  The ``ZmqShmLoadSnapshotReader`` on node 0
+requires the ZMQ transport to reach node 0.  The ``ZmqShmLoadSnapshotReader`` on node 0
 receives snapshots from all schedulers via zmq PUSH/PULL and writes them
 into the local SHM file.  All readers (TokenizerManager,
 DataParallelController) on
@@ -52,7 +58,12 @@ import msgspec.msgpack
 import msgspec.structs
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.network import is_zmq_endpoint_ipv6
+from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.utils.network import (
+    is_zmq_endpoint_ipv6,
+    restrict_zmq_peers,
+    zmq_connect,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,36 +72,40 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def should_use_zmq(server_args) -> bool:
+def should_use_zmq() -> bool:
     """Whether to use zmq PUSH/PULL instead of shared memory for load snapshots.
 
     Shared memory (mmap) only works within a single node.  When schedulers
     run on multiple nodes (multi-node DP attention), they cannot write to
-    the SHM file on node 0, so we fall back to zmq transport.  The env var
-    ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ`` forces zmq mode for testing.
+    the SHM file on node 0, so we fall back to zmq transport.  The Rust
+    server needs no collector: each listener reads its own rank's slot from
+    the file on its own node.  The env var ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ``
+    forces zmq mode for testing.
     """
     return (
-        server_args.enable_dp_attention and server_args.nnodes > 1
+        get_parallel().attn_dp_enabled
+        and get_parallel().nnodes > 1
+        and not envs.SGLANG_RUST_SERVER.get()
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
 _LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
 
 
-def _tokenizer_load_snapshot_owner_caller(server_args) -> str:
+def _tokenizer_load_snapshot_owner_caller() -> str:
     """The caller that plays the tokenizer-side zmq owner role.
 
     In multi-tokenizer mode (``tokenizer_worker_num > 1``) there are N
-    independent ``TokenizerWorker`` processes that would all try to bind the
+    independent tokenizer worker processes that would all try to bind the
     same zmq PULL endpoint.  Instead, the single ``MultiTokenizerRouter``
     process owns the socket (polls zmq -> SHM) and every worker reads SHM.
     """
-    if server_args.tokenizer_worker_num > 1:
+    if get_serving().tokenizer_worker_num > 1:
         return "MultiTokenizerRouter"
     return "TokenizerManager"
 
 
-def zmq_reader_owner(server_args, caller: str) -> bool:
+def zmq_reader_owner(caller: str) -> bool:
     """Decide which process owns the zmq PULL socket.
 
     Exactly one of ``"DataParallelController"``, ``"TokenizerManager"``, or
@@ -108,18 +123,25 @@ def zmq_reader_owner(server_args, caller: str) -> bool:
         load data -> tokenizer-side owner owns it (polls on /v1/loads calls).
 
     The tokenizer-side owner is the ``"MultiTokenizerRouter"`` caller in
-    multi-tokenizer mode, otherwise the ``"TokenizerManager"`` caller.
+    multi-tokenizer mode, otherwise the ``"TokenizerManager"`` caller. Which of
+    the two it is only matters to a tokenizer-side caller, and asking costs the
+    DP controller a `serving` read its role is not audited for -- so the
+    controller answers from the parallel leaves alone.
     """
-    if not should_use_zmq(server_args):
+    if not should_use_zmq():
         return False
-    if server_args.node_rank != 0:
+    if get_parallel().node_rank != 0:
         return False
-    tokenizer_owner = _tokenizer_load_snapshot_owner_caller(server_args)
-    if server_args.dp_size == 1:
-        return caller == tokenizer_owner
-    if server_args.load_balance_method.lower() in _LOAD_AWARE_METHODS:
-        return caller == "DataParallelController"
-    return caller == tokenizer_owner
+    if caller == "DataParallelController":
+        return (
+            get_parallel().num_dp_ranks > 1
+            and get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
+        )
+    if get_parallel().num_dp_ranks > 1 and (
+        get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
+    ):
+        return False
+    return caller == _tokenizer_load_snapshot_owner_caller()
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +184,10 @@ class DisaggregationMetrics(msgspec.Struct, array_like=True):
     decode_retracted_queue_reqs: int = 0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
+    # 1 while a full host staging pool holds back ready decode prealloc requests;
+    # host-staged transfers whose KV landed but wait for device admission.
+    decode_host_pool_blocked: int = 0
+    decode_host_staged_landed_reqs: int = 0
 
 
 class QueueMetrics(msgspec.Struct, array_like=True):
@@ -194,6 +220,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # num_total_tokens minus tokens still awaiting a KV transfer (equal to it
     # outside disaggregated decode).
     num_active_tokens: int = 0
+    num_prealloc_ready_tokens: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
     token_usage: float = 0.0
@@ -327,7 +354,7 @@ class ShmLoadSnapshotWriter:
                 HEADER_STRUCT.pack_into(
                     self.mmap, 0, MAGIC, VERSION, dp_size, self.slot_size
                 )
-                self._write_payload(LoadSnapshot(dp_rank=dp_rank))
+                self._copy_payload(self._encode_payload(LoadSnapshot(dp_rank=dp_rank)))
         except Exception:
             if self.fd >= 0:
                 os.close(self.fd)
@@ -339,10 +366,12 @@ class ShmLoadSnapshotWriter:
                 f"snapshot dp_rank={snapshot.dp_rank} does not match writer dp_rank={self.dp_rank}"
             )
 
+        # Encode before taking the lock so readers wait only for the copy.
+        payload = self._encode_payload(snapshot)
         with file_lock(self.fd, fcntl.LOCK_EX):
-            self._write_payload(snapshot)
+            self._copy_payload(payload)
 
-    def _write_payload(self, snapshot: LoadSnapshot) -> None:
+    def _encode_payload(self, snapshot: LoadSnapshot) -> bytes:
         payload = snapshot_encoder.encode(snapshot)
         max_payload_size = self.slot_size - SLOT_LEN_STRUCT.size
         if len(payload) > max_payload_size:
@@ -350,7 +379,9 @@ class ShmLoadSnapshotWriter:
                 f"load snapshot payload size {len(payload)} exceeds slot payload "
                 f"capacity {max_payload_size}"
             )
+        return payload
 
+    def _copy_payload(self, payload: bytes) -> None:
         offset = slot_offset(self.dp_rank, self.slot_size)
         payload_start = offset + SLOT_LEN_STRUCT.size
         payload_end = payload_start + len(payload)
@@ -392,7 +423,7 @@ class ZmqLoadSnapshotWriter:
             self._socket.setsockopt(_zmq.IPV6, 1)
         self._socket.setsockopt(_zmq.LINGER, 0)
         self._socket.setsockopt(_zmq.CONFLATE, 1)
-        self._socket.connect(endpoint)
+        zmq_connect(self._socket, endpoint)
 
     def write(self, snapshot: LoadSnapshot) -> None:
         if snapshot.dp_rank != self.dp_rank:
@@ -532,6 +563,8 @@ class ZmqShmLoadSnapshotReader:
             self._socket.setsockopt(_zmq.IPV6, 1)
         self._socket.setsockopt(_zmq.LINGER, 0)
         self._socket.setsockopt(_zmq.CONFLATE, 1)
+        if endpoint.startswith("tcp://"):
+            restrict_zmq_peers(self._ctx, self._socket)
         self._socket.bind(endpoint)
 
         self._endpoint = endpoint
@@ -627,14 +660,13 @@ def _zmq_addr_for(port_args) -> str:
 
 
 def create_load_snapshot_writer(
-    server_args,
     port_args,
     dp_size: int,
     dp_rank: int,
     publish_interval: int = 1,
 ):
     """Return a SHM or ZMQ writer based on server configuration."""
-    if should_use_zmq(server_args):
+    if should_use_zmq():
         return ZmqLoadSnapshotWriter(
             _zmq_addr_for(port_args), dp_size, dp_rank, publish_interval
         )
@@ -643,7 +675,7 @@ def create_load_snapshot_writer(
     )
 
 
-def create_load_snapshot_reader(server_args, port_args, caller: str):
+def create_load_snapshot_reader(port_args, caller: str):
     """Create a load snapshot reader.
 
     Args:
@@ -651,9 +683,9 @@ def create_load_snapshot_reader(server_args, port_args, caller: str):
             ``"MultiTokenizerRouter"`` -- determines who binds the zmq PULL
             socket when zmq mode is active.
     """
-    dp_size = server_args.dp_size
-    if zmq_reader_owner(server_args, caller):
+    num_dp_ranks = get_parallel().num_dp_ranks
+    if zmq_reader_owner(caller):
         return ZmqShmLoadSnapshotReader(
-            _zmq_addr_for(port_args), shm_path_for(port_args.instance_id), dp_size
+            _zmq_addr_for(port_args), shm_path_for(port_args.instance_id), num_dp_ranks
         )
-    return ShmLoadSnapshotReader(shm_path_for(port_args.instance_id), dp_size)
+    return ShmLoadSnapshotReader(shm_path_for(port_args.instance_id), num_dp_ranks)

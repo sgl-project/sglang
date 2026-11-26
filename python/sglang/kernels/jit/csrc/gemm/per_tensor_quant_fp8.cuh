@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 constexpr size_t kBlockSize = 256;
 
@@ -105,7 +105,7 @@ void per_tensor_quant_fp8_impl(
 
   auto device = SymbolicDevice{};
   auto N = SymbolicSize{"num_elements"};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   TensorMatcher({N})  //
       .with_dtype<DType>()
@@ -159,4 +159,4 @@ void per_tensor_absmax_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView outp
       DType>(input, output_s, output_s);
 }
 
-}  // namespace
+}  // namespace sglang

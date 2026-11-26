@@ -17,13 +17,24 @@ from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 import torch
 from torch.distributed import TCPStore
 
+try:
+    from torch.distributed import all_gather_single as _all_gather_single
+    from torch.distributed import reduce_scatter_single as _reduce_scatter_single
+except ImportError:  # older torch builds only have the *_tensor names
+    from torch.distributed import all_gather_into_tensor as _all_gather_single
+    from torch.distributed import reduce_scatter_tensor as _reduce_scatter_single
+
+from sglang.srt.runtime_context import get_resources
+
+all_gather_single = _all_gather_single
+reduce_scatter_single = _reduce_scatter_single
+
 logger = logging.getLogger(__name__)
 
 
 def set_global_tcp_store(store: TCPStore) -> None:
     """Install the shared TCPStore created during distributed initialization;
     the handle lives on ``ctx.resources``."""
-    from sglang.srt.runtime_context import get_resources
 
     get_resources().tcp_store = store
     logger.info("Global TCPStore has been set")
@@ -39,7 +50,6 @@ def get_global_tcp_store() -> Optional[TCPStore]:
     Returns:
         The global TCPStore instance, or None if not initialized yet.
     """
-    from sglang.srt.runtime_context import get_resources
 
     store = get_resources().tcp_store
     if store is None:
@@ -48,6 +58,11 @@ def get_global_tcp_store() -> Optional[TCPStore]:
             "was called with a tcp:// init method."
         )
     return store
+
+
+def get_group_rank_size(group) -> Tuple[int, int]:
+    """Read rank and size from a retained owner; None denotes an unsharded layout."""
+    return (0, 1) if group is None else (group.rank_in_group, group.world_size)
 
 
 def ensure_divisibility(numerator, denominator):
@@ -101,6 +116,10 @@ def get_pp_indices(
     """
     # partition_list_str can be set to None in sglang
     partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
+    if pp_size == 1:
+        # A singleton draft PP group owns every layer and must ignore the target's
+        # process-global pipeline partition list.
+        partition_list_str = None
     if partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]
@@ -193,13 +212,13 @@ class StatelessProcessGroup:
         """
         if self.rank == src:
             self.expire_data()
-            key = f"broadcast_from/{src}/" f"{self.broadcast_send_counter}"
+            key = f"broadcast_from/{src}/{self.broadcast_send_counter}"
             self.store.set(key, pickle.dumps(obj))
             self.broadcast_send_counter += 1
             self.entries.append((key, time.perf_counter()))
             return obj
         else:
-            key = f"broadcast_from/{src}/" f"{self.broadcast_recv_src_counter[src]}"
+            key = f"broadcast_from/{src}/{self.broadcast_recv_src_counter[src]}"
             recv_obj = pickle.loads(self.store.get(key))
             self.broadcast_recv_src_counter[src] += 1
             return recv_obj

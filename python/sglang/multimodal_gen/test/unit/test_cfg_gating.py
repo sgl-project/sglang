@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
@@ -29,12 +30,15 @@ class TestCFGGating(unittest.TestCase):
             pipeline_config=_PipelineConfig(),
         )
 
-    def _make_batch(self):
+    def _make_batch(self, cfg_gate_step=None):
         return SimpleNamespace(
             cfg_normalization=0,
             guidance_rescale=0,
             do_classifier_free_guidance=True,
             is_cfg_negative=False,
+            sampling_params=SimpleNamespace(
+                cfg_gate_step=cfg_gate_step, quality="lossless"
+            ),
         )
 
     def _make_gate_state(self, gate_step=1, model_id=None, delta=None):
@@ -58,6 +62,7 @@ class TestCFGGating(unittest.TestCase):
         calls = []
 
         def fake_predict_noise(**kwargs):
+            self.assertEqual(get_forward_context().quality, "lossless")
             calls.append("neg" if batch.is_cfg_negative else "pos")
             timestep = kwargs["timestep"]
             timestep_value = float(timestep.item())
@@ -110,11 +115,13 @@ class TestCFGGating(unittest.TestCase):
     def test_model_switch_invalidates_cached_delta(self):
         stage = DenoisingStage.__new__(DenoisingStage)
         batch = self._make_batch()
+        batch.sampling_params.quality = "exact"
         server_args = self._make_server_args()
         policy = CFGPolicy().build(batch, {}, {}, {})
         calls = []
 
         def fake_predict_noise(**kwargs):
+            self.assertEqual(get_forward_context().quality, "exact")
             calls.append("neg" if batch.is_cfg_negative else "pos")
             value = 3.0 if batch.is_cfg_negative else 10.0
             return torch.tensor([value])
@@ -174,6 +181,42 @@ class TestCFGGating(unittest.TestCase):
         with patch.dict(os.environ, {"SGLANG_DIFFUSION_CFG_GATE_STEP": "1.5"}):
             with self.assertRaises(ValueError):
                 stage._init_cfg_gate_state(ctx, batch, server_args)
+
+    def test_request_fraction_overrides_env_default(self):
+        stage = DenoisingStage.__new__(DenoisingStage)
+        ctx = SimpleNamespace(timesteps=torch.arange(10), extra={}, is_warmup=True)
+        batch = self._make_batch(cfg_gate_step=0.5)
+        server_args = self._make_server_args()
+
+        # env default is 1.0 (off); the request opts in.
+        stage._init_cfg_gate_state(ctx, batch, server_args)
+
+        state = ctx.extra["cfg_gate_state"]
+        self.assertTrue(state["requested"])
+        self.assertTrue(state["active"])
+        self.assertEqual(state["gate_step"], 5)
+
+    def test_request_fraction_disables_env_default(self):
+        stage = DenoisingStage.__new__(DenoisingStage)
+        ctx = SimpleNamespace(timesteps=torch.arange(10), extra={}, is_warmup=True)
+        batch = self._make_batch(cfg_gate_step=1.0)
+        server_args = self._make_server_args()
+
+        with patch.dict(os.environ, {"SGLANG_DIFFUSION_CFG_GATE_STEP": "0.5"}):
+            stage._init_cfg_gate_state(ctx, batch, server_args)
+
+        state = ctx.extra["cfg_gate_state"]
+        self.assertFalse(state["requested"])
+        self.assertFalse(state["active"])
+
+    def test_rejects_invalid_request_fraction(self):
+        stage = DenoisingStage.__new__(DenoisingStage)
+        ctx = SimpleNamespace(timesteps=torch.arange(10), extra={}, is_warmup=True)
+        batch = self._make_batch(cfg_gate_step=1.5)
+        server_args = self._make_server_args()
+
+        with self.assertRaises(ValueError):
+            stage._init_cfg_gate_state(ctx, batch, server_args)
 
 
 if __name__ == "__main__":

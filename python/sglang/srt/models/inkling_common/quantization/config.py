@@ -119,9 +119,6 @@ class InklingQuantizationConfigBase:
 
 
 class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBase):
-    moe_ep_size: int
-    nvfp4_moe_backend: str
-
     def __init__(
         self,
         is_checkpoint_nvfp4_serialized: bool = False,
@@ -131,8 +128,6 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
         packed_modules_mapping: dict[str, list[str]] | None = None,
         # New Inkling args
         scales_2d: bool = False,
-        moe_ep_size: int = 1,
-        nvfp4_moe_backend: str = "trtllm-routed",
     ) -> None:
         # unfortunately parent types are completely incorrect
         super().__init__(
@@ -149,8 +144,6 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
         else:
             self.dim1_group_size = 1
         self.dim2_group_size = group_size
-        self.moe_ep_size = moe_ep_size
-        self.nvfp4_moe_backend = nvfp4_moe_backend
 
     @classmethod
     def get_name(cls) -> str:
@@ -192,11 +185,8 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
                     # forward branch in UnquantizedFusedMoEMethod). The loader's
                     # shared_w13 [up||gate] swap keys on the same predicate.
                     # Routed quant-EXCLUDED bf16 layers keep the triton runner.
-                    return UnquantizedFusedMoEMethod(
-                        use_triton_kernels=False,
-                        use_flashinfer_trtllm_moe=True,
-                    )
-                return UnquantizedFusedMoEMethod(use_triton_kernels=False)
+                    return UnquantizedFusedMoEMethod(use_flashinfer_trtllm_moe=True)
+                return UnquantizedFusedMoEMethod()
             logger.debug(f"quantizing fused MoE layer: {prefix}")
             # Upstream ModelOpt NVFP4 fused-MoE method. It de-interleaves the Inkling
             # interleaved-w13 layout when the layer sets inference_moe_w13_interleaved.
@@ -209,8 +199,6 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
         exclude_modules = _map_exclude_modules(parent_config.exclude_modules)
         quant_config = config["quantization"]
         scales_2d = quant_config.get("scales_2d", False)
-        moe_ep_size = quant_config.get("moe_ep_size", 1)
-        nvfp4_moe_backend = quant_config.get("nvfp4_moe_backend", "trtllm-routed")
         return cls(
             is_checkpoint_nvfp4_serialized=parent_config.is_checkpoint_nvfp4_serialized,
             kv_cache_quant_algo=parent_config.kv_cache_quant_algo,
@@ -218,15 +206,12 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
             exclude_modules=exclude_modules,
             packed_modules_mapping=parent_config.packed_modules_mapping,
             scales_2d=scales_2d,
-            moe_ep_size=moe_ep_size,
-            nvfp4_moe_backend=nvfp4_moe_backend,
         )
 
     @classmethod
     def maybe_from_model_config(
         cls, model_config: ModelConfig
     ) -> InklingModelOptNvfp4Config | None:
-        from sglang.srt.runtime_context import get_parallel
 
         raw_quant_config = _get_raw_quant_config(model_config)
 
@@ -249,8 +234,6 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
         scales_2d = weight_quant_cfg["block_sizes"].get("-2") is not None
 
         quant_config["scales_2d"] = scales_2d
-        quant_config["moe_ep_size"] = get_parallel().moe_ep_size
-        quant_config["nvfp4_moe_backend"] = "trtllm-routed"
 
         # force parent class to fallback to nested format.
         return cls.from_config({"quantization": quant_config})

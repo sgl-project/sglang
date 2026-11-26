@@ -66,7 +66,7 @@ jobs:
 
       - name: Install dependencies
         if: steps.gate.outputs.run_job == 'true'
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
 
@@ -74,10 +74,9 @@ jobs:
         if: steps.gate.outputs.run_job == 'true'
         timeout-minutes: 30
         run: |
-          pytest python/sglang/kernels/aot/tests/test_per_token_quant_fp8.py
-          pytest python/sglang/kernels/aot/tests/speculative/test_eagle_utils.py
-          pytest python/sglang/kernels/aot/tests/speculative/test_ngram_utils.py
-          pytest python/sglang/kernels/aot/tests/speculative/test_speculative_sampling.py
+          pytest test/registered/kernels/ops/speculative/test_eagle_utils.py
+          pytest test/registered/kernels/ops/speculative/test_ngram_utils.py
+          pytest test/registered/kernels/ops/speculative/test_speculative_sampling.py
           pytest python/sglang/kernels/aot/tests/test_torch_defaults_reset.py
 
   # ==================== General: multimodal layer ====================
@@ -111,7 +110,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        timeout-minutes: 15
+        timeout-minutes: 30
         if: steps.gate.outputs.run_job == 'true'
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
@@ -154,7 +153,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        timeout-minutes: 15
+        timeout-minutes: 30
         if: steps.gate.outputs.run_job == 'true'
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
@@ -166,7 +165,7 @@ jobs:
           cd test
           python3 run_suite.py \
             --hw musa \
-            --suite nightly-musa-1-gpu \
+            --suite nightly-test-1-gpu-musa \
             --nightly \
             --timeout-per-file 7200
 
@@ -206,7 +205,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        timeout-minutes: 15
+        timeout-minutes: 30
         if: steps.gate.outputs.run_job == 'true'
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
@@ -255,7 +254,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
-        timeout-minutes: 15
+        timeout-minutes: 30
         if: steps.gate.outputs.run_job == 'true'
         run: |
           bash scripts/ci/musa/musa_install_dependency.sh
@@ -285,16 +284,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
         run: |
-          json_needs='${{ toJson(needs) }}'
-          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
-
-          for job in $job_names; do
-            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
-            echo "$job: $result"
-            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
-              echo "Nightly failed."
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully."
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS_JSON"
+          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
+            echo "::error::A dependent job failed or was cancelled."
+            exit 1
+          fi

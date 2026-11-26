@@ -10,9 +10,8 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
-    suite="full-2-npu-a3",
+    suite="nightly-perf-test-2-npu-a3",
     nightly=True,
-    disabled="performance testcase",
 )
 
 QWEN3_6_27B_3K5_1K5_ENVS = {
@@ -23,8 +22,6 @@ QWEN3_6_27B_3K5_1K5_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "0",
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "130",
     "ASCEND_USE_FIA": "1",
 }
 
@@ -49,7 +46,7 @@ QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
     74,
     "--mem-fraction-static",
     0.7,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     2,
     8,
     16,
@@ -79,6 +76,9 @@ QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
     "qwen3",
     "--tool-call-parser",
     "qwen3_coder",
+    "--enable-prefill-delayer",
+    "--prefill-delayer-max-delay-passes",
+    "130",
 ]
 
 

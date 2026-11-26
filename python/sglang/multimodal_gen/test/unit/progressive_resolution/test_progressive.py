@@ -5,21 +5,28 @@ import argparse
 import dataclasses
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2PipelineConfig,
+    FluxPipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
     ProgressiveDenoisingStageRouter,
     compute_stage_transitions,
     find_transition_steps,
     is_progressive_resolution_mode,
+    pack_2x2_latent,
     reset_scheduler_at_step,
+    unpack_2x2_latent,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux import (
-    _flux_pack,
-    _flux_unpack,
+    FluxProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux_2 import (
     Flux2ProgressiveDenoisingStage,
@@ -30,10 +37,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     Ideogram4ProgressiveDenoisingStage,
     _ideogram4_pack,
     _ideogram4_unpack,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
-    _qwen_image_pack,
-    _qwen_image_unpack,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.spectral_ops import (
     dct_2d,
@@ -216,6 +219,15 @@ class TestStageTransitionHelpers(unittest.TestCase):
 
         self.assertEqual(transitions, {2: 2, 3: 4})
 
+    def test_find_transition_steps_keeps_unreached_threshold_before_last_step(self):
+        transitions = find_transition_steps(
+            torch.tensor([1.0, 0.0]),
+            {1: 1.0, 2: 0.5},
+            n_steps=1,
+        )
+
+        self.assertEqual(transitions, {2: 0})
+
     def test_reset_scheduler_clears_solver_state(self):
         scheduler = SimpleNamespace(
             config=SimpleNamespace(solver_order=2),
@@ -322,19 +334,100 @@ class TestProgressiveStageHelpers(unittest.TestCase):
         self.assertEqual(wan_stage._latent_scale_factor(wan_args), 8)
         self.assertEqual(ideogram_stage._latent_scale_factor(ideogram_args), 16)
 
+    def test_wan_dual_transformer_is_passed_to_base_stage(self):
+        transformer_2 = object()
+        with mock.patch.object(
+            ProgressiveDenoisingStage, "__init__", return_value=None
+        ) as base_init:
+            WanProgressiveDenoisingStage(
+                transformer=object(),
+                scheduler=object(),
+                transformer_2=transformer_2,
+            )
+
+        self.assertIs(base_init.call_args.kwargs["transformer_2"], transformer_2)
+
+
+class _OneRowPerIdRotaryEmb:
+    def forward(self, ids):
+        rows = ids[:, :1].float()
+        return rows, rows
+
+
+class _RotaryDiT(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rotary_emb = _OneRowPerIdRotaryEmb()
+
+
+def _freqs_cis_rows_after_resolution_change(stage, pipeline_config, batch) -> int:
+    branch = SimpleNamespace(kwargs={"freqs_cis": None})
+    ctx = SimpleNamespace(
+        cfg_policy=SimpleNamespace(branches=[branch]),
+        pos_cond_kwargs={},
+        target_dtype=torch.float32,
+        latents=torch.zeros(1, device=stage.device),
+    )
+    # Derives vae_scale_factor, as loading the VAE does.
+    pipeline_config.vae_config.post_init()
+    server_args = SimpleNamespace(pipeline_config=pipeline_config)
+    stage._on_resolution_change(ctx, batch, server_args, batch.height, batch.width)
+    return branch.kwargs["freqs_cis"][0].shape[0]
+
+
+class TestFluxResolutionChange(unittest.TestCase):
+    """The RoPE table installed at a stage transition must match the request:
+    one stage instance serves requests whose text length or condition image
+    differ at the same latent size."""
+
+    def test_flux_table_follows_each_request_text_length(self):
+        stage = FluxProgressiveDenoisingStage(_RotaryDiT(), scheduler=None)
+        config = FluxPipelineConfig()
+
+        def rows(text_len: int) -> int:
+            batch = SimpleNamespace(
+                prompt_embeds=[None, torch.zeros(1, text_len, 4)],
+                prompt_seq_lens=[None, [text_len]],
+                pooled_embeds=None,
+                extra={},
+                height=64,
+                width=64,
+            )
+            return _freqs_cis_rows_after_resolution_change(stage, config, batch)
+
+        image_rows = (64 // 16) ** 2
+        self.assertEqual(rows(8), 8 + image_rows)
+        self.assertEqual(rows(5), 5 + image_rows)
+
+    def test_flux2_table_follows_each_request_condition_image(self):
+        stage = Flux2ProgressiveDenoisingStage(_RotaryDiT(), scheduler=None)
+        config = Flux2PipelineConfig()
+
+        def rows(condition_tokens: int) -> int:
+            batch = SimpleNamespace(
+                prompt_embeds=[torch.zeros(1, 8, 4)],
+                prompt_seq_lens=[[8]],
+                image_latent=torch.zeros(1) if condition_tokens else None,
+                condition_image_latent_ids=torch.zeros(
+                    condition_tokens, 4, device=stage.device
+                ),
+                height=64,
+                width=64,
+            )
+            return _freqs_cis_rows_after_resolution_change(stage, config, batch)
+
+        image_rows = (64 // 16) ** 2
+        self.assertEqual(rows(0), 8 + image_rows)
+        self.assertEqual(rows(6), 8 + image_rows + 6)
+
 
 class TestLatentAdapters(unittest.TestCase):
     def test_flux_and_qwen_patchify_roundtrip(self):
         x = torch.arange(1 * 16 * 8 * 12, dtype=torch.float32).reshape(1, 16, 8, 12)
 
-        for name, pack, unpack in (
-            ("flux", _flux_pack, _flux_unpack),
-            ("qwen_image", _qwen_image_pack, _qwen_image_unpack),
-        ):
-            with self.subTest(adapter=name):
-                packed = pack(x, 8, 12)
-                self.assertEqual(packed.shape, (1, (8 // 2) * (12 // 2), 64))
-                torch.testing.assert_close(unpack(packed, 8, 12), x)
+        packed = pack_2x2_latent(x, 8, 12)
+        self.assertEqual(packed.shape, (1, (8 // 2) * (12 // 2), 64))
+        torch.testing.assert_close(unpack_2x2_latent(packed, 8, 12), x)
 
     def test_flux2_row_major_roundtrip(self):
         x = torch.arange(2 * 4 * 3 * 5, dtype=torch.float32).reshape(2, 4, 3, 5)
@@ -476,6 +569,7 @@ class TestIdeogram4OnResolutionChange(unittest.TestCase):
             "ideogram4_neg_attn_mask": neg_attn_mask,
             "ideogram4_neg_attn_mask_meta": None,
             "ideogram4_neg_llm_features": neg_llm_features,
+            "ideogram4_llm_cond": {"positive": torch.zeros(1)},
         }
 
     def test_resolution_change_doubles_image_tokens(self):
@@ -500,6 +594,9 @@ class TestIdeogram4OnResolutionChange(unittest.TestCase):
         ctx = SimpleNamespace(
             latents=torch.zeros(B, new_num_img, self._IN_C),
             extra=self._make_ctx_extra(B, old_num_img, max_text_tokens),
+            # Non-None so _on_resolution_change proceeds (it early-returns when
+            # cfg_policy is None); the value itself is not used further here.
+            cfg_policy=CFGPolicy(),
         )
         batch = SimpleNamespace(
             extra={
@@ -533,6 +630,8 @@ class TestIdeogram4OnResolutionChange(unittest.TestCase):
             ctx.extra["ideogram4_neg_llm_features"].shape,
             (B, new_num_img, self._LLM_DIM),
         )
+        # LLM conditioning projected at the old sequence length is dropped
+        self.assertEqual(ctx.extra["ideogram4_llm_cond"], {})
 
     def test_text_portion_is_unchanged_after_resolution_change(self):
         B = 1
@@ -555,6 +654,9 @@ class TestIdeogram4OnResolutionChange(unittest.TestCase):
         ctx = SimpleNamespace(
             latents=torch.zeros(B, new_grid_h * new_grid_w, self._IN_C),
             extra=self._make_ctx_extra(B, old_grid_h * old_grid_w, max_text_tokens),
+            # Non-None so _on_resolution_change proceeds (it early-returns when
+            # cfg_policy is None); the value itself is not used further here.
+            cfg_policy=CFGPolicy(),
         )
         batch = SimpleNamespace(extra={"ideogram4": old_data})
 
@@ -594,6 +696,9 @@ class TestIdeogram4OnResolutionChange(unittest.TestCase):
         ctx = SimpleNamespace(
             latents=torch.zeros(B, grid_h * grid_w, self._IN_C),
             extra=self._make_ctx_extra(B, old_num_img, max_text_tokens),
+            # Non-None so _on_resolution_change proceeds (it early-returns when
+            # cfg_policy is None); the value itself is not used further here.
+            cfg_policy=CFGPolicy(),
         )
         batch = SimpleNamespace(
             extra={

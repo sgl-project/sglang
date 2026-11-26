@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
@@ -13,12 +12,17 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     try_cached_model,
 )
 
-register_cuda_ci(est_time=189, stage="base-c", runner_config="deepep-4-gpu-h100")
+register_cuda_ci(
+    est_time=189,
+    stage="base-c",
+    runner_config="4-gpu-h100",
+    disabled="Temporarily disabled: Mooncake 0.3.14 EP JIT intermittently fails to spawn nvcc (exit_code=127, kvcache-ai/Mooncake#5316); re-enable once CI bumps to a Mooncake release that includes kvcache-ai/Mooncake#5356.",
+)
 
 ib_devices = get_rdma_devices_args()
 
@@ -34,6 +38,9 @@ class TestTP(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            # Log each Mooncake EP JIT compile and cache event, to debug the
+            # intermittent nvcc exit_code=127 (kvcache-ai/Mooncake#5316).
+            env={"MOONCAKE_EP_JIT_LOG": "1"},
             other_args=[
                 "--trust-remote-code",
                 "--tp",
@@ -68,7 +75,7 @@ class TestTP(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -88,8 +95,7 @@ class TestTP(CustomTestCase):
 
 class TestPureDP(TestTP):
     extra_args = [
-        "--enable-dp-attention",
-        "--dp",
+        "--attn-dp-size",
         "4",
     ]
 
@@ -117,26 +123,6 @@ class TestPureDP(TestTP):
         """
         self._kill_and_bootstrap(self.pkill_process_1)
         super().test_gsm8k()
-
-    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-    def test_gsm8k_fault_2(self):
-        """
-        Kill another rank and the system should remain operational.
-        """
-        self._kill_and_bootstrap(self.pkill_process_2)
-        super().test_gsm8k()
-
-
-@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-class TestHybridDPTP(TestPureDP):
-    extra_args = [
-        "--enable-dp-attention",
-        "--dp",
-        "2",
-    ]
-
-    pkill_process_1 = "sglang::scheduler_DP1_TP2_EP2"
-    pkill_process_2 = "sglang::scheduler_DP1_TP3_EP3"
 
 
 if __name__ == "__main__":

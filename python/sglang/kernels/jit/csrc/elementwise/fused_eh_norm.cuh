@@ -10,7 +10,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-namespace {
+namespace sglang {
 
 struct FusedEHNormParams {
   const void* __restrict__ embeds;
@@ -83,7 +83,7 @@ struct FusedEHNormKernel {
     auto device_ = SymbolicDevice{};
     H.set_value(kHidden);
     H2.set_value(kHidden * 2);
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, H}).with_strides({SE, 1}).with_dtype<T>().with_device(device_).verify(embeds);
     TensorMatcher({N, H}).with_strides({SP, 1}).with_dtype<T>().with_device(device_).verify(previous_hidden);
@@ -110,4 +110,4 @@ struct FusedEHNormKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

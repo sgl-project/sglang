@@ -45,6 +45,8 @@
 #include <sstream>
 #include <utility>
 
+namespace sglang {
+
 namespace host {
 
 template <typename>
@@ -98,22 +100,22 @@ struct RuntimeCheck {
   template <typename Cond>
   explicit RuntimeCheck(Cond&& condition, Args&&... args, DebugInfo location = {}) {
     if (condition) return;
-    [[unlikely]] ::host::panic(location, std::forward<Args>(args)...);
+    [[unlikely]] host::panic(location, std::forward<Args>(args)...);
   }
   template <typename Cond>
   explicit RuntimeCheck(DebugInfo location, Cond&& condition, Args&&... args) {
     if (condition) return;
-    [[unlikely]] ::host::panic(location, std::forward<Args>(args)...);
+    [[unlikely]] host::panic(location, std::forward<Args>(args)...);
   }
 };
 
 template <typename... Args>
 struct Panic {
   explicit Panic(Args&&... args, DebugInfo location = {}) {
-    ::host::panic(location, std::forward<Args>(args)...);
+    host::panic(location, std::forward<Args>(args)...);
   }
   explicit Panic(DebugInfo location, Args&&... args) {
-    ::host::panic(location, std::forward<Args>(args)...);
+    host::panic(location, std::forward<Args>(args)...);
   }
   [[noreturn]] ~Panic() {
     std::terminate();
@@ -176,24 +178,17 @@ inline auto irange(T start, T end) {
 
 /** \brief Error class for stream-style error logging. */
 struct Error {
-  Error(DebugInfo location = {}) {
-    m_oss << "Failed at " << location.file_name() << ":" << location.line() << ": ";
+  std::ostringstream stream;
+  explicit Error(DebugInfo location = {}) {
+    stream << "Failed at " << location.file_name() << ":" << location.line() << ": ";
   }
-
-  template <typename T>
-  Error& operator<<(T&& arg) {
-    m_oss << std::forward<T>(arg);
-    return *this;
-  }
-
   [[noreturn]]
   ~Error() noexcept(false) {
-    throw PanicError(std::move(m_oss).str());
+    throw PanicError(std::move(stream).str());
   }
-
- private:
-  std::ostringstream m_oss;
 };
+
+#define SGL_PANIC ::sglang::host::Error().stream
 
 /**
  * \brief 0-overhead CHECK macro for host code. This can avoid unnecessary
@@ -201,11 +196,11 @@ struct Error {
  *
  * Usage: CHECK_HOST(ptr != nullptr) << "Pointer must not be null";
  */
-// The empty-true-branch if/else form keeps a trailing `else` in user code
-// bound to the user's `if`, not to the macro's.
 #define CHECK_HOST(COND) \
   if (COND) [[likely]] { \
   } else                 \
-    ::host::Error()
+    SGL_PANIC
 
 }  // namespace host
+
+}  // namespace sglang

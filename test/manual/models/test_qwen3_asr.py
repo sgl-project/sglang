@@ -156,9 +156,9 @@ async def _stream_websocket_async(
 
     async with websockets.connect(websocket_url) as websocket:
         created = json.loads(await websocket.recv())
-        assert (
-            created.get("type") == "session.created"
-        ), f"expected session.created, got {created!r}"
+        assert created.get("type") == "session.created", (
+            f"expected session.created, got {created!r}"
+        )
         session_id = created["session"]["id"]
 
         transcription_cfg = {"model": "qwen3-asr"}
@@ -200,9 +200,9 @@ async def _stream_websocket_async(
                 if t == "conversation.item.input_audio_transcription.delta":
                     deltas.append(resp["delta"])
                 elif t == "conversation.item.input_audio_transcription.completed":
-                    assert (
-                        "usage" in resp
-                    ), f"transcription.completed missing required usage field: {resp!r}"
+                    assert "usage" in resp, (
+                        f"transcription.completed missing required usage field: {resp!r}"
+                    )
                     assert resp["usage"].get("type") == "duration", resp["usage"]
                     completed_msg.update(resp)
                     return
@@ -317,7 +317,7 @@ class TestQwen3ASRTranscription(CustomTestCase):
             self.assertEqual(
                 results[0],
                 results[i],
-                f"Request {i+1} differs from first request",
+                f"Request {i + 1} differs from first request",
             )
         print(f"[Consistency] All 3 requests match: {results[0][:80]}...")
 

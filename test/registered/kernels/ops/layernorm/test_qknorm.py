@@ -6,11 +6,14 @@ import torch
 import triton
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
-register_cuda_ci(est_time=148, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=130, stage="nightly", runner_config="1-gpu-small")
+# backend-specific: ROCm tensors must pass the JIT launchers' DLPack device checks.
+register_amd_ci(est_time=30, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 def sglang_aot_qknorm(
@@ -51,22 +54,6 @@ def flashinfer_qknorm(
     rmsnorm(k, k_weight, out=k)
 
 
-@torch.compile()
-def torch_impl_qknorm(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    eps: float = 1e-6,
-) -> None:
-    q_mean = q.float().pow(2).mean(dim=-1, keepdim=True)
-    k_mean = k.float().pow(2).mean(dim=-1, keepdim=True)
-    q_norm = (q_mean + eps).rsqrt()
-    k_norm = (k_mean + eps).rsqrt()
-    q.copy_(q.float() * q_norm * q_weight.float())
-    k.copy_(k.float() * k_norm * k_weight.float())
-
-
 BS_LIST = [2**n for n in range(0, 14)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
 BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 256, 4109])
@@ -81,6 +68,7 @@ DTYPE = torch.bfloat16
 # so we allow a small rel/abs tolerance in correctness test.
 
 
+@pytest.mark.skipif(is_hip(), reason="The AOT reference requires CUDA")
 @pytest.mark.parametrize(
     "batch_size,n_k,n_q,head_dim",
     list(itertools.product(BS_LIST, N_K_LIST, N_Q_LIST, HEAD_DIM_LIST)),
@@ -96,6 +84,80 @@ def test_qknorm(batch_size: int, n_k: int, n_q: int, head_dim: int) -> None:
     sglang_jit_qknorm(q_k_jit[0], q_k_jit[1], q_weight, k_weight)
     triton.testing.assert_close(q_k_aot[0], q_k_jit[0], atol=1e-2, rtol=1e-2)
     triton.testing.assert_close(q_k_aot[1], q_k_jit[1], atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "dtype,pad", [(torch.bfloat16, 0), (torch.float16, 0), (torch.bfloat16, 4)]
+)
+def test_two_rows_per_warp_match_one_row_per_warp(dtype: torch.dtype, pad: int) -> None:
+    """head_dim 128 runs two rows per warp; its bytes must equal the one-row-per-warp
+    kernel's. q and k slice one qkv row as Qwen3 passes them; 5 q heads put a q/k
+    boundary inside a row pair, the odd row count leaves the last warp one row, and
+    4099 tokens need more than one pass of the persistent grid on H100 and B200.
+    pad=4 leaves odd tokens only 8 B aligned, so the launcher must keep one row per warp."""
+    from sglang.kernels.ops.layernorm.norm import _jit_qknorm_module
+
+    T, Hq, Hk, D = 4099, 5, 2, 128
+    g = torch.Generator(device="cpu").manual_seed(0)
+    qkv = (3 * torch.randn(T, (Hq + 2 * Hk) * D + pad, generator=g)).to(DEVICE, dtype)
+    qw = (torch.rand(D, generator=g) + 0.5).to(DEVICE, dtype)
+    kw = (torch.rand(D, generator=g) + 0.5).to(DEVICE, dtype)
+    outputs = []
+    for half_warp in (False, True):
+        out = qkv.clone()
+        q = out[:, : Hq * D].view(T, Hq, D)
+        k = out[:, Hq * D : (Hq + Hk) * D].view(T, Hk, D)
+        _jit_qknorm_module(D, dtype, half_warp=half_warp).qknorm(q, k, qw, kw, 1e-6)
+        outputs.append(out)
+    assert torch.equal(outputs[0], outputs[1])
+
+
+@pytest.mark.parametrize("head_dim", [128, 512])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_qknorm_packed_qkv(head_dim: int, dtype: torch.dtype) -> None:
+    """Both fused launchers must accept ROCm tensors and packed-QKV strides."""
+    from sglang.kernels.ops.layernorm.norm import can_use_fused_inplace_qknorm
+
+    batch_size, n_q, n_k = 9, 32, 8
+    qkv = torch.randn(
+        batch_size, (n_q + 2 * n_k) * head_dim, device=DEVICE, dtype=dtype
+    )
+    q, k, v = qkv.split([n_q * head_dim, n_k * head_dim, n_k * head_dim], dim=-1)
+    q = q.view(batch_size, n_q, head_dim)
+    k = k.view(batch_size, n_k, head_dim)
+    v_ref = v.clone()
+    q_weight = torch.randn(head_dim, device=DEVICE, dtype=dtype)
+    k_weight = torch.randn(head_dim, device=DEVICE, dtype=dtype)
+    expected = []
+    for x, weight in [(q, q_weight), (k, k_weight)]:
+        x_fp32 = x.float()
+        normed = x_fp32 * (x_fp32.square().mean(dim=-1, keepdim=True) + 1e-6).rsqrt()
+        expected.append((normed * weight.float()).to(dtype))
+
+    assert can_use_fused_inplace_qknorm(head_dim, dtype)
+    sglang_jit_qknorm(q, k, q_weight, k_weight)
+
+    torch.testing.assert_close(q, expected[0], atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k, expected[1], atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v, v_ref, atol=0, rtol=0)
+
+
+def test_apply_qk_norm_empty_batch() -> None:
+    """An idle DP-attention rank passes zero tokens, which cannot be viewed per head."""
+    from sglang.srt.layers.layernorm import RMSNorm
+    from sglang.srt.models.utils import apply_qk_norm
+    from sglang.srt.runtime_context import publish
+    from sglang.srt.server_args import ServerArgs
+
+    publish(ServerArgs(model_path="dummy"), role="test")
+    head_dim = 128
+    norm = RMSNorm(head_dim).to(DEVICE, DTYPE)
+    q = torch.empty(0, 32 * head_dim, device=DEVICE, dtype=DTYPE)
+    k = torch.empty(0, 8 * head_dim, device=DEVICE, dtype=DTYPE)
+
+    q_out, k_out = apply_qk_norm(q, k, norm, norm, head_dim)
+
+    assert q_out.shape == q.shape and k_out.shape == k.shape
 
 
 if __name__ == "__main__":

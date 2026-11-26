@@ -27,7 +27,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if sys.path and Path(sys.path[0]).resolve() == SCRIPT_DIR:
     sys.path.pop(0)
 
-from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (  # noqa: E402
+from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (  # noqa: E402
     pack_msgpack,
     unpack_msgpack,
 )
@@ -43,7 +43,6 @@ class Pi05BenchProfile:
     sglang_action_horizon: int
     openpi_action_horizon: int
     action_dim: int
-    output_action_dim: int
 
 
 PROFILES = {
@@ -56,7 +55,6 @@ PROFILES = {
         sglang_action_horizon=50,
         openpi_action_horizon=50,
         action_dim=32,
-        output_action_dim=7,
     ),
     "aloha": Pi05BenchProfile(
         name="aloha",
@@ -67,7 +65,6 @@ PROFILES = {
         sglang_action_horizon=50,
         openpi_action_horizon=50,
         action_dim=32,
-        output_action_dim=14,
     ),
 }
 
@@ -681,10 +678,10 @@ def create_sglang_python_pipeline(
 
 
 def _make_sglang_python_req(server_args, payload: dict[str, Any]):
-    from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-    from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
+    from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
         build_action_sampling_params,
     )
+    from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 
     sampling_params = build_action_sampling_params(payload, server_args)
     req = prepare_request(server_args, sampling_params)
@@ -729,7 +726,9 @@ def run_sglang_python(
         model_path,
         pipeline_config_path=pipeline_config_path,
     )
-    from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import action_metadata
+    from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
+        action_metadata,
+    )
 
     metadata = action_metadata(server_args)
     metadata["precision"] = sglang_precision_metadata(pipeline)
@@ -1148,7 +1147,6 @@ def main() -> None:
             sglang_action_horizon=profile.sglang_action_horizon,
             openpi_action_horizon=profile.openpi_action_horizon,
             action_dim=profile.action_dim,
-            output_action_dim=profile.output_action_dim,
         )
     openpi_config = args.openpi_config or profile.openpi_config
     openpi_checkpoint = args.openpi_checkpoint or profile.openpi_checkpoint

@@ -14,29 +14,62 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, List, Literal, Optional
+from typing import Any, List, Optional
 
 import addict
 import yaml
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.attention_roles import (
+    AttentionRole,
+    split_component_role_key,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+    LAYERWISE_OFFLOAD,
+    RESIDENT,
+    SNAPSHOT_OFFLOAD,
+    normalize_component_residency,
+    resolve_component_residency_mode,
+    resolve_diffusers_pipeline_offload,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
-    cpu_offload_flags_for_layerwise_components,
+    LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
+    LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
+    LAYERWISE_OFFLOAD_VAE_GROUP,
+    RESIDENCY_LIFETIME_FORWARD,
+    RESIDENCY_LIFETIME_PERMANENT,
+    RESIDENCY_LIFETIMES,
+    RESIDENCY_POLICIES,
+    RESIDENCY_POLICY_LEADING,
+    cpu_offload_component_matches,
+    is_dit_component_name,
+    is_image_encoder_component_name,
+    is_legacy_dit_offload_component_name,
+    is_text_encoder_component_name,
+    is_vae_component_name,
     layerwise_component_matches_any_selection,
+    normalize_cpu_offload_components,
     normalize_layerwise_offload_components,
+)
+from sglang.multimodal_gen.runtime.managers.request_watchdog import (
+    parse_request_time_limits,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -47,9 +80,12 @@ from sglang.multimodal_gen.runtime.server_args.auto_tune import (
     ServerArgsAutoTuner,
 )
 from sglang.multimodal_gen.runtime.server_args.disagg import DisaggServerArgsMixin
+from sglang.multimodal_gen.runtime.utils.argparse import (
+    FlexibleArgumentParser,
+    StoreBoolean,
+)
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
-    is_valid_ipv6_address,
     normalize_gpu_ids,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -57,38 +93,74 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
-from sglang.multimodal_gen.utils import (
-    FlexibleArgumentParser,
-    StoreBoolean,
-    expand_path_fields,
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.weights.source import (
+    is_explicit_weight_file_reference,
 )
+from sglang.srt.environ import envs as srt_envs
+from sglang.srt.environ import validate_env_values
+from sglang.srt.utils.network import is_valid_ipv6_address
 
 logger = init_logger(__name__)
 
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "resident")
-LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = (*LTX2_TWO_STAGE_DEVICE_MODES, "snapshot")
+LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = LTX2_TWO_STAGE_DEVICE_MODES
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 LORA_MERGE_MODES = ("auto", "merge", "dynamic")
+MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
+# Mirrors AttentionBackend.supports_ring_rotation; the name-level check
+# runs before backend classes are importable on every platform.
+RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn", "aiter")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
-    mode = mode.lower()
-    if mode == "snapshot":
-        logger.warning(
-            "ltx2_two_stage_device_mode=snapshot is deprecated and is treated "
-            "as original. Please use ltx2_two_stage_device_mode=original or "
-            "resident instead. This alias may be removed after two release cycles."
-        )
-        return "original"
-    return mode
+    return mode.lower()
 
 
 def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
     return pipeline_class_name in LTX2_TWO_STAGE_PIPELINE_NAMES
+
+
+def _infer_direct_constructor_explicit_arg_names(server_args) -> set[str]:
+    explicit_arg_names: set[str] = set()
+    for attr in dataclasses.fields(server_args):
+        if not attr.init or attr.name == "_explicit_arg_names":
+            continue
+
+        value = getattr(server_args, attr.name)
+        if attr.default is not dataclasses.MISSING:
+            default = attr.default
+        elif attr.default_factory is not dataclasses.MISSING:
+            default = attr.default_factory()
+        else:
+            explicit_arg_names.add(attr.name)
+            continue
+
+        if value != default:
+            explicit_arg_names.add(attr.name)
+
+    return explicit_arg_names
+
+
+def _normalize_component_precisions(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("component_precisions must be a mapping")
+
+    normalized: dict[str, str] = {}
+    for component, precision in value.items():
+        component_name = str(component).strip().replace("-", "_")
+        precision_name = str(precision).strip().lower()
+        if not component_name or precision_name not in PRECISION_TO_TYPE:
+            raise ValueError(
+                "Component precision entries require a component and one of "
+                f"{sorted(PRECISION_TO_TYPE)}"
+            )
+        normalized[component_name] = precision_name
+    return normalized
 
 
 class Backend(str, Enum):
@@ -128,9 +200,19 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
+        "anima-base-v1.0-diffusers",
+        "black-forest-labs/flux.1-dev",
+        "circlestone-labs/anima-base-v1.0-diffusers",
         "comfy-org/ideogram-4",
+        "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
+        "efficient-large-model/sana-video_2b_480p_diffusers",
+        "efficient-large-model/sana-video_2.0_5b_720p",
+        "sana1.5_1.6b_1024px_diffusers",
+        "sana-video_2b_480p_diffusers",
+        "sana-video_2.0_5b_720p",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
+        "flux.1-dev",
         "glm-image",
         "ideogram-4",
         "ideogram-4-fp8",
@@ -139,28 +221,73 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-v4-instant",
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
+        "jdopensource/joyai-echo",
+        "joyai-echo",
+        "lightricks/ltx-2",
+        "lightricks/ltx-2.3",
+        "lightricks/ltx-2.5-diffusers",
+        "meituan-longcat/longcat-image",
+        "meituan-longcat/longcat-image-edit-turbo",
+        "ltx-2",
+        "ltx-2.3",
+        "ltx-2.5-diffusers",
         "minimax-h3",
+        "minimax-h3-image",
         "minimaxai/minimax-h3",
+        "minimaxai/minimax-h3-image",
+        "inclusionai/ming-image-0.1-design",
+        "inclusionai/ming-image-0.1-design-layer",
+        "ming-image-0.1-design",
+        "ming-image-0.1-design-layer",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
+        "qwen/qwen-image-2.1",
         "qwen-image",
         "qwen-image-2512",
+        "qwen-image-2.1",
         "tongyi-mai/z-image",
         "tongyi-mai/z-image-turbo",
         "zai-org/glm-image",
         "z-image",
         "z-image-turbo",
+        "black-forest-labs/flux.2-klein-4b",
+        "black-forest-labs/flux.2-klein-9b",
+        "flux.2-klein-4b",
+        "flux.2-klein-9b",
     }
 )
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
+        "AnimaPipelineConfig",
+        "Flux3ImagePipelineConfig",
+        "FluxPipelineConfig",
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
+        "JoyEchoPipelineConfig",
+        "LTX2PipelineConfig",
+        "LTX23PipelineConfig",
+        "LongCatImagePipelineConfig",
+        "LongCatImageEditPipelineConfig",
         "MiniMaxH3PipelineConfig",
+        "MiniMaxH3ImagePipelineConfig",
+        "MingImagePipelineConfig",
+        "MingImageLayerPipelineConfig",
         "QwenImagePipelineConfig",
+        "QwenImage21PipelineConfig",
+        "SanaPipelineConfig",
+        "SanaVideoPipelineConfig",
+        "SanaVideo2PipelineConfig",
         "ZImagePipelineConfig",
+        "Flux2KleinPipelineConfig",
     }
+)
+
+# Pipeline configs identified purely by ``--pipeline-class-name`` (their weights
+# are local paths, not HuggingFace ids), so the model-id whitelist does not
+# apply: selecting the pipeline is already an explicit opt-in.
+BREAKABLE_CUDA_GRAPH_MODEL_ID_EXEMPT_PIPELINE_CONFIGS = frozenset(
+    {"Flux3ImagePipelineConfig"}
 )
 
 
@@ -188,14 +315,33 @@ class ServerArgs(DisaggServerArgsMixin):
     # explicit model ID override (e.g. "Qwen-Image")
     model_id: str | None = None
 
+    # served model name exposed via /v1/models and generation responses
+    served_model_name: str | None = None
+
     # Model backend (sglang native or diffusers)
     backend: Backend = Backend.AUTO
 
     # Attention
     attention_backend: str = None
+    # Time the viable attention backends on the model's own tensors during
+    # warmup and keep the fastest per layer. Off by default: it has only been
+    # measured on sm90 and sm12x.
+    enable_attention_backend_autotune: bool = False
     attention_backend_config: addict.Dict | None = None
     component_attention_backends: dict[str, str] | str | None = field(
         default_factory=dict
+    )
+    _requested_component_attention_backends: dict[str, str] | None = field(
+        default=None, repr=False, compare=False
+    )
+    # Role-qualified overrides (``<component>.<role>``) live in their own map so
+    # ``component_attention_backends`` stays a plain component -> backend dict for
+    # every consumer that looks a component up by name.
+    component_attention_backend_roles: dict[str, dict[str, str]] = field(
+        default_factory=dict
+    )
+    _requested_component_attention_backend_roles: dict[str, dict[str, str]] | None = (
+        field(default=None, repr=False, compare=False)
     )
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
@@ -203,6 +349,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
+    enable_nccl_nvls: bool = False
 
     # HuggingFace specific parameters
     trust_remote_code: bool = False
@@ -213,16 +360,28 @@ class ServerArgs(DisaggServerArgsMixin):
     performance_mode: str = "auto"
     base_gpu_id: int = 0
     gpu_ids: list[int] | None = None
+    # i-th entry: NUMA node of the worker on local GPU i; None auto-detects
+    numa_node: list[int] | None = None
+    # cross-node: num_gpus is the total world size across all nodes; each
+    # node runs num_gpus // nnodes local GPU workers (mirrors srt's
+    # tp_size_per_node convention)
+    nnodes: int = 1
+    node_rank: int = 0
+    dist_init_addr: str | None = None
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
     ulysses_degree: Optional[int] = None
     ring_degree: Optional[int] = None
+    # rows split inside attention, exchanged with one K/V all-gather instead
+    # of Ulysses a2a or ring rotation; auto-assigned at sp_degree=2 when no SP
+    # degree is set explicitly
+    kv_gather_degree: Optional[int] = None
+    # whether the SP split was auto-assigned (lets layers fall back per call)
+    sp_split_auto: bool = False
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
-    # number of gpu in a dp group
-    dp_degree: int = 1
     # cfg parallel (None = auto-decide based on num_gpus)
     enable_cfg_parallel: Optional[bool] = None
     # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
@@ -236,6 +395,7 @@ class ServerArgs(DisaggServerArgsMixin):
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
     dist_timeout: int | None = 3600  # 1 hour
+    scheduler_rpc_timeout: int | None = None
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
@@ -249,21 +409,45 @@ class ServerArgs(DisaggServerArgsMixin):
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_alpha: int | None = None  # Override training alpha when metadata omits it
     lora_merge_mode: str = "auto"
     lora_weight_name: str | None = None
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
+    # Exact weight-file overrides retain the base component configuration.
+    component_weights_paths: dict[str, str] = field(default_factory=dict)
+    # Opt in one component to a loader-specific direct-GPU weight path.  The
+    # existing --direct-gpu-weight-loading remains the primary-DiT control.
+    component_direct_gpu_weight_loading: dict[str, bool] = field(default_factory=dict)
+    # Explicit quantization override for one component. Self-describing
+    # checkpoints remain auto-detected and do not need this override.
+    component_quantizations: dict[str, str] = field(default_factory=dict)
+    # Exact load and execution precision overrides for components whose native
+    # loader advertises this capability.
+    component_precisions: dict[str, str] = field(default_factory=dict)
+    # Component-local layer name patterns to skip during online quantization.
+    component_quantization_ignored_layers: dict[str, list[str]] = field(
+        default_factory=dict
+    )
+    # Optional LTX-2.5 decoder is large enough to load only when requested.
+    load_diffusion_decoder: bool = False
 
-    # path to pre-quantized transformer weights (single .safetensors or directory).
+    # Pre-quantized transformer weights: safetensors file/directory or GGUF file.
     transformer_weights_path: str | None = None
-    # Per-component transformer weight overrides (key = model_index.json component name).
-    # Pipelines use this when a checkpoint ships separate quantized weights for
-    # secondary DiT components; the generic loader consumes it without model-specific
-    # filename logic.
-    component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
-
-    # Quantization method for online quantization
+    # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
+    minimax_h3_adaln_cache_path: str | None = None
+    # None lets the model choose; False explicitly keeps resident projections.
+    minimax_h3_adaln_online: bool | None = None
+    # None chooses 2 for image releases, otherwise MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
+    minimax_h3_adaln_plan_width: int | None = None
+    # Pinned-host cache for built AdaLN plans (decimal GB, 0 disables). Plans
+    # evicted from the GPU slab swap back in from here instead of re-reading
+    # the 24.2 GiB checkpoint. Expert knobs (GPU slot count, fp32 rebuild)
+    # live in envs.py as SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*.
+    minimax_h3_adaln_host_cache_gb: float | None = None
+    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
+    # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
     # Layer name patterns to skip during online quantization
     quantization_ignored_layers: list[str] | None = None
@@ -273,13 +457,36 @@ class ServerArgs(DisaggServerArgsMixin):
     lora_target_modules: list[str] | None = None
 
     # CPU offload parameters
+    # Exact component keys or component groups mapped to a residency mode.
+    component_residency: dict[str, str] | list[str] | str | None = None
+    # Exact component keys from model_index.json, or a legacy component group.
+    cpu_offload_components: list[str] | None = None
     dit_cpu_offload: bool | None = None
+    # trade checkpoint-loading peak memory for faster ordinary DiT startup
+    direct_gpu_weight_loading: bool = False
     # if true, select the DiT layerwise group
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
-    # If set, keep this many leading DiT layers resident on GPU
+    # If set, keep this many DiT layers resident on GPU
     dit_layerwise_resident_layers: float = 0.0
+    # Which layers those are: the leading ones, or spread evenly over the stack.
+    dit_layerwise_residency_policy: str = RESIDENCY_POLICY_LEADING
+    # How long they stay: while the DiT runs for a request, or for the life of
+    # the server.
+    dit_layerwise_residency_lifetime: str = RESIDENCY_LIFETIME_FORWARD
+    # Per-component overrides of the four knobs above; an entry wins for that
+    # component.
+    layerwise_prefetch_size: dict[str, float] | str | None = field(default_factory=dict)
+    layerwise_resident_layers: dict[str, float] | str | None = field(
+        default_factory=dict
+    )
+    layerwise_residency_policy: dict[str, str] | str | None = field(
+        default_factory=dict
+    )
+    layerwise_residency_lifetime: dict[str, str] | str | None = field(
+        default_factory=dict
+    )
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -288,6 +495,15 @@ class ServerArgs(DisaggServerArgsMixin):
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
+    _required_resident_components: set[str] = field(
+        default_factory=set, init=False, repr=False
+    )
+    _fsdp_disabled_components: set[str] = field(
+        default_factory=set, init=False, repr=False
+    )
+    _component_layerwise_capabilities: dict[str, bool] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     # ComfyUI integration
     comfyui_mode: bool = False
@@ -296,15 +512,21 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_torch_compile: bool = False
     regional_compile: bool = False
 
+    # PyTorch's two approximate numerics defaults, set explicitly per worker
+    # (see runtime/utils/numerics_policy.py). They are process-global, so they
+    # cannot follow a request's quality level; the defaults keep PyTorch's own
+    # values so the exact tier's speed is unchanged.
+    allow_cudnn_tf32: bool = True
+    allow_bf16_reduced_precision_reduction: bool = True
     # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
     # segments split at attention modules (SP all-to-all / dynamic attention
     # stay eager). Mutually exclusive with --enable-torch-compile and
     # Cache-DiT; BCG takes priority when more than one is requested.
     #
-    # BCG graphs are resolution-specific, so --warmup-resolutions is required
-    # when BCG is enabled: every requested resolution is captured at warmup so
-    # serving never triggers a fresh capture.
-    enable_breakable_cuda_graph: bool = False
+    # BCG graphs are resolution-specific: every warmup resolution is captured at
+    # warmup so serving never triggers a fresh capture. None resolves in
+    # _adjust_breakable_cuda_graph_support (on for opted-in pipelines).
+    enable_breakable_cuda_graph: bool | None = None
     # Text/prompt sequence-length padding budget for BCG. Prompt-conditioning
     # inputs are padded up to the smallest bucket that fits, so prompts of
     # different lengths reuse one captured graph. Warmup captures one graph per
@@ -315,33 +537,34 @@ class ServerArgs(DisaggServerArgsMixin):
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
 
-    # warmup
-    # `warmup_mode` is the canonical knob: one of WARMUP_MODES
+    # Warmup is controlled by the canonical `warmup_mode` knob: one of WARMUP_MODES.
     #   - "off":     no warmup.
     #   - "server":  server-based warmup — a synthetic request right after the
     #                server is ready, before real traffic
     #   - "request": request-based warmup — warm on the first real request(s).
-    #                This is a BENCHMARK aid
-    # existing consumers keep working) and as deprecated CLI aliases. None means
-    # "derive the mode from the legacy booleans"; _adjust_warmup resolves it.
+    #                This is a BENCHMARK aid.
+    # None is resolved by _adjust_warmup from the selected runtime features.
     warmup_mode: str | None = None
 
-    # deprecated: warmup and server_warmup
-    warmup: bool = False
-    server_warmup: bool = False
-
     warmup_resolutions: list[str] = None
+    warmup_num_frames: int | None = None
     warmup_steps: int = 1
+    # JSON overrides for the representative request shape used by synthetic
+    # warmup and automatic residency planning. Execution remains bounded by
+    # warmup_steps and the server warmup frame/area caps.
+    warmup_sampling_params: dict[str, Any] | str | None = None
 
     disable_autocast: bool | None = None
-
-    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
-    # When set, the transformer loader will use this instead of auto-detection.
-    quantization: str | None = None
 
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
         default_factory=NunchakuSVDQuantArgs, repr=False
+    )
+
+    # KV-cache quantization (Quant-VideoGen PRQ). Off by default; mirrors the
+    # SRT --kv-cache-dtype pattern (typed config, not a pile of env vars).
+    kv_cache_quant_config: QVGKVQuantArgs = field(
+        default_factory=QVGKVQuantArgs, repr=False
     )
 
     # Master port for distributed inference
@@ -350,17 +573,29 @@ class ServerArgs(DisaggServerArgsMixin):
     # http server endpoint config
     host: str | None = "127.0.0.1"
     port: int | None = 30000
+    http_graceful_shutdown_timeout: int | None = None
+    # Request watchdog (runtime/managers/request_watchdog.py): SECONDS or TASK=SECONDS
+    # entries; a request executing longer turns /health unhealthy. Unset: off.
+    request_time_limit: list[str] | None = None
+    enable_metrics: bool = False
+    # HTTP auth, as the LLM server's --api-key / --admin-api-key; kept out of logs.
+    api_key: str | None = field(default=None, repr=False)
+    admin_api_key: str | None = field(default=None, repr=False)
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+    # settled ingress ports, one per DP replica; None until ports are settled
+    scheduler_ports: list[int] | None = None
     batching_mode: str = "dynamic"
     batching_max_size: int = 1
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
     enable_batching_metrics: bool = False
+    async_output_save: bool = False
+    sleep_on_idle: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -385,29 +620,21 @@ class ServerArgs(DisaggServerArgsMixin):
         }
     )
 
-    # # DMD parameters
-    # dmd_denoising_steps: List[int] | None = field(default=None)
-
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
     disagg_timeout: int = 3600
-    disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
-    disagg_instance_id: int = 0
-    disagg_max_slots_per_instance: int = 8
-    disagg_transfer_redundancy: float = 1.25
-    disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
-    disagg_transfer_backend: Literal["auto", "mock", "mooncake"] = "auto"
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
-    disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
     disagg_p2p_hostname: str = "127.0.0.1"
     disagg_ib_device: str | None = None
     disagg_server_addr: str | None = None
     encoder_urls: str | None = None
+    prompt_encoder_urls: str | None = None
+    image_encoder_urls: str | None = None
     denoiser_urls: str | None = None
     decoder_urls: str | None = None
     encoder_tp: int | None = None
@@ -416,11 +643,8 @@ class ServerArgs(DisaggServerArgsMixin):
     denoiser_ulysses: int | None = None
     denoiser_ring: int | None = None
     decoder_sp: int | None = None
-    decoder_tp: int | None = None
     pool_work_endpoint: str | None = None
     pool_result_endpoint: str | None = None
-    pool_control_endpoint: str | None = None
-    pool_control_advertised_endpoint: str | None = None
 
     # Logging
     log_level: str = "info"
@@ -430,29 +654,40 @@ class ServerArgs(DisaggServerArgsMixin):
     log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
     enable_cache_report: bool = False
+    disable_conditioning_cache: bool = False
+    conditioning_cache_max_size_mb: float = 512.0
 
     # Tracing
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    otlp_service_name: str | None = None
 
     # SGLang backend for encoder stage
     srt_encoder_url: str | None = None
-    srt_encoder_connect_timeout: int = 3.05
+    srt_encoder_connect_timeout: float = 3.05
     srt_encoder_timeout: int = 100
 
     # SGLang server for PE model inference
     pe_server_url: str | None = None
+    prompt_enhancer_config: str | None = None
 
     @property
     def broker_port(self) -> int:
         return self.port + 1
 
     @property
-    def is_local_mode(self) -> bool:
-        """
-        If no server is running when a generation task begins, 'local_mode' will be enabled: a dedicated server will be launched
-        """
-        return self.host is None or self.port is None
+    def cancel_endpoint(self) -> str | None:
+        # the HTTP server publishes cancelled request ids here to every replica driver
+        if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
+            return None
+        return f"ipc://{tempfile.gettempdir()}/sglang-diffusion-cancel-{self.port}"
+
+    @property
+    def progress_endpoint(self) -> str | None:
+        # replica drivers send video progress here; ipc only reaches this node
+        if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
+            return None
+        return f"ipc://{tempfile.gettempdir()}/sglang-diffusion-progress-{self.port}"
 
     def _adjust_path(self):
         expand_path_fields(self)
@@ -460,18 +695,25 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
+        self._normalize_component_residency()
+        self._adjust_cpu_offload_components()
         auto_tuner = ServerArgsAutoTuner(self)
         auto_tuner.adjust_based_on_performance_mode()
-        self._adjust_disagg_parallelism_aliases()
         if auto_tuner.could_override_server_args():
             self._adjust_offload()
             auto_tuner.maybe_adjust_auto_default_layerwise_offload()
         self._adjust_ltx2_two_stage_device_mode()
         if auto_tuner.could_override_server_args():
-            auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
+            auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
+            auto_tuner.maybe_plan_extra_dit_residency()
         self._adjust_path()
+        if self.served_model_name is None:
+            self.served_model_name = self.model_id or self.model_path
+        if self.admin_api_key is None:
+            # --admin-api-key wins; without it the server takes SGLANG_ADMIN_API_KEY.
+            self.admin_api_key = srt_envs.SGLANG_ADMIN_API_KEY.get() or None
         self._adjust_quant_config()
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
@@ -485,38 +727,64 @@ class ServerArgs(DisaggServerArgsMixin):
         auto_tuner.finalize_auto_flags()
         self.adjust_pipeline_config()
 
-    def _adjust_disagg_parallelism_aliases(self):
-        if self.decoder_tp is None:
-            return
-        if self.decoder_sp is not None and self.decoder_sp != self.decoder_tp:
-            raise ValueError(
-                "decoder_tp is deprecated in favor of decoder_sp; "
-                "please set only one of them or keep the same value."
-            )
-        if self.decoder_sp is None:
-            logger.warning(
-                "decoder_tp is deprecated and is treated as decoder_sp for "
-                "decoder/VAE parallel decode. Please use decoder_sp instead."
-            )
-            self.decoder_sp = self.decoder_tp
-
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        validate_env_values()
+        self._validate_scheduler_rpc_timeout()
+        timeout = self.http_graceful_shutdown_timeout
+        if timeout is not None and (
+            not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 0
+        ):
+            raise ValueError(
+                "http_graceful_shutdown_timeout must be None or a non-negative "
+                "integer in seconds"
+            )
         self._validate_pipeline()
         self._validate_offload()
+        self._validate_direct_gpu_weight_loading()
+        if self.lora_alpha is not None and self.lora_alpha <= 0:
+            raise ValueError("lora_alpha must be a positive integer")
         if not current_platform.is_cpu():
             self._validate_parallelism()
         self._validate_cfg_parallel()
         self._validate_batching()
         self._validate_breakable_cuda_graph()
+        self._validate_minimax_h3_adaln()
+        parse_request_time_limits(self.request_time_limit)
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_minimax_h3_adaln(self) -> None:
+        # Warn, not raise: config-file and from_kwargs construction mark every
+        # provided key as explicit, so a shared base config pinning the
+        # default (or 0) must not fail non-online launches.
+        if self.minimax_h3_adaln_online:
+            return
+        if self.is_arg_explicitly_set("minimax_h3_adaln_host_cache_gb"):
+            logger.warning(
+                "--minimax-h3-adaln-host-cache-gb only takes effect with "
+                "--minimax-h3-adaln-online; ignoring it"
+            )
+
+    def _validate_scheduler_rpc_timeout(self) -> None:
+        timeout = self.scheduler_rpc_timeout
+        if timeout is None:
+            return
+        if (
+            not isinstance(timeout, int)
+            or isinstance(timeout, bool)
+            or not 0 < timeout <= MAX_SCHEDULER_RPC_TIMEOUT_S
+        ):
+            raise ValueError(
+                "scheduler_rpc_timeout must be None or an integer between "
+                f"1 and {MAX_SCHEDULER_RPC_TIMEOUT_S} seconds"
+            )
 
     def resolved_bcg_text_buckets(self) -> tuple[int, ...]:
         """Sorted, de-duplicated, positive BCG text buckets.
 
         Falls back to :data:`DEFAULT_BCG_TEXT_BUCKETS` when ``--bcg-text-buckets``
         is unset, so both prompt padding and warmup capture share one source of
-        truth instead of the legacy ``SGLANG_BCG_TEXT_BUCKETS`` env var.
+        truth.
         """
         raw = self.bcg_text_buckets
         if not raw:
@@ -527,15 +795,57 @@ class ServerArgs(DisaggServerArgsMixin):
     def _validate_breakable_cuda_graph(self):
         if not self.enable_breakable_cuda_graph:
             return
+        dit_residency = self.residency_mode("transformer")
+        if dit_residency != RESIDENT:
+            # BCG captures the DiT forward; every offload flavor rebinds or
+            # frees its weight storage between forwards, and a captured graph
+            # replays the addresses recorded at capture. Other components
+            # never enter the captured graph and stay free to offload.
+            if self.explicit_residency_mode(
+                "transformer"
+            ) is not None or self.is_explicit_layerwise_offload_component(
+                "transformer"
+            ):
+                raise ValueError(
+                    "--enable-breakable-cuda-graph requires a resident DiT: "
+                    f"the selected {dit_residency!r} placement rebinds weight "
+                    "storage between forwards, while a captured graph replays "
+                    "the addresses recorded at capture. Remove the DiT "
+                    "offload selection or drop --enable-breakable-cuda-graph."
+                )
+            logger.warning(
+                "[Diffusion BCG] the %s DiT placement was selected "
+                "automatically for this configuration; disabling "
+                "--enable-breakable-cuda-graph because a captured graph would "
+                "replay weight addresses the offload rebinds. The DiT runs "
+                "eager.",
+                dit_residency,
+            )
+            self.enable_breakable_cuda_graph = False
+            return
         # BCG graphs are captured per resolution and only replay for that exact
         # latent shape, so the user must declare the resolutions up front. We
         # capture every one of them at warmup; serving then never re-captures.
         if not self.warmup_resolutions:
-            raise ValueError(
-                "--enable-breakable-cuda-graph requires --warmup-resolutions: "
-                "diffusion CUDA graphs only replay for a fixed resolution, so "
-                "every served resolution must be declared and captured at "
-                "warmup, e.g. --warmup-resolutions 1024x1024 1328x1328."
+            # No explicit resolutions: capture the model's default warmup
+            # resolution (derived by build_warmup_reqs) so
+            # --enable-breakable-cuda-graph works standalone. BCG graphs are
+            # resolution-specific; a request at any other resolution simply
+            # falls back to eager (the runner never re-captures at serving
+            # time). Pass --warmup-resolutions to capture additional shapes.
+            logger.info(
+                "[Diffusion BCG] --warmup-resolutions unset; capturing the "
+                "model default warmup resolution. Requests at other "
+                "resolutions run eager."
+            )
+        if self._is_video_gen_task() and self.warmup_num_frames is None:
+            default_frames = self._bcg_default_warmup_num_frames()
+            logger.info(
+                "[Diffusion BCG] --warmup-num-frames unset; capturing the "
+                "model default warmup frame count (%s). Requests with a "
+                "different frame count run eager. Pass --warmup-num-frames N "
+                "matching your served frame count.",
+                default_frames,
             )
         if self.bcg_text_buckets is not None and not any(
             int(b) > 0 for b in self.bcg_text_buckets
@@ -544,31 +854,149 @@ class ServerArgs(DisaggServerArgsMixin):
                 "--bcg-text-buckets must contain at least one positive integer."
             )
 
+    def _is_video_gen_task(self) -> bool:
+        pipeline_config = getattr(self, "pipeline_config", None)
+        task_type = getattr(pipeline_config, "task_type", None)
+        is_video_gen = getattr(task_type, "is_video_gen", None)
+        return bool(is_video_gen()) if callable(is_video_gen) else False
+
+    def _bcg_default_warmup_num_frames(self):
+        """Best-effort preview of the warmup frame count BCG will capture."""
+        try:
+            from sglang.multimodal_gen.runtime.warmup_request_builder import (
+                _resolve_warmup_num_frames,
+                get_model_sampling_defaults,
+            )
+
+            sampling_defaults = get_model_sampling_defaults(self)
+            return _resolve_warmup_num_frames(
+                self,
+                sampling_defaults,
+                server_based_warmup=True,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None
+
     def _adjust_breakable_cuda_graph_support(self):
+        if self.enable_breakable_cuda_graph is None:
+            self.enable_breakable_cuda_graph = self._breakable_cuda_graph_default()
         if not self.enable_breakable_cuda_graph:
             return
 
         pipeline_config = getattr(self, "pipeline_config", None)
         pipeline_config_name = type(pipeline_config).__name__
-        if (
+        # The lists record validated checkpoints, not what can capture. An
+        # explicit request elsewhere stays on with a warning: warmup reports a
+        # denoising stage that captures nothing, and a captured segment that
+        # branches on Python-side state replays its capture-time branch.
+        if not (
             pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
-            and self._is_breakable_cuda_graph_supported_model()
+            and (
+                pipeline_config_name
+                in BREAKABLE_CUDA_GRAPH_MODEL_ID_EXEMPT_PIPELINE_CONFIGS
+                or self._is_breakable_cuda_graph_supported_model()
+            )
         ):
-            return
+            logger.warning(
+                "[Diffusion BCG] not validated for %s (%s); enabling it as "
+                "requested. Warmup warns if nothing gets captured; compare outputs "
+                "against eager before relying on it. Validated: Anima Base v1.0, "
+                "FLUX.1-dev, FLUX.2-Klein, FLUX.3 Image Klein, "
+                "Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
+                "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
+                "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, SANA-Video 2.0, "
+                "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image.",
+                pipeline_config_name,
+                self.model_path,
+            )
+        # ComfyUI requests carry the sampler's tensors, which a synthetic warmup
+        # cannot build; the ComfyUI step stage captures on its first real step.
+        if not self.warmup_resolutions and not self.comfyui_mode:
+            self._default_bcg_warmup_resolution()
 
-        logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
-            "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
-            "currently supported.",
-            pipeline_config_name,
+    def _breakable_cuda_graph_default(self) -> bool:
+        """Whether unset BCG turns on: an opted-in pipeline on a validated checkpoint,
+        captured by the startup warmup over DiT weights that never move."""
+        deployment_config = self.pipeline_config.get_model_deployment_config()
+        if (
+            self.pipeline_class_name
+            not in deployment_config.bcg_default_pipeline_class_names
+        ):
+            return False
+        enabled = (
+            self.performance_mode in ("auto", "speed")
+            and current_platform.is_cuda()
+            and not current_platform.device_shares_host_memory()
+            # offline runs have no startup warmup; capturing would add a generation
+            and self.warmup_mode == "server"
+            and self.disagg_role == RoleType.MONOLITHIC
+            and not self.comfyui_mode
+            and self._is_breakable_cuda_graph_supported_model()
+            and not self.enable_torch_compile
+            and not envs.SGLANG_CACHE_DIT_ENABLED
+            and self.batching_max_size == 1
+            and self.lora_path is None
+            # measured with both stage DiTs resident on >=130 GiB cards; capture
+            # holds ~7 GB more on Hopper, past an 80 GB card's speed-mode headroom
+            and current_platform.get_device_total_memory() / BYTES_PER_GB
+            >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
+            and (
+                self.ltx2_two_stage_device_mode == "resident"
+                or not self._is_ltx23_two_stage_pipeline()
+            )
+            # graphs replay fixed weight addresses
+            and not self.dit_layerwise_offload
+            and not self.use_fsdp_inference
+            and all(
+                self.residency_mode(name) == RESIDENT
+                for name in ("transformer", "transformer_2")
+            )
         )
-        self.enable_breakable_cuda_graph = False
+        if enabled:
+            logger.info(
+                "[Diffusion BCG] enabled by default for %s; pass "
+                "--enable-breakable-cuda-graph false to run eager.",
+                self.pipeline_class_name,
+            )
+        return enabled
 
     def _is_breakable_cuda_graph_supported_model(self) -> bool:
         refs = _normalized_bcg_model_refs(self.model_id)
         refs.update(_normalized_bcg_model_refs(self.model_path))
         return bool(refs & BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
+
+    def _default_bcg_warmup_resolution(self) -> None:
+        """Seed --warmup-resolutions with the model default for BCG.
+
+        BCG graphs are resolution-specific and captured at warmup. When the
+        user does not pre-declare resolutions we capture the model's default
+        warmup resolution so --enable-breakable-cuda-graph works standalone;
+        requests at any other resolution fall back to eager.
+        """
+        from sglang.multimodal_gen.runtime.warmup_request_builder import (
+            _resolve_default_warmup_resolution,
+            get_model_sampling_defaults,
+        )
+
+        try:
+            sampling_defaults = get_model_sampling_defaults(self)
+            width, height = _resolve_default_warmup_resolution(
+                self, sampling_defaults, server_based_warmup=True
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[Diffusion BCG] could not derive a default warmup resolution "
+                "(%s); no graph will be captured and serving runs eager.",
+                exc,
+            )
+            return
+        self.warmup_resolutions = [f"{width}x{height}"]
+        logger.info(
+            "[Diffusion BCG] --warmup-resolutions unset; capturing the model "
+            "default %dx%d. Requests at other resolutions run eager.",
+            width,
+            height,
+        )
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -601,8 +1029,23 @@ class ServerArgs(DisaggServerArgsMixin):
         replica_size = (self.num_gpus or tp_size) // dp_size
 
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
+        # An explicit fold policy is honored for any multi-rank replica —
+        # pure-TP (replica == tp) and dp>1 shapes included. Encoder layout is
+        # independent of the DiT's parallelism; the replica group is simply
+        # "the ranks that share this batch". `auto` keeps its conservative
+        # proposals below and never folds a pure-TP replica.
+        fold_replica = (
+            self.encoder_parallel == "fold"
+            and not self.disagg_mode
+            and replica_size > 1
+        )
 
-        if fold_world:
+        if self.pipeline_config.task_type == ModelTaskType.S2V:
+            return
+
+        if fold_replica:
+            mode = "replica"
+        elif fold_world:
             mode = "world"
         elif tp_size == 1 and sp_degree > 1:
             # Preserve prior behavior for dp>1 / disaggregated SP runs.
@@ -613,9 +1056,10 @@ class ServerArgs(DisaggServerArgsMixin):
         # propose the fold group from the parallelism alone; the loader keeps it
         # only for encoders worth folding at their real post-load size
         # (finalize_encoder_folding)
-        encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
-            getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
-        )
+        encoder_configs = [
+            *self.pipeline_config.text_encoder_configs,
+            self.pipeline_config.image_encoder_config,
+        ]
         for encoder_config in encoder_configs:
             encoder_config.parallel_folding_mode = mode
 
@@ -647,6 +1091,18 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.vae_cpu_offload = False
             return
 
+        if (
+            self.use_fsdp_inference
+            and self.num_gpus > 1
+            # with data parallelism the FSDP mesh would span the replicas
+            and self.dp_size == 1
+            and self.dit_cpu_offload is None
+            # a GGUF or pre-quantized override may not support FSDP
+            and self.transformer_weights_path is None
+        ):
+            # FSDP shards only resident components; component offload would bypass it
+            self.dit_cpu_offload = False
+
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
             logger.info(
@@ -673,11 +1129,41 @@ class ServerArgs(DisaggServerArgsMixin):
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
 
+    def _adjust_cpu_offload_components(self) -> None:
+        """Normalize the legacy component offload selector, when provided."""
+        if self.cpu_offload_components is None:
+            return
+        normalized = normalize_cpu_offload_components(self.cpu_offload_components)
+        self.cpu_offload_components = normalized if normalized is not None else []
+
+    def _normalize_component_residency(self) -> None:
+        self.component_residency = normalize_component_residency(
+            self.component_residency
+        )
+        if SNAPSHOT_OFFLOAD in (self.component_residency or {}).values():
+            if (
+                not current_platform.is_cuda()
+                or current_platform.device_shares_host_memory()
+            ):
+                raise ValueError(
+                    "snapshot-offload requires CUDA with separate host and device memory; "
+                    "use component-offload or layerwise-offload on this platform"
+                )
+            if self.enable_breakable_cuda_graph and any(
+                self.canonical_residency_mode(name) == SNAPSHOT_OFFLOAD
+                for name in ("transformer", "transformer_2")
+            ):
+                raise ValueError(
+                    "snapshot-offload for DiT is incompatible with "
+                    "--enable-breakable-cuda-graph because weight addresses change"
+                )
+
     def _adjust_ltx2_two_stage_device_mode(self):
-        if not self._is_ltx23_two_stage_pipeline():
+        if not self._is_ltx2_distilled_lora_two_stage_pipeline():
             return
 
         mode = self.ltx2_two_stage_device_mode
+        env_mode = None
         if mode is None:
             env_mode = os.getenv("SGLANG_LTX2_TWO_STAGE_DEVICE_MODE")
             mode = (
@@ -694,6 +1180,29 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODE_CHOICES}."
             )
 
+        explicit_nonresident_dits = {
+            component_name: residency_mode
+            for component_name in ("transformer", "transformer_2")
+            if (residency_mode := self.explicit_residency_mode(component_name))
+            in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD, LAYERWISE_OFFLOAD)
+        }
+        if mode == "resident" and explicit_nonresident_dits:
+            configured = ", ".join(
+                f"{name}={residency_mode}"
+                for name, residency_mode in explicit_nonresident_dits.items()
+            )
+            if self.is_arg_explicitly_set("ltx2_two_stage_device_mode") or env_mode:
+                raise ValueError(
+                    "ltx2_two_stage_device_mode=resident conflicts with explicit "
+                    f"component residency: {configured}"
+                )
+            mode = "original"
+            logger.info(
+                "Using ltx2_two_stage_device_mode=original because DiT offload "
+                "was explicitly configured: %s",
+                configured,
+            )
+
         self.ltx2_two_stage_device_mode = mode
 
     def _resolve_default_ltx2_two_stage_device_mode(self) -> str:
@@ -707,10 +1216,7 @@ class ServerArgs(DisaggServerArgsMixin):
         device_total_memory_gb = (
             current_platform.get_device_total_memory() / BYTES_PER_GB
         )
-        if (
-            "H200" in device_name
-            or device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
-        ):
+        if device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB:
             logger.info(
                 "Automatically set ltx2_two_stage_device_mode=resident for high-memory CUDA GPU (%s, %.2f GiB total)",
                 device_name,
@@ -724,6 +1230,13 @@ class ServerArgs(DisaggServerArgsMixin):
             device_total_memory_gb,
         )
         return "original"
+
+    def _is_ltx2_distilled_lora_two_stage_pipeline(self) -> bool:
+        # LTX-2 and LTX-2.3 refine with a distilled LoRA; LTX-2.5 ships a distilled DiT
+        return (
+            is_ltx2_two_stage_pipeline_name(self.pipeline_class_name)
+            and not self.pipeline_config.default_sigmas
+        )
 
     def _is_ltx23_two_stage_pipeline(self) -> bool:
         return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
@@ -746,11 +1259,30 @@ class ServerArgs(DisaggServerArgsMixin):
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
-        self.component_attention_backends = (
-            self._normalize_component_attention_backends(
-                self.component_attention_backends
+        self.component_attention_backends, self.component_attention_backend_roles = (
+            self._split_component_attention_backends(
+                self.component_attention_backends,
+                self.component_attention_backend_roles,
             )
         )
+        # Snapshot what the user asked for before the pipeline-specific
+        # adjustments below add any automatic entries of our own.
+        if self._requested_component_attention_backends is None:
+            self._requested_component_attention_backends = dict(
+                self.component_attention_backends
+            )
+            self._requested_component_attention_backend_roles = {
+                component: dict(entries)
+                for component, entries in self.component_attention_backend_roles.items()
+            }
+        else:
+            (
+                self._requested_component_attention_backends,
+                self._requested_component_attention_backend_roles,
+            ) = self._split_component_attention_backends(
+                self._requested_component_attention_backends,
+                self._requested_component_attention_backend_roles,
+            )
 
         # attention_backend_config
         if self.attention_backend_config is None:
@@ -775,20 +1307,56 @@ class ServerArgs(DisaggServerArgsMixin):
                         text_backend,
                     )
                 self.component_attention_backends["text_encoder"] = "torch_sdpa"
+            # A role-qualified override would otherwise outrank the backend we
+            # just forced, so drop it for the same reason.
+            text_encoder_roles = self.component_attention_backend_roles.pop(
+                "text_encoder", None
+            )
+            if text_encoder_roles:
+                logger.warning(
+                    "Ignoring per-role attention backend overrides (%s) for component "
+                    "text_encoder to preserve LTX2 official attention semantics",
+                    ", ".join(
+                        f"{role}={backend}"
+                        for role, backend in sorted(text_encoder_roles.items())
+                    ),
+                )
+        from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+            MiniMaxH3PipelineConfig,
+        )
+
+        if (
+            self.backend != Backend.DIFFUSERS
+            and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
+            and self.attention_backend in ("laser_attn", "ascend_sparse_attn")
+            and "text_encoder" not in self.component_attention_backends
+            and "text_encoder" not in self.component_attention_backend_roles
+        ):
+            # Laser and Ascend sparse attention target the H3 transformer. Keep the
+            # Qwen3-VL text encoder on SDPA to preserve its causal mask semantics.
+            logger.info(
+                "Automatically set torch_sdpa backend for the MiniMax H3 text "
+                "encoder; %s applies to the transformer",
+                self.attention_backend,
+            )
+            self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
         if self.ring_degree > 1:
-            if self.attention_backend is not None and self.attention_backend not in (
-                "fa",
-                "sage_attn",
+            if (
+                self.attention_backend is not None
+                and self.attention_backend not in RING_CAPABLE_ATTENTION_BACKENDS
             ):
                 raise ValueError(
-                    "Ring Attention is only supported for flash attention or sage attention backend for now"
+                    "Ring Attention requires one of the ring-capable backends "
+                    f"({', '.join(RING_CAPABLE_ATTENTION_BACKENDS)}), got "
+                    f"{self.attention_backend!r}"
                 )
             if self.attention_backend is None:
-                self.attention_backend = "fa"
+                self.attention_backend = RING_CAPABLE_ATTENTION_BACKENDS[0]
                 logger.info(
-                    "Ring Attention is currently only supported for flash attention or sage attention; "
-                    "attention_backend has been automatically set to flash attention"
+                    "Ring Attention requires a ring-capable backend; "
+                    "attention_backend has been automatically set to %s",
+                    self.attention_backend,
                 )
 
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
@@ -827,6 +1395,86 @@ class ServerArgs(DisaggServerArgsMixin):
             ) from None
 
     @staticmethod
+    def _parse_component_value_map(
+        value: dict[str, Any] | str | None, *, option: str
+    ) -> dict[str, str]:
+        """Parse a ``component=value`` map, the same shape as component backends."""
+        if value is None or value == "":
+            return {}
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items()}
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{option} must be a dict or a comma-separated component=value string"
+            )
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return {str(k): str(v) for k, v in parsed.items()}
+        except json.JSONDecodeError:
+            pass
+        result: dict[str, str] = {}
+        for pair in value.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(f"{option} must use component=value entries")
+            component, entry = pair.split("=", 1)
+            result[component.strip()] = entry.strip()
+        return result
+
+    def layerwise_tuning_for(
+        self, component_name: str | None, *, dit_group: bool
+    ) -> tuple[float, float, str, str]:
+        """Prefetch size, resident layers, residency policy and lifetime for one component."""
+        prefetch_map = self._parse_component_value_map(
+            self.layerwise_prefetch_size, option="--layerwise-prefetch-size"
+        )
+        resident_map = self._parse_component_value_map(
+            self.layerwise_resident_layers, option="--layerwise-resident-layers"
+        )
+        policy_map = self._parse_component_value_map(
+            self.layerwise_residency_policy, option="--layerwise-residency-policy"
+        )
+        lifetime_map = self._parse_component_value_map(
+            self.layerwise_residency_lifetime, option="--layerwise-residency-lifetime"
+        )
+
+        def _pick(mapping: dict[str, str], group_default, aux_default):
+            if component_name is not None and component_name in mapping:
+                return mapping[component_name]
+            return group_default if dit_group else aux_default
+
+        prefetch = float(_pick(prefetch_map, self.dit_offload_prefetch_size, 0.0))
+        resident = float(_pick(resident_map, self.dit_layerwise_resident_layers, 0.0))
+        policy = str(
+            _pick(
+                policy_map,
+                self.dit_layerwise_residency_policy,
+                RESIDENCY_POLICY_LEADING,
+            )
+        )
+        if policy not in RESIDENCY_POLICIES:
+            raise ValueError(
+                f"unknown residency policy {policy!r} for component "
+                f"{component_name!r}, expected one of {RESIDENCY_POLICIES}"
+            )
+        lifetime = str(
+            _pick(
+                lifetime_map,
+                self.dit_layerwise_residency_lifetime,
+                RESIDENCY_LIFETIME_FORWARD,
+            )
+        )
+        if lifetime not in RESIDENCY_LIFETIMES:
+            raise ValueError(
+                f"unknown residency lifetime {lifetime!r} for component "
+                f"{component_name!r}, expected one of {RESIDENCY_LIFETIMES}"
+            )
+        return prefetch, resident, policy, lifetime
+
+    @staticmethod
     def _parse_component_attention_backend_map(
         value: dict[str, str] | str | None,
     ) -> dict[str, str]:
@@ -861,19 +1509,50 @@ class ServerArgs(DisaggServerArgsMixin):
         return result
 
     @classmethod
-    def _normalize_component_attention_backends(
-        cls, value: dict[str, str] | str | None
-    ) -> dict[str, str]:
+    def _split_component_attention_backends(
+        cls,
+        value: dict[str, str] | str | None,
+        roles: dict[str, dict[str, str]] | None = None,
+    ) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+        """Normalize raw entries into component-wide and role-qualified maps.
+
+        A key may be a bare ``component`` or a role-qualified ``component.role``.
+        The optional trailing ``.<role>`` selects the backend for one attention
+        role (self vs cross) and is validated against ``AttentionRole``; those
+        entries are routed into the returned role map instead of the flat one so
+        a component lookup by name never sees them. ``roles`` seeds the role map
+        for callers that already hold a normalized one.
+        """
         raw = cls._parse_component_attention_backend_map(value)
         normalized: dict[str, str] = {}
+        normalized_roles: dict[str, dict[str, str]] = {
+            component: dict(entries) for component, entries in (roles or {}).items()
+        }
         for component, backend in raw.items():
             if not isinstance(component, str):
                 raise ValueError("Component attention backend key must be a string")
-            component_name = component.strip().replace("-", "_")
+            component_part, role = split_component_role_key(component.strip())
+            component_name = component_part.strip().replace("-", "_")
             if not component_name:
                 raise ValueError("Component attention backend key must not be empty")
-            normalized[component_name] = cls._normalize_attention_backend_name(backend)
-        return normalized
+            backend_name = cls._normalize_attention_backend_name(backend)
+            if role is None:
+                normalized[component_name] = backend_name
+            else:
+                normalized_roles.setdefault(component_name, {})[role.value] = (
+                    backend_name
+                )
+        return normalized, normalized_roles
+
+    @staticmethod
+    def _component_fallback_keys(component_name: str) -> list[str]:
+        key = component_name.replace("-", "_")
+        fallback_keys = [key]
+        if key.endswith("_2"):
+            # Secondary two-stage components inherit the base component backend
+            # unless explicitly overridden.
+            fallback_keys.append(key[:-2])
+        return fallback_keys
 
     def resolve_component_attention_backend(
         self, *component_names: str | None
@@ -881,77 +1560,94 @@ class ServerArgs(DisaggServerArgsMixin):
         for component_name in component_names:
             if component_name is None:
                 continue
-            key = component_name.replace("-", "_")
-            fallback_keys = [key]
-            if key.endswith("_2"):
-                # Secondary two-stage components inherit the base component
-                # backend unless explicitly overridden.
-                fallback_keys.append(key[:-2])
-            for backend_key in fallback_keys:
+            for backend_key in self._component_fallback_keys(component_name):
                 backend = self.component_attention_backends.get(backend_key)
                 if backend is not None:
                     return AttentionBackendEnum[backend.upper()], backend_key
         return None, None
 
+    def requested_component_attention_backend(self, component_name: str) -> str | None:
+        assert self._requested_component_attention_backends is not None
+        return self._requested_component_attention_backends.get(component_name)
+
+    def has_requested_component_attention_backends(self) -> bool:
+        return bool(self._requested_component_attention_backends) or bool(
+            self._requested_component_attention_backend_roles
+        )
+
+    def set_automatic_component_attention_backend(
+        self, component_name: str, backend: str
+    ) -> None:
+        """Select a component's backend on the user's behalf."""
+        self.component_attention_backends[component_name] = backend
+
+    def resolve_component_backend_by_role(
+        self, *component_names: str | None
+    ) -> dict[AttentionRole, AttentionBackendEnum]:
+        """Resolve the per-role backend overrides for a component.
+
+        For each role, tries ``<component>.<role>`` across the candidate names
+        (with the same ``_2`` two-stage fallback as the component-wide lookup).
+        Returns only the roles that have an explicit override configured.
+        """
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] = {}
+        for role in AttentionRole:
+            for component_name in component_names:
+                if component_name is None:
+                    continue
+                matched = False
+                for base_key in self._component_fallback_keys(component_name):
+                    backend = self.component_attention_backend_roles.get(
+                        base_key, {}
+                    ).get(role.value)
+                    if backend is not None:
+                        backend_by_role[role] = AttentionBackendEnum[backend.upper()]
+                        matched = True
+                        break
+                if matched:
+                    break
+        return backend_by_role
+
     def _adjust_warmup(self):
-        #   --warmup-mode > --warmup/--server-warmup
-        mode_explicit = self.is_arg_explicitly_set("warmup_mode")
-        legacy_explicit = self.is_arg_explicitly_set(
-            "warmup"
-        ) or self.is_arg_explicitly_set("server_warmup")
-        if self.warmup_mode is not None:
-            if self.warmup_mode not in WARMUP_MODES:
-                raise ValueError(
-                    f"Invalid --warmup-mode {self.warmup_mode!r}; "
-                    f"expected one of {WARMUP_MODES}."
-                )
-            if mode_explicit and legacy_explicit:
-                logger.warning(
-                    "Both --warmup-mode and the deprecated --warmup/--server-warmup "
-                    "were set; --warmup-mode=%s takes precedence.",
-                    self.warmup_mode,
-                )
-            if mode_explicit or not legacy_explicit:
-                self.warmup = self.warmup_mode != "off"
-                self.server_warmup = self.warmup_mode == "server"
-            elif self.warmup:
-                self.server_warmup = self.server_warmup or self.warmup_mode == "server"
+        if self.warmup_mode is not None and self.warmup_mode not in WARMUP_MODES:
+            raise ValueError(
+                f"Invalid --warmup-mode {self.warmup_mode!r}; "
+                f"expected one of {WARMUP_MODES}."
+            )
+        if self.warmup_num_frames is not None and self.warmup_num_frames <= 0:
+            raise ValueError("--warmup-num-frames must be a positive integer.")
 
-        # Explicit resolutions imply warmup is on (request-based).
-        if self.warmup_resolutions is not None:
-            self.warmup = True
-
-        if (
-            self.enable_torch_compile
-            and self.warmup_mode is None
-            and not mode_explicit
-            and not legacy_explicit
-        ):
-            self.warmup = True
-            self.server_warmup = True
+        if self.enable_torch_compile and self.warmup_mode is None:
+            self.warmup_mode = "server"
             logger.info(
                 "Automatically enabled server warmup for torch.compile so first "
                 "real requests do not pay compile latency. Set --warmup-mode off "
                 "to disable this behavior."
             )
 
+        # Explicit warmup shapes need a request path unless an existing server
+        # default already supplies the synthetic startup request.
+        if (
+            self.warmup_resolutions is not None or self.warmup_num_frames is not None
+        ) and self.warmup_mode in (None, "off"):
+            self.warmup_mode = "request"
+
         # BCG captures every graph during a synthetic warmup forward at startup
-        # so that serving never records a fresh graph. That requires
-        # server-based warmup (a real warmup request issued at startup), not
-        # request-based warmup which runs no forward until the first request.
-        if self.enable_breakable_cuda_graph and self.disagg_role == RoleType.MONOLITHIC:
-            self.warmup = True
-            self.server_warmup = True
+        # so serving never records a fresh graph.
+        if (
+            self.enable_breakable_cuda_graph
+            and self.disagg_role == RoleType.MONOLITHIC
+            and not self.comfyui_mode
+        ):
+            self.warmup_mode = "server"
 
-        if self.disagg_role != RoleType.MONOLITHIC:
-            self.server_warmup = False
+        # Disaggregated roles do not host the HTTP startup request. Preserve
+        # warmup intent, but schedule it on the first request instead.
+        if self.disagg_role != RoleType.MONOLITHIC and self.warmup_mode == "server":
+            self.warmup_mode = "request"
 
-        if not self.warmup:
-            self.server_warmup = False
-
-        self.warmup_mode = (
-            "off" if not self.warmup else "server" if self.server_warmup else "request"
-        )
+        if self.warmup_mode is None:
+            self.warmup_mode = "off"
 
     @staticmethod
     def _require_port(port: int, name: str) -> None:
@@ -963,9 +1659,8 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _adjust_network_ports(self):
-        # Disagg role instances (encoder/denoiser/decoder) don't serve HTTP,
-        # so skip settling the HTTP port to avoid unnecessary port collisions.
-        needs_http = self.disagg_role in (
+        # standalone roles only need an HTTP port when exposing metrics
+        needs_http = self.enable_metrics or self.disagg_role in (
             RoleType.MONOLITHIC,
             RoleType.SERVER,
         )
@@ -974,7 +1669,10 @@ class ServerArgs(DisaggServerArgsMixin):
             requested_ports = []
             if needs_http:
                 requested_ports.append((self.port, "HTTP"))
-            requested_ports.append((self.scheduler_port, "Scheduler"))
+            for replica in range(self.dp_size or 1):
+                requested_ports.append(
+                    (self.scheduler_port + replica, f"Scheduler[{replica}]")
+                )
             if self.master_port is not None:
                 requested_ports.append((self.master_port, "Master"))
             seen_ports: dict[int, str] = {}
@@ -998,6 +1696,13 @@ class ServerArgs(DisaggServerArgsMixin):
                 initial_scheduler_port, avoid=settled_ports
             )
             settled_ports.add(self.scheduler_port)
+            self.scheduler_ports = [self.scheduler_port]
+            for _ in range((self.dp_size or 1) - 1):
+                port = self.settle_port(
+                    self.scheduler_ports[-1] + 1, avoid=settled_ports
+                )
+                settled_ports.add(port)
+                self.scheduler_ports.append(port)
             if self.master_port is not None:
                 self.master_port = self.settle_port(
                     self.master_port, 37, avoid=settled_ports
@@ -1054,9 +1759,11 @@ class ServerArgs(DisaggServerArgsMixin):
                     self.enable_cfg_parallel = auto_cfg_parallel_degree > 1
                     if self.enable_cfg_parallel:
                         logger.info(
-                            "Automatically enabled CFG parallel at degree %d for %d GPUs. "
-                            "Use --sp-degree / --ulysses-degree to use sequence "
-                            "parallelism instead.",
+                            "Automatically enabled CFG parallel at degree %d for %d GPUs "
+                            "because this model uses classifier-free guidance by default. "
+                            "A request that turns CFG off still runs, but it has one branch, "
+                            "so the other CFG rank(s) recompute it redundantly. Override with "
+                            "--cfg-parallel-size 1, --tp-size, or --sp-degree / --ulysses-degree.",
                             self.cfg_parallel_degree,
                             self.num_gpus,
                         )
@@ -1086,12 +1793,47 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.ulysses_degree is None
             and self.ring_degree is None
+            and self.kv_gather_degree is None
             and self.sp_degree != 1
         ):
-            self.ulysses_degree = self.sp_degree
-            logger.info(
-                f"Automatically set ulysses_degree=sp_degree={self.ulysses_degree} for best performance"
-            )
+            if self.sp_degree == 2:
+                # measured-win zone for the K/V-gather exchange; layers whose
+                # calls the gather path cannot take fall back to Ulysses
+                self.kv_gather_degree = 2
+                self.sp_split_auto = True
+                logger.info(
+                    "Automatically set kv_gather_degree=sp_degree=2; set "
+                    "--ulysses-degree explicitly to keep the Ulysses exchange"
+                )
+            elif self._dit_num_attention_heads() % self.sp_degree:
+                # Ulysses splits attention heads across the SP ranks and fails
+                # at the first all-to-all; K/V gather keeps every head local
+                self.kv_gather_degree = self.sp_degree
+                self.sp_split_auto = True
+                logger.info(
+                    "Automatically set kv_gather_degree=sp_degree=%d: the DiT's "
+                    "%d attention heads do not divide across %d Ulysses ranks",
+                    self.sp_degree,
+                    self._dit_num_attention_heads(),
+                    self.sp_degree,
+                )
+            else:
+                self.ulysses_degree = self.sp_degree
+                logger.info(
+                    "Automatically set ulysses_degree=sp_degree=%d for the "
+                    "sequence-parallel process-group layout",
+                    self.ulysses_degree,
+                )
+
+        if self.kv_gather_degree is None:
+            self.kv_gather_degree = 1
+
+        if self.kv_gather_degree > 1:
+            if (self.ulysses_degree or 1) != 1 or (self.ring_degree or 1) != 1:
+                raise ValueError(
+                    "kv_gather_degree does not compose with ulysses_degree or "
+                    "ring_degree yet; set exactly one of them above 1"
+                )
 
         if self.ulysses_degree is None:
             self.ulysses_degree = 1
@@ -1103,11 +1845,25 @@ class ServerArgs(DisaggServerArgsMixin):
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
 
+        if self.kv_gather_degree > 1:
+            # K/V-gather rows occupy the contiguous inner SP dimension; the
+            # process groups are built from ulysses_degree, so alias it until
+            # gather gets a first-class dimension (needed only once it
+            # composes with Ulysses).
+            self.ulysses_degree = self.kv_gather_degree
+
+    def _dit_num_attention_heads(self) -> int:
+        """Head count from the DiT arch config, or 0 when the config does not set it."""
+        dit_config = getattr(self.pipeline_config, "dit_config", None)
+        arch_config = getattr(dit_config, "arch_config", None)
+        return getattr(arch_config, "num_attention_heads", 0) or 0
+
     def _model_default_uses_cfg(self) -> bool:
         """
         Check whether the model uses classifier-free guidance by default.
 
         CFG is active when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
+        A ``guidance_scale`` of None (resolved per request, e.g. FLUX.3) does not count.
         """
         from sglang.multimodal_gen.registry import get_model_info
 
@@ -1115,10 +1871,12 @@ class ServerArgs(DisaggServerArgsMixin):
         if model_info is None:
             return False
         default_params = model_info.sampling_param_cls()
+        guidance_scale = getattr(default_params, "guidance_scale", None)
 
         return (
             getattr(default_params, "negative_prompt", None) is not None
-            and getattr(default_params, "guidance_scale", 0) > 1.0
+            and guidance_scale is not None
+            and guidance_scale > 1.0
         )
 
     @staticmethod
@@ -1137,112 +1895,279 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _adjust_platform_specific(self):
         if current_platform.is_mps():
-            self.use_fsdp_inference = False
-            self.dit_layerwise_offload = False
-            self.layerwise_offload_components = None
-            if (
-                self.dit_cpu_offload
-                or self.text_encoder_cpu_offload
-                or self.image_encoder_cpu_offload
-                or self.vae_cpu_offload
+            if self.num_gpus != 1:
+                raise ValueError("MPS currently supports only --num-gpus 1")
+            if self.component_residency is not None and any(
+                mode not in (RESIDENT, LAYERWISE_OFFLOAD)
+                for mode in self.component_residency.values()
             ):
-                logger.warning(
-                    "Disabling component CPU offload on MPS because the component "
-                    "residency offload strategy is only validated on CUDA."
+                raise ValueError(
+                    "MPS supports only resident or layerwise-offload component "
+                    "residency"
                 )
-            self.dit_cpu_offload = False
-            self.text_encoder_cpu_offload = False
-            self.image_encoder_cpu_offload = False
-            self.vae_cpu_offload = False
+            self.use_fsdp_inference = False
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
         return arg_name in self._explicit_arg_names
 
-    def should_configure_layerwise_offload_for_lazy_component(
-        self, component_name: str
-    ) -> bool:
-        """Return whether a lazy-loaded component should try layerwise offload.
+    def canonical_residency_mode(self, component_name: str) -> str | None:
+        """Resolve the canonical selector for one component, if present."""
+        return resolve_component_residency_mode(
+            component_name, self.component_residency
+        )
 
-        Lazy components are loaded after the normal pipeline-wide configuration
-        pass, so they should only attempt layerwise configuration when their
-        component name is covered by the selected layerwise scope.
-        """
+    def explicit_residency_mode(self, component_name: str) -> str | None:
+        """Resolve explicit controls in canonical-to-compatibility priority."""
+        mode = self.canonical_residency_mode(component_name)
+        if mode is not None:
+            return mode
+
+        if self.is_explicit_layerwise_offload_component(component_name):
+            return LAYERWISE_OFFLOAD
+
+        if self.is_arg_explicitly_set("cpu_offload_components"):
+            if not self.cpu_offload_components:
+                return RESIDENT
+            if cpu_offload_component_matches(
+                component_name, self.cpu_offload_components
+            ):
+                return COMPONENT_OFFLOAD
+
+        legacy_flag = self._legacy_component_offload_flag(component_name)
+        if legacy_flag is not None and self.is_arg_explicitly_set(legacy_flag):
+            legacy_values = {
+                "dit_cpu_offload": self.dit_cpu_offload,
+                "text_encoder_cpu_offload": self.text_encoder_cpu_offload,
+                "image_encoder_cpu_offload": self.image_encoder_cpu_offload,
+                "vae_cpu_offload": self.vae_cpu_offload,
+            }
+            return COMPONENT_OFFLOAD if legacy_values[legacy_flag] else RESIDENT
+
+        # ``--dit-layerwise-offload false`` historically has no matching CPU
+        # flag, but explicitly requests that the DiT not be layerwise-offloaded.
+        if is_legacy_dit_offload_component_name(component_name) and (
+            self.is_arg_explicitly_set("dit_layerwise_offload")
+        ):
+            return RESIDENT
+        return None
+
+    @staticmethod
+    def _legacy_component_offload_flag(component_name: str) -> str | None:
+        if is_legacy_dit_offload_component_name(component_name):
+            return "dit_cpu_offload"
+        if is_text_encoder_component_name(component_name):
+            return "text_encoder_cpu_offload"
+        if is_image_encoder_component_name(component_name):
+            return "image_encoder_cpu_offload"
+        if is_vae_component_name(component_name):
+            return "vae_cpu_offload"
+        return None
+
+    def residency_mode(self, component_name: str) -> str:
+        """Return the effective residency mode for a loaded component."""
+        if current_platform.is_cpu():
+            return RESIDENT
+        if component_name in self._required_resident_components:
+            return RESIDENT
+
+        explicit_mode = self.explicit_residency_mode(component_name)
+        if explicit_mode is not None:
+            return explicit_mode
+
         component_names = normalize_layerwise_offload_components(
             self.layerwise_offload_components
         )
-        if not component_names:
-            return False
-        if LAYERWISE_OFFLOAD_ALL_COMPONENTS in component_names:
+        if self._component_layerwise_capabilities.get(component_name, True):
+            if component_names and (
+                LAYERWISE_OFFLOAD_ALL_COMPONENTS in component_names
+                or layerwise_component_matches_any_selection(
+                    component_name, component_names
+                )
+                or (
+                    LAYERWISE_OFFLOAD_DIT_GROUP in component_names
+                    and is_dit_component_name(component_name)
+                )
+            ):
+                return LAYERWISE_OFFLOAD
+
+        if self.cpu_offload_components is not None:
+            if cpu_offload_component_matches(
+                component_name, self.cpu_offload_components
+            ):
+                return COMPONENT_OFFLOAD
+        if is_legacy_dit_offload_component_name(component_name):
+            return COMPONENT_OFFLOAD if self.dit_cpu_offload else RESIDENT
+        if is_text_encoder_component_name(component_name):
+            return COMPONENT_OFFLOAD if self.text_encoder_cpu_offload else RESIDENT
+        if is_image_encoder_component_name(component_name):
+            return COMPONENT_OFFLOAD if self.image_encoder_cpu_offload else RESIDENT
+        if is_vae_component_name(component_name):
+            return COMPONENT_OFFLOAD if self.vae_cpu_offload else RESIDENT
+        return RESIDENT
+
+    def should_cpu_offload_component(self, component_name: str) -> bool:
+        return self.residency_mode(component_name) in (
+            COMPONENT_OFFLOAD,
+            SNAPSHOT_OFFLOAD,
+        )
+
+    def should_start_component_on_cpu(self, component_name: str) -> bool:
+        return self.residency_mode(component_name) in (
+            COMPONENT_OFFLOAD,
+            SNAPSHOT_OFFLOAD,
+            LAYERWISE_OFFLOAD,
+        )
+
+    def require_component_resident(
+        self, component_name: str, *, feature_name: str
+    ) -> None:
+        configured_mode = self.explicit_residency_mode(component_name)
+        if configured_mode is not None and configured_mode != RESIDENT:
+            raise ValueError(
+                f"{feature_name} requires {component_name!r} to be resident; "
+                f"got {configured_mode!r} from an explicit residency option"
+            )
+        self._required_resident_components.add(component_name)
+
+    def should_use_fsdp_for_component(self, component_name: str) -> bool:
+        return bool(
+            self.use_fsdp_inference
+            and component_name not in self._fsdp_disabled_components
+            and self.residency_mode(component_name) == RESIDENT
+        )
+
+    def disable_fsdp_for_component(self, component_name: str) -> None:
+        self._fsdp_disabled_components.add(component_name)
+
+    def record_component_layerwise_capability(
+        self, component_name: str, *, supported: bool
+    ) -> None:
+        self._component_layerwise_capabilities[component_name] = supported
+
+    @property
+    def node_local_gpu_worker_count(self) -> int:
+        """GPU worker processes sharing this node's host memory.
+
+        Per-process host budgets divide by it, because each worker reads the
+        same host-wide free-memory number.
+        """
+        return max(1, self.num_gpus // max(1, self.nnodes))
+
+    def has_layerwise_offload_components(self) -> bool:
+        return bool(
+            self.dit_layerwise_offload
+            or self.layerwise_offload_components
+            or (
+                self.component_residency
+                and LAYERWISE_OFFLOAD in self.component_residency.values()
+            )
+        )
+
+    def should_configure_layerwise_offload_for_lazy_component(
+        self, component_name: str
+    ) -> bool:
+        """Return whether a lazy-loaded component needs layerwise setup."""
+        return self.residency_mode(component_name) == LAYERWISE_OFFLOAD
+
+    def is_explicit_layerwise_offload_component(self, component_name: str) -> bool:
+        if self.canonical_residency_mode(component_name) == LAYERWISE_OFFLOAD:
             return True
-        return layerwise_component_matches_any_selection(
-            component_name, component_names
+
+        if self.is_arg_explicitly_set("layerwise_offload_components"):
+            selected_components = normalize_layerwise_offload_components(
+                self.layerwise_offload_components
+            )
+            if selected_components and (
+                LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected_components
+                or layerwise_component_matches_any_selection(
+                    component_name, selected_components
+                )
+                or (
+                    LAYERWISE_OFFLOAD_DIT_GROUP in selected_components
+                    and is_dit_component_name(component_name)
+                )
+            ):
+                return True
+
+        return bool(
+            self.is_arg_explicitly_set("dit_layerwise_offload")
+            and self.dit_layerwise_offload
+            and is_dit_component_name(component_name)
         )
 
     @property
     def is_dit_layerwise_offload_selected(self) -> bool:
-        """returns if dit is selected to be layerwise-offload"""
-        component_names = self.layerwise_offload_components
-        return bool(
-            component_names
-            and "dit_cpu_offload"
-            in cpu_offload_flags_for_layerwise_components(component_names)
-        )
+        """Return whether the primary DiT resolves to layerwise offload."""
+        return self.residency_mode("transformer") == LAYERWISE_OFFLOAD
 
     def _adjust_layerwise_offload_components(self):
-        explicitly_set_component_names = normalize_layerwise_offload_components(
+        selected_component_names = normalize_layerwise_offload_components(
             self.layerwise_offload_components
         )
         if self.dit_layerwise_offload:
-            if explicitly_set_component_names is None:
-                explicitly_set_component_names = [LAYERWISE_OFFLOAD_DIT_GROUP]
-            elif LAYERWISE_OFFLOAD_DIT_GROUP not in explicitly_set_component_names:
-                explicitly_set_component_names = [
+            if selected_component_names is None:
+                selected_component_names = [LAYERWISE_OFFLOAD_DIT_GROUP]
+            elif LAYERWISE_OFFLOAD_DIT_GROUP not in selected_component_names:
+                selected_component_names = [
                     LAYERWISE_OFFLOAD_DIT_GROUP,
-                    *explicitly_set_component_names,
+                    *selected_component_names,
                 ]
 
-        if explicitly_set_component_names is not None:
-            self.layerwise_offload_components = explicitly_set_component_names
-            self._disable_non_dit_cpu_offload_for_layerwise_components(
-                explicitly_set_component_names
+        self.layerwise_offload_components = selected_component_names
+        self._clear_non_dit_component_offload_for_layerwise_groups(
+            selected_component_names or ()
+        )
+
+        has_explicit_dit_offload = bool(
+            self.canonical_residency_mode("transformer")
+            in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD, LAYERWISE_OFFLOAD)
+            or self.is_explicit_layerwise_offload_component("transformer")
+            or (
+                self.is_arg_explicitly_set("cpu_offload_components")
+                and cpu_offload_component_matches(
+                    "transformer", self.cpu_offload_components
+                )
             )
-            return
-
-    def _disable_non_dit_cpu_offload_for_layerwise_components(
-        self, component_names: list[str]
-    ) -> None:
-        # non-DiT layerwise offload replaces the corresponding component-level CPU offload
-        flag_names = cpu_offload_flags_for_layerwise_components(component_names)
-        disabled_flag_names: list[str] = []
-
+            or (self.is_arg_explicitly_set("dit_cpu_offload") and self.dit_cpu_offload)
+        )
         if (
-            "text_encoder_cpu_offload" in flag_names
-            and self.text_encoder_cpu_offload is not False
+            self.is_arg_explicitly_set("dit_layerwise_offload")
+            and not self.dit_layerwise_offload
+            and not has_explicit_dit_offload
+        ):
+            self.dit_cpu_offload = False
+
+    def _clear_non_dit_component_offload_for_layerwise_groups(
+        self, selected_component_names: tuple[str, ...] | list[str]
+    ) -> None:
+        selected = set(selected_component_names)
+        select_all = LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected
+        disabled_explicit_flags: list[str] = []
+
+        if (select_all or LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP in selected) and (
+            self.text_encoder_cpu_offload is not False
         ):
             self.text_encoder_cpu_offload = False
-            disabled_flag_names.append("text_encoder_cpu_offload")
-        if (
-            "image_encoder_cpu_offload" in flag_names
-            and self.image_encoder_cpu_offload is not False
+            if self.is_arg_explicitly_set("text_encoder_cpu_offload"):
+                disabled_explicit_flags.append("text_encoder_cpu_offload")
+        if (select_all or LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP in selected) and (
+            self.image_encoder_cpu_offload is not False
         ):
             self.image_encoder_cpu_offload = False
-            disabled_flag_names.append("image_encoder_cpu_offload")
-        if "vae_cpu_offload" in flag_names and self.vae_cpu_offload is not False:
+            if self.is_arg_explicitly_set("image_encoder_cpu_offload"):
+                disabled_explicit_flags.append("image_encoder_cpu_offload")
+        if (select_all or LAYERWISE_OFFLOAD_VAE_GROUP in selected) and (
+            self.vae_cpu_offload is not False
+        ):
             self.vae_cpu_offload = False
-            disabled_flag_names.append("vae_cpu_offload")
+            if self.is_arg_explicitly_set("vae_cpu_offload"):
+                disabled_explicit_flags.append("vae_cpu_offload")
 
-        explicit_disabled_flag_names = [
-            flag_name
-            for flag_name in disabled_flag_names
-            if self.is_arg_explicitly_set(flag_name)
-        ]
-        if explicit_disabled_flag_names:
+        if disabled_explicit_flags:
             logger.info(
-                "Ignoring explicit CPU-offload flags because layerwise offload "
-                "manages the same component weights: %s",
-                ", ".join(
-                    f"{flag_name}=False" for flag_name in explicit_disabled_flag_names
-                ),
+                "Ignoring component-offload flags because layerwise offload "
+                "controls the same component groups: %s",
+                ", ".join(disabled_explicit_flags),
             )
 
     def _adjust_autocast(self):
@@ -1289,8 +2214,94 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(f"Could not parse attention backend config: {config_str}")
 
     def __post_init__(self):
+        if not 0 <= self.conditioning_cache_max_size_mb < float("inf"):
+            raise ValueError(
+                "conditioning_cache_max_size_mb must be finite and nonnegative"
+            )
+        if not self._explicit_arg_names:
+            self._explicit_arg_names = _infer_direct_constructor_explicit_arg_names(
+                self
+            )
+
+        current_platform.apply_server_args_defaults(self)
         # configure logger before use
         configure_logger(server_args=self)
+
+        component_paths: dict[str, str] = {}
+        component_weights_paths = dict(self.component_weights_paths)
+        migrated_component_weight_path = False
+        for component, path in self.component_paths.items():
+            if not is_explicit_weight_file_reference(path):
+                component_paths[component] = path
+                continue
+            existing = component_weights_paths.get(component)
+            if existing is not None and existing != path:
+                raise ValueError(
+                    f"Conflicting weight overrides for component {component!r}: "
+                    f"{existing!r} and {path!r}"
+                )
+            component_weights_paths[component] = path
+            migrated_component_weight_path = True
+        if migrated_component_weight_path and self.is_arg_explicitly_set(
+            "component_paths"
+        ):
+            self._explicit_arg_names.add("component_weights_paths")
+        self.component_paths = component_paths
+        self.component_weights_paths = component_weights_paths
+        self.component_precisions = _normalize_component_precisions(
+            self.component_precisions
+        )
+        normalized_direct_gpu_loading: dict[str, bool] = {}
+        for component, enabled in self.component_direct_gpu_weight_loading.items():
+            component_name = str(component).strip().replace("-", "_")
+            if not component_name or not isinstance(enabled, bool):
+                raise ValueError(
+                    "Component direct GPU loading entries require a component and "
+                    "a boolean value"
+                )
+            normalized_direct_gpu_loading[component_name] = enabled
+        self.component_direct_gpu_weight_loading = normalized_direct_gpu_loading
+        normalized_quantizations: dict[str, str] = {}
+        for component, quantization in self.component_quantizations.items():
+            component = str(component).strip().replace("-", "_")
+            quantization = str(quantization).strip().lower()
+            if not component or not quantization:
+                raise ValueError(
+                    "Component quantization entries require a component and method"
+                )
+            previous = normalized_quantizations.get(component)
+            if previous is not None and previous != quantization:
+                raise ValueError(
+                    f"Conflicting quantization overrides for {component!r}: "
+                    f"{previous!r} and {quantization!r}"
+                )
+            normalized_quantizations[component] = quantization
+        self.component_quantizations = normalized_quantizations
+        normalized_ignored_layers: dict[str, list[str]] = {}
+        for component, layers in self.component_quantization_ignored_layers.items():
+            component = str(component).strip().replace("-", "_")
+            if isinstance(layers, str):
+                layers = [layers]
+            if (
+                not component
+                or not isinstance(layers, (list, tuple))
+                or not all(isinstance(layer, str) and layer.strip() for layer in layers)
+            ):
+                raise ValueError(
+                    "Component quantization ignored layers require a component "
+                    "and non-empty layer patterns"
+                )
+            normalized_ignored_layers[component] = [layer.strip() for layer in layers]
+        missing_quantization = set(normalized_ignored_layers) - set(
+            self.component_quantizations
+        )
+        if missing_quantization:
+            raise ValueError(
+                "Component quantization ignored layers require a matching "
+                "quantization override for: "
+                f"{', '.join(sorted(missing_quantization))}"
+            )
+        self.component_quantization_ignored_layers = normalized_ignored_layers
 
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
@@ -1337,7 +2348,57 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "Semantic checkpoint variant to serve. Models with partitioned "
                 "checkpoints use this value to select the compatible weights "
-                "without exposing repository subfolder layout."
+                "without exposing repository subfolder layout. MiniMax H3: "
+                "fl2va, ref2va, or fl2va+ref2va (both transformers in one "
+                "server, each request on its task's; the automatic memory "
+                "policy keeps both resident when they fit)."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-online",
+            action=StoreBoolean,
+            default=ServerArgs.minimax_h3_adaln_online,
+            help=(
+                "Rebuild MiniMax H3 AdaLN outputs from the checkpoint per "
+                "request instead of keeping the 24.2 GiB of adaln_proj weights "
+                "resident. Works with any step count or schedule and needs no "
+                "prebuilt artifact. Requires unquantized weights."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-plan-width",
+            type=int,
+            default=ServerArgs.minimax_h3_adaln_plan_width,
+            help=(
+                "Widest timestep plan --minimax-h3-adaln-online sizes its slab "
+                "for. The default 4 covers every task; a deployment serving "
+                "only t2va (2) or fl2va (3) can shrink the slab proportionally. "
+                "A request exceeding it is rejected rather than truncated."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-host-cache-gb",
+            type=float,
+            default=ServerArgs.minimax_h3_adaln_host_cache_gb,
+            help=(
+                "Pinned host memory (decimal GB, per rank) caching AdaLN plans "
+                "built by --minimax-h3-adaln-online, so a plan set evicted "
+                "from the GPU slab swaps back in over PCIe instead of "
+                "re-reading the 24.2 GiB checkpoint (measured 5.8-6.7 s). One "
+                "50-step schedule needs ~0.9 (t2va) / 1.33 (fl2va) / 1.77 "
+                "(ref2va) GB. Auto uses 8 GB, or 0 for image releases whose "
+                "fixed timestep plans all fit on the GPU. Groups are evicted "
+                "LRU and over-cap groups just recompute. 0 disables the tier."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-cache-path",
+            type=str,
+            default=ServerArgs.minimax_h3_adaln_cache_path,
+            help=(
+                "Path to a precomputed MiniMax H3 AdaLN cache. This only "
+                "supports the matching unquantized H3 checkpoint and rejects "
+                "requests whose timestep embeddings are not present in the cache."
             ),
         )
         parser.add_argument(
@@ -1352,6 +2413,15 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=ServerArgs.served_model_name,
+            help=(
+                "Override the model name exposed by /v1/models and used in generation "
+                "responses. Defaults to --model-id if set, otherwise --model-path."
+            ),
+        )
+        parser.add_argument(
             "--pipeline",
             "--pipeline-class-name",
             dest="pipeline_class_name",
@@ -1362,16 +2432,27 @@ class ServerArgs(DisaggServerArgsMixin):
                 "or model_index.json. Must match a registered pipeline_name."
             ),
         )
+        parser.add_argument(
+            "--load-diffusion-decoder",
+            action=StoreBoolean,
+            default=ServerArgs.load_diffusion_decoder,
+            help=(
+                "Load the optional LTX-2.5 diffusion decoder so requests may set "
+                "use_diffusion_decoder. Offline generate enables this automatically "
+                "when --use-diffusion-decoder is passed."
+            ),
+        )
         # attention
         parser.add_argument(
             "--attention-backend",
             type=str,
             default=None,
             help=(
-                "The attention backend to use. For SGLang-native pipelines, use "
-                "values like fa, torch_sdpa, sage_attn, etc. For diffusers pipelines, "
-                "use diffusers attention backend names such as flash, _flash_3_hub, "
-                "sage, or xformers."
+                "The global attention backend. Native DiT components treat it as "
+                "strict; auxiliary native components use a compatible fallback when "
+                "needed. Use --component-attention-backends for a component-scoped "
+                "choice. For diffusers pipelines, use names such as flash, "
+                "_flash_3_hub, sage, or xformers."
             ),
         )
         parser.add_argument(
@@ -1379,6 +2460,16 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=None,
             help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
+        )
+        parser.add_argument(
+            "--enable-attention-backend-autotune",
+            action=StoreBoolean,
+            default=ServerArgs.enable_attention_backend_autotune,
+            help=(
+                "For native pipelines, time the compatible attention backends on "
+                "each layer's first large enough input and keep one only when it "
+                "is numerically compatible and faster. Validated on SM90 and SM12x."
+            ),
         )
         parser.add_argument(
             "--component-attention-backends",
@@ -1428,6 +2519,12 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         # Parallelism
         parser.add_argument(
+            "--enable-nccl-nvls",
+            action=StoreBoolean,
+            default=ServerArgs.enable_nccl_nvls,
+            help="Enable NCCL NVLS when available.",
+        )
+        parser.add_argument(
             "--num-gpus",
             type=int,
             default=ServerArgs.num_gpus,
@@ -1441,6 +2538,27 @@ class ServerArgs(DisaggServerArgsMixin):
             "to place role instances on specific GPUs without CUDA_VISIBLE_DEVICES.",
         )
         parser.add_argument(
+            "--nnodes",
+            type=int,
+            default=ServerArgs.nnodes,
+            help="The number of nodes for cross-node parallelism. --num-gpus is "
+            "the total GPU count across all nodes; each node runs "
+            "num_gpus // nnodes local workers.",
+        )
+        parser.add_argument(
+            "--node-rank",
+            type=int,
+            default=ServerArgs.node_rank,
+            help="The rank of this node among --nnodes nodes, in [0, nnodes).",
+        )
+        parser.add_argument(
+            "--dist-init-addr",
+            type=str,
+            default=ServerArgs.dist_init_addr,
+            help="The host:port distributed rendezvous address, reachable from "
+            "every node. Required when --nnodes > 1.",
+        )
+        parser.add_argument(
             "--gpu-ids",
             nargs="+",
             default=None,
@@ -1448,6 +2566,17 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Physical GPU IDs for this instance, e.g. --gpu-ids 0 1 6 7 "
                 "or --gpu-ids 0,1,6,7. Overrides --base-gpu-id for standalone "
                 "disagg roles."
+            ),
+        )
+        parser.add_argument(
+            "--numa-node",
+            type=int,
+            nargs="+",
+            default=ServerArgs.numa_node,
+            help=(
+                "NUMA node for each GPU worker; the i-th value is for the worker "
+                "on local GPU i. If unset, each worker binds to its GPU's NUMA "
+                "node on multi-socket NUMA hosts (disable with SGLANG_AUTO_NUMA_BIND=0)."
             ),
         )
         parser.add_argument(
@@ -1484,9 +2613,25 @@ class ServerArgs(DisaggServerArgsMixin):
                 "`auto` folds encoders wide enough to benefit (best "
                 "single-request latency) and data-parallels eligible native "
                 "text encoders at batch>1; `fold` always tensor-parallels the "
-                "encoder weights; `dp` never folds and splits the batch across "
-                "ranks (best batched throughput; requires TP=1 and DP=1); "
+                "encoder weights across the replica; `dp` never folds and "
+                "splits the batch across encoder copies inside each replica, "
+                "composing with encoder TP (best batched throughput); "
                 "`replicate` disables both. The default is `auto`."
+            ),
+        )
+        parser.add_argument(
+            "--kv-gather-degree",
+            type=int,
+            default=ServerArgs.kv_gather_degree,
+            help=(
+                "Sequence-parallel degree that splits rows inside attention "
+                "and exchanges with one K/V all-gather (queries stay local) "
+                "instead of Ulysses all-to-all. Non-causal attention only; "
+                "does not compose with --ulysses-degree/--ring-degree yet. "
+                "When no SP degree is set explicitly, sp_degree=2 defaults to "
+                "kv_gather_degree=2 (its measured-win zone); higher degrees "
+                "default to Ulysses when the DiT's attention heads divide by "
+                "sp_degree, and to K/V gather otherwise."
             ),
         )
         parser.add_argument(
@@ -1535,6 +2680,16 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Timeout for torch.distributed operations in seconds. "
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
         )
+        parser.add_argument(
+            "--scheduler-rpc-timeout",
+            type=int,
+            default=ServerArgs.scheduler_rpc_timeout,
+            help=(
+                "Optional end-to-end timeout in seconds for a scheduler RPC, including "
+                "time spent in the scheduler queue. By default no transport-level "
+                "deadline is imposed; callers may still cancel their request."
+            ),
+        )
 
         ServerArgs.add_disagg_cli_args(parser)
 
@@ -1546,11 +2701,6 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Path to a text file containing prompts (one per line) for batch processing",
         )
 
-        parser.add_argument(
-            "--mask-strategy-file-path",
-            type=str,
-            help="Path to mask strategy JSON file for STA",
-        )
         parser.add_argument(
             "--enable-torch-compile",
             action=StoreBoolean,
@@ -1577,6 +2727,23 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
         )
         parser.add_argument(
+            "--allow-cudnn-tf32",
+            action=StoreBoolean,
+            default=ServerArgs.allow_cudnn_tf32,
+            help="Let cuDNN run fp32 convolutions on TF32 tensor cores, which "
+            "truncates their inputs to 10 mantissa bits (PyTorch's own "
+            "default). Affects the fp32 VAE decoders; pass false together "
+            "with --allow-bf16-reduced-precision-reduction false for "
+            "reference-precision fp32 and bf16 math.",
+        )
+        parser.add_argument(
+            "--allow-bf16-reduced-precision-reduction",
+            action=StoreBoolean,
+            default=ServerArgs.allow_bf16_reduced_precision_reduction,
+            help="Let a bf16 GEMM accumulate its split-K partials below fp32 "
+            "(PyTorch's own default). See --allow-cudnn-tf32.",
+        )
+        parser.add_argument(
             "--enable-breakable-cuda-graph",
             action=StoreBoolean,
             default=ServerArgs.enable_breakable_cuda_graph,
@@ -1584,7 +2751,9 @@ class ServerArgs(DisaggServerArgsMixin):
             "(split at attention; SP all-to-all / dynamic attention stay "
             "eager) to cut per-kernel launch overhead. Mutually exclusive "
             "with --enable-torch-compile and Cache-DiT (BCG takes priority). "
-            "Requires --warmup-resolutions; all of them are captured at warmup.",
+            "Graphs are captured at warmup for --warmup-resolutions (default: "
+            "the model default shape). Unset, it is on for LTX-2/LTX-2.3 "
+            "LTX2TwoStagePipeline serving with resident DiTs on >=130 GiB GPUs.",
         )
         parser.add_argument(
             "--bcg-text-buckets",
@@ -1617,26 +2786,14 @@ class ServerArgs(DisaggServerArgsMixin):
             choices=list(WARMUP_MODES),
             default=ServerArgs.warmup_mode,
             help=(
-                "Warmup mode (canonical knob). One of: "
-                "`off` (no warmup); `request` (request-based: warm on real "
-                "incoming requests); `server` (server-based: a synthetic warmup "
-                "request right after the server is ready, before traffic). "
-                "Takes precedence over the deprecated --warmup/--server-warmup. "
-                "`sglang serve` defaults to `server`; other entrypoints default "
+                "Warmup mode. One of: `off` (no warmup); `request` "
+                "(request-based: warm on real incoming requests); `server` "
+                "(server-based: a synthetic warmup request right after the server "
+                "is ready, before traffic). `sglang serve` defaults to `server`; "
+                "other entrypoints default "
                 "to request-based when warmup is enabled. When enabled, look for "
                 "the line ending with `(with warmup excluded)` for actual "
                 "processing time."
-            ),
-        )
-        parser.add_argument(
-            "--warmup",
-            action=StoreBoolean,
-            default=ServerArgs.warmup,
-            help=(
-                "[DEPRECATED: use --warmup-mode] Perform warmup before normal "
-                "traffic. Maps to --warmup-mode request (or server, combined "
-                "with --server-warmup). Recommended when benchmarking for fair "
-                "comparison and best performance."
             ),
         )
         parser.add_argument(
@@ -1647,36 +2804,85 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Specify explicit warmup resolutions. e.g., `--warmup-resolutions 256x256 720x720`",
         )
         parser.add_argument(
+            "--warmup-num-frames",
+            type=int,
+            default=ServerArgs.warmup_num_frames,
+            help=(
+                "Override the synthetic video warmup frame count. Use this with "
+                "breakable CUDA graphs when serving a non-default frame count so "
+                "the captured latent shape matches the request."
+            ),
+        )
+        parser.add_argument(
             "--warmup-steps",
             type=int,
             default=ServerArgs.warmup_steps,
             help="The number of warmup steps to perform for each resolution.",
         )
         parser.add_argument(
-            "--server-warmup",
-            action=StoreBoolean,
-            default=ServerArgs.server_warmup,
+            "--warmup-sampling-params",
+            type=str,
+            default=ServerArgs.warmup_sampling_params,
             help=(
-                "[DEPRECATED: use --warmup-mode server] Send a synthetic warmup "
-                "request after the server is ready (server-based warmup)."
+                "JSON object overriding model sampling defaults for synthetic "
+                "warmup and auto residency planning, for example "
+                '\'{"width":832,"height":480,"num_frames":9,'
+                '"num_inference_steps":4}\'. Warmup still applies its '
+                "bounded execution caps."
             ),
         )
-
-        # layerwise offload
+        # component residency and legacy offload controls
+        parser.add_argument(
+            "--component-residency",
+            type=str,
+            nargs="+",
+            default=ServerArgs.component_residency,
+            metavar="COMPONENT=MODE",
+            help=(
+                "Select resident, component-offload, snapshot-offload, or layerwise-offload for "
+                "pipeline components. Exact model_index.json component keys override "
+                "the dit, text_encoder, image_encoder, vae, and all groups. "
+                "Components without an assignment keep their automatic placement."
+            ),
+        )
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
-            help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
+            help="Keep DiT weights on the CPU and move them onto the GPU whole around each "
+            "use. This takes the DiT out of FSDP, which shards only resident components.",
+        )
+        parser.add_argument(
+            "--direct-gpu-weight-loading",
+            action=StoreBoolean,
+            default=ServerArgs.direct_gpu_weight_loading,
+            help="Load the full unquantized DiT checkpoint state dict directly "
+            "onto GPU before assigning model parameters. This may reduce startup "
+            "time depending on the model, but temporarily requires checkpoint "
+            "weights and model weights to coexist on GPU. Disabled by default.",
+        )
+        parser.add_argument(
+            "--cpu-offload-components",
+            type=str,
+            nargs="+",
+            default=ServerArgs.cpu_offload_components,
+            help=(
+                "Select component keys from model_index.json for coarse CPU offload. "
+                "Use dit, text_encoder, image_encoder, or vae as group aliases; "
+                "all selects every loaded module and none disables component offload. "
+                "This compatibility option can be combined with per-component CPU "
+                "offload flags; selected components take component-offload while "
+                "unmatched components retain their existing settings."
+            ),
         )
         parser.add_argument(
             "--dit-layerwise-offload",
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
-            "It selects only the DiT layerwise group. Cannot be used together with cache-dit "
-            "(SGLANG_CACHE_DIT_ENABLED) or use_fsdp_inference. May be combined with "
-            "--dit-cpu-offload, in which case DiT weights stay on host memory and only the "
-            "layers needed for the current step are brought on-device (lowest peak GPU memory).",
+            "It selects only the DiT layerwise group. Compatible with cache-dit: "
+            "skipped blocks are not streamed. Cannot be used together with "
+            "use_fsdp_inference. If legacy DiT offload flags are also provided, "
+            "layerwise offload is the effective DiT mode.",
         )
         parser.add_argument(
             "--layerwise-offload-components",
@@ -1701,13 +2907,90 @@ class ServerArgs(DisaggServerArgsMixin):
             "--dit-layerwise-resident-layers",
             type=float,
             default=ServerArgs.dit_layerwise_resident_layers,
-            help="With --dit-layerwise-offload, keep this many leading DiT layers "
-            "permanently resident on GPU (retained across denoise steps) and stream "
-            "only the tail with --dit-offload-prefetch-size. 0.0 = off (pure "
+            help="With --dit-layerwise-offload, keep this many DiT layers on the GPU "
+            "across the denoise steps of a request and stream the rest with "
+            "--dit-offload-prefetch-size; which layers stay is "
+            "--dit-layerwise-residency-policy. 0.0 = off (pure "
             "streaming). Between 0.0 and 1.0 = ratio of layers; >= 1 = absolute "
             "count. Unlike raising the prefetch size, resident layers are transferred "
-            "once (not re-streamed every step), so this trades VRAM for lower denoise "
-            "latency when memory is available.",
+            "once per request rather than once per step, so this trades VRAM for "
+            "lower denoise latency when memory is available. How long they stay on "
+            "the GPU is --dit-layerwise-residency-lifetime: released when the "
+            "request finishes by default, or kept for the life of the server.",
+        )
+        parser.add_argument(
+            "--layerwise-prefetch-size",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-offload-prefetch-size, as "
+            "component=value entries, e.g. --layerwise-prefetch-size "
+            "text_encoder=2,vae=2. Same units as the DiT flag. Components with "
+            "no entry keep their group default. Prefetch overlaps a layer's "
+            "transfer with the previous layer's compute, which happens within a "
+            "single pass, so it is worth tuning on any streamed component.",
+        )
+        parser.add_argument(
+            "--layerwise-resident-layers",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-layerwise-resident-layers, as "
+            "component=value entries, e.g. --layerwise-resident-layers "
+            "video_vae=36. The layers are held on the GPU while that component "
+            "does its work for a request and released when it finishes, so this "
+            "pays for a component that runs its layers many times per request -- "
+            "a DiT across the denoise steps, a video VAE across the latent chunks. "
+            "A component that runs its layers once per request, such as a text "
+            "encoder, transfers the whole set again every request, so setting "
+            "this for one has no effect unless --layerwise-residency-lifetime "
+            "keeps the layers for the life of the server.",
+        )
+        parser.add_argument(
+            "--layerwise-residency-policy",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-layerwise-residency-policy, as "
+            "component=value entries, e.g. --layerwise-residency-policy "
+            "text_encoder=strided.",
+        )
+        parser.add_argument(
+            "--layerwise-residency-lifetime",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-layerwise-residency-lifetime, as "
+            "component=value entries, e.g. --layerwise-residency-lifetime "
+            "transformer=permanent,video_vae=forward. 'forward' releases a "
+            "component's resident layers when it finishes running for a request; "
+            "'permanent' places them on the GPU at load time and never releases "
+            "them.",
+        )
+        parser.add_argument(
+            "--dit-layerwise-residency-policy",
+            type=str,
+            choices=RESIDENCY_POLICIES,
+            default=ServerArgs.dit_layerwise_residency_policy,
+            help="Which layers --dit-layerwise-resident-layers keeps resident. "
+            "'leading' (default) keeps the first N, which crams the whole "
+            "weight stream into the tail of each step. 'strided' spreads the "
+            "resident layers evenly over the stack so the same bytes move over "
+            "the whole step instead: same VRAM, same bytes, only a different "
+            "schedule. Worth trying when weight streaming overlaps "
+            "memory-bound compute -- the transfers stop competing with it for "
+            "L2 and DRAM bandwidth, which is where the gain comes from.",
+        )
+        parser.add_argument(
+            "--dit-layerwise-residency-lifetime",
+            type=str,
+            choices=RESIDENCY_LIFETIMES,
+            default=ServerArgs.dit_layerwise_residency_lifetime,
+            help="How long the DiT layers kept by --dit-layerwise-resident-layers "
+            "stay on the GPU. 'forward' (default): placed when the DiT starts its "
+            "denoise steps for a request and released when they finish, so they "
+            "are transferred once per request and keep a copy in host memory. "
+            "'permanent': placed at load time, no host copy, never released -- "
+            "one transfer for the life of the server. Choose 'permanent' when the "
+            "resident layers of every component fit on the GPU together; with "
+            "'forward' only the running component holds its set, so the peak is "
+            "the largest set rather than their sum.",
         )
 
         # offload flags
@@ -1735,8 +3018,10 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--pin-cpu-memory",
             action=StoreBoolean,
-            help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
-            "Should be enabled in almost all cases",
+            help="Pin CPU-offloaded weights for faster host-to-device transfers, "
+            "subject to the host memory budget. Pinned memory cannot be reclaimed; "
+            "use --pin-cpu-memory false to reduce host/cgroup memory pressure "
+            'or work around CUDA pinning errors such as "invalid argument".',
         )
         parser.add_argument(
             "--ltx2-two-stage-device-mode",
@@ -1744,18 +3029,78 @@ class ServerArgs(DisaggServerArgsMixin):
             choices=LTX2_TWO_STAGE_DEVICE_MODE_CHOICES,
             default=ServerArgs.ltx2_two_stage_device_mode,
             help=(
-                "LTX-2.3 two-stage device residency mode: "
+                "LTX-2 / LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
-                "'resident' keeps both transformers resident on GPU. "
-                "'snapshot' is deprecated, treated as 'original', and may be "
-                "removed after two release cycles. "
-                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
+                "'resident' keeps both transformers resident on GPU and runs stage 2 "
+                "on the one with the distilled LoRA merged in. "
+                "Default is auto: resident on CUDA GPUs with at least 130 GiB, otherwise original."
             ),
         )
         parser.add_argument(
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
+        )
+
+        # KV-cache quantization (Quant-VideoGen PRQ)
+        parser.add_argument(
+            "--kv-cache-quant",
+            type=str,
+            default=None,
+            choices=["off", "int4", "int2"],
+            help="Enable Quant-VideoGen PRQ KV-cache quantization (off|int4|int2). "
+            "Defaults reproduce the tuned per-chunk config (stages=1, "
+            "centroids=128, block=64, symmetric, iters=2, recent=1, "
+            "per-chunk sink).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-centroids",
+            type=int,
+            default=None,
+            help="PRQ k-means centroids per stage (default 128).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-block-size",
+            type=int,
+            default=None,
+            help="PRQ residual scale block size (default 64).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-stages",
+            type=int,
+            default=None,
+            help="PRQ k-means stages (default 1).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-iters",
+            type=int,
+            default=None,
+            help="PRQ k-means iterations (default 2).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-asymmetric",
+            action="store_true",
+            default=None,
+            help="Use KIVI-style asymmetric residual quantization.",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-keep-recent",
+            type=int,
+            default=None,
+            help="Completed chunks kept bf16 before quantizing (default 1).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-sink",
+            type=int,
+            default=None,
+            choices=[0, 1],
+            help="Quantize the attention sink too (1, default) or keep it bf16 (0).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-sink-keep",
+            type=int,
+            default=None,
+            help="Leading sink chunks kept bf16 forever (default 0).",
         )
 
         # quantization
@@ -1768,11 +3113,14 @@ class ServerArgs(DisaggServerArgsMixin):
                 "auto-detected from the checkpoint config or safetensors metadata when "
                 "possible. Use this flag to override auto-detection. "
                 "Online (post-load) quantization from a BF16/FP16 checkpoint "
-                "is supported for 'fp8' and 'mxfp4'. Other methods "
+                "is supported for 'fp8', 'mxfp4' and 'convrot_int8' (ConvRot INT8 "
+                "W8A8; runs on SGLang's JIT-compiled fused ops on CC 9.0, 10.0, "
+                "12.0 and 12.1, else on comfy_kitchen; see "
+                "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND). Other methods "
                 "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
                 "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
                 "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
-                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
+                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (Ascend 950 series for mxfp4_npu)."
             ),
         )
         parser.add_argument(
@@ -1782,7 +3130,8 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.quantization_ignored_layers,
             help=(
                 "Layer name patterns to keep unquantized during online quantization "
-                "(fp8/mxfp4). Each pattern is matched against the layer prefix. "
+                "(fp8/mxfp4/convrot_int8). Each pattern is matched against the "
+                "layer prefix. "
                 "Example: --quantization-ignored-layers img_mod txt_mod to_out"
             ),
         )
@@ -1839,6 +3188,26 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
         )
         parser.add_argument(
+            "--sleep-on-idle",
+            action="store_true",
+            default=ServerArgs.sleep_on_idle,
+            help="Reduce idle CPU usage by waiting for requests instead of busy polling. "
+            "Disabled by default to minimize wake-up latency. Applies only to "
+            "single-rank monolithic replicas; TP/SP/CFG multi-rank replicas keep polling.",
+        )
+        parser.add_argument(
+            "--async-output-save",
+            action="store_true",
+            default=ServerArgs.async_output_save,
+            help="Finalize outputs (frame materialization, image/video encoding, disk "
+            "write, reply) on a background thread so the scheduler can start the next "
+            "request's GPU work immediately. Applies to save-to-file requests on the "
+            "output rank; requests carrying perf instrumentation keep the synchronous "
+            "path. Memory metrics reported for a request may include the next "
+            "request's allocations, and the per-request allocator cache release is "
+            "skipped.",
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -1849,6 +3218,47 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=ServerArgs.port,
             help="Port for the HTTP API server.",
+        )
+        parser.add_argument(
+            "--http-graceful-shutdown-timeout",
+            type=int,
+            default=ServerArgs.http_graceful_shutdown_timeout,
+            help="Seconds to wait for HTTP connections and tasks to finish on shutdown "
+            "before cancelling them. Unset waits indefinitely; 0 cancels immediately. "
+            "Does not bound GPU worker teardown or preserve asynchronous video jobs.",
+        )
+        parser.add_argument(
+            "--request-time-limit",
+            type=str,
+            nargs="+",
+            default=ServerArgs.request_time_limit,
+            help="Execution time limit per request: SECONDS for every request, or "
+            "TASK=SECONDS for one task of a model that names its request tasks "
+            "(MiniMax-H3: t2va, fl2va, ref2va); 0 or off removes a limit. A "
+            "request executing longer (queueing excluded) is logged with every "
+            "worker's Python stacks and turns /health unhealthy; restart the "
+            "server then. Unset: off. Not available with disaggregated roles.",
+        )
+        parser.add_argument(
+            "--enable-metrics",
+            action=StoreBoolean,
+            default=ServerArgs.enable_metrics,
+            help="Expose Prometheus metrics at /metrics.",
+        )
+        parser.add_argument(
+            "--api-key",
+            type=str,
+            default=ServerArgs.api_key,
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+        )
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=ServerArgs.admin_api_key,
+            help="Set admin API key for management endpoints. Sensitive ones (e.g. weight "
+            "updates, LoRA loading, memory release, profiling) are refused unless it is "
+            "set. When set, admin endpoints require this key and do NOT accept --api-key. "
+            "Defaults to SGLANG_ADMIN_API_KEY.",
         )
         parser.add_argument(
             "--strict-ports",
@@ -1902,14 +3312,25 @@ class ServerArgs(DisaggServerArgsMixin):
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
         )
         parser.add_argument(
+            "--lora-alpha",
+            type=int,
+            default=ServerArgs.lora_alpha,
+            help=(
+                "Override the LoRA training alpha when neither the checkpoint nor "
+                "adapter_config.json records it"
+            ),
+        )
+        parser.add_argument(
             "--lora-merge-mode",
             type=str,
             choices=LORA_MERGE_MODES,
             default=ServerArgs.lora_merge_mode,
             help=(
-                "How LoRA is applied: auto keeps static merge for regular weights "
-                "and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather; "
-                "merge always merges into base weights; dynamic always applies LoRA at forward time."
+                "How LoRA is applied: auto merges into regular weights, but uses "
+                "dynamic LoRA for FSDP-sharded weights (to avoid a full gather) and "
+                "for adapters a merge would mostly round away (more than 50%% of "
+                "the update, e.g. distilled LoRAs); merge always merges into base "
+                "weights; dynamic always applies LoRA at forward time."
             ),
         )
         parser.add_argument(
@@ -1941,6 +3362,13 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.otlp_traces_endpoint,
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
+        )
+        parser.add_argument(
+            "--otlp-service-name",
+            type=str,
+            default=ServerArgs.otlp_service_name,
+            help="Service name for OTLP traces (displayed as 'service.name' in trace backends). "
+            "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang-diffusion'.",
         )
         parser.add_argument(
             "--log-requests",
@@ -1990,6 +3418,18 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Return number of cached tokens in usage.prompt_tokens_details for each OpenAI-compatible request.",
         )
         parser.add_argument(
+            "--disable-conditioning-cache",
+            action="store_true",
+            default=ServerArgs.disable_conditioning_cache,
+            help="Disable cross-request text/image and VAE posterior caching; reuse within a grouped stage remains enabled.",
+        )
+        parser.add_argument(
+            "--conditioning-cache-max-size-mb",
+            type=float,
+            default=ServerArgs.conditioning_cache_max_size_mb,
+            help="Per-worker conditioning cache capacity across CPU and device entries in MiB (default: 512; 0 disables cross-request caching).",
+        )
+        parser.add_argument(
             "--backend",
             type=str,
             choices=Backend.choices(),
@@ -2007,7 +3447,8 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         parser.add_argument(
             "--srt-encoder-connection-timeout",
-            type=int,
+            dest="srt_encoder_connect_timeout",
+            type=float,
             default=ServerArgs.srt_encoder_connect_timeout,
             help="Timeout (in seconds) for establishing the initial TCP connection to the SGLang encoder server. "
             "Default value is 3.05.",
@@ -2027,7 +3468,22 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.pe_server_url,
             help="URL of SGLang server for PE model",
         )
+        parser.add_argument(
+            "--prompt-enhancer-config",
+            type=str,
+            default=ServerArgs.prompt_enhancer_config,
+            help="JSON config file for an external SRT prompt enhancer, used by HTTP requests with enhance_prompt=true.",
+        )
 
+        # use argparse's destinations so new aliases need no second registry
+        parser.set_defaults(
+            _sglang_cli_destinations={
+                option[2:].replace("-", "_"): action.dest
+                for action in parser._actions
+                for option in action.option_strings
+                if option.startswith("--")
+            }
+        )
         return parser
 
     def url(self):
@@ -2045,12 +3501,38 @@ class ServerArgs(DisaggServerArgsMixin):
     def scheduler_endpoint(self):
         """
         Internal endpoint for scheduler.
-        Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
+        Wildcard, localhost, and IPv6 hosts use IPv4 loopback for internal ZMQ.
+        """
+        return self.scheduler_endpoint_for(0)
+
+    def scheduler_endpoint_for(self, replica: int) -> str:
+        """Ingress endpoint of one DP replica's driver rank.
+
+        The scheduler ingress is an unauthenticated pickle-RPC endpoint
+        (``managers/scheduler.py`` ``recv_reqs`` deserializes client bytes
+        with ``pickle.loads``), so it must never be derived from the public
+        ``--host``: binding it to ``0.0.0.0`` would expose unsafe
+        deserialization to the network (CVE-2026-3059 family). Wildcard hosts
+        are pinned to loopback; IPv6 hosts also use IPv4 loopback for internal
+        ZMQ compatibility. Explicit non-wildcard IPv4 hosts and hostnames
+        (used for intentional cross-machine deployments) are honored.
         """
         scheduler_host = self.host
-        if scheduler_host is None or scheduler_host == "localhost":
+        if (
+            scheduler_host is None
+            or scheduler_host in ("localhost", "0.0.0.0")
+            or is_valid_ipv6_address(scheduler_host)
+        ):
             scheduler_host = "127.0.0.1"
-        return f"tcp://{scheduler_host}:{self.scheduler_port}"
+        if self.scheduler_ports is not None:
+            port = self.scheduler_ports[replica]
+        else:
+            port = self.scheduler_port + replica
+        return f"tcp://{scheduler_host}:{port}"
+
+    @property
+    def scheduler_endpoints(self) -> list[str]:
+        return [self.scheduler_endpoint_for(r) for r in range(self.dp_size or 1)]
 
     def settle_port(
         self,
@@ -2087,38 +3569,40 @@ class ServerArgs(DisaggServerArgsMixin):
         )
 
     @staticmethod
-    def _extract_component_paths(
+    def _extract_dynamic_component_map(
         unknown_args: list[str],
+        *,
+        option_prefixes: tuple[str, ...],
+        alias_suffix: str | None,
+        expand_values: bool = True,
     ) -> tuple[dict[str, str], list[str]]:
-        """
-        Extract dynamic component path args from unrecognised CLI args.
-
-        Supported forms:
-        - ``--<component>-path /path/to/component``
-        - ``--component-paths.<component> /path/to/component`` (expanded from config)
-        """
-        component_paths: dict[str, str] = {}
+        component_values: dict[str, str] = {}
         remaining: list[str] = []
         i = 0
         while i < len(unknown_args):
             arg = unknown_args[i]
             key_part = arg.split("=", 1)[0] if "=" in arg else arg
             component = None
-            if key_part.startswith("--component-paths."):
-                component = key_part[len("--component-paths.") :].replace("-", "_")
-            elif key_part.startswith("--component_paths."):
-                component = key_part[len("--component_paths.") :].replace("-", "_")
-            elif key_part.startswith("--") and key_part.endswith("-path"):
-                component = key_part[2:-5].replace("-", "_")
+            for option_prefix in option_prefixes:
+                if key_part.startswith(option_prefix):
+                    component = key_part[len(option_prefix) :].replace("-", "_")
+                    break
+            if (
+                component is None
+                and alias_suffix is not None
+                and key_part.startswith("--")
+                and key_part.endswith(alias_suffix)
+            ):
+                component = key_part[2 : -len(alias_suffix)].replace("-", "_")
 
             if component is not None:
                 if "=" in arg:
-                    component_paths[component] = arg.split("=", 1)[1]
+                    component_values[component] = arg.split("=", 1)[1]
                 elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
                     "-"
                 ):
                     i += 1
-                    component_paths[component] = unknown_args[i]
+                    component_values[component] = unknown_args[i]
                 else:
                     remaining.append(arg)
                     i += 1
@@ -2127,11 +3611,153 @@ class ServerArgs(DisaggServerArgsMixin):
                 remaining.append(arg)
             i += 1
 
-        # canonicalize and validate
-        for component, path in component_paths.items():
-            path = os.path.expanduser(path)
-            component_paths[component] = path
-        return component_paths, remaining
+        if expand_values:
+            component_values = {
+                component: os.path.expanduser(value)
+                for component, value in component_values.items()
+            }
+        return component_values, remaining
+
+    @classmethod
+    def _extract_component_paths(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract dynamic component configuration paths and aliases."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=("--component-paths.", "--component_paths."),
+            alias_suffix="-path",
+        )
+
+    @classmethod
+    def _extract_component_weights_paths(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract dynamic component weight-file paths and aliases."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=(
+                "--component-weights-paths.",
+                "--component_weights_paths.",
+            ),
+            alias_suffix="-weights-path",
+        )
+
+    @staticmethod
+    def _extract_component_direct_gpu_weight_loading(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, bool], list[str]]:
+        """Extract exact component direct-GPU loading toggles.
+
+        Dynamic boolean flags mirror ``StoreBoolean``: an omitted value means
+        true, while an explicit ``true`` or ``false`` works with either an
+        equals form or a following argument.
+        """
+        values: dict[str, bool] = {}
+        remaining: list[str] = []
+        prefixes = (
+            "--component-direct-gpu-weight-loading.",
+            "--component_direct_gpu_weight_loading.",
+        )
+        i = 0
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            prefix = next(
+                (candidate for candidate in prefixes if key_part.startswith(candidate)),
+                None,
+            )
+            if prefix is None:
+                remaining.append(arg)
+                i += 1
+                continue
+
+            component = key_part[len(prefix) :].replace("-", "_")
+            value = "true"
+            if "=" in arg:
+                value = arg.split("=", 1)[1]
+            elif i + 1 < len(unknown_args):
+                next_value = unknown_args[i + 1].lower()
+                if next_value in ("true", "false"):
+                    i += 1
+                    value = next_value
+
+            if not component or value.lower() not in ("true", "false"):
+                remaining.append(arg)
+            else:
+                values[component] = value.lower() == "true"
+            i += 1
+        return values, remaining
+
+    @classmethod
+    def _extract_component_quantizations(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract explicit per-component quantization methods."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=(
+                "--component-quantizations.",
+                "--component_quantizations.",
+            ),
+            alias_suffix="-quantization",
+        )
+
+    @classmethod
+    def _extract_component_precisions(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract exact component precision overrides."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=("--component-precisions.", "--component_precisions."),
+            alias_suffix=None,
+            expand_values=False,
+        )
+
+    @staticmethod
+    def _extract_component_quantization_ignored_layers(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, list[str]], list[str]]:
+        ignored_layers: dict[str, list[str]] = {}
+        remaining: list[str] = []
+        i = 0
+        prefixes = (
+            "--component-quantization-ignored-layers.",
+            "--component_quantization_ignored_layers.",
+        )
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            prefix = next(
+                (candidate for candidate in prefixes if key_part.startswith(candidate)),
+                None,
+            )
+            if prefix is None:
+                remaining.append(arg)
+                i += 1
+                continue
+
+            component = key_part[len(prefix) :].replace("-", "_")
+            if "=" in arg:
+                values = [arg.split("=", 1)[1]]
+            else:
+                values = []
+                while i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    values.append(unknown_args[i])
+            if component and values:
+                ignored_layers[component] = values
+            else:
+                remaining.append(arg)
+            i += 1
+        return ignored_layers, remaining
 
     @staticmethod
     def _extract_component_attention_backends(
@@ -2176,19 +3802,34 @@ class ServerArgs(DisaggServerArgsMixin):
         args: argparse.Namespace,
         unknown_args: list[str] | None = None,
         default_args: dict[str, Any] | None = None,
+        *,
+        argv: list[str] | None = None,
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
 
-        # extract dynamic --<component>-path from unknown args
-        dynamic_paths, remaining = cls._extract_component_paths(unknown_args)
+        dynamic_quantizations, remaining = cls._extract_component_quantizations(
+            unknown_args
+        )
+        dynamic_precisions, remaining = cls._extract_component_precisions(remaining)
+        dynamic_direct_gpu_loading, remaining = (
+            cls._extract_component_direct_gpu_weight_loading(remaining)
+        )
+        dynamic_ignored_layers, remaining = (
+            cls._extract_component_quantization_ignored_layers(remaining)
+        )
+        # Extract the more specific weights suffix before the generic path alias.
+        dynamic_weights_paths, remaining = cls._extract_component_weights_paths(
+            remaining
+        )
+        dynamic_paths, remaining = cls._extract_component_paths(remaining)
         dynamic_attention_backends, remaining = (
             cls._extract_component_attention_backends(remaining)
         )
         if remaining:
             raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
 
-        provided_args = cls.get_provided_args(args, unknown_args)
+        provided_args = cls.get_provided_args(args, unknown_args, argv=argv)
         explicit_arg_names = set(provided_args)
 
         # Handle config file
@@ -2207,6 +3848,35 @@ class ServerArgs(DisaggServerArgsMixin):
             existing.update(dynamic_paths)
             provided_args["component_paths"] = existing
             explicit_arg_names.add("component_paths")
+        if dynamic_weights_paths:
+            existing = dict(provided_args.get("component_weights_paths") or {})
+            existing.update(dynamic_weights_paths)
+            provided_args["component_weights_paths"] = existing
+            explicit_arg_names.add("component_weights_paths")
+        if dynamic_quantizations:
+            existing = dict(provided_args.get("component_quantizations") or {})
+            existing.update(dynamic_quantizations)
+            provided_args["component_quantizations"] = existing
+            explicit_arg_names.add("component_quantizations")
+        if dynamic_precisions:
+            existing = dict(provided_args.get("component_precisions") or {})
+            existing.update(dynamic_precisions)
+            provided_args["component_precisions"] = existing
+            explicit_arg_names.add("component_precisions")
+        if dynamic_direct_gpu_loading:
+            existing = dict(
+                provided_args.get("component_direct_gpu_weight_loading") or {}
+            )
+            existing.update(dynamic_direct_gpu_loading)
+            provided_args["component_direct_gpu_weight_loading"] = existing
+            explicit_arg_names.add("component_direct_gpu_weight_loading")
+        if dynamic_ignored_layers:
+            existing = dict(
+                provided_args.get("component_quantization_ignored_layers") or {}
+            )
+            existing.update(dynamic_ignored_layers)
+            provided_args["component_quantization_ignored_layers"] = existing
+            explicit_arg_names.add("component_quantization_ignored_layers")
         if dynamic_attention_backends:
             existing = cls._parse_component_attention_backend_map(
                 provided_args.get("component_attention_backends")
@@ -2221,6 +3891,7 @@ class ServerArgs(DisaggServerArgsMixin):
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
+        cls._reject_retired_args(kwargs)
         attrs = [attr.name for attr in dataclasses.fields(cls) if attr.init]
         server_args_kwargs: dict[str, Any] = {}
         explicit_arg_names = kwargs.get("_explicit_arg_names")
@@ -2242,10 +3913,37 @@ class ServerArgs(DisaggServerArgsMixin):
             elif attr == "nunchaku_config":
                 nunchaku_config = NunchakuSVDQuantArgs.from_dict(kwargs)
                 server_args_kwargs["nunchaku_config"] = nunchaku_config
+            elif attr == "kv_cache_quant_config":
+                kv_quant_config = kwargs.get("kv_cache_quant_config")
+                if kv_quant_config is None:
+                    kv_quant_config = QVGKVQuantArgs.from_dict(kwargs)
+                elif isinstance(kv_quant_config, dict):
+                    kv_quant_config = QVGKVQuantArgs(**kv_quant_config).validate()
+                elif isinstance(kv_quant_config, QVGKVQuantArgs):
+                    kv_quant_config.validate()
+                else:
+                    raise TypeError(
+                        "kv_cache_quant_config must be QVGKVQuantArgs or a dict"
+                    )
+                server_args_kwargs["kv_cache_quant_config"] = kv_quant_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
         return cls(**server_args_kwargs)
+
+    @staticmethod
+    def _reject_retired_args(kwargs: dict[str, Any]) -> None:
+        retired_args = {
+            "decoder_tp": "decoder_sp for decoder/VAE parallel decode",
+            "warmup": "warmup_mode=request or warmup_mode=off",
+            "server_warmup": "warmup_mode=server or warmup_mode=off",
+        }
+        removed = [name for name in retired_args if name in kwargs]
+        if removed:
+            replacements = "; ".join(
+                f"{name} -> {retired_args[name]}" for name in removed
+            )
+            raise ValueError(f"Removed server argument(s): {replacements}")
 
     @staticmethod
     def load_config_file(config_file: str) -> dict[str, Any]:
@@ -2254,13 +3952,6 @@ class ServerArgs(DisaggServerArgsMixin):
             with open(config_file, "r") as f:
                 return json.load(f)
         elif config_file.endswith((".yaml", ".yml")):
-            try:
-                import yaml
-            except ImportError:
-                raise ImportError(
-                    "Please install PyYAML to use YAML config files. "
-                    "`pip install pyyaml`"
-                )
             with open(config_file, "r") as f:
                 return yaml.safe_load(f)
         else:
@@ -2268,7 +3959,12 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
-        explicit_arg_names = set(kwargs)
+        cls._reject_retired_args(kwargs)
+        explicit_arg_names = kwargs.get("_explicit_arg_names")
+        if explicit_arg_names is None:
+            explicit_arg_names = set(kwargs)
+        else:
+            explicit_arg_names = set(explicit_arg_names)
 
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
@@ -2284,32 +3980,36 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @staticmethod
     def get_provided_args(
-        args: argparse.Namespace, unknown_args: list[str]
+        args: argparse.Namespace,
+        unknown_args: list[str],
+        *,
+        argv: list[str] | None = None,
     ) -> dict[str, Any]:
         """Get the arguments provided by the user."""
         provided_args = {}
         # We need to check against the raw command-line arguments to see what was
         # explicitly provided by the user, vs. what's a default value from argparse.
-        raw_argv = sys.argv + unknown_args
+        raw_argv = (sys.argv[1:] if argv is None else argv) + unknown_args
 
         # Create a set of argument names that were present on the command line.
         # This handles both styles: '--arg=value' and '--arg value'.
-        provided_arg_names = set(getattr(args, "_sglang_explicit_arg_names", ()))
+        provided_arg_names = set(vars(args).get("_sglang_explicit_arg_names", ()))
+        destinations = vars(args).get("_sglang_cli_destinations", {})
         for arg in raw_argv:
             if arg.startswith("--"):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
-                provided_arg_names.add(arg_name)
-        cli_aliases = {
-            "cfg_parallel_size": "cfg_parallel_degree",
-            "data_parallel_size": "dp_size",
-            "dp": "dp_size",
-            "layerwise_offload_modules": "layerwise_offload_components",
-            "mode": "performance_mode",
-        }
-        for alias_name, dest_name in cli_aliases.items():
-            if alias_name in provided_arg_names:
-                provided_arg_names.add(dest_name)
+                if arg_name not in destinations and arg_name not in vars(args):
+                    # argparse also accepts an unambiguous prefix of a flag; a
+                    # flag spelled in full (also one registered later) wins.
+                    abbreviated = {
+                        dest
+                        for name, dest in destinations.items()
+                        if name.startswith(arg_name)
+                    }
+                    if len(abbreviated) == 1:
+                        arg_name = abbreviated.pop()
+                provided_arg_names.add(destinations.get(arg_name, arg_name))
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
@@ -2341,6 +4041,17 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _validate_offload(self):
+        if (
+            self.component_residency is not None
+            and self.pipeline_config.task_type.is_action_gen()
+        ):
+            raise ValueError(
+                "--component-residency is not supported by action-generation "
+                "pipelines; use their existing model-specific offload controls"
+            )
+        if self.backend == Backend.DIFFUSERS and self.component_residency is not None:
+            resolve_diffusers_pipeline_offload(self.component_residency)
+
         # validate dit_offload_prefetch_size
         if self.dit_offload_prefetch_size > 1 and (
             isinstance(self.dit_offload_prefetch_size, float)
@@ -2382,6 +4093,55 @@ class ServerArgs(DisaggServerArgsMixin):
                 "--dit-layerwise-offload (or 'dit' in --layerwise-offload-components)."
             )
 
+        if self.dit_layerwise_residency_policy not in RESIDENCY_POLICIES:
+            # argparse's choices= only covers the CLI; ServerArgs is also
+            # constructed directly by the Python API, and without this the bad
+            # value would surface as a ValueError inside the GPU worker at
+            # model-load time.
+            raise ValueError(
+                f"Invalid --dit-layerwise-residency-policy "
+                f"{self.dit_layerwise_residency_policy!r}; expected one of "
+                f"{RESIDENCY_POLICIES}."
+            )
+
+        if self.dit_layerwise_residency_policy != RESIDENCY_POLICY_LEADING:
+            if not self.is_dit_layerwise_offload_selected:
+                logger.warning(
+                    "--dit-layerwise-residency-policy has no effect because the DiT is "
+                    "not layerwise-offloaded. It only applies together with "
+                    "--dit-layerwise-offload (or 'dit' in "
+                    "--layerwise-offload-components)."
+                )
+            elif self.dit_layerwise_resident_layers <= 0:
+                # With nothing resident every layer streams, so there is no
+                # layout to choose and the policies are the same run.
+                logger.warning(
+                    "--dit-layerwise-residency-policy has no effect because "
+                    "--dit-layerwise-resident-layers is 0: every layer is streamed, "
+                    "so there is no resident set to place."
+                )
+
+        if self.dit_layerwise_residency_lifetime not in RESIDENCY_LIFETIMES:
+            raise ValueError(
+                f"Invalid --dit-layerwise-residency-lifetime "
+                f"{self.dit_layerwise_residency_lifetime!r}; expected one of "
+                f"{RESIDENCY_LIFETIMES}."
+            )
+        if self.dit_layerwise_residency_lifetime == RESIDENCY_LIFETIME_PERMANENT:
+            if not self.is_dit_layerwise_offload_selected:
+                logger.warning(
+                    "--dit-layerwise-residency-lifetime has no effect because the "
+                    "DiT is not layerwise-offloaded. It only applies together with "
+                    "--dit-layerwise-offload (or 'dit' in "
+                    "--layerwise-offload-components)."
+                )
+            elif self.dit_layerwise_resident_layers <= 0:
+                logger.warning(
+                    "--dit-layerwise-residency-lifetime has no effect because "
+                    "--dit-layerwise-resident-layers is 0: there is no resident "
+                    "set to keep."
+                )
+
         # validate layerwise offload conflicts
         if envs.SGLANG_CACHE_DIT_ENABLED and self.use_fsdp_inference:
             if self.is_arg_explicitly_set("use_fsdp_inference"):
@@ -2397,39 +4157,97 @@ class ServerArgs(DisaggServerArgsMixin):
             )
             self.use_fsdp_inference = False
 
-        if self.layerwise_offload_components:
+        if self.has_layerwise_offload_components():
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")
-
-            is_dit_layerwise_offload_selected = self.is_dit_layerwise_offload_selected
-            if self.use_fsdp_inference and is_dit_layerwise_offload_selected:
-                logger.warning(
-                    "layerwise offload is selected for DiT components, automatically disabling use_fsdp_inference."
-                )
-                self.use_fsdp_inference = False
-
-            if envs.SGLANG_CACHE_DIT_ENABLED and is_dit_layerwise_offload_selected:
-                raise ValueError(
-                    "DiT layerwise offload cannot be enabled together with cache-dit. "
-                    "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
-                    "causing shape mismatch errors. "
-                    "Please disable --dit-layerwise-offload, remove DiT from --layerwise-offload-components, "
-                    "or disable SGLANG_CACHE_DIT_ENABLED."
-                )
 
             if (
                 self.performance_mode == "memory"
                 or self.is_arg_explicitly_set("layerwise_offload_components")
                 or self.dit_layerwise_offload
+                or (
+                    self.component_residency
+                    and LAYERWISE_OFFLOAD in self.component_residency.values()
+                )
             ):
+                selected_components = list(self.layerwise_offload_components or ())
+                if self.component_residency:
+                    selected_components.extend(
+                        selector
+                        for selector, mode in self.component_residency.items()
+                        if mode == LAYERWISE_OFFLOAD
+                    )
+                selected_components = list(dict.fromkeys(selected_components))
                 logger.info_once(
                     "Using layerwise offload components: "
-                    f"{', '.join(self.layerwise_offload_components)}. "
+                    f"{', '.join(selected_components or ())}. "
                     "This reduces peak GPU memory and can increase latency; use "
                     "--performance-mode speed for GPU-resident defaults when memory allows."
                 )
 
+    def _validate_direct_gpu_weight_loading(self) -> None:
+        if self.direct_gpu_weight_loading:
+            if not current_platform.is_cuda():
+                raise ValueError("--direct-gpu-weight-loading requires CUDA")
+            if (
+                self.should_cpu_offload_component("transformer")
+                or self.residency_mode("transformer") == LAYERWISE_OFFLOAD
+            ):
+                raise ValueError(
+                    "--direct-gpu-weight-loading requires a GPU-resident DiT; "
+                    "disable DiT CPU and layerwise offload"
+                )
+            if self.use_fsdp_inference:
+                raise ValueError(
+                    "--direct-gpu-weight-loading does not support FSDP inference"
+                )
+            if self.tp_size != 1:
+                raise ValueError("--direct-gpu-weight-loading requires --tp-size 1")
+
+        for component_name, enabled in self.component_direct_gpu_weight_loading.items():
+            if not enabled:
+                continue
+            if not current_platform.is_cuda():
+                raise ValueError("--component-direct-gpu-weight-loading requires CUDA")
+            if self.should_start_component_on_cpu(component_name):
+                raise ValueError(
+                    "--component-direct-gpu-weight-loading requires "
+                    f"{component_name!r} to be resident"
+                )
+
+    def should_direct_gpu_weight_load_component(self, component_name: str) -> bool:
+        """Return whether an exact component opted into direct GPU loading."""
+        return self.component_direct_gpu_weight_loading.get(component_name, False)
+
     def _validate_parallelism(self):
+        if self.kv_gather_degree < 1:
+            raise ValueError("kv_gather_degree must be >= 1")
+        if self.kv_gather_degree > 1 and self.sp_degree != self.kv_gather_degree:
+            raise ValueError(
+                f"kv_gather_degree ({self.kv_gather_degree}) must equal "
+                f"sp_degree ({self.sp_degree}); check how many GPUs remain for "
+                "sequence parallelism after dp/tp/cfg"
+            )
+
+        if self.nnodes < 1:
+            raise ValueError("--nnodes must be a natural number")
+        if not (0 <= self.node_rank < self.nnodes):
+            raise ValueError(
+                f"--node-rank ({self.node_rank}) must be in [0, nnodes={self.nnodes})"
+            )
+        if self.nnodes > 1 and self.dist_init_addr is None:
+            raise ValueError("--dist-init-addr is required when --nnodes > 1")
+        if self.num_gpus % self.nnodes != 0:
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be divisible by nnodes ({self.nnodes})"
+            )
+        local_num_gpus = self.num_gpus // self.nnodes
+        if self.numa_node is not None and len(self.numa_node) < local_num_gpus:
+            raise ValueError(
+                f"--numa-node needs one node per local GPU worker ({local_num_gpus}), "
+                f"got {self.numa_node}"
+            )
+
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) must be >= and divisible by sp_degree ({self.sp_degree})"
@@ -2459,8 +4277,11 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.dp_size < 1:
             raise ValueError("--dp-size must be a natural number")
 
-        if self.dp_size > 1:
-            raise ValueError("DP is not yet supported")
+        if self.dp_size > 1 and self.disagg_role != RoleType.MONOLITHIC:
+            raise ValueError(
+                "--dp-size > 1 is only supported for monolithic serving; "
+                "disaggregated roles scale by adding role instances instead"
+            )
 
         num_gpus_per_group = self.dp_size * self.tp_size
         if self.enable_cfg_parallel:
@@ -2478,15 +4299,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"sp_degree ({self.sp_degree}) must equal ring_degree * ulysses_degree "
                 f"({self.ring_degree} * {self.ulysses_degree} = {self.ring_degree * self.ulysses_degree})"
             )
-
-        if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
-            has_sp = self.sp_degree > 1
-            has_tp = self.tp_size > 1
-            if has_sp and has_tp:
-                logger.warning(
-                    "cache-dit is enabled with hybrid parallelism (SP + TP). "
-                    "Proceeding anyway (SGLang integration may support this mode)."
-                )
 
     def _validate_cfg_parallel(self):
         if not self.enable_cfg_parallel:
@@ -2508,10 +4320,6 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
-        if self.encoder_parallel == "dp" and (
-            (self.tp_size or 1) != 1 or (self.dp_size or 1) != 1
-        ):
-            raise ValueError("encoder_parallel=dp requires tp_size=1 and dp_size=1")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
@@ -2527,45 +4335,12 @@ class ServerArgs(DisaggServerArgsMixin):
 
 @dataclasses.dataclass
 class PortArgs:
-    # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
-    scheduler_input_ipc_name: str
-
-    # The port for nccl initialization (torch.dist)
-    nccl_port: int
-
-    # The ipc filename for rpc call between Engine and Scheduler
-    rpc_ipc_name: str
-
-    # The ipc filename for Scheduler to send metrics
-    metrics_ipc_name: str
-
     # Master port for distributed inference
     master_port: int | None = None
 
     @staticmethod
-    def from_server_args(
-        server_args: ServerArgs, dp_rank: Optional[int] = None
-    ) -> "PortArgs":
-        if server_args.nccl_port is None:
-            nccl_port = server_args.scheduler_port + random.randint(100, 1000)
-            while True:
-                if is_port_available(nccl_port):
-                    break
-                if nccl_port < 60000:
-                    nccl_port += 42
-                else:
-                    nccl_port -= 43
-        else:
-            nccl_port = server_args.nccl_port
-
-        # Normal case, use IPC within a single node
-        return PortArgs(
-            scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            nccl_port=nccl_port,
-            rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            master_port=server_args.master_port,
-        )
+    def from_server_args(server_args: ServerArgs) -> "PortArgs":
+        return PortArgs(master_port=server_args.master_port)
 
 
 _global_server_args = None
@@ -2578,7 +4353,7 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args, unknown_args = parser.parse_known_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args, unknown_args)
+    server_args = ServerArgs.from_cli_args(raw_args, unknown_args, argv=argv)
     return server_args
 
 
@@ -2592,9 +4367,5 @@ def set_global_server_args(server_args: ServerArgs):
 
 def get_global_server_args() -> ServerArgs:
     if _global_server_args is None:
-        # in ci, usually when we test custom ops/modules directly,
-        # we don't set the sgl_diffusion config. In that case, we set a default
-        # config.
-        # TODO(will): may need to handle this for CI.
         raise ValueError("Global sgl_diffusion args is not set.")
     return _global_server_args

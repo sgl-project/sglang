@@ -1,6 +1,7 @@
 import logging
 from typing import Any, List
 
+from sglang.srt.mem_cache.embedding_store import EmbeddingStore
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     DEFAULT_TENANT_ID,
     MooncakeBaseStore,
@@ -9,7 +10,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
 logger = logging.getLogger(__name__)
 
 
-class MooncakeEmbeddingStore(MooncakeBaseStore):
+class MooncakeEmbeddingStore(MooncakeBaseStore, EmbeddingStore):
     def __init__(
         self,
         storage_config: Any = None,
@@ -19,6 +20,14 @@ class MooncakeEmbeddingStore(MooncakeBaseStore):
         MooncakeDistributedStore = self._import_mooncake_store()
         self.store = MooncakeDistributedStore()
         self.config = self._load_config(storage_config)
+        if self.config.enable_egm_store_pool:
+            # The positional setup() below mounts an ordinary host segment, which
+            # NVLink peers on other nodes cannot read.
+            raise ValueError(
+                "enable_egm_store_pool is supported only by the HiCache Mooncake "
+                "store. Unset MOONCAKE_ENABLE_EGM_STORE_POOL (or the key in the "
+                "Mooncake config file) for the multimodal embedding cache."
+            )
         setup_kwargs = {}
         if self.config.tenant_id != DEFAULT_TENANT_ID:
             setup_kwargs["tenant_id"] = self.config.tenant_id

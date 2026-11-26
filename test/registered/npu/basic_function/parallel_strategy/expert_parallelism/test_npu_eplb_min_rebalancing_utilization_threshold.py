@@ -14,8 +14,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-8-npu-a3", nightly=False)
-register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="extra-b-test-8-npu-a3")
+register_npu_ci(est_time=400, suite="nightly-test-8-npu-a3", nightly=True)
 
 
 class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
@@ -32,7 +32,8 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
     common_args = [
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--trust-remote-code",
         "--chunked-prefill-size",
         "1024",
@@ -51,7 +52,8 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
         50,
         "--expert-distribution-recorder-buffer-size",
         50,
-        "--enable-expert-distribution-metrics",
+        "--expert-balancedness-report-mode",
+        "server_log",
         "--eplb-rebalance-layers-per-chunk",
         "1",
     ]
@@ -79,9 +81,11 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
                 "SGLANG_EXPERT_LOCATION_UPDATER_CANARY": "1",
                 "HCCL_BUFFSIZE": "1024",
                 "SGLANG_DEEPEP_BF16_DISPATCH": "1",
+                "DEEPEP_HYBRID_DEPLOYMENT": "1",
                 "TRANSFORMERS_VERBOSITY": "error",
                 "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
                 **os.environ,
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             },
             return_stdout_stderr=(cls.out_file, cls.err_file),
         )
@@ -112,7 +116,7 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
         self.assertGreaterEqual(
             metrics["score"],
             self.accuracy,
-            f'Accuracy of {self.model} is {str(metrics["score"])}, is lower than {self.accuracy}',
+            f"Accuracy of {self.model} is {str(metrics['score'])}, is lower than {self.accuracy}",
         )
 
         """
@@ -154,9 +158,11 @@ class TestEplbMinRebalancingUtilizationThreshold095(
                 "SGLANG_EXPERT_LOCATION_UPDATER_CANARY": "1",
                 "HCCL_BUFFSIZE": "1024",
                 "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1",
+                "DEEPEP_HYBRID_DEPLOYMENT": "1",
                 "TRANSFORMERS_VERBOSITY": "error",
                 "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
                 **os.environ,
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             },
             return_stdout_stderr=(cls.out_file, cls.err_file),
         )

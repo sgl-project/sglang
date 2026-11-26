@@ -16,6 +16,8 @@
 
 #include <cstdint>
 
+namespace sglang {
+
 namespace inkling_ar {
 
 constexpr uint32_t kLeaderStateWords = 8;
@@ -191,3 +193,5 @@ block_system_barrier(uint32_t* __restrict__ st, void* const* __restrict__ flag_p
 }
 
 }  // namespace inkling_ar
+
+}  // namespace sglang

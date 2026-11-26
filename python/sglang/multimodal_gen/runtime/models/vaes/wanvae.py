@@ -18,6 +18,7 @@
 
 import contextvars
 from contextlib import contextmanager, nullcontext
+from functools import partial
 
 import torch
 import torch.distributed as dist
@@ -27,11 +28,15 @@ from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
+    is_auto_parallel_decode_mode,
     should_use_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
+    get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
 )
@@ -41,10 +46,10 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelConv2d,
     SpatialParallelZeroPad2d,
     causal_conv3d_cat_pad,
-    chunk_height_for_parallel_decode,
     disable_spatial_parallel_decode,
     gather_and_trim_height,
     gather_height_for_global_op,
+    spatial_parallel_decode_disabled,
     split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import (
@@ -52,7 +57,33 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     ParallelTiledVAE,
     should_run_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes.resample import AvgDown3D
+from sglang.multimodal_gen.runtime.models.vaes.resample import DupUp3D as DupUp3DBase
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.utils import is_gfx1250_supported
+
+if (
+    current_platform.is_cuda()
+    or current_platform.is_xpu()
+    or (current_platform.is_rocm() and is_gfx1250_supported())
+):
+    try:
+        from sglang.kernels.ops.diffusion import (
+            can_use_conv_bias_epilogue,
+            cat_pad_channels_last_3d,
+            conv_bias_epilogue,
+            dup_up3d_add,
+        )
+    except ImportError:  # pragma: no cover
+        cat_pad_channels_last_3d = None
+        dup_up3d_add = None
+        conv_bias_epilogue = None
+        can_use_conv_bias_epilogue = None
+else:
+    cat_pad_channels_last_3d = None
+    dup_up3d_add = None
+    conv_bias_epilogue = None
+    can_use_conv_bias_epilogue = None
 
 CACHE_T = 2
 
@@ -63,8 +94,11 @@ first_chunk = contextvars.ContextVar("first_chunk", default=None)
 
 
 def _channels_last_3d_supported_by_platform() -> bool:
-    return hasattr(torch, "channels_last_3d") and (
-        current_platform.is_cuda() or current_platform.is_rocm()
+    return (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_cpu()
+        or current_platform.is_xpu()
     )
 
 
@@ -82,103 +116,160 @@ def match_conv3d_input_format(x: torch.Tensor, weight: torch.Tensor) -> torch.Te
     return x
 
 
-class AvgDown3D(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        factor_t,
-        factor_s=1,
+def _cache_payload(cache) -> torch.Tensor | None:
+    """Tensor payload of a feature-cache entry (``None`` for empty slots and
+    for the ``"Rep"`` marker)."""
+    return cache if isinstance(cache, torch.Tensor) else None
+
+
+def _fused_conv_cache_supported(conv: nn.Module, x: torch.Tensor) -> bool:
+    return (
+        cat_pad_channels_last_3d is not None
+        and type(conv) is WanCausalConv3d
+        # ROCm's batched-Conv2D replacement patches ``forward``; the fused
+        # path would call the unpatched conv epilogue instead.
+        and not hasattr(conv, "_weight_2d")
+        and x.dim() == 5
+        and x.device.type in ("cuda", "xpu")
+        and current_platform.is_amp_supported()
+        and _conv3d_weight_is_channels_last_3d(conv.weight)
+        and not torch.compiler.is_compiling()
+    )
+
+
+def _run_cached_causal_conv(
+    conv: nn.Module,
+    x: torch.Tensor,
+    cache_list: list,
+    idx: int,
+    residual: torch.Tensor | None = None,
+    skip_bias: bool = False,
+) -> torch.Tensor:
+    """Run one causal conv, consuming and refreshing its feature-cache slot.
+
+    ``residual`` / ``skip_bias`` are forwarded to the conv epilogue (see
+    ``WanCausalConv3d.forward``).
+
+    Fast path (bit-exact with the aten chain, pure data movement plus zero
+    fill): build the conv input (cache frames + hidden state + padding)
+    directly in channels_last_3d with one kernel, and take the next cache
+    entry as one compact copy of that input's unpadded tail instead of the
+    per-chunk clone/cat bookkeeping (the compact copy holds exactly the
+    reference cache values, so fused and fallback chunks can interleave).
+    Falls back to the original op chain whenever the fused kernel does not
+    support the request.
+    """
+    cache = cache_list[idx]
+    is_rep = isinstance(cache, str)  # "Rep" marker from WanResample
+    payload = None if is_rep else _cache_payload(cache)
+    if _fused_conv_cache_supported(conv, x) and (
+        payload is None or (payload.device == x.device and payload.dtype == x.dtype)
     ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.factor_t = factor_t
-        self.factor_s = factor_s
-        self.factor = self.factor_t * self.factor_s * self.factor_s
+        # The same kernel pass emits the conv input and the compact
+        # next-chunk cache (so the conv-input buffer is freed after the conv
+        # instead of being pinned until the next chunk).
+        pair = cat_pad_channels_last_3d(x, payload, conv._padding, keep_cache_t=CACHE_T)
+        if pair is not None:
+            inp, cache_list[idx] = pair
+            return conv._conv_with_epilogue(inp, residual, skip_bias)
+    # Original aten path (bit-identical bookkeeping).
+    cache_x = x[:, :, -CACHE_T:, :, :].clone()
+    if cache_x.shape[2] < 2 and payload is not None:
+        # cache last frame of last two chunk
+        cache_x = torch.cat(
+            [payload[:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x],
+            dim=2,
+        )
+    elif cache_x.shape[2] < 2 and is_rep:
+        cache_x = torch.cat(
+            [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
+            dim=2,
+        )
+    if isinstance(conv, WanCausalConv3d):
+        out = conv(x, payload, residual=residual, skip_bias=skip_bias)
+    else:
+        out = conv(x, payload)
+        if residual is not None:
+            out = out + residual
+    cache_list[idx] = cache_x
+    return out
 
-        assert in_channels * self.factor % out_channels == 0
-        self.group_size = in_channels * self.factor // out_channels
 
+class DupUp3D(DupUp3DBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pad_t = (self.factor_t - x.shape[2] % self.factor_t) % self.factor_t
-        pad = (0, 0, 0, 0, pad_t, 0)
-        x = F.pad(x, pad)
-        B, C, T, H, W = x.shape
-        x = x.view(
-            B,
-            C,
-            T // self.factor_t,
-            self.factor_t,
-            H // self.factor_s,
-            self.factor_s,
-            W // self.factor_s,
-            self.factor_s,
-        )
-        x = x.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()
-        x = x.view(
-            B,
-            C * self.factor,
-            T // self.factor_t,
-            H // self.factor_s,
-            W // self.factor_s,
-        )
-        x = x.view(
-            B,
-            self.out_channels,
-            self.group_size,
-            T // self.factor_t,
-            H // self.factor_s,
-            W // self.factor_s,
-        )
-        x = x.mean(dim=2)
-        return x
-
-
-class DupUp3D(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        factor_t,
-        factor_s=1,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-
-        self.factor_t = factor_t
-        self.factor_s = factor_s
-        self.factor = self.factor_t * self.factor_s * self.factor_s
-
-        assert out_channels * self.factor % in_channels == 0
-        self.repeats = out_channels * self.factor // in_channels
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.repeat_interleave(self.repeats, dim=1)
-        x = x.view(
-            x.size(0),
-            self.out_channels,
-            self.factor_t,
-            self.factor_s,
-            self.factor_s,
-            x.size(2),
-            x.size(3),
-            x.size(4),
-        )
-        x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
-        x = x.view(
-            x.size(0),
-            self.out_channels,
-            x.size(2) * self.factor_t,
-            x.size(4) * self.factor_s,
-            x.size(6) * self.factor_s,
-        )
-
         _first_chunk = first_chunk.get() if first_chunk is not None else None
-        if _first_chunk:
-            x = x[:, :, self.factor_t - 1 :, :, :]
-        return x
+        return super().forward(x, first_chunk=_first_chunk)
+
+    def can_fuse_add(
+        self, x_main: torch.Tensor, x: torch.Tensor, first_chunk: bool
+    ) -> bool:
+        """Return whether `add_into_` can replace `x_main + self(x)`."""
+        if x.ndim != 5 or x_main.ndim != 5:
+            return False
+        if torch.is_grad_enabled() and (x.requires_grad or x_main.requires_grad):
+            return False
+        if self.repeats <= 0 or self.factor % self.repeats != 0:
+            return False
+        if x.shape[1] != self.in_channels:
+            return False
+
+        batch, _, frames, height, width = x.shape
+        output_frames = frames * self.factor_t
+        if first_chunk:
+            output_frames -= self.factor_t - 1
+
+        return (
+            x_main.dtype == x.dtype
+            and x_main.device == x.device
+            and tuple(x_main.shape)
+            == (
+                batch,
+                self.out_channels,
+                output_frames,
+                height * self.factor_s,
+                width * self.factor_s,
+            )
+        )
+
+    def add_into_(
+        self, x_main: torch.Tensor, x: torch.Tensor, first_chunk: bool = False
+    ) -> torch.Tensor:
+        """Add the duplicated shortcut directly into `x_main`.
+
+        `forward` only copies input values into an expanded tensor. This
+        method adds those values to their strided destinations instead, avoiding
+        the expanded shortcut allocation and its layout conversion.
+        """
+        temporal_factor = self.factor_t
+        spatial_factor = self.factor_s
+        input_channel_stride = self.factor // self.repeats
+        dropped_frames = temporal_factor - 1 if first_chunk else 0
+
+        for temporal_offset in range(temporal_factor):
+            input_frame_start = 1 if temporal_offset < dropped_frames else 0
+            output_frame_start = (
+                input_frame_start * temporal_factor + temporal_offset - dropped_frames
+            )
+            for height_offset in range(spatial_factor):
+                for width_offset in range(spatial_factor):
+                    flattened_offset = (
+                        temporal_offset * spatial_factor + height_offset
+                    ) * spatial_factor + width_offset
+                    input_channel_start = flattened_offset // self.repeats
+                    x_main[
+                        :,
+                        :,
+                        output_frame_start::temporal_factor,
+                        height_offset::spatial_factor,
+                        width_offset::spatial_factor,
+                    ].add_(
+                        x[
+                            :,
+                            input_channel_start::input_channel_stride,
+                            input_frame_start:,
+                        ]
+                    )
+        return x_main
 
 
 class WanCausalConv3d(nn.Conv3d):
@@ -216,14 +307,58 @@ class WanCausalConv3d(nn.Conv3d):
         )
         self.padding = (0, 0, 0)
 
-    def forward(self, x, cache_x=None):
+    def _conv_with_epilogue(self, inp, residual=None, skip_bias=False):
+        """Convolution plus its bias epilogue.
+
+        PyTorch's cuDNN conv adds the bias as a separate broadcast ``add_``
+        kernel after ``cudnn_convolution``; on channels_last_3d outputs that
+        add is unvectorised and, in this decoder, costs about as much as the
+        residual add that usually follows. So run the conv without bias and
+        apply the bias in one fused Triton pass that reproduces aten's
+        arithmetic exactly (fp32 add, one rounding), optionally together with
+        the residual (``x.dtype(x.dtype(conv + bias) + residual)``, the two
+        roundings of the eager ``conv(x) + h`` chain). ``skip_bias`` returns
+        the raw conv output so a following fused norm can absorb the bias.
+        Falls back to the aten ops with identical arithmetic.
+        """
+        bias = self.bias
+        if skip_bias or bias is None:
+            out = self._conv_forward(inp, self.weight, None if skip_bias else bias)
+            return out if residual is None else out + residual
+        if (
+            conv_bias_epilogue is not None
+            and not torch.compiler.is_compiling()
+            and inp.is_cuda
+        ):
+            out = self._conv_forward(inp, self.weight, None)
+            if can_use_conv_bias_epilogue(out, bias, residual):
+                return conv_bias_epilogue(out, bias, residual)
+            # Same ops aten runs inside conv3d: bias cast to the activation
+            # dtype (autocast), fp32 add, one rounding.
+            out = out.add_(bias.to(out.dtype).view(1, -1, 1, 1, 1))
+        else:
+            out = self._conv_forward(inp, self.weight, bias)
+        return out if residual is None else out + residual
+
+    def forward(self, x, cache_x=None, *, residual=None, skip_bias=False):
         padding = list(self._padding)
+        if (
+            any(padding)
+            and _fused_conv_cache_supported(self, x)
+            and (
+                cache_x is None
+                or (cache_x.device == x.device and cache_x.dtype == x.dtype)
+            )
+        ):
+            inp = cat_pad_channels_last_3d(x, cache_x, padding)
+            if inp is not None:
+                return self._conv_with_epilogue(inp, residual, skip_bias)
         x = causal_conv3d_cat_pad(x, cache_x, padding)
         x = (
             x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
         )  # casting needed if amp isn't supported
         x = match_conv3d_input_format(x, self.weight)
-        return super().forward(x)
+        return self._conv_with_epilogue(x, residual, skip_bias)
 
 
 class WanRMS_norm(nn.Module):
@@ -247,7 +382,11 @@ class WanRMS_norm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
-    def forward(self, x):
+    def forward(self, x, conv_bias=None):
+        if conv_bias is not None:
+            # A preceding conv deferred its bias here (see
+            # ``WanCausalConv3d._conv_with_epilogue``); same aten add.
+            x = x + conv_bias.to(x.dtype).view(1, -1, 1, 1, 1)
         return (
             F.normalize(x, dim=(1 if self.channel_first else -1))
             * self.scale
@@ -267,6 +406,45 @@ class WanUpsample(nn.Upsample):
         return super().forward(x.float()).type_as(x)
 
 
+def _interleave_time_pairs(self, x, b, c, t, h, w):
+    """``time_conv`` doubles the channels; split them into two frame halves
+    and interleave along time: ``[B, 2C, T, H, W] -> [B, C, 2T, H, W]``.
+
+    The eager ``reshape / stack / reshape`` materialises the result in NCDHW,
+    which sends the following 2D upsample and conv2d down their NCHW paths
+    and hands every up block an NCDHW tensor (the fused RMSNorm+SiLU then
+    falls back and the residual adds run strided). With the decode-scoped
+    fast-path gate on and a channels_last_3d input, write the same values
+    straight into a channels_last_3d buffer with one copy instead. Values are
+    identical either way; the layout change is gated because the NHWC conv2d
+    it enables need not pick the same cuDNN algorithm as the NCHW one.
+    """
+    gate = getattr(self, "_sgl_gate", None)
+    if (
+        gate is not None
+        and gate.enabled
+        and not torch.compiler.is_compiling()
+        # Dense channels_last_3d (2C >= 2 channels, so this fixes stride(C) == 1
+        # and the channel split below is a view).
+        and x.is_contiguous(memory_format=torch.channels_last_3d)
+    ):
+        out = torch.empty(
+            (b, c, t * 2, h, w),
+            device=x.device,
+            dtype=x.dtype,
+            memory_format=torch.channels_last_3d,
+        )
+        # out viewed as [B, C, T, 2, H, W] receives x viewed as [B, 2, C, T, H, W]
+        # with the pair axis moved next to time.
+        out.view(b, c, t, 2, h, w).copy_(
+            x.view(b, 2, c, t, h, w).permute(0, 2, 3, 1, 4, 5)
+        )
+        return out
+    x = x.reshape(b, 2, c, t, h, w)
+    x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
+    return x.reshape(b, c, t * 2, h, w)
+
+
 def resample_forward(self, x):
     b, c, t, h, w = x.size()
     first_frame = is_first_frame.get()
@@ -281,48 +459,14 @@ def resample_forward(self, x):
                 _feat_cache[idx] = "Rep"
                 _feat_idx += 1
             else:
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                if (
-                    cache_x.shape[2] < 2
-                    and _feat_cache[idx] is not None
-                    and _feat_cache[idx] != "Rep"
-                ):
-                    # cache last frame of last two chunk
-                    cache_x = torch.cat(
-                        [
-                            _feat_cache[idx][:, :, -1, :, :]
-                            .unsqueeze(2)
-                            .to(cache_x.device),
-                            cache_x,
-                        ],
-                        dim=2,
-                    )
-                if (
-                    cache_x.shape[2] < 2
-                    and _feat_cache[idx] is not None
-                    and _feat_cache[idx] == "Rep"
-                ):
-                    cache_x = torch.cat(
-                        [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
-                        dim=2,
-                    )
-                if _feat_cache[idx] == "Rep":
-                    x = self.time_conv(x)
-                else:
-                    x = self.time_conv(x, _feat_cache[idx])
-                _feat_cache[idx] = cache_x
+                x = _run_cached_causal_conv(self.time_conv, x, _feat_cache, idx)
                 _feat_idx += 1
-
-                x = x.reshape(b, 2, c, t, h, w)
-                x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
-                x = x.reshape(b, c, t * 2, h, w)
+                x = _interleave_time_pairs(self, x, b, c, t, h, w)
             feat_cache.set(_feat_cache)
             feat_idx.set(_feat_idx)
         elif not first_frame and hasattr(self, "time_conv"):
             x = self.time_conv(x)
-            x = x.reshape(b, 2, c, t, h, w)
-            x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
-            x = x.reshape(b, c, t * 2, h, w)
+            x = _interleave_time_pairs(self, x, b, c, t, h, w)
     t = x.shape[2]
     x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
     x = self.resample(x)
@@ -356,62 +500,50 @@ def residual_block_forward(self, x):
     x = self.norm1(x)
     x = self.nonlinearity(x)
 
+    # conv1's bias is deferred into norm2 (fused RMSNorm+SiLU absorbs it in
+    # the same pass; the eager norm adds it first with the same arithmetic).
+    defer_bias = isinstance(self.conv1, WanCausalConv3d) and self.conv1.bias is not None
     _feat_cache = feat_cache.get()
     _feat_idx = feat_idx.get()
     if _feat_cache is not None:
         idx = _feat_idx
-        cache_x = x[:, :, -CACHE_T:, :, :].clone()
-        if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-            cache_x = torch.cat(
-                [
-                    _feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                    cache_x,
-                ],
-                dim=2,
-            )
-
-        x = self.conv1(x, _feat_cache[idx])
-        _feat_cache[idx] = cache_x
+        x = _run_cached_causal_conv(
+            self.conv1, x, _feat_cache, idx, skip_bias=defer_bias
+        )
         _feat_idx += 1
         feat_cache.set(_feat_cache)
         feat_idx.set(_feat_idx)
     else:
-        x = self.conv1(x)
+        x = self.conv1(x, skip_bias=True) if defer_bias else self.conv1(x)
 
     # Second normalization and activation
-    x = self.norm2(x)
+    x = self.norm2(x, conv_bias=self.conv1.bias if defer_bias else None)
     x = self.nonlinearity(x)
 
     # Dropout
     x = self.dropout(x)
 
+    # conv2's bias and the residual add are one epilogue pass (bit-exact with
+    # the eager ``conv2(x) + h`` chain).
     _feat_cache = feat_cache.get()
     _feat_idx = feat_idx.get()
     if _feat_cache is not None:
         idx = _feat_idx
-        cache_x = x[:, :, -CACHE_T:, :, :].clone()
-        if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-            cache_x = torch.cat(
-                [
-                    _feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                    cache_x,
-                ],
-                dim=2,
-            )
-
-        x = self.conv2(x, _feat_cache[idx])
-        _feat_cache[idx] = cache_x
+        x = _run_cached_causal_conv(self.conv2, x, _feat_cache, idx, residual=h)
         _feat_idx += 1
         feat_cache.set(_feat_cache)
         feat_idx.set(_feat_idx)
     else:
-        x = self.conv2(x)
+        if isinstance(self.conv2, WanCausalConv3d):
+            x = self.conv2(x, residual=h)
+        else:
+            x = self.conv2(x) + h
+    return x
 
-    # Add residual connection
-    return x + h
 
-
-def attention_block_forward(self, x):
+def attention_block_forward(self, x, rows: tuple[int, int] | None = None):
+    """``rows`` = (first, count) attends only those rows of the height as
+    queries (keys and values keep every row) and returns just them."""
     identity = x
     batch_size, channels, num_frames, height, width = x.size()
     x = x.permute(0, 2, 1, 3, 4).reshape(
@@ -424,8 +556,20 @@ def attention_block_forward(self, x):
     qkv = qkv.reshape(batch_size * num_frames, 1, channels * 3, -1)
     qkv = qkv.permute(0, 1, 3, 2).contiguous()
     q, k, v = qkv.chunk(3, dim=-1)
+    if rows is not None:
+        first, height = rows
+        q = q[:, :, first * width : (first + height) * width]
+        identity = identity[..., first : first + height, :]
 
-    x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    if getattr(self, "_sgl_math_sdpa", False) and q.dtype == torch.float32:
+        # The math SDPA backend's ops minus ``_safe_softmax``'s fully-masked-row
+        # fixup (no mask here, so bit-identical), which on gfx1250 is a slow
+        # broadcast ``where`` over the [HW, HW] scores.
+        s = (q.size(-1) ** -0.5) ** 0.5
+        attn = torch.matmul(q * s, k.transpose(-2, -1) * s)
+        x = torch.matmul(torch.softmax(attn, dim=-1), v)
+    else:
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
     x = (
         x.squeeze(1)
@@ -440,6 +584,14 @@ def attention_block_forward(self, x):
     x = x.view(batch_size, num_frames, channels, height, width)
     x = x.permute(0, 2, 1, 3, 4)
 
+    gate = getattr(self, "_sgl_gate", None)
+    if gate is not None and gate.enabled and not torch.compiler.is_compiling():
+        # ``identity`` carries the decoder's channels_last_3d layout; putting
+        # it first lets the sum inherit that layout so the next block's fused
+        # RMSNorm+SiLU applies. The add itself is commutative, but the layout
+        # changes the reduction order of the *eager* norm that follows under
+        # fp32 autocast, so this is quality-gated rather than lossless.
+        return identity + x
     return x + identity
 
 
@@ -478,7 +630,32 @@ def residual_up_block_forward(self, x):
         x = self.upsampler(x)
 
     if self.avg_shortcut is not None:
-        x = x + self.avg_shortcut(x_copy)
+        shortcut = self.avg_shortcut
+        is_first_chunk = bool(first_chunk.get())
+        if (
+            dup_up3d_add is not None
+            and type(shortcut) is DupUp3D
+            and x.device.type in ("cuda", "xpu")
+            and x_copy.device.type in ("cuda", "xpu")
+            and x.dtype == x_copy.dtype
+            and not torch.compiler.is_compiling()
+        ):
+            # Bit-exact single-pass ``main + DupUp3D(src)`` (data movement
+            # plus one same-order fp32-accumulated add).
+            fused = dup_up3d_add(
+                x,
+                x_copy,
+                shortcut.factor_t,
+                shortcut.factor_s,
+                shortcut.repeats,
+                is_first_chunk,
+            )
+            if fused is not None:
+                return fused
+        if shortcut.can_fuse_add(x, x_copy, is_first_chunk):
+            x = shortcut.add_into_(x, x_copy, is_first_chunk)
+        else:
+            x = x + shortcut(x_copy)
 
     return x
 
@@ -662,10 +839,22 @@ class WanAttentionBlock(nn.Module):
         dim (int): The number of channels in the input tensor.
     """
 
-    def __init__(self, dim, *, spatial_parallel: bool = False) -> None:
+    def __init__(
+        self,
+        dim,
+        *,
+        spatial_parallel: bool = False,
+        parallel_group: GroupCoordinator | None = None,
+    ) -> None:
         super().__init__()
         self.dim = dim
-        self.world_size = get_decode_parallel_world_size() if spatial_parallel else 1
+        self.parallel_group = parallel_group
+        if parallel_group is not None:
+            self.world_size = parallel_group.world_size
+        else:
+            self.world_size = (
+                get_decode_parallel_world_size() if spatial_parallel else 1
+            )
 
         # layers
         self.norm = WanRMS_norm(dim)
@@ -673,12 +862,21 @@ class WanAttentionBlock(nn.Module):
         self.proj = nn.Conv2d(dim, dim, 1)
 
     def forward(self, x):
-        if self.world_size > 1:
-            x = gather_height_for_global_op(x).contiguous()
-        x = attention_block_forward(self, x)
-        if self.world_size > 1:
-            x = chunk_height_for_parallel_decode(x)
-        return x
+        if self.world_size == 1 or spatial_parallel_decode_disabled():
+            return attention_block_forward(self, x)
+        x = gather_height_for_global_op(
+            x, parallel_group=self.parallel_group
+        ).contiguous()
+        # each rank attends only its own height shard's rows (the tensor_split
+        # chunk the full-frame output was cut to) over the whole frame
+        rank = (
+            self.parallel_group.rank_in_group
+            if self.parallel_group is not None
+            else get_decode_parallel_rank()
+        )
+        rows = torch.tensor_split(torch.arange(x.shape[-2]), self.world_size)[rank]
+        first = int(rows[0]) if rows.numel() else 0
+        return attention_block_forward(self, x, rows=(first, rows.numel())).contiguous()
 
 
 class WanMidBlock(nn.Module):
@@ -713,14 +911,11 @@ class WanMidBlock(nn.Module):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
-        self.gradient_checkpointing = False
-
     def forward(self, x):
         return mid_block_forward(self, x)
 
 
 class WanResidualDownBlock(nn.Module):
-
     def __init__(
         self,
         in_dim,
@@ -762,13 +957,21 @@ class WanResidualDownBlock(nn.Module):
 
 
 class WanDistResample(WanResample):
-    def __init__(self, dim: int, mode: str, upsample_out_dim: int = None) -> None:
+    def __init__(
+        self,
+        dim: int,
+        mode: str,
+        upsample_out_dim: int = None,
+        parallel_group: GroupCoordinator | None = None,
+    ) -> None:
         super().__init__(
             dim,
             mode,
             upsample_out_dim=upsample_out_dim,
-            conv2d_cls=SpatialParallelConv2d,
-            zero_pad2d_cls=SpatialParallelZeroPad2d,
+            conv2d_cls=partial(SpatialParallelConv2d, parallel_group=parallel_group),
+            zero_pad2d_cls=partial(
+                SpatialParallelZeroPad2d, parallel_group=parallel_group
+            ),
             spatial_parallel=True,
         )
 
@@ -780,19 +983,22 @@ class WanDistResidualBlock(WanResidualBlock):
         out_dim: int,
         dropout: float = 0.0,
         non_linearity: str = "silu",
+        parallel_group: GroupCoordinator | None = None,
     ) -> None:
         super().__init__(
             in_dim,
             out_dim,
             dropout,
             non_linearity,
-            causal_conv3d_cls=SpatialParallelCausalConv3d,
+            causal_conv3d_cls=partial(
+                SpatialParallelCausalConv3d, parallel_group=parallel_group
+            ),
         )
 
 
 class WanDistAttentionBlock(WanAttentionBlock):
-    def __init__(self, dim) -> None:
-        super().__init__(dim, spatial_parallel=True)
+    def __init__(self, dim, parallel_group: GroupCoordinator | None = None) -> None:
+        super().__init__(dim, spatial_parallel=True, parallel_group=parallel_group)
 
 
 class WanDistMidBlock(WanMidBlock):
@@ -802,14 +1008,19 @@ class WanDistMidBlock(WanMidBlock):
         dropout: float = 0.0,
         non_linearity: str = "silu",
         num_layers: int = 1,
+        parallel_group: GroupCoordinator | None = None,
     ):
         super().__init__(
             dim,
             dropout,
             non_linearity,
             num_layers=num_layers,
-            residual_block_cls=WanDistResidualBlock,
-            attention_block_cls=WanDistAttentionBlock,
+            residual_block_cls=partial(
+                WanDistResidualBlock, parallel_group=parallel_group
+            ),
+            attention_block_cls=partial(
+                WanDistAttentionBlock, parallel_group=parallel_group
+            ),
         )
 
 
@@ -822,6 +1033,7 @@ class WanDistResidualDownBlock(WanResidualDownBlock):
         num_res_blocks,
         temperal_downsample=False,
         down_flag=False,
+        parallel_group: GroupCoordinator | None = None,
     ):
         super().__init__(
             in_dim,
@@ -830,8 +1042,10 @@ class WanDistResidualDownBlock(WanResidualDownBlock):
             num_res_blocks,
             temperal_downsample=temperal_downsample,
             down_flag=down_flag,
-            residual_block_cls=WanDistResidualBlock,
-            resample_cls=WanDistResample,
+            residual_block_cls=partial(
+                WanDistResidualBlock, parallel_group=parallel_group
+            ),
+            resample_cls=partial(WanDistResample, parallel_group=parallel_group),
         )
 
 
@@ -885,12 +1099,21 @@ class WanEncoder3d(nn.Module):
             world_size = get_sp_world_size()
 
         if use_parallel_encode and world_size > 1:
-            CausalConv3d = SpatialParallelCausalConv3d
-            ResidualDownBlock = WanDistResidualDownBlock
-            ResidualBlock = WanDistResidualBlock
-            AttentionBlock = WanDistAttentionBlock
-            Resample = WanDistResample
-            MidBlock = WanDistMidBlock
+            self.parallel_group = get_sp_group()
+            CausalConv3d = partial(
+                SpatialParallelCausalConv3d, parallel_group=self.parallel_group
+            )
+            ResidualDownBlock = partial(
+                WanDistResidualDownBlock, parallel_group=self.parallel_group
+            )
+            ResidualBlock = partial(
+                WanDistResidualBlock, parallel_group=self.parallel_group
+            )
+            AttentionBlock = partial(
+                WanDistAttentionBlock, parallel_group=self.parallel_group
+            )
+            Resample = partial(WanDistResample, parallel_group=self.parallel_group)
+            MidBlock = partial(WanDistMidBlock, parallel_group=self.parallel_group)
         else:
             CausalConv3d = WanCausalConv3d
             ResidualDownBlock = WanResidualDownBlock
@@ -939,7 +1162,6 @@ class WanEncoder3d(nn.Module):
         self.norm_out = WanRMS_norm(out_dim, images=False)
         self.conv_out = CausalConv3d(out_dim, z_dim, 3, padding=1)
 
-        self.gradient_checkpointing = False
         self.world_size = 1
         self.rank = 0
         if dist.is_initialized():
@@ -958,20 +1180,7 @@ class WanEncoder3d(nn.Module):
         _feat_idx = feat_idx.get()
         if _feat_cache is not None:
             idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_in(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv_in, x, _feat_cache, idx)
             _feat_idx += 1
             feat_cache.set(_feat_cache)
             feat_idx.set(_feat_idx)
@@ -995,20 +1204,7 @@ class WanEncoder3d(nn.Module):
         _feat_idx = feat_idx.get()
         if _feat_cache is not None:
             idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_out(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv_out, x, _feat_cache, idx)
             _feat_idx += 1
             feat_cache.set(_feat_cache)
             feat_idx.set(_feat_idx)
@@ -1016,7 +1212,9 @@ class WanEncoder3d(nn.Module):
             x = self.conv_out(x)
 
         if self.use_parallel_encode and self.world_size > 1:
-            x = gather_and_trim_height(x, expected_height)
+            x = gather_and_trim_height(
+                x, expected_height, parallel_group=self.parallel_group
+            )
         return x
 
 
@@ -1081,8 +1279,6 @@ class WanResidualUpBlock(nn.Module):
         else:
             self.upsampler = None
 
-        self.gradient_checkpointing = False
-
     def forward(self, x):
         return residual_up_block_forward(self, x)
 
@@ -1132,8 +1328,6 @@ class WanUpBlock(nn.Module):
         self.upsamplers = None
         if upsample_mode is not None:
             self.upsamplers = nn.ModuleList([resample_cls(out_dim, mode=upsample_mode)])
-
-        self.gradient_checkpointing = False
 
     def forward(self, x):
         return up_block_forward(self, x)
@@ -1297,7 +1491,6 @@ class WanDecoder3d(nn.Module):
         self.norm_out = WanRMS_norm(out_dim, images=False)
         self.conv_out = CausalConv3d(out_dim, out_channels, 3, padding=1)
 
-        self.gradient_checkpointing = False
         self.world_size = 1
         self.rank = 0
         if dist.is_initialized():
@@ -1316,20 +1509,7 @@ class WanDecoder3d(nn.Module):
         _feat_idx = feat_idx.get()
         if _feat_cache is not None:
             idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_in(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv_in, x, _feat_cache, idx)
             _feat_idx += 1
             feat_cache.set(_feat_cache)
             feat_idx.set(_feat_idx)
@@ -1350,20 +1530,7 @@ class WanDecoder3d(nn.Module):
         _feat_idx = feat_idx.get()
         if _feat_cache is not None:
             idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_out(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
+            x = _run_cached_causal_conv(self.conv_out, x, _feat_cache, idx)
             _feat_idx += 1
             feat_cache.set(_feat_cache)
             feat_idx.set(_feat_idx)
@@ -1417,7 +1584,111 @@ class AutoencoderKLWan(ParallelTiledVAE):
     Introduced in [Wan 2.1].
     """
 
-    _supports_gradient_checkpointing = False
+    supports_decode_on_frames = True
+
+    # Official Wan2.1_VAE.pth key -> module key. No caller here; the Wan2.2-S2V
+    # overlay's _overlay/materialize.py uses it to convert the official VAE file.
+    @staticmethod
+    def _remap_official_state_key(key: str) -> str:
+        if key == "encoder.conv1.weight":
+            return "encoder.conv_in.weight"
+        if key == "encoder.conv1.bias":
+            return "encoder.conv_in.bias"
+        if key == "decoder.conv1.weight":
+            return "decoder.conv_in.weight"
+        if key == "decoder.conv1.bias":
+            return "decoder.conv_in.bias"
+        if key == "conv1.weight":
+            return "quant_conv.weight"
+        if key == "conv1.bias":
+            return "quant_conv.bias"
+        if key == "conv2.weight":
+            return "post_quant_conv.weight"
+        if key == "conv2.bias":
+            return "post_quant_conv.bias"
+
+        if key.startswith("encoder.downsamples."):
+            key = key.replace("encoder.downsamples.", "encoder.down_blocks.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            key = key.replace(".shortcut.", ".conv_shortcut.")
+            return key
+
+        if key.startswith("encoder.middle.0."):
+            key = key.replace("encoder.middle.0.", "encoder.mid_block.resnets.0.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("encoder.middle.1."):
+            return key.replace(
+                "encoder.middle.1.", "encoder.mid_block.attentions.0.", 1
+            )
+
+        if key.startswith("encoder.middle.2."):
+            key = key.replace("encoder.middle.2.", "encoder.mid_block.resnets.1.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("encoder.head.0.gamma"):
+            return key.replace("encoder.head.0.gamma", "encoder.norm_out.gamma", 1)
+        if key.startswith("encoder.head.2."):
+            return key.replace("encoder.head.2.", "encoder.conv_out.", 1)
+
+        if key.startswith("decoder.middle.0."):
+            key = key.replace("decoder.middle.0.", "decoder.mid_block.resnets.0.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("decoder.middle.1."):
+            return key.replace(
+                "decoder.middle.1.", "decoder.mid_block.attentions.0.", 1
+            )
+
+        if key.startswith("decoder.middle.2."):
+            key = key.replace("decoder.middle.2.", "decoder.mid_block.resnets.1.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("decoder.upsamples."):
+            parts = key.split(".")
+            flat_idx = int(parts[2])
+            block_idx = flat_idx // 4
+            block_offset = flat_idx % 4
+            if block_idx == 3:
+                block_offset = flat_idx - 12
+            prefix = f"decoder.up_blocks.{block_idx}."
+            suffix = ".".join(parts[3:])
+            if block_idx < 3 and block_offset == 3:
+                return prefix + "upsamplers.0." + suffix
+            res_idx = block_offset
+            key = prefix + f"resnets.{res_idx}." + suffix
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            key = key.replace(".shortcut.", ".conv_shortcut.")
+            return key
+
+        if key.startswith("decoder.head.0.gamma"):
+            return key.replace("decoder.head.0.gamma", "decoder.norm_out.gamma", 1)
+        if key.startswith("decoder.head.2."):
+            return key.replace("decoder.head.2.", "decoder.conv_out.", 1)
+
+        return key
 
     def __init__(
         self,
@@ -1439,7 +1710,12 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self.latents_std = list(config.latents_std)
         self.shift_factor = config.shift_factor
         self.use_parallel_encode = getattr(config, "use_parallel_encode", False)
-        self.use_parallel_decode = getattr(config, "use_parallel_decode", False)
+        # When auto declines spatial-shard (gfx1250), decode is single-rank and
+        # DecodingStage runs it on the main rank alone under cfg-parallel.
+        self.use_parallel_decode = config.use_parallel_decode and (
+            not is_auto_parallel_decode_mode(config.parallel_decode_mode)
+            or should_use_spatial_shard_parallel_decode(config)
+        )
 
         if config.load_encoder:
             self.encoder = WanEncoder3d(
@@ -1537,6 +1813,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self._causal_decode_initialized = True
         return out
 
+    @cached_vae_encode
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_feature_cache:
             self.clear_cache()
@@ -1569,6 +1846,26 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
         return enc
 
+    def encode_video(self, x: torch.Tensor) -> torch.Tensor:
+        self.clear_cache()
+        if self.config.patch_size is not None:
+            x = patchify(x, patch_size=self.config.patch_size)
+        with forward_context(
+            feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
+        ):
+            t = x.shape[2]
+            iter_ = 1 + (t - 1) // 4
+            for i in range(iter_):
+                feat_idx.set(0)
+                if i == 0:
+                    out = self.encoder(x[:, :, :1, :, :])
+                else:
+                    out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
+                    out = torch.cat([out, out_], 2)
+        enc = self.quant_conv(out)
+        self.clear_cache()
+        return enc[:, : self.z_dim]
+
     def _encode(self, x: torch.Tensor, first_frame=False) -> torch.Tensor:
         with forward_context(first_frame_arg=first_frame):
             out = self.encoder(x)
@@ -1595,7 +1892,8 @@ class AutoencoderKLWan(ParallelTiledVAE):
         enc = torch.cat([first_frame, enc], dim=2)
         return enc
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(self, z: torch.Tensor, on_frames=None) -> torch.Tensor:
+        """``on_frames`` receives every returned frame once, in order, as soon as it is final."""
         if self.use_feature_cache:
             self.clear_cache()
             iter_ = z.shape[2]
@@ -1614,6 +1912,10 @@ class AutoencoderKLWan(ParallelTiledVAE):
                         feat_idx.set(0)
                         first_chunk.set(i == 0)
                         out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                        # with the causal cache these frames are final, and full
+                        # height even under spatial-parallel decode
+                        if on_frames is not None:
+                            on_frames(self._output_frames(out_chunks[-1]))
                     out = (
                         torch.cat(out_chunks, 2)
                         if len(out_chunks) > 1
@@ -1628,8 +1930,17 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self.clear_cache()
         else:
             out = ParallelTiledVAE.decode(self, z)
+            # tiled and whole-clip decodes only finish frames at the end
+            if on_frames is not None:
+                on_frames(out)
 
         return out
+
+    def _output_frames(self, out: torch.Tensor) -> torch.Tensor:
+        """What ``decode`` returns for decoder output ``out``, leaving ``out`` intact."""
+        if self.config.patch_size is not None:
+            out = unpatchify(out, patch_size=self.config.patch_size)
+        return out.float().clamp(min=-1.0, max=1.0)
 
     def _decode(self, z: torch.Tensor, first_frame=False) -> torch.Tensor:
         x = self.post_quant_conv(z)
@@ -1664,27 +1975,6 @@ class AutoencoderKLWan(ParallelTiledVAE):
         dec = ParallelTiledVAE.parallel_tiled_decode(self, z)
         start_frame_idx = self.temporal_compression_ratio - 1
         dec = dec[:, :, start_frame_idx:]
-        return dec
-
-    def forward(
-        self,
-        sample: torch.Tensor,
-        sample_posterior: bool = False,
-        generator: torch.Generator | None = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            sample (`torch.Tensor`): Input sample.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`DecoderOutput`] instead of a plain tuple.
-        """
-        x = sample
-        posterior = self.encode(x).latent_dist
-        if sample_posterior:
-            z = posterior.sample(generator=generator)
-        else:
-            z = posterior.mode()
-        dec = self.decode(z)
         return dec
 
 

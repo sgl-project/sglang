@@ -40,7 +40,10 @@ class BasicDecodeCorrectnessMixin:
         self.assertIn("paris", out.lower())
 
     def test_basic_math(self):
+        # Qwen3 greedy is a near-tie between narrating and answering at the first
+        # token; a one-shot exemplar makes the bare answer the clear greedy choice.
         out = self._decode_generate(
+            "Q: What is 12 multiplied by 12? Reply with just the number.\nA: 144\n"
             "Q: What is 17 multiplied by 23? Reply with just the number.\nA:",
             self.sanity_max_new_tokens_short,
         )
@@ -58,8 +61,11 @@ class BasicDecodeCorrectnessMixin:
         # Language-agnostic gibberish detector. Healthy English output is
         # >90% printable ASCII; multilingual token salad / Unicode noise
         # from broken weight load drops well below 50%.
+        # Q/A framing, as in the probes above: a base model continues a bare
+        # instruction with arbitrary text whose language is not pinned down,
+        # so the ratio would measure the continuation, not output health.
         out = self._decode_generate(
-            "Write a single sentence about a sunny day in the park.",
+            "Q: Write a single sentence about a sunny day in the park.\nA:",
             self.sanity_max_new_tokens_long,
         )
         printable = sum(1 for c in out if 32 <= ord(c) < 127 or c in "\n\t")

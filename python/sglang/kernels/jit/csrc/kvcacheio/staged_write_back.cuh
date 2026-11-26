@@ -6,7 +6,7 @@
 #include <limits>
 #include <vector>
 
-namespace {
+namespace sglang {
 
 #if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
 #if CUDA_VERSION >= 13000
@@ -61,6 +61,18 @@ inline auto call_cuda_memcpy_batch_async(
 }
 #endif
 
+#if defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
+using HipMemcpyBatchAsyncFn = decltype(&hipMemcpyBatchAsync);
+
+inline auto get_hip_memcpy_batch_async() -> HipMemcpyBatchAsyncFn {
+  static HipMemcpyBatchAsyncFn hip_memcpy_batch_async = []() {
+    void* symbol = dlsym(RTLD_DEFAULT, "hipMemcpyBatchAsync");
+    return reinterpret_cast<HipMemcpyBatchAsyncFn>(symbol);
+  }();
+  return hip_memcpy_batch_async;
+}
+#endif
+
 inline void copy_page_first_pages_fallback(
     const std::vector<tvm::ffi::TensorView>& src_ptrs,
     std::vector<tvm::ffi::TensorView> dst_ptrs,
@@ -99,7 +111,59 @@ inline bool try_copy_page_first_pages_batch(
     int64_t page_size,
     int device_id,
     cudaStream_t stream) {
-#if defined(USE_ROCM) || !defined(CUDA_VERSION) || (CUDA_VERSION < 12080)
+#if defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
+  host::RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
+  auto copy_fn = get_hip_memcpy_batch_async();
+  if (copy_fn == nullptr) {
+    return false;
+  }
+  thread_local std::vector<void*> batch_srcs;
+  thread_local std::vector<void*> batch_dsts;
+  thread_local std::vector<size_t> batch_sizes;
+
+  const size_t num_copies = static_cast<size_t>(src_ptrs.size()) * static_cast<size_t>(num_pages);
+  batch_srcs.clear();
+  batch_dsts.clear();
+  batch_sizes.clear();
+  batch_srcs.reserve(num_copies);
+  batch_dsts.reserve(num_copies);
+  batch_sizes.reserve(num_copies);
+
+  for (const auto tensor_id : host::irange(src_ptrs.size())) {
+    host::RuntimeCheck(
+        src_ptrs[tensor_id].dtype() == dst_ptrs[tensor_id].dtype(),
+        "Source and destination tensors must have the same dtype");
+    const int64_t elem_size = host::dtype_bytes(src_ptrs[tensor_id].dtype());
+    const int64_t src_stride0 = src_ptrs[tensor_id].stride(0);
+    const int64_t dst_stride0 = dst_ptrs[tensor_id].stride(0);
+    const size_t src_page_bytes = static_cast<size_t>(page_size * src_stride0 * elem_size);
+    const size_t dst_page_bytes = static_cast<size_t>(page_size * dst_stride0 * elem_size);
+    host::RuntimeCheck(src_page_bytes == dst_page_bytes, "Source and destination page spans must match");
+    for (const auto page_offset : host::irange(num_pages)) {
+      char* src_ptr = static_cast<char*>(src_ptrs[tensor_id].data_ptr()) +
+                      static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
+      char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
+                      static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
+      batch_srcs.push_back(src_ptr);
+      batch_dsts.push_back(dst_ptr);
+      batch_sizes.push_back(src_page_bytes);
+    }
+  }
+
+  hipMemcpyAttributes attrs{};
+  attrs.srcAccessOrder = hipMemcpySrcAccessOrderStream;
+  size_t attrs_idx = 0;
+  size_t fail_idx = std::numeric_limits<size_t>::max();
+  const hipError_t err = copy_fn(
+      batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), num_copies, &attrs, &attrs_idx, 1, &fail_idx, stream);
+  if (err == hipErrorNotSupported && fail_idx == std::numeric_limits<size_t>::max()) {
+    (void)hipGetLastError();
+    return false;
+  }
+  host::RuntimeCheck(
+      err == hipSuccess, "hipMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", hipGetErrorString(err));
+  return true;
+#elif defined(USE_ROCM) || !defined(CUDA_VERSION) || (CUDA_VERSION < 12080)
   return false;
 #else
   host::RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
@@ -325,4 +389,72 @@ struct HiCacheStagedWriteBackKernel {
   }
 };
 
-}  // namespace
+template <int64_t kGroupBytes, bool kIsMLA = false>
+struct HiCachePageUnifiedWriteBackKernel {
+  static void
+  run(const tvm::ffi::TensorView dst,
+      const tvm::ffi::TensorView staging,
+      const tvm::ffi::TensorView k_ptr_src,
+      const tvm::ffi::TensorView v_ptr_src,
+      const tvm::ffi::TensorView src_pages,
+      const tvm::ffi::TensorView dst_pages,
+      const int64_t num_groups,
+      const int64_t page_size) {
+    using namespace host;
+    auto P = SymbolicSize{"page count"};
+    auto L = SymbolicSize{"layer count"};
+    auto B = SymbolicSize{"page elements"};
+    auto dtype = SymbolicDType{};
+    auto index_dtype = SymbolicDType{};
+    auto device = SymbolicDevice{};
+    TensorMatcher({L}).with_dtype<uint64_t>().with_device<kDLGPU>(device).verify(k_ptr_src);
+    if constexpr (!kIsMLA) {
+      TensorMatcher({L}).with_dtype<uint64_t>().with_device<kDLGPU>(device).verify(v_ptr_src);
+    }
+    TensorMatcher({P}).with_dtype<int32_t, int64_t>(index_dtype).with_device<kDLGPU>(device).verify(src_pages);
+    TensorMatcher({P}).with_dtype<int64_t>().with_device<kDLCPU, kDLGPUHost>().verify(dst_pages);
+    TensorMatcher({P, B}).with_dtype(dtype).with_device<kDLGPU>(device).verify(staging);
+    TensorMatcher({-1, B}).with_dtype(dtype).with_device<kDLCPU, kDLGPUHost>().verify(dst);
+    RuntimeCheck(num_groups > 0 && page_size > 0 && L.unwrap() > 0, "Page-unified write-back: invalid dimensions");
+    RuntimeCheck(!kIsMLA || num_groups == 1, "Page-unified MLA write-back: expected one latent group");
+    constexpr int64_t kComponents = kIsMLA ? 1 : 2;
+    RuntimeCheck(
+        B.unwrap() * dtype_bytes(dtype.unwrap()) == num_groups * L.unwrap() * kComponents * page_size * kGroupBytes,
+        "Page-unified write-back: page byte size mismatch");
+    RuntimeCheck(reinterpret_cast<uintptr_t>(staging.data_ptr()) % 16 == 0, "Staging must be 16-byte aligned");
+    const auto dst_ids = static_cast<const int64_t*>(dst_pages.data_ptr());
+    for (int64_t i = 0; i < P.unwrap(); ++i) {
+      RuntimeCheck(
+          dst_ids[i] >= 0 && dst_ids[i] < dst.size(0), "Page-unified write-back: destination page out of range");
+    }
+    if (P.unwrap() == 0) {
+      return;
+    }
+    const auto params = HicachePageUnifiedRelayoutParams{
+        .staging = staging.data_ptr(),
+        .k_ptr_src = k_ptr_src.data_ptr(),
+        .v_ptr_src = kIsMLA ? nullptr : v_ptr_src.data_ptr(),
+        .src_pages = src_pages.data_ptr(),
+        .total_vecs = static_cast<uint64_t>(P.unwrap()) * B.unwrap() * dtype_bytes(dtype.unwrap()) / 16,
+        .num_groups = num_groups,
+        .num_layers = L.unwrap(),
+        .page_size = page_size,
+    };
+    // Grid-stride traversal keeps large transfers within CUDA's grid limits.
+    constexpr uint32_t kThreads = 256;
+    const auto blocks =
+        static_cast<uint32_t>(std::min<uint64_t>(div_ceil(params.total_vecs, uint64_t{kThreads}), 65535));
+    const auto kernel = index_dtype.unwrap().bits == 32
+                            ? hicache_page_unified_relayout_kernel<int32_t, kGroupBytes, kIsMLA>
+                            : hicache_page_unified_relayout_kernel<int64_t, kGroupBytes, kIsMLA>;
+    const auto dev = device.unwrap();
+    LaunchKernel(blocks, kThreads, dev)(kernel, params);
+    const auto stream = LaunchKernel::resolve_device(dev);
+    // The flattened tensors have one row per page (a single latent cache for MLA).
+    if (!try_copy_page_first_pages_batch({staging}, {dst}, dst_ids, P.unwrap(), 1, dev.device_id, stream)) {
+      copy_page_first_pages_fallback({staging}, {dst}, dst_ids, P.unwrap(), 1, stream);
+    }
+  }
+};
+
+}  // namespace sglang

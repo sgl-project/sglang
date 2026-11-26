@@ -209,9 +209,9 @@ def _build_response(
     peak_memory_mb = result.peak_memory_mb if result.peak_memory_mb > 0 else None
     rollout_trajectory_data = result.rollout_trajectory_data
     if rollout:
-        assert (
-            rollout_trajectory_data is not None
-        ), "rollout_trajectory_data must be present when rollout=True"
+        assert rollout_trajectory_data is not None, (
+            "rollout_trajectory_data must be present when rollout=True"
+        )
 
     serialized_dit_timesteps = None
     serialized_dit_sigmas = None
@@ -340,8 +340,9 @@ async def rollout_generate(request: RolloutRequest):
         ) from exc
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
+    seed = request.seed if request.seed is not None else sampling_params.seed
     rollout_responses = _build_response(
-        request_id, request.prompt, request.seed, request.rollout, output_batch
+        request_id, request.prompt, seed, request.rollout, output_batch
     )
     payload = [r.model_dump() for r in rollout_responses]
     return Response(

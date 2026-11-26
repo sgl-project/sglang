@@ -1,23 +1,92 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
+from sglang.srt.configs.model_config import uses_compressed_kv_attention
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
 )
-from sglang.srt.runtime_context import get_exec, get_schedule
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_parallel,
+    get_schedule,
+)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.io_struct import (
-        UpdateWeightFromDiskReqInput,
-        UpdateWeightsFromIPCReqInput,
-    )
     from sglang.srt.managers.tp_worker import TpModelWorker
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.model_runner import (
+        ModelRunner,
+        SamplingPrewarmResult,
+    )
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+class HiCacheDraftMode(str, Enum):
+    NONE = "none"
+    FUSED = "fused"
+    PACKED = "packed"
+    SIDECAR = "sidecar"
+
+
+@dataclass(frozen=True, slots=True)
+class HiCacheDraftPlan:
+    mode: HiCacheDraftMode = HiCacheDraftMode.NONE
+    device_pools: tuple[object, ...] = ()
+
+
+def _can_pack_hicache_mtp(
+    spec_algorithm: SpeculativeAlgorithm,
+    draft_runners: tuple[ModelRunner, ...],
+) -> bool:
+    is_nextn_mtp = (
+        spec_algorithm.is_eagle()
+        and not spec_algorithm.is_eagle3()
+        and all(
+            runner.model_config.num_nextn_predict_layers for runner in draft_runners
+        )
+    )
+    is_dspark_compressed_kv = (
+        spec_algorithm.is_dspark()
+        and uses_compressed_kv_attention(draft_runners[0].model_config.hf_config)
+    )
+    return is_nextn_mtp or is_dspark_compressed_kv
+
+
+def _check_hicache_draft_dcp_layout(
+    mode: HiCacheDraftMode, draft_pools: tuple[object, ...]
+) -> None:
+    """Under DCP, packed host rows translate a draft with the target's owner
+    rule, while a sidecar mirrors it untranslated. A DSA draft pool records
+    which of the two layouts it has, so refuse a plan that reads the other."""
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    dsa_pools = [pool for pool in draft_pools if isinstance(pool, DSATokenToKVPool)]
+    if not dsa_pools or get_parallel().attn_dcp_size <= 1:
+        return
+    if mode == HiCacheDraftMode.PACKED and any(p.dcp_replicated for p in dsa_pools):
+        raise NotImplementedError(
+            "HiCache packs this DSA MTP draft into the target's DCP-sharded "
+            "host rows, but its device KV pool is replicated across the DCP "
+            "group. The draft KV must shard like the target."
+        )
+    if mode == HiCacheDraftMode.SIDECAR and not all(
+        p.dcp_replicated for p in dsa_pools
+    ):
+        raise NotImplementedError(
+            "HiCache mirrors this DSA draft in an untranslated sidecar, but its "
+            "device KV pool is DCP-sharded. Only a packed NextN MTP draft "
+            "shares the target's DCP translation."
+        )
 
 
 class EagleDraftWorkerBase(ABC):
@@ -61,6 +130,10 @@ class EagleDraftWorkerBase(ABC):
     def weight_load_time(self) -> float:
         return sum(runner.weight_load_time for runner in self.draft_runners)
 
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        return sum(runner.preloaded_weights_bytes for runner in self.draft_runners)
+
     def alloc_memory_pool(self, **kwargs):
         pass
 
@@ -88,7 +161,6 @@ class EagleDraftWorkerBase(ABC):
             f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
         )
         num_steps = self.speculative_num_steps
-        sa = self.server_args
         decode_max_bs = (
             get_exec().graph.cuda_graph_config.decode.max_bs
             if get_exec().graph.cuda_graph_config is not None
@@ -111,9 +183,51 @@ class EagleDraftWorkerBase(ABC):
 
 
 class BaseSpecWorker(ABC):
+    _hicache_draft_plan = HiCacheDraftPlan()
+    draft_parallel_layout: DraftParallelLayout | None = None
+
     def __init__(self) -> None:
         self._additional_graph_memory_usage: dict[str, float] = {}
         self._additional_graph_time_usage: dict[str, float] = {}
+
+    @property
+    def hicache_draft_plan(self) -> HiCacheDraftPlan:
+        return self._hicache_draft_plan
+
+    @property
+    def draft_window_reaches(self) -> dict[str, int]:
+        """Reader reaches from committed length, keyed by actual storage band."""
+        return {}
+
+    def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:
+        """(role, runner) pairs weight ops apply to; [] when the draft owns no weights."""
+        # NGRAM and UNO have no draft model
+        if self.draft_worker is None:
+            return []
+        return [("draft", runner) for runner in self.draft_worker.draft_runners]
+
+    def _draft_model_runners(self) -> tuple[ModelRunner, ...]:
+        spec_algorithm = self.target_worker.model_runner.spec_algorithm
+        draft_worker = self.draft_worker
+        if (
+            draft_worker is None
+            or spec_algorithm.is_ngram()
+            or spec_algorithm.is_frozen_kv_mtp()
+        ):
+            return ()
+        if spec_algorithm.is_dflash_family():
+            return (draft_worker.model_runner,)
+        return tuple(draft_worker.draft_runners)
+
+    @property
+    def primary_draft_kv_pool(self) -> Optional[object]:
+        draft_runners = self._draft_model_runners()
+        if not draft_runners:
+            return None
+        # A fused draft's KV lives in the target's pool: it has none of its own.
+        if draft_runners[0].runner_ids.is_fused_draft:
+            return None
+        return draft_runners[0].token_to_kv_pool
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -153,8 +267,17 @@ class BaseSpecWorker(ABC):
             return 0.0
         return self.draft_worker.weight_load_time
 
+    def prewarm_sampling(self) -> SamplingPrewarmResult:
+        return self.target_worker.model_runner.prewarm_sampling()
+
     @property
-    def war_fastpath_runner(self):
+    def preloaded_weights_bytes(self) -> int:
+        if self.draft_worker is None:
+            return 0
+        return self.draft_worker.preloaded_weights_bytes
+
+    @property
+    def last_shared_read_runner(self):
         # The runner that runs the step's LAST shared-buffer-reading phase --
         # it owns the read-done event the scheduler's WAR barrier waits on.
         # Default is the target runner; override if the last phase runs
@@ -172,6 +295,92 @@ class BaseSpecWorker(ABC):
         target worker and cleared by the scheduler."""
         # TODO: move this method to BaseTpWorker and call through self.model_runner
         pass
+
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        target_model_runner = self.target_worker.model_runner
+        target_model_runner.mtp_draft_device_pools = ()
+        target_model_runner.mtp_draft_mamba_pools = ()
+        spec_algorithm = target_model_runner.spec_algorithm
+        if not (
+            get_memory().enable_hierarchical_cache
+            or get_memory().enable_unified_cache_external_linker
+            or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+        ):
+            return HiCacheDraftPlan()
+
+        draft_runners = self._draft_model_runners()
+        if not draft_runners:
+            return HiCacheDraftPlan()
+        draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
+        if any(runner.runner_ids.is_fused_draft for runner in draft_runners):
+            from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+                validate_fused_hicache_draft,
+            )
+
+            validate_fused_hicache_draft(
+                target_config=target_model_runner.kv_cache_configurator,
+                draft_device_pools=draft_pools,
+            )
+            # The target's page envelopes already carry every draft layer.
+            # Packing or adding a sidecar would back up the same bytes twice.
+            return HiCacheDraftPlan(
+                mode=HiCacheDraftMode.FUSED, device_pools=draft_pools
+            )
+        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+            _check_hicache_draft_dcp_layout(HiCacheDraftMode.PACKED, draft_pools)
+            target_model_runner.mtp_draft_device_pools = draft_pools
+            target_mamba_pool = (
+                target_model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
+            )
+            draft_mamba_pools = tuple(
+                runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
+                for runner in draft_runners
+            )
+            # Shared state is already backed up with the target. Separate
+            # draft state follows the target's Mamba slot indices.
+            if any(
+                pool is not None and pool is not target_mamba_pool
+                for pool in draft_mamba_pools
+            ):
+                assert target_mamba_pool is not None, (
+                    "Packed draft state requires target Mamba slot indices"
+                )
+                assert all(
+                    pool is not None and pool is not target_mamba_pool
+                    for pool in draft_mamba_pools
+                ), "Packed MTP requires separate state for every draft layer"
+                target_model_runner.mtp_draft_mamba_pools = draft_mamba_pools
+            return HiCacheDraftPlan(
+                mode=HiCacheDraftMode.PACKED,
+                device_pools=draft_pools,
+            )
+
+        if get_memory().enable_unified_cache_external_linker and len(draft_pools) > 1:
+            raise NotImplementedError(
+                "The external linker supports one non-packed draft KV pool."
+            )
+
+        # Preserve the legacy non-packed HiCache behavior: multi-layer
+        # EAGLE registers only the first draft runner as the sidecar.
+        sidecar_pools = draft_pools[:1]
+        _check_hicache_draft_dcp_layout(HiCacheDraftMode.SIDECAR, sidecar_pools)
+        return HiCacheDraftPlan(
+            mode=HiCacheDraftMode.SIDECAR,
+            device_pools=sidecar_pools,
+        )
+
+    def init_hicache_draft_plan(self) -> None:
+        self._hicache_draft_plan = self._build_hicache_draft_plan()
+
+    def _wait_for_fused_hicache_load(self, batch) -> None:
+        if (
+            self.hicache_draft_plan.mode == HiCacheDraftMode.FUSED
+            and batch.hicache_consumer_index >= 0
+        ):
+            counter = self.target_worker.hicache_layer_transfer_counter
+            # A draft's layer ids do not identify target transfer events. Wait
+            # before dispatch so CUDA graph replay observes this dependency too.
+            counter.events[batch.hicache_consumer_index].wait(counter.num_layers - 1)
 
     def alloc_memory_pool(
         self,
@@ -196,24 +405,6 @@ class BaseSpecWorker(ABC):
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        for runner in self.draft_worker.draft_runners:
-            success, message = runner.weight_updater.update_weights_from_disk(
-                recv_req.model_path,
-                recv_req.load_format,
-                recapture_cuda_graph=recv_req.recapture_cuda_graph,
-            )
-            if not success:
-                return success, message
-        return True, "Succeeded to update model weights."
-
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        for runner in self.draft_worker.draft_runners:
-            success, message = runner.weight_updater.update_weights_from_ipc(recv_req)
-            if not success:
-                return success, message
-        return True, "Succeeded to update model weights."
-
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
@@ -223,6 +414,12 @@ class BaseSpecWorker(ABC):
         controller without forcing a GPU→CPU sync in the worker hot path.
         """
         pass
+
+    @property
+    def has_bound_runtime(self) -> bool:
+        """Whether a kernel build's runtime runs the decode round in place of
+        this worker's own round."""
+        return False
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         """Hook called by the batch-result processor when a request finishes.

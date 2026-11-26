@@ -3,16 +3,19 @@
 import dataclasses
 from types import SimpleNamespace
 
+import msgpack
 import numpy as np
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
-from sglang.multimodal_gen.configs.sample.vla import VLASamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
+from sglang.multimodal_gen.runtime.entrypoints.action import api, protocol
+from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     action_generation_response,
     action_metadata,
     action_raw_response,
@@ -26,6 +29,7 @@ def _server_args(config: Pi05PipelineConfig | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         model_id=None,
         model_path="lerobot/pi05_base",
+        served_model_name="pi05-production",
         output_path=None,
         comfyui_mode=False,
         num_gpus=1,
@@ -33,15 +37,16 @@ def _server_args(config: Pi05PipelineConfig | None = None) -> SimpleNamespace:
         sp_degree=1,
         ulysses_degree=1,
         ring_degree=1,
+        kv_gather_degree=1,
         pipeline_config=config or Pi05PipelineConfig(),
     )
 
 
-def test_pi05_uses_vla_sampling_params_not_visual_sampling_params():
+def test_pi05_uses_action_sampling_params_not_visual_sampling_params():
     params = Pi05SamplingParams()
     field_names = {field.name for field in dataclasses.fields(params)}
 
-    assert isinstance(params, VLASamplingParams)
+    assert isinstance(params, ActionSamplingParams)
     assert not isinstance(params, SamplingParams)
     assert "action_horizon" in field_names
     assert "action_dim" in field_names
@@ -158,12 +163,16 @@ def test_action_metadata_reports_policy_shape_and_capabilities():
         action_horizon=10,
         action_dim=32,
         output_action_dim=7,
+        prompt_token_buckets=[32, 64, 128, 200],
+        prefix_cuda_graph_max_entries=4,
         enable_action_cuda_graph=True,
+        action_cuda_graph_max_entries=6,
     )
 
     metadata = action_metadata(_server_args(config))
 
     assert metadata["object"] == "action.metadata"
+    assert metadata["model"] == "pi05-production"
     assert metadata["policy_family"] == "pi05"
     assert metadata["input"]["image_keys"] == ["front", "wrist"]
     assert metadata["input"]["image_size"] == [256, 256]
@@ -173,12 +182,34 @@ def test_action_metadata_reports_policy_shape_and_capabilities():
     assert metadata["output"]["padded_action_dim"] == 32
     assert metadata["runtime"]["materialize_dtype"] == "bf16"
     assert metadata["runtime"]["enable_autocast"] is True
+    assert metadata["runtime"]["cuda_graph"] == {
+        "prefix_enabled": True,
+        "prefix_max_entries": 4,
+        "action_enabled": True,
+        "action_max_entries": 6,
+        "prompt_token_buckets": [32, 64, 128, 200],
+    }
     assert metadata["runtime"]["parallelism"]["num_gpus"] == 1
+    assert metadata["runtime"]["parallelism"]["kv_gather_degree"] == 1
     assert metadata["runtime"]["parallelism"]["prefix_strategy"] == "tp"
     assert metadata["runtime"]["parallelism"]["action_strategy"] == "sp"
     assert metadata["defaults"]["prefix_cache"] is False
     assert metadata["capabilities"]["realtime_websocket"]
     assert metadata["capabilities"]["openpi_websocket"]
+
+
+def test_action_metadata_reports_effective_graph_availability():
+    config = Pi05PipelineConfig(
+        prefix_cuda_graph_max_entries=0,
+        offload_action_expert_after_denoise=True,
+    )
+
+    metadata = action_metadata(_server_args(config))
+
+    assert metadata["runtime"]["cuda_graph"]["prefix_enabled"] is False
+    assert metadata["runtime"]["cuda_graph"]["action_enabled"] is False
+    assert metadata["defaults"]["cuda_graph"] is False
+    assert metadata["capabilities"]["cuda_graph"] is False
 
 
 def test_action_generation_response_uses_actual_output_parameters():
@@ -195,6 +226,7 @@ def test_action_generation_response_uses_actual_output_parameters():
 
     assert response["id"] == "action-response-1"
     assert response["object"] == "action.generation"
+    assert response["model"] == "pi05-production"
     assert response["data"][0]["action"]["shape"] == [2, 2]
     assert response["data"][0]["action"]["values"] == output["actions"]
     assert response["usage"]["action_horizon"] == 2
@@ -239,3 +271,87 @@ def test_msgpack_roundtrip_preserves_string_keys_and_numpy_payloads():
     assert decoded["task"] == "pick"
     np.testing.assert_array_equal(decoded["array"], payload["array"])
     assert decoded["scalar"] == payload["scalar"]
+
+
+@pytest.fixture
+def action_client(monkeypatch):
+    app = FastAPI()
+    app.include_router(api.router)
+    app.state.server_args = _server_args()
+    app.state.server_args.attention_backend_config = {}
+    app.state.server_args.enable_trace = False
+
+    async def forward(req):
+        # Echo the observation as one action so the wire test checks both directions.
+        state = np.asarray(req.sampling_params.state, dtype=np.float32)
+        output = {"request_id": req.request_id, "actions": state[None, :]}
+        return SimpleNamespace(output=[output])
+
+    monkeypatch.setattr(protocol.async_scheduler_client, "forward", forward)
+    with TestClient(app) as client:
+        yield client
+
+
+def _observation(request_id, state):
+    return {
+        "request_id": request_id,
+        "input": {"task": "pick", "observation": {"state": state}},
+    }
+
+
+def _assert_binary_action(action, expected):
+    # Decode the cookbook's msgpack array layout independently of the server codec.
+    assert action[b"__ndarray__"]
+    assert action[b"shape"] == [1, len(expected)]
+    dtype = np.dtype(action[b"dtype"])
+    assert dtype == np.float32
+    np.testing.assert_array_equal(np.frombuffer(action[b"data"], dtype=dtype), expected)
+
+
+def test_action_http_client_formats(action_client):
+    endpoint = "/v1/actions/generations"
+    state = [1.25, -2.5]
+    payload = _observation("http-1", state)
+    reply = action_client.post(endpoint, json=payload)
+    assert reply.status_code == 200
+    envelope = reply.json()
+    assert (envelope["object"], envelope["id"]) == ("action.generation", "http-1")
+    assert envelope["data"][0]["action"]["values"] == [state]
+
+    payload["runtime"] = {"response_format": "raw"}
+    reply = action_client.post(
+        endpoint,
+        content=msgpack.packb(payload),
+        headers={
+            "Content-Type": "application/msgpack",
+            "Accept": "application/msgpack",
+        },
+    )
+    assert reply.status_code == 200
+    assert reply.headers["content-type"] == "application/msgpack"
+    _assert_binary_action(msgpack.unpackb(reply.content)["actions"], state)
+
+
+def test_action_realtime_client_session(action_client):
+    reply = action_client.get("/v1/actions/metadata")
+    assert reply.status_code == 200
+    metadata = reply.json()
+    assert metadata["object"] == "action.metadata"
+    with action_client.websocket_connect("/v1/actions/realtime") as ws:
+        assert msgpack.unpackb(ws.receive_bytes()) == metadata
+        for request_id, state in (("ws-1", [1.0, 2.0]), ("ws-2", [-3.0, 4.0])):
+            ws.send_bytes(msgpack.packb(_observation(request_id, state)))
+            envelope = msgpack.unpackb(ws.receive_bytes())
+            assert (envelope["object"], envelope["id"]) == (
+                "action.generation",
+                request_id,
+            )
+            _assert_binary_action(envelope["data"][0]["action"]["values"], state)
+
+
+def test_action_unsupported_output_format_is_a_client_error(action_client):
+    payload = _observation("format", [0.0])
+    payload["runtime"] = {"output_format": "csv"}
+    reply = action_client.post("/v1/actions/generations", json=payload)
+    assert reply.status_code == 400
+    assert "output_format" in reply.json()["detail"]

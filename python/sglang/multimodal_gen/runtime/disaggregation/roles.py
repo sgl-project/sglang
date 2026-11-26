@@ -1,17 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
 """Role definitions for diffusion pipeline disaggregation."""
 
+from collections.abc import Mapping
 from enum import Enum
 
 _ROLE_ALIASES = {"denoising": "denoiser"}
 
 
+def _matches_component_type(component_name: str, component_type: str) -> bool:
+    prefix = f"{component_type}_"
+    return component_name == component_type or (
+        component_name.startswith(prefix) and component_name[len(prefix) :].isdigit()
+    )
+
+
 class RoleType(str, Enum):
     MONOLITHIC = "monolithic"
     ENCODER = "encoder"
+    PROMPT_ENCODER = "prompt_encoder"
+    IMAGE_ENCODER = "image_encoder"
     DENOISER = "denoiser"
     DECODER = "decoder"
     SERVER = "server"  # Head node (no GPU, routes requests)
+
+    @property
+    def is_input_encoder(self) -> bool:
+        return self in (RoleType.ENCODER, RoleType.PROMPT_ENCODER)
+
+    @property
+    def is_transfer_receiver(self) -> bool:
+        return self in (RoleType.IMAGE_ENCODER, RoleType.DENOISER, RoleType.DECODER)
+
+    def includes_stage(self, affinity: "RoleType") -> bool:
+        return (
+            self == RoleType.MONOLITHIC
+            or self == affinity
+            or (
+                self == RoleType.ENCODER
+                and affinity in (RoleType.PROMPT_ENCODER, RoleType.IMAGE_ENCODER)
+            )
+        )
 
     @classmethod
     def from_string(cls, value: str) -> "RoleType":
@@ -37,6 +65,7 @@ def get_module_role(module_name: str) -> "RoleType | None":
         "image_processor",
         "processor",
         "connectors",
+        "duration_head",
         "vision_language_encoder",
     )
     if any(
@@ -62,7 +91,13 @@ def get_module_role(module_name: str) -> "RoleType | None":
     if module_name == "hy3dshape_model":
         return RoleType.DENOISER
 
-    decoder_prefixes = ("vae", "audio_vae", "video_vae", "vocoder")
+    decoder_prefixes = (
+        "vae",
+        "audio_vae",
+        "video_vae",
+        "vocoder",
+        "diffusion_decoder",
+    )
     if any(
         module_name == p or module_name.startswith(p + "_") for p in decoder_prefixes
     ):
@@ -79,21 +114,31 @@ def filter_modules_for_role(
     role: "RoleType",
     *,
     extra_allowed_modules: set[str] | None = None,
+    structural_component_names: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Filter module names to only those needed by the given role."""
     if role in (RoleType.MONOLITHIC, RoleType.SERVER):
         return module_names
 
     extra_allowed_modules = extra_allowed_modules or set()
+    structural_component_names = structural_component_names or {}
     filtered = []
     for name in module_names:
-        module_role = get_module_role(name)
+        structural_name = structural_component_names.get(name, name)
+        module_role = get_module_role(structural_name)
 
         if module_role is None:
             filtered.append(name)
         elif module_role == role:
             filtered.append(name)
-        elif name in extra_allowed_modules:
+        elif (
+            name in extra_allowed_modules
+            or structural_name in extra_allowed_modules
+            or any(
+                _matches_component_type(structural_name, component_type)
+                for component_type in extra_allowed_modules
+            )
+        ):
             filtered.append(name)
 
     return filtered

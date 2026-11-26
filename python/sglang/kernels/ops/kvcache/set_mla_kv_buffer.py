@@ -19,6 +19,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.kvcache.paged_rows import paged_layout
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -41,27 +42,7 @@ def set_mla_kv_buffer_module(nope_bytes: int, rope_bytes: int, use_pdl: bool) ->
 
 @cache_once
 def can_use_set_mla_kv_buffer(nope_bytes: int, rope_bytes: int) -> bool:
-    """Whether the TMA path can be used for these row byte widths.
-
-    TMA bulk store requires ``(nope_bytes + rope_bytes)`` to be a multiple of
-    16; both halves individually must also be a multiple of 4 (the warp-coop
-    smem load lower bound).
-    """
-    if nope_bytes % 4 != 0 or rope_bytes % 4 != 0:
-        logger.warning(
-            "Unsupported nope_bytes=%d rope_bytes=%d for JIT set_mla_kv_buffer:"
-            " both must be multiples of 4",
-            nope_bytes,
-            rope_bytes,
-        )
-        return False
-    if (nope_bytes + rope_bytes) % 16 != 0:
-        logger.warning(
-            "Unsupported nope_bytes=%d rope_bytes=%d for JIT set_mla_kv_buffer:"
-            " (nope_bytes + rope_bytes) must be a multiple of 16 for TMA bulk store",
-            nope_bytes,
-            rope_bytes,
-        )
+    if (rope_bytes + nope_bytes) % 16 != 0:
         return False
     try:
         set_mla_kv_buffer_module(nope_bytes, rope_bytes, is_arch_support_pdl())
@@ -89,16 +70,23 @@ def set_mla_kv_buffer(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
     num_warps: int = 0,
+    *,
+    reserved_skip_index: int = 0,
 ) -> None:
     """Write packed [k_nope | k_rope] rows into ``kv_buffer`` at ``loc`` indices
     via a TMA bulk-store. SM90+ only — the caller is expected to gate.
 
     Shapes (last dim is treated as the row payload; any leading singleton dims
     on the source tensors are flattened away):
-        kv_buffer:    [num_pages, total_dim] or [num_pages, 1, total_dim]
+        kv_buffer:    [num_slots, total_dim] or [num_slots, 1, total_dim], or a
+                      paged [num_pages, page_size, 1, total_dim] whose pages are
+                      not packed (`paged_layout`)
         cache_k_nope: [n_loc, nope_dim] or [n_loc, 1, nope_dim]
         cache_k_rope: [n_loc, rope_dim] or [n_loc, 1, rope_dim]
         loc:          [n_loc]
+
+    Writes targeting ``reserved_skip_index`` are skipped. Slot 0 is reserved
+    for CUDA-graph padding by default; pass -1 to disable skipping.
     """
     n_loc = loc.shape[0]
     if n_loc == 0:
@@ -106,7 +94,19 @@ def set_mla_kv_buffer(
 
     src_nope = cache_k_nope.view(n_loc, -1) if cache_k_nope.dim() != 2 else cache_k_nope
     src_rope = cache_k_rope.view(n_loc, -1) if cache_k_rope.dim() != 2 else cache_k_rope
-    buf = kv_buffer.view(kv_buffer.shape[0], -1) if kv_buffer.dim() != 2 else kv_buffer
+    paged = paged_layout(kv_buffer)
+    if paged is None:
+        page_size, row_stride = 1, 0
+        buf = (
+            kv_buffer.view(kv_buffer.shape[0], -1)
+            if kv_buffer.dim() != 2
+            else kv_buffer
+        )
+    else:
+        # The kernel takes each page's first row, a page stride apart, and
+        # steps a row stride within the page.
+        page_size, _, row_stride = paged
+        buf = kv_buffer[:, 0, 0, :]
 
     nope_bytes = src_nope.shape[-1] * src_nope.element_size()
     rope_bytes = src_rope.shape[-1] * src_rope.element_size()
@@ -114,4 +114,13 @@ def set_mla_kv_buffer(
         num_warps = _pick_num_warps(n_loc)
 
     module = set_mla_kv_buffer_module(nope_bytes, rope_bytes, is_arch_support_pdl())
-    module.set_mla_kv_buffer(buf, loc, src_nope, src_rope, num_warps)
+    module.set_mla_kv_buffer(
+        buf,
+        loc,
+        src_nope,
+        src_rope,
+        num_warps,
+        reserved_skip_index,
+        page_size,
+        row_stride,
+    )

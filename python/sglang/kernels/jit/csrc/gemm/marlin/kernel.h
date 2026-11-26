@@ -10,10 +10,13 @@
       const int *__restrict__ g_idx, int num_groups, int prob_m, int prob_n, int prob_k, int lda, int *locks,        \
       bool use_atomic_add, bool use_fp32_reduce, int max_shared_mem
 
+namespace sglang {
+
 namespace device::marlin {
 template <
     typename scalar_t,                   // compute dtype, half or nv_float16
     const host::ScalarTypeId w_type_id,  // weight ScalarType id
+    const host::ScalarTypeId s_type_id,  // weight scale ScalarType id
     const int threads,                   // number of threads in a threadblock
     const int thread_m_blocks,           // number of 16x16 blocks in the m
                                          // dimension (batchsize) of the
@@ -31,3 +34,5 @@ template <
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
 }  // namespace device::marlin
+
+}  // namespace sglang

@@ -25,7 +25,7 @@ def _mask_and_partial_sum_kernel(
     chunk = tl.program_id(1)
     offsets = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < vocab_size
-    row_offsets = row * vocab_size + offsets
+    row_offsets = row.to(tl.int64) * vocab_size + offsets
 
     probs = tl.load(probs_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
     pivot = tl.load(pivots_ptr + row)
@@ -43,7 +43,7 @@ def _normalize_kernel(
     vocab_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < numel
     row = offsets // vocab_size
     values = tl.load(out_ptr + offsets, mask=mask, other=0.0).to(tl.float32)

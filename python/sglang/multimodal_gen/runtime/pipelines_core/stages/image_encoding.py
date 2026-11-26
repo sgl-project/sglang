@@ -19,10 +19,12 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
+    peek_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
@@ -42,6 +44,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     align_tensor_to_module_dtype,
     autocast_context,
     autocast_enabled,
+    resolve_component_precision_override,
     resolve_precision,
     temporary_module_dtype,
 )
@@ -49,6 +52,7 @@ from sglang.multimodal_gen.runtime.utils.vision import (
     normalize,
     numpy_to_pt,
     pil_to_numpy,
+    preprocess_image,
 )
 
 logger = init_logger(__name__)
@@ -156,9 +160,25 @@ class ImageEncodingStage(PipelineStage):
         stage_name = self._component_stage_name(stage_name)
         uses = []
         if self.image_encoder is not None:
-            uses.append(ComponentUse(stage_name, "image_encoder"))
+            uses.append(
+                ComponentUse(
+                    stage_name,
+                    "image_encoder",
+                    target_dtype=resolve_component_precision_override(
+                        server_args, "image_encoder"
+                    ),
+                )
+            )
         if self.text_encoder is not None:
-            uses.append(ComponentUse(stage_name, "text_encoder"))
+            uses.append(
+                ComponentUse(
+                    stage_name,
+                    "text_encoder",
+                    target_dtype=resolve_component_precision_override(
+                        server_args, "text_encoder"
+                    ),
+                )
+            )
         return uses
 
     def encoding_image_edit(self, outputs, image_inputs, pipeline_config):
@@ -170,6 +190,20 @@ class ImageEncodingStage(PipelineStage):
             )
 
         return postprocess_funcs[0](outputs, image_inputs)
+
+    @staticmethod
+    def _prepare_text_encoder_inputs(image_inputs) -> dict[str, Any]:
+        inputs = {
+            "input_ids": image_inputs.input_ids,
+            "attention_mask": image_inputs.attention_mask,
+            "pixel_values": image_inputs.pixel_values,
+            "image_grid_thw": image_inputs.image_grid_thw,
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
+        if "mm_token_type_ids" in image_inputs:
+            inputs["mm_token_type_ids"] = image_inputs["mm_token_type_ids"]
+        return inputs
 
     @staticmethod
     def _split_text_conditioning_output(output):
@@ -317,19 +351,11 @@ class ImageEncodingStage(PipelineStage):
                         )
                     with set_forward_context(current_timestep=0, attn_metadata=None):
                         outputs = self.text_encoder(
-                            input_ids=image_inputs.input_ids,
-                            attention_mask=image_inputs.attention_mask,
-                            pixel_values=image_inputs.pixel_values,
-                            image_grid_thw=image_inputs.image_grid_thw,
-                            output_hidden_states=True,
+                            **self._prepare_text_encoder_inputs(image_inputs)
                         )
                         if batch.do_classifier_free_guidance:
                             neg_outputs = self.text_encoder(
-                                input_ids=neg_image_inputs.input_ids,
-                                attention_mask=neg_image_inputs.attention_mask,
-                                pixel_values=neg_image_inputs.pixel_values,
-                                image_grid_thw=neg_image_inputs.image_grid_thw,
-                                output_hidden_states=True,
+                                **self._prepare_text_encoder_inputs(neg_image_inputs)
                             )
 
                 prompt_embeds, prompt_embeds_mask, prompt_seq_lens = (
@@ -439,7 +465,6 @@ class ImageEncodingStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify image encoding stage outputs."""
         result = VerificationResult()
-        # result.add_check("image_embeds", batch.image_embeds, V.list_of_tensors_dims(3))
         return result
 
 
@@ -525,15 +550,39 @@ class LTX2ImageEncodingStage(PipelineStage):
             "condition_image_encoder"
         ):
             modules = {"condition_image_encoder": self._condition_image_encoder}
+            residency_manager = peek_global_component_residency_manager()
             configure_layerwise_offload_modules(
                 modules,
                 server_args,
-                component_names=server_args.layerwise_offload_components,
+                pin_budget=(
+                    residency_manager.host_pin_budget
+                    if residency_manager is not None
+                    else None
+                ),
+                component_names=(
+                    None
+                    if server_args.component_residency is not None
+                    else server_args.layerwise_offload_components
+                ),
                 warn_missing=False,
             )
         return True
 
     # -- image preprocessing ---------------------------------------------
+
+    # Conditioning images are re-compressed to match training: CRF 33 for
+    # LTX-2 / 2.3, 18 for LTX-2.5. Like upstream, keyed off the text-encoder
+    # generation -- the only signal that separates them.
+    _DEFAULT_IMAGE_CRF = 33
+    _LTX_2_5_IMAGE_CRF = 18
+
+    @classmethod
+    def _resolve_image_conditioning_crf(cls, server_args: ServerArgs) -> int:
+        text_encoder_configs = server_args.pipeline_config.text_encoder_configs
+        for encoder_config in text_encoder_configs:
+            if encoder_config.prefix in ("gemma_4_unified", "gemma_4"):
+                return cls._LTX_2_5_IMAGE_CRF
+        return cls._DEFAULT_IMAGE_CRF
 
     @staticmethod
     def _apply_video_codec_compression(
@@ -704,11 +753,12 @@ class LTX2ImageEncodingStage(PipelineStage):
         from sglang.multimodal_gen.runtime.utils.vision import load_image
 
         # 1. Load images, apply codec compression, resize for condition_image
+        crf = self._resolve_image_conditioning_crf(server_args)
         conditioned_imgs = []
         for image_path in image_paths:
             img = load_image(image_path)
             arr = np.array(img).astype(np.uint8)[..., :3]
-            arr = self._apply_video_codec_compression(arr, crf=33)
+            arr = self._apply_video_codec_compression(arr, crf=crf)
             conditioned_img = PIL.Image.fromarray(arr)
             conditioned_imgs.append(conditioned_img)
         batch.condition_image = [
@@ -926,17 +976,20 @@ class ImageVAEEncodingStage(PipelineStage):
                 with autocast_context(vae_dtype, server_args.disable_autocast):
                     if server_args.pipeline_config.vae_tiling:
                         self.vae.enable_tiling()
-                    # if server_args.vae_sp:
-                    #     self.vae.enable_parallel()
                     should_cast_vae = not vae_autocast_enabled
                     if not vae_autocast_enabled:
                         video_condition = video_condition.to(vae_dtype)
                     video_condition = server_args.pipeline_config.preprocess_vae_encode(
                         video_condition, self.vae
                     )
-                    with temporary_module_dtype(
-                        self.vae, vae_dtype, enabled=should_cast_vae
-                    ) as vae:
+                    with (
+                        temporary_module_dtype(
+                            self.vae, vae_dtype, enabled=should_cast_vae
+                        ) as vae,
+                        use_gpu_conditioning_hash(
+                            enabled=num_frames == 1 and len(images) > 1
+                        ),
+                    ):
                         latent_dist: DiagonalGaussianDistribution = vae.encode(
                             video_condition
                         )
@@ -1055,15 +1108,14 @@ class ImageVAEEncodingStage(PipelineStage):
         image: torch.Tensor | PIL.Image.Image,
     ) -> torch.Tensor:
         if isinstance(image, PIL.Image.Image):
-            image = pil_to_numpy(image)  # to np
-            image = numpy_to_pt(image)  # to pt
+            if image.mode == "RGB":
+                return preprocess_image(image, device=get_local_torch_device())
+            image = numpy_to_pt(pil_to_numpy(image))
+            return image if image.min() < 0 else normalize(image)
 
-        do_normalize = True
-        if image.min() < 0:
-            do_normalize = False
-        if do_normalize:
-            image = normalize(image)
-
+        # Tensors come from the pipeline config's preprocessing, already in
+        # [-1, 1]. Their range cannot be inferred from the values: a bright
+        # image has no negative pixel and would be normalized a second time.
         return image
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -1088,7 +1140,4 @@ class ImageVAEEncodingStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify encoding stage outputs."""
         result = VerificationResult()
-        # result.add_check(
-        #     "image_latent", batch.image_latent, [V.is_tensor, V.with_dims(5)]
-        # )
         return result

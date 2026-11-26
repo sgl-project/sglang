@@ -497,7 +497,8 @@ void fused_experts_kernel_impl(
 
       } else {
         const int64_t offset = offsets[mb];
-        if (act_func == CPUActMethod::swiglu) {
+        // the fused path below hardcodes SiLU in its store step
+        if (act_func != CPUActMethod::silu_and_mul) {
           tinygemm_kernel(
               /* A     */ A,
               /* B     */ B0,
@@ -539,11 +540,15 @@ void fused_experts_kernel_impl(
           add_bias_stub(C1 + m * BLOCK_N, B1_bias, n_size);
         }
       }
-      // 1.d silu and mul
+      // 1.d activation and mul
       const int64_t offset = offsets[mb];
       if (act_func == CPUActMethod::silu_and_mul && use_brgemm) {
         for (int64_t m = 0; m < m_size; ++m) {
           silu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
+        }
+      } else if (act_func == CPUActMethod::gelu_and_mul) {
+        for (int64_t m = 0; m < m_size; ++m) {
+          gelu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
         }
       } else if (act_func == CPUActMethod::swiglu) {
         for (int64_t m = 0; m < m_size; ++m) {
@@ -883,7 +888,18 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w2_bias,
     const std::optional<double>& alpha,
     const std::optional<double>& limit,
-    bool is_vnni) {
+    bool is_vnni,
+    const std::optional<std::string>& activation) {
+  const CPUActMethod act_func = act_method_from_string(activation, alpha.has_value() && limit.has_value());
+  // The int8 kernel only supports SiLU; int4 supports SiLU and GELU.
+  TORCH_CHECK(
+      !(moe_comp_method == CPUQuantMethod::INT8_W8A8) || act_func == CPUActMethod::silu_and_mul,
+      "fused_experts_cpu: INT8_W8A8 supports activation='silu' only");
+  TORCH_CHECK(
+      moe_comp_method != CPUQuantMethod::INT4_W4A8 || act_func == CPUActMethod::silu_and_mul ||
+          act_func == CPUActMethod::gelu_and_mul,
+      "fused_experts_cpu: INT4_W4A8 supports activation='silu' or 'gelu'");
+
   auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
   auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
 
@@ -909,6 +925,7 @@ at::Tensor fused_experts_cpu(
   }
   CHECK_DIM(2, topk_weights);
   CHECK_DIM(2, topk_ids_);
+
   CHECK_EQ(topk_ids_.scalar_type(), at::kInt);
 
   // TODO: support topk_weights to be bf16 or fp16 in the kernel.
@@ -1055,7 +1072,6 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
-      auto act_func = alpha.has_value() && limit.has_value() ? CPUActMethod::swiglu : CPUActMethod::silu_and_mul;
 
       CHECK_MOE_SCALES_FP8(1, 2);
       fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
@@ -1095,14 +1111,13 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
-      auto act_func = alpha.has_value() && limit.has_value() ? CPUActMethod::swiglu : CPUActMethod::silu_and_mul;
 
       // mxfp4 supports only group size of 32 (2^5)
       constexpr int64_t group_size = 32;
       auto w1s = w1_scale.value();
       auto w2s = w2_scale.value();
-      TORCH_CHECK(w1s.numel(), E * 2 * N * K >> 5);
-      TORCH_CHECK(w2s.numel(), E * K * N >> 5);
+      TORCH_CHECK(w1s.numel() == (E * 2 * N * K >> 5), "mxfp4 w1_scale must hold one scale per 32 weights.");
+      TORCH_CHECK(w2s.numel() == (E * K * N >> 5), "mxfp4 w2_scale must hold one scale per 32 weights.");
       fused_experts_fp_kernel_impl<scalar_t, uint8_t, uint8_t, true>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
@@ -1166,7 +1181,7 @@ at::Tensor fused_experts_cpu(
           w1_scale.value().data_ptr<float>(),
           w2_scale.value().data_ptr<float>(),
           group_size,
-          topk_weights.data_ptr<float>(),
+          topk_weights_.data_ptr<float>(),
           sorted_ids,
           expert_ids,
           offsets,
@@ -1175,12 +1190,12 @@ at::Tensor fused_experts_cpu(
           K,
           E,
           topk,
-          num_tokens_post_pad);
+          num_tokens_post_pad,
+          act_func);
     } else {
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       bool with_bias = w1_bias.has_value();
-      auto act_func = alpha.has_value() && limit.has_value() ? CPUActMethod::swiglu : CPUActMethod::silu_and_mul;
 
       fused_experts_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),

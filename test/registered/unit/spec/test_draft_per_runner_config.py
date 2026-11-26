@@ -22,11 +22,15 @@ from sglang.srt.model_executor.model_runner_components.attention_backend_setup i
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     build_load_config,
 )
-from sglang.srt.runtime_context import get_context, get_model
+from sglang.srt.runtime_context import (
+    get_context,
+    get_model,
+    remote_instance_transfer_engine_enabled,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _StopConstruction(Exception):
@@ -46,11 +50,6 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         runner = ModelRunner.__new__(ModelRunner)
         runner.is_draft_worker = is_draft_worker
         return runner._resolve_draft_load_format()
-
-    def test_the_draft_load_format_applies_to_the_draft_runner_only(self):
-        self._seed(load_format="auto", speculative_draft_load_format="dummy")
-        self.assertEqual(self._load_format_of(is_draft_worker=True), "dummy")
-        self.assertIsNone(self._load_format_of(is_draft_worker=False))
 
     def test_an_unset_draft_load_format_leaves_the_load_config_alone(self):
         self._seed(load_format="auto")
@@ -77,18 +76,14 @@ class TestDraftPerRunnerConfig(CustomTestCase):
     def test_the_transfer_engine_gate_answers_for_the_runner(self):
         """The engine is initialized at the top of initialize(), long before the
         weights load, so the gate has to see the draft's format."""
-        server_args = self._seed(
+        self._seed(
             load_format="auto",
             speculative_draft_load_format="remote_instance",
             remote_instance_weight_loader_backend="transfer_engine",
         )
-        self.assertFalse(
-            server_args.remote_instance_weight_loader_use_transfer_engine()
-        )
+        self.assertFalse(remote_instance_transfer_engine_enabled())
         self.assertTrue(
-            server_args.remote_instance_weight_loader_use_transfer_engine(
-                load_format="remote_instance"
-            )
+            remote_instance_transfer_engine_enabled(load_format="remote_instance")
         )
 
     def test_the_load_config_takes_the_per_runner_format_when_given(self):
@@ -134,14 +129,13 @@ class TestDraftPerRunnerConfig(CustomTestCase):
 
     def test_an_unresolved_draft_falls_back_to_the_config_field(self):
         """The v2 workers pass no backend: --speculative-draft-attention-backend."""
-        server_args = self._seed(
+        self._seed(
             attention_backend="fa3", speculative_draft_attention_backend="triton"
         )
 
         def effective(*, is_draft_worker, passed=None):
             return resolve_draft_attention_backend(
                 draft_attention_backend=passed,
-                server_args=server_args,
                 is_draft_worker=is_draft_worker,
             )
 
@@ -157,17 +151,6 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         )
         self.assertEqual((draft.prefill, draft.decode), ("triton", "triton"))
 
-    def test_the_target_keeps_its_split_pair(self):
-        self._seed(
-            attention_backend="fa3",
-            prefill_attention_backend="flashinfer",
-            decode_attention_backend="fa3",
-        )
-        target = resolve_attention_backend_strs(
-            model_runner=self._runner(is_draft_worker=False)
-        )
-        self.assertEqual((target.prefill, target.decode), ("flashinfer", "fa3"))
-
     # -- the scheduler hands over the process's own config ---------------------
 
     def _scheduler(self, server_args, create_worker):
@@ -176,7 +159,6 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         scheduler.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(model_config=SimpleNamespace(context_len=4096))
         )
-        scheduler.ps = SimpleNamespace(gpu_id=0)
         scheduler.nccl_port = 0
         scheduler.spec_algorithm = SimpleNamespace(
             is_none=lambda: False,

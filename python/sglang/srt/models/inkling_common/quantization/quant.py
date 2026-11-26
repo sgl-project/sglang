@@ -1,27 +1,17 @@
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import ceil_div, set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.models.inkling_common.quantization.config import (
         InklingModelOptNvfp4Config,
     )
-
-
-logger = logging.getLogger(__name__)
-
-MXFP_BLOCK_SIZE = 32
-NVFP_BLOCK_SIZE = 16
-
-FLOAT8_E4M3_MAX = 448.0
-FLOAT4_E2M1_MAX = 6.0
 
 
 class InklingMoEMethodBase(FusedMoEMethodBase):
@@ -31,10 +21,6 @@ class InklingMoEMethodBase(FusedMoEMethodBase):
 class InklingNvfp4MoEMethod(InklingMoEMethodBase):
     def __init__(self, quant_config: InklingModelOptNvfp4Config):
         self.quant_config = quant_config
-        self.runner: MoeRunner | None = None
-        self.moe_runner_config: MoeRunnerConfig | None = None
-        self._srt_trtllm_runner: MoeRunner | None = None
-        self._srt_trtllm_runner_config: MoeRunnerConfig | None = None
 
     def create_weights(
         self,
@@ -50,9 +36,9 @@ class InklingNvfp4MoEMethod(InklingMoEMethodBase):
 
         from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
 
-        assert isinstance(
-            layer, InklingBatchDenseMLP
-        ), "InklingNvfp4MoEMethod is only used for InklingBatchDenseMLP (shared experts)"
+        assert isinstance(layer, InklingBatchDenseMLP), (
+            "InklingNvfp4MoEMethod is only used for InklingBatchDenseMLP (shared experts)"
+        )
 
         w13_up_dim = 2 * intermediate_size_per_partition
 

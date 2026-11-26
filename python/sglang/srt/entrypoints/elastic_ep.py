@@ -6,13 +6,12 @@ from http import HTTPStatus
 from fastapi import APIRouter, Request
 from fastapi.responses import ORJSONResponse
 
-from sglang.srt.utils.auth import AuthLevel, auth_level
+from sglang.srt.runtime_context import get_exec
 
 router = APIRouter()
 
 
 @router.post("/scale_elastic_ep")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def scale_elastic_ep(raw_request: Request):
     """Request an asynchronous EP scale-up."""
     try:
@@ -43,7 +42,7 @@ async def scale_elastic_ep(raw_request: Request):
     from sglang.srt.entrypoints.http_server import _global_state
     from sglang.srt.managers.io_struct import ScaleElasticEPReqInput
 
-    if _global_state.tokenizer_manager.server_args.elastic_ep_backend is None:
+    if get_exec().moe.elastic_ep_backend is None:
         return ORJSONResponse(
             {"error": "elastic EP is not enabled (set --elastic-ep-backend)"},
             status_code=HTTPStatus.NOT_FOUND,
@@ -73,12 +72,11 @@ async def scale_elastic_ep(raw_request: Request):
 
 
 @router.get("/is_scaling_elastic_ep")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def is_scaling_elastic_ep(raw_request: Request):
     """Return the tokenizer's mirrored Elastic EP scale state."""
     from sglang.srt.entrypoints.http_server import _global_state
 
-    if _global_state.tokenizer_manager.server_args.elastic_ep_backend is None:
+    if get_exec().moe.elastic_ep_backend is None:
         return ORJSONResponse(
             {"error": "elastic EP is not enabled (set --elastic-ep-backend)"},
             status_code=HTTPStatus.NOT_FOUND,

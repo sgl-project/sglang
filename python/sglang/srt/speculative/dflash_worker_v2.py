@@ -1,10 +1,11 @@
 import logging
 import math
-from dataclasses import replace
-from typing import List, Optional
+import os
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.memory.small_copy import try_small_copy
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
     rebuild_compact_draft_req_to_token_func,
@@ -12,35 +13,94 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
+    _prepare_dflash_mamba_commit,
+    compute_dflash_correct_drafts_and_bonus,
+    dflash_chain_accept_indices,
+    dflash_commit_block,
+)
+from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+    AcceptGreedy,
+    accept_sampling,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
+from sglang.srt.kernel_plugins.nvidia.kimi_k31_dflash_binding import (
+    bind_dflash_runtime,
+)
+from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessor,
+    LogitsProcessorOutput,
+    should_apply_lm_head_quant_method,
+)
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import assign_req_to_token_pool_func
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+from sglang.srt.mem_cache.memory_pool import (
+    KVWriteLoc,
+    layer_window_locs,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     compute_position,
+    enable_num_token_non_padded,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.model_runner import SamplingPrewarmResult
+from sglang.srt.model_executor.runner_utils.pool import (
+    disable_graph_pool_borrow,
+    graph_pool_borrow_enabled,
+)
+from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
+from sglang.srt.models.dflash import DFlashMLAAttention
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_spec,
+    mamba_track_grid,
+)
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, adjusts_logits
+from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
+from sglang.srt.speculative.dflash_dp import gather_draft_embedding
+from sglang.srt.speculative.dflash_draft_l2_prefetch import (
+    DraftL2Prefetch,
+    draft_l2_prefetch_tensors,
+)
+from sglang.srt.speculative.dflash_draft_ring import (
+    DFlashDraftKVRing,
+    draft_kv_ring_is_paged,
+    draft_kv_ring_rows_per_req_from_config,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
+    _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
-    apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
-    compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    get_dflash_attention_sliding_window_size,
+    is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+)
+from sglang.srt.speculative.domino_utils import (
+    domino_greedy_rollout,
+    validate_domino_runtime,
+)
+from sglang.srt.speculative.draft_parallel import (
+    model_draft_parallel_spec,
+    resolve_draft_parallel_layout,
 )
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
@@ -49,19 +109,65 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_input_v2,
     make_draft_sampler_capture_hook,
 )
+from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.dspark_components.dspark_observability import (
+    DecodeStepObservation,
+    DsparkInfoDumper,
+    resolve_enabled_components,
+)
+from sglang.srt.speculative.dspark_components.dspark_planner import (
+    DSparkVerifyPlanner,
+    VerifyWindow,
+)
+from sglang.srt.speculative.dspark_components.dspark_verify import (
+    TargetVerifyExecutor,
+)
+from sglang.srt.speculative.lilicorr_utils import (
+    build_lilicorr_draft_sampler,
+    propose_lilicorr_block,
+    publish_anchor,
+    resolve_sampling_enabled,
+    target_input_embeddings,
+)
+from sglang.srt.speculative.online_acceptance_estimator import (
+    OnlineAcceptanceEstimator,
+)
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_sampling_mask import (
+    SpeculativeSamplingMaskCapture,
+)
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     SIMULATE_ACC_METHOD,
     SIMULATE_ACC_TOKEN_MODE,
     GrammarTree,
-    assign_req_to_token_pool_func,
-    build_grammar_vocab_mask,
+    check_simulate_acc_token_mode,
+    draft_pp_context,
+    draft_tp_context,
+    simulated_acc_len_generator,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.speculative.target_verify import TargetVerify, adjust_verify_logits
+from sglang.srt.utils import (
+    async_h2d,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 
 _is_npu = is_npu()
 
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.dflash_mla_ctx import MlaContextKV
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +183,12 @@ def _get_fused_kv_materialize_helper():
 
         _FusedKVMaterializeHelper = FusedKVMaterializeHelper
     return _FusedKVMaterializeHelper
+
+
+def _unit_scale_on_hip(scale):
+    """ROCm: a missing draft KV scale becomes 1.0, which takes the fused fp8 write (bit-exact
+    with the eager saturating cast it replaces); other platforms keep None."""
+    return 1.0 if scale is None and is_hip() else scale
 
 
 class _DflashDraftSampler:
@@ -102,7 +214,6 @@ class _DflashDraftSampler:
         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
         max_tokens = int(max_bs) * (self.block_size - 1)
         device = weight.device
-        # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
         if self.tp_size > 1:
             # Static buffers (fixed addresses) keep the in-graph select replay-safe.
@@ -157,6 +268,229 @@ class _DflashDraftSampler:
         self.out[:n].copy_(selected.view(-1))
 
 
+def _commit_accept(candidates, accept_len, bonus_tokens):
+    """The committed block: drafted tokens shifted left, the bonus at the accept
+    boundary. Returns it with the commit lengths."""
+    out_tokens = torch.empty_like(candidates, dtype=torch.int64)
+    out_tokens[:, :-1].copy_(candidates[:, 1:])
+    out_tokens[:, -1].fill_(0)
+    out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus_tokens[:, None])
+    return out_tokens, accept_len.to(torch.int32) + 1
+
+
+def _resolve_dflash_embedding_module(draft_model, target_model):
+    if getattr(draft_model, "is_nemotron_35_draft", False):
+        embed_module = draft_model.get_input_embeddings()
+        if embed_module is None:
+            raise RuntimeError(
+                "Nemotron 3.5 DFLASH draft requires its checkpoint embedding."
+            )
+        return embed_module
+    return target_model.get_input_embeddings()
+
+
+def _is_all_greedy(sampling_info) -> bool:
+    return sampling_info is None or sampling_info.is_all_greedy
+
+
+def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
+    # Row 0 is the anchor, unless shift_label: then row i drafts token i + 1.
+    pred_hidden = pred_hidden[:, :-1] if draft_model.shift_label else pred_hidden[:, 1:]
+    # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
+    bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
+    candidate_ids, unary_logits = draft_model.compute_candidates(
+        pred_hidden.reshape(-1, pred_hidden.shape[-1])
+    )
+    candidate_ids = candidate_ids.view(bs, num_pred, -1)
+    return candidate_ids, draft_model.candidate_selector.build_lattice(
+        candidate_ids=candidate_ids,
+        unary_logits=unary_logits.view(bs, num_pred, -1),
+        hidden_states=pred_hidden,
+        anchor_token_ids=anchor_token_ids,
+    )
+
+
+def _walked_confidence(
+    estimator,
+    *,
+    candidate_ids,
+    scores,
+    tokens,
+    temperatures,
+    greedy_mask,
+    features_out=None,
+    predictions_out=None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(feature, conditional acceptance probability) of each draft token, both
+    [bs, block_size - 1]. The feature scores the selector row the walk drew the
+    token from, at the request's temperature (1 for a greedy row), never the
+    token itself. The walk is recovered by matching each token against its
+    slot's candidates, which are distinct vocabulary ids (a top-k)."""
+    path = (candidate_ids == tokens.unsqueeze(-1)).int().argmax(dim=-1)
+    rows = scores[:, 1:].gather(
+        2, path[:, :-1, None, None].expand(-1, -1, 1, scores.shape[-1])
+    )[:, :, 0]
+    return estimator.predict(
+        logits=torch.cat((scores[:, :1, 0], rows), dim=1),
+        temperatures=temperatures.masked_fill(greedy_mask, 1.0),
+        features_out=features_out,
+        predictions_out=predictions_out,
+    )
+
+
+class _SelectorDraftSampler:
+    """Selector decode folded into the draft cuda graph.
+
+    On sampling-enabled backends, one captured graph serves both: it always walks
+    the sampling path, and a static greedy_mask selects the argmax per row.
+    """
+
+    def __init__(
+        self,
+        *,
+        draft_model,
+        block_size,
+        max_bs,
+        device,
+        sampling_enabled: bool,
+        acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
+    ):
+        self.draft_model = draft_model
+        self.selector = draft_model.candidate_selector
+        self.block_size = int(block_size)
+        self.sampling_enabled = sampling_enabled
+        max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
+        self.max_bs = max_bs
+        self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
+        # Written by the host before replay, or read after it; the addresses are
+        # baked into the captured graph.
+        self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
+        self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
+        self.uniforms = torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
+        self.candidate_out = torch.empty(
+            (max_bs, gamma, top_k), dtype=torch.int64, device=device
+        )
+        self.q_out = torch.empty(
+            (max_bs, gamma, top_k), dtype=torch.float32, device=device
+        )
+        # The verify planner's acceptance feature and confidence, when it
+        # schedules a budget.
+        self.acceptance_estimator = acceptance_estimator
+        if acceptance_estimator is not None:
+            self.feature_out = torch.empty(
+                (max_bs, gamma), dtype=torch.float32, device=device
+            )
+            self.confidence_out = torch.empty_like(self.feature_out)
+
+    def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
+        """Host-side refresh of the static sampling params; must run before the draft
+        graph replay that consumes them."""
+        if sampling_info is None or not self.sampling_enabled:
+            self.temperatures[:bs].fill_(1.0)
+            self.greedy_mask[:bs].fill_(True)
+            return
+        torch.clamp(
+            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
+            min=1e-5,
+            out=self.temperatures[:bs],
+        )
+        self.greedy_mask[:bs].copy_(
+            resolve_greedy_mask(
+                bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+            )
+        )
+
+    def __call__(self, hidden_states, input_ids):
+        bs = hidden_states.shape[0] // self.block_size
+        block_ids = input_ids.view(bs, self.block_size)
+        hs = hidden_states.view(bs, self.block_size, -1)
+        candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
+        # In-graph philox draw: each replay advances the generator and redraws.
+        tokens, q_rows = self.selector.sample_path(
+            candidate_ids=candidate_ids,
+            scores=scores,
+            uniforms=self.uniforms[:bs].uniform_(),
+            temperatures=self.temperatures[:bs],
+            greedy_mask=self.greedy_mask[:bs],
+        )
+        self.out[: tokens.numel()].copy_(tokens.reshape(-1))
+        self.candidate_out[:bs].copy_(candidate_ids)
+        self.q_out[:bs].copy_(q_rows)
+        if self.acceptance_estimator is not None:
+            _walked_confidence(
+                self.acceptance_estimator,
+                candidate_ids=candidate_ids,
+                scores=scores,
+                tokens=tokens,
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+                features_out=self.feature_out[:bs],
+                predictions_out=self.confidence_out[:bs],
+            )
+
+
+class _DominoDraftSampler:
+    """Capture-safe Domino rollout over a fixed-size draft block."""
+
+    def __init__(
+        self,
+        *,
+        target_embedding,
+        lm_head_weight,
+        prefix_gru,
+        embed_proj,
+        vocab_size,
+        block_size,
+        shift_label,
+        max_bs,
+        candidate_pool_size,
+        tp_group=None,
+        lm_head_org_vocab_start=0,
+        lm_head_num_org=None,
+        lm_head_num_org_padded=None,
+    ):
+        self.target_embedding = target_embedding
+        self.lm_head_weight = lm_head_weight
+        self.prefix_gru = prefix_gru
+        self.embed_proj = embed_proj
+        self.vocab_size = int(vocab_size)
+        self.block_size = int(block_size)
+        self.shift_label = bool(shift_label)
+        self.candidate_pool_size = int(candidate_pool_size)
+        self.tp_group = tp_group
+        self.lm_head_org_vocab_start = int(lm_head_org_vocab_start)
+        self.lm_head_num_org = lm_head_num_org
+        self.lm_head_num_org_padded = lm_head_num_org_padded
+        max_tokens = int(max_bs) * (self.block_size - 1)
+        self.out = torch.empty(
+            (max_tokens,), dtype=torch.int64, device=lm_head_weight.device
+        )
+
+    def __call__(self, hidden_states, input_ids=None):
+        if input_ids is None:
+            raise RuntimeError("Domino draft sampler requires block input_ids.")
+        bs = hidden_states.shape[0] // self.block_size
+        draft_hidden = hidden_states.view(bs, self.block_size, -1)
+        bonus_tokens = input_ids.view(bs, self.block_size)[:, 0]
+        proposals = domino_greedy_rollout(
+            draft_hidden=draft_hidden,
+            bonus_tokens=bonus_tokens,
+            target_embedding=self.target_embedding,
+            lm_head_weight=self.lm_head_weight,
+            prefix_gru=self.prefix_gru,
+            embed_proj=self.embed_proj,
+            vocab_size=self.vocab_size,
+            shift_label=self.shift_label,
+            candidate_pool_size=self.candidate_pool_size,
+            tp_group=self.tp_group,
+            lm_head_org_vocab_start=self.lm_head_org_vocab_start,
+            lm_head_num_org=self.lm_head_num_org,
+            lm_head_num_org_padded=self.lm_head_num_org_padded,
+            in_cuda_graph=True,
+        )
+        self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
@@ -164,11 +498,22 @@ class DFlashWorkerV2(BaseSpecWorker):
     scheduler runs it synchronously when overlap is disabled.
     """
 
+    _hosts_draft: bool = True
+    _runtime = None  # see kernel_plugins/nvidia/kimi_k31_dflash_binding.py
+    _verify_planner: Optional[DSparkVerifyPlanner] = None
+    _aux_pending: bool = False
+
+    @property
+    def has_bound_runtime(self) -> bool:
+        return self._runtime is not None
+
+    def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        return [("draft", self.draft_model_runner)] if self._hosts_draft else []
+
     def __init__(
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -176,42 +521,142 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.ps = ps
-        self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self._need_mamba_verify_commit = False
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
-        self.draft_window_size: Optional[int] = (
-            server_args.speculative_draft_window_size
-        )
+        self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+        self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
 
         self._warned_sampling_fallback = False
-        self._logged_first_verify = False
-
-        bundle = build_draft_tp_worker(
-            server_args=server_args,
-            gpu_id=gpu_id,
-            ps=replace(ps, pp_rank=0),
-            nccl_port=nccl_port,
-            target_model_config=target_worker.model_runner.model_config,
-            algo_label="DFLASH",
+        self._warned_lilicorr_eager = False
+        self._draft_probs_buf = None
+        self._full_embed_gpu: Optional[torch.Tensor] = None
+        # Under dp attention, peer DP ranks run different (idle) paths, so
+        # spec broadcasts must stay within the attn-TP group.
+        self._tp_sync = SpecTpSync(get_dp_tp_group())
+        check_simulate_acc_token_mode()
+        # The forced lengths overwrite accept_len after its broadcast, so every rank
+        # draws them from the same server-seeded stream.
+        self._simulated_acc_len_rng = (
+            simulated_acc_len_generator(target_worker.random_seed)
+            if SIMULATE_ACC_LEN > 0
+            else None
         )
+
+        # DP drafts use per-DP attention TP, independent of idle peers. CP
+        # drafts use full TP without CP, including their backend and KV pool.
+        self.draft_parallel_layout = resolve_draft_parallel_layout(
+            model_draft_parallel_spec(
+                target_worker.model_runner.spec_aux_config.draft_model_config,
+                spec_algorithm=target_worker.model_runner.spec_algorithm,
+            ),
+            collapse_cp=True,
+        )
+        # Inside the draft scope the context answers the draft's narrowed rank.
+        self._target_tp_rank = get_parallel().tp_rank
+        # On a pipelined PD prefill only the last stage holds the draft: it gets the
+        # aux hidden states on the PP proxy and sends the prompt's draft KV.
+        self._hosts_draft = get_parallel().pp_group.is_last_rank
+        if not self._hosts_draft:
+            self._draft_worker = None
+            self.draft_model_runner = None
+            self.draft_model = None
+            return
+        # The earlier stages returned above: the load must join no all-rank collective.
+        load_group = get_pp_stage_load_group()
+        with draft_pp_context(), draft_tp_context(self.draft_parallel_layout):
+            bundle = build_draft_tp_worker(
+                server_args=server_args,
+                gpu_id=gpu_id,
+                nccl_port=nccl_port,
+                target_model_config=target_worker.model_runner.model_config,
+                algo_label="DFLASH",
+                random_seed=target_worker.random_seed,
+                load_group=load_group,
+            )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
+        self._draft_compact_page_size = self._compact_draft_alignment_for_backend(
+            self.page_size,
+            bundle.resolved_attention_backend,
+            target_worker.model_runner.model_config.hf_config.architectures,
+        )
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        self.selector = self.draft_model.candidate_selector
+        # Ascend keeps selector proposal aligned with its greedy-only verify path.
+        self._selector_sampling_enabled = not _is_npu
+        self.lilicorr = self.draft_model.lilicorr
+        # The sampled commit rides the selector's accept path.
+        self._lilicorr_sampling_enabled = self.lilicorr is not None and (
+            resolve_sampling_enabled(device_supported=self._selector_sampling_enabled)
+        )
+        self._lilicorr_anchor: Optional[torch.Tensor] = None
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
-        if server_args.speculative_num_draft_tokens is None:
+        self._is_domino = draft_config.is_domino
+        if get_parallel().attn_dp_enabled and not _is_npu:
+            if self._is_domino or self.lilicorr is not None:
+                raise ValueError(
+                    "DFLASH with dp attention supports plain DFlash and DFlash2 "
+                    "drafts; Domino and LiLiCorr heads are not supported."
+                )
+        self.domino_candidate_pool_size = int(
+            get_spec().speculative_domino_candidate_pool_size
+        )
+        if self._is_domino:
+            if self.domino_candidate_pool_size < 0:
+                raise ValueError(
+                    "--speculative-domino-candidate-pool-size must be non-negative, "
+                    f"got {self.domino_candidate_pool_size}."
+                )
+            target_model = self.target_worker.model_runner.model
+            target_embedding = target_model.get_input_embeddings()
+            lm_head = getattr(target_model, "lm_head", None)
+            prefix_gru = getattr(self.draft_model, "prefix_gru", None)
+            embed_proj = getattr(self.draft_model, "embed_proj", None)
+            if lm_head is None or prefix_gru is None or embed_proj is None:
+                raise ValueError(
+                    "DFLASH Domino requires target lm_head and loaded Domino projector modules."
+                )
+            validate_domino_runtime(
+                device=torch.device(self.device),
+                tp_size=int(get_parallel().tp_group.world_size),
+                tp_rank=int(get_parallel().tp_rank),
+                target_vocab_size=int(self.model_runner.model_config.vocab_size),
+                draft_vocab_size=int(self.draft_model_runner.model_config.vocab_size),
+                hidden_size=int(self.draft_model.config.hidden_size),
+                target_embedding=target_embedding,
+                lm_head=lm_head,
+                prefix_gru=prefix_gru,
+                embed_proj=embed_proj,
+            )
+        self._block_verification = get_spec().speculative_use_block_verification
+        if (
+            self._block_verification
+            and (
+                self._is_domino
+                or (self.selector is None and not self._lilicorr_sampling_enabled)
+            )
+            and get_parallel().tp_rank == 0
+        ):
+            # A greedy draft is a point mass, where token-wise verification
+            # already accepts every prefix with its target probability.
+            logger.warning(
+                "--speculative-use-block-verification has no effect for this DFLASH "
+                "draft: it proposes greedy tokens, and block verification only "
+                "differs from token-wise verification for sampled proposals."
+            )
+        if get_spec().speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
             self.block_size = int(draft_config.resolve_block_size(default=16))
         else:
-            self.block_size = int(server_args.speculative_num_draft_tokens)
+            self.block_size = int(get_spec().speculative_num_draft_tokens)
             model_block_size = draft_config.block_size
             if model_block_size is None:
                 model_block_size = getattr(self.draft_model, "block_size", None)
@@ -223,7 +668,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self.block_size,
                     model_block_size,
                 )
+        self.draft_model.set_block_size(self.block_size)
         self.speculative_num_draft_tokens = int(self.block_size)
+        if self._is_domino and self.block_size <= 1:
+            raise ValueError(
+                "DFLASH Domino requires speculative_num_draft_tokens > 1, "
+                f"got {self.block_size}."
+            )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -231,7 +682,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
-        if self.ps.tp_rank == 0:
+        target_model = self._target_worker.model_runner.model
+        self._noise_embed_scale = (
+            float(target_model.get_dflash_noise_embedding_scale())
+            if hasattr(target_model, "get_dflash_noise_embedding_scale")
+            else 1.0
+        )
+        self._maybe_merge_trained_mask_embedding()
+        self._cache_full_embed_weight()
+        if get_parallel().tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
                 bundle.resolved_attention_backend,
@@ -240,11 +699,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self.draft_window_size,
                 self.use_compact_draft_cache,
             )
+            if self._is_domino:
+                logger.info(
+                    "DFLASH Domino rollout enabled (BF16, TP=%s, block-shared candidate pool size=%s).",
+                    int(get_parallel().tp_group.world_size),
+                    self.domino_candidate_pool_size,
+                )
             logger.info(
-                "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
+                "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s, noise_embed_scale=%s",
                 self._mask_token,
                 self._mask_token_id,
                 self._mask_token_id_override,
+                self._noise_embed_scale,
             )
 
         self._block_pos_offsets = build_block_pos_offsets(
@@ -261,6 +727,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             None  # [cap_bs, block_size]
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
+        self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
@@ -275,12 +742,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda() or is_hip()
+        self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
-        supports_gpu_triton = is_cuda() or is_hip()
+        supports_gpu_triton = is_cuda() or is_hip() or is_xpu()
         self._use_triton_prepare_block = supports_gpu_triton
         self._use_triton_accept_bonus = supports_gpu_triton
         # The legacy compact-rebuild path host-syncs twice per step (masked
@@ -294,18 +761,175 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+        self._sharded_greedy_logits = (
+            is_hip() and envs.SGLANG_ROCM_MUSE_SHARDED_GREEDY_LOGITS.get()
+        )
+        self._target_logits_processor = self._defer_target_verify_gather()
+        self._aux_graphs = {}
+        self._mamba_commit_buffers = None
+        self._use_commit_metadata = (
+            is_cuda() and envs.SGLANG_OPT_DFLASH_COMMIT_METADATA.get()
+        )
+        self._use_aux_graph = (
+            is_cuda()
+            and get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            and self.lilicorr is None
+            and envs.SGLANG_OPT_DFLASH_AUX_GRAPH.get()
+        )
+        self._batched_small_copy = envs.SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY.get()
+        # A megakernel's decode round (kimi_k31_dflash_binding.py), or None for the stock
+        # one; built before the KV pools are sized, so its allocations come out of the KV
+        # budget.
+        self._runtime = bind_dflash_runtime(self, target_model)
+        # Side stream only where KV frees wait on it (overlap scheduler, no unified
+        # memory or HiCache), and beside a bound runtime only if it joins the aux.
+        self._aux_overlap = (
+            self._use_aux_graph
+            and (self._runtime is None or "join_aux" in self._runtime.bindings)
+            and envs.SGLANG_OPT_DFLASH_AUX_OVERLAP.get()
+            and not get_schedule().disable_overlap_schedule
+            and not get_memory().enable_unified_memory
+            and not get_memory().enable_hierarchical_cache
+        )
+        self._aux_stream: Optional[torch.cuda.Stream] = None
+        self._aux_done: Optional[torch.cuda.Event] = None
+        if self._aux_overlap:
+            logger.info("DFLASH aux graph runs on a side stream beside the draft prep")
+        self._init_verify_planner()
 
-    @property
-    def draft_worker(self):
-        # DFLASH drives the draft model through a plain TpModelWorker: the
-        # draft KV is materialized from target hidden states, so there is no
-        # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
-        return self._draft_worker
+    def _init_verify_planner(self) -> None:
+        """Confidence-scheduled verify (SGLANG_RAGGED_VERIFY_MODE cap-accept or
+        compact) on DSpark's verify planner and target-verify executor. DFLASH
+        drafts have no confidence head: an online acceptance estimator scores
+        each draft token from the selector row it was drawn from."""
+        gamma = int(self.block_size) - 1
+        mode = read_ragged_verify_mode()
+        self._verify_planner: Optional[DSparkVerifyPlanner] = None
+        self._verify_executor: Optional[TargetVerifyExecutor] = None
+        self._acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None
+        # This step's acceptance feature and confidence of the drafts.
+        self._draft_feature: Optional[torch.Tensor] = None
+        self._draft_confidence: Optional[torch.Tensor] = None
+        # Per-step records for sglang.benchmark.dspark_sps_profiler; off unless
+        # SGLANG_DSPARK_ENABLE_SPS_RECORD or SGLANG_DSPARK_DEBUG_DUMP is set.
+        self._info_dumper = DsparkInfoDumper(
+            components=resolve_enabled_components(),
+            gamma=gamma,
+            verify_num_draft_tokens=int(self.block_size),
+            attn_tp_rank=get_parallel().attn_tp_rank,
+            device=self.device,
+            mode_value=mode.value,
+            sps_report_interval=envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL.get(),
+        )
+        if mode is RaggedVerifyMode.STATIC:
+            return
+        if (
+            self.selector is None
+            or self._is_domino
+            or not self._selector_sampling_enabled
+        ):
+            raise ValueError(
+                f"SGLANG_RAGGED_VERIFY_MODE={mode.value!r} with DFLASH needs a "
+                "selector draft (DFlash2) on a backend with selector sampling: "
+                "its verify budget is planned from the selector's candidate scores."
+            )
+        if get_parallel().attn_dp_enabled:
+            raise ValueError(
+                f"SGLANG_RAGGED_VERIFY_MODE={mode.value!r} with DFLASH does not "
+                "support attention DP yet; use SGLANG_RAGGED_VERIFY_MODE=static."
+            )
+        self._verify_planner = DSparkVerifyPlanner(
+            draft_model=self.draft_model,
+            gamma=gamma,
+            model_runner=self.model_runner,
+            device=self.device,
+            tp_rank=get_parallel().tp_rank,
+            verify_num_draft_tokens=int(self.block_size),
+            tp_sync=self._tp_sync,
+            online_confidence=True,
+        )
+        if (
+            SIMULATE_ACC_LEN > 0
+            and SIMULATE_ACC_LEN != 1.0
+            and not self._verify_planner.is_verify_all
+        ):
+            raise ValueError(
+                "SGLANG_SIMULATE_ACC_LEN other than 1.0 can force an acceptance "
+                f"past a planned verify length; got {SIMULATE_ACC_LEN} with "
+                f"SGLANG_RAGGED_VERIFY_MODE={mode.value!r}."
+            )
+        self._verify_executor = TargetVerifyExecutor(
+            target_worker=self._target_worker,
+            gamma=gamma,
+            verify_num_draft_tokens=int(self.block_size),
+            model_runner=self.model_runner,
+            tp_sync=self._tp_sync,
+        )
+        self._acceptance_estimator = OnlineAcceptanceEstimator(
+            num_positions=gamma,
+            device=self.device,
+            log_rank=get_parallel().tp_rank == 0,
+        )
+
+    def get_confidence_budget_prepare(self):
+        if self._verify_planner is None:
+            return None
+        return self._verify_planner.confidence_budget_prepare()
+
+    def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
+        if self._verify_planner is not None:
+            self._verify_planner.set_forced_budget_frac(frac)
+
+    def dump_info_records(self) -> Optional[dict]:
+        dumped = self._info_dumper.dump()
+        if dumped is not None:
+            dumped["simulate_acc_len"] = (
+                SIMULATE_ACC_LEN if SIMULATE_ACC_LEN > 0 else None
+            )
+        return dumped
+
+    def clear_info_records(self) -> None:
+        self._info_dumper.clear()
+
+    def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
+        processors = [
+            module
+            for module in self.target_worker.model_runner.model.modules()
+            if isinstance(module, LogitsProcessor)
+        ]
+        if len(processors) != 1:
+            return None
+        processors[0].defer_verify_gather = True
+        return processors[0]
+
+    def _can_skip_verify_logits(self, batch: ScheduleBatch, sampling_info) -> bool:
+        """The accept reads only the target argmax: the vocab shards stay ungathered."""
+        if batch.return_logprob:
+            return False
+        if sampling_info is None:
+            return not batch.has_grammar and self._selector_sample is None
+        if (
+            adjusts_logits(sampling_info, has_grammar=batch.has_grammar)
+            # A sampling mask is captured from the full target distribution.
+            or sampling_info.sampling_mask_batch_indices is not None
+        ):
+            return False
+        if sampling_info.is_all_greedy:
+            return self._selector_sample is None
+        if not self._sharded_greedy_logits:
+            return False
+        # A sampling batch whose accept is the argmax anyway: a simulated acceptance
+        # overrides it, and without a sampling verify kernel it falls back to greedy.
+        return SIMULATE_ACC_LEN > 0 or (
+            self._selector_sample is None and not is_dflash_sampling_verify_available()
+        )
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        if not self._hosts_draft:
+            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -317,55 +941,301 @@ class DFlashWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if not self._hosts_draft:
+            return
         # Without draft windowing, the draft worker aliases the target
         # request->token mapping and allocation state. With draft windowing
         # enabled, the draft worker keeps a private compact req->token table
         # over the same global KV index space, so radix-cache/prefix-hit KV
         # remains reusable while draft attention sees only the recent window.
-        self._draft_worker.alloc_memory_pool(
-            memory_pool_config=memory_pool_config,
-            req_to_token_pool=(
-                None if self.use_compact_draft_cache else req_to_token_pool
+        with draft_tp_context(self.draft_parallel_layout):
+            self._draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=(
+                    None if self.use_compact_draft_cache else req_to_token_pool
+                ),
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+        if get_spec().speculative_dflash_draft_kv_ring:
+            self._init_draft_kv_ring()
+
+    def _init_draft_kv_ring(self) -> None:
+        parallel = get_parallel()
+        dcp_size = parallel.attn_dcp_size
+        pool = self.draft_model_runner.token_to_kv_pool
+        draft_hf_config = self.draft_model_runner.model_config.hf_config
+        req_to_token_rows = self.model_runner.req_to_token_pool.req_to_token.shape[0]
+        self.draft_kv_ring = DFlashDraftKVRing(
+            rows_per_req=draft_kv_ring_rows_per_req_from_config(draft_hf_config),
+            dcp_size=dcp_size,
+            req_to_token_rows=req_to_token_rows,
+            device=self.device,
+            window_left=get_dflash_attention_sliding_window_size(draft_hf_config),
+            dcp_rank=parallel.attn_dcp_rank,
+            pool=pool,
+            page_size=(
+                pool.page_size if draft_kv_ring_is_paged(draft_hf_config) else None
             ),
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        self.draft_kv_ring.warm_block_locs(req_to_token_rows, self.block_size)
+        if parallel.tp_rank == 0:
+            logger.info(
+                "DFLASH draft KV ring: %d rows per request per rank (%d positions), "
+                "%d req_to_token rows, draft pool %d rows.",
+                self.draft_kv_ring.rows_per_req,
+                self.draft_kv_ring.span,
+                req_to_token_rows,
+                pool.size,
+            )
+
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        # A ring holds no prefix: a cached prefix brings no draft KV back.
+        if self.draft_kv_ring is not None:
+            return HiCacheDraftPlan()
+        return super()._build_hicache_draft_plan()
 
     def init_attention_backends(self):
-        self._draft_worker.init_attention_backends()
+        if not self._hosts_draft:
+            return
+        with (
+            draft_pp_context(),
+            draft_tp_context(self.draft_parallel_layout),
+        ):
+            self._draft_worker.init_attention_backends()
+        if self.draft_kv_ring is not None:
+            self.draft_model_runner.attn_backend.set_draft_kv_ring(self.draft_kv_ring)
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
             self.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
         )
+        target_attn_backend = self.model_runner.attn_backend
+        if (
+            read_ragged_verify_mode() is RaggedVerifyMode.COMPACT
+            and not target_attn_backend.supports_ragged_verify_graph
+        ):
+            raise ValueError(
+                "SGLANG_RAGGED_VERIFY_MODE=compact verifies packed per-request "
+                "token runs, which the target attention backend "
+                f"{type(target_attn_backend).__name__} does not support; use "
+                "SGLANG_RAGGED_VERIFY_MODE=cap-accept or static."
+            )
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = (
-            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
-        )
-        if is_cuda() and capture_decode_cuda_graph:
-            available_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            if available_mem < 1.0:
+        if not self._hosts_draft:
+            return
+        # Read outside the narrowed draft scope, which hides the target's DP flag.
+        target_dp_enabled = get_parallel().attn_dp_enabled
+        with (
+            draft_pp_context(),
+            draft_tp_context(self.draft_parallel_layout),
+        ):
+            capture_decode_cuda_graph = (
+                get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            )
+            if (
+                capture_decode_cuda_graph
+                and current_platform.is_out_of_tree()
+                and not current_platform.capabilities.graph_capture
+            ):
                 capture_decode_cuda_graph = False
                 logger.warning(
-                    "Disable DFLASH draft cuda graph because only %.2f GB GPU "
-                    "memory is available after target backend initialization.",
-                    available_mem,
+                    "Disable DFLASH draft cuda graph because %s does not support "
+                    "device graph capture.",
+                    type(current_platform).__name__,
                 )
-        if capture_decode_cuda_graph:
-            # Must run before capture so the draft graph folds the head in.
-            self._draft_sampler = self._maybe_build_draft_sampler()
-            if self._draft_sampler is not None:
-                self.draft_model_runner.capture_tail_hooks.append(
-                    make_draft_sampler_capture_hook(self._draft_sampler)
+            if _is_npu and target_dp_enabled and capture_decode_cuda_graph:
+                # Idle DP ranks skip the draft step and cannot join a shared replay;
+                # CUDA avoids this by keying the draft's graphs on the local batch size.
+                capture_decode_cuda_graph = False
+                if self._target_tp_rank == 0:
+                    logger.warning(
+                        "Disable DFLASH draft cuda graph because dp attention "
+                        "is enabled (draft runs eager)."
+                    )
+            if (is_cuda() or is_gfx95_supported()) and capture_decode_cuda_graph:
+                available_mem = self._tp_sync.available_memory_gb(
+                    SpecTpSyncSite.DFLASH_MEM,
+                    self.device,
+                    self.gpu_id,
+                    group=get_parallel().tp_group,
                 )
-        self._draft_worker.init_cuda_graphs(
-            capture_decode_cuda_graph=capture_decode_cuda_graph
+                if available_mem < 1.0:
+                    capture_decode_cuda_graph = False
+                    logger.warning(
+                        "Disable DFLASH draft cuda graph because only %.2f GB GPU "
+                        "memory is available after target backend initialization.",
+                        available_mem,
+                    )
+            if capture_decode_cuda_graph:
+                # Must run before capture so the draft graph folds it in.
+                self._draft_sampler = self._maybe_build_draft_sampler()
+                if self._draft_sampler is not None:
+                    self.draft_model_runner.capture_tail_hooks.append(
+                        make_draft_sampler_capture_hook(self._draft_sampler)
+                    )
+                if is_cuda() and envs.SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH.get():
+                    self._install_draft_l2_prefetch()
+            self._draft_worker.init_cuda_graphs(
+                capture_decode_cuda_graph=capture_decode_cuda_graph
+            )
+            if target_dp_enabled and not _is_npu and self.selector is not None:
+                self._warm_eager_selector()
+
+    def _warm_eager_selector(self) -> None:
+        # Build selector kernels before serving rather than under the watchdog.
+        hidden = torch.zeros(
+            (int(self.block_size), int(self.draft_model.config.hidden_size)),
+            dtype=self.draft_model_runner.dtype,
+            device=self.device,
         )
+        self._propose_selector_block(
+            draft_logits_output=LogitsProcessorOutput(
+                next_token_logits=None, hidden_states=hidden
+            ),
+            bs=1,
+            lm_head=unwrap_lora_layer(self._target_worker.model_runner.model.lm_head),
+            anchor_token_ids=torch.zeros((1,), dtype=torch.int64, device=self.device),
+            sampling_info=None,
+        )
+
+    def _install_draft_l2_prefetch(self) -> None:
+        prefetch = DraftL2Prefetch(draft_l2_prefetch_tensors(self.draft_model))
+        self.draft_model_runner.capture_head_hooks.append(prefetch.capture_head_hook)
+        # Appended after the sampler's tail hook: the prefetch joins at the graph's end.
+        self.draft_model_runner.capture_tail_hooks.append(prefetch.capture_tail_hook)
+
+    def _prewarm_batch_size(self, block_size: int) -> int:
+        """Largest batch the non-greedy verify path can see in one step."""
+        bs = self.model_runner.max_decode_logits_rows() // block_size
+        max_running_requests = self.model_runner.max_running_requests
+        if max_running_requests is not None:
+            bs = min(bs, int(max_running_requests))
+        return max(1, bs)
+
+    def _measure_sampling_peak(
+        self,
+        *,
+        candidates: torch.Tensor,
+        target_logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+    ) -> int:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        compute_dflash_sampling_correct_drafts_and_bonus(
+            candidates=candidates,
+            next_token_logits=target_logits,
+            sampling_info=sampling_info,
+            max_top_k=None,
+            uniform_top_k_value=None,
+        )
+        torch.cuda.synchronize()
+        return torch.cuda.memory_stats()["allocated_bytes.all.peak"] - base_bytes
+
+    def prewarm_sampling(self) -> SamplingPrewarmResult:
+        """Rehearse the non-greedy verify path so an undersized graph-pool
+        borrow surfaces at startup rather than under traffic."""
+        # gfx950 prewarms the sampler without graph-pool borrowing; KV is sized before capture.
+        if (
+            not self._hosts_draft
+            or not (is_cuda() or is_gfx95_supported())
+            or not is_dflash_sampling_verify_available()
+        ):
+            return self.model_runner.prewarm_sampling()
+
+        block_size = int(self.block_size)
+        vocab_size = self.model_config.vocab_size
+        bs = self._prewarm_batch_size(block_size)
+        device = self.device
+
+        sampling_info = SamplingBatchInfo(
+            temperatures=torch.ones((bs, 1), dtype=torch.float32, device=device),
+            top_ps=torch.full((bs,), 0.95, dtype=torch.float32, device=device),
+            top_ks=torch.zeros(bs, dtype=torch.int32, device=device),
+            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
+            is_all_greedy=False,
+            is_any_greedy=False,
+            need_top_p_sampling=True,
+            # Top-k off: the sparse path is cheaper, so the dense full-vocab
+            # renormalization is the peak this rehearsal has to reproduce.
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=vocab_size,
+        )
+        candidates = torch.zeros((bs, block_size), dtype=torch.int64, device=device)
+        target_logits = torch.zeros(
+            (bs * block_size, vocab_size), dtype=torch.float32, device=device
+        )
+
+        # Size the process-lifetime chain buffers before anything borrows. The
+        # cache is keyed on device index, so pass the resolved device, not "cuda".
+        _get_or_create_chain_verify_buffers(
+            bs=bs, draft_token_num=block_size, device=target_logits.device
+        )
+        # One unborrowed pass, so any workspace a kernel caches for the process
+        # lifetime lands outside graph storage and off the measured peak.
+        with envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False):
+            self._measure_sampling_peak(
+                candidates=candidates,
+                target_logits=target_logits,
+                sampling_info=sampling_info,
+            )
+
+        borrowing = graph_pool_borrow_enabled()
+        try:
+            peak_bytes = self._measure_sampling_peak(
+                candidates=candidates,
+                target_logits=target_logits,
+                sampling_info=sampling_info,
+            )
+        except torch.OutOfMemoryError:
+            if not borrowing:
+                raise
+            reason = (
+                "DFLASH sampling rehearsal exhausted graph-pool memory for the "
+                f"{bs}x{block_size}x{vocab_size} verify probability matrices"
+            )
+            logger.warning(
+                "Graph pool %s; disabling borrowing and reserving the measured "
+                "headroom in the post-capture KV sizing instead",
+                reason,
+            )
+            disable_graph_pool_borrow(reason)
+            peak_bytes = self._measure_sampling_peak(
+                candidates=candidates,
+                target_logits=target_logits,
+                sampling_info=sampling_info,
+            )
+
+        sampling_input_bytes = target_logits.numel() * target_logits.element_size()
+        result = SamplingPrewarmResult(
+            sampling_input_bytes=sampling_input_bytes,
+            sampling_headroom_bytes=peak_bytes + sampling_input_bytes,
+        )
+        self.model_runner.sampling_prewarm_result = result
+        logger.info(
+            "DFLASH sampling pre-warm: borrowing=%s bs=%d peak=%d B headroom=%d B",
+            graph_pool_borrow_enabled(),
+            bs,
+            peak_bytes,
+            result.sampling_headroom_bytes,
+        )
+        return result
+
+    def _stage_draft_sampler(self, *, bs: int, sampling_info) -> None:
+        # A batch past the sampler's static buffers has no captured bucket,
+        # so its draft runs eager and the eager head reads none of them.
+        sampler = self._draft_sampler
+        if sampler is None:
+            return
+        if sampler.max_bs is None or bs <= sampler.max_bs:
+            sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
 
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
-            if self.ps.tp_rank == 0:
+            if self._target_tp_rank == 0:
                 logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
             return None
 
@@ -374,13 +1244,90 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.block_size <= 1:
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
-        lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
+        lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+        if lm_head is None:
             return _eager("no target lm_head")
-        if not torch.is_floating_point(lm_head.weight):
+
+        # A gate-admitted quantized head is capture-safe: the target's own
+        # logits path already runs the same kernel under CUDA graphs.
+        head_supported = is_dense_head_weight(
+            getattr(lm_head, "weight", None)
+        ) or should_apply_lm_head_quant_method(
+            lm_head, getattr(lm_head, "quant_method", None)
+        )
+
+        if self.selector is not None:
+            # compute_candidates needs the target lm_head attached before capture.
+            if not head_supported:
+                return _eager("unsupported quantized lm_head")
+            self.draft_model.lm_head = lm_head
+            if self._runtime is not None:
+                sampler = self._runtime.draft_sampler(lm_head)
+                if sampler is not None:
+                    return sampler
+            if self._target_tp_rank == 0:
+                logger.info(
+                    "DFLASH selector decode folded into the draft cuda graph "
+                    "(sampling_enabled=%s).",
+                    self._selector_sampling_enabled,
+                )
+            return _SelectorDraftSampler(
+                draft_model=self.draft_model,
+                block_size=self.block_size,
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                device=self.device,
+                sampling_enabled=self._selector_sampling_enabled,
+                acceptance_estimator=self._acceptance_estimator,
+            )
+        if self.lilicorr is not None:
+            if not head_supported:
+                return _eager("unsupported quantized lm_head")
+            return build_lilicorr_draft_sampler(
+                sampling_enabled=self._lilicorr_sampling_enabled,
+                head=self.lilicorr,
+                draft_model=self.draft_model,
+                embed_tokens=target_input_embeddings(target_model),
+                lm_head=lm_head,
+                block_size=self.block_size,
+            )
+        if not hasattr(lm_head, "weight"):
+            return _eager("quantized lm_head has no dense weight")
+        if not is_dense_head_weight(lm_head.weight):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
+        if self._is_domino:
+            prefix_gru = self.draft_model.prefix_gru
+            embed_proj = self.draft_model.embed_proj
+            if prefix_gru is None or embed_proj is None:
+                return _eager("Domino projector modules are unavailable")
+            if self._target_tp_rank == 0:
+                logger.info(
+                    "DFLASH Domino rollout folded into the draft cuda graph (tp=%s).",
+                    int(tp_group.world_size),
+                )
+            shard = getattr(lm_head, "shard_indices", None)
+            return _DominoDraftSampler(
+                target_embedding=target_model.get_input_embeddings(),
+                lm_head_weight=lm_head.weight,
+                prefix_gru=prefix_gru,
+                embed_proj=embed_proj,
+                vocab_size=int(self.model_runner.model_config.vocab_size),
+                block_size=self.block_size,
+                shift_label=self.draft_model.shift_label,
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                candidate_pool_size=self.domino_candidate_pool_size,
+                tp_group=tp_group,
+                lm_head_org_vocab_start=(
+                    int(shard.org_vocab_start_index) if shard is not None else 0
+                ),
+                lm_head_num_org=(
+                    int(shard.num_org_elements) if shard is not None else None
+                ),
+                lm_head_num_org_padded=(
+                    int(shard.num_org_elements_padded) if shard is not None else None
+                ),
+            )
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
                 # No shard metadata to recover per-rank vocab offsets from.
@@ -393,7 +1340,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
-        if self.ps.tp_rank == 0:
+        if self._target_tp_rank == 0:
             logger.info(
                 "DFLASH draft greedy head folded into the draft cuda graph (tp=%d).",
                 tp_group.world_size,
@@ -419,7 +1366,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 fused_disable_reason = "draft model does not support fused context KV"
 
             if fused_disable_reason is not None:
-                if self.ps.tp_rank == 0:
+                if get_parallel().tp_rank == 0:
                     logger.info(
                         "DFLASH fused KV materialization disabled: %s",
                         fused_disable_reason,
@@ -462,7 +1409,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     break
 
             if fused_disable_reason is not None:
-                if self.ps.tp_rank == 0:
+                if get_parallel().tp_rank == 0:
                     logger.info(
                         "DFLASH fused KV materialization disabled: %s",
                         fused_disable_reason,
@@ -484,7 +1431,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_position_hint=self.target_worker.model_runner.model_config.context_len
                 + int(self.block_size),
             )
-            if self.ps.tp_rank == 0:
+            if get_parallel().tp_rank == 0:
                 logger.info(
                     "DFLASH fused KV materialization enabled. "
                     "n_layers=%d, num_kv_heads=%d, head_dim=%d",
@@ -538,13 +1485,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         if name == "_target_worker":
             raise AttributeError(name)
         return getattr(self.target_worker, name)
-
-    def clear_cache_pool(self):
-        # The target worker owns the shared KV allocator/cache. For the compact
-        # sliding-window path, the draft req->token view is rebuilt from committed
-        # target state before each draft forward, so there is nothing persistent
-        # to flush here.
-        pass
 
     def _gather_req_to_token_masked(
         self,
@@ -616,13 +1556,31 @@ class DFlashWorkerV2(BaseSpecWorker):
             context="DFLASH req_to_token segment gather",
         )
 
+    @staticmethod
+    def _compact_draft_alignment_for_backend(
+        page_size: int, backend: str, architectures: Optional[List[str]] = None
+    ) -> int:
+        # Muse Spark on ROCm: Triton reads individual token slots, so the compact
+        # suffix need not start at a physical page boundary. Keep the 16-token
+        # logical origin that defines the existing draft softmax and reduction
+        # partitions. Other models and backends keep the page alignment.
+        if (
+            torch.version.hip is not None
+            and architectures
+            and is_muse_spark_architecture(architectures[0])
+            and backend == "triton"
+            and page_size in (32, 64, 128)
+        ):
+            return 16
+        return page_size
+
     def _compute_compact_draft_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
         assert self.draft_window_size is not None
         visible_lens = torch.clamp(
             seq_lens.to(dtype=torch.int32, device=self.device),
             max=int(self.draft_window_size),
         )
-        if self.page_size <= 1:
+        if self._draft_compact_page_size <= 1:
             return visible_lens
 
         # Paged FA backends derive the page table from local token positions, so the
@@ -631,7 +1589,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_i64 = seq_lens.to(torch.int64)
         visible_lens_i64 = visible_lens.to(torch.int64)
         visible_start = seq_lens_i64 - visible_lens_i64
-        aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
+        aligned_start = visible_start - torch.remainder(
+            visible_start, self._draft_compact_page_size
+        )
         return (seq_lens_i64 - aligned_start).to(torch.int32)
 
     def _compute_compact_draft_seq_lens_host(
@@ -647,7 +1607,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         assert self.draft_window_size is not None
         bound = int(self.draft_window_size) + (
-            self.page_size if self.page_size > 1 else 0
+            self._draft_compact_page_size if self._draft_compact_page_size > 1 else 0
         )
         lens = host_seq_lens.to(dtype=torch.int64, device="cpu")
         out.copy_(torch.clamp(lens, max=bound).to(torch.int32))
@@ -656,8 +1616,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         *,
         batch_seq_lens_cpu: Optional[torch.Tensor],
-        reserved_seq_lens_cpu: Optional[torch.Tensor],
-        draft_prefix_lens: torch.Tensor,
+        nxt_kv_lens_cpu: Optional[torch.Tensor],
         out: torch.Tensor,
     ) -> None:
         """Fill the seq_lens_cpu planning bound, sync-free when a host-side
@@ -665,11 +1624,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         (same contract as the non-compact path in forward_batch_generation)."""
         if batch_seq_lens_cpu is not None:
             self._compute_compact_draft_seq_lens_host(batch_seq_lens_cpu, out=out)
-        elif reserved_seq_lens_cpu is not None:
-            self._compute_compact_draft_seq_lens_host(reserved_seq_lens_cpu, out=out)
+        elif nxt_kv_lens_cpu is not None:
+            self._compute_compact_draft_seq_lens_host(nxt_kv_lens_cpu, out=out)
         else:
-            # Last resort: the legacy blocking D2H copy.
-            out.copy_(draft_prefix_lens)
+            # Compact device lengths never exceed the window plus one page.
+            out.fill_(
+                int(self.draft_window_size)
+                + (
+                    self._draft_compact_page_size
+                    if self._draft_compact_page_size > 1
+                    else 0
+                )
+            )
 
     def _rebuild_compact_draft_cache(
         self,
@@ -684,6 +1650,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         """Write the draft-local compact req->token rows: the committed suffix
         window at [0, draft_prefix_len) plus the verify block slots after it."""
         suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
+        full_to_swa = self._draft_kv_full_to_swa_mapping()
         if self._use_triton_compact_rebuild:
             rebuild_compact_draft_req_to_token_func(
                 draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
@@ -694,6 +1661,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 batch_size=bs,
                 block_size=block_size,
+                full_to_swa=full_to_swa,
             )
         else:
             suffix_cache_loc = self._gather_req_to_token_segments(
@@ -702,6 +1670,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 start=suffix_start,
                 lengths=draft_prefix_lens,
             )
+            if full_to_swa is not None:
+                suffix_cache_loc = full_to_swa[suffix_cache_loc]
+                verify_out_cache_loc_2d = full_to_swa[verify_out_cache_loc_2d]
             assign_req_to_token_pool_func(
                 req_pool_indices,
                 self.draft_model_runner.req_to_token_pool.req_to_token,
@@ -722,6 +1693,90 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d.reshape(-1),
                 bs,
             )
+
+    def _draft_kv_full_to_swa_mapping(self) -> Optional[torch.Tensor]:
+        """The target's full->SWA id table when the draft pool's rows are the
+        target's sliding-window ids (SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV), else
+        None. Its compact rows must name those ids, like its writes do."""
+        if not self.draft_model_runner.token_to_kv_pool.follows_target_swa_ids:
+            return None
+        assert self.use_compact_draft_cache, (
+            "a draft pool on the target's SWA ids needs the compact window"
+        )
+        return self.model_runner.token_to_kv_pool_allocator.full_to_swa_index_mapping
+
+    def _maybe_merge_trained_mask_embedding(self) -> None:
+        """Merge a trained mask embedding (mask_embedding.pt) into the target table.
+
+        The target's own mask-token row is typically an untrained added-vocab
+        slot; overwrite it with the learned vector. VocabParallelEmbedding-aware:
+        each rank only updates the row if the token falls within its shard.
+        """
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+
+        draft_model_path = resolving_view(self.server_args).speculative_draft_model_path
+        if draft_model_path is None:
+            return
+
+        mask_emb_path = os.path.join(draft_model_path, "mask_embedding.pt")
+        if not os.path.exists(mask_emb_path):
+            return
+
+        saved = torch.load(mask_emb_path, map_location=self.device, weights_only=True)
+        embedding_tensor = saved["embedding"]
+        saved_token_id = int(saved["mask_token_id"])
+
+        if saved_token_id != self._mask_token_id:
+            raise ValueError(
+                f"DFLASH mask_embedding.pt was trained with mask_token_id={saved_token_id}, "
+                f"but the current resolved mask_token_id={self._mask_token_id}. "
+                "These must match."
+            )
+
+        target_model = self._target_worker.model_runner.model
+        embed_module = target_model.get_input_embeddings()
+
+        if saved.get("per_position"):
+            raise NotImplementedError(
+                "DFLASH per-position mask embeddings are not supported in "
+                "inference yet (mask_embedding.pt per_position=True)."
+            )
+
+        token_id = self._mask_token_id
+        shard_indices = getattr(embed_module, "shard_indices", None)
+        with torch.no_grad():
+            if shard_indices is not None:
+                # VocabParallelEmbedding: only update if this token is in our shard.
+                start = shard_indices.org_vocab_start_index
+                end = shard_indices.org_vocab_end_index
+                if start <= token_id < end:
+                    local_idx = token_id - start
+                    embed_module.weight[local_idx].copy_(
+                        embedding_tensor.to(embed_module.weight.dtype)
+                    )
+            else:
+                embed_module.weight[token_id].copy_(
+                    embedding_tensor.to(embed_module.weight.dtype)
+                )
+
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "Merged trained mask embedding into target model "
+                "(mask_token_id=%s, source=%s)",
+                self._mask_token_id,
+                mask_emb_path,
+            )
+
+    def _cache_full_embed_weight(self) -> None:
+        if not get_parallel().attn_dp_enabled:
+            return
+        embedding = unwrap_lora_layer(
+            _resolve_dflash_embedding_module(
+                self.draft_model, self._target_worker.model_runner.model
+            )
+        )
+        # Reconstruct on the table's own group before DP ranks can go idle.
+        self._full_embed_gpu = gather_draft_embedding(embedding)
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -780,7 +1835,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if resolved_id is None:
                 resolved_id = tokenizer.convert_tokens_to_ids(mask_token)
 
-            if added and self.ps.tp_rank == 0:
+            if added and get_parallel().tp_rank == 0:
                 logger.info(
                     "Added DFLASH mask token to tokenizer. token=%s, mask_token_id=%s, tokenizer_len=%s, model_vocab_size=%s",
                     mask_token,
@@ -805,6 +1860,141 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return int(resolved_id)
 
+    def _propose_selector_block(
+        self,
+        *,
+        draft_logits_output,
+        bs: int,
+        lm_head,
+        anchor_token_ids: torch.Tensor,
+        sampling_info,
+    ) -> torch.Tensor:
+        """The eager fallback for batches the draft graph cannot take."""
+        draft_model = self.draft_model
+        if draft_model.lm_head is None:
+            draft_model.lm_head = lm_head
+
+        draft_hidden = draft_logits_output.hidden_states
+        if draft_hidden is None:
+            raise RuntimeError("DFLASH selector draft returned no hidden states.")
+        draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+        num_pred = int(self.block_size) - 1
+
+        candidate_ids, scores = _selector_lattice(
+            draft_model, draft_hidden, anchor_token_ids
+        )
+        device = draft_hidden.device
+        # Clamped like DSpark so greedy rows don't divide by zero.
+        temperatures = (
+            torch.ones(bs, dtype=torch.float32, device=device)
+            if sampling_info is None or not self._selector_sampling_enabled
+            else sampling_info.temperatures.view(-1).float().clamp_min(1e-5)
+        )
+        greedy_mask = (
+            torch.ones(bs, dtype=torch.bool, device=device)
+            if not self._selector_sampling_enabled
+            else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
+        )
+        tokens, q_rows = self.selector.sample_path(
+            candidate_ids=candidate_ids,
+            scores=scores,
+            uniforms=torch.rand(bs, num_pred, dtype=torch.float32, device=device),
+            temperatures=temperatures,
+            greedy_mask=greedy_mask,
+        )
+        if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
+            self._selector_sample = (candidate_ids, q_rows)
+        if self._acceptance_estimator is not None:
+            self._draft_feature, self._draft_confidence = _walked_confidence(
+                self._acceptance_estimator,
+                candidate_ids=candidate_ids,
+                scores=scores,
+                tokens=tokens,
+                temperatures=temperatures,
+                greedy_mask=greedy_mask,
+            )
+        return tokens.view(bs, num_pred)
+
+    def _selector_sampling_accept(
+        self,
+        *,
+        candidates: torch.Tensor,
+        next_token_logits: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        q_rows: torch.Tensor,
+        sampling_info,
+        draft_input,
+        cutoff_verify_lens: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
+        bs, block = candidates.shape
+        gamma = block - 1
+        vocab = int(next_token_logits.shape[-1])
+        # A fresh dense q would zero the whole vocabulary to carry top_k per row.
+        buffer = self._draft_probs_buf
+        if buffer is None or buffer.shape[0] < bs or buffer.shape[1:] != (gamma, vocab):
+            cap = bs if buffer is None else max(bs, buffer.shape[0] * 2)
+            buffer = torch.zeros(
+                (cap, gamma, vocab), dtype=torch.float32, device=candidates.device
+            )
+            self._draft_probs_buf = buffer
+        draft_probs = buffer[:bs]
+        try:
+            draft_probs.scatter_(-1, candidate_ids, q_rows.float())
+            accept_len, bonus, cap_trim_lens = accept_sampling(
+                candidates=candidates,
+                target_logits=next_token_logits,
+                draft_probs=draft_probs,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                gamma=gamma,
+                verify_num_draft_tokens=block,
+                cutoff_verify_lens=cutoff_verify_lens,
+                block_verification=self._block_verification,
+            )
+        finally:
+            # Here, not before the next write: candidate_ids may be a view of a
+            # buffer the next draft step overwrites. In finally because the next
+            # call scatters different ids and reads q across the whole vocabulary.
+            draft_probs.scatter_(-1, candidate_ids, 0.0)
+        return accept_len.to(torch.int32), bonus.to(torch.int64), cap_trim_lens
+
+    def _greedy_sample_from_quantized_head(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        """Greedy argmax over a target LM head that has no dense ``weight``.
+
+        A GGUF head stores packed ``qweight`` plus a type tag, so the dense path's
+        ``weight[:num_org]`` slicing has nothing to slice. Logits come from the
+        layer's own kernel instead -- the same call ``LogitsProcessor._get_logits``
+        makes for GGUF models. Padding rows are excluded so argmax cannot return
+        an id outside the real vocabulary.
+        """
+        tp_size = int(get_parallel().tp_group.world_size)
+        if tp_size != 1:
+            raise RuntimeError(
+                "DFLASH with a quantized target lm_head is only supported at "
+                f"tp=1, got tp_size={tp_size}."
+            )
+
+        num_tokens = int(hidden_states.shape[0])
+        out_tokens = torch.empty(
+            (num_tokens,), dtype=torch.long, device=hidden_states.device
+        )
+        num_org = int(getattr(lm_head, "org_vocab_size", 0)) or None
+
+        for start in range(0, num_tokens, int(chunk_size)):
+            end = min(num_tokens, start + int(chunk_size))
+            logits = lm_head.quant_method.apply(lm_head, hidden_states[start:end], None)
+            if num_org is not None and logits.shape[-1] > num_org:
+                logits = logits[:, :num_org]
+            out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
+        return out_tokens
+
     def _greedy_sample_from_vocab_parallel_head(
         self,
         *,
@@ -821,6 +2011,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+
+        if not is_dense_head_weight(getattr(lm_head, "weight", None)):
+            return self._greedy_sample_from_quantized_head(
+                hidden_states=hidden_states, lm_head=lm_head, chunk_size=chunk_size
+            )
 
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
@@ -841,7 +2036,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return out_tokens
 
         shard = lm_head.shard_indices
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         tp_size = int(tp_group.world_size)
 
         # Valid ranges in the local shard (excluding padding):
@@ -1017,6 +2212,21 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
+    def _draft_write_ids(
+        self, plan: IterationIds, kind=IdSpaceKind.FULL
+    ) -> Optional[torch.Tensor]:
+        """The plan's write ids as the draft pool indexes them: the target's
+        physical ids for a fused draft, the virtual ids for a private one."""
+        return plan.write_ids(self.draft_model_runner.runner_ids, kind=kind)
+
+    def _mla_context_kv(self) -> Optional["MlaContextKV"]:
+        """The ROCm monokernel's stacked context-KV writer, or None."""
+        if "_mla_ctx" not in self.__dict__:
+            from sglang.srt.speculative.dflash_mla_ctx import MlaContextKV
+
+            self._mla_ctx = MlaContextKV.for_worker(self)
+        return self._mla_ctx
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1025,12 +2235,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        extend_lens: Optional[torch.Tensor] = None,
+        swa_cache_loc: Optional[torch.Tensor] = None,
+        projected: bool = False,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
+
+        `projected=True`: `target_hidden` already went through `project_target_hidden`.
 
         For the spec-v2 overlap path, callers can pass dense `[bs, block_size]`
         `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
         only the live prefix rows without constructing masked/packed index tensors.
+        `cache_loc_2d` holds the same ids as `cache_loc`, row-major.
         """
         if target_hidden is None:
             raise RuntimeError("DFLASH missing target hidden context features.")
@@ -1051,6 +2267,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                 f"DFLASH positions must be 1D, got shape={tuple(positions.shape)}."
             )
         num_tokens = int(target_hidden.shape[0])
+        # Drop trailing alignment-padding rows (from TP/EP-size rounding)
+        # before materializing into the draft KV; they would corrupt other
+        # requests' cache slots.
+        expected_tokens = int(cache_loc.numel())
+        if num_tokens > expected_tokens:
+            if not getattr(self, "_logged_padding_trim", False):
+                logger.warning(
+                    "DFLASH target_hidden has %d trailing padding row(s); trimming "
+                    "to cache_loc length=%d (target_hidden=%d). Logged once per worker.",
+                    num_tokens - expected_tokens,
+                    expected_tokens,
+                    num_tokens,
+                )
+                self._logged_padding_trim = True
+            target_hidden = target_hidden[:expected_tokens]
+            num_tokens = expected_tokens
         if int(cache_loc.numel()) != num_tokens:
             raise ValueError(
                 "DFLASH cache_loc length mismatch: "
@@ -1077,9 +2309,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFLASH cache_loc_2d requires commit_lens for prefix-valid writes."
                 )
 
+        if swa_cache_loc is not None and swa_cache_loc.shape != cache_loc.shape:
+            raise ValueError(
+                "DFLASH full and window cache locations must have matching shapes."
+            )
+
         device = self.model_runner.device
         if cache_loc.device != device:
             cache_loc = cache_loc.to(device, non_blocking=True)
+        if swa_cache_loc is not None:
+            swa_cache_loc = swa_cache_loc.to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
         if positions.device != device:
             positions = positions.to(device, non_blocking=True)
         if target_hidden.device != device:
@@ -1100,8 +2341,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
-        with torch.inference_mode():
-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+        # `cache_loc` arrives in the draft pool's id space (`_draft_write_ids`);
+        # the callers' window buffers stay virtual for the compact
+        # req_to_token rebuild.
+        with (
+            torch.inference_mode(),
+            draft_tp_context(self.draft_parallel_layout),
+        ):
+            ctx_hidden = (
+                target_hidden
+                if projected
+                else self.draft_model.project_target_hidden(target_hidden)
+            )
+            if self.lilicorr is not None:
+                self._lilicorr_anchor = publish_anchor(
+                    draft_sampler=self._draft_sampler,
+                    ctx_hidden=ctx_hidden,
+                    extend_lens=extend_lens,
+                    commit_lens=commit_lens,
+                )
 
             if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])
@@ -1118,6 +2376,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                             ctx_hidden=ctx_hidden,
                             ctx_positions=positions,
                             ctx_cache_loc=cache_loc,
+                            ctx_swa_cache_loc=swa_cache_loc,
                             ctx_cache_loc_2d=cache_loc_2d,
                             commit_lens=commit_lens,
                         )
@@ -1130,25 +2389,54 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
+                if is_gfx95_supported() and (ctx := self._mla_context_kv()) is not None:
+                    pool = self.draft_model_runner.token_to_kv_pool
+                    ctx.write(pool, positions, ctx_hidden, cache_loc_2d, commit_lens)
+                    return
                 for layer in self.draft_model.layers:
                     attn = layer.self_attn
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                         layer, ctx_hidden
                     )
+                    if isinstance(attn, DFlashMLAAttention):
+                        attn.write_context_kv(
+                            pool=self.draft_model_runner.token_to_kv_pool,
+                            positions=positions,
+                            hidden_states=layer_ctx_hidden,
+                            cache_loc=cache_loc,
+                            swa_cache_loc=swa_cache_loc,
+                            cache_loc_2d=cache_loc_2d,
+                            commit_lens=commit_lens,
+                        )
+                        continue
                     k, v = attn.kv_proj_only(layer_ctx_hidden)
                     k = attn.apply_k_norm(k)
                     k = attn.apply_k_rope(positions, k)
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                     v = v.view(-1, attn.num_kv_heads, attn.head_dim)
 
-                    self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
+                    self.draft_model_runner.token_to_kv_pool.layer_router.layer(
+                        attn.attn.layer_id
+                    ).store_prefix(
                         attn.attn,
-                        cache_loc_2d,
+                        KVWriteLoc(
+                            cache_loc_2d,
+                            window_locs=layer_window_locs(
+                                self.draft_model_runner.token_to_kv_pool,
+                                attn.attn.layer_id,
+                                swa_cache_loc.view_as(cache_loc_2d)
+                                if swa_cache_loc is not None
+                                else None,
+                            ),
+                            physical=True,
+                        ),
                         commit_lens,
                         k,
                         v,
-                        attn.attn.k_scale,
-                        attn.attn.v_scale,
+                        # ROCm: a unit scale where the layer has none, so the fused fp8
+                        # write (one launch) replaces the eager clamp / cast / write fallback
+                        _unit_scale_on_hip(attn.attn.k_scale),
+                        _unit_scale_on_hip(attn.attn.v_scale),
                     )
                 return
 
@@ -1158,6 +2446,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         ctx_hidden=ctx_hidden,
                         ctx_positions=positions,
                         ctx_cache_loc=cache_loc,
+                        ctx_swa_cache_loc=swa_cache_loc,
                     )
                     return
                 except Exception as e:
@@ -1172,30 +2461,145 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_hidden=ctx_hidden,
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
+                ctx_swa_cache_loc=swa_cache_loc,
             )
+
+    def _append_target_hidden_decode(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        swa_cache_loc: Optional[torch.Tensor] = None,
+    ) -> None:
+        # The aux graphs hold no sliding-window locations: such drafts append eagerly.
+        if not self._use_aux_graph or swa_cache_loc is not None:
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=target_hidden,
+                cache_loc=cache_loc,
+                positions=positions,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
+                swa_cache_loc=swa_cache_loc,
+            )
+            return
+        # A TP-split fc all-reduces, so project on the main stream in program order;
+        # the aux graph may replay on a side stream beside other collectives.
+        projected = self.draft_model.fc_tp_columns is not None
+        if projected:
+            with torch.inference_mode(), draft_tp_context(self.draft_parallel_layout):
+                target_hidden = self.draft_model.project_target_hidden(target_hidden)
+
+        key = (tuple(target_hidden.shape), tuple(cache_loc_2d.shape))
+        entry = self._aux_graphs.get(key)
+        inputs = (target_hidden, cache_loc, positions, commit_lens)
+        if entry is None:
+            static = tuple(torch.empty_like(t) for t in inputs)
+            for dst, src in zip(static, inputs):
+                dst.copy_(src)
+            hidden_buf, loc_buf, pos_buf, commit_buf = static
+
+            def append():
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=hidden_buf,
+                    cache_loc=loc_buf,
+                    positions=pos_buf,
+                    cache_loc_2d=loc_buf.view(cache_loc_2d.shape),
+                    commit_lens=commit_buf,
+                    projected=projected,
+                )
+
+            stream = torch.cuda.Stream(device=target_hidden.device)
+            current = torch.cuda.current_stream(target_hidden.device)
+            stream.wait_stream(current)
+            # Warm-up before capture: rewriting only the committed rows is idempotent.
+            with torch.cuda.stream(stream):
+                append()
+            current.wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                append()
+            current.wait_stream(stream)
+            entry = (static, graph)
+            self._aux_graphs[key] = entry
+            logger.info(
+                "DFLASH aux CUDA graph captured rows=%d", target_hidden.shape[0]
+            )
+        elif self._batched_small_copy and try_small_copy(
+            list(entry[0][1:]), list(inputs[1:])
+        ):
+            entry[0][0].copy_(inputs[0])
+        else:
+            for dst, src in zip(entry[0], inputs):
+                dst.copy_(src)
+        if self._aux_overlap:
+            self._replay_aux_overlapped(entry[1])
+        else:
+            entry[1].replay()
+
+    def _replay_aux_overlapped(self, graph: torch.cuda.CUDAGraph) -> None:
+        current = torch.cuda.current_stream(self.device)
+        if self._aux_stream is None:
+            self._aux_stream = torch.cuda.Stream(device=self.device)
+            self._aux_done = torch.cuda.Event()
+        self._aux_stream.wait_stream(current)
+        with torch.cuda.stream(self._aux_stream):
+            graph.replay()
+        self._aux_done.record(self._aux_stream)
+        self._aux_pending = True
+
+    def _join_aux(self) -> None:
+        if self._aux_pending:
+            torch.cuda.current_stream(self.device).wait_event(self._aux_done)
+            self._aux_pending = False
 
     def _append_target_hidden_sequential(
         self,
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        ctx_swa_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
             )
+            if isinstance(attn, DFlashMLAAttention):
+                attn.write_context_kv(
+                    pool=self.draft_model_runner.token_to_kv_pool,
+                    positions=ctx_positions,
+                    hidden_states=layer_ctx_hidden,
+                    cache_loc=ctx_cache_loc,
+                    swa_cache_loc=ctx_swa_cache_loc,
+                )
+                continue
             if _is_npu:
                 _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
+                # Keep V scaling consistent with forward().
+                if attn.v_scale is not None:
+                    v = v * attn.v_scale
             else:
                 k, v = attn.kv_proj_only(layer_ctx_hidden)
                 k = attn.apply_k_norm(k)
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
+            self.draft_model_runner.token_to_kv_pool.layer_router.layer(
+                attn.attn.layer_id
+            ).store(
                 attn.attn,
-                ctx_cache_loc,
+                KVWriteLoc(
+                    ctx_cache_loc,
+                    window_locs=layer_window_locs(
+                        self.draft_model_runner.token_to_kv_pool,
+                        attn.attn.layer_id,
+                        ctx_swa_cache_loc,
+                    ),
+                    physical=True,
+                ),
                 k,
                 v,
                 attn.attn.k_scale,
@@ -1209,6 +2613,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_cache_loc: torch.Tensor,
         ctx_cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        ctx_swa_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
@@ -1222,19 +2627,35 @@ class DFlashWorkerV2(BaseSpecWorker):
         ) -> None:
             attn = self.draft_model.layers[layer_idx].self_attn.attn
             if ctx_cache_loc_2d is not None and commit_lens is not None:
-                token_to_kv_pool.set_kv_buffer_prefix_valid(
+                token_to_kv_pool.layer_router.layer(attn.layer_id).store_prefix(
                     attn,
-                    ctx_cache_loc_2d,
+                    KVWriteLoc(
+                        ctx_cache_loc_2d,
+                        window_locs=layer_window_locs(
+                            token_to_kv_pool,
+                            attn.layer_id,
+                            ctx_swa_cache_loc.view_as(ctx_cache_loc_2d)
+                            if ctx_swa_cache_loc is not None
+                            else None,
+                        ),
+                        physical=True,
+                    ),
                     commit_lens,
                     cache_k,
                     cache_v,
-                    attn.k_scale,
-                    attn.v_scale,
+                    _unit_scale_on_hip(attn.k_scale),
+                    _unit_scale_on_hip(attn.v_scale),
                 )
             else:
-                token_to_kv_pool.set_kv_buffer(
+                token_to_kv_pool.layer_router.layer(attn.layer_id).store(
                     attn,
-                    ctx_cache_loc,
+                    KVWriteLoc(
+                        ctx_cache_loc,
+                        window_locs=layer_window_locs(
+                            token_to_kv_pool, attn.layer_id, ctx_swa_cache_loc
+                        ),
+                        physical=True,
+                    ),
                     cache_k,
                     cache_v,
                     attn.k_scale,
@@ -1252,6 +2673,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         batch: ScheduleBatch,
         seq_lens_pre_verify: torch.Tensor,
+        seq_lens_post_verify: torch.Tensor,
         commit_lens: torch.Tensor,
     ) -> None:
         """Commit Mamba intermediate states for accepted verify steps.
@@ -1264,27 +2686,51 @@ class DFlashWorkerV2(BaseSpecWorker):
             return
         attn_backend = self.target_worker.model_runner.attn_backend
 
-        last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
-
-        if batch.mamba_track_indices is not None:
-            mamba_track_interval = get_exec().mamba.mamba_track_interval
-            to_track_mask = (
-                seq_lens_pre_verify // mamba_track_interval
-                != batch.seq_lens // mamba_track_interval
+        if self._use_commit_metadata:
+            bs = commit_lens.numel()
+            if (
+                self._mamba_commit_buffers is None
+                or self._mamba_commit_buffers[0].numel() < bs
+            ):
+                self._mamba_commit_buffers = tuple(
+                    torch.empty_like(commit_lens, dtype=torch.int64) for _ in range(2)
+                )
+            last_buf, track_buf = self._mamba_commit_buffers
+            last_correct_step_indices = last_buf[:bs]
+            has_track = batch.mamba_track_indices is not None
+            _prepare_dflash_mamba_commit(
+                seq_lens_pre_verify,
+                commit_lens,
+                last_correct_step_indices,
+                track_buf[:bs],
+                mamba_track_grid(batch.tree_cache.page_size) if has_track else 1,
+                has_track,
             )
-            tracking_point = (
-                batch.seq_lens // mamba_track_interval * mamba_track_interval
-            )
-            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
-            can_track_mask = to_track_mask & (
-                to_track_ith < commit_lens.to(to_track_ith.dtype)
-            )
-            mamba_steps_to_track = torch.where(
-                can_track_mask,
-                to_track_ith.to(torch.int64),
-                torch.full_like(to_track_ith, -1, dtype=torch.int64),
-            )
+            if has_track:
+                mamba_steps_to_track = track_buf[:bs]
+        else:
+            last_correct_step_indices = commit_lens.to(torch.int64) - 1
+            if batch.mamba_track_indices is not None:
+                mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
+                to_track_mask = (
+                    seq_lens_pre_verify // mamba_track_interval
+                    != seq_lens_post_verify // mamba_track_interval
+                )
+                tracking_point = (
+                    seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+                )
+                to_track_ith = torch.clamp(
+                    tracking_point - seq_lens_pre_verify - 1, min=0
+                )
+                can_track_mask = to_track_mask & (
+                    to_track_ith < commit_lens.to(to_track_ith.dtype)
+                )
+                mamba_steps_to_track = torch.where(
+                    can_track_mask,
+                    to_track_ith.to(torch.int64),
+                    torch.full_like(to_track_ith, -1, dtype=torch.int64),
+                )
 
         model_runner = self.target_worker.model_runner
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
@@ -1327,7 +2773,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         ]
         self._accept_bonus_buffer_cap = new_cap
 
-    def _next_accept_bonus_buffers(self, bs: int) -> tuple[
+    def _next_accept_bonus_buffers(
+        self, bs: int
+    ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -1346,15 +2794,167 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._new_seq_lens_bufs[slot][:bs],
         )
 
+    def _accept_block(
+        self,
+        *,
+        candidates: torch.Tensor,
+        next_token_logits: torch.Tensor,
+        sampling_info,
+        draft_input,
+        prefix_lens: torch.Tensor,
+        bs: int,
+        target_predict: Optional[torch.Tensor] = None,
+        cutoff_verify_lens: Optional[torch.Tensor] = None,
+    ):
+        """With cutoff_verify_lens, request i accepts at most
+        cutoff_verify_lens[i] - 1 drafts and takes its bonus from the last row
+        it verified; cap_trim_lens counts the accepted drafts the cutoff cut."""
+        out_tokens = None
+        new_seq_lens = None
+        cap_trim_lens = None
+        # A resolved argmax (vocab-sharded verify) means the accept is greedy.
+        if target_predict is None and self._selector_sample is not None:
+            selector_candidate_ids, selector_q_rows = self._selector_sample
+            accept_len, bonus, cap_trim_lens = self._selector_sampling_accept(
+                candidates=candidates,
+                next_token_logits=next_token_logits,
+                candidate_ids=selector_candidate_ids,
+                q_rows=selector_q_rows,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                cutoff_verify_lens=cutoff_verify_lens,
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, cap_trim_lens)
+        elif target_predict is None and (
+            not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
+        ):
+            # Ragged modes require a selector draft (_init_verify_planner); this
+            # kernel cannot stop at a planned verify length.
+            assert cutoff_verify_lens is None
+            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
+                candidates=candidates,
+                next_token_logits=next_token_logits,
+                sampling_info=sampling_info,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
+        else:
+            if target_predict is None:
+                target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.view(bs, int(self.block_size))
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
+            if cutoff_verify_lens is not None:
+                accept_len, bonus, cap_trim_lens = AcceptGreedy.execute(
+                    candidates=candidates,
+                    target_logits=None,
+                    target_predict=target_predict,
+                    verify_num_draft_tokens=int(self.block_size),
+                    cutoff_verify_lens=cutoff_verify_lens,
+                )
+            elif self._use_triton_accept_bonus:
+                try:
+                    (
+                        accept_len,
+                        commit_lens,
+                        bonus,
+                        out_tokens,
+                        new_seq_lens,
+                    ) = self._next_accept_bonus_buffers(bs)
+                    _compute_dflash_accept_bonus_triton_unchecked(
+                        candidates=candidates,
+                        target_top1=target_predict,
+                        accept_lens_out=accept_len,
+                        commit_lens_out=commit_lens,
+                        bonus_ids_out=bonus,
+                        out_tokens_out=out_tokens,
+                        prefix_lens=prefix_lens,
+                        new_seq_lens_out=new_seq_lens,
+                    )
+                except Exception as e:
+                    self._use_triton_accept_bonus = False
+                    logger.warning(
+                        "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
+                        e,
+                    )
+                    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                        candidates=candidates,
+                        target_predict=target_predict,
+                    )
+                    # The buffers may be unwritten; the eager commit below rebuilds.
+                    out_tokens = new_seq_lens = None
+            else:
+                accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                )
+        if out_tokens is None:
+            if self._use_triton_accept_bonus:
+                _, commit_lens, _, out_tokens, new_seq_lens = (
+                    self._next_accept_bonus_buffers(bs)
+                )
+                dflash_commit_block(
+                    candidates=candidates,
+                    num_correct_drafts=accept_len,
+                    bonus_tokens=bonus,
+                    prefix_lens=prefix_lens,
+                    out_tokens=out_tokens,
+                    num_accept_tokens_out=commit_lens,
+                    new_seq_lens_out=new_seq_lens,
+                )
+            else:
+                out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        if SIMULATE_ACC_LEN > 0:
+            # new_seq_lens, if a Triton kernel wrote it, holds the real
+            # accept; it comes back rewritten from the forced lengths, or None.
+            new_seq_lens = apply_dflash_simulated_acceptance(
+                candidates=candidates,
+                target_predict=target_predict,
+                accept_len=accept_len,
+                commit_lens=commit_lens,
+                bonus=bonus,
+                out_tokens=out_tokens,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_method=SIMULATE_ACC_METHOD,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+                next_token_logits=next_token_logits,
+                generator=self._simulated_acc_len_rng,
+                prefix_lens=prefix_lens,
+                new_seq_lens=new_seq_lens,
+            )
+            cap_trim_lens = None
+
+        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, cap_trim_lens
+
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
         if sampling_info is None or sampling_info.is_all_greedy:
             return
 
+        if self.selector is not None:
+            if self._selector_sampling_enabled:
+                return
+            if not self._warned_sampling_fallback and get_parallel().tp_rank == 0:
+                logger.warning(
+                    "DFLASH non-greedy verification is unavailable on this "
+                    "build/device; falling back to greedy argmax verification. "
+                    "The requested sampling distribution will not be preserved; "
+                    "use temperature=0 and top_k=1 for lossless greedy decoding."
+                )
+                self._warned_sampling_fallback = True
+            return
+
+        # The sampled head hands verify the q it drew from, so no fallback is needed.
+        if self.lilicorr is not None and self._lilicorr_sampling_enabled:
+            return
+
         if (
             not is_dflash_sampling_verify_available()
             and not self._warned_sampling_fallback
-            and self.ps.tp_rank == 0
+            and get_parallel().tp_rank == 0
         ):
             logger.warning(
                 "DFLASH non-greedy verification is unavailable on this build/device; "
@@ -1383,22 +2983,58 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
+        if not self._hosts_draft:
+            batch_output = self.target_worker.forward_batch_generation(
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            batch_output.new_seq_lens = batch.seq_lens
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
+            return batch_output
         self._validate_phase1_sampling_support(batch)
+        if (
+            batch.forward_mode.is_extend()
+            or batch.is_extend_in_batch
+            or batch.forward_mode.is_idle()
+        ):
+            # A pending aux append may own draft KV rows this forward reuses; only the
+            # decode draft prep (no KV writes) runs beside it, up to the draft forward.
+            self._join_aux()
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            self._note_non_decode_step()
+            self._wait_for_fused_hicache_load(batch)
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                return_iteration_ids=True,
             )
+            iteration_ids, batch_output.iteration_ids = batch_output.iteration_ids, None
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
-            batch_output.new_seq_lens = batch.seq_lens
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
+            new_seq_lens = batch.seq_lens
+            batch_output.new_seq_lens = new_seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
+
+            # An idle DP rank runs the empty target prefill above to stay in
+            # the DP collective, but must skip the draft KV materialization,
+            # which needs per-request extend info.
+            if batch.forward_mode.is_idle():
+                batch_output.next_draft_input = DFlashDraftInputV2.create_idle_input(
+                    device=self.device
+                )
+                return batch_output
 
             if logits_output.hidden_states is None:
                 raise RuntimeError(
@@ -1415,8 +3051,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
+            # Enqueue metadata copies without waiting for the target prefill's
+            # outstanding GPU work; the same stream orders their consumers.
+            ctx_lens = async_h2d(batch.extend_lens, dtype=torch.int32, device=device)
+            draft_seq_lens = async_h2d(
                 batch.prefix_lens, dtype=torch.int32, device=device
             )
 
@@ -1430,10 +3068,33 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
+            if self.draft_kv_ring is not None:
+                self.draft_kv_ring.record_floors(
+                    batch.reqs,
+                    batch.prefix_lens,
+                    self.model_runner.req_to_token_pool.req_generation,
+                )
+                draft_cache_loc = self.draft_kv_ring.extend_locs(
+                    req_pool_indices=batch.req_pool_indices,
+                    positions=positions,
+                    extend_lens=ctx_lens,
+                    seq_ends=draft_seq_lens + ctx_lens,
+                )
+            else:
+                # The draft KV goes to the slots the target prefill just wrote.
+                draft_cache_loc = self._draft_write_ids(iteration_ids)
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
+                cache_loc=draft_cache_loc,
+                swa_cache_loc=(
+                    None
+                    if self.draft_kv_ring is not None
+                    else self._draft_write_ids(
+                        iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                    )
+                ),
                 positions=positions,
+                extend_lens=ctx_lens,
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -1441,7 +3102,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             batch_output.next_draft_input = self._make_next_draft_input_prefill(
                 bonus_tokens=next_token_ids,
-                seq_lens=batch.seq_lens,
+                seq_lens=new_seq_lens,
             )
             return batch_output
 
@@ -1456,6 +3117,38 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         if batch.forward_mode.is_idle():
+            self._note_non_decode_step()
+            # Under dp attention an idle DP rank must still run the target
+            # verify forward (IDLE mode) so its cross-DP collectives stay in
+            # lockstep with the active DP group; the draft block's
+            # collectives are within-rank and skipped.
+            idle_can_run_cuda_graph = False
+            if get_parallel().attn_dp_enabled:
+                idle_verify_input = DFlashVerifyInput(
+                    draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
+                    positions=torch.empty((0,), dtype=torch.int64, device=self.device),
+                    draft_token_num=int(self.block_size),
+                    custom_mask=None,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                )
+                # ModelRunner plans the metadata after DP padding fixes the shapes.
+                idle_verify_forward_batch, idle_can_run_cuda_graph = (
+                    idle_verify_input.prepare_for_verify(
+                        batch, self._target_worker, defer_metadata_init=True
+                    )
+                )
+                if _is_npu:
+                    # Matches the active ranks, which go eager when any DP rank is idle.
+                    idle_verify_forward_batch.can_run_decode_cuda_graph = False
+                    idle_can_run_cuda_graph = False
+                    idle_verify_forward_batch.mark_forward_metadata_ready()
+                # On CUDA every rank pads to max(original_global_num_tokens_cpu), so
+                # the idle rank replays the active ranks' graph with zero real rows.
+                self._target_worker.forward_batch_generation(
+                    batch=None,
+                    forward_batch=idle_verify_forward_batch,
+                    is_verify=True,
+                )
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
             next_draft_input = self._make_next_draft_input_decode(
@@ -1469,10 +3162,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 next_token_ids=empty_ids,
                 accept_lens=empty_lens,
                 next_draft_input=next_draft_input,
-                can_run_cuda_graph=False,
+                can_run_cuda_graph=idle_can_run_cuda_graph,
                 speculative_num_draft_tokens=int(self.block_size),
                 new_seq_lens=next_draft_input.new_seq_lens,
             )
+
+        if self._runtime is not None:
+            # The bound runtime runs the whole round, or returns None for the stock one.
+            result = self._runtime.decode_round(
+                batch, on_publish=on_publish, grammar_barrier=grammar_barrier
+            )
+            if result is not None:
+                return result
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
         # produced on another stream.
@@ -1482,14 +3183,21 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+        self._info_dumper.begin_step()
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
-        lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
+        embed_module = unwrap_lora_layer(
+            _resolve_dflash_embedding_module(self.draft_model, target_model)
+        )
+        lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+        if lm_head is None or not (
+            hasattr(lm_head, "weight")
+            or callable(getattr(getattr(lm_head, "quant_method", None), "apply", None))
+        ):
             raise RuntimeError(
-                "DFLASH requires the target model to expose `lm_head` with `weight`."
+                "DFLASH requires the target model to expose `lm_head` with either "
+                "`weight` or a `quant_method` that can produce logits."
             )
 
         block_size = int(self.block_size)
@@ -1561,11 +3269,33 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        noise_embedding = embed_module(block_ids)
+        if self._full_embed_gpu is not None:
+            # A borrowed embedding may use target-wide collectives, while
+            # other DP replicas are idle or looking up different token IDs.
+            noise_embedding = torch.nn.functional.embedding(
+                block_ids, self._full_embed_gpu
+            )
+        else:
+            noise_embedding = embed_module(block_ids)
+        if self._noise_embed_scale != 1.0:
+            noise_embedding = noise_embedding * self._noise_embed_scale
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+        # The iteration's window -- the draft block, the verify and the
+        # target-hidden KV writes all write it -- planned once.
+        iteration_ids = self.target_worker.model_runner.runner_ids.plan(
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=prefix_lens,
+            seq_lens_cpu=(
+                batch.seq_lens_cpu
+                if batch.seq_lens_cpu is not None
+                else draft_input.nxt_kv_lens_cpu
+            ),
+            write_virtual=verify_out_cache_loc,
+            read_extent=block_size,
+        )
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
@@ -1573,8 +3303,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
             self._fill_compact_seq_lens_cpu_bound(
                 batch_seq_lens_cpu=batch.seq_lens_cpu,
-                reserved_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
-                draft_prefix_lens=draft_prefix_lens,
+                nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,
                 out=seq_lens_cpu,
             )
             self._rebuild_compact_draft_cache(
@@ -1597,13 +3326,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.copy_(batch.seq_lens_cpu)
                 seq_lens_cpu.add_(block_size)
                 draft_seq_lens_sum = int(seq_lens_cpu.sum())
-            elif draft_input.reserved_seq_lens_cpu is not None:
+            elif draft_input.nxt_kv_lens_cpu is not None:
                 # GPU-only backend: reserved is a safe over-estimate.
-                seq_lens_cpu.copy_(draft_input.reserved_seq_lens_cpu)
-                draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+                seq_lens_cpu.copy_(draft_input.nxt_kv_lens_cpu)
+                draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
             else:
-                seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
-                draft_seq_lens_sum = int(prefix_lens.sum().item())
+                # Allocated lengths include the in-flight verify reservation.
+                for i, req in enumerate(batch.reqs):
+                    seq_lens_cpu[i] = req.kv.kv_allocated_len
+                draft_seq_lens_sum = int(seq_lens_cpu.sum())
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -1619,31 +3350,182 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_token_non_padded=(
+                torch.full((), bs * block_size, dtype=torch.int32, device=device)
+                if enable_num_token_non_padded()
+                else None
+            ),
+            global_num_token_non_padded_cpu=bs * block_size,
+            can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
         )
+        # The draft block writes the whole window. A compact draft reads its
+        # own `req_to_token` rows over its own lengths.
+        draft_translator = self.draft_model_runner.runner_ids
+        draft_plan = (
+            iteration_ids.reads_from(
+                draft_translator,
+                seq_lens=draft_seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                read_extent=block_size,
+            )
+            if self.use_compact_draft_cache
+            else iteration_ids
+        )
+        draft_plan.bind(forward_batch, draft_translator)
+        ring_block_locs = None
+        if self.draft_kv_ring is not None:
+            ring_block_locs = self.draft_kv_ring.block_locs(
+                batch.req_pool_indices, positions, block_size
+            )
+            forward_batch.out_cache_loc = ring_block_locs
+            forward_batch.out_cache_loc_virtual = None
 
-        with torch.inference_mode():
+        if self.selector is not None or self.lilicorr is not None:
+            self._selector_sample = None
+            self._draft_feature = self._draft_confidence = None
+            # Consumed by the in-graph sample; must be staged before the replay.
+            self._stage_draft_sampler(bs=bs, sampling_info=batch.sampling_info)
+
+        self._join_aux()
+        with (
+            torch.inference_mode(),
+            draft_tp_context(self.draft_parallel_layout),
+        ):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if self._draft_sampler is not None and draft_out.can_run_graph:
+        if (
+            self._is_domino
+            and self._draft_sampler is not None
+            and draft_out.can_run_graph
+        ):
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
+        elif self._is_domino:
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH draft model returned no hidden states.")
+            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            prefix_gru = self.draft_model.prefix_gru
+            embed_proj = self.draft_model.embed_proj
+            if prefix_gru is None or embed_proj is None:
+                raise RuntimeError("DFLASH Domino projector modules are unavailable.")
+            tp_group = get_parallel().tp_group
+            shard = getattr(lm_head, "shard_indices", None)
+            draft_next = domino_greedy_rollout(
+                draft_hidden=draft_hidden,
+                bonus_tokens=block_ids[:, 0],
+                target_embedding=embed_module,
+                lm_head_weight=lm_head.weight,
+                prefix_gru=prefix_gru,
+                embed_proj=embed_proj,
+                vocab_size=int(self.model_runner.model_config.vocab_size),
+                shift_label=bool(self.draft_model.shift_label),
+                candidate_pool_size=self.domino_candidate_pool_size,
+                tp_group=tp_group,
+                lm_head_org_vocab_start=(
+                    int(shard.org_vocab_start_index) if shard is not None else 0
+                ),
+                lm_head_num_org=(
+                    int(shard.num_org_elements) if shard is not None else None
+                ),
+                lm_head_num_org_padded=(
+                    int(shard.num_org_elements_padded) if shard is not None else None
+                ),
+                in_cuda_graph=False,
+            )
+        elif self._draft_sampler is not None and draft_out.can_run_graph:
+            draft_next = self._draft_sampler.out[
+                : bs * (int(self.block_size) - 1)
+            ].view(bs, int(self.block_size) - 1)
+            if self._acceptance_estimator is not None:
+                self._draft_feature = self._draft_sampler.feature_out[:bs]
+                self._draft_confidence = self._draft_sampler.confidence_out[:bs]
+            if (
+                self.selector is not None
+                and not _is_all_greedy(batch.sampling_info)
+                and self._selector_sampling_enabled
+            ):
+                self._selector_sample = (
+                    self._draft_sampler.candidate_out[:bs],
+                    self._draft_sampler.q_out[:bs],
+                )
+            elif (
+                self.lilicorr is not None
+                and self._lilicorr_sampling_enabled
+                and not _is_all_greedy(batch.sampling_info)
+            ):
+                self._selector_sample = (
+                    self._draft_sampler.candidate_out[:bs],
+                    self._draft_sampler.q_out[:bs],
+                )
+        elif self.selector is not None:
+            with draft_tp_context(self.draft_parallel_layout):
+                draft_next = self._propose_selector_block(
+                    draft_logits_output=draft_logits_output,
+                    bs=bs,
+                    lm_head=lm_head,
+                    anchor_token_ids=block_ids[:, 0],
+                    sampling_info=batch.sampling_info,
+                )
+        elif self.lilicorr is not None:
+            if (
+                self._lilicorr_sampling_enabled
+                and not self._warned_lilicorr_eager
+                and get_parallel().tp_rank == 0
+            ):
+                logger.warning(
+                    "LiLiCorr sampled draft ran the eager head on a decode step "
+                    "(draft cuda graph unavailable for batch size %d; captured "
+                    "buckets do not cover it, or graphs are disabled). Acceptance is "
+                    "unaffected but expect a large throughput regression, and do not "
+                    "compare tokens/s from this run against a folded one.",
+                    bs,
+                )
+                self._warned_lilicorr_eager = True
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH draft model returned no hidden states.")
+            with draft_tp_context(self.draft_parallel_layout):
+                draft_next, lilicorr_candidate_ids, lilicorr_q_rows = (
+                    propose_lilicorr_block(
+                        head=self.lilicorr,
+                        draft_hidden=draft_hidden.view(bs, int(self.block_size), -1),
+                        lm_head=lm_head,
+                        embed_tokens=target_input_embeddings(
+                            self.target_worker.model_runner.model
+                        ),
+                        anchor=self._lilicorr_anchor,
+                        sampling_info=batch.sampling_info,
+                        sampling_enabled=self._lilicorr_sampling_enabled,
+                    )
+                )
+            if lilicorr_q_rows is not None and not _is_all_greedy(batch.sampling_info):
+                self._selector_sample = (lilicorr_candidate_ids, lilicorr_q_rows)
         else:
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            draft_next = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(
-                    -1, draft_hidden.shape[-1]
-                ),
-                lm_head=lm_head,
-            ).view(bs, int(self.block_size) - 1)
+            with draft_tp_context(self.draft_parallel_layout):
+                draft_next = self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=draft_hidden[:, 1:, :].reshape(
+                        -1, draft_hidden.shape[-1]
+                    ),
+                    lm_head=lm_head,
+                ).view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+        if not (
+            bs == 1
+            and self._batched_small_copy
+            and try_small_copy(
+                [draft_tokens[:, 0], draft_tokens[:, 1:]], [block_ids[:, 0], draft_next]
+            )
+        ):
+            draft_tokens[:, 0].copy_(block_ids[:, 0])
+            draft_tokens[:, 1:].copy_(draft_next)
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -1661,201 +3543,198 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.block_size),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            iteration_ids=iteration_ids,
         )
 
         batch.out_cache_loc = verify_out_cache_loc
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
         sampling_info = batch.sampling_info
 
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if self._need_mamba_verify_commit else None
         )
-        seq_lens_cpu_backup = batch.seq_lens_cpu
-        seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
-            batch.seq_lens_cpu = verify_host_seq_lens
-            batch.seq_lens_sum = int(verify_host_seq_lens.sum())
-        elif draft_input.reserved_seq_lens_cpu is not None:
-            batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-            batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
-
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
+        confidence, verify_token_budget, layout = self._plan_verify(
+            batch=batch, draft_input=draft_input, prefix_lens=prefix_lens
         )
-        batch.seq_lens_cpu = seq_lens_cpu_backup
-        batch.seq_lens_sum = seq_lens_sum_backup
-
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
+        run_compact = self._verify_planner is not None and (
+            self._verify_planner.should_run_compact(layout=layout)
         )
+        if run_compact:
+            target_out = self._run_compact_verify(
+                batch=batch,
+                layout=layout,
+                draft_tokens=draft_tokens,
+                verify_window=VerifyWindow(
+                    positions_2d=positions_2d,
+                    verify_cache_loc=verify_out_cache_loc,
+                    verify_cache_loc_2d=verify_out_cache_loc_2d,
+                    iteration_ids=iteration_ids,
+                ),
+            )
+            routed_experts_output = indexer_topk_output = None
+            kv_weight_version_record = None
+        else:
+            seq_lens_cpu_backup = batch.seq_lens_cpu
+            seq_lens_sum_backup = batch.seq_lens_sum
+            if seq_lens_cpu_backup is not None:
+                # Verify host bound = committed prefix + one verify block (matches draft).
+                verify_host_seq_lens = seq_lens_cpu_backup + block_size
+                batch.seq_lens_cpu = verify_host_seq_lens
+                batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+            elif draft_input.nxt_kv_lens_cpu is not None:
+                batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+                batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+
+            verify_forward_batch, _ = verify_input.prepare_for_verify(
+                batch,
+                self.target_worker,
+                defer_metadata_init=get_parallel().attn_dp_enabled,
+            )
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
+
+            # Idle-DP guard (NPU): an eager idle rank's raw counts and a replaying rank's
+            # padded bucket disagree on DP-gather offsets, so any idle rank forces eager.
+            if (
+                _is_npu
+                and get_parallel().attn_dp_enabled
+                and verify_forward_batch.original_global_num_tokens_cpu is not None
+                and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
+            ):
+                verify_forward_batch.can_run_decode_cuda_graph = False
+
+            # Mixed-round guard: an extend rank's raw token counts disagree with
+            # the verify batch's spec-scaled counts on the DP-gather layout; run
+            # eager, symmetric with the idle guard above.
+            if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
+                verify_forward_batch.can_run_decode_cuda_graph = False
+
+            if not (_is_npu or get_parallel().attn_dp_enabled):
+                verify_forward_batch.mark_forward_metadata_ready()
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+            )
+            routed_experts_output = target_out.routed_experts_output
+            indexer_topk_output = target_out.indexer_topk_output
+            kv_weight_version_record = target_out.kv_weight_version_record
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+        target_predict = None
+        target_lp = self._target_logits_processor
+        if target_lp is not None and target_lp.is_deferred_shard(
+            logits_output.next_token_logits
+        ):
+            if self._can_skip_verify_logits(batch, sampling_info):
+                target_predict = target_lp.deferred_argmax(
+                    logits_output.next_token_logits
+                )
+                logits_output.next_token_logits = None
+            else:
+                logits_output.next_token_logits = target_lp.finish_deferred_gather(
+                    logits_output.next_token_logits
+                )
 
-        grammar_mask = None
-        if batch.has_grammar:
-            grammar_mask = build_grammar_vocab_mask(
-                reqs=batch.reqs,
-                tree=grammar_tree,
-                sampling_info=batch.sampling_info,
-                device=logits_output.next_token_logits.device,
-                barrier=grammar_barrier,
-            )
-
-        if sampling_info is not None:
-            apply_dflash_verify_logits_adjustments(
-                next_token_logits=logits_output.next_token_logits,
+        verify = TargetVerify.prepare(
+            batch,
+            logits_output=logits_output,
+            grammar_tree=grammar_tree,
+            grammar_barrier=grammar_barrier,
+            watermark_engine=None,
+            watermark_full_mask=False,
+        )
+        if sampling_info is not None and target_predict is None:
+            adjust_verify_logits(
+                logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=int(self.block_size),
+                grammar_mask=verify.grammar_mask,
+                draft_tokens=draft_tokens,
+                has_custom_logit_processor=sampling_info.has_custom_logit_processor,
             )
-
-        # Constrain every chain position before accept picks from it.
-        if grammar_mask is not None:
-            grammar_mask.apply(logits_output.next_token_logits)
 
         candidates = draft_tokens
-        new_seq_lens = None
-        # Only the greedy branch sets target_predict; the simulated-acceptance
-        # override below checks for it.
-        target_predict = None
-        if (
-            sampling_info is not None
-            and not sampling_info.is_all_greedy
-            and is_dflash_sampling_verify_available()
-        ):
-            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
-                candidates=candidates,
-                next_token_logits=logits_output.next_token_logits,
-                sampling_info=sampling_info,
-                max_top_k=draft_input.max_top_k,
-                uniform_top_k_value=draft_input.uniform_top_k_value,
+        (
+            accept_len,
+            commit_lens,
+            bonus,
+            out_tokens,
+            new_seq_lens,
+            cap_trim_lens,
+        ) = self._accept_block(
+            candidates=candidates,
+            next_token_logits=logits_output.next_token_logits,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            prefix_lens=prefix_lens,
+            bs=bs,
+            target_predict=target_predict,
+            cutoff_verify_lens=None if layout is None else layout.verify_lens,
+        )
+        verify.commit(
+            batch,
+            logits_output=logits_output,
+            accept=VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
+        )
+        if self._acceptance_estimator is not None and SIMULATE_ACC_LEN <= 0:
+            self._observe_acceptance(
+                correct_len=accept_len,
+                cap_trim_lens=cap_trim_lens,
+                layout=layout if run_compact else None,
             )
-            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-            out_tokens = torch.empty(
-                (bs, int(self.block_size)), dtype=torch.int64, device=device
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.commit_spec_accept_tokens(
+                batch=batch,
+                accept_indices=dflash_chain_accept_indices(
+                    num_accept_tokens=commit_lens, block_size=block_size
+                ),
             )
-            if int(self.block_size) > 1:
-                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-            out_tokens[:, int(self.block_size) - 1].fill_(0)
-            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
-        else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
-            if self._use_triton_accept_bonus:
-                try:
-                    (
-                        accept_len,
-                        commit_lens,
-                        bonus,
-                        out_tokens,
-                        new_seq_lens,
-                    ) = self._next_accept_bonus_buffers(bs)
-                    _compute_dflash_accept_bonus_triton_unchecked(
-                        candidates=candidates,
-                        target_top1=target_predict,
-                        accept_lens_out=accept_len,
-                        commit_lens_out=commit_lens,
-                        bonus_ids_out=bonus,
-                        out_tokens_out=out_tokens,
-                        prefix_lens=prefix_lens,
-                        new_seq_lens_out=new_seq_lens,
-                    )
-                except Exception as e:
-                    self._use_triton_accept_bonus = False
-                    logger.warning(
-                        "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
-                        e,
-                    )
-                    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
-                        candidates=candidates,
-                        target_predict=target_predict,
-                    )
-                    commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                    out_tokens = torch.empty(
-                        (bs, int(self.block_size)),
-                        dtype=torch.int64,
-                        device=device,
-                    )
-                    if int(self.block_size) > 1:
-                        out_tokens[:, : int(self.block_size) - 1].copy_(
-                            candidates[:, 1:]
-                        )
-                    out_tokens[:, int(self.block_size) - 1].fill_(0)
-                    out_tokens.scatter_(
-                        1, accept_len.to(torch.int64)[:, None], bonus[:, None]
-                    )
-            else:
-                accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
-                    candidates=candidates,
-                    target_predict=target_predict,
-                )
-                commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                out_tokens = torch.empty(
-                    (bs, int(self.block_size)), dtype=torch.int64, device=device
-                )
-                if int(self.block_size) > 1:
-                    out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-                out_tokens[:, int(self.block_size) - 1].fill_(0)
-                out_tokens.scatter_(
-                    1, accept_len.to(torch.int64)[:, None], bonus[:, None]
-                )
 
-        if SIMULATE_ACC_LEN > 0:
-            if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
-                raise ValueError(
-                    "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
-                    f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
-                    "'real-draft-token'."
-                )
-
-            if SIMULATE_ACC_TOKEN_MODE == "real-draft-token" and target_predict is None:
-                # The sampling-verify branch does not materialize the target argmax.
-                target_predict = torch.argmax(
-                    logits_output.next_token_logits, dim=-1
-                ).view(bs, int(self.block_size))
-            apply_dflash_simulated_acceptance(
-                candidates=candidates,
-                target_predict=target_predict,
-                accept_len=accept_len,
-                commit_lens=commit_lens,
-                bonus=bonus,
+        sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
+            sampling_info,
+            next_token_logits=logits_output.next_token_logits,
+            draft_input=draft_input,
+            draft_token_num=int(self.block_size),
+            bs=bs,
+        )
+        if sampling_mask_capture is not None:
+            logits_output.sampling_mask_output = sampling_mask_capture.build_output(
                 out_tokens=out_tokens,
-                simulate_acc_len=SIMULATE_ACC_LEN,
-                simulate_acc_method=SIMULATE_ACC_METHOD,
-                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
-            )
-            # The Triton path may have written new_seq_lens from the real
-            # accept_len; recompute it from the forced commit_lens.
-            new_seq_lens = None
-
-        if batch.return_logprob:
-            output_indices = torch.arange(
-                bs * block_size, dtype=torch.int64, device=device
-            ).view(bs, block_size)
-            compute_spec_v2_logprobs(
-                batch,
-                logits_output,
-                out_tokens.reshape(-1),
-                output_indices,
-                block_size - 1,
+                commit_lens=commit_lens,
             )
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
+            if new_seq_lens is None:
+                new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
             self._update_target_mamba_state_after_verify(
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
+                seq_lens_post_verify=new_seq_lens,
                 commit_lens=commit_lens,
             )
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
-            on_publish(new_seq_lens)
+            if confidence is not None:
+                on_publish(new_seq_lens, confidence=confidence)
+            else:
+                on_publish(new_seq_lens)
+        if self._info_dumper.enabled:
+            self._observe_decode_step(
+                batch=batch,
+                layout=layout,
+                confidence=confidence,
+                verify_token_budget=verify_token_budget,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
+                accept_len=accept_len,
+                cap_trim_lens=cap_trim_lens,
+                bonus=bonus,
+                commit_lens=commit_lens,
+            )
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
         hidden = logits_output.hidden_states
@@ -1865,12 +3744,24 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
 
-        self._append_target_hidden_to_draft_kv_by_loc(
+        # Consume in this step: every decode graph size shares one aux output,
+        # which the next target forward overwrites (resolve_aux_hidden_states_width).
+        cache_loc = (
+            ring_block_locs
+            if ring_block_locs is not None
+            else self._draft_write_ids(iteration_ids)
+        )
+        self._append_target_hidden_decode(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
             positions=positions,
             commit_lens=commit_lens,
+            swa_cache_loc=(
+                None
+                if ring_block_locs is not None
+                else self._draft_write_ids(iteration_ids, IdSpaceKind.SLIDING_WINDOW)
+            ),
         )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -1887,8 +3778,148 @@ class DFlashWorkerV2(BaseSpecWorker):
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
+            side_stream_done=self._aux_done if self._aux_pending else None,
             speculative_num_draft_tokens=int(self.block_size),
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
+            block_accept_lens=(
+                None if cap_trim_lens is None else commit_lens + cap_trim_lens
+            ),
+            cap_lens=None if layout is None else layout.verify_lens.to(torch.int32),
+            routed_experts_output=routed_experts_output,
+            indexer_topk_output=indexer_topk_output,
+            kv_weight_version_record=kv_weight_version_record,
+        )
+
+    def _note_non_decode_step(self) -> None:
+        self._info_dumper.note_non_decode_step()
+        if self._verify_planner is not None:
+            self._verify_planner.note_non_decode_step()
+
+    def _observe_acceptance(
+        self,
+        *,
+        correct_len: torch.Tensor,
+        cap_trim_lens: Optional[torch.Tensor],
+        layout: Optional[RaggedVerifyLayout],
+    ) -> None:
+        gamma = int(self.block_size) - 1
+        num_graded_drafts = (
+            torch.full_like(correct_len, gamma)
+            if layout is None
+            else torch.clamp(layout.verify_lens - 1, max=gamma)
+        )
+        self._acceptance_estimator.observe(
+            features=self._draft_feature,
+            num_correct_drafts=(
+                correct_len if cap_trim_lens is None else correct_len + cap_trim_lens
+            ),
+            num_graded_drafts=num_graded_drafts,
+        )
+
+    def _plan_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        prefix_lens: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], Optional[int], Optional[RaggedVerifyLayout]]:
+        """(confidence, verify token budget, layout) of this step; a None layout
+        verifies every draft. As for DSPARK, every TP rank computes the same
+        confidence from the same draft, and the planner broadcasts the lengths."""
+        if self._verify_planner is None:
+            return None, None, None
+        confidence = self._draft_confidence
+        verify_token_budget = self._verify_planner.resolve_verify_token_budget(
+            draft_input=draft_input,
+            confidence=confidence,
+            prefix_lens=prefix_lens,
+            req_pool_indices=batch.req_pool_indices,
+        )
+        layout = self._verify_planner.schedule_layout(
+            req_pool_indices=batch.req_pool_indices,
+            prefix_lens=prefix_lens,
+            device=self.device,
+            confidence=confidence,
+            budget=verify_token_budget,
+        )
+        return confidence, verify_token_budget, layout
+
+    def _run_compact_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        layout: RaggedVerifyLayout,
+        draft_tokens: torch.Tensor,
+        verify_window: VerifyWindow,
+    ):
+        """Verify only verify_lens[i] rows of request i. The logits (still on
+        the vocabulary shard when the gather is deferred) and hidden states
+        come back in the [bs * block_size] layout."""
+        target_out, _ = self._verify_executor.run_compact(
+            batch=batch,
+            layout=layout,
+            draft_block_ids=draft_tokens,
+            draft_tokens=draft_tokens[:, 1:],
+            bs=int(draft_tokens.shape[0]),
+            device=self.device,
+            verify_window=verify_window,
+        )
+        return target_out
+
+    def _observe_decode_step(
+        self,
+        *,
+        batch: ScheduleBatch,
+        layout: Optional[RaggedVerifyLayout],
+        confidence: Optional[torch.Tensor],
+        verify_token_budget: Optional[int],
+        prefix_lens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        accept_len: torch.Tensor,
+        cap_trim_lens: Optional[torch.Tensor],
+        bonus: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        planner = self._verify_planner
+        decision = None if planner is None else planner.take_budget_decision()
+        predicted_step_seconds = (
+            None if decision is None else decision.predicted_step_seconds
+        )
+        num_verify_tokens = (
+            draft_tokens.numel() if layout is None else layout.graph_num_tokens
+        )
+        self._info_dumper.observe_decode_step(
+            DecodeStepObservation(
+                forward_ct=int(batch.forward_iter),
+                bs=int(draft_tokens.shape[0]),
+                mode=self._info_dumper.mode_value,
+                budget=verify_token_budget,
+                lag_steps=None if planner is None else planner.lag_steps,
+                num_verify_tokens=num_verify_tokens,
+                verify_tokens_local=int(batch.spec_verify_tier_num_tokens),
+                verify_tokens_dp_synced=-1,
+                verify_tokens_graph_key=num_verify_tokens,
+                predicted_step_ms=(
+                    None
+                    if predicted_step_seconds is None
+                    else predicted_step_seconds * 1e3
+                ),
+                predicted_theta=None if decision is None else decision.predicted_theta,
+                verify_lens=None if layout is None else layout.verify_lens,
+                confidence=confidence,
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens[:, 1:],
+                bonus_tokens=bonus,
+                correct_len=accept_len,
+                cap_trim_lens=(
+                    torch.zeros_like(commit_lens)
+                    if cap_trim_lens is None
+                    else cap_trim_lens
+                ),
+                commit_lens=commit_lens,
+                rids=[req.rid for req in batch.reqs],
+            )
         )

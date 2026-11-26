@@ -16,10 +16,10 @@
 """Inference-only MiniCPM-o model compatible with HuggingFace weights."""
 
 import math
+from array import array
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.nn.utils.parametrize as P
@@ -39,22 +39,16 @@ from transformers.models.whisper.modeling_whisper import (
 
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalInputs,
-    flatten_nested_list,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
-from sglang.srt.models.minicpmv import MiniCPMBaseModel, Resampler2_5
+from sglang.srt.models.minicpmv import MiniCPMBaseModel
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import get_device, logger
+from sglang.srt.utils import flatten_nested_list, logger
 
 try:
     # `LogitsWarper` was removed in transformers v4.48 (merged into
@@ -726,66 +720,6 @@ class ConditionalChatTTS(PreTrainedModel):
         return past_key_values
 
     @torch.inference_mode()
-    def prefill_audio_ids(
-        self,
-        input_ids: torch.Tensor,
-        past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
-        streaming_tts_text_mask=None,
-        add_audio_bos: bool = True,
-    ):
-        """Prefill a chunk of audio ids to the model. Used in sliding-window long audio generation.
-        Specifically, prefill many audio ids (typically from last window) to the model in the new window.
-
-        Args:
-            input_ids (torch.Tensor): (1, seq_len, num_vq) Audio input token ids.
-            past_key_values (List[Tuple[torch.Tensor, torch.Tensor]]): Past key values for attention mechanism.
-        """
-        assert input_ids.shape[0] == 1
-        assert past_key_values is not None
-
-        code_emb = [self.emb_code[i](input_ids[:, :, i]) for i in range(self.num_vq)]
-        inputs_embeds = torch.stack(code_emb, 3).sum(3)  # [1,seq_len,768]
-        input_len = input_ids.shape[1]
-
-        if add_audio_bos:
-            narrowed_input_ids = torch.tensor(
-                [[self.audio_bos_token_id]], dtype=torch.long, device=self.device
-            )
-            bos_inputs_embeds = self.emb_text(narrowed_input_ids)
-            inputs_embeds = torch.cat([bos_inputs_embeds, inputs_embeds], dim=1)
-            input_len += 1
-
-        past_key_values_length = past_key_values[0][0].shape[2]
-        position_ids = torch.arange(
-            past_key_values_length,
-            past_key_values_length + input_len,
-            dtype=torch.long,
-            device=self.device,
-        ).unsqueeze(0)
-
-        cache_position = position_ids.clone()
-        causal_mask = make_streaming_chunk_mask_generation(
-            inputs_embeds=inputs_embeds,
-            past_seen_tokens=past_key_values[0][0].shape[2],
-            streaming_tts_text_mask=streaming_tts_text_mask,
-            streaming_reserved_length=self.streaming_text_reserved_len,
-            streaming_text_chunk_size=self.streaming_text_chunk_size,
-        )  # [1, 1, 1, past_key_values_length + input_len]
-
-        # Model forward
-        outputs: BaseModelOutputWithPast = self.model(
-            attention_mask=causal_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=True,
-            output_attentions=False,
-            cache_position=cache_position,
-        )
-        past_key_values = outputs.past_key_values
-        return past_key_values
-
-    @torch.inference_mode()
     def generate(
         self,
         input_ids: torch.Tensor,
@@ -1053,43 +987,6 @@ class ConditionalChatTTS(PreTrainedModel):
             finished=finish.all(),
         )
 
-    @torch.inference_mode()
-    def decode_to_mel_specs(
-        self,
-        result_list: List[torch.Tensor],
-    ):
-        """Decode discrete audio codes to mel spectrograms.
-
-        Borrowed from `https://github.com/2noise/ChatTTS/blob/main/ChatTTS/core.py`
-
-        Args:
-            result_list (List[torch.Tensor]): Audio codes output from `generate`.
-
-        Returns:
-            torch.Tensor: Mel spectrograms.
-        """
-
-        decoder = self.dvae
-        max_x_len = -1
-        if len(result_list) == 0:
-            return np.array([], dtype=np.float32)
-        for result in result_list:
-            if result.size(0) > max_x_len:
-                max_x_len = result.size(0)
-        batch_result = torch.zeros(
-            (len(result_list), result_list[0].size(1), max_x_len),
-            dtype=result_list[0].dtype,
-            device=result_list[0].device,
-        )
-        for i in range(len(result_list)):
-            src = result_list[i]
-            batch_result[i].narrow(1, 0, src.size(0)).copy_(src.permute(1, 0))
-            del src
-
-        mel_specs = decoder(batch_result)
-        del batch_result
-        return mel_specs
-
 
 # Copied from transformers.models.whisper.modeling_whisper.WhisperEncoderLayer and add use_cache for streaming inference
 class MiniCPMWhisperEncoderLayer(nn.Module):
@@ -1188,7 +1085,6 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
 
 # Copied from from transformers.models.whisper.modeling_whisper.WhisperEncoder and add use_cache for streaming inference
 class MiniCPMWhisperEncoder(WhisperEncoder):
-
     def __init__(self, config: WhisperConfig):
         super().__init__(config)
         self.layers = nn.ModuleList(
@@ -1355,9 +1251,9 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
 
         # check if head_mask has a correct number of layers specified if desired
         if head_mask is not None:
-            assert head_mask.size()[0] == (
-                len(self.layers)
-            ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+            assert head_mask.size()[0] == (len(self.layers)), (
+                f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+            )
 
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -1457,9 +1353,9 @@ class MiniCPMO(MiniCPMBaseModel):
         logger.info("TTS is disabled for now")
         if self.config.init_tts:
             # print("tts enabled")
-            assert (
-                _tts_deps
-            ), "please make sure vector_quantize_pytorch and vocos are installed."
+            assert _tts_deps, (
+                "please make sure vector_quantize_pytorch and vocos are installed."
+            )
             self.tts = self.init_tts_module()
 
     def init_tts_module(self):
@@ -1499,27 +1395,7 @@ class MiniCPMO(MiniCPMBaseModel):
 
         return model
 
-    def init_resampler(
-        self,
-        embed_dim: int,
-        vision_dim: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> nn.Module:
-        with set_default_torch_dtype(torch.float16):
-            # The resampler in 2.6 remains consistent with the one in 2.5.
-            resampler = Resampler2_5(
-                num_queries=self.config.query_num,
-                embed_dim=embed_dim,
-                num_heads=embed_dim // 128,
-                kv_dim=vision_dim,
-                quant_config=quant_config,
-                prefix=prefix,
-            )
-
-        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
-
-    def pad_input_ids(self, input_ids: List[int], mm_input: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_input: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = mm_input.im_start_id
         im_end_id: int = mm_input.im_end_id
@@ -1532,11 +1408,13 @@ class MiniCPMO(MiniCPMBaseModel):
             (mm_input.audio_start_id, mm_input.audio_end_id),
         ]
         data_start_token_ids = [im_start_id, mm_input.audio_start_id]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(
-            data_token_pairs=data_token_pairs, data_start_token_ids=data_start_token_ids
-        )
 
-        return pattern.pad_input_tokens(input_ids, mm_input)
+        return pad_mm_token_pairs(
+            input_ids,
+            mm_input,
+            data_token_pairs=data_token_pairs,
+            data_start_token_ids=data_start_token_ids,
+        )
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         """
@@ -1806,49 +1684,6 @@ class MiniCPMO(MiniCPMBaseModel):
 
         return audio_embs
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
-            result = torch.cat([item.feature for item in items])
-            return result.reshape(-1, result.shape[-1])
-
-        # list of tensors
-        pixel_values = flatten_nested_list([item.feature for item in items])
-        tgt_sizes = torch.stack(
-            flatten_nested_list([item.tgt_size for item in items]), dim=0
-        )
-        assert len(pixel_values) == tgt_sizes.shape[0]
-
-        device = self.vpm.embeddings.position_embedding.weight.device
-        dtype = self.vpm.embeddings.position_embedding.weight.dtype
-        all_pixel_values_lst = [
-            i.flatten(end_dim=1).permute(1, 0) for i in pixel_values
-        ]
-
-        max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
-        assert isinstance(max_patches, int)
-        all_pixel_values = torch.nn.utils.rnn.pad_sequence(
-            all_pixel_values_lst, batch_first=True, padding_value=0.0
-        )
-
-        B, L, _ = all_pixel_values.shape
-        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
-        patch_attn_mask = torch.zeros(
-            (B, 1, max_patches), dtype=torch.bool, device=device
-        )
-
-        tgt_sizes_tensor = tgt_sizes.clone().to(device=patch_attn_mask.device)
-        mask_shapes = tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]
-        patch_attn_mask[:, 0, :] = torch.arange(
-            patch_attn_mask.size(2), device=patch_attn_mask.device
-        ).unsqueeze(0) < mask_shapes.unsqueeze(1)
-
-        vision_embedding = self.vpm(
-            all_pixel_values.type(dtype),
-            patch_attention_mask=patch_attn_mask,
-            tgt_sizes=tgt_sizes,
-        )
-        return self.resampler(vision_embedding, tgt_sizes)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1878,7 +1713,6 @@ class MiniCPMO(MiniCPMBaseModel):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-
             if "rotary_emb.inv_freq~" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

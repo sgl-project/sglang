@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace sglang {
+
 namespace ngram {
 
 class Ngram {
@@ -79,12 +81,10 @@ class Ngram {
     match_state_.clear();
   }
 
-  const Param& param() const {
-    return param_;
-  }
-
  private:
   void insertWorker();
 };
 
 }  // namespace ngram
+
+}  // namespace sglang

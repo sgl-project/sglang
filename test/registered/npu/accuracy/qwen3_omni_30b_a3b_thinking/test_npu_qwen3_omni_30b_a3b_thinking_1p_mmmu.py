@@ -9,7 +9,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
+    est_time=4800,
     suite="",
     nightly=True,
     disabled="performance testcase",
@@ -23,8 +23,6 @@ ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "200",
     "HCCL_BUFFSIZE": "400",
 }
 
@@ -63,7 +61,7 @@ OTHER_ARGS = [
     2,
     "--mem-fraction-static",
     0.87,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     5,
     15,
@@ -82,6 +80,9 @@ OTHER_ARGS = [
     162,
     "--dtype",
     "bfloat16",
+    "--enable-prefill-delayer",
+    "--prefill-delayer-max-delay-passes",
+    "200",
 ]
 
 

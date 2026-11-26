@@ -24,8 +24,13 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     create_dcp_kv_indices,
     update_kv_lens_and_indices,
 )
-from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
+from sglang.srt.layers.dcp.layout import (
+    dcp_local_row,
+    filter_dcp_local_chunk_kv_indices,
+    update_local_kv_lens_for_dcp,
+)
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_device, get_parallel
 
 
@@ -41,6 +46,8 @@ def prepare_decode_context_parallel_metadata(
     kv_cache_dtype,
     kv_cache_device,
     create_chunked_prefix_cache_kv_indices_fn,
+    interleave_size: int = 1,
+    allocate_kv_buffer: bool = True,
 ) -> Optional[DecodeContextParallelMetadata]:
     parallel = get_parallel()
     if not parallel.dcp_enabled:
@@ -109,20 +116,38 @@ def prepare_decode_context_parallel_metadata(
         extend_prefix_lens_sum,
         parallel.dcp_size,
     )
-    dcp_local_prefix_kv_indices = (
-        dcp_prefix_kv_indices[
-            dcp_prefix_kv_indices % parallel.dcp_size == parallel.dcp_rank
-        ]
-        // parallel.dcp_size
-    )
-    dcp_kv_buffer = torch.empty(
-        (
-            seq_lens_sum,
-            *kv_buffer_shape[1:],
-        ),
-        dtype=kv_cache_dtype,
-        device=kv_cache_device,
-    )
+    # `get_mla_kv_buffer` is a read door with the caller-translates contract.
+    runner_ids = get_attn_backend().runner_ids
+    if interleave_size == 1:
+        # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
+        dcp_local_prefix_kv_indices = runner_ids.translate_dcp_read_ids(
+            dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
+        )
+    else:
+        # Interleaved pools are written rank-local, never through translated ids.
+        assert runner_ids is None or not runner_ids.is_translating, (
+            f"interleave_size={interleave_size} expects a rank-local pool, "
+            "but the KV ids are being translated"
+        )
+        owned_kv_indices = filter_dcp_local_chunk_kv_indices(
+            dcp_prefix_kv_indices,
+            torch.zeros(len(extend_prefix_lens_cpu), dtype=torch.int64),
+            torch.as_tensor(extend_prefix_lens_cpu, dtype=torch.int64),
+            interleave_size=interleave_size,
+        )
+        dcp_local_prefix_kv_indices = dcp_local_row(
+            owned_kv_indices, parallel.dcp_size, interleave_size
+        )
+    dcp_kv_buffer = None
+    if allocate_kv_buffer:
+        dcp_kv_buffer = torch.empty(
+            (
+                seq_lens_sum,
+                *kv_buffer_shape[1:],
+            ),
+            dtype=kv_cache_dtype,
+            device=kv_cache_device,
+        )
     attn_dcp_metadata = DecodeContextParallelMetadata(
         dcp_kv_indptr=dcp_kv_indptr,
         dcp_kv_buffer=dcp_kv_buffer,
@@ -140,7 +165,14 @@ def plan_dcp_decode_metadata(
     init_metadata_replay: bool,
     fast_decode_kwargs: dict,
     bs: int,
-):
+) -> int:
+    """Shard `kv_indices` to this DCP rank in place; return the shard's length.
+
+    `kv_lens` / `kv_indptr` are rewritten to the per-rank lengths, and this
+    rank's ids (`loc % dcp_size == dcp_rank`) are compacted into
+    `kv_indices[:total_local_len]`, still WIDENED. The returned length bounds the
+    prefix the caller hands to `RunnerIds.translate_dcp_read_ids`.
+    """
     parallel = get_parallel()
     local_kv_lens = kv_lens.clone()
     update_local_kv_lens_for_dcp(local_kv_lens)
@@ -186,3 +218,4 @@ def plan_dcp_decode_metadata(
     kv_indices[:total_local_len] = local_kv_indices[:total_local_len]
     kv_lens.copy_(local_kv_lens)
     kv_indptr[: bs + 1] = local_kv_lens_cumsum[: bs + 1]
+    return total_local_len

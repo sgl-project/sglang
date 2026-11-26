@@ -10,10 +10,9 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
-    suite="",
+    est_time=4800,
+    suite="full-acc-test-4-npu-a3",
     nightly=True,
-    disabled="accuracy testcase",
 )
 
 QWEN3_32B_ENVS = {
@@ -23,8 +22,6 @@ QWEN3_32B_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "100",
     "SGLANG_NPU_USE_DEEPGEMM": "1",
 }
 
@@ -63,7 +60,7 @@ QWEN3_32B_OTHER_ARGS = [
     4,
     "--mem-fraction-static",
     0.845,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     16,
     32,
     64,
@@ -84,6 +81,9 @@ QWEN3_32B_OTHER_ARGS = [
     "qwen3",
     "--tool-call-parser",
     "qwen",
+    "--enable-prefill-delayer",
+    "--prefill-delayer-max-delay-passes",
+    "100",
 ]
 
 

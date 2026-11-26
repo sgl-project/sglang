@@ -5,16 +5,29 @@ import logging
 import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
+from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
+    KVTransferEngine,
+    TransferIntent,
+)
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+)
+from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_local_ip_auto
 
 if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
+    pass
 
 logger = logging.getLogger(__name__)
 
+# Mooncake's ERR_ADDRESS_OVERLAPPED: the region is already registered.
+_ERR_ADDRESS_OVERLAPPED = -7
+
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
-_mooncake_transfer_engine: Optional[MooncakeTransferEngine] = None
+_mooncake_transfer_engine: Optional[KVTransferEngine] = None
 
 
 def parse_ib_device_config(
@@ -101,7 +114,7 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
     )
 
 
-class MooncakeTransferEngine:
+class MooncakeTransferEngine(KVTransferEngine):
     """Shared Mooncake transfer engine for RDMA/transfer operations."""
 
     def __init__(
@@ -137,42 +150,55 @@ class MooncakeTransferEngine:
             self.hostname, self.engine.get_rpc_port()
         ).to_host_port_str()
 
-    def register(self, ptr, length):
+    def register(self, ptr, length) -> None:
         try:
             ret_value = self.engine.register_memory(ptr, length)
-        except Exception:
-            # Mark register as failed
-            ret_value = -1
+        except Exception as exc:
+            raise RuntimeError("Mooncake memory registration failed") from exc
 
         if ret_value != 0:
-            logger.debug("Mooncake memory registration %s failed.", ptr)
+            raise RuntimeError(f"Mooncake memory registration failed (ret={ret_value})")
 
-    def deregister(self, ptr):
+    def deregister(self, ptr) -> None:
         try:
             ret_value = self.engine.unregister_memory(ptr)
-        except Exception:
-            # Mark deregister as failed
-            ret_value = -1
+        except Exception as exc:
+            raise RuntimeError("Mooncake memory deregistration failed") from exc
 
         if ret_value != 0:
-            logger.debug("Mooncake memory deregistration %s failed.", ptr)
+            raise RuntimeError(
+                f"Mooncake memory deregistration failed (ret={ret_value})"
+            )
 
-    def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
+    def batch_register(self, ptrs: List[int], lengths: List[int]) -> None:
         """Batch register multiple memory regions."""
+        if not hasattr(self.engine, "batch_register_memory"):
+            raise RuntimeError(
+                "Mooncake's batch register requires a newer version of "
+                "mooncake-transfer-engine. Please upgrade Mooncake."
+            )
+
+        start = min(ptrs)
+        end = max(ptr + length for ptr, length in zip(ptrs, lengths))
+        what = (
+            f"{len(ptrs)} memory regions ({sum(lengths)} bytes in "
+            f"[{start:#x}, {end:#x})) on device {self.ib_device!r}"
+        )
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
-        except Exception:
-            # Mark batch register as failed
-            ret_value = -1
-            if not hasattr(self.engine, "batch_register_memory"):
-                raise RuntimeError(
-                    "Mooncake's batch register requires a newer version of "
-                    "mooncake-transfer-engine. Please upgrade Mooncake."
-                )
+        except Exception as exc:
+            raise RuntimeError(f"Mooncake failed to register {what}") from exc
 
-        if ret_value != 0:
-            logger.debug("Mooncake batch memory registration failed.")
-        return ret_value
+        if ret_value == _ERR_ADDRESS_OVERLAPPED:
+            # A resume after a failed deregister re-registers live regions; not fatal.
+            logger.error(
+                f"Mooncake reports {what} already registered (ret={ret_value})"
+            )
+        elif ret_value != 0:
+            raise RuntimeError(
+                f"Mooncake failed to register {what} (ret={ret_value}); "
+                "see the Mooncake log above for the cause"
+            )
 
     def batch_deregister(self, ptrs: List[int]) -> int:
         """Batch deregister multiple memory regions."""
@@ -202,18 +228,27 @@ class MooncakeTransferEngine:
             # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
             protocol = envs.MOONCAKE_PROTOCOL.get()
 
-        ret_value = self.engine.initialize(
-            hostname,
-            "P2PHANDSHAKE",
-            protocol,
-            device_name if device_name is not None else "",
+        ret_value = run_with_deadline(
+            lambda: self.engine.initialize(
+                hostname,
+                "P2PHANDSHAKE",
+                protocol,
+                device_name if device_name is not None else "",
+            ),
+            timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
+            what=f"Mooncake TransferEngine.initialize({hostname!r}, {protocol!r}, {device_name!r})",
         )
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
 
     def transfer_sync(
-        self, session_id: str, buffer: int, peer_buffer_address: int, length: int
+        self,
+        session_id: str,
+        buffer: int,
+        peer_buffer_address: int,
+        length: int,
+        intent: Optional[TransferIntent] = None,
     ) -> int:
         """Synchronously transfer data to the specified address."""
         try:
@@ -239,8 +274,12 @@ class MooncakeTransferEngine:
         buffers: List[int],
         peer_buffer_addresses: List[int],
         lengths: List[int],
+        intent: Optional[TransferIntent] = None,
     ) -> int:
-        """Synchronously transfer data to the specified addresses in batches."""
+        """Synchronously transfer data to the specified addresses in batches.
+
+        Classic TE has no QoS lanes, so `intent` is ignored.
+        """
         try:
             ret = self.engine.batch_transfer_sync_write(
                 session_id, buffers, peer_buffer_addresses, lengths
@@ -281,30 +320,67 @@ def init_mooncake_transfer_engine(
     hostname: str,
     gpu_id: Optional[int] = None,
     ib_device: Optional[str] = None,
-) -> MooncakeTransferEngine:
+) -> KVTransferEngine:
     """
-    Initialize the shared MooncakeTransferEngine. Note: if already
-    initialized with the same (hostname, gpu_id, ib_device), returns existing
-    instance. Call from parallel_state when model parallel is set up and
-    mooncake transfer is needed.
+    Initialize the shared transfer engine selected by
+    SGLANG_MOONCAKE_TRANSFER_ENGINE. Note: if already initialized, returns the
+    existing instance. Call from parallel_state when model parallel is set up
+    and mooncake transfer is needed.
     """
     global _mooncake_transfer_engine
     if _mooncake_transfer_engine is not None:
         return _mooncake_transfer_engine
-    _mooncake_transfer_engine = MooncakeTransferEngine(
-        hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
-    )
+    backend = envs.SGLANG_MOONCAKE_TRANSFER_ENGINE.get()
+    if backend == "te":
+        _mooncake_transfer_engine = MooncakeTransferEngine(
+            hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
+        )
+    elif backend == "tent":
+        from sglang.srt.distributed.device_communicators.tent_transfer_engine import (
+            TentTransferEngine,
+        )
+
+        _mooncake_transfer_engine = TentTransferEngine(
+            hostname=hostname,
+            ib_device=get_ib_devices_for_gpu(
+                ib_device, gpu_id if gpu_id is not None else 0
+            ),
+            gpu_id=gpu_id,
+        )
+    else:
+        raise ValueError(
+            f"SGLANG_MOONCAKE_TRANSFER_ENGINE must be 'te' or 'tent', got {backend!r}"
+        )
     return _mooncake_transfer_engine
 
 
-def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:
-    """Return the shared MooncakeTransferEngine if initialized, else None."""
+def get_mooncake_transfer_engine() -> Optional[KVTransferEngine]:
+    """Return the shared transfer engine if initialized, else None."""
     return _mooncake_transfer_engine
 
 
-def maybe_init_shared_mooncake_transfer_engine(
-    *, server_args: ServerArgs, gpu_id: int
-) -> None:
+def _hicache_mooncake_store_uses_rdma() -> bool:
+    """MooncakeStore reuses the shared engine only with protocol "rdma"; for any
+    other protocol it builds its own, so creating the shared one is wasted."""
+    try:
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            load_mooncake_store_config,
+        )
+
+        extra_config = HybridCacheController.parse_storage_backend_extra_config(
+            get_memory().hicache_storage_backend_extra_config
+        )[0]
+        return load_mooncake_store_config(extra_config).protocol == "rdma"
+    except Exception as e:
+        # Keep the shared engine; the store reports a bad config when it starts.
+        logger.debug("Could not resolve the HiCache Mooncake protocol: %s", e)
+        return True
+
+
+def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
     """
     Need MooncakeTransferEngine when:
     1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
@@ -313,39 +389,50 @@ def maybe_init_shared_mooncake_transfer_engine(
     """
     use_mooncake_te = (
         (
-            server_args.disaggregation_mode != "null"
-            and server_args.disaggregation_transfer_backend == "mooncake"
+            get_disagg().disaggregation_mode != "null"
+            and get_disagg().disaggregation_transfer_backend == "mooncake"
         )
         or (
-            server_args.enable_hierarchical_cache
-            and server_args.hicache_storage_backend == "mooncake"
+            get_memory().enable_hierarchical_cache
+            and get_memory().hicache_storage_backend == "mooncake"
             and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
+            and _hicache_mooncake_store_uses_rdma()
         )
         or (
-            server_args.encoder_only
-            and server_args.encoder_transfer_backend == "mooncake"
+            get_disagg().encoder_only
+            and get_disagg().encoder_transfer_backend == "mooncake"
         )
         or (
-            server_args.language_only
-            and server_args.encoder_transfer_backend == "mooncake"
+            get_disagg().language_only
+            and get_disagg().encoder_transfer_backend == "mooncake"
         )
         or (
-            server_args.enable_elastic_expert_backup
-            and server_args.elastic_ep_backend is not None
+            get_exec().moe.enable_elastic_expert_backup
+            and get_exec().moe.elastic_ep_backend is not None
         )
-        or server_args.elastic_ep_backend == "mooncake"
+        or get_exec().moe.elastic_ep_backend == "mooncake"
     )
 
     if use_mooncake_te:
+        if envs.SGLANG_MOONCAKE_TRANSFER_ENGINE.get() == "tent" and (
+            get_exec().moe.enable_elastic_expert_backup
+            or get_exec().moe.elastic_ep_backend is not None
+        ):
+            raise ValueError(
+                "SGLANG_MOONCAKE_TRANSFER_ENGINE=tent supports PD and encoder "
+                "disaggregation only; elastic EP and expert backup drive the "
+                "classic mooncake.engine object directly."
+            )
         init_mooncake_transfer_engine(
             hostname=get_local_ip_auto(),
             gpu_id=gpu_id,
             ib_device=(
-                server_args.disaggregation_ib_device or server_args.mooncake_ib_device
+                get_disagg().disaggregation_ib_device
+                or get_exec().moe.mooncake_ib_device
             ),
         )
 
-        if server_args.elastic_ep_backend == "mooncake":
+        if get_exec().moe.elastic_ep_backend == "mooncake":
             try:
                 from mooncake.pg import set_transfer_engine
             except ImportError as e:

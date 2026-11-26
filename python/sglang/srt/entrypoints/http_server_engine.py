@@ -5,13 +5,20 @@ from typing import List, Optional, Tuple
 import requests
 import torch
 
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
+from sglang.srt.utils.auth import admin_auth_headers, bearer_auth_headers
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+    # Resolve here, not in the child: the pipeline probes the device, and a
+    # forked child cannot re-initialize CUDA if this process already has. The
+    # child's gate then finds nothing left to do.
+    server_args.resolve_once()
 
     p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
@@ -20,14 +27,17 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     timeout = 300.0  # Increased timeout to 5 minutes for downloading large models
     start_time = time.perf_counter()
 
-    ssl_verify = server_args.ssl_verify()
+    ssl_verify = ssl_verify_of(server_args)
+    # The adapter's own configuration, not the bags: this runs in the parent,
+    # and the record it was handed is published only inside the server child.
+    cfg = resolving_view(server_args)
 
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
             try:
                 headers = {
                     "Content-Type": "application/json; charset=utf-8",
-                    "Authorization": f"Bearer {server_args.api_key}",
+                    "Authorization": f"Bearer {cfg.api_key}",
                 }
                 response = session.get(
                     f"{base_url}/health_generate", headers=headers, verify=ssl_verify
@@ -55,9 +65,11 @@ class HttpServerEngineAdapter(EngineBase):
 
     def __init__(self, **kwargs):
         self.server_args = ServerArgs(**kwargs)
-        print(
-            f"Launch HttpServerEngineAdapter at: {self.server_args.host}:{self.server_args.port}"
-        )
+        # This process launches the server as a child and never publishes, so
+        # every read here is of the record it just built -- a bag read would
+        # either fail closed or answer for an unrelated engine in the process.
+        cfg = resolving_view(self.server_args)
+        print(f"Launch HttpServerEngineAdapter at: {cfg.host}:{cfg.port}")
         self.process = launch_server_process(self.server_args)
 
     def _make_request(self, endpoint: str, payload: Optional[dict] = None):
@@ -69,11 +81,28 @@ class HttpServerEngineAdapter(EngineBase):
             The JSON response from the server
         """
         url = f"{self.server_args.url()}/{endpoint}"
+        cfg = resolving_view(self.server_args)
+        # Every endpoint but /generate is an admin one, which takes the admin key when set.
+        headers = (
+            bearer_auth_headers(cfg.api_key)
+            if endpoint == "generate"
+            else admin_auth_headers(cfg.admin_api_key)
+            or bearer_auth_headers(cfg.api_key)
+        )
         response = requests.post(
-            url, json=payload or {}, verify=self.server_args.ssl_verify()
+            url,
+            json=payload or {},
+            headers=headers,
+            verify=ssl_verify_of(self.server_args),
         )
         response.raise_for_status()
         return response.json()
+
+    def begin_weight_update(self, selector: str = "all"):
+        return self._make_request("begin_weight_update", {"selector": selector})
+
+    def end_weight_update(self):
+        return self._make_request("end_weight_update")
 
     def update_weights_from_tensor(
         self,
@@ -92,7 +121,7 @@ class HttpServerEngineAdapter(EngineBase):
             {
                 "serialized_named_tensors": [
                     MultiprocessingSerializer.serialize(named_tensors, output_str=True)
-                    for _ in range(self.server_args.tp_size)
+                    for _ in range(resolving_view(self.server_args).tp_size)
                 ],
                 "load_format": load_format,
                 "flush_cache": flush_cache,

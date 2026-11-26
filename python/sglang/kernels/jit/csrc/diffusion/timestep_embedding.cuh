@@ -17,9 +17,9 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
-namespace sglang_timestep_embedding {
+namespace sglang {
 
-namespace {
+namespace timestep_embedding {
 
 constexpr int kVec = 4;  // 16B float vector store
 
@@ -120,8 +120,6 @@ inline void launch_timestep_embedding(
   }
 }
 
-}  // namespace
-
 template <typename TIn>
 void timestep_embedding(
     tvm::ffi::TensorView input,
@@ -140,10 +138,10 @@ void timestep_embedding(
   TensorMatcher({B})  // input
       .with_strides({1})
       .with_dtype<TIn>()
-      .template with_device<kDLCUDA>(device)
+      .template with_device<kDLGPU>(device)
       .verify(input);
 
-  TensorMatcher({B, D}).with_strides({D, 1}).with_dtype<float>().template with_device<kDLCUDA>(device).verify(output);
+  TensorMatcher({B, D}).with_strides({D, 1}).with_dtype<float>().template with_device<kDLGPU>(device).verify(output);
 
   RuntimeCheck(D.unwrap() == dim, "Output dim mismatch: ", D.unwrap(), " vs ", dim);
   RuntimeCheck(dim % 8 == 0, "dim must align to 8, got ", dim);
@@ -151,4 +149,6 @@ void timestep_embedding(
   launch_timestep_embedding<TIn>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
 }
 
-}  // namespace sglang_timestep_embedding
+}  // namespace timestep_embedding
+
+}  // namespace sglang

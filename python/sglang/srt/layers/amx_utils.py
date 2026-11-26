@@ -125,7 +125,12 @@ def _init_amx_conv_state(conv_state):
 
 
 def _amx_process_weight_after_loading(
-    module, weight_names, transpose_dims=None, qweight_packed_method=None
+    module,
+    weight_names,
+    transpose_dims=None,
+    qweight_packed_method=None,
+    *,
+    is_symmetric=False,
 ) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
@@ -133,14 +138,15 @@ def _amx_process_weight_after_loading(
     device = devices.pop()
 
     if transpose_dims:
-        assert len(weight_names) == len(
-            transpose_dims
-        ), "len(weight_names) should be equal to len(transpose_dims)"
+        assert len(weight_names) == len(transpose_dims), (
+            "len(weight_names) should be equal to len(transpose_dims)"
+        )
 
     module.use_intel_amx_backend = (
         device == torch.device("cpu") and cpu_has_amx_support()
     )
 
+    is_conv_weight = False
     if qweight_packed_method is None:
         for i, weight_name in enumerate(weight_names):
             weight_tensor = getattr(module, weight_name)
@@ -181,6 +187,7 @@ def _amx_process_weight_after_loading(
             qzeros_tensor,
             scales_tensor,
             CPUQuantAlgo.AWQ if qweight_packed_method == "awq" else CPUQuantAlgo.GPTQ,
+            is_symmetric,
         )
         packed_qweight = torch.nn.Parameter(
             qweight.detach(),

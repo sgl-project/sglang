@@ -21,6 +21,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -29,7 +30,7 @@
 #include <cuda_bf16.h>
 #include <utility>
 
-namespace {
+namespace sglang {
 
 using bf16_t = __nv_bfloat16;
 
@@ -419,7 +420,7 @@ struct MmaComputer {
           }
         }
       }
-      ::arrive_barrier(smem_barrier + 1 + stage_idx * 2);
+      arrive_barrier(smem_barrier + 1 + stage_idx * 2);
       stage_idx += 1;
       phase_bit = stage_idx == stage_cnt ? phase_bit ^ 1 : phase_bit;
       stage_idx = stage_idx == stage_cnt ? 0 : stage_idx;
@@ -593,9 +594,9 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
   dim3 grid(cta_m_cnt, cta_n_cnt, 1);
   dim3 block_size(256);
 
-  auto kernel = fused_a_gemm_kernel<batch_size, gemm_m, gemm_k, tile_m, tile_n, tile_k, stage_cnt>;
-  if (smem_bytes >= (48 * 1024)) {
-    host::RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+  constexpr auto kernel = fused_a_gemm_kernel<batch_size, gemm_m, gemm_k, tile_m, tile_n, tile_k, stage_cnt>;
+  if constexpr (smem_bytes >= (48 * 1024)) {
+    host::runtime::set_max_dynamic_smem_per_device<kernel>(device.device_id, smem_bytes);
   }
   host::LaunchKernel(grid, block_size, device, smem_bytes).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b, gemm_n);
 }
@@ -647,4 +648,4 @@ struct DSV3FusedAGemmKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

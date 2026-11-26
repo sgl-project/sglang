@@ -1,32 +1,33 @@
+import glob
+import inspect
+import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import sys
 import threading
 import time
+from datetime import datetime
 from functools import wraps
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
     generate_gsm8k_dataset,
+    generate_gsm8k_shared_prefix_dataset,
     generate_mm_dataset,
     generate_random_dataset,
     save_jsonl,
 )
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
-    ACTIVE_TEST_CLASS,
-    CONFIGMAP_NAME,
-    NAMESPACE,
-    SERVICE_PORT,
+    PdMixNodeMixin,
+    PdSepNodeMixin,
     check_role,
-    launch_pd_mix_node,
-    launch_pd_separation_node,
-    launch_router,
-    query_configmap,
-    wait_for_prefill_decode_exit,
-    wait_server_ready,
+    kill_process_group,
 )
+from sglang.test.ascend.test_ascend_utils import maybe_start_hicache_storage_service
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -158,6 +159,9 @@ GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/yzgjhdxf/GLM-5-top64-pruned-gsm8k"
 )
 GLM_5_1_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.1-w4a8"
+GLM_5_2_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w4a8"
+GLM_5_2_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w8a8"
+GLM_5_3_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.3-w8a8"
 MINIMAX_M2_5_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
 )
@@ -171,8 +175,15 @@ MINIMAX_M2_5_EAGLE3_MODEL_PATH = (
 QWEN3_5_397B_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w8a8-mtp"
 )
-DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH = (
-    "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-w8a8-mtp"
+DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8"
+)
+DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Pro-0813-w4a8"
+)
+# DeepSeek-V4-Flash default model for Ascend 950 testcase
+DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-V4-Flash-0731"
 )
 QWEN3_5_397B_W4A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp"
@@ -181,6 +192,8 @@ KIMI_K2_6_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/Kimi-K2
 KIMI_K2_6_EAGLE3_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/lightseekorg/kimi-k2.6-eagle3"
 )
+KIMI_K3_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/sgl-npu/Kimi-K3-W4A8"
+KIMI_K3_DSPARK_MODEL_PATH = "/root/.cache/modelscope/hub/models/RadixArk/Kimi-K3-DSpark"
 GLM_4_6V_FLASH_MODEL_PATH = "/root/.cache/modelscope/hub/models/ZhipuAI/GLM-4.6V-Flash"
 QWEN3_VL_8B_THINKING_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Qwen/Qwen3-VL-8B-Thinking"
@@ -198,6 +211,9 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 
 # Timeouts and delays
 SERVER_INITIALIZATION_DELAY = 120
+BENCHMARK_STDOUT_DRAIN_GRACE = 10  # Grace seconds to wait for the direct child to exit after it drains stdout / exits
+BENCHMARK_STDOUT_IDLE_TIMEOUT = 300  # Idle timeout: no output for this long means the benchmark is stuck, then force-kill
+BENCHMARK_WATCHDOG_POLL_INTERVAL = 30  # Watchdog polling interval (seconds)
 
 # Test parameters
 PROMPTS_MULTIPLIER = 4
@@ -209,6 +225,21 @@ TPOT_TOLERANCE_HIGH = 1.02  # +2%
 TTFT_TOLERANCE = 1.02  # +2%
 E2E_TOLERANCE = 1.02  # +2%
 OUTPUT_TOKEN_THROUGHPUT_TOLERANCE = 0.98  # -2%
+REQUEST_THROUGHPUT_TOLERANCE = 0.98  # -2%
+
+
+def _get_spec_num_draft_tokens(other_args):
+    """Extract the value of --speculative-num-draft-tokens from server args."""
+    if not other_args:
+        return None
+    args = [str(arg) for arg in other_args]
+    if "--speculative-num-draft-tokens" not in args:
+        return None
+    idx = args.index("--speculative-num-draft-tokens")
+    if idx + 1 >= len(args):
+        return None
+    return int(args[idx + 1])
+
 
 # Package filtering keywords
 PACKAGE_FILTER_KEYWORDS = [
@@ -356,8 +387,23 @@ def run_bench_serving(
     repeat_rate=None,
     temperature=None,
     top_p=None,
+    gsp_num_groups=None,
+    gsp_prompts_per_group=None,
+    cache_report=False,
     env=None,
 ):
+    """Run sglang.bench_serving against a live server and parse its metrics.
+
+    With cache_report=True the returned metrics dict additionally carries
+    the server's hierarchical KV hit rates:
+      - cache_hit_rate_pct: overall KV hit rate across all tiers
+      - device_hit_rate_pct: L1 tier hit rate (device = GPU/NPU memory)
+      - host_hit_rate_pct: L2 tier hit rate (host = CPU memory / HiCache)
+      - storage_hit_rate_pct: L3 tier hit rate (HiCache storage backend)
+    Thresholds for these tiers are declared on the test case as the
+    min_hit_rate_pcts class attribute and enforced by assert_metrics,
+    which requires cache_report=True to have any values to check.
+    """
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_file = (
         "./bench_log.txt"
@@ -372,7 +418,7 @@ def run_bench_serving(
         cmd_args = [
             PYTHON_FOR_TEST_TOOL,
             "-m",
-            "sglang.bench_serving",
+            "sglang.benchmark.serving",
             "--host",
             host,
             "--port",
@@ -384,9 +430,9 @@ def run_bench_serving(
             "--dataset-name",
             dataset_name,
             "--gsp-num-groups",
-            "1",
+            str(gsp_num_groups) if gsp_num_groups else "1",
             "--gsp-prompts-per-group",
-            str(num_prompts),
+            str(gsp_prompts_per_group) if gsp_prompts_per_group else str(num_prompts),
             "--gsp-system-prompt-len",
             (
                 str(int((repeat_rate if repeat_rate is not None else 0.9) * input_len))
@@ -417,11 +463,17 @@ def run_bench_serving(
             cmd_args.extend(["--temperature", str(temperature)])
         if top_p is not None:
             cmd_args.extend(["--top-p", str(top_p)])
+        if seed:
+            cmd_args.extend(["--seed", str(seed)])
+        if warmup_requests:
+            cmd_args.extend(["--warmup-requests", str(warmup_requests)])
+        if cache_report:
+            cmd_args.append("--cache-report")
     else:
         cmd_args = [
             PYTHON_FOR_TEST_TOOL,
             "-m",
-            "sglang.bench_serving",
+            "sglang.benchmark.serving",
             "--host",
             host,
             "--port",
@@ -467,6 +519,9 @@ def run_bench_serving(
     # Run benchmark command and capture output
     metrics = {"mean_ttft": None, "mean_tpot": None, "total_tps": None}
 
+    # Launch the benchmark in its own session/process group so a dead server
+    # cannot wedge the run: on timeout we nuke the whole group (including any
+    # re-parented descendants) instead of waiting forever on its stdout.
     process = subprocess.Popen(
         cmd_args,
         stdout=subprocess.PIPE,
@@ -474,11 +529,59 @@ def run_bench_serving(
         text=True,
         bufsize=1,
         env=env,
+        start_new_session=True,
     )
+
+    reader_done = threading.Event()
+    # Timestamp of the last output line; the watchdog reads it to detect a
+    # silent/stuck benchmark.
+    last_activity = time.time()
+
+    def _kill_on_timeout():
+        while True:
+            # Direct child has exited, but stdout may still be held open by a
+            # grandchild; wait for the reader to drain within the grace period,
+            # otherwise force-kill the whole process group.
+            if process.poll() is not None:
+                if not reader_done.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE):
+                    logger.error(
+                        f"Benchmark stdout still open after process exit, "
+                        f"killing process group {process.pid}"
+                    )
+                    kill_process_group(process)
+                return
+            # stdout has drained, but the direct child may still be alive:
+            # give it a bounded time to exit, otherwise nuke the group.
+            if reader_done.is_set():
+                try:
+                    process.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE)
+                except subprocess.TimeoutExpired:
+                    logger.error(
+                        f"Benchmark {process.pid} still alive after stdout EOF, "
+                        f"killing process group {process.pid}"
+                    )
+                    kill_process_group(process)
+                return
+            # No output for too long while still alive -> likely hung.
+            idle = time.time() - last_activity
+            if idle > BENCHMARK_STDOUT_IDLE_TIMEOUT:
+                logger.error(
+                    f"Benchmark produced no output for {idle:.0f}s "
+                    f"(> {BENCHMARK_STDOUT_IDLE_TIMEOUT}s), "
+                    f"killing process group {process.pid}"
+                )
+                kill_process_group(process)
+                return
+            time.sleep(BENCHMARK_WATCHDOG_POLL_INTERVAL)
+
+    watchdog = threading.Thread(target=_kill_on_timeout, daemon=True)
+    watchdog.start()
+
     try:
         # Read output line by line
         with open(result_file, "a", encoding="utf-8") as f:
             for line in process.stdout:
+                last_activity = time.time()
                 if line.strip():
                     print(line, end="")
                 f.write(line)
@@ -501,6 +604,38 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 5:
                         metrics["mean_e2e_latency"] = parts[4]
+                elif "Accept length" in stripped_line:
+                    # Format: "Accept length:                           4.35"
+                    parts = stripped_line.split()
+                    if len(parts) >= 3:
+                        metrics["accept_length"] = parts[2]
+                elif stripped_line.startswith("Cache hit rate:"):
+                    # Overall KV hit rate, e.g. "Cache hit rate: 82.2%"
+                    parts = stripped_line.split()
+                    if len(parts) >= 4:
+                        metrics["cache_hit_rate_pct"] = parts[3].rstrip("%")
+                elif stripped_line.startswith("Device:") and stripped_line.endswith(
+                    "%"
+                ):
+                    # L1 (device KV cache) hit rate, e.g. "Device: 19.7%"
+                    parts = stripped_line.split()
+                    if len(parts) >= 2:
+                        metrics["device_hit_rate_pct"] = parts[1].rstrip("%")
+                elif stripped_line.startswith("Host:") and stripped_line.endswith("%"):
+                    # L2 (host HiCache) hit rate, e.g. "Host: 19.7%"
+                    parts = stripped_line.split()
+                    if len(parts) >= 2:
+                        metrics["host_hit_rate_pct"] = parts[1].rstrip("%")
+                elif stripped_line.startswith(
+                    ("Storage:", "Storage (")
+                ) and stripped_line.endswith("%"):
+                    # L3 (storage backend) hit rate, e.g. "Storage: 19.7%" or
+                    # "Storage (MooncakeStore): 19.7%" when the engine that
+                    # served the request has a storage backend configured.
+                    parts = stripped_line.split()
+                    if len(parts) >= 2:
+                        metrics["storage_hit_rate_pct"] = parts[-1].rstrip("%")
+        reader_done.set()
         process.wait()
         if process.returncode != 0:
             logger.error(
@@ -509,9 +644,9 @@ def run_bench_serving(
     except Exception as e:
         logger.error(f"Error running benchmark: {e}")
     finally:
+        reader_done.set()
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
-
     return metrics
 
 
@@ -568,6 +703,26 @@ def run_aisbench(
             )
         dataset_path = dataset_file
         logger.info(f"Dataset generated: {dataset_path}")
+
+    elif dataset_type == "gsm8k-shared-prefix" and not dataset_path:
+        # Identical natural-text rows (one GSM8K QA pool padded past
+        # input_len): every request hits the same ~131072-token radix
+        # prefix, mirroring the dev shared-prefix shape. Emitted as
+        # test.jsonl because GSM8KDataset hardcodes that name inside the
+        # config's path dir; identical rows are not deduped.
+        dataset_file = "/tmp/datasets/gsm8k_shared_prefix/test.jsonl"
+        if not os.path.exists(dataset_file):
+            generate_gsm8k_shared_prefix_dataset(
+                model_path=model_path,
+                source_dataset_path=GSM8K_DATASET_TRAIN_FILE,
+                batch_size=num_prompts,
+                input_len=input_len,
+                output_file=dataset_file,
+                output_format="aisbench",
+            )
+        dataset_path = dataset_file
+        dataset_type = AISBENCHMARK_DATASET_GSM8K
+        logger.info(f"Shared-prefix GSM8K dataset ready: {dataset_path}")
 
     elif dataset_type == AISBENCHMARK_DATASET_MM_CUSTOM_GEN and not dataset_path:
         dataset_file = f"/tmp/datasets/mm.jsonl"
@@ -646,6 +801,12 @@ def run_aisbench(
         metrics = {}
         full_output = "\n".join(output_lines)
 
+        # With warmup passes enabled the stdout carries one summarizer
+        # table per invocation; only the last one is the formal run.
+        last_table = full_output.rfind("Performance Parameters")
+        if last_table != -1:
+            full_output = full_output[last_table:]
+
         simplified_output = re.sub(r"[^\w\s.]", " ", full_output)
 
         tpot_match = re.search(r"TPOT\s+total\s+([\d.]+)\s+ms", simplified_output)
@@ -655,7 +816,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract mean_tpot from output")
             logger.error(
-                f"Simplified output snippet around TPOT: {simplified_output[simplified_output.find('TPOT')-20:simplified_output.find('TPOT')+50] if 'TPOT' in simplified_output else 'TPOT not found'}"
+                f"Simplified output snippet around TPOT: {simplified_output[simplified_output.find('TPOT') - 20 : simplified_output.find('TPOT') + 50] if 'TPOT' in simplified_output else 'TPOT not found'}"
             )
 
         tps_matches = re.findall(
@@ -685,7 +846,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract total_tps from output")
             logger.warning(
-                f"Simplified output snippet around Output Token Throughput: {simplified_output[simplified_output.find('Output')-20:simplified_output.find('Output')+100] if 'Output' in simplified_output else 'Output not found'}"
+                f"Simplified output snippet around Output Token Throughput: {simplified_output[simplified_output.find('Output') - 20 : simplified_output.find('Output') + 100] if 'Output' in simplified_output else 'Output not found'}"
             )
 
         ttft_match = re.search(r"TTFT\s+total\s+([\d.]+)\s+ms", simplified_output)
@@ -695,7 +856,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract mean_ttft from output")
             logger.warning(
-                f"Simplified output snippet around TTFT: {simplified_output[simplified_output.find('TTFT')-20:simplified_output.find('TTFT')+50] if 'TTFT' in simplified_output else 'TTFT not found'}"
+                f"Simplified output snippet around TTFT: {simplified_output[simplified_output.find('TTFT') - 20 : simplified_output.find('TTFT') + 50] if 'TTFT' in simplified_output else 'TTFT not found'}"
             )
 
         e2el_match = re.search(r"E2EL\s+total\s+([\d.]+)\s+ms", simplified_output)
@@ -705,7 +866,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract mean_e2e_latency from output")
             logger.warning(
-                f"Simplified output snippet around E2EL: {simplified_output[simplified_output.find('E2EL')-20:simplified_output.find('E2EL')+50] if 'E2EL' in simplified_output else 'E2EL not found'}"
+                f"Simplified output snippet around E2EL: {simplified_output[simplified_output.find('E2EL') - 20 : simplified_output.find('E2EL') + 50] if 'E2EL' in simplified_output else 'E2EL not found'}"
             )
 
         concurrency_match = re.search(
@@ -717,7 +878,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract concurrency from output")
             logger.warning(
-                f"Simplified output snippet around Concurrency: {simplified_output[simplified_output.find('Concurrency')-20:simplified_output.find('Concurrency')+50] if 'Concurrency' in simplified_output else 'Concurrency not found'}"
+                f"Simplified output snippet around Concurrency: {simplified_output[simplified_output.find('Concurrency') - 20 : simplified_output.find('Concurrency') + 50] if 'Concurrency' in simplified_output else 'Concurrency not found'}"
             )
 
         max_concurrency_match = re.search(
@@ -729,7 +890,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract max_concurrency from output")
             logger.warning(
-                f"Simplified output snippet around Max Concurrency: {simplified_output[simplified_output.find('Max Concurrency')-20:simplified_output.find('Max Concurrency')+50] if 'Max Concurrency' in simplified_output else 'Max Concurrency not found'}"
+                f"Simplified output snippet around Max Concurrency: {simplified_output[simplified_output.find('Max Concurrency') - 20 : simplified_output.find('Max Concurrency') + 50] if 'Max Concurrency' in simplified_output else 'Max Concurrency not found'}"
             )
 
         req_throughput_match = re.search(
@@ -744,7 +905,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract request_throughput from output")
             logger.warning(
-                f"Simplified output snippet around Request Throughput: {simplified_output[simplified_output.find('Request')-20:simplified_output.find('Request')+50] if 'Request' in simplified_output else 'Request not found'}"
+                f"Simplified output snippet around Request Throughput: {simplified_output[simplified_output.find('Request') - 20 : simplified_output.find('Request') + 50] if 'Request' in simplified_output else 'Request not found'}"
             )
 
         total_requests_match = re.search(
@@ -756,7 +917,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract total_requests from output")
             logger.warning(
-                f"Simplified output snippet around Total Requests: {simplified_output[simplified_output.find('Total Requests')-20:simplified_output.find('Total Requests')+50] if 'Total Requests' in simplified_output else 'Total Requests not found'}"
+                f"Simplified output snippet around Total Requests: {simplified_output[simplified_output.find('Total Requests') - 20 : simplified_output.find('Total Requests') + 50] if 'Total Requests' in simplified_output else 'Total Requests not found'}"
             )
 
         failed_requests_match = re.search(
@@ -768,7 +929,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract failed_requests from output")
             logger.warning(
-                f"Simplified output snippet around Failed Requests: {simplified_output[simplified_output.find('Failed Requests')-20:simplified_output.find('Failed Requests')+50] if 'Failed Requests' in simplified_output else 'Failed Requests not found'}"
+                f"Simplified output snippet around Failed Requests: {simplified_output[simplified_output.find('Failed Requests') - 20 : simplified_output.find('Failed Requests') + 50] if 'Failed Requests' in simplified_output else 'Failed Requests not found'}"
             )
 
         logger.info(f"All extracted metrics: {metrics}")
@@ -803,7 +964,15 @@ def assert_metrics(self, metrics):
         raise Exception("No metrics obtained from benchmark")
 
     tc_name = self.__class__.__name__
-    if self.tpot and metrics.get("mean_tpot"):
+    # The perf knobs below are declared on the perf test bases; callers from
+    # other bases (e.g. accuracy cases) may not define them, so read them
+    # defensively instead of relying on class attributes.
+    tpot = getattr(self, "tpot", None)
+    output_token_throughput = getattr(self, "output_token_throughput", None)
+    request_throughput = getattr(self, "request_throughput", None)
+    ttft = getattr(self, "ttft", None)
+    mean_e2e_latency = getattr(self, "mean_e2e_latency", None)
+    if tpot and metrics.get("mean_tpot"):
         dump_metric(
             "tpot",
             float(metrics["mean_tpot"]),
@@ -811,10 +980,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "tpot_baseline",
-            float(self.tpot),
+            float(tpot),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if self.output_token_throughput and metrics.get("total_tps"):
+    if output_token_throughput and metrics.get("total_tps"):
         dump_metric(
             "throughput",
             float(metrics["total_tps"]),
@@ -822,10 +991,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "throughput_baseline",
-            float(self.output_token_throughput),
+            float(output_token_throughput),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if self.ttft and metrics.get("mean_ttft"):
+    if ttft and metrics.get("mean_ttft"):
         dump_metric(
             "ttft",
             float(metrics["mean_ttft"]),
@@ -833,10 +1002,21 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "ttft_baseline",
-            float(self.ttft),
+            float(ttft),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if self.mean_e2e_latency and metrics.get("mean_e2e_latency"):
+    if request_throughput and metrics.get("request_throughput"):
+        dump_metric(
+            "request_throughput",
+            float(metrics["request_throughput"]),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+        dump_metric(
+            "request_throughput_baseline",
+            float(request_throughput),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+    if mean_e2e_latency and metrics.get("mean_e2e_latency"):
         dump_metric(
             "e2e_latency",
             float(metrics["mean_e2e_latency"]),
@@ -844,36 +1024,147 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "e2e_latency_baseline",
-            float(self.mean_e2e_latency),
+            float(mean_e2e_latency),
             labels={"test_case": tc_name, "type": "perf"},
         )
 
-    if self.tpot:
-        if self.tpot < TPOT_THRESHOLD:
+    spec_num_draft_tokens = _get_spec_num_draft_tokens(
+        getattr(self, "other_args", None)
+    )
+    # accept_rate = accept_length / --speculative-num-draft-tokens.
+    # Dump only when all inputs are present; the mandatory checks below
+    # decide pass/fail when the baseline is set.
+    if (
+        getattr(self, "accept_rate", None)
+        and metrics.get("accept_length")
+        and spec_num_draft_tokens
+    ):
+        accept_rate = float(metrics["accept_length"]) / spec_num_draft_tokens
+        dump_metric(
+            "accept_rate",
+            accept_rate,
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+        dump_metric(
+            "accept_rate_baseline",
+            float(self.accept_rate),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+
+    if tpot:
+        if tpot < TPOT_THRESHOLD:
             self.assertLessEqual(
                 float(metrics["mean_tpot"]),
-                self.tpot + TPOT_TOLERANCE_LOW,
+                tpot + TPOT_TOLERANCE_LOW,
             )
         else:
             self.assertLessEqual(
                 float(metrics["mean_tpot"]),
-                self.tpot * TPOT_TOLERANCE_HIGH,
+                tpot * TPOT_TOLERANCE_HIGH,
             )
-    if self.output_token_throughput:
+    if output_token_throughput:
         self.assertGreaterEqual(
             float(metrics["total_tps"]),
-            self.output_token_throughput * OUTPUT_TOKEN_THROUGHPUT_TOLERANCE,
+            output_token_throughput * OUTPUT_TOKEN_THROUGHPUT_TOLERANCE,
         )
-    if self.ttft:
+    if ttft:
         self.assertLessEqual(
             float(metrics["mean_ttft"]),
-            self.ttft * TTFT_TOLERANCE,
+            ttft * TTFT_TOLERANCE,
         )
-    if self.mean_e2e_latency:
+    if request_throughput:
+        self.assertIsNotNone(
+            metrics.get("request_throughput"),
+            "request_throughput not found in benchmark output while a baseline is set",
+        )
+        self.assertGreaterEqual(
+            float(metrics["request_throughput"]),
+            request_throughput * REQUEST_THROUGHPUT_TOLERANCE,
+        )
+    if mean_e2e_latency:
         self.assertLessEqual(
             float(metrics["mean_e2e_latency"]),
-            self.mean_e2e_latency * E2E_TOLERANCE,
+            mean_e2e_latency * E2E_TOLERANCE,
         )
+    # Once an accept_rate baseline is set, a missing "Accept length" line
+    # (e.g. server_info request failed or spec decoding inactive) or a
+    # missing --speculative-num-draft-tokens arg must fail the test
+    # instead of being silently skipped.
+    if getattr(self, "accept_rate", None):
+        self.assertIsNotNone(
+            metrics.get("accept_length"),
+            "accept_length not found in bench_serving output "
+            "while accept_rate baseline is set",
+        )
+        self.assertIsNotNone(
+            spec_num_draft_tokens,
+            "--speculative-num-draft-tokens not found in other_args "
+            "while accept_rate baseline is set",
+        )
+        self.assertGreater(
+            float(metrics["accept_length"]) / spec_num_draft_tokens,
+            self.accept_rate,
+        )
+    # Once a hit-rate baseline dict is set, a missing "Cache Hit Details"
+    # section (e.g. the case did not set cache_report=True or the server
+    # was launched without --enable-cache-report) must fail the test
+    # instead of being silently skipped. Keys map HiCache tiers to their
+    # parsed metrics; values are percentage thresholds (10 = 10%).
+    min_hit_rate_pcts = getattr(self, "min_hit_rate_pcts", None)
+    if min_hit_rate_pcts:
+        hit_rate_keys = {
+            "cache": "cache_hit_rate_pct",
+            "device": "device_hit_rate_pct",
+            "host": "host_hit_rate_pct",
+            "storage": "storage_hit_rate_pct",
+        }
+        unknown_tiers = sorted(set(min_hit_rate_pcts) - set(hit_rate_keys))
+        if unknown_tiers:
+            raise Exception(
+                f"Unknown hit-rate tiers {unknown_tiers} in "
+                f"min_hit_rate_pcts; supported tiers: {sorted(hit_rate_keys)}"
+            )
+        for tier, threshold in min_hit_rate_pcts.items():
+            if metrics.get(hit_rate_keys[tier]) is None:
+                if metrics.get("cache_hit_rate_pct") is not None:
+                    # The overall rate was parsed, so the cache report
+                    # itself worked; only the tier line is missing.
+                    hint = (
+                        "cache_report worked but this tier has no line; "
+                        "the tier may never have been engaged (e.g. L1 "
+                        "capacity sufficed so L2 saw no traffic, or the "
+                        "workload had no prefix reuse), or radix cache "
+                        "is disabled on the server - inspect the "
+                        "server-side Cache Hit Details output"
+                    )
+                else:
+                    hint = (
+                        "did the case set cache_report=True and the server "
+                        "run with --enable-cache-report?"
+                    )
+                self.assertIsNotNone(
+                    metrics.get(hit_rate_keys[tier]),
+                    f"{tier} hit rate not found in bench_serving output "
+                    f"while min_hit_rate_pcts['{tier}'] is set; {hint}",
+                )
+            dump_metric(
+                f"{tier}_hit_rate",
+                float(metrics[hit_rate_keys[tier]]),
+                labels={"test_case": tc_name, "type": "perf"},
+            )
+            dump_metric(
+                f"{tier}_hit_rate_baseline",
+                float(threshold),
+                labels={"test_case": tc_name, "type": "perf"},
+            )
+            # Strictly greater: a zero threshold stays meaningful (any
+            # actual hit must be > 0), instead of trivially passing on >=.
+            self.assertGreater(
+                float(metrics[hit_rate_keys[tier]]),
+                float(threshold),
+                f"{tier} hit rate {metrics[hit_rate_keys[tier]]}% is not "
+                f"above {threshold}%",
+            )
 
 
 class TestNpuPerformanceTestCaseBase(CustomTestCase):
@@ -904,14 +1195,148 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    request_throughput = None
+    # Baseline for accept_length / speculative-num-draft-tokens; None disables
+    # the assertion.
+    accept_rate = None
 
     dp = None
     generation_kwargs = None
     pop_sglang_is_in_ci_for_gsp = False
 
     @classmethod
+    def _get_tc_name(cls):
+        """Derive the test case name from the test file (filename without
+        extension). Mirrors the workflow's ``tc_name=${test_case##*/}`` logic
+        so each case in a suite writes to its own output path."""
+        try:
+            tc_file = inspect.getfile(cls)
+        except (TypeError, OSError):
+            tc_file = getattr(sys.modules.get(cls.__module__), "__file__", "")
+        return os.path.splitext(os.path.basename(tc_file))[0]
+
+    @classmethod
+    def _setup_per_case_output(cls):
+        """Set up per-case output directories and env vars.
+
+        When the workflow sets METRICS_DATA_FILE to a suite-level directory
+        (e.g. .../output/{branch_label}-{create_date}-{run_id}-{run_attempt}/
+        {workflow_name}/{test_type}/{suite}), each case in the suite
+        writes to its own subdirectory under it, so results stay in the
+        structured layout and are keyed by the case id. Falls back to the
+        legacy per-case layout when the env var is not set.
+        """
+        cls.tc_name = cls._get_tc_name()
+        suite_output = os.environ.get("METRICS_DATA_FILE")
+        if suite_output:
+            # Append the case id under the suite output prefix.
+            cls.metrics_data_file = os.path.join(suite_output, cls.tc_name)
+            # Mirror the output prefix to the plog location (drop the test_type/suite tail).
+            suite_plog = suite_output.replace("/output/", "/logs/plog/", 1)
+            cls.plog_base = os.path.dirname(os.path.dirname(suite_plog))
+        else:
+            current_date = datetime.now().strftime("%Y%m%d")
+            test_type = getattr(cls, "test_type", "perf")
+            base_output = f"/root/.cache/tests/output/{test_type}/{current_date}"
+            cls.metrics_data_file = os.path.join(base_output, cls.tc_name)
+            cls.plog_base = f"/root/.cache/tests/logs/plog"
+        os.makedirs(cls.metrics_data_file, exist_ok=True)
+        # Override env vars so evalscope/dump_metric write to per-case paths.
+        os.environ["METRICS_DATA_FILE"] = cls.metrics_data_file
+        os.environ["SGLANG_TEST_METRICS_OUTPUT"] = os.path.join(
+            cls.metrics_data_file, "metrics"
+        )
+        logger.info(
+            "Per-case output: tc_name=%s metrics_data_file=%s",
+            cls.tc_name,
+            cls.metrics_data_file,
+        )
+
+    @classmethod
+    def _save_metrics_json(cls):
+        """Write per-case ``metrics.json`` from ``dump_metric`` JSONL files.
+
+        Replaces the workflow's stdout-parsing + ``dump_metrics.py`` logic so
+        each case in a suite persists its own metrics snapshot.
+        """
+        if not getattr(cls, "metrics_data_file", None):
+            return
+        metrics = {}
+        baselines = {}
+        pattern = os.path.join(cls.metrics_data_file, "metrics.*.jsonl")
+        for jsonl_path in glob.glob(pattern):
+            try:
+                with open(jsonl_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        record = json.loads(line)
+                        name = record.get("metric_name")
+                        value = record.get("value")
+                        if name is None:
+                            continue
+                        if name.endswith("_baseline"):
+                            baselines[name[: -len("_baseline")]] = value
+                        else:
+                            metrics[name] = value
+            except Exception as e:
+                logger.warning("Failed to read %s: %s", jsonl_path, e)
+        out_path = os.path.join(cls.metrics_data_file, "metrics.json")
+        payload = {
+            "test_case": cls.tc_name,
+            "test_type": getattr(cls, "test_type", "perf"),
+            "metrics": metrics,
+            "baselines": baselines,
+        }
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            logger.info("Saved per-case metrics to %s", out_path)
+        except Exception as e:
+            logger.warning("Failed to write metrics.json: %s", e)
+        # Remove the intermediate JSONL records, keeping only the final metrics.json.
+        for jsonl_path in glob.glob(pattern):
+            try:
+                os.remove(jsonl_path)
+            except Exception as e:
+                logger.warning("Failed to remove %s: %s", jsonl_path, e)
+
+    @classmethod
+    def _backup_plog(cls):
+        """Backup Ascend plog files to a per-case path.
+
+        Replaces the workflow's ``Backup plog`` step so each case in a suite
+        gets its own plog snapshot instead of all cases sharing the suite name.
+        """
+        plog_path = "/root/ascend/log/debug/plog"
+        if not os.path.isdir(plog_path):
+            return
+        tc_name = getattr(cls, "tc_name", None)
+        if not tc_name:
+            return
+        hostname = os.getenv("HOSTNAME", "unknown")
+        plog_base = getattr(cls, "plog_base", "/root/.cache/tests/logs/plog")
+        target = os.path.join(plog_base, tc_name, hostname)
+        os.makedirs(target, exist_ok=True)
+        for name in os.listdir(plog_path):
+            src = os.path.join(plog_path, name)
+            if os.path.isfile(src):
+                try:
+                    shutil.copy2(src, os.path.join(target, name))
+                except Exception as e:
+                    logger.warning("Failed to copy plog %s: %s", name, e)
+        logger.info("Backed up plog to %s", target)
+
+    @classmethod
     def setUpClass(cls):
+        cls._setup_per_case_output()
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # Start the storage service first: it may export MOONCAKE_* variables
+        # that the server environment copy below has to pick up.
+        other_args = list(cls.other_args)
+        cls.storage_service_process = maybe_start_hicache_storage_service(other_args)
+
         env = os.environ.copy()
         for key, value in env.items():
             logger.info(f"ENV_VAR_SYS {key}:{value}")
@@ -919,8 +1344,6 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             for key, value in cls.envs.items():
                 logger.info(f"ENV_VAR_CASE {key}:{value}")
                 env[key] = value
-
-        other_args = list(cls.other_args)
 
         cls.process = popen_launch_server(
             cls.model,
@@ -937,6 +1360,14 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        storage_service_process = getattr(cls, "storage_service_process", None)
+        if storage_service_process:
+            try:
+                kill_process_tree(storage_service_process.pid)
+            except Exception as e:
+                logger.error(f"Error during storage service teardown: {e}")
+        cls._save_metrics_json()
+        cls._backup_plog()
 
     @retry()
     def run_throughput(self):
@@ -998,8 +1429,10 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             assert_metrics(self, metrics)
 
 
-class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
+class TestNpuPerfMultiNodePdMixTestCaseBase(PdMixNodeMixin, CustomTestCase):
     model_config = None
+    initialization_delay = SERVER_INITIALIZATION_DELAY
+    keep_alive_time = MAX_SERVER_KEEP_ALIVE_TIME
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
     dataset_name = "random"
@@ -1023,55 +1456,11 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    request_throughput = None
 
     dp = None
     generation_kwargs = None
     pop_sglang_is_in_ci_for_gsp = False
-
-    @classmethod
-    def setUpClass(cls):
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = "master" if cls.hostname.endswith("sglang-node-0") else "worker"
-        logger.info(f"Init {cls.host} {cls.role=}!")
-
-        cls.start_pd_mix_master_node()
-        cls.start_pd_mix_worker_node()
-
-    @classmethod
-    def tearDownClass(cls):
-        pass
-
-    @classmethod
-    @check_role(allowed_roles=["master"])
-    def start_pd_mix_master_node(cls):
-        sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        sglang_thread.start()
-
-        wait_server_ready(f"{cls.base_url}/health")
-
-        logger.info(
-            f"Wait {SERVER_INITIALIZATION_DELAY}s, starting run benchmark ......"
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["worker"])
-    def start_pd_mix_worker_node(cls):
-        sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        sglang_thread.start()
-
-        logger.info(
-            f"{cls.role} node started, keeping test alive for {MAX_SERVER_KEEP_ALIVE_TIME} seconds"
-        )
-        time.sleep(MAX_SERVER_KEEP_ALIVE_TIME)
 
     @retry()
     @check_role(allowed_roles=["master", "worker"])
@@ -1131,8 +1520,9 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
             assert_metrics(self, metrics)
 
 
-class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
+class TestNpuPerfMultiNodePdSepTestCaseBase(PdSepNodeMixin, CustomTestCase):
     model_config = None
+    initialization_delay = SERVER_INITIALIZATION_DELAY
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
     dataset_name = "random"
@@ -1156,89 +1546,11 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    request_throughput = None
 
     dp = None
     generation_kwargs = None
     pop_sglang_is_in_ci_for_gsp = False
-
-    @classmethod
-    def setUpClass(cls):
-        cls.process = None
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = (
-            "router"
-            if "router" in cls.hostname
-            else "prefill" if "prefill" in cls.hostname else "decode"
-        )
-        logger.info(f"Init {cls.host} {cls.role=}!")
-
-        cls.start_pd_server()
-        cls.start_router_server()
-
-    @classmethod
-    def tearDownClass(cls):
-        logger.info("Start exec tearDownClass")
-        if cls.process:
-            try:
-                kill_process_tree(cls.process.pid)
-                for _ in range(60):
-                    if cls.process.poll() is not None:
-                        logger.info("Process fully exited")
-                        break
-                    time.sleep(1)
-                else:
-                    logger.warning("Process did NOT exit in time")
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
-        logger.info("tearDownClass finished")
-
-    @classmethod
-    @check_role(allowed_roles=["router"])
-    def start_router_server(cls):
-        wait_for_prefill_decode_exit(key=ACTIVE_TEST_CLASS, value=cls.__name__)
-        logger.info(f"Starting router in thread...")
-        sglang_thread = threading.Thread(target=launch_router, args=(cls.model_config,))
-        sglang_thread.daemon = True
-        sglang_thread.start()
-
-        health_check_url = f"{cls.base_url}/health"
-        logger.info(f"Waiting for router to be ready at {health_check_url}")
-        wait_server_ready(health_check_url)
-
-        logger.info(
-            f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["prefill", "decode"])
-    def start_pd_server(cls):
-        logger.info(f"Starting pd separation node...")
-        cls.process = launch_pd_separation_node(cls.model_config)
-        logger.info(f"Pd separation node started with PID: {cls.process.pid}")
-
-        # Loop to check if the process is still running
-        while True:
-            configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
-            if configmap and configmap.data:
-                executing_class = configmap.data.get(ACTIVE_TEST_CLASS)
-                if executing_class and executing_class != cls.__name__:
-                    logger.info(f"Retrieved ConfigMap data: {configmap.data}")
-                    logger.info(f"[{cls.__name__}] exec completed, exiting waiter.")
-                    return
-            if cls.process.poll() is None:
-                # Process is still running
-                time.sleep(30)
-            else:
-                # Process has exited
-                exit_code = cls.process.poll()
-                raise Exception(
-                    f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
-                )
 
     @retry()
     @check_role(allowed_roles=["router"])

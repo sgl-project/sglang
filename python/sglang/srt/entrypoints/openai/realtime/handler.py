@@ -17,7 +17,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.utils import random_uuid
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,6 @@ async def handle_realtime_transcription(
     websocket: WebSocket,
     tokenizer_manager: TokenizerManager,
     adapter: TranscriptionAdapter,
-    server_args: ServerArgs,
     session_semaphore: asyncio.Semaphore,
 ) -> None:
     """WS endpoint for /v1/realtime. Pre-session validation runs before
@@ -85,7 +84,7 @@ async def handle_realtime_transcription(
             websocket,
             "too_many_sessions",
             f"Maximum concurrent sessions reached "
-            f"({server_args.asr_max_concurrent_sessions}).",
+            f"({get_serving().asr_max_concurrent_sessions}).",
             error_type="rate_limit_exceeded",
         )
         return
@@ -97,9 +96,7 @@ async def handle_realtime_transcription(
             except (WebSocketDisconnect, RuntimeError) as e:
                 logger.debug("[realtime] accept failed: %s", e)
                 return
-            connection = RealtimeConnection(
-                websocket, tokenizer_manager, adapter, server_args
-            )
+            connection = RealtimeConnection(websocket, tokenizer_manager, adapter)
             await connection.run()
         except WebSocketDisconnect:
             logger.info("[realtime] client disconnected (normal)")

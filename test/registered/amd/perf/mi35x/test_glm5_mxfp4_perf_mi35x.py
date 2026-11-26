@@ -5,7 +5,7 @@ Benchmarks the AMD Quark MXFP4-quantized GLM-5 model on MI35x with 8 GPUs.
 Model: amd/GLM-5-MXFP4 (MOE-only MXFP4 quantization of zai-org/GLM-5)
 Reference: https://huggingface.co/amd/GLM-5-MXFP4
 
-Registry: nightly-perf-8-gpu-mi35x-glm5-mxfp4 suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-glm5-mxfp4 suite
 """
 
 import os
@@ -19,13 +19,14 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 register_amd_ci(
     est_time=18000,
-    suite="nightly-perf-8-gpu-mi35x-glm5-mxfp4",
+    suite="nightly-perf-test-8-gpu-amd-mi35x-glm5-mxfp4",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns.
+    """Generate a simplified markdown report without cost columns.
 
     Skips the first result if it's a warmup run (duplicate batch_size).
     """
@@ -58,7 +59,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
     return summary
 
 
-PROFILE_DIR = "performance_profiles_glm5_mxfp4_mi35x"
+RESULT_DIR = "performance_results_glm5_mxfp4_mi35x"
 
 
 class TestGLM5MXFP4PerfMI35x(unittest.TestCase):
@@ -99,8 +100,8 @@ class TestGLM5MXFP4PerfMI35x(unittest.TestCase):
             },
         ]
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_one_batch(self):
@@ -124,7 +125,6 @@ class TestGLM5MXFP4PerfMI35x(unittest.TestCase):
                         other_args=variant_config["other_args"],
                         variant=variant_config["name"],
                         extra_bench_args=["--trust-remote-code"],
-                        enable_profile=False,
                     )
                     results = result_tuple[0]
                     success = result_tuple[1]

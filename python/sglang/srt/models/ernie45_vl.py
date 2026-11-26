@@ -13,7 +13,8 @@
 """Inference-only Ernie45-VL model compatible with HuggingFace weights."""
 
 import logging
-from functools import lru_cache, partial
+from array import array
+from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
 
 import numpy as np
@@ -35,17 +36,16 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie45_moe_vl import Ernie4_5_VLMoeModel
-from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,6 @@ logger = logging.getLogger(__name__)
 
 
 class Ernie4_5_VisionMLP(nn.Module):
-
     def __init__(
         self,
         in_features: int,
@@ -86,7 +85,6 @@ class Ernie4_5_VisionMLP(nn.Module):
 
 
 class Ernie4_5_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -145,7 +143,6 @@ class Ernie4_5_VisionBlock(nn.Module):
 
 
 class Ernie4_5_VisionPatchEmbed(nn.Module):
-
     def __init__(
         self,
         patch_size: int = 14,
@@ -200,7 +197,6 @@ class VariableResolutionResamplerModel(nn.Module):
             self.spatial_dim,
             bias=True,
             gather_output=True,
-            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.spatial_linear1",
         )
 
@@ -211,7 +207,6 @@ class VariableResolutionResamplerModel(nn.Module):
             self.spatial_dim,
             bias=True,
             gather_output=True,
-            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.spatial_linear2",
         )
 
@@ -223,7 +218,6 @@ class VariableResolutionResamplerModel(nn.Module):
                 self.spatial_dim,
                 bias=True,
                 gather_output=True,
-                quant_config=getattr(config, "quant_config", None),
                 prefix=f"{prefix}.temporal_linear1",
             )
 
@@ -234,7 +228,6 @@ class VariableResolutionResamplerModel(nn.Module):
                 self.spatial_dim,
                 bias=True,
                 gather_output=True,
-                quant_config=getattr(config, "quant_config", None),
                 prefix=f"{prefix}.temporal_linear2",
             )
 
@@ -245,7 +238,6 @@ class VariableResolutionResamplerModel(nn.Module):
             self.out_dim,
             bias=True,
             gather_output=True,
-            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.mlp",
         )
 
@@ -337,38 +329,8 @@ class VariableResolutionResamplerModel(nn.Module):
         x = fwd_mlp(x)
         return x
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            if name not in params_dict:
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
-
-
-class Ernie4_5_VisionRotaryEmbedding(nn.Module):
-
-    def __init__(self, dim: int, theta: float = 10000.0) -> None:
-        super().__init__()
-        self.inv_freq = 1.0 / theta ** (
-            torch.arange(start=0, end=dim, step=2, dtype=torch.float32) / dim
-        )
-
-    def forward(self, seqlen: int) -> torch.Tensor:
-        seq = torch.arange(
-            seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
-        )
-        freqs = torch.outer(input=seq, vec2=self.inv_freq)
-        return freqs
-
 
 class Ernie4_5_VisionTransformer(nn.Module):
-
     def __init__(
         self,
         vision_config: PretrainedConfig,
@@ -510,9 +472,6 @@ class Ernie4_5_VisionTransformer(nn.Module):
         return final_output
 
 
-cached_get_processor = lru_cache(get_processor)
-
-
 class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
@@ -593,9 +552,8 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         else:
             self._visual_token_ids_tensor_cache = None
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def _vision_forward(
         self,
@@ -657,12 +615,12 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         )
 
         pad_values = []
-        if hasattr(forward_batch, "mm_inputs") and forward_batch.mm_inputs is not None:
+        if forward_batch.mm_inputs is not None:
             for mm_input in forward_batch.mm_inputs:
                 if mm_input is None:
                     continue
                 for item in mm_input.mm_items:
-                    pad_values.append(item.pad_value)
+                    pad_values.extend(item.padding_values())
         placeholder_tensor = torch.as_tensor(
             pad_values,
             device=input_ids.device,
@@ -688,18 +646,6 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
     ):
-        """Run forward pass for Ernie45-VL.
-
-        Args:
-            input_ids: Flattened (concatenated) input_ids corresponding to a
-                batch.
-            positions: Flattened (concatenated) position ids corresponding to a
-                batch.
-                **NOTE**: If mrope is enabled (default setting for Qwen2-VL
-                opensource models), the shape will be `(3, seq_len)`,
-                otherwise it will be `(seq_len,).
-                (Use input_metadata.mrope_positions to replace it)
-        """
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
@@ -713,11 +659,18 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        self._set_visual_token_mask(input_ids, forward_batch)
+        # Skip on decode/text-only batches: per-step mask allocs exhaust XPU memory.
+        if not forward_batch.forward_mode.is_decode() and (
+            forward_batch.contains_image_inputs()
+            or forward_batch.contains_video_inputs()
+        ):
+            self._set_visual_token_mask(input_ids, forward_batch)
+        else:
+            self.visual_token_mask = None
 
-        assert (
-            input_ids.numel() == positions.shape[-1]
-        ), f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"
+        assert input_ids.numel() == positions.shape[-1], (
+            f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"
+        )
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,

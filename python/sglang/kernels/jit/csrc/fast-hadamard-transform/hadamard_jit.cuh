@@ -19,10 +19,8 @@
 #include <cstdint>
 #include <cstring>
 
-namespace {
+namespace sglang {
 
-using ::bf16_t;
-using ::fp16_t;
 using ::HadamardParamsBase;
 
 constexpr inline int ceil_log2(int val) {
@@ -406,7 +404,7 @@ inline void run_hadamard(const tvm::ffi::TensorView x, const tvm::ffi::TensorVie
   auto SX = SymbolicSize{"x_batch_stride"};
   auto SO = SymbolicSize{"out_batch_stride"};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   TensorMatcher({N, D}).with_strides({SX, 1}).with_dtype<DType>().with_device(device).verify(x);
   TensorMatcher({N, D}).with_strides({SO, 1}).with_dtype<DType>().with_device(device).verify(out);
@@ -479,4 +477,4 @@ struct Hadamard40NKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

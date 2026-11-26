@@ -1,7 +1,8 @@
 import asyncio
 import os
 import time
-from typing import Any, Dict, List, Optional
+from contextlib import AsyncExitStack
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import (
     APIRouter,
@@ -19,6 +20,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     MeshGenerationsRequest,
     MeshListResponse,
@@ -30,7 +32,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     merge_image_input_list,
     process_generation_batch,
+    save_first_input_image,
     save_image_to_path,
+    temp_dir_if_disabled,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -54,20 +58,25 @@ def _build_sampling_params_from_request(
     server_args = get_global_server_args()
     sampling_kwargs: Dict[str, Any] = {
         "request_id": request_id,
+        "task_type": ModelTaskType.I2M,
         "prompt": req.prompt,
         "num_frames": 1,
         "image_path": [image_path] if image_path else None,
         "save_output": True,
         "output_file_name": f"{request_id}.{ext}",
-        "seed": req.seed,
-        "generator_device": req.generator_device,
     }
-    if req.num_inference_steps is not None:
-        sampling_kwargs["num_inference_steps"] = req.num_inference_steps
-    if req.guidance_scale is not None:
-        sampling_kwargs["guidance_scale"] = req.guidance_scale
-    if req.negative_prompt is not None:
-        sampling_kwargs["negative_prompt"] = req.negative_prompt
+    sampling_kwargs.update(
+        req.model_dump(
+            include={
+                "seed",
+                "generator_device",
+                "num_inference_steps",
+                "guidance_scale",
+                "negative_prompt",
+            },
+            exclude_none=True,
+        )
+    )
 
     return SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
@@ -91,7 +100,9 @@ def _mesh_job_from_sampling(
     }
 
 
-async def _dispatch_job_async(job_id: str, batch: Req) -> None:
+async def _dispatch_job_async(
+    job_id: str, batch: Req, *, resources: AsyncExitStack
+) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
@@ -100,9 +111,7 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
         )
         save_file_path = save_file_path_list[0]
 
-        file_size = None
-        if os.path.exists(save_file_path):
-            file_size = os.path.getsize(save_file_path)
+        file_size = os.path.getsize(save_file_path)
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
@@ -119,10 +128,19 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
         )
         await MESH_STORE.update_fields(job_id, update_fields)
     except Exception as e:
-        logger.error(f"{e}")
+        logger.exception("Mesh job %s failed", job_id)
         await MESH_STORE.update_fields(
-            job_id, {"status": "failed", "error": {"message": str(e)}}
+            job_id,
+            {
+                "status": "failed",
+                "error": {"message": str(e)},
+                "file_path": None,
+                "url": None,
+                "file_size_bytes": None,
+            },
         )
+    finally:
+        await resources.aclose()
 
 
 @router.post("", response_model=MeshResponse)
@@ -147,107 +165,104 @@ async def create_mesh(
 
     input_path = None
 
-    if "multipart/form-data" in content_type:
-        images = image or image_array
-        urls = url or url_array
-        image_list = merge_image_input_list(images, urls)
-
-        if not image_list:
-            raise HTTPException(
-                status_code=422,
-                detail="Field 'image' or 'url' is required for mesh generation",
-            )
-
-        uploads_dir = os.path.join("outputs", "uploads")
-        os.makedirs(uploads_dir, exist_ok=True)
-        img = image_list[0]
-        filename = img.filename if hasattr(img, "filename") else "input_image"
-        try:
-            input_path = await save_image_to_path(
-                img, os.path.join(uploads_dir, f"{request_id}_{filename}")
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=400, detail=f"Failed to process image source: {str(e)}"
-            )
-
-        req = MeshGenerationsRequest(
-            prompt=prompt or "generate 3d mesh",
-            model=model,
-            seed=seed,
-            generator_device=generator_device,
-            num_inference_steps=num_inference_steps,
-            negative_prompt=negative_prompt,
-            output_format=output_format,
-            **(
-                {"guidance_scale": guidance_scale} if guidance_scale is not None else {}
-            ),
+    async with AsyncExitStack() as resources:
+        uploads_dir = resources.enter_context(
+            temp_dir_if_disabled(server_args.input_save_path)
         )
-    else:
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        try:
-            payload: Dict[str, Any] = dict(body or {})
+        if "multipart/form-data" in content_type:
+            images = image or image_array
+            urls = url or url_array
+            image_list = merge_image_input_list(images, urls)
 
-            if payload.get("input_image"):
-                img_src = payload.pop("input_image")
-                uploads_dir = os.path.join("outputs", "uploads")
-                os.makedirs(uploads_dir, exist_ok=True)
-                input_path = await save_image_to_path(
-                    img_src,
-                    os.path.join(uploads_dir, f"{request_id}_input_image"),
+            if not image_list:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Field 'image' or 'url' is required for mesh generation",
                 )
 
-            req = MeshGenerationsRequest(**payload)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+            try:
+                input_path = await save_first_input_image(
+                    image_list, request_id, uploads_dir
+                )
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400, detail=f"Failed to process image source: {str(e)}"
+                )
 
-    if not input_path:
-        raise HTTPException(
-            status_code=422,
-            detail="An input image is required for mesh generation",
+            req = MeshGenerationsRequest(
+                prompt=prompt or "generate 3d mesh",
+                model=model,
+                seed=seed,
+                generator_device=generator_device,
+                num_inference_steps=num_inference_steps,
+                negative_prompt=negative_prompt,
+                output_format=output_format,
+                **(
+                    {"guidance_scale": guidance_scale}
+                    if guidance_scale is not None
+                    else {}
+                ),
+            )
+        else:
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            try:
+                payload: Dict[str, Any] = dict(body or {})
+
+                if payload.get("input_image"):
+                    img_src = payload.pop("input_image")
+                    input_path = await save_image_to_path(
+                        img_src,
+                        os.path.join(uploads_dir, f"{request_id}_input_image"),
+                        uploads_root=uploads_dir,
+                    )
+
+                req = MeshGenerationsRequest(**payload)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid request body: {e}"
+                )
+
+        if not input_path:
+            raise HTTPException(
+                status_code=422,
+                detail="An input image is required for mesh generation",
+            )
+
+        try:
+            sampling_params = _build_sampling_params_from_request(
+                request_id, req, input_path
+            )
+        except (TypeError, ValueError) as exc:
+            # The image and video routes answer 400 for an invalid sampling parameter;
+            # this route builds its params through the same `SamplingParams` validation,
+            # so it must not surface the same input as a 500.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        batch = prepare_request(
+            server_args=server_args,
+            sampling_params=sampling_params,
         )
 
-    sampling_params = _build_sampling_params_from_request(request_id, req, input_path)
-    job = _mesh_job_from_sampling(request_id, req, sampling_params)
-    await MESH_STORE.upsert(request_id, job)
-
-    batch = prepare_request(
-        server_args=server_args,
-        sampling_params=sampling_params,
-    )
-
-    asyncio.create_task(_dispatch_job_async(request_id, batch))
-    return MeshResponse(**job)
+        job = _mesh_job_from_sampling(request_id, req, sampling_params)
+        await MESH_STORE.upsert(request_id, job)
+        # the background job owns the upload directory once the job is queued
+        asyncio.create_task(
+            _dispatch_job_async(request_id, batch, resources=resources.pop_all())
+        )
+        return MeshResponse(**job)
 
 
 @router.get("", response_model=MeshListResponse)
 async def list_meshes(
     after: Optional[str] = Query(None),
-    limit: Optional[int] = Query(None, ge=1, le=100),
-    order: Optional[str] = Query("desc"),
+    limit: int = Query(20, ge=1, le=100),
+    order: Literal["asc", "desc"] = Query("desc"),
 ):
-    order = (order or "desc").lower()
-    if order not in ("asc", "desc"):
-        order = "desc"
-    jobs = await MESH_STORE.list_values()
-
-    reverse = order != "asc"
-    jobs.sort(key=lambda j: j.get("created_at", 0), reverse=reverse)
-
-    if after is not None:
-        try:
-            idx = next(i for i, j in enumerate(jobs) if j["id"] == after)
-            jobs = jobs[idx + 1 :]
-        except StopIteration:
-            jobs = []
-
-    if limit is not None:
-        jobs = jobs[:limit]
-    items = [MeshResponse(**j) for j in jobs]
-    return MeshListResponse(data=items)
+    return MeshListResponse(
+        **await MESH_STORE.list_page(after=after, limit=limit, order=order)
+    )
 
 
 @router.get("/{mesh_id}", response_model=MeshResponse)
@@ -274,6 +289,10 @@ async def download_mesh_content(
     job = await MESH_STORE.get(mesh_id)
     if not job:
         raise HTTPException(status_code=404, detail="Mesh not found")
+
+    # an exporter may create its final path before generation finishes
+    if job["status"] != "completed":
+        raise HTTPException(status_code=404, detail="Mesh output is not available")
 
     if job.get("url"):
         raise HTTPException(

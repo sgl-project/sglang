@@ -4,33 +4,31 @@ SGLang SDARMoeModelLM (block diffusion / dLLM-style forward) with MoE MLP.
 """
 
 import logging
+from functools import partial
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    QKVParallelLinear,
     ReplicatedLinear,
-    RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -40,9 +38,9 @@ from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -52,13 +50,9 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.utils import (
-    apply_qk_norm,
-    create_fused_set_kv_buffer_arg,
-    enable_fused_set_kv_buffer,
-)
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+from sglang.srt.models.sdar import SDARAttention
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.utils import LazyValue, is_cuda
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -105,6 +99,10 @@ class SDARMoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -116,7 +114,6 @@ class SDARMoeSparseMoeBlock(nn.Module):
 
         # Deepep / FuseEP support
         if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
@@ -129,6 +126,7 @@ class SDARMoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         if (
             not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_ascend_ops()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self.forward_normal(hidden_states)
@@ -147,11 +145,6 @@ class SDARMoeSparseMoeBlock(nn.Module):
         topk_output = self.topk(hidden_states, router_logits)
         out = self.experts(hidden_states, topk_output)  # (T, H)
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            out = tensor_model_parallel_all_reduce(out)
-
         return out.view(num_tokens, hidden_dim)
 
     def forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
@@ -160,10 +153,6 @@ class SDARMoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -180,136 +169,6 @@ class SDARMoeSparseMoeBlock(nn.Module):
                 name, p, self.experts.num_local_experts
             )
         ]
-
-
-class SDARMoeAttention(nn.Module):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        reduce_results: bool = True,
-        prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
-    ):
-        super().__init__()
-        self.layer_id = layer_id
-        self.hidden_size = config.hidden_size
-        self.total_num_heads = config.num_attention_heads
-
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
-
-        assert self.total_num_heads % attn_tp_size == 0
-        self.num_heads = self.total_num_heads // attn_tp_size
-
-        self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= attn_tp_size:
-            assert self.total_num_kv_heads % attn_tp_size == 0
-        else:
-            assert attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
-
-        self.head_dim = getattr(
-            config, "head_dim", self.hidden_size // self.total_num_heads
-        )
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scale = self.head_dim**-0.5
-
-        self.qkv_proj = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=getattr(config, "attention_bias", False),
-            quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
-            bias=getattr(config, "attention_bias", False),
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("o_proj", prefix),
-        )
-
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
-        rope_theta = getattr(config, "rope_theta", 10000.0)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_pos = getattr(config, "max_position_embeddings", 32768)
-        self.rotary_dim = self.head_dim
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.rotary_dim,
-            max_position=max_pos,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
-
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scale,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            attn_type=AttentionType.ENCODER_ONLY,
-            prefix=add_prefix("attn", prefix),
-        )
-        self.alt_stream = alt_stream
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        if get_exec().deterministic.rl_on_policy_target is not None:
-            hidden_states = hidden_states.bfloat16()
-
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
-        )
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
-                )
-                if enable_fused_set_kv_buffer(forward_batch)
-                else None
-            ),
-        )
-
-        if get_exec().deterministic.rl_on_policy_target is not None:
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-
-        context = self.attn(
-            q,
-            k,
-            v,
-            forward_batch,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
-        )
-        out, _ = self.o_proj(context)
-        return out
 
 
 class SDARMoeBlock(nn.Module):
@@ -343,7 +202,7 @@ class SDARMoeBlock(nn.Module):
             self.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
-        self.self_attn = SDARMoeAttention(
+        self.self_attn = SDARAttention(
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
@@ -359,20 +218,20 @@ class SDARMoeBlock(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=True,
-            is_previous_layer_sparse=True,
-            is_next_layer_sparse=True,
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(sparse=True, next_layer_sparse=True),
         )
 
     def forward(
@@ -380,12 +239,9 @@ class SDARMoeBlock(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -394,36 +250,16 @@ class SDARMoeBlock(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+
+        hidden_states = self.mlp(
+            hidden_states,
+            forward_batch=forward_batch,
         )
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch=forward_batch,
-            )
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-
-        return hidden_states, residual
+        return hidden_states
 
 
 class SDARMoeModel(nn.Module):
@@ -438,7 +274,7 @@ class SDARMoeModel(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.embed_dim = config.hidden_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -451,7 +287,7 @@ class SDARMoeModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: SDARMoeBlock(
                 config=config,
@@ -460,9 +296,8 @@ class SDARMoeModel(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(SDARMoeBlock.stage_facts, config),
         )
 
         if self.pp_group.is_last_rank:
@@ -492,26 +327,26 @@ class SDARMoeModel(nn.Module):
             hidden_states = (
                 self.embed_tokens(input_ids) if input_embeds is None else input_embeds
             )
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors.get("residual", None)
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual
-                )
+                hidden_states = layer(positions, hidden_states, forward_batch)
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states, residual = self.norm(hidden_states, residual)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm
+            )
         return hidden_states
 
 
@@ -525,13 +360,12 @@ class SDARMoeForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         assert self.pp_group.world_size == 1, (
             f"SDARMoeForCausalLM does not support pipeline parallel (pp_size={self.pp_group.world_size}). "
             "Please set pp_size=1."
         )
 
-        self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
         alt_stream = get_stream("alt") if _is_cuda else None

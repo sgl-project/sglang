@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 using DType = bf16_t;
 constexpr int64_t kRopeDim = 64;
@@ -105,7 +105,7 @@ struct FusedQKRopeKernel {
     auto K = SymbolicSize{"num_k_heads"};
     constexpr auto D = kRopeDim;
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, Q, D})  //
         .with_strides({-1, -1, 1})
@@ -166,4 +166,4 @@ struct FusedQKRopeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

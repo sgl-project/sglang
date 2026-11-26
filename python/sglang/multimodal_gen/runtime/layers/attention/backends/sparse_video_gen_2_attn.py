@@ -42,9 +42,6 @@ logger = init_logger(__name__)
 
 
 class SparseVideoGen2AttentionBackend(AttentionBackend):
-
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 128, 256]
@@ -56,10 +53,6 @@ class SparseVideoGen2AttentionBackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["SparseVideoGen2AttentionImpl"]:
         return SparseVideoGen2AttentionImpl
-
-    @staticmethod
-    def get_metadata_cls() -> type["SparseVideoGen2AttentionMetadata"]:
-        return SparseVideoGen2AttentionMetadata
 
     @staticmethod
     def get_builder_cls() -> type["SparseVideoGen2AttentionMetadataBuilder"]:
@@ -107,22 +100,7 @@ class SparseVideoGen2AttentionMetadata(AttentionMetadata):
     max_seqlen_k: int | None = None
 
 
-def _require_kwarg(kwargs: dict[str, Any], name: str) -> Any:
-    if name not in kwargs:
-        raise ValueError(
-            f"Missing required argument for SparseVideoGen2Attention: {name}"
-        )
-    return kwargs[name]
-
-
 class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
-
-    def __init__(self) -> None:
-        pass
-
-    def prepare(self) -> None:
-        pass
-
     def build(  # type: ignore[override]
         self,
         current_timestep: int,
@@ -180,7 +158,6 @@ class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class SparseVideoGen2AttentionImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,
@@ -461,9 +438,9 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         if prompt_length is None:
             prompt_length = context_length
 
-        assert (
-            seq_len == context_length + num_frame * frame_size
-        ), f"Query Shape: {seq_len} is not equivalent to {context_length} + {num_frame} * {frame_size}"
+        assert seq_len == context_length + num_frame * frame_size, (
+            f"Query Shape: {seq_len} is not equivalent to {context_length} + {num_frame} * {frame_size}"
+        )
 
         # Determine if we use Full Attention to calculate
         full_attention_flag = False

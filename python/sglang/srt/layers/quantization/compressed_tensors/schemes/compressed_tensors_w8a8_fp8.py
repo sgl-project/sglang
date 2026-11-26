@@ -9,6 +9,7 @@ from compressed_tensors.quantization import QuantizationArgs, QuantizationStrate
 from torch.nn import Parameter
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.environ import envs
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
@@ -24,16 +25,19 @@ from sglang.srt.layers.quantization.fp8_utils import (
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     normalize_e4m3fn_to_e4m3fnuz,
+    prepare_xpu_block_scale_for_scaled_mm,
     requant_block_scale_ue8m0_for_deepgemm,
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_cpu, is_hip, is_xpu
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_xpu = is_xpu()
+_is_cpu = is_cpu()
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
@@ -56,6 +60,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
+        # TODO: torch.xpu.get_device_capability
+        if _is_xpu:
+            return 20
         # lovelace and up
         return 89
 
@@ -143,6 +150,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             layer.register_parameter("input_scale", input_scale)
 
     def process_weights_after_loading(self, layer) -> None:
+        if _is_cpu:
+            raise NotImplementedError(
+                "CPU compressed-tensors W8A8 FP8 linear is not supported; CPU FP8 kernels are W8A16."
+            )
+
         if self.strategy == QuantizationStrategy.TENSOR:
             max_w_scale, weight = requantize_with_max_scale(
                 weight=layer.weight,
@@ -215,6 +227,15 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 output_dtype=getattr(layer, "orig_dtype", None),
                 weight_shape=layer.weight.shape,
             )
+            if _is_xpu:
+                scale_reordered = prepare_xpu_block_scale_for_scaled_mm(
+                    layer.weight_scale.data,
+                    self.weight_block_size,
+                    self.w8a8_block_fp8_linear,
+                )
+                if scale_reordered is not layer.weight_scale.data:
+                    with torch.no_grad():
+                        layer.weight_scale.set_(scale_reordered)
 
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
@@ -231,8 +252,77 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        return self._apply_weights(layer, x, bias)
+
+    def apply_weights_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """``apply_weights`` into the caller-owned ``output`` (RowParallelLinear's
+        ``output_tensor``). The DeepGEMM block-FP8 linear writes it directly;
+        every other path computes normally and copies."""
+        return self._apply_weights(layer, x, bias, output)
+
+    def _block_fp8_linear_into(self, output: Optional[torch.Tensor], **kwargs):
+        if output is None:
+            return self.w8a8_block_fp8_linear(**kwargs)
+        fn = self.w8a8_block_fp8_linear
+        # only the DeepGEMM linear takes the storage (and copies when its own
+        # fallbacks run); the dispatcher may hand it back as a partial
+        if getattr(fn, "func", fn) is deepgemm_w8a8_block_fp8_linear_with_fallback:
+            return fn(**kwargs, output=output)
+        return output.copy_(fn(**kwargs))
+
+    def _apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if _is_cpu:
+            raise NotImplementedError(
+                "CPU compressed-tensors W8A8 FP8 linear is not supported; CPU FP8 kernels are W8A16."
+            )
+
+        if self.weight_block_size is None and output is not None:
+            return output.copy_(self._apply_weights(layer, x, bias))
+        if isinstance(x, tuple) and self.weight_block_size is not None:
+            # Pre-quantized per-token-group activation (fp8 [M, K], fp32 scales
+            # [M, K / block_k]) from the fused all-reduce epilogue
+            # (layers/communication/gemma4_ar_fusion.py).
+            return self._block_fp8_linear_into(
+                output,
+                input=x[0],
+                weight=layer.weight,
+                block_size=self.weight_block_size,
+                weight_scale=layer.weight_scale,
+                input_scale=x[1],
+                bias=bias,
+            )
+        if isinstance(x, tuple):
+            # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
+            # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
+            # apply_fp8_linear detects the fp8 dtype and skips re-quantizing;
+            # orig_dtype (when present) sets the GEMM output dtype.
+            qx, x_scale = x[0], x[1]
+            out_dtype = x[2] if len(x) > 2 else None
+            return apply_fp8_linear(
+                input=qx,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=x_scale,
+                bias=bias,
+                use_per_token_if_dynamic=True,
+                compressed_tensor_quant=True,
+                pre_quant_output_dtype=out_dtype,
+            )
         if self.weight_block_size is not None:
-            return self.w8a8_block_fp8_linear(
+            return self._block_fp8_linear_into(
+                output,
                 input=x,
                 weight=layer.weight,
                 block_size=self.weight_block_size,

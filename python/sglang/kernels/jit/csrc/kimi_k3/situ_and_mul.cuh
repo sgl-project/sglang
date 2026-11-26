@@ -6,12 +6,13 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
-#include <sgl_kernel/warp.cuh>   // For warp::copy_bytes, elect_one_lane, inclusive_sum
+#include <sgl_kernel/warp.cuh>   // For warp::inclusive_sum, reduce_sum, reduce_max
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
@@ -28,11 +29,10 @@ namespace sglang {
 
 namespace kimi_k3 {
 
-/// One SiTU element. `sigmoid_fast` is `1/(1+expf(-x))` (math.cuh), i.e. the
-/// same expression both call sites used before they were folded together.
+/// One SiTU element.
 template <bool kHasLinearBeta>
 SGL_DEVICE float situ_activate(float g, float u, float beta, float inv_beta, float linear_beta, float inv_linear_beta) {
-  const float gate_out = beta * tanhf(g * inv_beta) * device::math::sigmoid_fast(g);
+  const float gate_out = beta * tanhf(g * inv_beta) * device::activation::sigmoid(g);
   float up_out;
   if constexpr (kHasLinearBeta) {
     up_out = linear_beta * tanhf(u * inv_linear_beta);
@@ -43,10 +43,6 @@ SGL_DEVICE float situ_activate(float g, float u, float beta, float inv_beta, flo
 }
 
 }  // namespace kimi_k3
-
-}  // namespace sglang
-
-namespace {
 
 // SiTU (SoftCap-GLU) activation:
 //   gate_out = beta * tanh(gate / beta) * sigmoid(gate)
@@ -66,19 +62,42 @@ struct SituAndMulParams {
   uint32_t hidden_dim;  // D (output width, half of input last dim)
   uint32_t num_tokens;
   uint32_t stride_in_vecs;  // input row stride in vector units (2*D/vec if dense)
+  // Optional rows cast TIn -> TOut in the same launch (cast_vecs 0: none): the
+  // routed input sharing an fp32 fused-GEMM output with the shared gate_up.
+  const void* __restrict__ cast_in;
+  void* __restrict__ cast_out;
+  uint32_t cast_vecs;  // per token, dense in cast_out
+  uint32_t cast_stride_in_vecs;
 };
 
-template <typename T, bool kHasLinearBeta, bool kUsePDL>
+template <typename TIn, typename TOut, bool kHasLinearBeta, bool kUsePDL>
 __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams params) {
   using namespace device;
-  constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
-  using vec_t = AlignedVector<T, kMaxVecBytes / sizeof(T)>;
+  constexpr auto kWidest = sizeof(TIn) > sizeof(TOut) ? sizeof(TIn) : sizeof(TOut);
+  constexpr auto kVecSize = kMaxVecBytes / kWidest;
+  using vec_t = AlignedVector<TIn, kVecSize>;
+  using out_vec_t = AlignedVector<TOut, kVecSize>;
 
   const auto num_vecs = params.hidden_dim / kVecSize;  // per token
   const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto token_id = tid / num_vecs;
 
-  if (token_id >= params.num_tokens) return;
+  if (token_id >= params.num_tokens) {
+    // past the activation's items: the optional cast rows
+    const auto c = tid - params.num_tokens * num_vecs;
+    const auto ct = c / (params.cast_vecs != 0 ? params.cast_vecs : 1u);
+    if (params.cast_vecs == 0 || ct >= params.num_tokens) return;
+    const auto co = c % params.cast_vecs;
+    PDLWaitPrimary<kUsePDL>();
+    const auto v = load_as<vec_t>(params.cast_in, static_cast<uint64_t>(ct) * params.cast_stride_in_vecs + co);
+    PDLTriggerSecondary<kUsePDL>();
+    out_vec_t w;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i)
+      w[i] = cast<TOut>(cast<fp32_t>(v[i]));
+    store_as<out_vec_t>(params.cast_out, w, c);
+    return;
+  }
 
   const auto offset = tid % num_vecs;
   // Input rows may be strided (e.g. a slice of a wider fused-GEMM output);
@@ -88,8 +107,10 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
 
   PDLWaitPrimary<kUsePDL>();
 
-  const auto gate = load_as<vec_t>(params.input, input_offset);
-  const auto up = load_as<vec_t>(params.input, input_offset + num_vecs);
+  const auto input = assume_global(params.input);
+  vec_t gate, up;
+  gate.load(input, input_offset);
+  up.load(input, input_offset + num_vecs);
 
   PDLTriggerSecondary<kUsePDL>();
 
@@ -98,29 +119,52 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
   const float linear_beta = params.linear_beta;
   const float inv_linear_beta = params.inv_linear_beta;
 
-  vec_t out;
+  out_vec_t out;
 #pragma unroll
   for (int i = 0; i < kVecSize; ++i) {
     const float g = cast<fp32_t>(gate[i]);
     const float u = cast<fp32_t>(up[i]);
 
-    out[i] =
-        cast<T>(sglang::kimi_k3::situ_activate<kHasLinearBeta>(g, u, beta, inv_beta, linear_beta, inv_linear_beta));
+    out[i] = cast<TOut>(kimi_k3::situ_activate<kHasLinearBeta>(g, u, beta, inv_beta, linear_beta, inv_linear_beta));
   }
 
-  store_as<vec_t>(params.out, out, output_offset);
+  store_as<out_vec_t>(params.out, out, output_offset);
 }
 
 // Host launcher
 
-template <typename T, bool kUsePDL>
+template <typename TIn, typename TOut, bool kUsePDL>
 struct SituAndMulKernel {
-  static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
+  static constexpr auto kWidest = sizeof(TIn) > sizeof(TOut) ? sizeof(TIn) : sizeof(TOut);
+  static constexpr auto kVecSize = device::kMaxVecBytes / kWidest;
   static constexpr auto kBlockSize = 256u;
 
   static void
   run(const tvm::ffi::TensorView input,
       const tvm::ffi::TensorView out,
+      const double beta,
+      const double linear_beta,
+      const bool has_linear_beta) {
+    launch(input, out, nullptr, nullptr, beta, linear_beta, has_linear_beta);
+  }
+
+  // run() plus cast_in [N, C] (row-strided TIn) -> cast_out [N, C] (dense TOut) in the same launch.
+  static void run_with_cast(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView cast_in,
+      const tvm::ffi::TensorView cast_out,
+      const double beta,
+      const double linear_beta,
+      const bool has_linear_beta) {
+    launch(input, out, &cast_in, &cast_out, beta, linear_beta, has_linear_beta);
+  }
+
+  static void launch(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView* cast_in,
+      const tvm::ffi::TensorView* cast_out,
       const double beta,
       const double linear_beta,
       const bool has_linear_beta) {
@@ -130,14 +174,14 @@ struct SituAndMulKernel {
     auto D_in = SymbolicSize{"input_width"};
     auto D_out = SymbolicSize{"output_width"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, D_out})  //
-        .with_dtype<T>()
+        .with_dtype<TOut>()
         .with_device(device_)
         .verify(out);
     TensorMatcher({N, D_in})  //
-        .with_dtype<T>()
+        .with_dtype<TIn>()
         .with_device(device_)
         .with_strides({-1, 1})
         .verify(input);
@@ -151,7 +195,20 @@ struct SituAndMulKernel {
     RuntimeCheck(hidden_size % kVecSize == 0, "hidden size must be divisible by vector size");
     RuntimeCheck(input.stride(0) % kVecSize == 0, "input row stride must be divisible by vector size");
 
-    const auto num_total_items = num_tokens * (hidden_size / kVecSize);
+    uint32_t cast_vecs = 0, cast_stride_in_vecs = 0;
+    if (cast_in != nullptr) {
+      auto C = SymbolicSize{"cast_width"};
+      TensorMatcher({N, C}).with_dtype<TOut>().with_device(device_).verify(*cast_out);
+      TensorMatcher({N, C}).with_dtype<TIn>().with_device(device_).with_strides({-1, 1}).verify(*cast_in);
+      RuntimeCheck(C.unwrap() % kVecSize == 0, "cast width must be divisible by vector size");
+      RuntimeCheck(cast_in->stride(0) % kVecSize == 0, "cast row stride must be divisible by vector size");
+      RuntimeCheck(
+          reinterpret_cast<uintptr_t>(cast_in->data_ptr()) % device::kMaxVecBytes == 0,
+          "cast input must be vector aligned");
+      cast_vecs = static_cast<uint32_t>(C.unwrap() / kVecSize);
+      cast_stride_in_vecs = static_cast<uint32_t>(cast_in->stride(0) / kVecSize);
+    }
+    const auto num_total_items = static_cast<uint64_t>(num_tokens) * (hidden_size / kVecSize + cast_vecs);
     RuntimeCheck(num_total_items <= std::numeric_limits<uint32_t>::max(), "too many items for 32-bit indexing");
 
     const auto num_blocks = div_ceil(static_cast<uint32_t>(num_total_items), kBlockSize);
@@ -168,12 +225,18 @@ struct SituAndMulKernel {
         .hidden_dim = hidden_size,
         .num_tokens = num_tokens,
         .stride_in_vecs = static_cast<uint32_t>(input.stride(0) / kVecSize),
+        .cast_in = cast_in != nullptr ? cast_in->data_ptr() : nullptr,
+        .cast_out = cast_out != nullptr ? cast_out->data_ptr() : nullptr,
+        .cast_vecs = cast_vecs,
+        .cast_stride_in_vecs = cast_stride_in_vecs,
     };
 
     if (has_linear_beta) {
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(situ_and_mul_kernel<T, true, kUsePDL>, params);
+      LaunchKernel(num_blocks, kBlockSize, device)
+          .enable_pdl(kUsePDL)(situ_and_mul_kernel<TIn, TOut, true, kUsePDL>, params);
     } else {
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(situ_and_mul_kernel<T, false, kUsePDL>, params);
+      LaunchKernel(num_blocks, kBlockSize, device)
+          .enable_pdl(kUsePDL)(situ_and_mul_kernel<TIn, TOut, false, kUsePDL>, params);
     }
   }
 };
@@ -218,8 +281,8 @@ situ_and_mul(DType2 gate, DType2 up, float beta, float inv_beta, float linear_be
   const auto [g0, g1] = cast<fp32x2_t>(gate);
   const auto [u0, u1] = cast<fp32x2_t>(up);
   // kHasLinearBeta=true: this path always softcaps the up operand, as before.
-  const float val0 = sglang::kimi_k3::situ_activate<true>(g0, u0, beta, inv_beta, linear_beta, inv_linear_beta);
-  const float val1 = sglang::kimi_k3::situ_activate<true>(g1, u1, beta, inv_beta, linear_beta, inv_linear_beta);
+  const float val0 = kimi_k3::situ_activate<true>(g0, u0, beta, inv_beta, linear_beta, inv_linear_beta);
+  const float val1 = kimi_k3::situ_activate<true>(g1, u1, beta, inv_beta, linear_beta, inv_linear_beta);
   if constexpr (kPrecise) {
     return {val0, val1};
   } else {
@@ -247,7 +310,7 @@ SGL_DEVICE CTAWork get_work(const SituMulQuantVarlenParams& params) {
   const uint32_t val = tx < params.num_experts ? params.masked_m[tx] : 0u;
 
   // Per-warp inclusive scan of masked_m.
-  const uint32_t warp_inclusive = device::warp::inclusive_sum(lane_id, val);
+  const uint32_t warp_inclusive = device::warp::inclusive_sum(val, lane_id);
   const uint32_t warp_exclusive = warp_inclusive - val;
 
   // Write each warp total.
@@ -389,7 +452,7 @@ struct SituAndMulMaskedPostQuantKernel {
     auto D = SymbolicSize{"hidden_dim x 2"};
     auto N = SymbolicSize{"hidden_dim"};
     auto G = SymbolicSize{"num_groups"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({E, T, D})  // input
         .with_dtype<bf16_t>()
@@ -449,4 +512,4 @@ struct SituAndMulMaskedPostQuantKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
