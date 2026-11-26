@@ -90,6 +90,8 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
     def __init__(self):
         self.cases: Dict[str, List[str]] = {}  # list_name -> [case_id, ...]
         self.factory_case_ids: Dict[str, str] = {}
+        # case_id -> the DiffusionTestCase(...) calls that build it
+        self.case_calls: Dict[str, List[ast.Call]] = {}
 
     def visit_Module(self, node: ast.Module):
         for stmt in node.body:
@@ -219,6 +221,7 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
             "_make_modelopt_ci_case",
         }:
             if node.args and isinstance(node.args[0], ast.Constant):
+                self.case_calls.setdefault(node.args[0].value, []).append(node)
                 return node.args[0].value
         if isinstance(node.func, ast.Name) and not node.args:
             return self.factory_case_ids.get(node.func.id)

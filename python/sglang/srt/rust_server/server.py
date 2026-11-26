@@ -223,6 +223,13 @@ class RustServer:
         self.startup_time: Optional[Dict[str, Any]] = None
         # Set by `launch`: the launch state a crash dump carries.
         self.server_args: Optional[ServerArgs] = None
+        # Set by `launch`: the cores `_partition_cores` kept free for the
+        # scheduler thread and the ones it gave the server threads (None when
+        # the server runs unpinned), from this listener's `(index, count)`
+        # share of its CPU mask.
+        self.launch_cores: Optional[List[int]] = None
+        self.server_cores: Optional[List[int]] = None
+        self.frontend_cpu_share: Tuple[int, int] = (0, 1)
         # Once per process: the exception path and a watchdog may both try.
         self._crash_dump_lock = threading.Lock()
         self._crash_dump_performed = False
@@ -481,7 +488,7 @@ class RustServer:
         listen_port = get_serving().port + port_offset
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
-        _, server_cores = cls._partition_cores(
+        launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
                 (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
                 if scheduler.model_config.is_multimodal
@@ -531,6 +538,9 @@ class RustServer:
         instance = cls(server, http_port=listen_port)
         instance._mm_cache_namespace = mm_cache_namespace
         instance.server_args = scheduler.server_args
+        instance.launch_cores = launch_cores
+        instance.server_cores = server_cores
+        instance.frontend_cpu_share = frontend_cpu_share
         instance._broadcasts_shutdown = get_parallel().tp_rank == 0
 
         if scheduler.model_config.is_multimodal:
