@@ -188,6 +188,7 @@ class _InstalledMegakernel:
     built: BuiltMegakernel
     dispatch: Callable
     pool_layout: Any
+    mlp_sync_cohort_metadata: bool
     prepared: bool = False
 
 
@@ -208,6 +209,11 @@ def oot_megakernel_dispatch(model) -> Callable | None:
 def oot_megakernel_pool_layout(model) -> Any:
     installed = _installed(model)
     return None if installed is None else installed.pool_layout
+
+
+def oot_megakernel_needs_mlp_sync_cohort(model) -> bool:
+    installed = _installed(model)
+    return installed is not None and installed.mlp_sync_cohort_metadata
 
 
 def _gather_tp(value: Any) -> list[Any]:
@@ -295,7 +301,9 @@ def install_oot_megakernel(model_runner: ModelRunner) -> None:
         )
         if not callable(dispatch):
             raise TypeError("the platform must return a whole-step megakernel callable")
-        return _InstalledMegakernel(built, dispatch, layout)
+        return _InstalledMegakernel(
+            built, dispatch, layout, spec.mlp_sync_cohort_metadata
+        )
 
     installed = _local_phase("build", build)
     layout = installed.pool_layout
@@ -304,6 +312,7 @@ def install_oot_megakernel(model_runner: ModelRunner) -> None:
         tuple(installed.built.widths),
         type(layout).__module__,
         type(layout).__qualname__,
+        installed.mlp_sync_cohort_metadata,
     )
     if any(other != signature for other in _gather_tp(signature)):
         raise ValueError(

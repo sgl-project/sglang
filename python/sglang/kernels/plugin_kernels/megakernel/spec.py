@@ -592,6 +592,8 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     prefill_graph: bool = False
     # Optional host-only check of a normalized, tokenized request before enqueue.
     request_disable_reasons: Optional[Callable[[Any], list[str]]] = None
+    # The provider consumes the scheduler's attention-DP cohort snapshot.
+    mlp_sync_cohort_metadata: bool = False
 
 
 # (HF architecture, device target or None for the architecture default) -> spec path

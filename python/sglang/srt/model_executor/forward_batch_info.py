@@ -55,6 +55,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.mlp_sync_metadata import MLPSyncBatchMetadata
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -644,6 +645,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    mlp_sync_batch_metadata: MLPSyncBatchMetadata | None = None
 
     # Real (non-padding) token count, held at two scopes whose meaning never
     # changes once set:
@@ -866,6 +868,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         is_draft_worker: bool = False,
     ) -> None:
         """Populate per-rank token counts for DP-attention MLP synchronization."""
+        self.mlp_sync_batch_metadata = getattr(batch, "mlp_sync_batch_metadata", None)
         self.dp_spec_prefill_coordination_applied = (
             batch.dp_spec_prefill_coordination_applied
         )

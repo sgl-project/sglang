@@ -136,6 +136,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.mlp_sync_metadata import MLPSyncBatchMetadata
 from sglang.srt.multimodal.cache.digest import structured_digest
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.metrics_collector import (
@@ -2056,6 +2057,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    mlp_sync_batch_metadata: MLPSyncBatchMetadata | None = None
     dp_balance_stats: Optional[DPBalanceStats] = None
     prefill_stats: Optional[PrefillStats] = None
     forward_iter: Optional[int] = None
@@ -3578,6 +3580,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_decode_batch_idx_cpu=self.mamba_decode_batch_idx_cpu,
             mamba_lazy_spec_track_positions_cpu=self.mamba_lazy_spec_track_positions_cpu,
             dp_cooperation_info=self.dp_cooperation_info,
+            mlp_sync_batch_metadata=self.mlp_sync_batch_metadata,
             dp_balance_stats=self.dp_balance_stats,
             prefill_stats=self.prefill_stats,
             forward_iter=self.forward_iter,
