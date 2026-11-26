@@ -104,5 +104,27 @@ def test_aiter_situ_weight_layout_follows_a8w4_route(monkeypatch, gfx95, a8w4, a
     )
 
 
+@pytest.mark.parametrize(
+    ("value", "expected", "warns"),
+    [
+        (None, False, False),
+        ("0", False, False),
+        ("1", True, False),
+        ("true", False, True),
+    ],
+)
+def test_aiter_env_flag_warns_on_values_aiter_ignores(
+    monkeypatch, value, expected, warns
+):
+    from sglang.srt.layers.quantization import mxfp4
+
+    warnings = []
+    monkeypatch.setattr(mxfp4, "print_warning_once", warnings.append)
+    _set_situ_env(monkeypatch, value, None)
+
+    assert mxfp4._aiter_env_flag("AITER_SITUV2_A8W4") is expected
+    assert bool(warnings) is warns
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
