@@ -339,7 +339,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # Logical-page KV sharding reserves a fixed double-buffered assembly
         # scratch next to the pool; charge it before token sizing.
-        self._page_shard_scratch_bytes = compute_page_shard_scratch_bytes(
+        self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(
             kvc,
             include_mtp=not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle(),
         )
@@ -826,21 +826,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        pool_bytes = available_bytes - self._page_shard_scratch_bytes
-
         published_budget = self._kvc.sparse_kv_budget_plan
         if not self._fused_sparse_kv:
             budget = None
         elif published_budget is not None:
             budget = published_budget
         else:
-            budget = self._build_sparse_kv_budget(pool_bytes, page_size)
+            budget = self._build_sparse_kv_budget(
+                available_bytes - self._fixed_overhead_bytes, page_size
+            )
 
         if budget is not None:
-            pool_bytes -= budget.managed_hbm_bytes
-        native_available_bytes = max(pool_bytes, 0)
+            available_bytes -= budget.managed_hbm_bytes
+        available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = (
-            native_available_bytes // self._cell_size
+            available_bytes // self._cell_size
             if self._cell_size
             else self._zero_kv_max_tokens
         )
@@ -901,7 +901,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         native_kv_bytes = max_total_num_tokens * self._cell_size
         return SparseKVHBMSizing(
             available_bytes=available_bytes,
-            planned_bytes=self._page_shard_scratch_bytes
+            planned_bytes=self._fixed_overhead_bytes
             + budget.managed_hbm_bytes
             + native_kv_bytes,
             native_kv_bytes=native_kv_bytes,

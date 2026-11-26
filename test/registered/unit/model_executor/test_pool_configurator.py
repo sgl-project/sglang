@@ -548,7 +548,7 @@ class TestDefaultConfigurator(CustomTestCase):
             cfg.get_sparse_kv_hbm_sizing(
                 available, sizes.max_total_num_tokens
             ).planned_bytes,
-            cfg._page_shard_scratch_bytes
+            cfg._fixed_overhead_bytes
             + selected_plan.managed_hbm_bytes
             + sizes.max_total_num_tokens * cfg._cell_size,
         )
@@ -580,7 +580,7 @@ class TestDefaultConfigurator(CustomTestCase):
 
         self.assertEqual(sizes.max_total_num_tokens, 2048)
         self.assertEqual(cfg._cell_size, 2 * 128 * 2)
-        self.assertEqual(cfg._page_shard_scratch_bytes, 0)
+        self.assertEqual(cfg._fixed_overhead_bytes, 0)
         self.assertIsNone(mr.sparse_kv_budget_plan)
 
     def test_fused_draft_entry_overrides_the_layer_ratio(self):

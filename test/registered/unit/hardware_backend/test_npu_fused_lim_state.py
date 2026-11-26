@@ -149,7 +149,7 @@ class TestLIMState(CustomTestCase):
             )
             configurator = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
             configurator._fused_sparse_kv = True
-            configurator._page_shard_scratch_bytes = 256
+            configurator._fixed_overhead_bytes = 256
             configurator._is_fused_sparse_offload_pd_decode_worker = False
             configurator._kvc = SimpleNamespace(
                 sparse_kv_budget_plan=None,
@@ -160,9 +160,7 @@ class TestLIMState(CustomTestCase):
             configurator._cell_size = 8
             configurator._num_layers = 1
             required = (
-                configurator._page_shard_scratch_bytes
-                + plan.managed_hbm_bytes
-                + 256 * 8
+                configurator._fixed_overhead_bytes + plan.managed_hbm_bytes + 256 * 8
             )
             with (
                 patch(
@@ -195,7 +193,7 @@ class TestLIMState(CustomTestCase):
             later = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
             later._kvc = configurator._kvc
             later._fused_sparse_kv = True
-            later._page_shard_scratch_bytes = configurator._page_shard_scratch_bytes
+            later._fixed_overhead_bytes = configurator._fixed_overhead_bytes
             later._is_fused_sparse_offload_pd_decode_worker = False
             later._cell_size = 8
             with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
