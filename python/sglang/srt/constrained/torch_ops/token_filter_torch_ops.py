@@ -19,9 +19,19 @@ bitmask operations using torch tensor indexing.
 """
 
 import ctypes
+from functools import lru_cache
 from typing import List
 
 import torch
+
+
+@lru_cache(maxsize=128)
+def _cached_cpu_filter(width: int, token_ids: tuple[int, ...], is_allowed: bool):
+    mask = torch.full(
+        (1, width), 0 if is_allowed else -1, dtype=torch.int32, device="cpu"
+    )
+    set_token_filter_torch(mask, token_ids, 0, is_allowed, reset_vocab_mask=False)
+    return mask[0]
 
 
 def set_token_filter_torch(
@@ -31,6 +41,17 @@ def set_token_filter_torch(
     is_allowed: bool = True,
     reset_vocab_mask: bool = True,
 ):
+    if (
+        reset_vocab_mask
+        and vocab_mask.device.type == "cpu"
+        and vocab_mask.dtype == torch.int32
+    ):
+        # Cached rows are only copied out; request masks never alias the cache.
+        vocab_mask[batch_idx].copy_(
+            _cached_cpu_filter(vocab_mask.shape[-1], tuple(token_ids), is_allowed)
+        )
+        return
+
     if reset_vocab_mask:
         vocab_mask[batch_idx].fill_(-1 if (not is_allowed) else 0)
 

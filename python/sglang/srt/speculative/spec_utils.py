@@ -756,11 +756,19 @@ def traverse_tree(
     assert (
         retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
     )
+    retrieve_next_token = retrieve_next_token.tolist()
+    retrieve_next_sibling = retrieve_next_sibling.tolist()
+    draft_tokens = draft_tokens.tolist()
+    bitmask_cpu = (
+        allocate_token_bitmask.numpy()
+        if allocate_token_bitmask.device.type == "cpu"
+        else None
+    )
 
     def dfs(
         curr: int,
-        retrieve_next_token: torch.Tensor,
-        retrieve_next_sibling: torch.Tensor,
+        retrieve_next_token: List[int],
+        retrieve_next_sibling: List[int],
         parent_pos: int,
     ):
         if curr == 0:
@@ -768,21 +776,23 @@ def traverse_tree(
             # accepted from the previous iteration
             is_accepted = True
         else:
-            parent_bitmask = allocate_token_bitmask[parent_pos]
             current_token = draft_tokens[curr]
             if vocab_size and current_token >= vocab_size:
                 is_accepted = False
             else:
                 # 32 boolean bitmask values are packed into 32-bit integers
-                is_accepted = (
-                    parent_bitmask[current_token // 32] & (1 << (current_token % 32))
-                ) != 0
+                parent_word = (
+                    int(bitmask_cpu[parent_pos, current_token // 32])
+                    if bitmask_cpu is not None
+                    else int(allocate_token_bitmask[parent_pos, current_token // 32])
+                )
+                is_accepted = (parent_word & (1 << (current_token % 32))) != 0
 
         if is_accepted:
             if curr != 0:
                 # Accept the current token
                 try:
-                    grammar.accept_token(int(draft_tokens[curr]))
+                    grammar.accept_token(draft_tokens[curr])
                 except ValueError:
                     # The matcher can reject a draft token that passed the parent
                     # mask row (mask/matcher desync, e.g. a disagg retracted-request
@@ -790,8 +800,8 @@ def traverse_tree(
                     # accept it, and prune this branch rather than raising to -- and
                     # killing -- the scheduler. The accept failed, so the grammar is
                     # still at the parent state; no rollback is owed for this node.
-                    parent_bitmask[int(current_token) // 32] &= ~(
-                        1 << (int(current_token) % 32)
+                    allocate_token_bitmask[parent_pos, current_token // 32] &= ~(
+                        1 << (current_token % 32)
                     )
                     is_accepted = False
             if is_accepted:
@@ -801,7 +811,7 @@ def traverse_tree(
                     if retrieve_next_token[curr] != -1:
                         # Visit the child node
                         dfs(
-                            int(retrieve_next_token[curr]),
+                            retrieve_next_token[curr],
                             retrieve_next_token,
                             retrieve_next_sibling,
                             curr,
@@ -814,7 +824,7 @@ def traverse_tree(
         if retrieve_next_sibling[curr] != -1:
             # Visit the sibling node
             dfs(
-                int(retrieve_next_sibling[curr]),
+                retrieve_next_sibling[curr],
                 retrieve_next_token,
                 retrieve_next_sibling,
                 parent_pos,

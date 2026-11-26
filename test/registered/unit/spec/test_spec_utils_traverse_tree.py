@@ -6,9 +6,11 @@ and reads `draft_tokens[curr]`, both of which return 0-d tensors and must be
 explicitly cast before being handed to the grammar matcher.
 """
 
+import sys
 import unittest
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from sglang.srt.speculative.spec_utils import GrammarTree, traverse_tree
@@ -159,5 +161,91 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
         self.assertEqual(int(bitmask[0, 11 // 32] & (1 << (11 % 32))), 0)
 
 
+class _PathGrammar:
+    def __init__(self, rejected_token=None):
+        self.path = [40]
+        self.rejected_token = rejected_token
+        self.accept_attempts = []
+        self.fill_paths = {}
+        self.rollback_count = 0
+
+    def accept_token(self, token):
+        self.accept_attempts.append(token)
+        if token == self.rejected_token:
+            raise ValueError("token rejected")
+        self.path.append(token)
+
+    def rollback(self, count):
+        assert len(self.path) > count
+        del self.path[-count:]
+        self.rollback_count += count
+
+    def is_terminated(self):
+        return False
+
+    def fill_vocab_mask(self, mask, idx):
+        self.fill_paths[idx] = tuple(self.path)
+        mask[idx].fill_(-1)
+        mask[idx, 0] &= ~(1 << len(self.path))
+
+
+@pytest.mark.parametrize(
+    "next_token,next_sibling,expected_paths",
+    [
+        (
+            [1, 2, 3, -1],
+            [-1, -1, -1, -1],
+            {0: (40,), 1: (40, 31), 2: (40, 31, 32), 3: (40, 31, 32, 63)},
+        ),
+        (
+            [1, -1, 3, -1],
+            [-1, 2, -1, -1],
+            {0: (40,), 1: (40, 31), 2: (40, 32), 3: (40, 32, 63)},
+        ),
+    ],
+)
+def test_tree_masks_follow_path_and_restore_state(
+    next_token, next_sibling, expected_paths
+):
+    grammar = _PathGrammar()
+    mask = torch.zeros((4, 2), dtype=torch.int32)
+    traverse_tree(
+        torch.tensor(next_token),
+        torch.tensor(next_sibling),
+        torch.tensor([40, 31, 32, 63]),
+        grammar,
+        mask,
+        vocab_size=64,
+    )
+    expected = torch.tensor(
+        [[-1 - (1 << len(expected_paths[i])), -1] for i in range(4)], dtype=torch.int32
+    )
+    assert torch.equal(mask, expected)
+    assert grammar.fill_paths == expected_paths
+    assert grammar.path == [40]
+    assert grammar.rollback_count == 3
+
+
+def test_rejection_and_vocab_bounds_prune_without_extra_rollback():
+    grammar = _PathGrammar(rejected_token=31)
+    mask = torch.full((6, 2), 17, dtype=torch.int32)
+    traverse_tree(
+        torch.tensor([1, 2, -1, -1, -1, -1]),
+        torch.tensor([-1, 3, -1, 4, 5, -1]),
+        torch.tensor([40, 31, 8, 31, 64, 63]),
+        grammar,
+        mask,
+        vocab_size=64,
+    )
+    expected = torch.full_like(mask, 17)
+    expected[0] = torch.tensor([2147483645, -1])
+    expected[5] = torch.tensor([-5, -1])
+    assert torch.equal(mask, expected)
+    assert grammar.fill_paths == {0: (40,), 5: (40, 63)}
+    assert grammar.accept_attempts == [31, 63]
+    assert grammar.path == [40]
+    assert grammar.rollback_count == 1
+
+
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))
