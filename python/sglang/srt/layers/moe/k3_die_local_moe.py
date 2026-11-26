@@ -17,7 +17,6 @@ from sglang.srt.utils.log_utils import print_warning_once
 
 logger = logging.getLogger(__name__)
 
-_SWITCH = "SGLANG_K3_ROUTED_MOE_DEEPGEMM"
 _TABLE = Path(__file__).with_name("k3_die_local_moe_widths.json")
 # Rows of the MegaMoE buffer; no dispatched width may exceed it
 MAX_VERIFY_ROWS = 256
@@ -111,7 +110,8 @@ def wanted(layer: torch.nn.Module, with_bias: bool, precision: str) -> bool:
     )
     if reason is not None:
         print_warning_once(
-            f"{_SWITCH} is set but not used ({reason}); the routed experts stay on the default path"
+            "SGLANG_K3_ROUTED_MOE_DEEPGEMM is set but not used "
+            f"({reason}); the routed experts stay on the default path"
         )
         return False
     verify_widths()  # read the table here, at load
@@ -297,10 +297,6 @@ def finish(layer: torch.nn.Module) -> None:
     w2, s2 = layer.w2_weight, layer.w2_weight_scale
     layer.mega_l1_weights = (w13.view(torch.int8), s13.view(torch.int32))
     layer.mega_l2_weights = (w2.view(torch.int8), s2.view(torch.int32))
-    for view, param in zip(
-        (*layer.mega_l1_weights, *layer.mega_l2_weights), (w13, s13, w2, s2)
-    ):
-        assert view.untyped_storage().data_ptr() == param.untyped_storage().data_ptr()
     layer.use_cuda_mxfp4_decode_moe = False
     _summary.update(
         layers=_summary["layers"] + 1,

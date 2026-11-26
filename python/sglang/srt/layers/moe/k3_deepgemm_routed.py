@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import functools
 import inspect
-import logging
 from typing import Optional, Tuple, Union
 
 import torch
-
-logger = logging.getLogger(__name__)
 
 MegaWeights = Tuple[torch.Tensor, torch.Tensor]
 
@@ -55,10 +52,7 @@ def missing_capability() -> Optional[str]:
         name for name in _BUFFER_KEYWORDS if name not in buffer_keywords
     ]
     if missing:
-        try:
-            version = str(deep_gemm.__version__)
-        except Exception:
-            version = "unknown"
+        version = getattr(deep_gemm, "__version__", "unknown")
         return (
             f"deep_gemm {version} lacks the one-rank MegaMoE API ({', '.join(missing)})"
         )
@@ -290,21 +284,6 @@ def _get_pack_kernel():
     return _pack_kernel
 
 
-def _call_keywords(num_call_tokens: int) -> dict:
-    limit = _TRTLLM_SPLIT4_COMBINE_MAX_TOKENS
-    return dict(
-        cumulative_local_expert_recv_stats=_group.stats,
-        recipe=(1, 1, 32),
-        activation="situ",
-        fast_math=True,
-        weight_layout="trtllm",
-        numerics="trtllm",
-        split4_combine_max_tokens=0 if num_call_tokens > limit else limit,
-        topk_format="packed",
-        topk_first_expert=_group.first_expert,
-    )
-
-
 def select_routing(prepared_ids, prepared_routing, standard_routing):
     """The `routing` argument of `run`: packed words, or (ids, weights)."""
     if prepared_routing is not None:
@@ -365,7 +344,20 @@ def run(
             BLOCK=1024,
             num_warps=4,
         )
+    limit = _TRTLLM_SPLIT4_COMBINE_MAX_TOKENS
     deep_gemm.fp8_fp4_mega_moe(
-        out, l1_weights, l2_weights, buf, **_call_keywords(num_tokens)
+        out,
+        l1_weights,
+        l2_weights,
+        buf,
+        cumulative_local_expert_recv_stats=_group.stats,
+        recipe=(1, 1, 32),
+        activation="situ",
+        fast_math=True,
+        weight_layout="trtllm",
+        numerics="trtllm",
+        split4_combine_max_tokens=0 if num_tokens > limit else limit,
+        topk_format="packed",
+        topk_first_expert=_group.first_expert,
     )
     return out
