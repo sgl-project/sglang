@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -42,7 +41,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     ASCEND_OPS = "ascend_ops"
-    FLASHINFER = "flashinfer"
+    FLASHINFER = "flashinfer_nvlink_one_sided"
     MEGAMOE = "megamoe"
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
@@ -118,14 +117,15 @@ class AscendOpsConfig:
     - ``prefill``: ``allgather`` (TP AllGather -> local compute -> TP ReduceScatter)
       or ``alltoallv`` (TP AllToAllv -> compute -> TP AllToAllv).
     - ``decode``: ``low_latency`` (EP MC2 dispatch_v2 -> gmm -> activation ->
-      gmm -> combine_v2) or ``fused_op`` (single dispatch_ffn_combine).
+      gmm -> combine_v2).
+    - Either phase can select ``fused_op`` (MegaMoE dispatch, FFN and combine).
     - ``ll_dispatch_alg`` / ``ll_combine_alg``: the ``comm_alg`` handed to the
       MC2 dispatch/combine ops of the ``low_latency`` path. The defaults are the
       ones recommended by the operator owners (full-mesh dispatch, default
       combine).
     """
 
-    PREFILL_CHOICES = ("allgather", "alltoallv")
+    PREFILL_CHOICES = ("allgather", "alltoallv", "fused_op")
     DECODE_CHOICES = ("low_latency", "fused_op")
 
     prefill: str = "alltoallv"
@@ -144,11 +144,10 @@ class AscendOpsConfig:
                 f"invalid moe-ascend-ops-config decode mode {self.decode!r}; "
                 f"expected one of {self.DECODE_CHOICES}"
             )
-        if self.decode == "fused_op":
-            raise ValueError(
-                "moe-ascend-ops-config decode mode 'fused_op' is not implemented; "
-                "use 'low_latency'"
-            )
+
+    @property
+    def uses_fused_op(self) -> bool:
+        return "fused_op" in (self.prefill, self.decode)
 
     @classmethod
     def from_json_str(cls, s: Optional[str]) -> AscendOpsConfig:
@@ -204,9 +203,6 @@ class _MoeRunnerBackendPredicates:
 
     def is_ascend(self):
         return self.value == MoeRunnerBackend.ASCEND.value
-
-    def is_triton_kernels(self):
-        return self.value == MoeRunnerBackend.TRITON_KERNELS.value
 
     def is_flashinfer_trtllm(self):
         # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
@@ -276,7 +272,6 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
-    TRITON_KERNELS = "triton_kernel"
     ASCEND = "ascend"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
@@ -1138,11 +1133,7 @@ def get_moe_padding_size(is_aiter_moe):
     if is_aiter_moe:
         return AITER_PADDING_SIZE
     else:
-        return (
-            TRITON_PADDING_SIZE
-            if bool(int(os.getenv("SGLANG_MOE_PADDING", "0")))
-            else 0
-        )
+        return TRITON_PADDING_SIZE if envs.SGLANG_MOE_PADDING.get() else 0
 
 
 def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
@@ -1175,3 +1166,11 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+def route_dropped_experts_to_local(
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map -1 ids (EP-dropped, padded) to expert 0 at weight 0 for sgl-kernel-xpu."""
+    dropped = topk_ids < 0
+    return topk_weights.masked_fill(dropped, 0), topk_ids.masked_fill(dropped, 0)

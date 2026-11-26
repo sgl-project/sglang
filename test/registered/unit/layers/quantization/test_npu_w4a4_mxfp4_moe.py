@@ -50,7 +50,6 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
     def test_config_selects_online_experts_and_respects_ignored_layers(self):
         layer = FusedMoE.__new__(FusedMoE)
         torch.nn.Module.__init__(layer)
-        layer.use_triton_kernels = False
         layer.use_flashinfer_trtllm_moe = False
         prefix = "model.layers.0.mlp.experts"
         with (
@@ -582,7 +581,7 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
                     patch.object(layer.w2_kernel, "apply", return_value=x) as down,
                 ):
                     result = runner.run(
-                        SimpleNamespace(
+                        ascend_runner.AscendRunnerInput(
                             hidden_states=x,
                             hidden_states_scale=None,
                             expert_tokens=torch.tensor([1, 2]),

@@ -7,7 +7,6 @@ import math
 import os
 import typing as tp
 from dataclasses import dataclass
-from functools import wraps
 from typing import Optional, Tuple
 
 import torch
@@ -126,53 +125,6 @@ _ROPE_INIT_FUNCTIONS = {
 }
 
 
-def _dynamic_rope_update(rope_forward):
-    def longrope_frequency_update(self, position_ids, device):
-        seq_len = torch.max(position_ids) + 1
-        if hasattr(self.config, "original_max_position_embeddings"):
-            original_max_position_embeddings = (
-                self.config.original_max_position_embeddings
-            )
-        else:
-            original_max_position_embeddings = self.config.max_position_embeddings
-        if seq_len > original_max_position_embeddings:
-            if not hasattr(self, "long_inv_freq"):
-                self.long_inv_freq, _ = self.rope_init_fn(
-                    self.config, device, seq_len=original_max_position_embeddings + 1
-                )
-            self.register_buffer("inv_freq", self.long_inv_freq, persistent=False)
-        else:
-            self.original_inv_freq = self.original_inv_freq.to(device)
-            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
-
-    def dynamic_frequency_update(self, position_ids, device):
-        seq_len = torch.max(position_ids) + 1
-        if seq_len > self.max_seq_len_cached:  # growth
-            inv_freq, self.attention_scaling = self.rope_init_fn(
-                self.config, device, seq_len=seq_len
-            )
-            self.register_buffer("inv_freq", inv_freq, persistent=False)
-            self.max_seq_len_cached = seq_len
-
-        if (
-            seq_len < self.original_max_seq_len
-            and self.max_seq_len_cached > self.original_max_seq_len
-        ):
-            self.original_inv_freq = self.original_inv_freq.to(device)
-            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
-            self.max_seq_len_cached = self.original_max_seq_len
-
-    @wraps(rope_forward)
-    def wrapper(self, x, position_ids):
-        if "dynamic" in self.rope_type:
-            dynamic_frequency_update(self, position_ids, device=x.device)
-        elif self.rope_type == "longrope":
-            longrope_frequency_update(self, position_ids, device=x.device)
-        return rope_forward(self, x, position_ids)
-
-    return wrapper
-
-
 class AudioRotaryEmbedding(nn.Module):
     def __init__(self, base, dim, max_seq_len, rope_type="default", device=None):
         super().__init__()
@@ -183,10 +135,8 @@ class AudioRotaryEmbedding(nn.Module):
             device=device, base=base, dim=dim
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
 
     @torch.no_grad()
-    @_dynamic_rope_update
     def forward(self, x, position_ids):
         inv_freq_expanded = self.inv_freq[:, None].float().expand(-1, 1).to(x.device)
         position_ids_expanded = position_ids[None, :].float()
@@ -840,11 +790,6 @@ class AudioEncoder(nn.Module):
         hidden_states = torch.where(attention_mask, hidden_states, 0)
         return hidden_states, hidden_states_packed, output_length, codes
 
-    @torch.no_grad()
-    def decode_vq(self, codes):
-        self.quantizer.float()
-        return self.quantizer.decode(codes)
-
 
 class MiMoAudioTokenizer(PreTrainedModel):
     config_class = MiMoAudioTokenizerConfig
@@ -863,7 +808,6 @@ class MiMoAudioTokenizer(PreTrainedModel):
     @torch.no_grad()
     def encode(self, mels, input_lens, use_quantizer=True):
         input_features = mels
-        encoder_output_length = self.get_output_length(input_lens)
         hidden_states, hidden_states_packed, encoder_output_length, codes = (
             self.encoder.encode(
                 input_features, input_lens=input_lens, use_quantizer=use_quantizer
@@ -1036,149 +980,43 @@ class MiMoV2AudioConfig:
         input_projection_layers: int = 2,
         output_projection_layers: int = 2,
         add_encoder_post_norm: bool = True,
-        audio_config: dict = None,
         **kwargs,
     ):
         for key, value in kwargs.items():
             setattr(self, key, value)
 
-        if audio_config is not None:
-            self._load_from_audio_config(audio_config)
-        else:
-            self.speech_vocab_size = speech_vocab_size
-            self.speech_lm_head_sizes = (
-                speech_lm_head_sizes
-                if speech_lm_head_sizes is not None
-                else speech_vocab_size
-            )
-            self.speech_zeroemb_idx = speech_zeroemb_idx
-            self.delay_pattern = delay_pattern
-            self.group_size = group_size
-            self.audio_channels = audio_channels
-            self.input_local_dim = input_local_dim
-            self.input_local_layers = input_local_layers
-            self.input_local_attn_heads = input_local_attn_heads
-            self.input_local_intermediate_size = input_local_intermediate_size
-            self.input_local_rope_theta = input_local_rope_theta
-            self.input_local_partial_rotary_factor = input_local_partial_rotary_factor
-            self.output_local_dim = output_local_dim
-            self.output_local_layers = output_local_layers
-            self.output_local_attn_heads = output_local_attn_heads
-            self.output_local_intermediate_size = output_local_intermediate_size
-            self.output_local_rope_theta = output_local_rope_theta
-            self.output_local_partial_rotary_factor = output_local_partial_rotary_factor
-            self.input_projection_layers = input_projection_layers
-            self.output_projection_layers = output_projection_layers
-            self.add_encoder_post_norm = add_encoder_post_norm
+        self.speech_vocab_size = speech_vocab_size
+        self.speech_lm_head_sizes = (
+            speech_lm_head_sizes
+            if speech_lm_head_sizes is not None
+            else speech_vocab_size
+        )
+        self.speech_zeroemb_idx = speech_zeroemb_idx
+        self.delay_pattern = delay_pattern
+        self.group_size = group_size
+        self.audio_channels = audio_channels
+        self.input_local_dim = input_local_dim
+        self.input_local_layers = input_local_layers
+        self.input_local_attn_heads = input_local_attn_heads
+        self.input_local_intermediate_size = input_local_intermediate_size
+        self.input_local_rope_theta = input_local_rope_theta
+        self.input_local_partial_rotary_factor = input_local_partial_rotary_factor
+        self.output_local_dim = output_local_dim
+        self.output_local_layers = output_local_layers
+        self.output_local_attn_heads = output_local_attn_heads
+        self.output_local_intermediate_size = output_local_intermediate_size
+        self.output_local_rope_theta = output_local_rope_theta
+        self.output_local_partial_rotary_factor = output_local_partial_rotary_factor
+        self.input_projection_layers = input_projection_layers
+        self.output_projection_layers = output_projection_layers
+        self.add_encoder_post_norm = add_encoder_post_norm
 
         self._attn_implementation_internal = "sdpa"
-
-    def _load_from_audio_config(self, audio_config: dict):
-        """Load audio parameters from audio_config dict in checkpoint.
-
-        Uses naming that matches megatron2hf conversion output to minimize manual mapping.
-        """
-        self.group_size = audio_config.get("group_size", 4)
-        self.audio_channels = audio_config.get("audio_channels", 20)
-        self.speech_vocab_size = audio_config.get("speech_vocab_size", "1280")
-        self.speech_lm_head_sizes = audio_config.get(
-            "speech_lm_head_sizes", self.speech_vocab_size
-        )
-        self.speech_zeroemb_idx = audio_config.get("speech_zeroemb_idx", "1280")
-        # Per-channel decode delays; len must equal audio_channels.
-        self.delay_pattern = audio_config.get(
-            "audio_output_delay_pattern", "0-1-2-3-4-5-6-7-7-7-7-7-7-7-7-7-7-7-7-7"
-        )
-
-        self.input_local_dim = audio_config.get("input_local_dim", 1024)
-        self.input_local_layers = audio_config.get("input_local_layers", 6)
-        self.input_local_attn_heads = audio_config.get("input_local_attn_heads", 16)
-        self.input_local_intermediate_size = audio_config.get(
-            "input_local_intermediate_size", 4096
-        )
-        self.input_local_rope_theta = audio_config.get(
-            "input_local_rope_theta", 640000.0
-        )
-        self.input_local_partial_rotary_factor = audio_config.get(
-            "input_local_partial_rotary_factor", 1.0
-        )
-
-        self.output_local_dim = audio_config.get("output_local_dim", 1024)
-        self.output_local_layers = audio_config.get("output_local_layers", 6)
-        self.output_local_attn_heads = audio_config.get("output_local_attn_heads", 16)
-        self.output_local_intermediate_size = audio_config.get(
-            "output_local_intermediate_size", 4096
-        )
-        self.output_local_rope_theta = audio_config.get(
-            "output_local_rope_theta", 640000.0
-        )
-        self.output_local_partial_rotary_factor = audio_config.get(
-            "output_local_partial_rotary_factor", 1.0
-        )
-
-        self.input_projection_layers = audio_config.get("input_projection_layers", 2)
-        self.output_projection_layers = audio_config.get("output_projection_layers", 2)
-
-        self.add_encoder_post_norm = audio_config.get("add_encoder_post_norm", True)
 
     def _parse_maybe_list(self, value: str | int, length: int) -> list[int]:
         if isinstance(value, str) and "-" in value:
             return [int(s) for s in value.split("-")]
         return [int(value)] * length
-
-    def parsed_speech_empty_ids(self):
-        return self._parse_maybe_list(self.speech_zeroemb_idx, self.audio_channels)
-
-    def parsed_speech_vocab_sizes(self):
-        return self._parse_maybe_list(self.speech_vocab_size, self.audio_channels)
-
-    def parsed_speech_lm_head_sizes(self):
-        return self._parse_maybe_list(self.speech_lm_head_sizes, self.audio_channels)
-
-    def parsed_delay_pattern(self):
-        return self._parse_maybe_list(self.delay_pattern, self.audio_channels)
-
-    def input_local_config(self):
-        """Create config for input local transformer."""
-        config = Qwen2Config()
-        for attr in dir(self):
-            if not attr.startswith("_") and hasattr(config, attr):
-                setattr(config, attr, getattr(self, attr))
-
-        config.hidden_size = self.input_local_dim
-        config.num_hidden_layers = self.input_local_layers
-        config.num_attention_heads = self.input_local_attn_heads
-        config.num_key_value_heads = self.input_local_attn_heads
-        config.head_dim = getattr(
-            self,
-            "input_local_head_dim",
-            self.input_local_dim // self.input_local_attn_heads,
-        )
-        config.intermediate_size = self.input_local_intermediate_size
-        config.rope_theta = self.input_local_rope_theta
-        config.partial_rotary_factor = self.input_local_partial_rotary_factor
-        config._attn_implementation_internal = "sdpa"
-
-        return config
-
-    def output_local_config(self):
-        """Create config for output local transformer."""
-        config = Qwen2Config()
-        for attr in dir(self):
-            if not attr.startswith("_") and hasattr(config, attr):
-                setattr(config, attr, getattr(self, attr))
-
-        config.hidden_size = self.output_local_dim
-        config.num_hidden_layers = self.output_local_layers
-        config.num_attention_heads = self.output_local_attn_heads
-        config.num_key_value_heads = self.output_local_attn_heads
-        config.head_dim = self.output_local_dim // self.output_local_attn_heads
-        config.intermediate_size = self.output_local_intermediate_size
-        config.rope_theta = self.output_local_rope_theta
-        config.partial_rotary_factor = self.output_local_partial_rotary_factor
-        config._attn_implementation_internal = "sdpa"
-
-        return config
 
 
 def _remap_audio_tokenizer_state_dict(state_dict: dict) -> dict:
@@ -1258,8 +1096,7 @@ class AudioEncoderMixin:
 
     def build_audio_encoder(self, config) -> None:
         if not isinstance(config, MiMoV2AudioConfig):
-            cfg_dict = vars(config) if hasattr(config, "__dict__") else config.__dict__
-            config = MiMoV2AudioConfig(**cfg_dict)
+            config = MiMoV2AudioConfig(**vars(config))
 
         self.audio_channels = config.audio_channels
         self.audio_group_size = config.group_size

@@ -10,6 +10,7 @@ from sglang.kernels.ops.attention.metadata import (
     draft_extend_set_metadata,
     normal_decode_set_metadata,
     prepare_swa_spec_page_table_triton,
+    prepare_tree_spec_metadata,
 )
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
 from sglang.kernels.ops.attention.suffix_attention_merge import (
@@ -45,7 +46,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
@@ -53,6 +54,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
 )
@@ -70,6 +72,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 from sgl_kernel import merge_state_v2
 
@@ -188,6 +191,8 @@ class FlashAttentionBackend(AttentionBackend):
     # Set from the pool type in __init__; the class default keeps the extend
     # metadata guard readable on instances built with __new__ (test stubs).
     _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
+    _draft_kv_ring: Optional[DFlashDraftKVRing] = None
+    _ring_page_cols: Optional[torch.Tensor] = None
 
     # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
     # KV-index buffers directly, so it needs no backend-private replay state.
@@ -213,7 +218,6 @@ class FlashAttentionBackend(AttentionBackend):
         self.forward_metadata: FlashAttentionMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
-        self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
@@ -226,10 +230,16 @@ class FlashAttentionBackend(AttentionBackend):
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
         self.kv_cache_is_mxfp8 = self.kv_cache_dtype_str == "mxfp8"
         self.page_size = model_runner.page_size
+        self.mxfp8_via_bf16 = self.kv_cache_is_mxfp8 and get_platform().is_sm120
+        if self.mxfp8_via_bf16 and self.page_size != 128:
+            raise ValueError(
+                "MXFP8 KV cache on SM120 requires --page-size 128, got "
+                f"{self.page_size}."
+            )
         # Static page-table width (upper bound). The device-side page-table build
         # sizes to this constant, so no runtime host max is needed.
         self.max_num_pages = (
-            self.max_context_len + self.page_size - 1
+            self.req_to_token_pool.row_width + self.page_size - 1
         ) // self.page_size
         # Page table is built on-device (build_trtllm_mha_page_table) and the
         # tree mask is preallocated (see VerifyMask), so no
@@ -313,6 +323,8 @@ class FlashAttentionBackend(AttentionBackend):
         self.fa3_upgrades_to_fa4 = (
             self.fa_impl_ver == 3 and not self.use_mla and model_head_dim > 256
         )
+        self._anchor_window_cache = {}
+        self._anchor_first_layer = {}
         device_capability = get_device_capability()
         if self.fa3_upgrades_to_fa4 and device_capability[0] < 9:
             raise ValueError(
@@ -320,11 +332,33 @@ class FlashAttentionBackend(AttentionBackend):
                 "which requires SM90 or newer for paged KV cache. "
                 "Use --attention-backend triton on SM8x."
             )
-        if self.fa3_upgrades_to_fa4 and self.kv_cache_dtype != torch.bfloat16:
+        # FA4 on SM90 reads an fp8 e4m3 cache with unquantized Q, casting K/V in-kernel.
+        # MHA only: absorbed MLA passes qv, which that kernel path does not take.
+        self.fa4_casts_fp8_kv = (
+            device_capability[0] == 9
+            and self.kv_cache_dtype == torch.float8_e4m3fn
+            and not self.kv_cache_is_mxfp8
+            and not self.use_mla
+        )
+        if (
+            self.fa_impl_ver == 4
+            and self.fa4_casts_fp8_kv
+            and model_head_dim not in (256, 512)
+        ):
+            raise ValueError(
+                "FA4 on SM90 reads an fp8_e4m3 KV cache only at head_dim 256 or "
+                f"512, and this model has head_dim {model_head_dim}. Use a BF16 "
+                "KV cache or the fa3 backend."
+            )
+        if (
+            self.fa3_upgrades_to_fa4
+            and self.kv_cache_dtype != torch.bfloat16
+            and not self.fa4_casts_fp8_kv
+        ):
             raise ValueError(
                 f"FA4 has no {self.kv_cache_dtype_str} KV cache path on SM90, and "
                 f"the fa3 backend runs head_dim {model_head_dim} layers on FA4. "
-                "Use a BF16 KV cache."
+                "Use a BF16 or fp8_e4m3 KV cache."
             )
         self._init_flash_attention_functions(device_capability)
 
@@ -398,7 +432,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def _init_flash_attention_functions(self, device_capability):
         if self.fa_impl_ver == 3:
-            from sgl_kernel.flash_attn import get_scheduler_metadata
+            from sgl_fa3 import get_scheduler_metadata
 
             from sglang.kernels.ops.attention.flash_attention_v3 import (
                 flash_attn_varlen_func,
@@ -426,6 +460,18 @@ class FlashAttentionBackend(AttentionBackend):
         return self._fa_kernels[ver][0](*args, **kwargs)
 
     def flash_attn_with_kvcache(self, *args, ver: int, **kwargs):
+        # The FP8 k/v descales are one per-layer scalar expanded over the request
+        # batch (prepare_paged_mha_query), but the kernel takes one row per
+        # sequence of its own call. Calls on another batch layout (the expanded
+        # suffix of a topk > 1 target verify, SWA speculative metadata, local
+        # attention) get the same scalar at their own row count.
+        k_descale = kwargs.get("k_descale")
+        cu_seqlens_q = kwargs.get("cu_seqlens_q")
+        if k_descale is not None and cu_seqlens_q is not None:
+            batch = cu_seqlens_q.shape[0] - 1
+            if k_descale.shape[0] != batch:
+                kwargs["k_descale"] = k_descale[:1].expand(batch, -1)
+                kwargs["v_descale"] = kwargs["v_descale"][:1].expand(batch, -1)
         return self._fa_kernels[ver][1](*args, **kwargs)
 
     def _ver_for(self, layer: RadixAttention, *, needs_fa4: bool = False) -> int:
@@ -456,7 +502,7 @@ class FlashAttentionBackend(AttentionBackend):
         return LocalAttentionMetadataBuilder(
             attention_chunk_size=model_runner.attention_chunk_size,
             page_size=self.page_size,
-            max_context_len=self.max_context_len,
+            req_to_token_row_width=self.req_to_token_pool.row_width,
             device=self.device,
             swa_translate=(
                 functools.partial(self.runner_ids.ids_in, IdSpaceKind.SLIDING_WINDOW)
@@ -513,6 +559,13 @@ class FlashAttentionBackend(AttentionBackend):
         block-scaled QK^T (mxf8f6f4) and in-kernel V dequant."""
         if not self.kv_cache_is_mxfp8:
             return {}
+        if self.mxfp8_via_bf16:
+            if q_descale is not None:
+                raise RuntimeError(
+                    "MXFP8 KV cache on SM120 attends with a BF16 query; FA4 reads "
+                    "a BF16 copy of the cache, so Q must not be quantized."
+                )
+            return {}
         if self.fa_impl_ver != 4:
             raise RuntimeError("MXFP8 KV cache requires the FA4 backend.")
         if q_descale is None:
@@ -525,6 +578,50 @@ class FlashAttentionBackend(AttentionBackend):
         # flash_attn_with_kvcache / varlen wrappers don't forward them anyway).
         k_sf, v_sf = self.kv_layers.read(layer.layer_id).kv_scales()
         return {"sfq": q_descale, "sfk": k_sf, "sfv": v_sf}
+
+    def _mxfp8_kv_scales(self, layer):
+        if not self.kv_cache_is_mxfp8:
+            return {}
+        k_scale, v_scale = self.kv_layers.read(layer.layer_id).kv_scales()
+        return {"k_scale": k_scale, "v_scale": v_scale}
+
+    def _mxfp8_bf16_kv_cache(
+        self, *, layer, page_table, cache_seqlens, cu_seqlens_q, window_left
+    ):
+        from sglang.kernels.ops.kvcache.mxfp8_dequant_paged import (
+            mxfp8_dequant_paged,
+        )
+
+        kv_layer = self.kv_layers.read(layer.layer_id)
+        k_out, v_out = kv_layer.dequant_workspace()
+        k_cache, v_cache = kv_layer.kv()
+        k_scale, v_scale = kv_layer.kv_scales()
+        mxfp8_dequant_paged(
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            k_out=k_out,
+            v_out=v_out,
+            page_table=page_table,
+            seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            window_left=window_left,
+        )
+        return (
+            paged_kv_view(
+                buf=k_out,
+                page_size=self.page_size,
+                head_num=layer.tp_k_head_num,
+                head_dim=layer.head_dim,
+            ),
+            paged_kv_view(
+                buf=v_out,
+                page_size=self.page_size,
+                head_num=layer.tp_v_head_num,
+                head_dim=layer.v_head_dim,
+            ),
+        )
 
     def _capture_unified_verify_metadata(self, forward_batch: ForwardBatch) -> bool:
         # Fixed-width verify uses only capture-stable request/length buffers.
@@ -601,7 +698,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def stage_draft_extend_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self.draft_extend_metadata[forward_batch.batch_size]
-        self.forward_metadata.max_seq_len_k = self.max_context_len
+        self.forward_metadata.max_seq_len_k = self.req_to_token_pool.row_width
         self.forward_metadata_spec_decode_expand = None
         self.init_forward_metadata_in_graph(forward_batch)
 
@@ -760,7 +857,7 @@ class FlashAttentionBackend(AttentionBackend):
                     # the graph. Capture against the full replay bound, not the
                     # padded seq-len fill value (1), or a later long-context
                     # replay would leave K/V tiles uncovered.
-                    metadata.max_seq_len_k = self.max_context_len
+                    metadata.max_seq_len_k = self.req_to_token_pool.row_width
                 if self.local_attn_builder is not None:
                     metadata.local_attn_metadata = (
                         self.local_attn_builder.build_for_capture(
@@ -819,7 +916,7 @@ class FlashAttentionBackend(AttentionBackend):
           aliases it to cu_seqlens_k — under capture that would permanently
           weld q to the k buffer and break prefix replays);
         - max_seq_len_q / max_seq_len_k are baked at capture as upper bounds
-          (the bucket's num_tokens / max_context_len): the kernel reads real
+          (the bucket's num_tokens / req_to_token_row_width): the kernel reads real
           work extents from the cu_seqlens / cache_seqlens device buffers.
         """
         bs = forward_batch.batch_size
@@ -830,15 +927,15 @@ class FlashAttentionBackend(AttentionBackend):
             m.cu_seqlens_q = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             m.cu_seqlens_k = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             # Block table sized in PAGES. For page_size == 1 max_num_pages ==
-            # max_context_len, so this reduces to the per-token layout.
+            # req_to_token_row_width, so this reduces to the per-token layout.
             m.page_table = torch.zeros(
                 (bs, self.max_num_pages), dtype=torch.int32, device=device
             )
             # Page-start token offsets for the strided block-table gather. For
-            # page_size == 1 this is arange(max_context_len) and the gather + //1
+            # page_size == 1 this is arange(req_to_token_row_width) and the gather + //1
             # below reduces to the plain per-token req_to_token copy.
             self.full_cg_prefill_strided_indices = torch.arange(
-                0, self.max_context_len, self.page_size, device=device
+                0, self.req_to_token_pool.row_width, self.page_size, device=device
             )
             # SWA (hybrid sliding-window) buffers, mirroring the eager extend
             # path: a page-strided SWA block table + SWA-translated write
@@ -905,7 +1002,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 m.swa_page_table[:, :max_seq_pages].copy_(swa_starts // self.page_size)
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            # SWA write targets for the new tokens (KVWriteLoc.swa_loc), refilled
+            # SWA write targets for the new tokens (KVWriteLoc.window_locs), refilled
             # into the pointer-stable buffer and bound as a [:num_tokens] view.
             num_out = forward_batch.out_cache_loc.shape[0]
             assert_buffer_fits(
@@ -927,8 +1024,52 @@ class FlashAttentionBackend(AttentionBackend):
         if in_capture:
             # Baked into the captured kernel launches; upper bounds only.
             m.max_seq_len_q = forward_batch.positions.numel()
-            m.max_seq_len_k = self.max_context_len
+            m.max_seq_len_k = self.req_to_token_pool.row_width
         self.forward_metadata = m
+
+    def set_draft_kv_ring(self, ring: DFlashDraftKVRing) -> None:
+        if (
+            not ring.paged
+            or self.use_mla
+            or self.use_sliding_window_kv_pool
+            or self.runner_ids.is_translating
+            or self._kv_shard_pool is not None
+            or self.is_prefill_aware_swa
+            or self.topk > 1
+        ):
+            raise ValueError(
+                "fa4 reads only a paged ring on a plain MHA pool with topk 1."
+            )
+        self._draft_kv_ring = ring
+        self._ring_page_cols = (
+            torch.arange(self.max_num_pages, device=self.device) % ring.pages_per_req
+        ).to(torch.int32)
+
+    def _ring_seq_lens(
+        self,
+        forward_mode: ForwardMode,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        # The draft only runs TARGET_VERIFY; other modes (warmup, idle) just
+        # stay inside the ring through its page table.
+        ring = self._draft_kv_ring
+        if ring is None or not forward_mode.is_target_verify():
+            return seq_lens
+        return ring.relative_seq_lens(req_pool_indices, seq_lens)
+
+    def _fill_ring_page_table(
+        self, req_pool_indices: torch.Tensor, page_table: torch.Tensor
+    ) -> None:
+        cols = self._ring_page_cols
+        width = page_table.shape[1]
+        if width > cols.numel():
+            # Eager verify tables can run past max_num_pages by the draft block.
+            cols = (
+                torch.arange(width, device=cols.device)
+                % self._draft_kv_ring.pages_per_req
+            ).to(torch.int32)
+        self._draft_kv_ring.fill_page_table(req_pool_indices, cols[:width], page_table)
 
     def _spec_read_seq_len_delta(
         self, forward_mode: ForwardMode, spec_info: Optional[SpecInput]
@@ -962,13 +1103,13 @@ class FlashAttentionBackend(AttentionBackend):
         # Eager (non-cuda-graph) path: max_seq_len_k only feeds Python-side
         # page-table slicing and the scheduler_metadata heuristic -- never the
         # kernel. Use the CPU mirror when published; otherwise the static
-        # max_context_len bound (over-wide page table, slightly suboptimal
+        # req_to_token_row_width bound (over-wide page table, slightly suboptimal
         # split heuristic, but no D2H sync).
         seq_lens_cpu = forward_batch.seq_lens_cpu
         eager_max_k = (
             seq_lens_cpu.max().item()
             if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0
-            else self.max_context_len
+            else self.req_to_token_pool.row_width
         )
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -1101,10 +1242,15 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
+                verify_seq_lens = self._ring_seq_lens(
+                    forward_batch.forward_mode,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                )
                 ragged_layout = forward_batch.ragged_verify_layout
                 if ragged_layout is not None:
                     geometry = build_ragged_target_verify_geometry(
-                        seq_lens=forward_batch.seq_lens, layout=ragged_layout
+                        seq_lens=verify_seq_lens, layout=ragged_layout
                     )
                     metadata.cache_seqlens_int32 = geometry.cache_seqlens_int32
                     # Device-only layouts carry no host lens; the verify
@@ -1121,7 +1267,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.cu_seqlens_k = geometry.cu_seqlens_k
                 else:
                     metadata.cache_seqlens_int32 = (
-                        forward_batch.seq_lens + self.speculative_num_draft_tokens
+                        verify_seq_lens + self.speculative_num_draft_tokens
                     ).to(torch.int32)
                     metadata.max_seq_len_q = self.speculative_num_draft_tokens
                     metadata.max_seq_len_k = (
@@ -1177,58 +1323,25 @@ class FlashAttentionBackend(AttentionBackend):
                     device=device,
                 )
 
-                # create expand page table
-                offsets = torch.arange(
-                    self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
-                cols = offsets.expand(
-                    forward_batch.seq_lens.numel(), -1
-                ) + forward_batch.seq_lens.unsqueeze(1)
-                cum_len = torch.nn.functional.pad(
-                    torch.cumsum(
-                        (
-                            forward_batch.seq_lens + self.speculative_num_draft_tokens
-                        ).repeat_interleave(self.speculative_num_draft_tokens),
-                        dim=0,
-                    ),
-                    (1, 0),
-                )[:-1]
-                mask_extraction_indices = (
-                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                    + cum_len[:, None]
-                ).view(1, -1)
-                mask = forward_batch.spec_info.custom_mask[
-                    mask_extraction_indices
-                ].view(
-                    -1, self.speculative_num_draft_tokens
-                )  # (bsz * draft_num, draft_num)
-
-                # shift table indices to avoid padding
-                # non_masked_page_table [[8, 9, 10],   mask (display with int format) [[1, 0, 0],
-                #                        [8, 9, 10],                                   [1, 1, 0],
-                #                        [8, 9, 10]]                                   [1, 0, 1]]
-                # if masked with padding [[8, 0, 0],   our mask without padding       [[8, 9, 10],
-                #                        [8, 9, 0],                                    [8, 9, 10],
-                #                        [8, 0, 10]]                                   [8, 10, 9]]
-                # note here cache_seqlens_int32 is [1, 2, 2] so extra page indices will be ignored in each row
-                col_indices = offsets.expand(
-                    mask.shape[0], self.speculative_num_draft_tokens
+                num_queries = batch_size * self.speculative_num_draft_tokens
+                metadata_expand.page_table = torch.empty(
+                    (num_queries, self.speculative_num_draft_tokens),
+                    dtype=self.req_to_token.dtype,
+                    device=device,
                 )
-                # Build keys: if an entry is valid (mask==True), keep its original index;
-                # if not, add self.speculative_num_draft_tokens so that it sorts after all valid entries.
-                keys = torch.where(
-                    mask, col_indices, col_indices + self.speculative_num_draft_tokens
+                metadata_expand.cache_seqlens_int32 = torch.empty(
+                    num_queries, dtype=torch.int32, device=device
                 )
-                _, sort_order = torch.sort(keys, dim=1)
-                non_masked_page_table = (
-                    self.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices, :
-                    ]
-                    .gather(1, cols)
-                    .repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                )  # (bsz, draft_num)
-                metadata_expand.page_table = non_masked_page_table.gather(1, sort_order)
-                metadata_expand.cache_seqlens_int32 = mask.sum(dim=1).to(torch.int32)
+                prepare_tree_spec_metadata(
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    metadata.cu_seqlens_k,
+                    forward_batch.spec_info.custom_mask,
+                    metadata_expand.page_table,
+                    metadata_expand.cache_seqlens_int32,
+                    num_queries,
+                )
                 metadata_expand.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
                         metadata_expand.cache_seqlens_int32, dim=0, dtype=torch.int32
@@ -1298,7 +1411,7 @@ class FlashAttentionBackend(AttentionBackend):
                     max_pf = int(seq_lens_cpu[:batch_size].max().item())
                 else:
                     # Ratchet needs a true upper bound; a local D2H beats
-                    # poisoning it with max_context_len forever.
+                    # poisoning it with req_to_token_row_width forever.
                     max_pf = int(forward_batch.seq_lens[:batch_size].max().item())
                 if max_pf > self._pa_swa_max_prefill_len:
                     self._pa_swa_max_prefill_len = max_pf
@@ -1435,6 +1548,11 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
+        if self._draft_kv_ring is not None and metadata.page_table is not None:
+            page_table = torch.empty_like(metadata.page_table, dtype=torch.int32)
+            self._fill_ring_page_table(forward_batch.req_pool_indices, page_table)
+            metadata.page_table = page_table
+
         self.forward_metadata = metadata
 
     def get_paged_mha_kv_cache(
@@ -1491,16 +1609,17 @@ class FlashAttentionBackend(AttentionBackend):
         Optional[torch.Tensor],
     ]:
         k_descale = v_descale = None
-        if (
-            self.kv_cache_dtype_str != "auto"
-            and layer.head_dim <= 256
-            and not self.kv_cache_is_mxfp8
-            and (not is_prefill or ver != 4)
-        ):
-            if layer.k_scale is not None:
-                descale_shape = (logical_batch_size, kv_head_num)
-                k_descale = layer.k_scale.expand(descale_shape)
-                v_descale = layer.v_scale.expand(descale_shape)
+        if self.kv_cache_dtype_str == "auto" or self.kv_cache_is_mxfp8:
+            return q, q_rope, k_rope, k_descale, v_descale
+        fa4_casts_kv = ver == 4 and self.fa4_casts_fp8_kv
+        quantize_q = (
+            not fa4_casts_kv and layer.head_dim <= 256 and (not is_prefill or ver != 4)
+        )
+        if (fa4_casts_kv or quantize_q) and layer.k_scale is not None:
+            descale_shape = (logical_batch_size, kv_head_num)
+            k_descale = layer.k_scale.expand(descale_shape)
+            v_descale = layer.v_scale.expand(descale_shape)
+        if quantize_q:
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
@@ -1522,10 +1641,14 @@ class FlashAttentionBackend(AttentionBackend):
         write_loc = KVWriteLoc.for_layer(
             forward_batch,
             layer,
-            swa_loc=self.forward_metadata.swa_out_cache_loc,
+            window_locs=window_write_locs(
+                self.runner_ids, self.forward_metadata.swa_out_cache_loc
+            ),
         )
         locations = (
-            write_loc.swa_loc
+            (write_loc.window_locs or {}).get(
+                self.kv_layers.route(layer.layer_id).sub_pool
+            )
             if self.use_sliding_window_kv_pool and layer.sliding_window_size >= 0
             else write_loc.loc
         )
@@ -1540,6 +1663,39 @@ class FlashAttentionBackend(AttentionBackend):
             if buffer.shape[1:] != shape or buffer.stride()[-2:] != (shape[-1], 1):
                 return None
         return (*buffers, locations)
+
+    def _forward_suffix_attention(
+        self, q, key_cache, value_cache, layer, window_size, kwargs, ver
+    ):
+        """One query per suffix sequence, with FlashAttention's varlen LSE layout."""
+        metadata = self.forward_metadata_spec_decode_expand
+        # FA4 can map one-query suffixes directly, without its varlen scheduler.
+        # Optional modifiers and scale tensors keep their original query layout.
+        fixed_length = ver == 4 and not kwargs
+        result = self.flash_attn_with_kvcache(
+            q=q.unsqueeze(1) if fixed_length else q,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=metadata.page_table,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            cu_seqlens_q=None if fixed_length else metadata.cu_seqlens_q,
+            cu_seqlens_k_new=None if fixed_length else metadata.cu_seqlens_k,
+            max_seqlen_q=1,
+            softmax_scale=layer.scaling,
+            causal=False,
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            return_softmax_lse=True,
+            num_splits=self.num_splits
+            if layer.num_splits is None
+            else layer.num_splits,
+            **kwargs,
+            ver=ver,
+        )
+        if fixed_length:
+            output, lse, *rest = result
+            return output.squeeze(1), lse.squeeze(-1).T, *rest
+        return result
 
     def forward_extend(
         self,
@@ -1561,6 +1717,9 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias=None,
         rel_bias_event=None,
         return_lse: bool = False,
+        rel_bias_compact_decode: bool = False,
+        rel_bias_decode_epilogue=None,
+        rel_bias_presheared: bool = False,
     ):
         ver = self._ver_for(
             layer, needs_fa4=self.forward_metadata.image_token_ranges is not None
@@ -1569,6 +1728,7 @@ class FlashAttentionBackend(AttentionBackend):
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         if return_lse and self.use_mla:
             raise NotImplementedError("MLA extend does not return an LSE.")
+        num_splits = self.num_splits if layer.num_splits is None else layer.num_splits
         extend_lse = None
         cp_active = is_cp_active(forward_batch)
 
@@ -1593,15 +1753,17 @@ class FlashAttentionBackend(AttentionBackend):
                 elif cp_active:
                     # Dense-MHA CP: k, v are still rank-local; backend
                     # all-gathers and writes to the per-rank pool.
-                    swa_loc = (
-                        self.forward_metadata.swa_out_cache_loc
+                    window_locs = (
+                        window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        )
                         if self.use_sliding_window_kv_pool
                         else None
                     )
                     cp_strategy = get_cp_strategy()
                     assert cp_strategy is not None
                     cp_strategy.materialize_full_kv(
-                        forward_batch, layer, k, v, swa_loc=swa_loc
+                        forward_batch, layer, k, v, window_locs=window_locs
                     )
                 else:
                     k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
@@ -1611,7 +1773,9 @@ class FlashAttentionBackend(AttentionBackend):
                         KVWriteLoc.for_layer(
                             forward_batch,
                             layer,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                            window_locs=window_write_locs(
+                                self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                            ),
                         ),
                         k,
                         v,
@@ -1666,6 +1830,8 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         kwargs = {}
+        if layer.pack_gqa is not None:
+            kwargs["pack_gqa"] = layer.pack_gqa
         if sinks is not None:
             kwargs["sinks"] = sinks
         if score_mod is not None:
@@ -1703,7 +1869,7 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["k_descale"] = fa_k_descale
             kwargs["v_descale"] = fa_v_descale
         if rel_bias is not None:
-            if ver != 4:
+            if ver != 4 and not rel_bias_compact_decode:
                 raise RuntimeError(
                     "rel_bias (sheared bias) is only supported by the FA4 backend."
                 )
@@ -1713,6 +1879,8 @@ class FlashAttentionBackend(AttentionBackend):
                 # it -- so rel_logits_proj overlaps the KV-write above.
                 rel_bias_event.wait()
             kwargs["rel_bias"] = rel_bias
+            if rel_bias_presheared:
+                kwargs["rel_bias_presheared"] = True
             if metadata is self.full_cg_prefill_metadata:
                 # Full-CG reuses the cu_seqlens pointer with new values each replay.
                 # Disable its pointer-keyed schedule cache so the graph refreshes it.
@@ -1727,6 +1895,15 @@ class FlashAttentionBackend(AttentionBackend):
             if getattr(forward_batch, "_attn_output", None) is not None
             else None
         )
+        if layer.out_dtype is not None and not rel_bias_compact_decode:
+            if ver != 4:
+                raise ValueError("Explicit attention output dtype requires FA4")
+            if _fa_out is None:
+                _fa_out = torch.empty(
+                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                    dtype=layer.out_dtype,
+                    device=q.device,
+                )
 
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
@@ -1748,13 +1925,67 @@ class FlashAttentionBackend(AttentionBackend):
                 if metadata.swa_page_table is not None:
                     page_table = metadata.swa_page_table
                 else:
-                    page_table = self.runner_ids.ids_in(
-                        IdSpaceKind.SLIDING_WINDOW, metadata.page_table
+                    # page_table holds page ids; translate their first token slots.
+                    page_table = (
+                        self.runner_ids.ids_in(
+                            IdSpaceKind.SLIDING_WINDOW,
+                            metadata.page_table * self.page_size,
+                        )
+                        // self.page_size
                     ).to(torch.int32)
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
             cu_seqlens_k = metadata.cu_seqlens_k
+
+        if layer.window_anchor_at_start:
+            if (
+                ver != 4
+                or not is_swa_layer
+                or causal
+                or use_local_attn
+                or use_cascade_attn
+                or cp_active
+                or self.use_mla
+                or self.fa_skip_kv_cache
+                or metadata.swa_spec_metadata is not None
+            ):
+                raise NotImplementedError(
+                    "Block-anchored windows require bidirectional FA4 MHA "
+                    "with standard paged metadata"
+                )
+            # Rebuilt by the lowest anchored layer of every forward.
+            anchor_key = (layer.sliding_window_size, is_swa_layer)
+            anchor_cache = self._anchor_window_cache
+            first = self._anchor_first_layer.setdefault(anchor_key, layer.layer_id)
+            if layer.layer_id < first:
+                first = self._anchor_first_layer[anchor_key] = layer.layer_id
+            if layer.layer_id == first or anchor_key not in anchor_cache:
+                query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+                start = (
+                    cache_seqlens - query_lens - (layer.sliding_window_size + 1)
+                ).clamp(min=0)
+                width = min(
+                    page_table.shape[1] * self.page_size,
+                    max_seqlen_q + layer.sliding_window_size + 1,
+                )
+                offsets = start[:, None].to(torch.int64) + torch.arange(
+                    width, device=page_table.device
+                )
+                offsets = offsets.clamp(max=page_table.shape[1] * self.page_size - 1)
+                anchored = cache_seqlens - start
+                anchor_cache[anchor_key] = (
+                    (
+                        page_table.gather(1, offsets // self.page_size) * self.page_size
+                        + offsets.remainder(self.page_size)
+                    ).to(torch.int32),
+                    anchored,
+                    torch.cat(
+                        [anchored.new_zeros(1), anchored.cumsum(0, dtype=torch.int32)]
+                    ),
+                )
+            page_table, cache_seqlens, cu_seqlens_k = anchor_cache[anchor_key]
+            window_size = (-1, -1)
 
         # Use Flash Attention for prefill
         if not self.use_mla:
@@ -1762,11 +1993,39 @@ class FlashAttentionBackend(AttentionBackend):
             key_cache, value_cache = self.get_paged_mha_kv_cache(
                 layer,
             )
+            if layer.window_anchor_at_start:
+                key_cache = paged_view(
+                    key_cache.view(-1, layer.tp_k_head_num, layer.head_dim), 1
+                )
+                value_cache = paged_view(
+                    value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim), 1
+                )
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
+            if self.mxfp8_via_bf16 and not rel_bias_compact_decode:
+                if (
+                    cp_active
+                    or self.fa_skip_kv_cache
+                    or use_local_attn
+                    or use_cascade_attn
+                    or layer.window_anchor_at_start
+                    or layer.is_cross_attention
+                ):
+                    raise NotImplementedError(
+                        "MXFP8 KV cache on SM120 supports paged self-attention "
+                        "without context parallelism, chunked local or cascade "
+                        "attention, anchored windows or a skipped KV cache."
+                    )
+                key_cache, value_cache = self._mxfp8_bf16_kv_cache(
+                    layer=layer,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    window_left=window_size[0],
+                )
 
             if cp_active:
 
@@ -1787,16 +2046,16 @@ class FlashAttentionBackend(AttentionBackend):
                         window_size=window_size,
                         softcap=layer.logit_cap,
                         return_softmax_lse=use_cascade_attn,
-                        num_splits=self.num_splits,
+                        num_splits=num_splits,
                         **kwargs,
                         ver=ver,
                     )
 
-                q_cp = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 cp_strategy = get_cp_strategy()
                 assert cp_strategy is not None
                 result = cp_strategy.run_attention(
-                    q_cp,
+                    q,
                     forward_batch,
                     self.device,
                     _fa_cp_attn,
@@ -1841,8 +2100,9 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         metadata.fa_skip_cu_seqlens_q = cu_seqlens_q
                         metadata.fa_skip_max_seqlen_q = max_seqlen_q
+                q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 result = self.flash_attn_varlen_func(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q,
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
                     cu_seqlens_q=metadata.fa_skip_cu_seqlens_q,
@@ -1853,14 +2113,37 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    num_splits=self.num_splits,
+                    num_splits=num_splits,
                     out=_fa_out,
                     **kwargs,
                     ver=ver,
                 )
+            elif rel_bias_compact_decode:
+                assert forward_batch.forward_mode.is_target_verify()
+                assert not (use_local_attn or use_cascade_attn or return_lse)
+                from sglang.kernels.ops.attention.inkling2_attn import rel_bias_partials
+
+                result = rel_bias_decode_epilogue(
+                    *rel_bias_partials(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        key_cache,
+                        value_cache,
+                        page_table,
+                        cache_seqlens,
+                        rel_bias,
+                        layer.scaling,
+                        _fa_out,
+                        window_size_left=(
+                            window_size[0] if window_size[0] >= 0 else None
+                        ),
+                        verify=True,
+                        **self._mxfp8_kv_scales(layer),
+                    )
+                )
             else:
+                q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 result = self.flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q,
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
@@ -1873,7 +2156,7 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     return_softmax_lse=use_cascade_attn or return_lse,
-                    num_splits=self.num_splits,
+                    num_splits=num_splits,
                     out=_fa_out,
                     **kwargs,
                     ver=ver,
@@ -1883,13 +2166,31 @@ class FlashAttentionBackend(AttentionBackend):
                 if not isinstance(result, tuple):
                     raise RuntimeError("This extend path does not return an LSE.")
                 o, softmax_lse, *_ = result
-                extend_lse = softmax_lse.T.contiguous()
+                extend_lse = (
+                    softmax_lse.T
+                    if getattr(layer, "strided_lse", False)
+                    else softmax_lse.T.contiguous()
+                )
                 result = o
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
+                suffix_metadata = self.forward_metadata_spec_decode_expand
+                suffix_page_table = suffix_metadata.page_table
+                if forward_batch.spec_algorithm.is_eagle():
+                    # Each query sees its ancestors, not the whole tree.
+                    suffix_page_table = suffix_page_table[
+                        :, : forward_batch.spec_info.max_tree_depth
+                    ]
             if (
                 use_cascade_attn
-                and forward_batch.spec_algorithm.is_uno()
+                and (
+                    forward_batch.spec_algorithm.is_uno()
+                    or (
+                        forward_batch.spec_algorithm.is_eagle()
+                        and suffix_page_table.shape[1] <= 64
+                        and layer.head_dim <= 128
+                    )
+                )
                 and can_use_fused_suffix_attention_merge(
                     layer=layer,
                     q=q,
@@ -1898,12 +2199,11 @@ class FlashAttentionBackend(AttentionBackend):
                     extra_kwargs=kwargs,
                 )
             ):
-                suffix_metadata = self.forward_metadata_spec_decode_expand
                 o = merge_suffix_attention_in_place(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q,
                     k_cache=key_cache.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v_cache=value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                    suffix_page_table=suffix_metadata.page_table,
+                    suffix_page_table=suffix_page_table,
                     suffix_cache_seqlens=suffix_metadata.cache_seqlens_int32,
                     prefix=o,
                     prefix_lse=softmax_lse,
@@ -1911,30 +2211,20 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif use_cascade_attn:
                 o_expand, softmax_lse_expand, *rest_expand = (
-                    self.flash_attn_with_kvcache(
-                        q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                        # The suffix table stores physical token slots, so expose
-                        # the paged cache as page-size-one blocks.
-                        k_cache=paged_view(
+                    self._forward_suffix_attention(
+                        q,
+                        # The suffix table contains physical token slots.
+                        paged_view(
                             key_cache.view(-1, layer.tp_k_head_num, layer.head_dim), 1
                         ),
-                        v_cache=paged_view(
+                        paged_view(
                             value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
                             1,
                         ),
-                        page_table=self.forward_metadata_spec_decode_expand.page_table,
-                        cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                        cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                        cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                        max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                        softmax_scale=layer.scaling,
-                        causal=False,
-                        window_size=window_size,
-                        softcap=layer.logit_cap,
-                        return_softmax_lse=True,
-                        num_splits=self.num_splits,
-                        **kwargs,
-                        ver=ver,
+                        layer,
+                        window_size,
+                        kwargs,
+                        ver,
                     )
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -2063,7 +2353,7 @@ class FlashAttentionBackend(AttentionBackend):
                             softcap=layer.logit_cap,
                             k_descale=fa_k_descale,
                             v_descale=fa_v_descale,
-                            num_splits=self.num_splits,
+                            num_splits=num_splits,
                             ver=ver,
                         )
 
@@ -2093,7 +2383,7 @@ class FlashAttentionBackend(AttentionBackend):
                         k_descale=fa_k_descale,
                         v_descale=fa_v_descale,
                         return_softmax_lse=use_cascade_attn,
-                        num_splits=self.num_splits,
+                        num_splits=num_splits,
                         ver=ver,
                     )
                     if use_cascade_attn:
@@ -2116,7 +2406,7 @@ class FlashAttentionBackend(AttentionBackend):
                                 k_descale=fa_k_descale,
                                 v_descale=fa_v_descale,
                                 return_softmax_lse=True,
-                                num_splits=self.num_splits,
+                                num_splits=num_splits,
                                 ver=ver,
                             )
                         )
@@ -2156,12 +2446,20 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias=None,
         rel_bias_event=None,
         return_lse: bool = False,
+        rel_bias_compact_decode: bool = False,
+        rel_bias_decode_epilogue=None,
     ) -> torch.Tensor:
+        if layer.window_anchor_at_start:
+            raise NotImplementedError("Block-anchored windows are extend-only")
         ver = self._ver_for(layer)
         if score_mod is not None and ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         if return_lse and self.use_mla:
             raise NotImplementedError("MLA decode does not return an LSE.")
+        num_splits = self.num_splits if layer.num_splits is None else layer.num_splits
+        decode_num_splits = (
+            self.decode_num_splits if layer.num_splits is None else layer.num_splits
+        )
         decode_lse = None
         if k is not None:
             assert v is not None
@@ -2174,7 +2472,9 @@ class FlashAttentionBackend(AttentionBackend):
                         KVWriteLoc.for_layer(
                             forward_batch,
                             layer,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                            window_locs=window_write_locs(
+                                self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                            ),
                         ),
                         k,
                         v,
@@ -2220,6 +2520,8 @@ class FlashAttentionBackend(AttentionBackend):
             causal = False
 
         kwargs = {}
+        if layer.pack_gqa is not None:
+            kwargs["pack_gqa"] = layer.pack_gqa
         if sinks is not None:
             kwargs["sinks"] = sinks
         if score_mod is not None:
@@ -2227,7 +2529,7 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["aux_tensors"] = aux_tensors
         kwargs.update(self._mxfp8_sf_kwargs(layer, forward_batch, q_descale))
         if rel_bias is not None:
-            if ver != 4:
+            if ver != 4 and not rel_bias_compact_decode:
                 raise RuntimeError(
                     "rel_bias (sheared bias) is only supported by the FA4 backend."
                 )
@@ -2251,6 +2553,15 @@ class FlashAttentionBackend(AttentionBackend):
             if getattr(forward_batch, "_attn_output", None) is not None
             else None
         )
+        if layer.out_dtype is not None and not rel_bias_compact_decode:
+            if ver != 4:
+                raise ValueError("Explicit attention output dtype requires FA4")
+            if _fa_out is None:
+                _fa_out = torch.empty(
+                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                    dtype=layer.out_dtype,
+                    device=q.device,
+                )
 
         q, q_rope, k_rope, fa_k_descale, fa_v_descale = self.prepare_paged_mha_query(
             q,
@@ -2271,6 +2582,11 @@ class FlashAttentionBackend(AttentionBackend):
             key_cache, value_cache = self.get_paged_mha_kv_cache(
                 layer,
             )
+            if self.mxfp8_via_bf16 and (layer.is_cross_attention or use_local_attn):
+                raise NotImplementedError(
+                    "MXFP8 KV cache on SM120 does not support cross or chunked "
+                    "local attention."
+                )
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
@@ -2289,7 +2605,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False,
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
-                    num_splits=self.num_splits,
+                    num_splits=num_splits,
                     **kwargs,
                     ver=ver,
                 )
@@ -2310,7 +2626,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=True,
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
-                    num_splits=self.num_splits,
+                    num_splits=num_splits,
                     **kwargs,
                     ver=ver,
                 )
@@ -2320,8 +2636,12 @@ class FlashAttentionBackend(AttentionBackend):
                     if metadata.swa_page_table is not None:
                         page_table = metadata.swa_page_table
                     else:
-                        page_table = self.runner_ids.ids_in(
-                            IdSpaceKind.SLIDING_WINDOW, metadata.page_table
+                        page_table = (
+                            self.runner_ids.ids_in(
+                                IdSpaceKind.SLIDING_WINDOW,
+                                metadata.page_table * self.page_size,
+                            )
+                            // self.page_size
                         ).to(torch.int32)
                 cache_seqlens = metadata.cache_seqlens_int32
                 max_seqlen_q = metadata.max_seq_len_q
@@ -2350,34 +2670,71 @@ class FlashAttentionBackend(AttentionBackend):
                     sched_meta = metadata.scheduler_metadata
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.max_seq_len_k
-                result = self.flash_attn_with_kvcache(
-                    q=q_reshaped,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn or return_lse,
-                    num_splits=(
-                        self.decode_num_splits
-                        if not is_swa_layer
-                        and not use_cascade_attn
-                        and not pa_swa_active
-                        else self.num_splits
-                    ),
-                    out=_fa_out,
-                    scheduler_metadata=sched_meta,
-                    **kwargs,
-                    ver=ver,
-                )
+                if rel_bias_compact_decode:
+                    assert not (use_cascade_attn or pa_swa_active or return_lse)
+                    from sglang.kernels.ops.attention.inkling2_attn import (
+                        rel_bias_partials,
+                    )
+
+                    result = rel_bias_decode_epilogue(
+                        *rel_bias_partials(
+                            q_reshaped,
+                            key_cache,
+                            value_cache,
+                            page_table,
+                            cache_seqlens,
+                            rel_bias,
+                            layer.scaling,
+                            _fa_out,
+                            window_size_left=(
+                                window_size[0] if window_size[0] >= 0 else None
+                            ),
+                            verify=False,
+                            **self._mxfp8_kv_scales(layer),
+                        )
+                    )
+                else:
+                    if self.mxfp8_via_bf16:
+                        # FA4 would dequantize every sequence's whole context
+                        # into the workspace on each step.
+                        raise NotImplementedError(
+                            "MXFP8 KV cache on SM120 decodes only through the "
+                            "relative-bias decode kernel."
+                        )
+                    result = self.flash_attn_with_kvcache(
+                        q=q_reshaped,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        return_softmax_lse=use_cascade_attn or return_lse,
+                        num_splits=(
+                            decode_num_splits
+                            if not is_swa_layer
+                            and not use_cascade_attn
+                            and not pa_swa_active
+                            else num_splits
+                        ),
+                        out=_fa_out,
+                        scheduler_metadata=sched_meta,
+                        **kwargs,
+                        ver=ver,
+                    )
                 if return_lse and not use_cascade_attn:
                     o, softmax_lse, *_ = result
-                    decode_lse = softmax_lse.T.contiguous()
+                    # Layers flagged strided_lse read the (heads, tokens) LSE
+                    # through its transposed view instead of a copy.
+                    decode_lse = (
+                        softmax_lse.T
+                        if getattr(layer, "strided_lse", False)
+                        else softmax_lse.T.contiguous()
+                    )
                     result = o
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -2386,23 +2743,14 @@ class FlashAttentionBackend(AttentionBackend):
                             self.forward_metadata_spec_decode_expand.max_seq_len_k
                         )
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        self.flash_attn_with_kvcache(
-                            q=q_reshaped,
-                            k_cache=key_cache,
-                            v_cache=value_cache,
-                            page_table=self.forward_metadata_spec_decode_expand.page_table,
-                            cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                            cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                            cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                            max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                            softmax_scale=layer.scaling,
-                            causal=False,
-                            window_size=window_size,
-                            softcap=layer.logit_cap,
-                            return_softmax_lse=True,
-                            num_splits=self.num_splits,
-                            **kwargs,
-                            ver=ver,
+                        self._forward_suffix_attention(
+                            q_reshaped,
+                            key_cache,
+                            value_cache,
+                            layer,
+                            window_size,
+                            kwargs,
+                            ver,
                         )
                     )
                     o, _ = merge_state_v2(
@@ -2447,7 +2795,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_descale=fa_k_descale,
                 v_descale=fa_v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
-                num_splits=self.num_splits,
+                num_splits=num_splits,
                 ver=ver,
             )
             if use_cascade_attn:
@@ -2470,7 +2818,7 @@ class FlashAttentionBackend(AttentionBackend):
                         k_descale=fa_k_descale,
                         v_descale=fa_v_descale,
                         return_softmax_lse=True,
-                        num_splits=self.num_splits,
+                        num_splits=num_splits,
                         ver=ver,
                     )
                 )
@@ -2499,7 +2847,9 @@ class FlashAttentionBackend(AttentionBackend):
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
-        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        max_num_pages = (
+            self.req_to_token_pool.row_width + self.page_size - 1
+        ) // self.page_size
 
         # This is being used by normal decode and draft decode when topk == 1
         self.decode_cuda_graph_metadata = {
@@ -2517,7 +2867,7 @@ class FlashAttentionBackend(AttentionBackend):
                 device=self.device,
             ),
             "strided_indices": torch.arange(
-                0, self.max_context_len, self.page_size, device=self.device
+                0, self.req_to_token_pool.row_width, self.page_size, device=self.device
             ),
         }
         # Pre-allocate scheduler_metadata buffer for CUDA graph
@@ -2568,7 +2918,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    self.max_context_len,
+                    self.req_to_token_pool.row_width,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -2637,7 +2987,10 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 ),
                 "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
+                    0,
+                    self.req_to_token_pool.row_width,
+                    self.page_size,
+                    device=self.device,
                 ),
             }
 
@@ -2646,7 +2999,7 @@ class FlashAttentionBackend(AttentionBackend):
                 is_draft_runner=self.is_draft_runner,
                 skip_prefill=self.skip_prefill,
                 max_bs=max_bs,
-                max_context_len=self.max_context_len,
+                max_context_len=self.req_to_token_pool.row_width,
                 num_draft_tokens=self.speculative_num_draft_tokens,
                 device=self.device,
                 is_read=self.topk > 1,
@@ -2671,7 +3024,10 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 ),
                 "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
+                    0,
+                    self.req_to_token_pool.row_width,
+                    self.page_size,
+                    device=self.device,
                 ),
             }
 
@@ -2706,7 +3062,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    self.max_context_len,
+                    self.req_to_token_pool.row_width,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -2759,7 +3115,8 @@ class FlashAttentionBackend(AttentionBackend):
                     # columns (checked by assert_buffer_fits at the merge).
                     "page_table": torch.zeros(
                         max_bs * self.speculative_num_draft_tokens,
-                        self.max_context_len + self.speculative_num_draft_tokens,
+                        self.req_to_token_pool.row_width
+                        + self.speculative_num_draft_tokens,
                         dtype=torch.int32,
                         device=self.device,
                     ),
@@ -2770,7 +3127,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.encoder_metadata = {
                 "encoder_page_table": torch.zeros(
                     max_bs,
-                    self.max_context_len,
+                    self.req_to_token_pool.row_width,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -3034,6 +3391,7 @@ class FlashAttentionBackend(AttentionBackend):
         the fused kernel is left with the prefix sum alone.
         """
         translated = self.runner_ids.reads_are_translated
+        ring = self._draft_kv_ring is not None
         normal_decode_set_metadata(
             metadata.cache_seqlens_int32,
             metadata.cu_seqlens_k,
@@ -3051,8 +3409,11 @@ class FlashAttentionBackend(AttentionBackend):
                 and not self.runner_ids.is_translating
                 else None
             ),
-            skip_page_table=translated,
+            skip_page_table=translated or ring,
         )
+        if ring:
+            bs = int(req_pool_indices.numel())
+            self._fill_ring_page_table(req_pool_indices, metadata.page_table[:bs])
         if translated:
             # The plan's table reaches `cache_seqlens_int32`, which the kernels
             # bound their reads by: a draft decode reads past `seq_lens`.
@@ -3087,7 +3448,7 @@ class FlashAttentionBackend(AttentionBackend):
         """
         seq_lens = seq_lens[:bs]
         # The sync-free path passes seq_lens_cpu=None; branches that still need a
-        # host max fall back to the static max_context_len, so no D2H is forced here.
+        # host max fall back to the static req_to_token_row_width, so no D2H is forced here.
         seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
         req_pool_indices = req_pool_indices[:bs]
         device = seq_lens.device
@@ -3128,7 +3489,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.max_seq_len_k = (
                         seq_lens_cpu.max().item()
                         if seq_lens_cpu is not None
-                        else self.max_context_len
+                        else self.req_to_token_pool.row_width
                     )
                     max_seq_pages = (
                         metadata.max_seq_len_k + self.page_size - 1
@@ -3206,7 +3567,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.max_seq_len_k = (
                         seq_lens_cpu.max().item()
                         if seq_lens_cpu is not None
-                        else self.max_context_len
+                        else self.req_to_token_pool.row_width
                     )
                     self._set_decode_page_metadata(
                         plan,
@@ -3242,6 +3603,7 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
+                seq_lens = self._ring_seq_lens(forward_mode, req_pool_indices, seq_lens)
                 if ragged_verify_layout is not None:
                     padded = ragged_verify_layout.padded_to_bucket(padded_bs=bs)
                     geometry = build_ragged_target_verify_geometry(
@@ -3271,7 +3633,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # Page table built on-device (self-guards on cache_seqlens).
                 # max_seq_len_k stays the static bound; its only replay reader
                 # is the SWA-merge capacity assert, capture-sized to match.
-                metadata.max_seq_len_k = self.max_context_len
+                metadata.max_seq_len_k = self.req_to_token_pool.row_width
                 # metadata.cu_seqlens_q already set in capture
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
@@ -3289,53 +3651,16 @@ class FlashAttentionBackend(AttentionBackend):
 
                 # metadata_expand.max_seq_len_q = 1, already set in capture
                 # metadata_expand.cu_seqlens_q already set in capture
-                offsets = torch.arange(
-                    self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
-
-                cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
-                cum_len = torch.nn.functional.pad(
-                    torch.cumsum(
-                        (
-                            seq_lens + self.speculative_num_draft_tokens
-                        ).repeat_interleave(self.speculative_num_draft_tokens),
-                        dim=0,
-                    ),
-                    (1, 0),
-                )[:-1]
-                mask_extraction_indices = (
-                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                    + cum_len[:, None]
-                ).view(1, -1)
-                # avoid extracting padded seq indices which will be out of boundary
-                mask_extraction_indices[
-                    :,
-                    spec_info.positions.numel() * self.speculative_num_draft_tokens :,
-                ].fill_(0)
-                mask = spec_info.custom_mask[mask_extraction_indices].view(
-                    -1, self.speculative_num_draft_tokens
-                )  # (bsz * draft_num, draft_num)
-
-                col_indices = offsets.expand(
-                    mask.shape[0], self.speculative_num_draft_tokens
+                prepare_tree_spec_metadata(
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    metadata.cu_seqlens_k,
+                    spec_info.custom_mask,
+                    metadata_expand.page_table,
+                    metadata_expand.cache_seqlens_int32,
+                    spec_info.positions.numel(),
                 )
-                keys = torch.where(
-                    mask,
-                    col_indices,
-                    col_indices + self.speculative_num_draft_tokens,
-                )
-                _, sort_order = torch.sort(keys, dim=1)
-
-                non_masked_page_table = (
-                    self.req_to_token[req_pool_indices, :]
-                    .gather(1, cols)
-                    .repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                )  # (bsz, draft_num)
-
-                metadata_expand.page_table.copy_(
-                    non_masked_page_table.gather(1, sort_order)
-                )
-                metadata_expand.cache_seqlens_int32.copy_(mask.sum(dim=1))
                 metadata_expand.cu_seqlens_k[1:].copy_(
                     torch.cumsum(
                         metadata_expand.cache_seqlens_int32,
@@ -3357,7 +3682,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.max_seq_len_k = (
                 seq_lens_cpu.max().item()
                 if seq_lens_cpu is not None
-                else self.max_context_len
+                else self.req_to_token_pool.row_width
             )
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)

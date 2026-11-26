@@ -19,7 +19,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=20, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 SWA_WINDOW = 128
 PAGE_SIZE = 256
@@ -51,7 +51,9 @@ def _make_backend(*, block_size, device, is_dspark_draft=True, low_ratios=()):
     backend.req_to_token = req_to_token.to(device=device, dtype=torch.int32)
     backend.req_to_token_pool = SimpleNamespace(req_to_token=backend.req_to_token)
     backend.MAX_SEQ_LEN_FOR_CAPTURE = MAX_CONTEXT
-    backend.max_context_len = MAX_CONTEXT
+    backend.model_runner = SimpleNamespace(
+        model_config=SimpleNamespace(context_len=MAX_CONTEXT)
+    )
     # full -> swa: injective and not the identity, so a wrong source shows.
     full_to_swa = (torch.arange(NUM_FULL_SLOTS) * 3 + 7).to(
         device=device, dtype=torch.int64

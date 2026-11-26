@@ -12,7 +12,7 @@ import torch
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
-from sglang.srt.mem_cache.kv.decl import MHAGeometry, kv_layer_decls
+from sglang.srt.mem_cache.kv.decl import MHAGeometry, WindowLayers, kv_layer_decls
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -55,9 +55,7 @@ def _storage():
     decls = kv_layer_decls(
         full_layer_ids=(0,),
         full_geometry=geometry,
-        window_layer_ids=(1,),
-        window_geometry=geometry,
-        window=_WINDOW,
+        windows=[WindowLayers(layer_ids=(1,), geometry=geometry, window=_WINDOW)],
     )
     plan = plan_kv_storage(decls, page_size=_PAGE)
     sized = size_plan(
@@ -68,6 +66,7 @@ def _storage():
             state_slots=0,
             max_running_requests=4,
             context_len=_CONTEXT,
+            req_to_token_row_width=_CONTEXT,
             alignment=_PAGE,
         ),
     )
@@ -78,7 +77,6 @@ def _storage():
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=4,
-        model_context_len=_CONTEXT,
         lazy_compaction=True,
     )
     return build_kv_storage(plan, sized, ctx)
