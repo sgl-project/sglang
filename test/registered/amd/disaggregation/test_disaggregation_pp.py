@@ -1,8 +1,9 @@
-import torch
 import os
 import time
 import unittest
 from types import SimpleNamespace
+
+import torch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci

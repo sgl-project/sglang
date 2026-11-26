@@ -1,4 +1,3 @@
-import torch
 import json
 import os
 import unittest
@@ -6,6 +5,7 @@ from types import SimpleNamespace
 
 import openai
 import requests
+import torch
 from transformers import AutoTokenizer
 
 from sglang.srt.environ import envs

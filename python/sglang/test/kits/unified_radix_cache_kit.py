@@ -1,10 +1,10 @@
 import random
-import torch
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import requests
+import torch
 
 from sglang.test.kl_multiturn_utils import (
     test_input_output_logprobs_match_decode_cache_hit_helper,

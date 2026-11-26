@@ -5,7 +5,9 @@ python3 -m unittest test_ascend_w4a4_quantization.TestAscendW4A4.test_gsm8k
 
 import os
 import unittest
+
 import torch
+
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
 from sglang.test.ascend.test_ascend_utils import (
     ECO_TECH_QWEN3_32B_W4A4_LAOS_WEIGHTS_PATH,

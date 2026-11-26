@@ -1,5 +1,6 @@
-import torch
 import unittest
+
+import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase, run_mmlu_test

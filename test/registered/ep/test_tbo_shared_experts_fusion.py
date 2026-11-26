@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
+
 import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (

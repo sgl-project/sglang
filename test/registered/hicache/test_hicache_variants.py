@@ -8,6 +8,7 @@ Tests HiCache with different configurations: standard, MLA, EAGLE, and page size
 """
 
 import unittest
+
 import torch
 
 from sglang.benchmark.utils import get_tokenizer

@@ -22,6 +22,7 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (

@@ -3,9 +3,10 @@ Usage:
 python3 -m unittest test_intel_xpu_backend.TestIntelXPUBackend.test_latency_qwen_model
 """
 
-import torch
 import unittest
 from functools import wraps
+
+import torch
 
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (

@@ -17,6 +17,7 @@ import unittest
 from urllib import error, request
 
 import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,

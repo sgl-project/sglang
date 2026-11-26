@@ -9,8 +9,9 @@ import os
 import shutil
 import tempfile
 import time
-import torch
 import unittest
+
+import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.utils import is_hip

@@ -14,9 +14,10 @@
 
 import multiprocessing as mp
 import os
-import torch
 import unittest
 from typing import List
+
+import torch
 
 from sglang.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,

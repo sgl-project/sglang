@@ -8,13 +8,13 @@ Registry: nightly-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-tp4 suite
 
 import ast
 import os
-import torch
 import re
 import time
 import unittest
 from typing import Tuple
 
 import numpy as np
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci

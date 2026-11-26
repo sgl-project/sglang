@@ -1,6 +1,7 @@
 import os
-import torch
 import unittest
+
+import torch
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
 from sglang.test.ascend.test_ascend_utils import QWEN3_30B_A3B_WEIGHTS_PATH
