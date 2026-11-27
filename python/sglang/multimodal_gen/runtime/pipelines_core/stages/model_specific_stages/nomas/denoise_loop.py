@@ -143,6 +143,7 @@ class NomasLatentSession:
         return_trace=False,
         cache_segment=True,
         evict=False,
+        graph_predict=None,
     ):
         """Return [1,C,T,H,W] latent; optionally record every Euler step for parity.
 
@@ -228,7 +229,10 @@ class NomasLatentSession:
                 kwargs["_context"] = context
                 for index in range(self.steps):
                     timestep = (sigmas[index : index + 1] * 1000).to(p.device)
-                    pred, _ = self.model.predict(latent, timestep, **kwargs)
+                    if graph_predict is None:
+                        pred, _ = self.model.predict(latent, timestep, **kwargs)
+                    else:
+                        pred = graph_predict(latent, timestep, condition, context)
                     latent = (
                         latent.float()
                         + pred.float() * (sigmas[index + 1] - sigmas[index])

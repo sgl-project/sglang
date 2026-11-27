@@ -4,7 +4,7 @@ The e2e counterpart, over the real scheduler load-report path, is
 test/registered/disaggregation/test_disaggregation_dp_attention.py.
 
 Fragility: scheduler tests bypass `DataParallelController.__init__` via `__new__` and
-inject only the attrs the schedulers read (`workers`, `_active_workers`,
+inject only the attrs the schedulers read (`workers`, `_active_workers`, `_draining_slots`,
 `round_robin_counter`, `dp_budget`). `status` / `dp_active` / `max_dp_size` are for
 `update_active_ranks`. Update `_make_controller` if a scheduler starts reading another
 attr. `maybe_external_dp_rank_routing` is exercised as the real method, no mock. The
@@ -32,6 +32,7 @@ from sglang.srt.managers import io_struct
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
+    DPRoutingUnavailable,
     LoadBalanceMethod,
     WorkerPortHandshake,
 )
@@ -88,6 +89,7 @@ def _make_controller(
     ctl.status = list(ctl.dp_active)
     ctl._active_workers = list(range(num_dp_ranks))
     ctl._active_count_cache = num_dp_ranks
+    ctl._draining_slots = set()
     ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
@@ -122,7 +124,9 @@ class TestJoinerWorkerPortAdmission(CustomTestCase):
         controller = DataParallelController.__new__(DataParallelController)
         controller._receive_ports_as_client = MagicMock(return_value=handshake)
         controller.launch_tensor_parallel_group = launch
-        execution = SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=True))
+        execution = SimpleNamespace(
+            moe=SimpleNamespace(is_ep_scale_joiner=True, is_ep_offset_joiner=True)
+        )
 
         with (
             patch(
@@ -531,6 +535,23 @@ class TestDispatchingWithTrace(CustomTestCase):
                     [call(req, refresh_load_budget=False) for req in reqs],
                 )
 
+    def test_batch_aborts_only_the_unroutable_item(self):
+        """The batch itself has no rid, so aborting it would leave every item hanging."""
+        for dispatch in ("dispatch_batch_generate", "dispatch_batch_embedding"):
+            with self.subTest(dispatch=dispatch):
+                ctl = self._make_traced_controller()
+                reqs = [_req(rid=rid) for rid in ("a", "b", "c")]
+                ctl.dispatching_with_trace = MagicMock(
+                    side_effect=[None, DPRoutingUnavailable("retired"), None]
+                )
+                ctl._abort_undispatchable = MagicMock()
+                getattr(ctl, dispatch)(reqs)
+                self.assertEqual(ctl.dispatching_with_trace.call_count, 3)
+                self.assertEqual(
+                    ctl._abort_undispatchable.call_args_list,
+                    [call(reqs[1], "retired")],
+                )
+
 
 class TestHealthCheckScheduler(CustomTestCase):
     def test_health_and_user_round_robin_state_are_independent(self):
@@ -587,10 +608,14 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
             ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=room))
             ctl.workers[expected_rank].send_pyobj.assert_called()
 
-    def test_requires_bootstrap_room(self):
+    def test_room_less_request_is_placed_round_robin(self):
+        """A room-less request (Rust frontend, sent straight to a PD server) is
+        placed for the scheduler to answer or reject, not asserted on."""
         ctl = _make_controller(num_dp_ranks=4)
-        with self.assertRaises(AssertionError):
+        for _ in range(4):
             ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=None))
+        for worker in ctl.workers:
+            worker.send_pyobj.assert_called_once()
 
     def test_routed_dp_rank_bypasses_bootstrap_room(self):
         ctl = _make_controller(num_dp_ranks=4)

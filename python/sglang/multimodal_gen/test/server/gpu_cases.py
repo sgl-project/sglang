@@ -944,6 +944,111 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
     ),
 ]
 
+
+MAGI2_FOUR_GPU_H100_CASES = [
+    DiffusionTestCase(
+        "magi2_preview_t2va_ep4_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="sand-ai/MAGI-2-preview",
+            modality="video",
+            num_gpus=4,
+            ulysses_degree=4,
+            extras=[
+                # ep_size has no CLI flag; the file also skips loading the refiner.
+                "--pipeline-config-path",
+                str(_CACHE_DIT_CONFIG_DIR / "magi2_ep4_preview_only.json"),
+                "--warmup-resolutions",
+                "896x512",
+                "--enable-torch-compile",
+                "false",
+            ],
+            env_vars={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A street musician plays an acoustic guitar under a stone archway "
+                "at dusk, strumming a slow folk melody while pigeons settle nearby."
+            ),
+            output_size="896x512",
+            seconds=10,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={"num_inference_steps": 2, "seed": 42},
+        ),
+        # Consistency: no golden file in sgl-project/ci-data-diffusion yet.
+        run_consistency_check=False,
+        # Component accuracy: FOUR_GPU_H100_CASES is not wired to any CI lane
+        # (test_server_4_gpu_h100.py has no registered bridge), so this case
+        # never runs component-accuracy in CI — a future lane addition can
+        # enable it once the golden artifacts exist.
+        run_component_accuracy_check=False,
+        # Perf: run_perf_check=False keeps perf noise off until a stable
+        # baseline on matching hardware is added to h100.json. The e2e and load
+        # guards in _validate_and_record still run unconditionally.
+        run_perf_check=False,
+        # models-api: not disabled by design — left False until the two-stage
+        # tier is covered by a separate case so this smoke run stays fast.
+        run_models_api_check=False,
+        # t2v_input_reference: TI2V task type, so the base check is a no-op.
+        run_t2v_input_reference_check=False,
+    ),
+]
+
+MAGI2_TWO_STAGE_FOUR_GPU_H100_CASES = [
+    DiffusionTestCase(
+        "magi2_two_stage_t2va_ep4_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="sand-ai/MAGI-2-preview",
+            modality="video",
+            num_gpus=4,
+            ulysses_degree=4,
+            extras=[
+                "--pipeline-config-path",
+                str(_CACHE_DIT_CONFIG_DIR / "magi2_ep4_two_stage.json"),
+                "--warmup-resolutions",
+                "1920x1088",
+                "--dit-layerwise-offload",
+                "true",
+                "--enable-torch-compile",
+                "false",
+            ],
+            env_vars={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A street musician plays an acoustic guitar under a stone archway "
+                "at dusk, strumming a slow folk melody while pigeons settle nearby."
+            ),
+            output_size="1920x1088",
+            seconds=10,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "num_inference_steps": 2,
+                "refiner_num_inference_steps": 1,
+                "seed": 42,
+            },
+        ),
+        # Consistency: no golden file in sgl-project/ci-data-diffusion yet.
+        run_consistency_check=False,
+        # Component accuracy: same lane constraint as the preview-only case.
+        run_component_accuracy_check=False,
+        # Perf: baseline measured on H100 × 4 with layerwise offload (117.5 s,
+        # peak VRAM 61.7 GiB). run_perf_check=False until the lane is wired.
+        run_perf_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+]
+
+FOUR_GPU_H100_CASES = (
+    MINIMAX_H3_FOUR_GPU_H100_CASES
+    + MAGI2_FOUR_GPU_H100_CASES
+    + MAGI2_TWO_STAGE_FOUR_GPU_H100_CASES
+)
+
 TWO_GPU_CASES = [
     DiffusionTestCase(
         "minimax_h3_t2va_2gpu_h100",

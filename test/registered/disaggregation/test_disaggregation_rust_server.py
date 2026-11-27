@@ -248,6 +248,20 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         )
         self.assertEqual(response.status_code, 400, response.text)
 
+    def test_one_token_request_without_bootstrap_is_answered(self):
+        # What the rejection above spares: prefill samples a single token itself,
+        # so it answers a request for no more than that with no decode.
+        response = requests.post(
+            self.prefill_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+            },
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["meta_info"]["completion_tokens"], 1)
+
     def test_backend_health(self):
         # /health_generate directly on each side: on a PD node the probe only
         # passes with the fake bootstrap pair injected (room-less requests are

@@ -217,8 +217,10 @@ async def async_request_openai_chat_completions(
     return output
 
 
-def gen_payload_openai(messages, output_len, model):
-    return {
+def gen_payload_openai(
+    messages, output_len, model, *, chat_template_kwargs=None, extra_request_body=None
+):
+    payload = {
         "model": model,
         "messages": messages,
         "max_tokens": output_len,
@@ -226,6 +228,11 @@ def gen_payload_openai(messages, output_len, model):
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if extra_request_body is not None:
+        payload.update(extra_request_body)
+    if chat_template_kwargs is not None:
+        payload["chat_template_kwargs"] = chat_template_kwargs
+    return payload
 
 
 def gen_payload(input_ids, output_len, lora_path=""):

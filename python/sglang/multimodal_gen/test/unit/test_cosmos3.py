@@ -59,6 +59,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader imp
     SchedulerLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     Cosmos3OmniTransformer,
     DomainAwareLinear,
@@ -2430,6 +2431,35 @@ class TestCosmos3BatchedActionStages(unittest.TestCase):
         self.assertEqual(tuple(input_ids.shape), (2, 16))
         self.assertEqual(tuple(attention_mask.shape), (2, 16))
         self.assertEqual(seq_len, 4)
+
+    def test_transformer_context_carries_the_request(self):
+        """Quality-gated paths read the request from the transformer's forward
+        context; the stage must not keep the request once its loop ends."""
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        stage._request_batch = None
+        stage._extra_transformer_kwargs = {}
+        stage._share_vision_temporal_positions = True
+        seen = []
+
+        def fake_transformer(**kwargs):
+            seen.append(get_forward_context().forward_batch)
+            return kwargs["hidden_states"]
+
+        stage.transformer = fake_transformer
+        batch = types.SimpleNamespace(
+            sampling_params=types.SimpleNamespace(quality="lossless")
+        )
+        with stage._bind_request(batch):
+            stage._run_transformer(
+                latents=torch.zeros(1),
+                timestep=torch.ones(1),
+                text_ids=torch.ones(1, 4, dtype=torch.long),
+                text_mask=torch.ones(1, 4, dtype=torch.long),
+                video_shape=(1, 1, 1),
+                fps=20.0,
+            )
+        self.assertEqual(seen, [batch])
+        self.assertIsNone(stage._request_batch)
 
     def test_cfg_duplicates_batched_timesteps(self):
         stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
