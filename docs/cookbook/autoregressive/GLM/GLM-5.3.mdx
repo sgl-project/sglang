@@ -253,6 +253,75 @@ sglang serve \
   --watchdog-timeout 1800
 ```
 
+### MI355X FP8 high-concurrency deployment with DCP4
+
+Official FP8 checkpoint `zai-org/GLM-5.3` at concurrency 16 and 24 on one 8×MI355X node, measured with the InferenceX AgentX harness ([InferenceX #5168](https://github.com/SemiAnalysisAI/InferenceX/pull/5168), [sweep run](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/45896778660)) on `lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261119`. Below concurrency 16, keep the [monokernel recipe above](#mi355x-fp8-deployment-with-the-amd-monokernel).
+
+- **Decode context parallelism.** At TP8 every rank holds a full copy of the KV cache, so the pool stays near 3.3M tokens. From concurrency 16, the agentic working set no longer fits: cached prefixes are evicted, the prefix-cache hit rate drops to 93%, and recomputed prefill stalls decode. `--dcp-size 4` shards the KV cache over four ranks, which raises the pool to about 10.5M tokens and the hit rate to 97%. At concurrency 8 and 10 the cache already fits, and DCP4 measured lower than DCP1 because of its extra per-step cost.
+- **KV cache.** The GPU pool holds the working set at DCP4, so these commands run without HiCache. Adding `--enable-hierarchical-cache --hicache-ratio 1.0` changed throughput by less than 1% in a local one-hour run.
+- **Prefill.** Pass `--cuda-graph-backend-prefill disabled`: breakable prefill CUDA graphs fail with DCP larger than 1 on this image. The prefill delayer batches up to two long prefills instead of interleaving them one at a time with decode. Keep `--chunked-prefill-size 32768`. With 16384-token chunks, the DSA indexer ran out of GPU memory during a cold long-context prefill.
+- **MTP.** EAGLE runs 3 steps with 4 draft tokens. 5 steps with 6 draft tokens slowed each decode step enough to cancel the higher acceptance length.
+
+The braced value `{max-running-requests}` is twice the concurrency and sets both `--max-running-requests` and `--cuda-graph-max-bs-decode`. Throughput counts input and output tokens per second per GPU. Interactivity is the output tokens per second each session sees at the P90 inter-token latency. The sweep used synthetic MTP acceptance at the GLM-5.3 golden acceptance length (2.94 for 3 steps).
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700, width: "40%"}}>Concurrency</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>16</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>24</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}>max-running-requests</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>32</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>48</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>Throughput (tok/s/GPU)</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>9,415</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>13,478</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>P90 interactivity (tok/s/user)</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>62.5</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>40.6</td>
+    </tr>
+  </tbody>
+</table>
+
+```bash TP8·DCP4 (concurrency 16–24)
+SGLANG_OPT_USE_TOPK_V2=false \
+sglang serve \
+  --model-path zai-org/GLM-5.3 \
+  --trust-remote-code \
+  --tp 8 \
+  --ep-size 1 \
+  --dcp-size 4 \
+  --dsa-prefill-backend triton \
+  --dsa-decode-backend triton \
+  --kv-cache-dtype fp8_e4m3 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 32768 \
+  --max-prefill-tokens 16384 \
+  --cuda-graph-backend-prefill disabled \
+  --max-running-requests {max-running-requests} \
+  --cuda-graph-max-bs-decode {max-running-requests} \
+  --enable-prefill-delayer \
+  --prefill-delayer-max-delay-ms 800 \
+  --prefill-delayer-max-delay-passes 32 \
+  --prefill-delayer-queue-min-ratio 0.5 \
+  --prefill-max-requests 2 \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --watchdog-timeout 1800
+```
+
 ## 1. Model Introduction
 
 **GLM-5.3** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It keeps the same base architecture while updating post-training for complex coding and long-horizon tasks. It ships in two precisions — **FP8** (`zai-org/GLM-5.3`) and full **BF16** (`zai-org/GLM-5.3-BF16`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup. For Blackwell, RadixArk publishes an **experimental NVFP4** build (`RadixArk/GLM-5.3-NVFP4`, Model Optimizer) that quantizes only the routed experts' linear weights and activations to 4-bit (attention, shared experts, dense layers, MTP, embeddings, and the LM head stay unquantized), cutting the weight footprint to ~0.45 TB so a 4-GPU GB300 node can serve it with TP4. **The NVFP4 cells are experimental** — benchmark data (accuracy / throughput) is still pending; treat them as provisional until the benchmark cards fill in.

@@ -32,7 +32,7 @@ def unsupported_reason(
     block_size,
     topk,
     score_type,
-    max_context_len,
+    max_kv_len,
     radix_topk,
     draft_is_chain,
     tbo,
@@ -61,8 +61,8 @@ def unsupported_reason(
         return "requires four index/KV heads, dimension 128, block 128, top-k 16"
     if score_type != "max" or not radix_topk:
         return "requires max scores and the radix decode top-k"
-    if not 0 < max_context_len <= 16384 * 128:
-        return "context length exceeds the radix selector contract"
+    if not 0 < max_kv_len <= 16384 * 128:
+        return "KV length exceeds the radix selector contract"
     if not draft_is_chain:
         return "verify rows must be chain drafts: no speculation, or EAGLE with top-k 1"
     if tbo or hisparse or fp8_query or dense_sparse_decode:
@@ -119,7 +119,7 @@ def make_indexer_cp(backend, runner, sparse_cfg):
         block_size=backend.block_size_k,
         topk=backend.topk_blocks,
         score_type=backend.score_type,
-        max_context_len=backend.req_to_token_pool.row_width,
+        max_kv_len=backend.max_kv_len,
         radix_topk=envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get(),
         draft_is_chain=draft_is_chain_layout(
             spec.speculative_algorithm, spec.speculative_eagle_topk
