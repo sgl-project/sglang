@@ -2254,6 +2254,36 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
+def _send_batched_extend_warmup(url, headers, ssl_verify, warmup_timeout):
+    """Prefill batches of 2 before the server reports ready (ROCM-31261).
+
+    The single-request warmup above runs extend attention at batch size 1 only.
+    On HIP, a ragged multi-request prefill uses a separately compiled variant of
+    the Triton extend kernel (the compact tile grid), so without this the first
+    multi-request prefills JIT-compile it while serving, stalling every rank for
+    about a second. One uniform pair and one ragged pair compile all variants;
+    1 new token each.
+    """
+    for k, lens in enumerate(((256, 256), (128, 512))):
+        # Distinct ids per prompt, so no prompt is a prefix-cache hit and every
+        # request really prefills.
+        input_ids = [
+            [1000 + 211 * k + 7 * i + (j % 97) for j in range(n)]
+            for i, n in enumerate(lens)
+        ]
+        res = requests.post(
+            url + "/generate",
+            json={
+                "input_ids": input_ids,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+            },
+            headers=headers,
+            timeout=warmup_timeout if warmup_timeout > 0 else 600,
+            verify=ssl_verify,
+        )
+        assert res.status_code == 200, f"{res.text}"
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2384,6 +2414,14 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+            if (
+                envs.SGLANG_WARMUP_BATCHED_EXTEND.get()
+                and request_name == "/generate"
+                and model_info["is_generation"]
+                and get_parallel().dp_size == 1
+                and not get_observability().debug_tensor_dump_input_file
+            ):
+                _send_batched_extend_warmup(url, headers, ssl_verify, warmup_timeout)
             # Skip server_status update for Rust server
             if not envs.SGLANG_RUST_SERVER.get():
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up

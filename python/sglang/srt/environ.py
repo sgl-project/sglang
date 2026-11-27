@@ -1129,6 +1129,9 @@ class Envs:
     # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
     # explicitly in code; this env var allows override (0=force off, 1=force on).
     SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
+    # Server warmup also prefills a uniform and a ragged batch of 2, so the Triton
+    # extend-attention variants for batch size > 1 compile before ready (ROCM-31261).
+    SGLANG_WARMUP_BATCHED_EXTEND = EnvBool(True)
     # Raise if Triton loads a kernel after the engine starts serving. This
     # verifies that startup warmup covers every kernel specialization used at
     # serving time.
