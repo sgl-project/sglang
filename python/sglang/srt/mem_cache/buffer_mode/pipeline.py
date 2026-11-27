@@ -538,11 +538,10 @@ class BufferModePipeline:
             state.parent_node_id, ()
         ):
             return True
-        if (
-            state.parent_last_hash is not None
-            and self._cache.storage_existence_cache.pool(PoolName.KV).contains(
-                state.parent_last_hash
-            )
+        # A head split off a node in flight has no in-flight entry of its own:
+        # its pages ride the original node's write.
+        if state.parent_last_hash is not None and self._pool_covered(
+            PoolName.KV, [state.parent_last_hash]
         ):
             return True
         return any(
