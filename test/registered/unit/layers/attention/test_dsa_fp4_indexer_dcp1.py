@@ -532,6 +532,7 @@ class TestDsaFp4IndexerDcp1(CustomTestCase):
             dsa.runner_ids = None
             dsa.needs_cpu_seq_lens = False
             dsa.real_page_span = 64
+            dsa.decode_cuda_graph_metadata = {}
             linear = SimpleNamespace(
                 needs_cpu_seq_lens=False,
                 supports_prefill_graph_extend=lambda: False,

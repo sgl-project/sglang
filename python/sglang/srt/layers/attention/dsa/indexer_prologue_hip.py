@@ -82,6 +82,9 @@ class RocmNoPEPrologue:
         forward_batch,
         layer_id: int,
         act_quant,
+        *,
+        weights_proj_lora: bool,
+        wk_proj_lora: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         fuse_k_norm = self.mono_k_norm and dsa_indexer_hip.fuse_index_k_norm(
             indexer, forward_batch
@@ -95,11 +98,7 @@ class RocmNoPEPrologue:
             # AITER's fused RMSNorm hands (fp8, scale, bf16); wk and the gate read the bf16
             if isinstance(x, tuple):
                 x = x[2]
-            if (
-                self.k_gate_weight is None
-                or getattr(indexer.weights_proj, "set_lora", False)
-                or getattr(indexer.wk, "set_lora", False)
-            ):
+            if self.k_gate_weight is None or weights_proj_lora or wk_proj_lora:
                 key, gate = indexer.wk(x)[0], indexer.weights_proj(x)[0]
             else:
                 # wk's unquantized route; the K3.1 bf16 GEMM table tunes N = 160

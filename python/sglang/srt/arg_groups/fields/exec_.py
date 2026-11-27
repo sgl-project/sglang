@@ -521,8 +521,8 @@ class ExecKernel(msgspec.Struct):
     enable_dsa_fp4_indexer: A[
         bool,
         "Store the DSA indexer keys in MXFP4 and score them with AITER's FP4 MQA-logits kernels "
-        "(Kimi-K3.1 on gfx950 with DCP): the row-group kernel in decode and target verify, the "
-        "prefill kernel over the DCP-gathered keys in prefill.",
+        "(Kimi-K3.1 on gfx950 at DCP1 or with DCP-sharded keys): the row-group kernel in "
+        "decode and target verify, the prefill kernel over gathered keys in prefill.",
     ] = False
     enable_dsa_fused_indexer: A[
         Optional[bool],

@@ -407,7 +407,7 @@ def store_index_k_prenorm(indexer, forward_batch, layer_id: int, key) -> None:
     )
 
 
-def _fp4_fixed_table_cols(block_tables: torch.Tensor, page_size: int) -> int:
+def _fp4_fixed_table_cols(block_tables: torch.Tensor) -> int:
     """Fixed block-table column width matching decode CUDA graph capture so eager
     DCP1 batches share one AITER row-group variant and cannot evict captured graphs."""
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
@@ -427,9 +427,9 @@ def _fp4_fixed_table_cols(block_tables: torch.Tensor, page_size: int) -> int:
         attn_backend = attn_backend.decode_backend
     if not isinstance(attn_backend, DeepseekSparseAttnBackend):
         return block_tables.shape[1]
-    cg_meta = attn_backend.__dict__.get("decode_cuda_graph_metadata")
-    if cg_meta is not None:
-        cg_table = cg_meta.get("real_page_table")
+    cg_meta = attn_backend.decode_cuda_graph_metadata
+    if cg_meta:
+        cg_table = cg_meta["real_page_table"]
         if cg_table is not None:
             return max(block_tables.shape[1], cg_table.shape[1])
     span = attn_backend.real_page_span
@@ -445,18 +445,24 @@ def fp4_request_rows(
     block_tables: torch.Tensor,
     q_offset: int,
     next_n: int,
-    target_cols: Optional[int] = None,
+    match_decode_graph_width: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Each request's page-table row (dense, as AITER's row-group logits index it) and
     the start of its ``next_n`` query rows."""
-    cols = (
-        block_tables.shape[1]
-        if target_cols is None
-        else max(block_tables.shape[1], target_cols)
+    key = (
+        id(forward_batch),
+        q_offset,
+        next_n,
+        block_tables.shape[1],
+        match_decode_graph_width,
     )
-    key = (id(forward_batch), q_offset, next_n, cols)
 
     def _build_tables() -> torch.Tensor:
+        cols = (
+            _fp4_fixed_table_cols(block_tables)
+            if match_decode_graph_width
+            else block_tables.shape[1]
+        )
         base = block_tables[:q_offset:next_n]
         if cols == base.shape[1] and base.stride(0) == cols and base.is_contiguous():
             return base
@@ -528,16 +534,13 @@ def fp4_topk_paged(
         if dcp_size > 1
         else seqlens_32.view(-1)[:q_offset]
     )
-    target_cols = (
-        _fp4_fixed_table_cols(block_tables, page_size) if dcp_size == 1 else None
-    )
     request_tables, query_starts = fp4_request_rows(
-        forward_batch,
-        layer_id,
-        block_tables,
-        q_offset,
-        next_n,
-        target_cols=target_cols,
+        forward_batch=forward_batch,
+        layer_id=layer_id,
+        block_tables=block_tables,
+        q_offset=q_offset,
+        next_n=next_n,
+        match_decode_graph_width=dcp_size == 1,
     )
     logits = fp4_index_hip.fp4_paged_mqa_logits(
         query[:q_offset],
@@ -577,7 +580,7 @@ def fp4_topk_paged(
 def fp4_dcp_gather_index_k(
     layer_id: int, metadata, block_tables: torch.Tensor, seq_lens_cpu: torch.Tensor
 ):
-    """Prefill under DCP: every request's MXFP4 index-K from all ranks, gathered as
+    """Prefill at DCP1 or under DCP: each request's MXFP4 index-K, gathered as
     68-byte rows and staged back into pages (fp4_index_hip.Fp4IndexKeys)."""
     from sglang.kernels.ops.attention.dsa import fp4_index_hip
     from sglang.srt.layers.attention.dsa.dsa_dcp_sharded_hip import (
