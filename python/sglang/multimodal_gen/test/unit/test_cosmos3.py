@@ -1494,8 +1494,8 @@ class TestCosmos3DecodeFastPath(unittest.TestCase):
         gates = []
 
         @contextlib.contextmanager
-        def record_gate(vae, enabled):
-            gates.append((vae, enabled))
+        def record_gate(vae, quality):
+            gates.append((vae, quality))
             yield
 
         for quality in ("lossless", "high", "exact"):
@@ -1511,13 +1511,11 @@ class TestCosmos3DecodeFastPath(unittest.TestCase):
             )
             with mock.patch(
                 "sglang.multimodal_gen.runtime.pipelines_core.stages."
-                "model_specific_stages.cosmos3.use_vae_fast_path",
+                "model_specific_stages.cosmos3.use_vae_decode_quality",
                 record_gate,
             ):
                 stage.forward(batch, types.SimpleNamespace())
-        self.assertEqual(
-            gates, [(stage.vae, True), (stage.vae, True), (stage.vae, False)]
-        )
+        self.assertEqual(gates, [(stage.vae, q) for q in ("lossless", "high", "exact")])
 
 
 class TestCosmos3MRoPE(unittest.TestCase):

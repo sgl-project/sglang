@@ -10,9 +10,6 @@ import weakref
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    quality_allows,
-)
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
     get_local_torch_device,
@@ -24,7 +21,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
-    use_vae_fast_path,
+    use_vae_decode_quality,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -422,12 +419,7 @@ class DecodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
-            # The decoder fast paths re-associate the reference operators
-            # without lowering any precision, so they belong to "lossless".
-            with use_vae_fast_path(
-                vae,
-                quality_allows(batch.sampling_params.quality, "lossless"),
-            ):
+            with use_vae_decode_quality(vae, batch.sampling_params.quality):
                 decode_latents = server_args.pipeline_config.prepare_decoding_latents(
                     batch, server_args=server_args, vae=vae
                 )

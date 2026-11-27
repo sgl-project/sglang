@@ -41,7 +41,7 @@ quantization/ FP8 rowwise producers fused into the GEMM input path
 attention/   sparse linear attention, gated delta-net
 routing/     diffusion-model MoE routing and expert selection
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
-conv/        convolutions in a library solver's accumulation order (MIOpen replicas)
+conv/        convolutions, including MIOpen replicas and Wan VAE Winograd Conv3D
 common/      platform predicates, non-Triton fallbacks, cached Triton launches (numerics: kernels/numerics.py)
 sites/       request-scoped mount policy — NOT kernels (see below)
 ext/         JIT C++/CUDA extensions (Hunyuan3D raster/inpaint) — NOT kernels
@@ -70,6 +70,10 @@ may also enable model-owned approximate paths such as Cache-DiT or a lower-preci
 decode. A plain fp32 single-pass norm fusion looks harmless and is not: on
 ERNIE-Image it moved the 50-step trajectory to PSNR 18.83 dB, which is what
 motivated the bit-exact rewrite.
+
+The Wan2.2/Cosmos3 Winograd Conv3D is approximate: only `quality="high"`
+can use it. See the [CLI reference](../../../../../docs/docs/sglang-diffusion/api/cli.mdx)
+for `--enable-vae-conv3d-winograd` and its hardware defaults.
 
 **Model/checkpoint-native.** Generic close-contract kernels, sparse operators,
 and FP8/NVFP4 producers can belong to the selected model or deployment path.

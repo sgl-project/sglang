@@ -52,6 +52,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.winograd_conv3d",
+        KernelBackend.TRITON,
+        "conv.winograd_conv3d_triton:try_winograd_conv3d",
+        _CUDA,
+    ),
+    (
         "diffusion.depthwise_conv3x3_bias_glu",
         KernelBackend.KDA,
         "sglang.kernels.kda_kernels.sana_depthwise_glu_triton:fused_depthwise_conv3x3_bias_glu",
@@ -908,6 +914,7 @@ _EXPORTS: dict[str, str] = {
     "flux3_nvfp4_linear_swiglu_fp4": "gemm.flux3_nvfp4_prims_ts",
     "flux3_nvfp4_qkv_qknorm_rope": "gemm.flux3_nvfp4_prims_ts",
     "quantize_flux3_nvfp4_activation": "gemm.flux3_nvfp4_prims_ts",
+    "try_winograd_conv3d": "conv.winograd_conv3d_triton",
     # Data movement: bitwise identical to the aten chains they replace
     "can_use_fused_causal_conv3d_cat_pad_cuda": "sglang.kernels.kda_kernels.causal_conv3d_cat_pad_jit",
     "fused_causal_conv3d_cat_pad_cuda": "sglang.kernels.kda_kernels.causal_conv3d_cat_pad_jit",

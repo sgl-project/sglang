@@ -2,9 +2,29 @@
 """Shared decode-scoped gate for optional VAE fast paths."""
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from weakref import WeakKeyDictionary
 
 import torch.nn as nn
+
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+
+# Decode can also run on a streaming worker. Missing scope must be exact.
+_allow_approximate = ContextVar("vae_allow_approximate", default=False)
+
+
+def approximate_decode_enabled() -> bool:
+    return _allow_approximate.get()
+
+
+@contextmanager
+def use_vae_decode_quality(vae: nn.Module, quality: str):
+    token = _allow_approximate.set(quality_allows(quality, "high"))
+    try:
+        with use_vae_fast_path(vae, quality_allows(quality, "lossless")):
+            yield
+    finally:
+        _allow_approximate.reset(token)
 
 
 class VaeFastPathGate:

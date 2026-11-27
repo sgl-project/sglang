@@ -1,1 +1,1 @@
-"""Convolution kernels that reproduce a library's accumulation order."""
+"""Convolution kernels for diffusion models."""

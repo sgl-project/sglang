@@ -1473,7 +1473,7 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
                         return_value=torch.bfloat16,
                     ),
                     patch(
-                        f"{decoding_module}.use_vae_fast_path",
+                        f"{decoding_module}.use_vae_decode_quality",
                         return_value=nullcontext(),
                     ),
                     patch.object(DecodingStage, "decode", return_value=decoded),
