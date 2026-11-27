@@ -265,27 +265,16 @@ pub trait TreeComponent<K: ChildKeyType> {
     }
 
     /// Redistribute component data between `new_parent` and `child` when a node is
-    /// split; `new_parent` is the newly created prefix node.
-    // Python reference — base.py::TreeComponent.redistribute_on_node_split:
-    //     @abstractmethod
-    //     def redistribute_on_node_split(
-    //         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
-    //     ):
-    //         """Redistribute component data between new_parent and child when a
-    //         node is split. new_parent is the newly created prefix node.
-    //         - Full: copies child's lock_ref to new_parent.
-    //         - SWA: slices (or clones) the swa value for new_parent, copies
-    //           lock_ref and component_uuid metadata, then syncs child's swa
-    //           value with its (now-trimmed) full_value.
-    //         - Mamba: sets new_parent's mamba value to None and lock_ref to 0
-    //           (mamba data stays on the original leaf, not on prefix nodes)."""
-    //         ...
+    /// split; `new_parent` is the newly created prefix node. Path components split
+    /// through `Node::split_path_slots`; the default keeps leaf-only state off the
+    /// prefix, which starts with empty slots.
     fn redistribute_on_node_split(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         new_parent_id: NodeIdx_,
         child_id: NodeIdx_,
-    );
+    ) {
+    }
 
     /// Free this component's KV resources on a node being evicted; returns
     /// (device_freed, host_freed) token counts.

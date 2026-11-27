@@ -396,6 +396,29 @@ impl<K: ChildKeyType> Node<K> {
         );
     }
 
+    /// Split a component whose data covers the whole path: the new parent
+    /// inherits both lock refcounts and takes the head of each value.
+    pub fn split_path_slots(
+        parent_node: &mut Node<K>,
+        child_node: &mut Node<K>,
+        component_type: ComponentType,
+        split_len: i64,
+    ) {
+        parent_node.copy_device_lock_ref(component_type, child_node);
+        parent_node.copy_host_lock_ref(component_type, child_node);
+        if child_node.has_device_value(component_type) {
+            Node::redistribute_child_device_value(
+                parent_node,
+                child_node,
+                component_type,
+                split_len,
+            );
+        }
+        if child_node.has_host_value(component_type) {
+            Node::redistribute_child_host_value(parent_node, child_node, component_type, split_len);
+        }
+    }
+
     /// Whether any component holds a device lock on this node.
     pub fn is_device_locked(&self) -> bool {
         self.values[..NUM_COMPONENT_TYPES]

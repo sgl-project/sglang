@@ -88,17 +88,10 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
     ) {
         let (new_parent, child) = tree_core.arena.node_pair_mut(new_parent_id, child_id);
         let split_len = new_parent.key.atom_len() as i64;
-        new_parent.copy_device_lock_ref(FULL, child);
-        new_parent.set_lock_ref_(FullComponent::HOST, child.host_lock_ref(FULL));
+        Node::split_path_slots(new_parent, child, FULL, split_len);
         // The boundary marks the older edge of the host-lock segment. A split
         // inserts the prefix at that edge, so move the boundary with it.
         new_parent.full_host_uuid = child.full_host_uuid.take();
-        if child.has_device_value(FULL) {
-            Node::redistribute_child_device_value(new_parent, child, FULL, split_len);
-        }
-        if child.has_host_value(FULL) {
-            Node::redistribute_child_host_value(new_parent, child, FULL, split_len);
-        }
     }
 
     fn evict_component(

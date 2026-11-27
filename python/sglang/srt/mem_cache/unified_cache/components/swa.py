@@ -71,6 +71,9 @@ class SWAComponent(TreeComponent):
     """
 
     family = TREE_WINDOW
+    # The window-boundary uuids mark the node's older edge, which a split moves
+    # to the parent; both tiers migrate with it.
+    split_boundary_keys = ("uuid", "host_uuid")
 
     @property
     def window_sub_pool(self) -> str:
@@ -617,70 +620,26 @@ class SWAComponent(TreeComponent):
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
     ):
-        new_parent.component_data[self.component_type].lock_ref = child.component_data[
-            self.component_type
-        ].lock_ref
-        new_parent.component_data[
-            self.component_type
-        ].host_lock_ref = child.component_data[self.component_type].host_lock_ref
-        new_parent.component_data[
-            self.component_type
-        ].session_ref = child.component_data[self.component_type].session_ref
-        assert new_parent.component_data[self.component_type].session_ids is None
-
-        child_swa_value = child.component_data[self.component_type].value
-        if child_swa_value is not None:
-            split_len = len(new_parent.key)
-            new_parent.component_data[self.component_type].value = child_swa_value[
-                :split_len
-            ].clone()
-            child.component_data[self.component_type].value = child_swa_value[
-                split_len:
-            ].clone()
-        else:
-            new_parent.component_data[self.component_type].value = None
-
-        child_swa_host_value = child.component_data[self.component_type].host_value
-        if child_swa_host_value is not None:
-            split_len = len(new_parent.key)
-            new_parent.component_data[
-                self.component_type
-            ].host_value = child_swa_host_value[:split_len].clone()
-            child.component_data[self.component_type].host_value = child_swa_host_value[
-                split_len:
-            ].clone()
-            parent_swa_data = new_parent.component_data[self.component_type]
-            child_swa_data = child.component_data[self.component_type]
-            parent_swa_data.host_lock_ref = child_swa_data.host_lock_ref
-
-            host_lru = self.tree_core.host_lru_lists[self.component_type]
-            # Host-locked halves stay out of the host LRU: in-flight IO
-            # holds them, and host acquire removed the node at 0->1.
-            if (
-                new_parent.component_data[self.component_type].value is None
-                and parent_swa_data.host_lock_ref == 0
-            ):
-                if host_lru.in_list(child):
-                    host_lru.insert_after(child, new_parent)
-                else:
-                    host_lru.insert_mru(new_parent)
-            if (
-                child.component_data[self.component_type].value is None
-                and child_swa_data.host_lock_ref == 0
-                and not host_lru.in_list(child)
-            ):
-                host_lru.insert_mru(child)
-
-        # The window-boundary uuids mark the node's older edge, which the
-        # split moves to the parent — both tiers migrate with it.
-        new_parent.component_data[self.component_type].metadata["uuid"] = (
-            child.component_data[self.component_type].metadata.get("uuid")
-        )
-        child.component_data[self.component_type].metadata.pop("uuid", None)
-        new_parent.component_data[self.component_type].metadata["host_uuid"] = (
-            child.component_data[self.component_type].metadata.get("host_uuid")
-        )
-        child.component_data[self.component_type].metadata.pop("host_uuid", None)
+        super().redistribute_on_node_split(new_parent, child)
+        ct = self.component_type
+        parent_cd = new_parent.component_data[ct]
+        child_cd = child.component_data[ct]
+        if parent_cd.host_value is None:
+            return
+        host_lru = self.tree_core.host_lru_lists[ct]
+        # Host-locked halves stay out of the host LRU: in-flight IO
+        # holds them, and host acquire removed the node at 0->1.
+        if parent_cd.value is None and parent_cd.host_lock_ref == 0:
+            if host_lru.in_list(child):
+                host_lru.insert_after(child, new_parent)
+            else:
+                host_lru.insert_mru(new_parent)
+        if (
+            child_cd.value is None
+            and child_cd.host_lock_ref == 0
+            and not host_lru.in_list(child)
+        ):
+            host_lru.insert_mru(child)
 
     def evict_component(
         self,

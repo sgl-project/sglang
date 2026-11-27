@@ -523,18 +523,6 @@ class MambaComponent(TreeComponent):
                 )
             excess -= 1
 
-    def redistribute_on_node_split(
-        self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
-    ):
-        ct = self.component_type
-        new_parent.component_data[ct].value = None
-        new_parent.component_data[ct].lock_ref = 0
-        new_parent.component_data[ct].session_ref = 0
-        new_parent.component_data[ct].session_ids = None
-        # HiCache: mamba host_value stays on child (mamba = leaf-only data)
-        new_parent.component_data[ct].host_value = None
-        new_parent.component_data[ct].host_lock_ref = 0
-
     def evict_component(
         self,
         node: UnifiedTreeNode,

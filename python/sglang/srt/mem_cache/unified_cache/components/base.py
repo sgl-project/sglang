@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_STATE
 from sglang.srt.mem_cache.unified_cache.component_type import (
     ComponentType,
     tree_slot_ids,
@@ -251,6 +252,8 @@ class TreeComponent(ABC):
     # The slot family this class keeps (`kv.plan` TREE_*): what its values are
     # rows of. None when it keeps none of the storage families.
     family: Optional[str] = None
+    # Metadata keys marking a node's older edge, which a split moves to the parent.
+    split_boundary_keys: tuple[str, ...] = ()
 
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
@@ -594,19 +597,34 @@ class TreeComponent(ABC):
           has mamba data, resets its LRU position instead."""
         pass
 
-    @abstractmethod
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
     ):
         """Redistribute component data between new_parent and child when a
-        node is split. new_parent is the newly created prefix node.
-        - Full: copies child's lock_ref to new_parent.
-        - SWA: slices (or clones) the swa value for new_parent, copies
-          lock_ref and component_uuid metadata, then syncs child's swa
-          value with its (now-trimmed) full_value.
-        - Mamba: sets new_parent's mamba value to None and lock_ref to 0
-          (mamba data stays on the original leaf, not on prefix nodes)."""
-        ...
+        node is split. new_parent is the newly created prefix node, holding
+        default records. Path data splits: the parent inherits the locks and
+        session refs and takes the head of each value. State belongs to one
+        exact node, so a prefix parent owns none of it."""
+        if self.family == TREE_STATE:
+            return
+        ct = self.component_type
+        parent_cd = new_parent.component_data[ct]
+        child_cd = child.component_data[ct]
+        assert parent_cd.session_ids is None
+        parent_cd.lock_ref = child_cd.lock_ref
+        parent_cd.host_lock_ref = child_cd.host_lock_ref
+        parent_cd.session_ref = child_cd.session_ref
+        split_len = len(new_parent.key)
+        if child_cd.value is not None:
+            parent_cd.value = child_cd.value[:split_len].clone()
+            child_cd.value = child_cd.value[split_len:].clone()
+        if child_cd.host_value is not None:
+            parent_cd.host_value = child_cd.host_value[:split_len].clone()
+            child_cd.host_value = child_cd.host_value[split_len:].clone()
+        for key in self.split_boundary_keys:
+            boundary = child_cd.metadata.pop(key, None)
+            if boundary is not None:
+                parent_cd.metadata[key] = boundary
 
     @abstractmethod
     def evict_component(
