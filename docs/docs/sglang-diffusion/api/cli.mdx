@@ -533,6 +533,33 @@ native NVIDIA CUDA serving. It is disabled by default. See
 [Asynchronous output saving](/docs/sglang-diffusion/performance-optimization#asynchronous-output-saving)
 for an example, eligible requests, and the response latency and memory tradeoffs.
 
+### Temporary media
+
+For ephemeral media, set `TMPDIR` to an existing, writable, absolute directory
+private to the service instance. The HTTP temporary media helper, remote video
+loader and Wan S2V input downloads use that directory or fail; they do not
+silently switch volumes. Wan S2V no longer caches downloads between requests.
+For repeated offline runs, pass a local file you own. Explicitly configured
+input and output directories and cloud objects are persistent, not scratch.
+
+Request cleanup cannot run after a process is killed. Let the supervisor own
+the scratch volume; do not sweep a shared directory while another replica
+might still be using it. For example, in a systemd template service:
+
+```ini
+[Service]
+RuntimeDirectory=sgld-media-%i
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+Environment=TMPDIR=/run/sgld-media-%i
+```
+
+[systemd](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#RuntimeDirectoryPreserve=)
+removes the directory when the unit stops. On Kubernetes, a per-Pod
+[`emptyDir`](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir)
+survives container restarts and is removed when the Pod is removed. Neither
+mechanism expires objects in external storage or guarantees secure erasure.
+
 ### Graceful shutdown
 
 Set `--http-graceful-shutdown-timeout 30` to allow up to 30 seconds for open HTTP
