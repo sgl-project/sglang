@@ -60,25 +60,61 @@ def _fake_linear(x, weight, block_size, weight_scale, *args, **kwargs):
     return (x.float() @ _dequant(weight, weight_scale).T).to(x.dtype)
 
 
+_ALL_TARGET_PREFIXES = (
+    "model.layers.1.self_attn.fused_qkv_a_proj_with_mqa",
+    "model.layers.1.self_attn.q_b_proj",
+    "model.layers.1.self_attn.o_proj",
+    "model.layers.1.mlp.shared_experts.gate_up_proj",
+    "model.layers.1.mlp.shared_experts.down_proj",
+    "model.layers.0.mlp.gate_up_proj",
+    "model.layers.0.mlp.down_proj",
+)
+_O_PROJ = "model.layers.1.self_attn.o_proj"
+
+
 class TestOnlineBlockFp8Selection(CustomTestCase):
-    def _applies(self, prefix: str, enabled: bool = True, aiter: bool = True) -> bool:
+    def _applies(
+        self,
+        prefix: str,
+        enabled: bool = True,
+        all_layers: bool = False,
+        layers: str = "o_proj",
+        aiter: bool = True,
+    ) -> bool:
         with (
             envs.SGLANG_QUARK_DENSE_FP8.override(enabled),
+            envs.SGLANG_QUARK_DENSE_FP8_ALL.override(all_layers),
+            envs.SGLANG_QUARK_DENSE_FP8_LAYERS.override(layers),
             patch.object(fp8_utils, "_use_aiter_mxfp8_gfx1250", aiter),
         ):
             return online_block_fp8_applies(prefix)
 
-    def test_default_targets(self):
-        for prefix in (
-            "model.layers.1.self_attn.fused_qkv_a_proj_with_mqa",
-            "model.layers.1.self_attn.q_b_proj",
-            "model.layers.1.self_attn.o_proj",
-            "model.layers.1.mlp.shared_experts.gate_up_proj",
-            "model.layers.1.mlp.shared_experts.down_proj",
-            "model.layers.0.mlp.gate_up_proj",
-            "model.layers.0.mlp.down_proj",
-        ):
-            self.assertTrue(self._applies(prefix), prefix)
+    def test_default_is_o_proj_only(self):
+        self.assertEqual(envs.SGLANG_QUARK_DENSE_FP8_LAYERS.default, "o_proj")
+        for prefix in _ALL_TARGET_PREFIXES:
+            self.assertEqual(self._applies(prefix), prefix == _O_PROJ, prefix)
+
+    def test_all_flag_targets_every_dense_linear(self):
+        for enabled in (False, True):
+            for prefix in _ALL_TARGET_PREFIXES:
+                self.assertTrue(
+                    self._applies(prefix, enabled=enabled, all_layers=True), prefix
+                )
+
+    def test_all_flag_ignores_layer_list(self):
+        prefix = "model.layers.1.self_attn.q_b_proj"
+        self.assertTrue(self._applies(prefix, all_layers=True, layers="o_proj"))
+
+    def test_layer_list_override(self):
+        layers = "fused_qkv_a_proj_with_mqa, o_proj"
+        self.assertTrue(
+            self._applies(
+                "model.layers.1.self_attn.fused_qkv_a_proj_with_mqa", layers=layers
+            )
+        )
+        self.assertFalse(
+            self._applies("model.layers.1.self_attn.q_b_proj", layers=layers)
+        )
 
     def test_router_kv_b_and_lm_head_stay_bf16(self):
         for prefix in (
@@ -86,18 +122,18 @@ class TestOnlineBlockFp8Selection(CustomTestCase):
             "model.layers.1.self_attn.kv_b_proj",
             "lm_head",
         ):
-            self.assertFalse(self._applies(prefix), prefix)
+            self.assertFalse(self._applies(prefix, all_layers=True), prefix)
 
     def test_off_by_default_and_without_gfx1250_aiter(self):
-        prefix = "model.layers.1.self_attn.o_proj"
-        self.assertFalse(self._applies(prefix, enabled=False))
-        self.assertFalse(self._applies(prefix, aiter=False))
+        self.assertFalse(self._applies(_O_PROJ, enabled=False))
+        self.assertFalse(self._applies(_O_PROJ, aiter=False))
+        self.assertFalse(self._applies(_O_PROJ, all_layers=True, aiter=False))
 
     def test_quark_routes_excluded_linears(self):
         config = _bare_config()
         layer = LinearBase.__new__(LinearBase)
         with (
-            envs.SGLANG_QUARK_DENSE_FP8.override(True),
+            envs.SGLANG_QUARK_DENSE_FP8_ALL.override(True),
             patch.object(fp8_utils, "_use_aiter_mxfp8_gfx1250", True),
         ):
             fused = config.get_quant_method(

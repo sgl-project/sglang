@@ -22,10 +22,32 @@ logger = logging.getLogger(__name__)
 
 _BLOCK = 128
 
+ALL_DENSE_FP8_LAYERS = (
+    "fused_qkv_a_proj_with_mqa",
+    "q_b_proj",
+    "o_proj",
+    "shared_experts.gate_up_proj",
+    "shared_experts.down_proj",
+    "mlp.gate_up_proj",
+    "mlp.down_proj",
+)
+
+
+def _dense_fp8_targets() -> list[str]:
+    if envs.SGLANG_QUARK_DENSE_FP8_ALL.get():
+        return list(ALL_DENSE_FP8_LAYERS)
+    return [
+        name.strip()
+        for name in envs.SGLANG_QUARK_DENSE_FP8_LAYERS.get().split(",")
+        if name.strip()
+    ]
+
 
 def online_block_fp8_applies(prefix: str) -> bool:
-    """Whether the excluded linear at ``prefix`` is one SGLANG_QUARK_DENSE_FP8_LAYERS names."""
-    if not envs.SGLANG_QUARK_DENSE_FP8.get():
+    """Whether the excluded linear at ``prefix`` is a dense FP8 target: every
+    ALL_DENSE_FP8_LAYERS entry with SGLANG_QUARK_DENSE_FP8_ALL, else the ones
+    SGLANG_QUARK_DENSE_FP8_LAYERS names (o_proj by default)."""
+    if not (envs.SGLANG_QUARK_DENSE_FP8.get() or envs.SGLANG_QUARK_DENSE_FP8_ALL.get()):
         return False
     if not fp8_utils._use_aiter_mxfp8_gfx1250:
         logger.warning_once(
@@ -33,12 +55,9 @@ def online_block_fp8_applies(prefix: str) -> bool:
             "block-scale GEMM; the excluded linears stay BF16."
         )
         return False
-    targets = [
-        name.strip()
-        for name in envs.SGLANG_QUARK_DENSE_FP8_LAYERS.get().split(",")
-        if name.strip()
-    ]
-    return any(prefix == name or prefix.endswith("." + name) for name in targets)
+    return any(
+        prefix == name or prefix.endswith("." + name) for name in _dense_fp8_targets()
+    )
 
 
 class QuarkOnlineBlockFp8LinearMethod(UnquantizedLinearMethod):
@@ -67,8 +86,8 @@ class QuarkOnlineBlockFp8LinearMethod(UnquantizedLinearMethod):
         layer.weight_scale_inv = Parameter(scale, requires_grad=False)
         layer.dense_fp8_out_features = n
         logger.info_once(
-            "Quark dense FP8: excluded BF16 linears matching SGLANG_QUARK_DENSE_FP8_LAYERS "
-            "run as 128x128 block FP8."
+            "Quark dense FP8: excluded BF16 linears matching %s run as 128x128 block FP8.",
+            ",".join(_dense_fp8_targets()),
         )
 
     def apply(
