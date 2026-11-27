@@ -687,12 +687,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     disable_ue8m0_cast=False,
                 )
             if self.use_mega_moe:
-                # MegaMoE consumes the same transformed sf, plus its own
-                # interleaved/UTCCP weight layout. K3 routes EVERY batch
-                # through mega (the megamoe backend has no a2a fallback), so
-                # the contig-layout originals are dead weight — repoint the
-                # params at the mega tensors to reclaim ~1.9GB/layer/rank
-                # (keeping both layouts OOMs: 92 layers double the experts).
+                # Rebind the registered parameters to the selected packed weights
+                # so the raw checkpoint storage can be released after loading.
                 from deep_gemm import transform_weights_for_mega_moe
 
                 from sglang.srt.layers.moe.mega_moe import (
@@ -706,18 +702,32 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     intermediate=layer.w13_weight.shape[1] // 2,
                     mma_type=mma_type,
                 )
-                l1_pair, l2_pair = transform_weights_for_mega_moe(
-                    (layer.w13_weight.data, layer.w13_weight_scale.data),
-                    (layer.w2_weight.data, layer.w2_weight_scale.data),
-                    mma_type=mma_type,
-                )
-                layer.mega_l1_weights = l1_pair
-                layer.mega_l2_weights = l2_pair
+                if getattr(layer, "_prepare_gc_k3", False):
+                    if mma_type != "fp8xfp4":
+                        raise ValueError(
+                            "Kimi K3 GC decode requires MXFP4 weights with FP8 activations"
+                        )
+                    from gc_moe import transform_weights_for_gc_moe_k3
+
+                    layer._gc_k3_weights = transform_weights_for_gc_moe_k3(
+                        (layer.w13_weight.data, layer.w13_weight_scale.data),
+                        (layer.w2_weight.data, layer.w2_weight_scale.data),
+                    )
+                if getattr(layer, "_gc_k3_decode_only", False):
+                    l1_pair, l2_pair = layer._gc_k3_weights
+                else:
+                    l1_pair, l2_pair = transform_weights_for_mega_moe(
+                        (layer.w13_weight.data, layer.w13_weight_scale.data),
+                        (layer.w2_weight.data, layer.w2_weight_scale.data),
+                        mma_type=mma_type,
+                    )
+                    layer.mega_l1_weights = l1_pair
+                    layer.mega_l2_weights = l2_pair
+                    layer._mega_moe_weights_built = True
                 layer.w13_weight.data = l1_pair[0]
                 layer.w13_weight_scale.data = l1_pair[1]
                 layer.w2_weight.data = l2_pair[0]
                 layer.w2_weight_scale.data = l2_pair[1]
-                layer._mega_moe_weights_built = True
             layer._mxfp4_backend = "deep_gemm"
             return
 

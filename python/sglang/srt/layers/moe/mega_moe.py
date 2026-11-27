@@ -338,6 +338,11 @@ def allocate_mega_moe_buffers(model: torch.nn.Module) -> None:
         return
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
+    if envs.SGLANG_K3_GC_MOE.get():
+        from sglang.srt.layers.moe.kimi_k3_gc import prepare_gc_decode
+
+        prepare_gc_decode(model)
+
     buffers = {}
     for module in model.modules():
         if isinstance(module, DeepseekV2MoE) and is_mega_moe_experts_ready(

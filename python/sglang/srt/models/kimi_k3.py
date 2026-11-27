@@ -143,6 +143,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_platform,
@@ -648,6 +649,19 @@ class KimiK3MoE(nn.Module):
         # SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK must cover the
         # per-rank prefill chunk.
         self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        self._gc_decode = None
+        gc_enabled = envs.SGLANG_K3_GC_MOE.get()
+        disaggregation_mode = get_disagg().disaggregation_mode if gc_enabled else None
+        self.experts._prepare_gc_k3 = gc_enabled and disaggregation_mode != "prefill"
+        if self.experts._prepare_gc_k3 and not self._use_mega_moe:
+            raise ValueError("SGLANG_K3_GC_MOE requires --moe-a2a-backend megamoe")
+        # A non-speculative PD decode worker runs only decode or its idle peers.
+        # Mixed workers and verify batches still need the native weight layout.
+        self.experts._gc_k3_decode_only = (
+            self.experts._prepare_gc_k3
+            and disaggregation_mode == "decode"
+            and SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm).is_none()
+        )
         self._mega_intermediate_size = moe_intermediate_size
         self._mega_top_k = config.num_experts_per_token
         if self._use_mega_moe:
@@ -1784,6 +1798,7 @@ class KimiK3MoE(nn.Module):
         prefix_sum: Optional[torch.Tensor] = None,
         cp_shard_rows: bool = False,
         valid_token_count: Optional[torch.Tensor] = None,
+        gc_decode: bool = False,
     ) -> torch.Tensor:
         """A latent MoE, which writes the next stream itself, takes the pending
         prefix_sum: folded into the 3-way JIT tail add when covered, plain adds
@@ -1792,6 +1807,10 @@ class KimiK3MoE(nn.Module):
 
         cp_shard_rows: the rows are gathered rank-major over the attention-CP
         group, and only this rank's CP rows of the output are returned."""
+        if gc_decode:
+            return self._gc_decode(hidden_states, prefix_sum, valid_token_count)
+        if self.experts._gc_k3_decode_only:
+            raise RuntimeError("A GC-only Kimi K3 decode worker cannot run native MoE")
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         if cp_shard_rows:
@@ -3206,6 +3225,10 @@ class KimiK3DecoderLayer(nn.Module):
                     else None
                 ),
                 valid_token_count=valid_token_count,
+                gc_decode=(
+                    self.mlp._gc_decode is not None
+                    and self.mlp._gc_decode.use_for(forward_batch)
+                ),
             )
         elif self._ffn_writes_stream:
             hidden_states = self.mlp(
