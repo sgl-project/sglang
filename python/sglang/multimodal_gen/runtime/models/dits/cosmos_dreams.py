@@ -11,7 +11,8 @@ as history after a clean refresh pass; control-video clips are committed the
 same way, as clean vision frames sharing the target frames' positions.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextvars import ContextVar
 from typing import Any
 
 import msgspec
@@ -41,6 +42,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.runtime_context import get_stream
 
 KVPair = tuple[torch.Tensor, torch.Tensor]
@@ -421,8 +425,16 @@ def build_cosmos_dreams_position_ids(
 
 
 def _joint_attention(
+    attention: Cosmos3CrossAttention, hidden: torch.Tensor, **cache_kwargs: Any
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    qkv, _ = attention.to_qkv(hidden)
+    out, k, v = _attend_qkv(attention, qkv, **cache_kwargs)
+    return attention.to_out(out)[0], k, v
+
+
+def _attend_qkv(
     attention: Cosmos3CrossAttention,
-    hidden: torch.Tensor,
+    qkv: torch.Tensor,
     *,
     text_kv: KVPair,
     history_kv: KVPair | None,
@@ -437,10 +449,9 @@ def _joint_attention(
     Returns the attention output and the chunk's K (post-norm, post-RoPE) and V
     (null-action slots zeroed), which is exactly what history must store.
     """
-    batch_size, seq_len = hidden.shape[:2]
+    batch_size, seq_len = qkv.shape[:2]
     num_q_heads = attention.local_num_attention_heads
     num_kv_heads = attention.local_num_key_value_heads
-    qkv, _ = attention.to_qkv(hidden)
     qkv = qkv.view(
         batch_size, seq_len, num_q_heads + 2 * num_kv_heads, attention.head_dim
     )
@@ -498,8 +509,7 @@ def _joint_attention(
         out = torch.cat(outputs, dim=1)
     else:
         out = attention.attn(q, all_k, all_v)
-    out, _ = attention.to_out(out.reshape(batch_size, seq_len, -1))
-    return out, k, v
+    return out.reshape(batch_size, seq_len, -1), k, v
 
 
 class CosmosDreamsCrossAttention(Cosmos3CrossAttention):
@@ -513,15 +523,38 @@ class CosmosDreamsCrossAttention(Cosmos3CrossAttention):
         super().__init__(*args, default_attention_backend=default_backend, **kwargs)
 
 
+# Graph breaks read the KV history of the request currently replaying.
+_denoise_attention: ContextVar[
+    Callable[["CosmosDreamsGenDecoderLayer", torch.Tensor], torch.Tensor]
+] = ContextVar("cosmos_denoise_attention")
+
+
 class CosmosDreamsGenDecoderLayer(Cosmos3GenDecoderLayer):
+    @eager_on_graph(
+        output_factory=lambda self, qkv: qkv.new_empty(
+            (
+                *qkv.shape[:2],
+                self.cross_attention.local_num_attention_heads
+                * self.cross_attention.head_dim,
+            )
+        )
+    )
+    def live_attention(self, qkv: torch.Tensor) -> torch.Tensor:
+        return _denoise_attention.get()(self, qkv)
+
+    def after_attention(
+        self, hidden: torch.Tensor, attention_output: torch.Tensor
+    ) -> torch.Tensor:
+        hidden = hidden + attention_output
+        return hidden + self.mlp(self.post_attention_layernorm(hidden))
+
     def forward(
         self, hidden: torch.Tensor, **attention_kwargs: Any
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attention_output, k, v = _joint_attention(
             self.cross_attention, self.input_layernorm(hidden), **attention_kwargs
         )
-        hidden = hidden + attention_output
-        return hidden + self.mlp(self.post_attention_layernorm(hidden)), k, v
+        return self.after_attention(hidden, attention_output), k, v
 
 
 def project_actions(
@@ -578,6 +611,16 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         self._validate_causal_arch(hf_config)
         self.action_tokens_per_frame = self.manifest.action_tokens_per_frame
         self.text_cache_max_len = self.manifest.text_cache_max_len
+        self.denoise_runner = None
+        self.can_capture_denoise = (
+            quant_config is None
+            and self.manifest.conditioning_mode == ACTION_CONDITIONING_MODE
+        )
+
+    def release_cuda_graphs(self, reason: str = "weights released") -> None:
+        if self.denoise_runner is not None:
+            self.denoise_runner.reset(disabled_reason=reason)
+            self.denoise_runner = None
 
     def _validate_causal_arch(self, hf_config: dict[str, Any]) -> None:
         expected_flags = {
@@ -668,6 +711,14 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         text_kv = self.language_model(text_ids, text_mask, position_ids.unsqueeze(1))
         return text_kv, real_len
 
+    def denoise_blocks(self, hidden: torch.Tensor) -> torch.Tensor:
+        for layer in self.gen_layers:
+            attention = layer.cross_attention
+            qkv, _ = attention.to_qkv(layer.input_layernorm(hidden))
+            out, _ = attention.to_out(layer.live_attention(qkv))
+            hidden = layer.after_attention(hidden, out)
+        return hidden
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -680,6 +731,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         action_domain_ids: torch.Tensor | None = None,
         history_kv: HistoryKV | None = None,
         condition_vision: bool = False,
+        denoise_runner=None,
         clean_frame_ranges: tuple[tuple[int, int, int], ...] | None = None,
         null_action_frame_indexes: Sequence[int] = (),
     ) -> CosmosDreamsForwardOutput:
@@ -739,25 +791,57 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
             action_tokens_per_frame=action_count,
         )
 
-        current_kv: list[KVPair] = []
-        for layer_idx, layer in enumerate(self.gen_layers):
-            if isinstance(history_kv, CosmosDreamsKVCache):
-                kv_buffer = history_kv.attention_buffer(layer_idx, hidden.shape[1])
-                layer_history = None
-            else:
-                kv_buffer = None
-                layer_history = None if history_kv is None else history_kv[layer_idx]
-            hidden, k, v = layer(
-                hidden,
-                text_kv=text_kv[layer_idx],
-                history_kv=layer_history,
-                kv_buffer=kv_buffer,
-                cos_sin_cache=cos_sin_cache,
-                rope_positions=rope_positions,
-                null_token_slices=null_slices,
-                clean_frame_ranges=clean_frame_ranges,
-            )
-            current_kv.append((k, v))
+        if (
+            denoise_runner is not None
+            and not condition_vision
+            and clean_frame_ranges is None
+            and isinstance(history_kv, CosmosDreamsKVCache)
+        ):
+            replay_kv = {}
+
+            def attend(layer, qkv):
+                index = layer.layer_idx
+                out, k, v = _attend_qkv(
+                    layer.cross_attention,
+                    qkv,
+                    text_kv=text_kv[index],
+                    history_kv=None,
+                    kv_buffer=history_kv.attention_buffer(index, qkv.shape[1]),
+                    cos_sin_cache=cos_sin_cache,
+                    rope_positions=rope_positions,
+                    null_token_slices=null_slices,
+                )
+                replay_kv[index] = (k, v)
+                return out
+
+            token = _denoise_attention.set(attend)
+            try:
+                hidden = denoise_runner(hidden=hidden)
+            finally:
+                _denoise_attention.reset(token)
+            current_kv = [replay_kv[i] for i in range(len(self.gen_layers))]
+        else:
+            current_kv: list[KVPair] = []
+            for layer_idx, layer in enumerate(self.gen_layers):
+                if isinstance(history_kv, CosmosDreamsKVCache):
+                    kv_buffer = history_kv.attention_buffer(layer_idx, hidden.shape[1])
+                    layer_history = None
+                else:
+                    kv_buffer = None
+                    layer_history = (
+                        None if history_kv is None else history_kv[layer_idx]
+                    )
+                hidden, k, v = layer(
+                    hidden,
+                    text_kv=text_kv[layer_idx],
+                    history_kv=layer_history,
+                    kv_buffer=kv_buffer,
+                    cos_sin_cache=cos_sin_cache,
+                    rope_positions=rope_positions,
+                    null_token_slices=null_slices,
+                    clean_frame_ranges=clean_frame_ranges,
+                )
+                current_kv.append((k, v))
 
         hidden = self.norm_moe_gen(hidden)
         _, vision_hidden = split_interleaved_action_vision_tokens(

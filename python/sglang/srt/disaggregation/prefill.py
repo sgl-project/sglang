@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     NetworkTransferWaiter,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    answered_by_prefill,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -539,6 +540,11 @@ class PrefillBootstrapQueue:
         backend = (
             TransferBackend.FAKE
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST
+            or answered_by_prefill(
+                req,
+                disaggregation_mode=self.scheduler.disaggregation_mode,
+                transfer_backend=self.transfer_backend,
+            )
             else self.transfer_backend
         )
         kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
@@ -1535,7 +1541,16 @@ class SchedulerDisaggregationPrefillMixin:
                 if req.return_routed_experts:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
-                    req.finish_outside_step(FINISH_LENGTH(length=0))
+                    if answered_by_prefill(
+                        req,
+                        disaggregation_mode=self.disaggregation_mode,
+                        transfer_backend=self.transfer_backend,
+                    ):
+                        # This output is the whole response, not a handoff.
+                        req.update_finish_state()
+                        assert req.finished(), f"{req.rid=} sampled no final token"
+                    else:
+                        req.finish_outside_step(FINISH_LENGTH(length=0))
                 self.request_retirer.release(req, checkpoint=True)
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
