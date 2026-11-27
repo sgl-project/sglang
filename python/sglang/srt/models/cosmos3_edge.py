@@ -178,7 +178,6 @@ class Cosmos3EdgeForConditionalGeneration(ArceeForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        self.root_config = config
         self.language_model_only = bool(getattr(config, "language_model_only", False))
         self.allow_patterns_overrides = (
             ["transformer/*.safetensors"]

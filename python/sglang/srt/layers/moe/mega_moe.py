@@ -125,6 +125,29 @@ def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None
         )
 
 
+# MegaMoESignals limits in sgl-deep-gemm.
+_DEEPGEMM_MEGA_MOE_MAX_EXPERTS = 2048
+_DEEPGEMM_MEGA_MOE_MAX_EXPERTS_PER_RANK = 512
+
+
+def check_mega_moe_num_experts(num_experts: int, ep_size: int) -> None:
+    num_experts_per_rank = num_experts // ep_size
+    if (
+        num_experts <= _DEEPGEMM_MEGA_MOE_MAX_EXPERTS
+        and num_experts_per_rank <= _DEEPGEMM_MEGA_MOE_MAX_EXPERTS_PER_RANK
+    ):
+        return
+    raise ValueError(
+        "DeepGEMM MegaMoE supports at most "
+        f"{_DEEPGEMM_MEGA_MOE_MAX_EXPERTS} routed experts and "
+        f"{_DEEPGEMM_MEGA_MOE_MAX_EXPERTS_PER_RANK} routed experts per rank; got "
+        f"{num_experts} experts over an EP group of {ep_size} rank(s) = "
+        f"{num_experts_per_rank} per rank. --moe-a2a-backend megamoe sets the EP "
+        "size to --tp-size, so raise --tp-size until the experts per rank fit, "
+        "or use another --moe-a2a-backend for this model."
+    )
+
+
 def _get_mega_moe_symm_buffer(
     group,
     num_experts: int,

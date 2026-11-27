@@ -173,7 +173,6 @@ class XPUAttentionBackend(AttentionBackend):
         self.forward_metadata: FlashAttentionMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
-        self.max_context_len = model_runner.model_config.context_len
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
         )
@@ -268,6 +267,8 @@ class XPUAttentionBackend(AttentionBackend):
             and self.page_size not in (1, 64, 128)
         ):
             self.page_size = 1
+        self.max_kv_len = self.req_to_token_pool.row_width
+        self.max_num_pages = (self.max_kv_len + self.page_size - 1) // self.page_size
 
         # Gemma-3 multimodal: per-token image-block id over whole sequences, set by
         # prepare_attn_masks each image EXTEND forward, consumed by forward_extend.
@@ -699,7 +700,7 @@ class XPUAttentionBackend(AttentionBackend):
 
         if self.use_mla:
             workspace_kwargs = dict(
-                max_seq_len=self.max_context_len,
+                max_seq_len=self.max_kv_len,
                 num_batches=batch_size,
                 num_heads=self.num_local_heads,
                 page_size=self.page_size,
@@ -1690,7 +1691,6 @@ class XPUAttentionBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Pre-allocate fixed-size tensors reused across XPU graph captures."""
-        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "cu_seqlens_q": torch.arange(
@@ -1700,15 +1700,15 @@ class XPUAttentionBackend(AttentionBackend):
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
             "page_table": torch.zeros(
-                max_bs, max_num_pages, dtype=torch.int32, device=self.device
+                max_bs, self.max_num_pages, dtype=torch.int32, device=self.device
             ),
             "strided_indices": torch.arange(
-                0, self.max_context_len, self.page_size, device=self.device
+                0, self.max_kv_len, self.page_size, device=self.device
             ),
         }
         if self.use_sliding_window_kv_pool:
             self.decode_cuda_graph_metadata["swa_page_table"] = torch.zeros(
-                max_bs, max_num_pages, dtype=torch.int32, device=self.device
+                max_bs, self.max_num_pages, dtype=torch.int32, device=self.device
             )
             self.decode_cuda_graph_metadata["swa_out_cache_loc"] = torch.zeros(
                 max_num_tokens, dtype=torch.int64, device=self.device
@@ -1716,7 +1716,10 @@ class XPUAttentionBackend(AttentionBackend):
         if self.is_encoder_decoder:
             self.encoder_metadata = {
                 "encoder_page_table": torch.zeros(
-                    max_bs, self.max_context_len, dtype=torch.int32, device=self.device
+                    max_bs,
+                    self.max_kv_len,
+                    dtype=torch.int32,
+                    device=self.device,
                 ),
                 "encoder_lens_int32": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
@@ -1974,7 +1977,7 @@ class XPUAttentionBackend(AttentionBackend):
         - cu_seqlens_q gets its own buffer (never aliased to cu_seqlens_k,
           unlike eager no-prefix path) so prefix replays stay correct;
         - max_seq_len_q / max_seq_len_k are baked at capture as upper bounds
-          (num_tokens in this bucket / max_context_len): the kernel reads real
+          (num_tokens in this bucket / max_kv_len): the kernel reads real
           work extents from the cu_seqlens / cache_seqlens device buffers;
         - page_table is page-granularity (one column per `page_size` tokens),
           converted from the token-granularity req_to_token table via strided
@@ -1988,24 +1991,21 @@ class XPUAttentionBackend(AttentionBackend):
             )
         if in_capture and getattr(self, "full_cg_prefill_metadata", None) is None:
             device = forward_batch.seq_lens.device
-            max_num_pages = (
-                self.max_context_len + self.page_size - 1
-            ) // self.page_size
             m = FlashAttentionMetadata()
             m.cache_seqlens_int32 = torch.zeros((bs,), dtype=torch.int32, device=device)
             m.cu_seqlens_q = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             m.cu_seqlens_k = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             m.page_table = torch.zeros(
-                (bs, max_num_pages), dtype=torch.int32, device=device
+                (bs, self.max_num_pages), dtype=torch.int32, device=device
             )
             self.full_cg_prefill_metadata = m
             self.full_cg_prefill_strided_indices = torch.arange(
-                0, self.max_context_len, self.page_size, device=device
+                0, self.max_kv_len, self.page_size, device=device
             )
             if self.use_sliding_window_kv_pool:
                 assert forward_batch.out_cache_loc is not None
                 m.swa_page_table = torch.zeros(
-                    (bs, max_num_pages), dtype=torch.int32, device=device
+                    (bs, self.max_num_pages), dtype=torch.int32, device=device
                 )
                 self.full_cg_prefill_swa_out_cache_loc = torch.zeros(
                     (forward_batch.out_cache_loc.shape[0],),
@@ -2091,7 +2091,7 @@ class XPUAttentionBackend(AttentionBackend):
         if in_capture:
             # Baked into the captured kernel launches; upper bounds only.
             m.max_seq_len_q = forward_batch.positions.numel()
-            m.max_seq_len_k = self.max_context_len
+            m.max_seq_len_k = self.max_kv_len
         self.forward_metadata = m
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
@@ -2231,7 +2231,6 @@ class XPUMultiStepDraftBackend:
             )
             for i in range(speculative_num_steps - 1)
         ]
-        self.max_context_len = self.attn_backends[0].max_context_len
         self.device = model_runner.device
         self.token_to_kv_pool = model_runner.token_to_kv_pool
 

@@ -31,6 +31,7 @@ from sglang.srt.kernel_plugins.nvidia.binding import prepare_megakernel
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_capacity_for,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_tp_gather,
@@ -62,6 +63,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_model,
     get_parallel,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import empty_context, log_info_on_rank0
@@ -169,10 +171,10 @@ def _allocate_decode_buffers(
 
         if require_mlp_tp_gather:
             global_num_tokens_gpu = torch.zeros(
-                (parallel.num_dp_ranks,), dtype=torch.int32
+                (dp_capacity_for(parallel.num_dp_ranks),), dtype=torch.int32
             )
             global_num_tokens_for_logprob_gpu = torch.zeros(
-                (parallel.num_dp_ranks,), dtype=torch.int32
+                (dp_capacity_for(parallel.num_dp_ranks),), dtype=torch.int32
             )
         else:
             global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
@@ -298,7 +300,9 @@ class BaseRunner(ABC):
                 "_autotune_buffers() must return a reusable buffer set for autotune"
             )
             self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
-            maybe_flashinfer_autotune_extend(self, decode_num_tokens=batch_size)
+            maybe_flashinfer_autotune_extend(
+                self, decode_num_tokens=self._decode_autotune_num_tokens(batch_size)
+            )
 
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
@@ -440,6 +444,17 @@ class BaseRunner(ABC):
         if not capture_bs:
             return None
         return max(capture_bs) * tokens_per_req
+
+    def _decode_autotune_num_tokens(self, batch_size: int) -> int:
+        mr = self.model_runner
+        is_pd_prefill_target = (
+            get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
+        )
+        if mr.spec_algorithm.is_speculative() and not is_pd_prefill_target:
+            return batch_size * mr.decode_num_tokens_per_req(
+                num_draft_tokens=max_speculative_num_draft_tokens()
+            )
+        return batch_size
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
@@ -685,7 +700,10 @@ class BaseRunner(ABC):
             assert require_mlp_tp_gather_ or require_attn_tp_gather_
 
         if require_mlp_tp_gather_:
-            global_num_tokens_cpu = [num_tokens] * get_parallel().num_dp_ranks
+            # Capture at the ceiling; slots with no live rank replay as zero.
+            global_num_tokens_cpu = [num_tokens] * dp_capacity_for(
+                get_parallel().num_dp_ranks
+            )
         elif require_attn_tp_gather_:
             global_num_tokens_cpu = [num_tokens]
         else:

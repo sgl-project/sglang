@@ -442,7 +442,6 @@ class TestCopyForForward(CustomTestCase):
                 self.assertIs(copied.__dict__[name], value, name)
 
 
-# set_step_state
 class TestStepBuilds(CustomTestCase):
     def setUp(self):
         super().setUp()

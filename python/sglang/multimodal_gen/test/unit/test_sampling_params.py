@@ -27,6 +27,7 @@ from sglang.multimodal_gen.configs.sample.glmimage import (
     GlmImageSamplingParams,
     align_glm_image_dimension,
 )
+from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     QUALITY_LEVELS,
@@ -45,6 +46,7 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
 )
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 
 
@@ -541,6 +543,58 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertNotIn("height", implicit_fields)
         self.assertIn("width", explicit_fields)
         self.assertIn("height", explicit_fields)
+
+    def test_default_output_quality_follows_the_request_data_type(self):
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+
+        with (
+            patch.object(
+                SamplingParams,
+                "from_pretrained",
+                side_effect=lambda *args, **kwargs: Flux2SamplingParams(),
+            ),
+            patch.object(
+                SamplingParams, "resolve_task_type", return_value=ModelTaskType.T2I
+            ),
+            patch.object(SamplingParams, "_validate_with_pipeline_config"),
+        ):
+            default = SamplingParams.from_user_sampling_params_args(
+                "dummy-model", server_args=server_args, prompt="p"
+            )
+            explicit = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="p",
+                output_compression=50,
+            )
+
+        # 75 is the image default, which writes a stored PNG; 50 is the video one
+        self.assertEqual(default.output_compression, 75)
+        self.assertEqual(explicit.output_compression, 50)
+
+    def test_action_request_has_no_output_quality_to_resolve(self):
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+
+        with (
+            patch.object(
+                SamplingParams,
+                "from_pretrained",
+                side_effect=lambda *args, **kwargs: Pi05SamplingParams(),
+            ),
+            patch.object(Pi05SamplingParams, "_validate_with_pipeline_config"),
+        ):
+            action = SamplingParams.from_user_sampling_params_args(
+                "dummy-model", server_args=server_args, prompt="p"
+            )
+
+        self.assertEqual(action.data_type, DataType.ACTION)
+        self.assertFalse(hasattr(action, "output_quality"))
 
     def test_cli_path_preserves_diffusers_kwargs_in_request_extra(self):
         server_args = MagicMock()

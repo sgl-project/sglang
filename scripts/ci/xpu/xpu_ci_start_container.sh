@@ -55,6 +55,12 @@ retry_with_backoff() {
 # Authenticate to Docker Hub when credentials are present (avoids anonymous pull
 # rate limits). Both vars are optional; falls back to unauthenticated pulls.
 if [[ -n "${DOCKERHUB_INTEL_USERNAME:-}" && -n "${DOCKERHUB_INTEL_TOKEN:-}" ]]; then
+  # The runners are long-lived and also run approved PR code: log in to a throwaway
+  # config so the token never lands in the runner user's ~/.docker/config.json.
+  # RUNNER_TEMP is emptied after every job, should the trap not run.
+  DOCKER_CONFIG="$(mktemp -d "${RUNNER_TEMP:-/tmp}/docker-config.XXXXXX")"
+  export DOCKER_CONFIG
+  trap 'rm -rf "${DOCKER_CONFIG}"' EXIT
   echo "Logging in to Docker Hub..."
   if retry_with_backoff 6 sh -c 'echo "${DOCKERHUB_INTEL_TOKEN}" | docker login -u "${DOCKERHUB_INTEL_USERNAME}" --password-stdin >/dev/null 2>&1'; then
     echo "Docker Hub login successful"
@@ -102,12 +108,77 @@ else
   echo "         Set ZE_AFFINITY_MASK per runner to spread jobs across GPUs." >&2
 fi
 
+# PR jobs run the PR's code inside this container. Treat them as untrusted:
+# no Hugging Face token, no writable host workspace, and no write access to caches
+# that trusted runs (schedule, push, workflow_dispatch) read later. XPU_CI_UNTRUSTED=1|0 overrides.
+case "${XPU_CI_UNTRUSTED:-}" in
+  1|0) UNTRUSTED="${XPU_CI_UNTRUSTED}" ;;
+  *)
+    case "${GITHUB_EVENT_NAME:-}" in
+      pull_request|pull_request_target) UNTRUSTED=1 ;;
+      *) UNTRUSTED=0 ;;
+    esac
+    ;;
+esac
+
 HF_TOKEN_FILE="${HOME}/huggingface_token.txt"
 HF_TOKEN_VALUE=""
-if [[ -n "${HF_TOKEN:-}" ]]; then
+if [[ "${UNTRUSTED}" == "1" ]]; then
+  echo "Untrusted (PR) job: starting the container without a Hugging Face token."
+  unset HF_TOKEN
+elif [[ -n "${HF_TOKEN:-}" ]]; then
   HF_TOKEN_VALUE="${HF_TOKEN}"
 elif [[ -r "${HF_TOKEN_FILE}" ]]; then
   HF_TOKEN_VALUE=$(cat "${HF_TOKEN_FILE}")
+fi
+# Self-hosted runners read the token from the host, not from a GitHub secret,
+# so GitHub does not mask it. Register the mask with tracing off, so the echo
+# line itself is never traced.
+if [[ -n "${HF_TOKEN_VALUE}" && -n "${GITHUB_ACTIONS:-}" ]]; then
+  { set +x; } 2>/dev/null
+  echo "::add-mask::${HF_TOKEN_VALUE}"
+fi
+# Passed to docker by name (-e HF_TOKEN) so the value never shows in the argv.
+if [[ -n "${HF_TOKEN_VALUE}" ]]; then
+  export HF_TOKEN="${HF_TOKEN_VALUE}"
+fi
+
+# Hugging Face cache. Trusted runs mount the host cache read-write. Untrusted
+# runs get an overlay: they read everything already cached, but every write
+# (new downloads, or a PR rewriting a cached file) lands in a throwaway upper
+# layer, so a PR can't plant files that a later trusted run loads.
+HF_CACHE_HOST="${HOME}/.cache/huggingface"
+mkdir -p "${HF_CACHE_HOST}"
+HF_MOUNT_SRC="${HF_CACHE_HOST}"
+if [[ "${UNTRUSTED}" == "1" ]]; then
+  OVERLAY_ROOT="${HOME}/.cache/sglang-xpu-ci-pr-overlay"
+  mkdir -p "${OVERLAY_ROOT}"
+  # Held until this job's container exists, so a concurrent start never sees our
+  # overlay without its container and removes it. Released on exit if we fail.
+  exec {OVERLAY_LOCK_FD}>"${OVERLAY_ROOT}/.lock"
+  flock "${OVERLAY_LOCK_FD}"
+  # Drop overlays left by earlier PR runs whose container is gone.
+  shopt -s nullglob
+  for dir in "${OVERLAY_ROOT}"/*/; do
+    name=$(basename "${dir}")
+    if [[ "${name}" == "${CONTAINER_NAME}" ]] || ! docker ps -a --format '{{.Names}}' | grep -qx "${name}"; then
+      docker volume rm -f "${name}-hf" >/dev/null 2>&1 || true
+      docker run --rm -v "${OVERLAY_ROOT}:/o" busybox:latest rm -rf "/o/${name}" || true
+    fi
+  done
+  shopt -u nullglob
+  OVERLAY_DIR="${OVERLAY_ROOT}/${CONTAINER_NAME}"
+  mkdir -p "${OVERLAY_DIR}/upper" "${OVERLAY_DIR}/work"
+  # Hide tokens that trusted runs' `hf auth login` left in the host cache:
+  # a 0/0 character device in the upper layer is an overlayfs whiteout.
+  docker run --rm -v "${OVERLAY_DIR}/upper:/u" busybox:latest \
+    sh -c 'mknod /u/token c 0 0 && mknod /u/stored_tokens c 0 0'
+  HF_MOUNT_SRC="${CONTAINER_NAME}-hf"
+  docker volume create --driver local \
+    --opt type=overlay --opt device=overlay \
+    --opt "o=lowerdir=${HF_CACHE_HOST},upperdir=${OVERLAY_DIR}/upper,workdir=${OVERLAY_DIR}/work" \
+    "${HF_MOUNT_SRC}" >/dev/null
+  echo "Using a throwaway overlay of the Hugging Face cache: ${HF_MOUNT_SRC}"
 fi
 
 # Persistent JIT kernel cache keyed by GPU mask + image ID (new image -> new
@@ -118,7 +189,10 @@ else
   # `|| IMG_ID_SHORT=""` keeps pipefail from killing the script on inspect failure.
   IMG_ID_SHORT=$(docker image inspect --format '{{.Id}}' "${IMAGE}" 2>/dev/null \
     | sed 's/^sha256://' | cut -c1-12) || IMG_ID_SHORT=""
+  # PR jobs compile into their own cache, so a PR can't leave a kernel .so
+  # that a trusted run later loads.
   CACHE_ROOT="${HOME}/.cache/sglang-xpu-ci"
+  [[ "${UNTRUSTED}" == "1" ]] && CACHE_ROOT="${HOME}/.cache/sglang-xpu-ci-pr"
   GPU_KEY="gpu${ZE_AFFINITY_MASK:-shared}"
   if [[ -n "${IMG_ID_SHORT}" ]]; then
     XPU_KERNEL_CACHE_HOST="${CACHE_ROOT}/kernel-cache-${GPU_KEY}-${IMG_ID_SHORT}"
@@ -152,6 +226,13 @@ if [[ -n "${cache_mb}" && "${cache_mb}" -gt "${XPU_KERNEL_CACHE_MAX_MB}" ]]; the
   mkdir -p "${XPU_KERNEL_CACHE_HOST}"/{triton,inductor,neo,sycl}
 fi
 
+# Untrusted jobs get a copy of the checkout instead of a bind mount, so root in the
+# container can't plant files (e.g. .git/hooks) that later run on the host.
+WORKSPACE_MOUNT=(-v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout")
+if [[ "${UNTRUSTED}" == "1" ]]; then
+  WORKSPACE_MOUNT=()
+fi
+
 echo "Launching container: ${CONTAINER_NAME} from ${IMAGE}"
 # SGLANG_SERVER_LAUNCH_TIMEOUT=36000 matches /data/pgirijal/scripts/setup_upstream_env.sh:
 # 4-GPU MoE loads (Qwen3.5-35B-A3B, gemma-4-26B-A4B, ...) on Arc Pro B60 can
@@ -173,10 +254,10 @@ docker run -dt \
   ${RENDER_GID:+--group-add "${RENDER_GID}"} \
   --device /dev/dri \
   -v /dev/dri/by-path:/dev/dri/by-path \
-  -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
-  -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
+  -v "${HF_MOUNT_SRC}:/root/.cache/huggingface" \
+  "${WORKSPACE_MOUNT[@]}" \
   -v "${XPU_KERNEL_CACHE_HOST}:/root/.cache/sglang-xpu" \
-  -e HF_TOKEN="${HF_TOKEN_VALUE}" \
+  ${HF_TOKEN_VALUE:+-e HF_TOKEN} \
   -e SGLANG_SERVER_LAUNCH_TIMEOUT=36000 \
   -e TRITON_CACHE_DIR=/root/.cache/sglang-xpu/triton \
   -e TORCHINDUCTOR_CACHE_DIR=/root/.cache/sglang-xpu/inductor \
@@ -189,6 +270,16 @@ docker run -dt \
   --name "${CONTAINER_NAME}" \
   "${IMAGE}"
 
+# The container now marks our overlay as in use; let other starts clean up.
+if [[ -n "${OVERLAY_LOCK_FD:-}" ]]; then
+  exec {OVERLAY_LOCK_FD}>&-
+fi
+
+if [[ "${UNTRUSTED}" == "1" ]]; then
+  # docker cp copies symlinks as links and does not follow them out of the checkout.
+  docker cp "${GITHUB_WORKSPACE:-$PWD}/." "${CONTAINER_NAME}:/sglang-checkout"
+fi
+
 # Mark the workspace mount as a safe directory so git operations as root
 # inside the container don't trip the cross-user repo guard.
 docker exec "${CONTAINER_NAME}" git config --global --add safe.directory /sglang-checkout || true
@@ -197,10 +288,8 @@ docker exec "${CONTAINER_NAME}" git config --global --add safe.directory /sglang
 # popen_launch_server's inner timeout counts network time, so a slow HF Hub can
 # eat the whole window before shard loading begins. Best-effort: on failure the
 # test still tries a live download.
-if [[ -n "${HF_TOKEN_VALUE}" ]]; then
-  docker exec "${CONTAINER_NAME}" /bin/bash -c \
-    "/opt/venv/bin/hf auth login --token '${HF_TOKEN_VALUE}' >/dev/null 2>&1 || true"
-fi
+# No `hf auth login`: it writes the token into the mounted cache on the host.
+# The HF_TOKEN environment variable is enough for downloads.
 for model in \
     "meta-llama/Llama-3.2-1B-Instruct" \
     "rescommons/SpecForge-EAGLE3-Llama-3.2-1B-Instruct"; do
