@@ -2492,6 +2492,13 @@ class Envs:
     SGLANG_DSA_INDEXER_BF16_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # Bound the per-replay DSA metadata kernels (decode, target verify, draft
+    # extend) by a program budget that strides over each row's live kv blocks,
+    # instead of one program per 128 columns of the --context-length-wide table
+    # (CUDA, kpool 1, no KPool metadata fusion). Outputs are bit-identical.
+    # It also writes the MTP draft-decode metadata of every step backend in one
+    # launch (DeepseekSparseAttnMultiStepBackend).
+    SGLANG_DSA_BOUNDED_REPLAY_METADATA = EnvBool(False)
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
     # localization in one kernel (DcpFusedTopK, SM100, multicast).
     SGLANG_ENABLE_DSA_DCP_FUSED_TOPK = EnvBool(False)
