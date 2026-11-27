@@ -1249,7 +1249,9 @@ class Engine(EngineScoreMixin, EngineBase):
             _check_rust_server_warmups()
             # Allocate ports for inter-process communications
             if port_args is None:
-                port_args = PortArgs.init_new(server_args)
+                # Alternate launchers (e.g. RayEngine) may place workers on
+                # other hosts even when nnodes is one.
+                port_args = PortArgs.init_new(server_args, local_dp_ipc=cls is Engine)
             logger.info(f"server_args={_server_args_for_logging(server_args)}")
 
             # Start the engine info bootstrap server if per-rank info is needed.

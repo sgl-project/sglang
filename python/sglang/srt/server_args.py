@@ -845,11 +845,32 @@ class PortArgs:
     # derive the /dev/shm path for load snapshots.
     instance_id: str = ""
 
+    def for_dp_worker(
+        self, server_args: ServerArgs, dp_rank: int, worker_ports: list[int] | None
+    ) -> PortArgs:
+        if self.scheduler_input_ipc_name.startswith("ipc://"):
+            # The controller already bound this worker's socket. All other
+            # endpoints belong to the server instance and are shared by its ranks.
+            assert worker_ports is not None
+            return dataclasses.replace(
+                self,
+                scheduler_input_ipc_name=NetworkAddress(
+                    "127.0.0.1", worker_ports[dp_rank]
+                ).to_tcp(),
+            )
+
+        ports = PortArgs.init_new(server_args, dp_rank, worker_ports)
+        ports.nccl_port = self.nccl_port
+        ports.instance_id = self.instance_id
+        return ports
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
         dp_rank: int | None = None,
         worker_ports: list[int] | None = None,
+        *,
+        local_dp_ipc: bool = False,
     ) -> PortArgs:
         cfg = resolving_view(server_args)
         if server_args.nccl_port is None:
@@ -885,8 +906,21 @@ class PortArgs:
                 rank=int(server_args.decoupled_spec_rank),
             )
 
-        if not attn_dp_enabled_of(cfg):
-            # Normal case, use IPC within a single node
+        # Local Python DP workers inherit these endpoints from the controller.
+        # Keep address-derived TCP endpoints for independently launched peers.
+        attention_dp = attn_dp_enabled_of(cfg)
+        local_attention_dp = (
+            local_dp_ipc
+            and attention_dp
+            and dp_rank is None
+            and server_args.nnodes == 1
+            and server_args.dist_init_addr is None
+            and cfg.elastic_ep_backend is None
+            and not envs.SGLANG_RUST_SERVER.get()
+        )
+        if local_attention_dp and not envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get():
+            wait_port_available(nccl_port, "nccl_port")
+        if local_attention_dp or not attention_dp:
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
