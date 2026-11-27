@@ -363,11 +363,43 @@ def get_context_max_new_tokens(max_req_len: int, input_len: int) -> int:
     return max_req_len - input_len + 1
 
 
+def get_context_length_sentence(max_tokens: int) -> str:
+    """OpenAI's context-overflow sentence. OpenAI-compatible clients (e.g.
+    LiteLLM) recognize a context overflow by it; without it a rejection is a
+    generic 400 to them."""
+    return f"This model's maximum context length is {max_tokens} tokens on this server."
+
+
+def get_prompt_length_error(
+    input_len: int, max_req_input_len: int, *, is_multimodal: bool = False
+) -> Optional[str]:
+    """The rejection of a prompt longer than max_req_input_len, or None if it fits.
+
+    A multimodal prompt is rejected even under --allow-auto-truncate: a cut can
+    split an item's placeholder tokens, so its message does not offer the flag.
+    """
+    if input_len <= max_req_input_len:
+        return None
+    error_msg = (
+        f"Input length ({input_len} tokens) exceeds the maximum allowed length "
+        f"({max_req_input_len} tokens). "
+        f"{get_context_length_sentence(max_req_input_len)} "
+    )
+    if is_multimodal:
+        return (
+            "Multimodal prompt is too long after expanding multimodal tokens. "
+            f"{error_msg}Use a shorter input."
+        )
+    return f"{error_msg}Use a shorter input or enable --allow-auto-truncate."
+
+
 def validate_input_length(
     req: Req,
     max_req_input_len: int,
     allow_auto_truncate: bool,
     preserve_last_token_id: Optional[int] = None,
+    *,
+    is_multimodal: bool = False,
 ) -> Optional[str]:
     """Validate and potentially truncate input length.
 
@@ -376,36 +408,26 @@ def validate_input_length(
         max_req_input_len: Maximum allowed input length, inclusive
         allow_auto_truncate: Whether to truncate long inputs to that length
         preserve_last_token_id: See ``truncate_input_ids``.
+        is_multimodal: See ``get_prompt_length_error``.
 
     Returns:
         Error message if validation fails, None if successful
     """
-    if len(req.origin_input_ids) > max_req_input_len:
-        if allow_auto_truncate:
-            logger.warning(
-                "Request length is longer than the KV cache pool size or "
-                "the max context length. Truncated. "
-                f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
-            )
-            req.origin_input_ids = truncate_input_ids(
-                req.origin_input_ids,
-                max_len=max_req_input_len,
-                preserve_last_token_id=preserve_last_token_id,
-            )
-            return None
-        else:
-            # OpenAI-compatible clients (e.g. LiteLLM) recognize a context
-            # overflow by OpenAI's "This model's maximum context length is"
-            # sentence; without it this is a generic 400 to them.
-            error_msg = (
-                f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                f"the maximum allowed length ({max_req_input_len} tokens). "
-                f"This model's maximum context length is {max_req_input_len} "
-                f"tokens on this server. "
-                f"Use a shorter input or enable --allow-auto-truncate."
-            )
-            return error_msg
-
+    error_msg = get_prompt_length_error(
+        len(req.origin_input_ids), max_req_input_len, is_multimodal=is_multimodal
+    )
+    if error_msg is None or is_multimodal or not allow_auto_truncate:
+        return error_msg
+    logger.warning(
+        "Request length is longer than the KV cache pool size or "
+        "the max context length. Truncated. "
+        f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
+    )
+    req.origin_input_ids = truncate_input_ids(
+        req.origin_input_ids,
+        max_len=max_req_input_len,
+        preserve_last_token_id=preserve_last_token_id,
+    )
     return None
 
 

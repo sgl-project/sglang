@@ -165,7 +165,7 @@ Each input item produces one embedding. In this API, an item carries at most one
 
 ## Input limits
 
-All modalities share the 8,192-token context, of which a request's input may use 8,186 tokens. Longer requests fail with HTTP 400 (`The input (N tokens) is longer than the model's context length allows (8186 tokens on this server).`).
+All modalities share the 8,192-token context, of which a request's input may use 8,186 tokens. Longer requests fail with HTTP 400 (`The input (N tokens) is longer than the model's context length allows. This model's maximum context length is 8186 tokens on this server.`).
 
 | Modality | Cost | Max, single modality |
 | :-- | :-- | :-- |

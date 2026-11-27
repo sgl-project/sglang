@@ -312,8 +312,8 @@ pub struct MmContext {
     /// (`RustMmProcessor._use_feature_shm`) exactly when the scheduler broadcasts
     /// across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
-    /// The intake limits, which fit the expanded ids to the context before
-    /// [`MmProcessor::processed`] sees them (`None`: left as processed).
+    /// The intake limits, which reject expanded ids over the context before
+    /// [`MmProcessor::processed`] sees them (`None`: unchecked).
     pub limits: Option<Limits>,
 }
 
@@ -464,18 +464,14 @@ fn make_buffers(
 struct Processed {
     input_ids: TokenIds,
     result: MmEncodedEntry,
-    /// Whether intake will take the ids. A prompt it will reject keeps its
-    /// features inline: nothing to publish.
-    fits: bool,
 }
 
 impl Processed {
     /// The final expanded ids and the buffers to ride the ring; an
     /// unplaceable buffer is the server's fault, `Internal` (a 500).
     fn into_buffers(self, ctx: &MmContext) -> Result<(TokenIds, Vec<Buffer>), Error> {
-        let publisher = self.fits.then_some(ctx.processor.as_ref());
-        let buffers =
-            make_buffers(self.result, ctx.feature_shm, publisher).map_err(Error::Internal)?;
+        let buffers = make_buffers(self.result, ctx.feature_shm, Some(ctx.processor.as_ref()))
+            .map_err(Error::Internal)?;
         Ok((self.input_ids, buffers))
     }
 }
@@ -483,8 +479,8 @@ impl Processed {
 /// Run the processor for one request, up to its buffers
 /// ([`Processed::into_buffers`]). `Err` rejects the request back to the
 /// client: the processor's [`MediaError`] as `Encode`, which keeps its status
-/// class, and a malformed processor result -- the server's fault -- as
-/// `Internal` (a 500).
+/// class, expanded ids over the context as `Validation` (a 400), and a
+/// malformed processor result -- the server's fault -- as `Internal` (a 500).
 fn process(
     ctx: &MmContext,
     request: MmRequestInfo<'_>,
@@ -515,22 +511,18 @@ fn process(
         .result
         .resolve_identities()
         .map_err(Error::Internal)?;
-    // Intake fits the ids to the context (`check_total_tokens`) before the
-    // scheduler sees them; fit them first, so `processed` sees the same ids. A
-    // prompt intake will reject is not observed.
-    let fits = ctx
-        .limits
-        .as_ref()
-        .is_none_or(|limits| fit_input(&mut output.input_ids, limits).is_ok());
-    if fits {
-        ctx.processor
-            .try_processed(request, &output)
-            .map_err(Error::Encode)?;
+    // The expanded ids must fit the context as they are: a multimodal prompt
+    // is rejected, never truncated, so `processed` sees the ids the scheduler
+    // gets and never a prompt that intake rejects.
+    if let Some(limits) = &ctx.limits {
+        fit_input(&mut output.input_ids, limits, true)?;
     }
+    ctx.processor
+        .try_processed(request, &output)
+        .map_err(Error::Encode)?;
     Ok(Processed {
         input_ids: output.input_ids,
         result: output.result,
-        fits,
     })
 }
 
@@ -1629,13 +1621,12 @@ mod tests {
         );
     }
 
-    /// `processed` sees the ids intake forwards, fitted to the context as
-    /// `check_total_tokens` fits them: a 12-token prompt on an 8-token context
-    /// is truncated under `allow_auto_truncate` (a prefill with a smaller
-    /// context than its decode publishes its own 8 ids), and not observed when
-    /// intake will reject it.
+    /// A multimodal prompt over the input limit is rejected as a 400, never
+    /// truncated (a cut could split an item's placeholder tokens), even under
+    /// `allow_auto_truncate`, and `processed` never sees it; one within the
+    /// limit is observed with the ids intake forwards.
     #[test]
-    fn processed_sees_the_ids_fitted_to_the_context() {
+    fn mm_prompt_over_the_limit_is_rejected_not_truncated() {
         use std::sync::Mutex;
 
         struct Observing(Mutex<Vec<TokenIds>>);
@@ -1656,22 +1647,28 @@ mod tests {
             }
         }
 
-        for (allow_auto_truncate, forwarded, observed) in [(true, 8, 1), (false, 12, 0)] {
+        for (allow_auto_truncate, max_req_input_len) in [(true, 8), (false, 8), (true, 12)] {
             let processor = Arc::new(Observing(Mutex::new(Vec::new())));
             let ctx = MmContext::with_processor(processor.clone(), false).with_limits(Limits {
                 skip_tokenizer_init: false,
                 vocab_size: 1000,
-                context_len: 8,
+                max_req_len: 17,
+                max_req_input_len,
                 num_reserved_tokens: 0,
                 allow_auto_truncate,
                 return_hidden_states_mode: HiddenStatesMode::Null,
             });
-            let (input_ids, _) =
-                process_to_buffers(&ctx, (0..12).collect(), MmData::default()).unwrap();
-            assert_eq!(input_ids, (0..forwarded).collect::<TokenIds>());
+            let result = process_to_buffers(&ctx, (0..12).collect(), MmData::default());
             let seen = processor.0.lock().unwrap();
-            assert_eq!(seen.len(), observed);
-            assert!(seen.iter().all(|ids| *ids == input_ids));
+            if max_req_input_len < 12 {
+                let err = result.expect_err("over the limit");
+                assert!(matches!(err, Error::Validation(_)), "{err}");
+                assert!(seen.is_empty());
+            } else {
+                let (input_ids, _) = result.unwrap();
+                assert_eq!(input_ids, (0..12).collect::<TokenIds>());
+                assert_eq!(*seen, [input_ids]);
+            }
         }
     }
 

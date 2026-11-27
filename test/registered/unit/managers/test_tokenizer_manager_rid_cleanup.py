@@ -116,7 +116,8 @@ class TestSamplingParamsTruncation(CustomTestCase):
                     self.assertEqual(shared, {"max_new_tokens": 20})
 
     def test_truncated_prompt_keeps_its_reserved_tokens(self):
-        """Reserved tokens still count as input after truncation."""
+        """Reserved tokens still count as input after truncation, which never
+        applies to a multimodal prompt; rejections carry OpenAI's sentence."""
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
@@ -139,6 +140,34 @@ class TestSamplingParamsTruncation(CustomTestCase):
 
         self.assertEqual(len(req.input_ids), 94 - 3)
         self.assertEqual(req.sampling_params["max_new_tokens"], 99 - 94 + 1)
+
+        # A multimodal prompt is rejected instead: a cut could split an item's
+        # placeholder tokens.
+        mm_req = GenerateReqInput(
+            input_ids=[1] * 120, sampling_params={"max_new_tokens": 20}
+        )
+        mm_req.normalize_batch_and_arguments()
+        with self.assertRaisesRegex(
+            ValueError, "longer than the model's context"
+        ) as cm:
+            manager._validate_one_request(mm_req, mm_req.input_ids, is_multimodal=True)
+        self.assertEqual(len(mm_req.input_ids), 120)
+        # OpenAI-compatible clients (e.g. LiteLLM) classify a context overflow
+        # by OpenAI's sentence; it quotes the prompt limit here and the window
+        # (max_req_len + 1) for the total.
+        self.assertIn(
+            "This model's maximum context length is 94 tokens on this server.",
+            str(cm.exception),
+        )
+        manager.allow_auto_truncate = False
+        long_req = GenerateReqInput(
+            input_ids=[1] * 10, sampling_params={"max_new_tokens": 200}
+        )
+        long_req.normalize_batch_and_arguments()
+        with self.assertRaisesRegex(
+            ValueError, "This model's maximum context length is 100 tokens"
+        ):
+            manager._validate_one_request(long_req, long_req.input_ids)
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet

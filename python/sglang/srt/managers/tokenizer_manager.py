@@ -146,6 +146,7 @@ from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
+    get_context_length_sentence,
     get_context_max_new_tokens,
     get_preserve_last_token_id,
     is_health_check_generate_req,
@@ -775,7 +776,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.served_model_name = get_serving().served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
-        self.context_len = self.model_config.context_len
         # Set from the scheduler's init info once the scheduler is ready.
         self.max_req_len = None
         self.max_req_input_len = None
@@ -1482,7 +1482,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
-        self._validate_one_request(obj, input_ids)
+        # An encoder-dispatched request gets its mm_inputs in the scheduler.
+        is_multimodal = mm_inputs is not None or bool(obj.need_wait_for_mm_inputs)
+        self._validate_one_request(obj, input_ids, is_multimodal=is_multimodal)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -1519,7 +1521,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj.mm_content_hashes = normalized
 
     def _validate_one_request(
-        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        input_ids: List[int],
+        *,
+        is_multimodal: bool = False,
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         if get_exec().features.enable_encoder_swa_bounded_replay:
@@ -1547,9 +1553,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
 
-        # Validate input length
+        # Validate input length. A multimodal prompt is never truncated: the
+        # cut can split an item's placeholder tokens.
         if input_token_num > self.max_req_input_len:
-            if self.allow_auto_truncate:
+            if self.allow_auto_truncate and not is_multimodal:
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length allows ({self.max_req_input_len} "
@@ -1564,8 +1571,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 raise ValueError(
                     f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length allows ({self.max_req_input_len} "
-                    "tokens on this server)."
+                    "model's context length allows. "
+                    f"{get_context_length_sentence(self.max_req_input_len)}"
                 )
 
         # Validate total tokens (input + max_new_tokens)
@@ -1589,8 +1596,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 total_tokens = max_new_tokens + input_token_num
                 error_msg = (
-                    f"Requested token count exceeds the model's maximum context length "
-                    f"of {max_total_tokens} tokens. You requested a total of {total_tokens} "
+                    "Requested token count exceeds the model's maximum context length. "
+                    f"{get_context_length_sentence(max_total_tokens)} "
+                    f"You requested a total of {total_tokens} "
                     f"tokens: {input_token_num} tokens from the input messages and "
                     f"{max_new_tokens} tokens for the completion. Please reduce the number "
                     f"of tokens in the input messages or the completion to fit within the limit."

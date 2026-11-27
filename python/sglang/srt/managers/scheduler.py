@@ -3755,17 +3755,6 @@ class Scheduler(
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) > self.max_req_input_len:
-                req.set_finish_with_abort(
-                    error_msg=(
-                        "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} > {self.max_req_input_len}."
-                    )
-                )
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
-
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
@@ -3775,6 +3764,7 @@ class Scheduler(
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
             self._embedding_preserve_last_token_id,
+            is_multimodal=recv_req.mm_inputs is not None,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
@@ -4285,24 +4275,16 @@ class Scheduler(
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) > self.max_req_input_len:
-                req.set_finish_with_abort(
-                    error_msg=(
-                        "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} > {self.max_req_input_len}."
-                    )
-                )
-                self._add_request_to_queue(req)
-                return
-
         # Validate prompts length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
             self._embedding_preserve_last_token_id,
+            is_multimodal=recv_req.mm_inputs is not None,
         )
         if error_msg:
+            req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
 

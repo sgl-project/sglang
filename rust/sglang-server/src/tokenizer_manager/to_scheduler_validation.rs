@@ -125,44 +125,63 @@ pub(super) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result
     Ok(())
 }
 
-/// The context-window checks that need the tokenized length, mirroring Python
-/// `TokenizerManager._validate_one_request`: the input alone must fit, and then
-/// input + the client's own `max_new_tokens` must fit. Without them the
-/// scheduler silently clamps and the client gets a 200 with a truncated
-/// completion instead of an actionable 400. A defaulted `max_new_tokens` (see
-/// [`GenerateRequest::max_new_tokens_defaulted`]) is left to that clamp.
-///
-/// Under `allow_auto_truncate` both clamp instead of rejecting — the launch flag
-/// opted into that.
+/// OpenAI's context-overflow sentence, the text Python's
+/// `get_context_length_sentence` builds. OpenAI-compatible clients (e.g.
+/// LiteLLM) recognize a context overflow by it; without it a rejection is a
+/// generic 400 to them.
+fn context_length_sentence(max_tokens: u64) -> String {
+    format!("This model's maximum context length is {max_tokens} tokens on this server.")
+}
+
 /// The input-length half of [`check_total_tokens`]: `input_ids` truncated to
-/// the context under `allow_auto_truncate`, else the rejection of an input that
-/// does not fit. The MM worker applies it too, so its
-/// [`processed`](crate::MmProcessor::processed) hook sees the ids the
-/// scheduler will.
-pub(crate) fn fit_input(input_ids: &mut TokenIds, limits: &Limits) -> Result<(), Error> {
-    let max_req_len = limits.context_len;
+/// `max_req_input_len`, reserved slots counted, under `allow_auto_truncate`,
+/// else the rejection of an input that does not fit. A multimodal prompt is
+/// never truncated: the cut can split an item's placeholder tokens. The MM
+/// worker applies it too, so its [`processed`](crate::MmProcessor::processed)
+/// hook sees the ids the scheduler will.
+pub(crate) fn fit_input(
+    input_ids: &mut TokenIds,
+    limits: &Limits,
+    is_multimodal: bool,
+) -> Result<(), Error> {
+    let max_req_input_len = limits.max_req_input_len;
     // Python counts the reserved slots as part of the input, so a request can be
     // rejected for them even when the prompt alone fits.
     let input_len = input_ids.len() as u64 + limits.num_reserved_tokens;
-    // Python's comparison is `>=` — a prompt that exactly fills the window
-    // leaves no room to generate.
-    if input_len >= max_req_len {
-        if !limits.allow_auto_truncate {
+    if input_len > max_req_input_len {
+        if !limits.allow_auto_truncate || is_multimodal {
             return Err(Error::Validation(format!(
                 "The input ({input_len} tokens) is longer than the model's context \
-                 length ({max_req_len} tokens)."
+                 length allows. {}",
+                context_length_sentence(max_req_input_len)
             )));
         }
-        input_ids.truncate(max_req_len as usize);
+        input_ids.truncate(max_req_input_len.saturating_sub(limits.num_reserved_tokens) as usize);
     }
     Ok(())
 }
 
+/// The context-window checks that need the tokenized length, the policy of
+/// Python `TokenizerManager._validate_one_request`: the input, reserved slots
+/// counted, must fit `max_req_input_len`, and then input + the client's own
+/// `max_new_tokens` must fit `max_req_len + 1` (the last output token is
+/// sampled but never forwarded). Without them the scheduler silently clamps
+/// and the client gets a 200 with a truncated completion instead of an
+/// actionable 400. A defaulted `max_new_tokens` (see
+/// [`GenerateRequest::max_new_tokens_defaulted`]) is left to that clamp.
+///
+/// Under `allow_auto_truncate` both clamp instead of rejecting -- the launch
+/// flag opted into that.
 pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
-    let max_req_len = limits.context_len;
     // Input length first, and unconditionally: `max_new_tokens: null` means "no
-    // cap", which must not disable this.
-    fit_input(g.input_ids.as_mut().unwrap_or(&mut Vec::new()), limits)?;
+    // cap", which must not disable this. A multimodal prompt was already
+    // checked, untruncated, by the MM worker; with MM disabled its media is
+    // ignored, so the prompt is text here.
+    fit_input(
+        g.input_ids.as_mut().unwrap_or(&mut Vec::new()),
+        limits,
+        false,
+    )?;
     let input_len =
         g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
 
@@ -172,20 +191,22 @@ pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Re
     let Some(max_new_tokens) = g.sampling_params.max_new_tokens else {
         return Ok(()); // no cap requested → nothing to add to the input length
     };
+    let max_total_tokens = limits.max_req_len + 1;
     let total = input_len.saturating_add(max_new_tokens.max(0) as u64);
-    if total <= max_req_len {
+    if total <= max_total_tokens {
         return Ok(());
     }
     if !limits.allow_auto_truncate {
         return Err(Error::Validation(format!(
-            "Requested token count exceeds the model's maximum context length of \
-             {max_req_len} tokens. You requested a total of {total} tokens: {input_len} \
+            "Requested token count exceeds the model's maximum context length. {} You \
+             requested a total of {total} tokens: {input_len} \
              tokens from the input messages and {max_new_tokens} tokens for the \
              completion. Please reduce the number of tokens in the input messages or \
-             the completion to fit within the limit."
+             the completion to fit within the limit.",
+            context_length_sentence(max_total_tokens)
         )));
     }
-    let clamped = max_req_len.saturating_sub(input_len) as i64;
+    let clamped = max_total_tokens.saturating_sub(input_len) as i64;
     // Re-check what the clamp can break. `verify` already ran (in Normalizing), so
     // lowering `max_new_tokens` here can leave `min_new_tokens > max_new_tokens` —
     // and `is_normalized: true` stops the scheduler from re-verifying, so nothing

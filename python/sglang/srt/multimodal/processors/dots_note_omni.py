@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.managers.utils import get_prompt_length_error
 from sglang.srt.models.dots3 import Dots3NoteForCausalLM
 from sglang.srt.models.dots3_common.dots_omni_audio import OmniAudioConfig
 from sglang.srt.models.dots3_common.dots_omni_towers import (
@@ -546,11 +547,11 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
             item.set_pad_value()
             mm_items.append(item)
 
-        if len(input_ids) > max_req_input_len:
-            raise ValueError(
-                "Dots note omni expanded prompt is too long: "
-                f"{len(input_ids)} > {max_req_input_len}"
-            )
+        error_msg = get_prompt_length_error(
+            len(input_ids), max_req_input_len, is_multimodal=True
+        )
+        if error_msg is not None:
+            raise ValueError(error_msg)
         padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
             input_ids, mm_items
         )

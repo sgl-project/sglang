@@ -433,6 +433,8 @@ class TestModelInfoTransportParity(CustomTestCase):
             rust_server_tokenizer_path=lambda: "/loaded-tokenizer",
             tokenizer=None,
             max_total_num_tokens=1024,
+            max_req_len=1023,
+            max_req_input_len=1018,
             load_snapshot_writer=None,
             rust_server_endpoints=[
                 {"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}

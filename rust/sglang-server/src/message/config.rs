@@ -251,6 +251,10 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    /// The scheduler's request length limits (`get_request_length_limits`),
+    /// which intake checks a request against as Python's `TokenizerManager` does.
+    pub max_req_len: u64,
+    pub max_req_input_len: u64,
     /// Resolved deployment metadata used by out-of-process orchestrators.
     pub deployment_info: DeploymentInfo,
     /// Python's `/server_info` fields that are fixed at launch, which
@@ -336,6 +340,8 @@ impl ServerArgs {
         tokenizer_model_max_length,
         version,
         max_total_num_tokens,
+        max_req_len,
+        max_req_input_len,
         deployment_info,
         launch_server_info,
         launch_model_info,
@@ -403,6 +409,8 @@ impl ServerArgs {
         tokenizer_model_max_length: i64,
         version: String,
         max_total_num_tokens: u64,
+        max_req_len: u64,
+        max_req_input_len: u64,
         deployment_info: DeploymentInfo,
         launch_server_info: JsonObject,
         launch_model_info: JsonObject,
@@ -468,6 +476,8 @@ impl ServerArgs {
             tokenizer_model_max_length,
             version,
             max_total_num_tokens,
+            max_req_len,
+            max_req_input_len,
             deployment_info,
             launch_server_info,
             launch_model_info,
@@ -540,6 +550,10 @@ impl Default for ServerArgs {
             tokenizer_model_max_length: -1,
             version: String::new(),
             max_total_num_tokens: 0,
+            // What the scheduler derives from `ModelConfig::default()`'s
+            // 2048-token context with an unbounded KV pool.
+            max_req_len: 2047,
+            max_req_input_len: 2042,
             deployment_info: DeploymentInfo::default(),
             launch_server_info: JsonObject::default(),
             launch_model_info: JsonObject::default(),
