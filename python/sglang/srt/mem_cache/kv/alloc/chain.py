@@ -1654,7 +1654,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         *,
         full_tokens: int,
         num_owner_pages: int,
-        owner_take: Callable[[Optional[torch.Tensor]], Optional[torch.Tensor]],
+        owner_take: Optional[
+            Callable[[Optional[torch.Tensor]], Optional[torch.Tensor]]
+        ] = None,
         window_tail_pages: Optional[Mapping[str, int]] = None,
         consumer: Consumer = Consumer.FORWARD,
     ) -> Optional[torch.Tensor]:
@@ -1678,6 +1680,17 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         ):
             self._refused_decided_take(decided, demands)
             return None
+        if owner_take is None:
+            out_indices = (
+                torch.empty(
+                    (max(0, full_tokens),), dtype=torch.int64, device=self.device
+                )
+                if self.page_size == 1 and full_tokens > 0
+                else None
+            )
+            owner_take = lambda physical: self._take_owner_tokens(
+                full_tokens, physical, consumer, out=out_indices
+            )
         physical = self._plan_and_take(
             demands, bind_at_frontier=True, consumer=consumer
         )
@@ -1948,16 +1961,25 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             for band in self.members:
                 band._physical_take_scope = None
 
-    def _take_owner_tokens(self, need_size, physical, consumer=Consumer.FORWARD):
+    def _take_owner_tokens(
+        self, need_size, physical, consumer=Consumer.FORWARD, *, out=None
+    ):
         owner = self.full_attn_allocator
-        if physical is None:
+        if out is None and physical is None:
             return owner.alloc(need_size, consumer)
+
+        def tokens(pages):
+            selected = pages[: need_size // self.page_size]
+            return (
+                out.copy_(selected)
+                if out is not None
+                else owner._expand_pages_to_tokens(selected)
+            )
+
         return take_new_pages(
             owner,
             need_size // self.page_size,
-            lambda pages: owner._expand_pages_to_tokens(
-                pages[: need_size // self.page_size]
-            ),
+            tokens,
             copy_new_pages=False,
             physical_pages=physical,
             consumer=consumer,
@@ -1972,9 +1994,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             return self._allocate(
                 full_tokens=need_size,
                 num_owner_pages=need_size // self.page_size,
-                owner_take=lambda physical: self._take_owner_tokens(
-                    need_size, physical, consumer
-                ),
                 consumer=consumer,
             )
 
@@ -2183,13 +2202,14 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         if need_size > len(state.free_virtual_ids):
             self._refused_decided_take(decided, demands)
             return None
+        out = torch.empty((need_size,), dtype=torch.int64, device=self.device)
         physical = self._plan_and_take(
             demands, bind_at_frontier=True, consumer=Consumer.SCHEDULE_COPY
         )
         if physical is None:
             self._refused_decided_take(decided, demands)
             return None
-        slots = state.free_virtual_ids[:need_size]
+        slots = out.copy_(state.free_virtual_ids[:need_size])
         pages = physical[state.sub_pool_name]
         if pages is None:
             if state.place_pages(slots, need_size, Consumer.SCHEDULE_COPY) is None:

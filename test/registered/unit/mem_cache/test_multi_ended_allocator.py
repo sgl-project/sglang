@@ -33,10 +33,13 @@ from sglang.test.unified_allocator_fixtures import (
     FakeUnifiedSWAKVPool,
     arena_of,
     build_paged_band_pair,
+    build_swa_pool,
+    build_tri_pool,
     build_window_chain,
     hold_band,
     largest_take,
     release_band,
+    setup_allocator_context,
     stand_in_views,
 )
 
@@ -1040,6 +1043,144 @@ class TestWindowChainAllocator(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # page_size > 1 -- paged unit tests
 # ---------------------------------------------------------------------------
+
+
+class TestAllocationIdOwnership(CustomTestCase):
+    def setUp(self):
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+
+    def test_retained_ids_do_not_pin_retired_free_lists(self):
+        for path in ("band", "chain", "state"):
+            for page_size in (1,) if path == "state" else (1, 4):
+                with self.subTest(path=path, page_size=page_size):
+                    self._check_retained_ids(path, page_size, True)
+
+    def test_owned_ids_with_planned_physical_holes(self):
+        allocator = build_swa_pool()
+        band = allocator.full_attn_allocator
+        first = allocator.alloc(4)
+        physical = band.ids.virtual_to_physical[first[:2]].clone()
+        allocator.free(first[:2])
+        with patch.object(
+            allocator, "_take_owner_tokens", wraps=allocator._take_owner_tokens
+        ) as take:
+            ids = allocator.alloc(2)
+        self.assertIsNotNone(take.call_args.args[1])
+        self.assertEqual(ids.untyped_storage().nbytes(), 16)
+        self.assertFalse(torch.equal(ids, physical))
+        mapped = band.ids.virtual_to_physical[ids]
+        torch.testing.assert_close(
+            mapped.sort().values, physical.sort().values, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            band.ids.physical_to_virtual[mapped], ids, rtol=0, atol=0
+        )
+
+    def test_output_allocation_failure_preserves_ids_and_bindings(self):
+        for path in ("band", "chain", "state"):
+            with self.subTest(path=path):
+                if path == "state":
+                    _, allocator = build_tri_pool()
+                    take = allocator.alloc_state_slots
+                    free = allocator.mamba_allocator.free
+                else:
+                    allocator = build_swa_pool()
+                    take = (
+                        allocator.full_attn_allocator.alloc
+                        if path == "band"
+                        else allocator.alloc
+                    )
+                    free = (
+                        allocator.full_attn_allocator.free
+                        if path == "band"
+                        else allocator.free
+                    )
+                live = take(4)
+                free(live[:2])
+                before = self._allocation_state(allocator)
+                target = "torch.Tensor.clone" if path == "band" else "torch.empty"
+                with patch(target, side_effect=torch.OutOfMemoryError("output")):
+                    with self.assertRaises(torch.OutOfMemoryError):
+                        take(1)
+                after = self._allocation_state(allocator)
+                for old, new in zip(before, after):
+                    if isinstance(old, torch.Tensor):
+                        torch.testing.assert_close(old, new, rtol=0, atol=0)
+                    else:
+                        self.assertEqual(old, new)
+
+    def test_nonpositive_take_keeps_the_empty_result_contract(self):
+        allocator = build_swa_pool()
+        for need in (0, -1):
+            with self.subTest(need=need):
+                self.assertEqual(allocator.alloc(need).numel(), 0)
+                self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+
+    def test_refused_take_does_not_allocate_an_output(self):
+        for limited_by in ("ids", "full_cap"):
+            with self.subTest(limited_by=limited_by):
+                allocator = build_swa_pool()
+                band = allocator.full_attn_allocator
+                if limited_by == "ids":
+                    need = len(band.free_virtual_ids) + 1
+                else:
+                    band.max_live_tokens = 1
+                    need = 2
+                with patch("torch.empty", side_effect=torch.OutOfMemoryError("output")):
+                    self.assertIsNone(allocator.alloc(need))
+                self.assertEqual(band.allocated_count(), 0)
+
+    @staticmethod
+    def _allocation_state(allocator):
+        state = []
+        for band in allocator.bands:
+            state.extend(
+                (
+                    band.allocated_count(),
+                    band.watermark_physical,
+                    band.ids.virtual_to_physical.clone(),
+                    band.ids.physical_to_virtual.clone(),
+                    None
+                    if band.free_virtual_ids is None
+                    else band.free_virtual_ids.clone(),
+                    band._free_phys_pages.clone(),
+                )
+            )
+        return state
+
+    def _check_retained_ids(self, path, page_size, lazy):
+        if path == "state":
+            _, allocator = build_tri_pool(page_size=page_size, lazy=lazy)
+            band = allocator.mamba_allocator
+            take, free = allocator.alloc_state_slots, band.free
+        else:
+            allocator = build_swa_pool(page_size=page_size, lazy=lazy)
+            band = allocator.full_attn_allocator
+            take = band.alloc if path == "band" else allocator.alloc
+            free = band.free if path == "band" else allocator.free
+        held, expected = [], []
+        for _ in range(4):
+            result = take(page_size)
+            self.assertIsNotNone(result)
+            held.append(result[0] if path == "state" else result)
+            expected.append(held[-1].clone())
+            del result
+            churn = take(page_size)
+            self.assertIsNotNone(churn)
+            free(churn)
+            del churn
+        stores = {
+            ids.untyped_storage().data_ptr(): ids.untyped_storage().nbytes()
+            for ids in held
+        }
+        self.assertEqual(sum(stores.values()), 4 * page_size * 8)
+        for ids, want in zip(held, expected):
+            torch.testing.assert_close(ids, want, rtol=0, atol=0)
+            self.assertTrue(
+                bool((band.ids.virtual_to_physical[ids // page_size] > 0).all())
+            )
+        self.assertEqual(band.allocated_count(), 4 * page_size)
 
 
 class TestJointLRUEviction(unittest.TestCase):
