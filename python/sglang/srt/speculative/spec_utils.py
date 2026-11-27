@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.runtime_context import (
     get_exec,
+    get_memory,
     get_parallel,
     get_spec,
     mamba_track_grid,
@@ -1232,6 +1233,15 @@ def _verify_commit_step_indices(
     return last_correct_step_indices, mamba_steps_to_track
 
 
+def _tree_donates_working_mamba_slot() -> bool:
+    # A disabled or state-free tree frees the finished slot instead.
+    return not (
+        get_exec().mamba.enable_mamba_extra_buffer
+        or get_memory().disable_radix_cache
+        or get_exec().mamba.decode_state_free_radix
+    )
+
+
 def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,
@@ -1389,7 +1399,7 @@ def commit_mamba_states_after_verify(
             # no_buffer donates the working slot at finish with no track row to
             # fold into, so `temporal` must already be the committed state.
             fold_every_commit=spec_state.temporal.dtype != torch.float32
-            or not get_exec().mamba.enable_mamba_extra_buffer,
+            or _tree_donates_working_mamba_slot(),
             mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
