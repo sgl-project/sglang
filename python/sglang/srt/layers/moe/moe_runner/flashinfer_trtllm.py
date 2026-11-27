@@ -2246,6 +2246,7 @@ class FlashInferTrtllmBf16MoeQuantInfo(MoeQuantInfo):
     # Expert-parallel metadata
     global_num_experts: int
     local_expert_offset: int
+    gemm1_clamp_limit: Optional[torch.Tensor] = None
 
 
 def fused_experts_none_to_flashinfer_trtllm_bf16(
@@ -2333,6 +2334,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 hidden_states=hidden_states,
                 gemm1_weights=quant_info.gemm1_weights,
                 gemm2_weights=quant_info.gemm2_weights,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
                 num_experts=quant_info.global_num_experts,
                 top_k=runner_config.top_k,
                 n_group=None,
@@ -2367,6 +2369,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 hidden_states=hidden_states,
                 gemm1_weights=quant_info.gemm1_weights,
                 gemm2_weights=quant_info.gemm2_weights,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
                 num_experts=quant_info.global_num_experts,
                 top_k=topk_config.top_k,
                 n_group=topk_config.num_expert_group,

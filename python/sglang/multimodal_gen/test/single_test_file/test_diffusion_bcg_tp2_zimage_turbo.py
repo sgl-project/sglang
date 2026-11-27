@@ -107,7 +107,6 @@ class TestDiffusionBCGTP2ZImageTurbo(CustomTestCase):
         ]
 
         env = os.environ.copy()
-        env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
         # this guard exercises legacy graph-buffer registration; v2 uses a
         # symmetric workspace and does not emit the registration marker
         env["SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"] = "0"

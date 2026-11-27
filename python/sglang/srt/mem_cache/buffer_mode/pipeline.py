@@ -292,7 +292,7 @@ class BufferModePipeline:
         cache: UnifiedRadixCache,
         swa_component: Optional[SWAComponent],
         write_backlog_cap: int,
-        max_context_len: int = 0,
+        context_length: int = 0,
         *,
         further_window_components: Sequence[SWAComponent] = (),
     ):
@@ -320,16 +320,16 @@ class BufferModePipeline:
             0,
             min(
                 int(envs.SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP.get() * full_pool.size),
-                full_pool.size - max_context_len,
+                full_pool.size - context_length,
             ),
         )
         if self.anchor_lock_cap_tokens == 0:
             logger.warning(
                 "BufferModePipeline anchor_lock_cap_tokens=0 (pool=%d, "
-                "max_context_len=%d): every prefetch launches with its splice "
+                "context_length=%d): every prefetch launches with its splice "
                 "base unpinned. Shrink --context-length or grow the KV pool.",
                 full_pool.size,
-                max_context_len,
+                context_length,
             )
         else:
             logger.info(

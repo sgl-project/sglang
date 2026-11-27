@@ -197,6 +197,7 @@ export const DiffusionModelCatalog = ({ category }) => {
         "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
         "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        "Wan-AI/Wan2.2-S2V-14B",
       ],
       cookbook: "/cookbook/diffusion/Wan/Wan2.2",
     },
@@ -272,6 +273,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       name: "VDN-H3",
       modelIds: ["OpenVDN/vdn-minimax-h3"],
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#7-vdn-h3-hybrid-attention-8-step-distill",
+    },
+    {
+      name: "MAGI-2-preview",
+      modelIds: ["sand-ai/MAGI-2-preview"],
+      cookbook: "/cookbook/diffusion/MAGI/MAGI-2",
     },
     {
       name: "MOVA",

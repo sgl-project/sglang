@@ -5,7 +5,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import spec_decode_alloc_lens
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
@@ -126,7 +126,7 @@ class UnoDraftInput(SpecInput):
         self.max_top_k = max_top_k
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
-        current_lengths, next_lengths, num_needed_tokens = decode_alloc_lens(
+        current_lengths, next_lengths, num_needed_tokens = spec_decode_alloc_lens(
             batch.reqs, page_size=batch.token_to_kv_pool_allocator.page_size
         )
 
