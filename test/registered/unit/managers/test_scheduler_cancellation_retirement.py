@@ -57,7 +57,10 @@ from sglang.srt.runtime_context import (  # noqa: E402
 )
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
-from sglang.test.scheduler_test_utils import empty_request_lists  # noqa: E402
+from sglang.test.scheduler_test_utils import (  # noqa: E402
+    empty_request_lists,
+    idle_penalty_status_pool,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -133,6 +136,7 @@ def make_cpu_scheduler(
         beam_coordinator=scheduler.beam_coordinator,
         hisparse_coordinator=None,
         uocr_runtime=None,
+        penalty_status_pool=idle_penalty_status_pool(),
         send_abort_output=scheduler.send_abort_output,
         stream_output=Mock(),
     )

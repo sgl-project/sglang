@@ -1659,6 +1659,7 @@ mod tests {
         for (allow_auto_truncate, forwarded, observed) in [(true, 8, 1), (false, 12, 0)] {
             let processor = Arc::new(Observing(Mutex::new(Vec::new())));
             let ctx = MmContext::with_processor(processor.clone(), false).with_limits(Limits {
+                is_disaggregation: false,
                 skip_tokenizer_init: false,
                 vocab_size: 1000,
                 context_len: 8,

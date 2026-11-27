@@ -18,7 +18,7 @@ Opt-in `wait_for_retirement_ms` (0..30000) with a nonempty `cancellation_id` (â‰
 
 **Semantics.** Capture exactly one original internal rid under the public ID before cancel. Retries reuse that capture. Ambiguous duplicate public IDs and `abort_all` are refused for the wait mode. A wait timeout returns `success=true`, `retirement_confirmed=false`. Retry the same `cancellation_id` within the five-minute retention window (capacity 256). Unknown or lost receipts return `FailedPrecondition` / `Unavailable`. A positive Decode receipt requires a nonempty set of matching transfer-drain ACKs and completed local KV, metadata and receiver release. The Decode receipt covers the Decode worker's ownership, independent of Prefill request retirement. A Generate terminal outcome, channel closure, transfer release deadline, or load counter cannot establish retirement.
 
-**Dependency.** [PR #50617](https://github.com/sgl-project/sglang/pull/50617) (replacing #48624) provides the Python HTTP and scheduler receipt implementation reused here for Rust text control. The integration includes its `44d5424d37` core, including failed-delivery retry, MLX rejection and retraction-abort retirement fences; the scheduler core should land first. Rust HTTP waiting remains unsupported; native `api.v1` uses the typed Rust integration below.
+**Dependencies.** [PR #50617](https://github.com/sgl-project/sglang/pull/50617) provides the scheduler retirement machinery. [PR #50042](https://github.com/sgl-project/sglang/pull/50042) exposes that machinery in native `api.v1` for single-rank text serving. The Decode transfer receipt builds on #50042. Rust HTTP waiting remains unsupported.
 
 **Linux CPU checks.** From `rust/`:
 `cargo test -p sglang-api-types`,
@@ -35,12 +35,12 @@ python -m pytest -q \
 
 **Validation plan.**
 
-1. First-token cancel ordering: receipt only after scheduler retirement (or Intake-local nonadmission).
+1. First-token cancel ordering in unified serving: receipt only after scheduler retirement (or Intake-local nonadmission). For Decode, a request still in Intake must go through the scheduler control path and cannot produce a local receipt.
 2. Timeout and disconnect: bounded wait expires or client disconnects without implying retirement; shared operation retains the result.
 3. Public RID reuse: later request with the same public ID does not satisfy the prior instanceâ€™s receipt.
 4. Unsupported topology: unknown or unsupported scope fails closed.
 5. Normal generation positive control: completed generate still succeeds without opt-in retirement. Legacy Abort still reports acceptance only.
-6. Decode transport drain: run single-rank Prefill and Decode workers with the same text model, Mooncake, device KV and deferred release. Use native gRPC on Decode. Send the same P/D bootstrap room to both workers. Hold the Prefill transfer or its ACK briefly in the test environment and call `Abort` on Decode while the room is in the receive/drain queue. `wait_for_retirement_ms=0` must report an unconfirmed receipt while the transfer is held. Resume the transfer worker and poll with the same cancellation ID. The positive receipt must follow the ACKs and local release. Repeat with a fresh room and withhold the ACK through the deferred-release deadline. The receipt must remain unconfirmed or end with `FAILED_PRECONDITION`. Run a normal P/D request afterwards to check recovery.
+6. Decode transport drain: run one Prefill and one Decode worker with the same text model and `--disaggregation-transfer-backend mooncake`. Enable the Rust server (`SGLANG_RUST_SERVER=1`), native gRPC (`--grpc-port`), receipts (`SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS=1`) and deferred device KV release (`SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE=1`). Send the same P/D bootstrap room to both workers. Hold the Prefill drain ACK in the test environment once Decode has entered the receive queue. Call `Abort` on Decode with an exact `rid`, a new `cancellation_id`, and `wait_for_retirement_ms=0`. While the ACK is held, polling the same operation must return `retirement_confirmed=false`. Release the ACK and poll again. The positive receipt must follow both the ACK and local release. In a separate run, hold the ACK past `SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT`. A released slot without a confirmed drain must end with `FAILED_PRECONDITION`. Run a normal P/D request afterwards to check recovery.
 
 ## api.v1 engine instance identity
 

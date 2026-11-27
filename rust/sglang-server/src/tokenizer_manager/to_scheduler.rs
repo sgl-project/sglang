@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::io_struct::{
-    AbortReq, CancellationRetirementOutput, CancellationRetirementReq, CancellationRetirementStatus,
-    ControlRequest,
+    AbortReq, CancellationRetirementOutput, CancellationRetirementReq,
+    CancellationRetirementStatus, ControlRequest,
 };
 use crate::message::request::{
     GenerateRequest, MmCancellation, Request, RequestKind, SchedulerRequest,
@@ -537,6 +537,10 @@ impl Intake {
         &mut self,
         retirement: &CancellationRetirementReq,
     ) -> Option<bytes::Bytes> {
+        // Decode receipts require transfer-drain evidence from the scheduler.
+        if self.limits.is_disaggregation {
+            return None;
+        }
         let target = retirement.target_rid().unwrap_or(retirement.get_rid());
         let target_rid = Rid::from(target);
         if !self.request_states.contains_key(&target_rid) {
