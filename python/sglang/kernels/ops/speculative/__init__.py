@@ -22,6 +22,8 @@ _TRITON_KERNELS = [
     ("cache_locs", "generate_draft_decode_kv_indices"),
     ("cache_locs", "generate_draft_decode_window_kv_indices"),
     ("dflash", "compute_dflash_correct_drafts_and_bonus"),
+    ("dflash", "dflash_commit_block"),
+    ("dflash", "dflash_chain_accept_indices"),
     ("dflash_sparse_verify", "pack_shard_topk"),
     ("dflash_sparse_verify", "merge_shard_topk"),
     ("dflash_sparse_verify", "sparse_chain_speculative_sampling"),

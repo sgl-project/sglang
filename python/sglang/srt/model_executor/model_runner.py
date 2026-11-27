@@ -220,6 +220,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_device,
     get_exec,
+    get_forward,
     get_global_dwdp_manager,
     get_lora,
     get_memory,
@@ -660,7 +661,7 @@ class ModelRunner:
         self.watermark = (
             make_watermark_engine(
                 max_num_reqs=self.req_to_token_pool.req_to_token.shape[0],
-                max_contexts_per_req=self.req_to_token_pool.req_to_token.shape[1],
+                max_contexts_per_req=self.req_to_token_pool.row_width,
                 vocab_size=self.model_config.vocab_size,
                 device=self.device,
             )
@@ -1672,6 +1673,7 @@ class ModelRunner:
                 ),
                 speculative_draft_attention_backend=self.draft_attention_backend,
                 speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
+                model_config=getattr(self, "model_config", None),
             )
         )
 
@@ -1955,6 +1957,7 @@ class ModelRunner:
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
+            get_forward().scoped(forward_batch=forward_batch),
         ):
             output = self._forward_raw(forward_batch, pp_proxy_tensors)
             if self.enable_elastic_ep:
