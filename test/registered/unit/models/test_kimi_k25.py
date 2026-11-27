@@ -40,10 +40,12 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
 )
+from sglang.srt.multimodal.media_artifacts.base import MediaArtifactInput
 from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
     KimiK3ImagePreprocessArtifact,
     KimiK3PreprocessConfig,
     KimiK3ResizeConfig,
+    k3_preprocess_library_versions,
 )
 from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
@@ -662,6 +664,65 @@ def test_kimi_k25_fingerprint_includes_gpu_preprocessing_options():
     assert fingerprints[0] != fingerprints[1]
 
 
+def test_kimi_k3_fingerprint_tracks_preprocessing_libraries():
+    """K3 image identities hash no pixels, so an upgrade of the libraries that
+    decode and resize images must change the fingerprint."""
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor._processor = SimpleNamespace()
+    processor.image_processor_backend = "auto"
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
+    processor.image_config = processor.video_config = processor.audio_config = {}
+    libraries = {
+        "sglang": "1.0.0",
+        "torch": "2.14.1+cu130",
+        "torch_cuda": "13.0",
+        "torchvision": "0.29.2",
+        "pillow": "12.0.0",
+        "nvimgcodec": {"nvidia-nvimgcodec-cu13": "0.6.0"},
+    }
+
+    def fingerprint(libraries):
+        with (
+            patch(
+                "sglang.srt.multimodal.processors.kimi_k3."
+                "k3_preprocess_library_versions",
+                return_value=libraries,
+            ),
+            get_context().override_server_args(revision=None, mm_process_config={}),
+        ):
+            return build_processor_fingerprint(
+                processor, SimpleNamespace(to_dict=lambda: {})
+            )
+
+    base = fingerprint(libraries)
+    assert fingerprint(libraries) == base
+    for name, version in (("torch", "2.14.1+cu128"), ("nvimgcodec", {})):
+        assert fingerprint({**libraries, name: version}) != base
+
+
+def test_kimi_k3_library_versions_list_every_nvimgcodec_distribution():
+    """nvImageCodec ships one distribution per CUDA major, and wheels record the
+    name with either separator."""
+    distributions = [
+        SimpleNamespace(metadata={"Name": "nvidia_nvimgcodec_cu12"}, version="0.5.0"),
+        SimpleNamespace(metadata={"Name": "nvidia-nvimgcodec-cu13"}, version="0.6.0"),
+        SimpleNamespace(metadata={"Name": "nvidia-cublas-cu12"}, version="12.9.1"),
+    ]
+    k3_preprocess_library_versions.cache_clear()
+    try:
+        with patch("importlib.metadata.distributions", return_value=distributions):
+            versions = k3_preprocess_library_versions()
+    finally:
+        k3_preprocess_library_versions.cache_clear()
+
+    assert versions["nvimgcodec"] == {
+        "nvidia-nvimgcodec-cu12": "0.5.0",
+        "nvidia-nvimgcodec-cu13": "0.6.0",
+    }
+
+
 @pytest.mark.parametrize(
     ("processor_cls", "wrapper_cls"),
     [
@@ -800,6 +861,7 @@ def _cached_k3_artifact(content_digest, artifact_key, value=1):
             pad_height=0,
         ),
         grid_thw=(1, 2, 6),
+        pixel_route=("host", "eager-cpu"),
         feature=torch.full((12, 2), value, dtype=torch.float32),
     )
 
@@ -819,7 +881,9 @@ def test_kimi_k3_cached_artifact_is_composed_per_prompt():
     assert first.input_ids != second.input_ids
     assert first.mm_items[0].offsets == [(3, 5)]
     assert second.mm_items[0].offsets == [(4, 6)]
-    identity = kimi_image_identity(artifact.artifact_key, artifact.grid_thw)
+    identity = kimi_image_identity(
+        artifact.artifact_key, artifact.grid_thw, pixel_route=artifact.pixel_route
+    )
     assert first.mm_items[0].identity == second.mm_items[0].identity == identity
     assert first.mm_items[0].hash == second.mm_items[0].hash
     assert first.mm_items[0].pad_values == second.mm_items[0].pad_values
@@ -836,6 +900,7 @@ def test_kimi_k3_cached_deferred_artifact_has_model_contract():
     artifact = processor._make_artifact(
         content_digest="sha256:" + "ab" * 32,
         artifact_key="sha256:" + "cd" * 32,
+        source_image=feature,
         original_size=(2, 2),
         resize_config={
             "num_tokens": 1,
@@ -864,6 +929,69 @@ def test_kimi_k3_cached_deferred_artifact_has_model_contract():
     config = artifact.deferred
     assert config.backend == "gpu"
     assert config.resize_config["new_width"] == 2
+
+
+class _CudaFeature:
+    """An eager GPU feature on a CPU-only runner: reports CUDA, copies to the host."""
+
+    device = torch.device("cuda")
+
+    def cpu(self) -> torch.Tensor:
+        return torch.zeros((1, 12))
+
+
+def test_kimi_k3_artifact_records_the_route_that_produced_its_pixels():
+    """One source can decode on nvImageCodec or PIL and preprocess eagerly on the
+    GPU or deferred; the artifact names its route from the device, before the
+    feature is copied to the host."""
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
+    resize_config = {
+        "num_tokens": 1,
+        "new_width": 2,
+        "new_height": 2,
+        "pad_width": 0,
+        "pad_height": 0,
+    }
+    # A meta tensor stands in for nvImageCodec's CUDA output; nothing copies it.
+    decoded_on_device = torch.empty((3, 2, 2), dtype=torch.uint8, device="meta")
+    k3_processor = SimpleNamespace(
+        preprocess_config=_k3_preprocess_config(patch_size=2),
+        prepare_image_features=Mock(
+            return_value=([_CudaFeature()], [(2, 2)], [resize_config], [(1, 1, 1)])
+        ),
+    )
+    entries = [
+        MediaArtifactInput(
+            content_digest="sha256:" + "ab" * 32,
+            artifact_key="sha256:" + "cd" * 32,
+            modality=Modality.IMAGE,
+            media=media,
+        )
+        for media in (decoded_on_device, Image.new("RGB", (2, 2)))
+    ]
+
+    with (
+        patch.object(
+            processor,
+            "_should_defer_gpu_preprocessing",
+            side_effect=lambda images: isinstance(images[0], Image.Image),
+        ),
+        # The stand-in feature carries no data to hash.
+        patch(
+            "sglang.srt.multimodal.processors.kimi_k3.resolve_multimodal_item_hash",
+            return_value=0,
+        ),
+    ):
+        eager, deferred = processor.prepare_artifact_batch(
+            entries, processor=k3_processor
+        )
+
+    assert eager.pixel_route == ("nvimgcodec", "eager-gpu")
+    assert eager.feature.device.type == "cpu"
+    assert deferred.pixel_route == ("host", "deferred-gpu")
 
 
 def test_kimi_k3_normal_cache_path_connects_real_producer_to_model_consumer():
@@ -1122,6 +1250,7 @@ def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
     artifact = processor._make_artifact(
         content_digest=digest,
         artifact_key="sha256:" + "01" * 32,
+        source_image=Image.new("RGB", (2, 2)),
         original_size=(2, 2),
         resize_config={
             "num_tokens": 1,
@@ -1144,7 +1273,11 @@ def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
     assert artifact.feature_hash == expected_hash
     expected_item = MultimodalDataItem(modality=Modality.IMAGE)
     expected_item.set_identity(
-        kimi_image_identity(artifact.artifact_key, artifact.grid_thw)
+        kimi_image_identity(
+            artifact.artifact_key,
+            artifact.grid_thw,
+            pixel_route=("host", "eager-cpu"),
+        )
     )
     assert composed_item.identity == expected_item.identity
     assert composed_item.hash == expected_item.hash
@@ -1183,6 +1316,7 @@ def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
         artifact_key=processor._artifact_key(
             snapshot_media(image).content_digest, image
         ),
+        source_image=image,
         original_size=(4, 2),
         resize_config=resize_config,
         grid_thw=tuple(fresh_item.image_grid_thw.flatten().tolist()),

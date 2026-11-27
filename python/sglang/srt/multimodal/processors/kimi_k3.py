@@ -12,7 +12,7 @@ import asyncio
 import functools
 import math
 import re
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -45,6 +45,7 @@ from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
     KimiK3ImagePreprocessArtifact,
     KimiK3PreprocessConfig,
     KimiK3ResizeConfig,
+    k3_preprocess_library_versions,
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
@@ -289,6 +290,31 @@ def _k3_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
     if image.shape[0] == 1:
         image = image.repeat(3, 1, 1)
     return image
+
+
+def _k3_pixel_route(
+    *,
+    source_image: Union[torch.Tensor, Image.Image],
+    feature: Optional[torch.Tensor],
+    deferred: Optional[KimiK3DeferredPreprocessing],
+) -> tuple[str, str]:
+    """Name the decoder and preprocessing backend that produced an image's pixels.
+
+    One source can decode through nvImageCodec or, after a per-image fallback,
+    PIL; and preprocess eagerly on GPU or CPU, or deferred to the model.
+    """
+    # Only nvImageCodec yields a device tensor; caller pixels arrive on the host.
+    decoder = (
+        "nvimgcodec"
+        if isinstance(source_image, torch.Tensor) and source_image.device.type != "cpu"
+        else "host"
+    )
+    if deferred is not None:
+        return decoder, f"deferred-{deferred.backend}"
+    # The feature's device is the only record of the eager backend; read it
+    # before any host copy.
+    on_device = feature is not None and feature.device.type != "cpu"
+    return decoder, "eager-gpu" if on_device else "eager-cpu"
 
 
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
@@ -587,6 +613,22 @@ class KimiK3ImageProcessor(
 
         return raw_bytes <= processed_bytes
 
+    def preprocess_fingerprint_payload(self):
+        # K3 identities hash no pixels, so library upgrades must change the namespace.
+        return {
+            **super().preprocess_fingerprint_payload(),
+            "libraries": k3_preprocess_library_versions(),
+        }
+
+    def _kimi_pixel_route(
+        self, item: MultimodalDataItem, image: Any
+    ) -> tuple[str, str]:
+        return _k3_pixel_route(
+            source_image=image.image if isinstance(image, KimiLoadedImage) else image,
+            feature=item.feature,
+            deferred=item.model_specific_data.get(DEFERRED_PREPROCESSING_KEY),
+        )
+
     def _build_deferred_output(self, base_output):
         images = unwrap_kimi_images(base_output.images)
         (
@@ -635,6 +677,7 @@ class KimiK3ImageProcessor(
         *,
         content_digest: str,
         artifact_key: str,
+        source_image: Union[torch.Tensor, Image.Image],
         original_size: tuple[int, int],
         resize_config: dict,
         grid_thw: tuple[int, int, int],
@@ -646,6 +689,9 @@ class KimiK3ImageProcessor(
         feature_hash = resolve_multimodal_item_hash(
             feature=feature, namespace=artifact_key
         )
+        pixel_route = _k3_pixel_route(
+            source_image=source_image, feature=feature, deferred=deferred
+        )
         if not self.keep_mm_features_on_device and feature.device.type != "cpu":
             feature = feature.cpu()
         return KimiK3ImagePreprocessArtifact(
@@ -655,6 +701,7 @@ class KimiK3ImageProcessor(
             original_size=original_size,
             resize_config=KimiK3ResizeConfig.from_dict(resize_config),
             grid_thw=grid_thw,
+            pixel_route=pixel_route,
             feature=feature,
             deferred=deferred,
         )
@@ -699,6 +746,7 @@ class KimiK3ImageProcessor(
             artifacts[index] = self._make_artifact(
                 content_digest=entry.content_digest,
                 artifact_key=entry.artifact_key,
+                source_image=image,
                 original_size=(width, height),
                 resize_config=resize_config,
                 grid_thw=grid_thw,
@@ -724,6 +772,7 @@ class KimiK3ImageProcessor(
                 artifacts[index] = self._make_artifact(
                     content_digest=entry.content_digest,
                     artifact_key=entry.artifact_key,
+                    source_image=entry.media,
                     original_size=size,
                     resize_config=resize_config,
                     grid_thw=grid,
@@ -784,7 +833,11 @@ class KimiK3ImageProcessor(
                 item.set_hash(artifact.feature_hash)
             else:
                 item.set_identity(
-                    kimi_image_identity(artifact.artifact_key, artifact.grid_thw)
+                    kimi_image_identity(
+                        artifact.artifact_key,
+                        artifact.grid_thw,
+                        pixel_route=artifact.pixel_route,
+                    )
                 )
             if self.keep_mm_features_on_device and item.feature is not None:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (

@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import functools
+import importlib.metadata
+import re
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any, Optional, Protocol
 
+import PIL
 import torch
 
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     KimiK3DeferredPreprocessing,
 )
+from sglang.version import __version__ as sglang_version
 
 
 class KimiK3MediaProcessorConfigProvider(Protocol):
@@ -54,6 +59,39 @@ class KimiK3PreprocessConfig:
         )
 
 
+def _distribution_version(name: str) -> Optional[str]:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _normalized_distribution_name(dist: importlib.metadata.Distribution) -> str:
+    # PEP 503 normalization: wheels may record nvidia_nvimgcodec_cu12 or the dashed form.
+    return re.sub(r"[-_.]+", "-", dist.metadata.get("Name", "")).lower()
+
+
+@functools.lru_cache(maxsize=1)
+def k3_preprocess_library_versions() -> dict[str, Any]:
+    """Versions of the code that decodes and preprocesses K3 images."""
+    return {
+        "sglang": sglang_version,
+        "torch": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        # Read from metadata: importing torchvision costs about a second.
+        "torchvision": _distribution_version("torchvision"),
+        "pillow": PIL.__version__,
+        # nvImageCodec publishes one distribution per CUDA major (cu12, cu13).
+        "nvimgcodec": {
+            name: dist.version
+            for dist in importlib.metadata.distributions()
+            if (name := _normalized_distribution_name(dist)).startswith(
+                "nvidia-nvimgcodec"
+            )
+        },
+    }
+
+
 @dataclass(frozen=True)
 class KimiK3ResizeConfig:
     num_tokens: int
@@ -90,6 +128,8 @@ class KimiK3ImagePreprocessArtifact:
     each prompt; ``grid_thw`` becomes encoder metadata; ``feature`` is either
     the prepared encoder input or a raw tensor paired with deferred GPU
     preprocessing. ``feature_hash`` links the artifact to the embedding cache.
+    ``pixel_route`` names the decoder and preprocessing backend that produced
+    the feature, so every hit reports the route of the pixels it serves.
     """
 
     content_digest: str
@@ -98,6 +138,7 @@ class KimiK3ImagePreprocessArtifact:
     original_size: tuple[int, int]
     resize_config: KimiK3ResizeConfig
     grid_thw: tuple[int, int, int]
+    pixel_route: tuple[str, str]
     feature: Optional[torch.Tensor]
     deferred: Optional[KimiK3DeferredPreprocessing] = None
 
@@ -135,6 +176,7 @@ class KimiK3ImagePreprocessArtifact:
                 self.resize_config.pad_height,
             ),
             self.grid_thw,
+            self.pixel_route,
             self.feature,
             deferred,
         )
