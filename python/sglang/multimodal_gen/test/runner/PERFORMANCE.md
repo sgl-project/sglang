@@ -274,6 +274,26 @@ median and sampled steps also guard the denoising loop. On 31 later jobs (Novemb
 replaying the logged performance checks increased first-attempt passes from
 3 to 16, and jobs with a passing attempt from 19 to 31.
 
+### FastHunyuan VAE decode at `quality="exact"`
+
+`fast_hunyuan_video` has a consistency golden, so its request runs at
+`quality="exact"`. Since #50806, the Hunyuan VAE decoder runs the fused
+GroupNorm+SiLU kernel only while its `VaeFastPathGate` is on, and the gate is off
+at `exact`, because the fused kernel is not bit-identical to eager
+`GroupNorm` → `SiLU`. `DecodingStage` went from about 3.5 s to about 5.3 s on
+every H100 pool, while denoising did not change (#53413).
+
+The shared E2E and `DecodingStage` references follow the calibration policy in
+the file metadata: the maximum over 9 measurements in 7 `computable-e` jobs from
+November 21–26, 2026, plus 5%. The maximum E2E was
+[11273.92 ms](https://github.com/sgl-project/sglang/actions/runs/45330088512/job/138229283688),
+giving 11837.62 ms. The maximum decode was
+[5314.89 ms](https://github.com/sgl-project/sglang/actions/runs/45788354474/job/139809952138),
+giving 5580.63 ms. Replaying the logged checks of 8 `computable-d` jobs from
+November 20–26 raises the jobs with a passing attempt from 2 to 8. All 7
+`computable-e` jobs pass under both the old and the new references. No
+`runner_overrides` entry is needed.
+
 ## Initial loading references
 
 The initial H100 loading references cover 28 cases with at least three distinct

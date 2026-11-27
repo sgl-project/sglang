@@ -423,6 +423,7 @@ jobs:
       && needs.call-gate.outputs.opted-in != 'false'
     uses: ./.github/workflows/pr-test-multimodal-gen.yml
     with:
+      model_scoped_pr: ${{ github.event_name == 'pull_request_target' && github.base_ref == 'main' && !inputs.git_ref && !inputs.run_all_tests }}
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
       multimodal_gen_server: ${{ needs.check-changes.outputs.multimodal_gen_server }}
@@ -535,5 +536,5 @@ jobs:
       - name: Require that tests ran
         if: needs.call-gate.outputs.opted-in == 'false'
         run: |
-          echo "::error::Tests were skipped: the PR is a draft, lacks the 'run-ci' label, or its head commit has no run-ci approval. Mark the PR ready, then have a maintainer comment /tag-and-rerun-ci to approve this commit; adding 'run-ci' in the UI, /rerun-failed-ci and 'Re-run all jobs' approve nothing."
+          echo "::error::Tests were skipped: the PR is a draft, lacks the 'run-ci' label, or its head commit has no run-ci approval. Mark the PR ready, then have a maintainer comment /tag-and-rerun-ci to approve this commit (/approve-ci if the PR already has 'run-ci'); adding 'run-ci' in the UI, /rerun-failed-ci and 'Re-run all jobs' approve nothing."
           exit 1
