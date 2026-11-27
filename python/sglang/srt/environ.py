@@ -2019,11 +2019,6 @@ class Envs:
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
-    # Graph-input fill fast paths: skip the padding reset of an unpadded replay and copy
-    # one dense integer dtype pair with a single foreach launch.
-    SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # Reuse wholly-free graph-pool segments for step-local eager allocations.
     SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
     # Mint capture's measured footprint as one span so the graph pool is carved
@@ -2788,7 +2783,11 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH": _DeprecatedEnv(
+        note="The CUDA graph fill fast paths were removed; unset it."
+    ),
+}
 
 
 def _handle_deprecated_envs():
