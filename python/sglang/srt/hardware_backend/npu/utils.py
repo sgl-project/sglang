@@ -36,6 +36,16 @@ def _is_npu_arch(arch: int) -> bool:
 
 
 @functools.lru_cache(maxsize=1)
+def is_ascend_910c() -> bool:
+    """Whether the selected runtime supports A3 mapped host reads."""
+    if not is_npu():
+        return False
+    import acl
+
+    return acl.get_soc_name().startswith("Ascend910_93")
+
+
+@functools.lru_cache(maxsize=1)
 def is_npu_arch22() -> bool:
     """Whether the runtime is on NPU architecture 22 (Atlas A2/A3)."""
     return _is_npu_arch(2201)

@@ -39,6 +39,49 @@ def _choice(default: str, choices: tuple):
 
 
 @dataclasses.dataclass(frozen=True)
+class EngramPoolConfig:
+    store_url: str = ""
+    world_size: int = 0
+    rank_offset: int = 0
+    owner_ranks: Optional[list[int]] = None
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> "EngramPoolConfig":
+        fields = {f.name: f for f in dataclasses.fields(cls)}
+        if not isinstance(raw, dict) or any(
+            k not in fields
+            or (
+                not isinstance(v, list) or any(type(r) is not int for r in v)
+                if k == "owner_ranks"
+                else type(v) is not type(fields[k].default)
+            )
+            for k, v in raw.items()
+        ):
+            raise ValueError("--engram-config: invalid pool fields or types")
+        config = cls(**raw)
+        if config.world_size < 0 or config.rank_offset < 0:
+            raise ValueError(
+                "--engram-config: pool world_size/rank_offset must be nonnegative"
+            )
+        if config.world_size and config.rank_offset >= config.world_size:
+            raise ValueError(
+                "--engram-config: pool rank_offset must be below world_size"
+            )
+        owners = config.owner_ranks
+        if owners is not None and (
+            not owners
+            or len(set(owners)) != len(owners)
+            or any(
+                r < 0 or (config.world_size and r >= config.world_size) for r in owners
+            )
+        ):
+            raise ValueError(
+                "--engram-config: pool owner_ranks must be unique ranks within world_size"
+            )
+        return config
+
+
+@dataclasses.dataclass(frozen=True)
 class EngramConfig:
     placement: str = _choice(EngramPlacement.GPU, EngramPlacement.ALL)
     replication: str = _choice(EngramReplication.NONE, EngramReplication.ALL)
@@ -47,9 +90,12 @@ class EngramConfig:
     # tables, and a directory all of them see, empty for each deployment.
     group_size: int = 0
     group_store: str = ""
+    pool: Optional[EngramPoolConfig] = None
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "EngramConfig":
+        raw = dict(raw)
+        pool = EngramPoolConfig.from_dict(raw.pop("pool")) if "pool" in raw else None
         if raw.get("lookup") == EngramLookup.COLLECTIVE:
             raw = {**raw, "lookup": EngramLookup.AUTO}
         fields = {f.name: f for f in dataclasses.fields(cls)}
@@ -65,7 +111,17 @@ class EngramConfig:
             raise ValueError(
                 f"--engram-config: invalid {', '.join(invalid)}; choices: {choices}"
             )
-        config = cls(**raw)
+        config = cls(**raw, pool=pool)
+        if pool is not None:
+            if config.placement != EngramPlacement.CPU:
+                raise ValueError("--engram-config: pool requires NPU host offload")
+            if config.replication == EngramReplication.GROUP_SHARDS or (
+                config.replication == EngramReplication.PER_NODE
+                and (pool.world_size or pool.rank_offset)
+            ):
+                raise ValueError(
+                    "--engram-config: an explicit pool topology requires replication 'none'"
+                )
         if config.replication == EngramReplication.GROUP_SHARDS:
             if config.lookup not in (EngramLookup.AUTO, EngramLookup.PEER_READ):
                 raise ValueError(

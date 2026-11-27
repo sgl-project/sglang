@@ -1286,10 +1286,14 @@ class ExecOffload(msgspec.Struct):
         Optional[Dict[str, Any]],
         Arg(
             help="Where the DeepSeek-V4.1 Engram tables live, as JSON: "
-            "'placement' gpu|cpu, 'replication' none|per_node|group_shards, 'lookup' "
+            "'placement' gpu|cpu (device memory or host memory; on NPU, "
+            "cpu uses the MemFabric host pool), 'replication' "
+            "none|per_node|group_shards, 'lookup' "
             "auto|all_reduce|reduce_scatter|all_to_all|peer_read; an omitted key "
             "takes the first value. 'group_shards' also takes 'group_size' and "
-            "'group_store'. "
+            "'group_store'. NPU host offload also accepts 'pool' with "
+            "'store_url', 'world_size', 'rank_offset', and 'owner_ranks' "
+            "(a JSON array). Omit 'pool' to use a node-local pool. "
             "See docs/advanced_features/engram.",
             type_parser=json.loads,
         ),
