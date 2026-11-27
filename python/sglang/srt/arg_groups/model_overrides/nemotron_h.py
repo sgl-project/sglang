@@ -128,7 +128,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Use marlin as MoE runner backend on SM80-SM90 for "
                 f"{model_arch} {model_config.quantization}"
             )
-        else:
+        elif not get_platform().is_xpu:
             overrides["moe_runner_backend"] = "flashinfer_cutlass"
 
     if get_platform().is_blackwell and is_attention_backend_not_set(cfg):

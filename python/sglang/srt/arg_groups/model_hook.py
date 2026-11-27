@@ -618,7 +618,7 @@ def handle_model_specific_adjustments(server_args: Any):
             # disable_hybrid_swa_memory moved to the override registry
             # (arg_groups/model_overrides/exaone.py).
             # https://docs.sglang.ai/advanced_features/attention_backend.html
-            accepted_backends = ["fa3", "triton", "trtllm_mha"]
+            accepted_backends = ["fa3", "triton", "trtllm_mha", "intel_xpu"]
             attention_backend = resolved_view(server_args).attention_backend
             assert attention_backend in accepted_backends, (
                 f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
