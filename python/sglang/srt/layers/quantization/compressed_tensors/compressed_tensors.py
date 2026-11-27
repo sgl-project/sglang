@@ -1551,6 +1551,9 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        self.fuse_routed_scaling_factor_in_topk = getattr(
+            layer.scheme, "fuse_routed_scaling_factor_in_topk", False
+        )
         return layer.scheme.create_moe_runner(layer, moe_runner_config)
 
     def get_moe_runner_backend(self, layer):

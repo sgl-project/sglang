@@ -384,8 +384,47 @@ class TestWeightOnlyFp4WeightCreation(CustomTestCase):
 
 
 class TestWeightOnlyFp4BackendSelection(CustomTestCase):
-    """The NVFP4 weight-only linear follows --fp4-gemm-backend; only the cuDNN
-    and CuTe-DSL FlashInfer backends implement bf16 x fp4."""
+    """Test weight-only FP4 backend selection and MoE routed scaling."""
+
+    def test_mxfp4_routed_scale_is_applied_in_topk(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import (
+            _fuses_routed_scaling_factor_in_topk,
+        )
+        from sglang.srt.layers.moe.topk import TopK
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.runtime_context import get_context
+
+        hidden = torch.zeros(2, 4)
+        logits = torch.tensor([[1.0, 2.0, 3.0], [-1.0, 1.0, 0.0]])
+        method = compressed_tensors.CompressedTensorsFusedMoEMethod(None)
+        # MXFP4 Marlin's combine does not apply an output scale. NVFP4
+        # retains output scaling and must not also fold it into TopK.
+        for scheme, expected_sum in (
+            (CompressedTensorsW4A16Mxfp4MoE(), 2.5),
+            (CompressedTensorsW4A16Nvfp4MoE(), 1.0),
+        ):
+            with (
+                self.subTest(scheme=type(scheme).__name__),
+                mock.patch(f"{type(scheme).__module__}.MoeRunner"),
+                get_context().override_server_args(),
+            ):
+                method.create_moe_runner(
+                    SimpleNamespace(scheme=scheme), MoeRunnerConfig()
+                )
+                fold_scale = _fuses_routed_scaling_factor_in_topk(
+                    method, MoeRunnerBackend.MARLIN
+                )
+                router = TopK(
+                    top_k=2,
+                    layer_id=0,
+                    routed_scaling_factor=2.5,
+                    apply_routed_scaling_factor_on_output=fold_scale,
+                )
+                output = router.forward_native(hidden, logits)
+                torch.testing.assert_close(
+                    output.topk_weights.sum(dim=-1),
+                    torch.full((2,), expected_sum),
+                )
 
     def _use_flashinfer(
         self, backend, is_blackwell=True, dtype=torch.bfloat16, cudnn_version=92301

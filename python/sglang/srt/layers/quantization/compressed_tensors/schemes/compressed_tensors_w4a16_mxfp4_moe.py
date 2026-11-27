@@ -54,6 +54,9 @@ class CompressedTensorsW4A16Mxfp4MoE(CompressedTensorsMoEScheme):
     so that order comes from the flag's default and must not be overridden here.
     """
 
+    # MXFP4 Marlin combines weighted routes without applying an output scale.
+    fuse_routed_scaling_factor_in_topk = True
+
     def __init__(self, has_input_global_scale: bool = False):
         # True for a w4a4 checkpoint being served weight-only.
         self.has_input_global_scale = has_input_global_scale
