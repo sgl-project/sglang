@@ -1398,8 +1398,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
 
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
-            all_exists = (
-                self._batch_exist(all_component_keys) if all_component_keys else []
+            all_exists = self._batch_exist_pool_pages(
+                all_component_keys, prepared, kv_pages
             )
         for transfer, key_multiplier, start, end in prepared:
             if not restorable:
@@ -2080,6 +2080,29 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
+
+    def _batch_exist_pool_pages(
+        self, keys: List[str], prepared: list, kv_pages: int
+    ) -> List[int]:
+        if not keys or not hasattr(self.store, "batch_probe_key"):
+            return self._batch_exist(keys) if keys else []
+        exists = [0] * len(keys)
+        leased = []
+        for transfer, key_multiplier, start, end in prepared:
+            if transfer.name == PoolName.MAMBA and key_multiplier > 0:
+                # A restore reads only the deepest Mamba state; leasing the
+                # shallower ones would keep superseded states from being freed.
+                stop = start + kv_pages * key_multiplier
+                exists[start:stop] = self.store.batch_probe_key(
+                    keys[start:stop], "LastHitOnly", key_multiplier
+                )
+            else:
+                leased.extend(range(start, end))
+        if leased:
+            results = self._batch_exist([keys[i] for i in leased])
+            for i, result in zip(leased, results):
+                exists[i] = result
+        return exists
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
