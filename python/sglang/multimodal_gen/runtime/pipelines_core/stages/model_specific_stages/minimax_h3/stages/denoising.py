@@ -531,6 +531,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         transformer,
         pipeline=None,
         stochastic_sampling: bool = False,
+        dwd_output: bool = False,
         transformer_2=None,
     ) -> None:
         # transformer_2: the Ref2VA DiT of a fl2va+ref2va server, which
@@ -543,6 +544,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
         # the release's few-step re-noising update (release metadata)
         self.stochastic_sampling = stochastic_sampling
+        # DWD releases decode the video from the last step's DiT features
+        self.dwd_output = dwd_output
         self._minimax_h3_quality = "exact"
         self._minimax_h3_cache_mode: str | None = None
 
@@ -1022,6 +1025,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     batch.rollout_trajectory_data = (
                         rollout_ctx.collector.build_trajectory_data()
                     )
+                if getattr(self, "dwd_output", False):
+                    self._decode_dwd_pixels(model, batch, ctx)
         finally:
             self._finish_active_component_use()
         _publish_full_loop_outputs(
@@ -1030,6 +1035,27 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             positive=positive,
             video_rows=video_rows,
             audio_rows=audio_rows,
+        )
+
+    @staticmethod
+    def _decode_dwd_pixels(model: Any, batch: Req, ctx: Any) -> None:
+        """Decode the frames from the last step's features while the DiT is resident."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+            MINIMAX_H3_DWD_FEATURES_EXTRA_KEY,
+            MINIMAX_H3_DWD_PIXELS_EXTRA_KEY,
+        )
+
+        features = batch.extra.pop(MINIMAX_H3_DWD_FEATURES_EXTRA_KEY, None)
+        if features is None:
+            raise RuntimeError("MiniMax H3 DWD: the last step returned no features")
+        token_grid = (int(ctx.latent_t), int(ctx.latent_h) // 2, int(ctx.latent_w) // 2)
+        if features.shape[0] != token_grid[0] * token_grid[1] * token_grid[2]:
+            raise ValueError(
+                f"MiniMax H3 DWD: {features.shape[0]} feature rows do not cover the "
+                f"{token_grid} token grid"
+            )
+        batch.extra[MINIMAX_H3_DWD_PIXELS_EXTRA_KEY] = model.decode_dwd_pixels(
+            features, token_grid
         )
 
     def _begin_dit_use(self, is_ref2va: bool, batch: Req) -> Any:
@@ -1224,6 +1250,19 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             ),
             forward_batch=batch,
         ):
+            if (
+                getattr(self, "dwd_output", False)
+                and num_steps is not None
+                and step_index == num_steps - 1
+            ):
+                from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+                    MINIMAX_H3_DWD_FEATURES_EXTRA_KEY,
+                )
+
+                # the last step also returns the pixel-head features, eagerly
+                video, audio, features = model(**call_kwargs, return_dwd_features=True)
+                batch.extra[MINIMAX_H3_DWD_FEATURES_EXTRA_KEY] = features
+                return video, audio
             runner = self._maybe_get_bcg_runner(model)
             if runner is None:
                 return model(**call_kwargs)
