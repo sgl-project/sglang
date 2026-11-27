@@ -277,7 +277,7 @@ class TestNpuMhcSeam(unittest.TestCase):
             rows * self.MULT * self.HIDDEN, dtype=torch.float32
         ).reshape(rows, self.MULT, self.HIDDEN)
 
-    def test_a3_combine_calls_v2_with_previous_premix_and_stashes_the_triplet(self):
+    def test_npu_combine_uses_previous_pre_mix_and_stashes_stats(self):
         hc = self._sub_layer()
         x = self._residual()
         pre_prev = torch.full((2, self.MULT), 0.25)
@@ -326,7 +326,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         torch.testing.assert_close(post_mix, torch.ones(2, self.MULT))
         torch.testing.assert_close(comb, torch.ones(2, self.MULT, self.MULT))
 
-    def test_a5_first_sublayer_calls_v2_with_stream_zero_one_hot(self):
+    def test_npu_first_sublayer_seeds_stream_zero_one_hot(self):
         hc = self._sub_layer()
         x = self._residual()
         state = mhc.HcState(x)  # no previous pre-mix
