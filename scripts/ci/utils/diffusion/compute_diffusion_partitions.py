@@ -7,6 +7,7 @@ AST parsing to extract parametrized cases plus standalone files from source.
 """
 
 import argparse
+import ast
 import importlib.util
 import json
 import math
@@ -18,9 +19,14 @@ from diffusion_case_parser import (
     BASELINE_REL_PATH,
     RUN_SUITE_REL_PATH,
     DiffusionSuiteInfo,
+    DiffusionTestCaseVisitor,
     collect_diffusion_suites,
+    pr_model_families,
     resolve_case_config_path,
 )
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from hf_repo_scan import RepoIdScanner  # noqa: E402
 
 
 def _load_partitioning_helpers():
@@ -45,6 +51,9 @@ if USE_NPU_CONFIGS:
     SUITE_OUTPUT_NAMES = {"1-npu": "1npu", "2-npu": "2npu"}
 
 DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
+
+# The directory diffusion_suite_runner.py resolves standalone files against.
+STANDALONE_DIR_REL_PATH = "python/sglang/multimodal_gen/test/server"
 
 
 def validate_suite_case_coverage(suites: dict[str, DiffusionSuiteInfo]) -> None:
@@ -122,6 +131,31 @@ def build_partition_items(
     return items
 
 
+def item_repo_ids(
+    repo_root: Path, case_config_path: Path, standalone_files: set[str]
+) -> dict[str, set[str]]:
+    """`item_id -> Hugging Face repo ids` for the cases ``case_config_path``
+    builds and for ``standalone_files``."""
+    scanner = RepoIdScanner(str(repo_root))
+    tree = ast.parse(case_config_path.read_text(encoding="utf-8"))
+    visitor = DiffusionTestCaseVisitor()
+    visitor.visit(tree)
+    table = scanner.module_repo_ids(str(case_config_path), tree)
+    found = {
+        case_id: set().union(*(scanner.node_repo_ids(call, table) for call in calls))
+        for case_id, calls in visitor.case_calls.items()
+    }
+    for standalone_file in standalone_files:
+        path = os.path.normpath(repo_root / STANDALONE_DIR_REL_PATH / standalone_file)
+        found[standalone_file] = scanner.file_repo_ids(os.path.relpath(path, repo_root))
+    # The NVFP4 pipeline loads its shared components from a second Hub repo.
+    # Only partitions that load the Comfy checkpoint need to prefetch it.
+    for repos in found.values():
+        if "Comfy-Org/Ideogram-4" in repos:
+            repos.add("ideogram-ai/ideogram-4-fp8")
+    return found
+
+
 def build_matrix(partition_count: int) -> dict:
     if partition_count <= 0:
         return {"include": []}
@@ -131,6 +165,7 @@ def build_matrix(partition_count: int) -> dict:
 def build_partition_plan(
     suite_name: str,
     partitions: list[list[PartitionItem]],
+    repo_ids: dict[str, set[str]],
 ) -> dict:
     return {
         "suite": suite_name,
@@ -148,13 +183,16 @@ def build_partition_plan(
                     if item.kind == "standalone" and item.used_fallback_estimate
                 ],
                 "estimated_time": round(sum(item.est_time for item in partition), 1),
+                "repo_ids": sorted(
+                    set().union(*(repo_ids.get(item.item_id, ()) for item in partition))
+                ),
             }
             for idx, partition in enumerate(partitions)
         ],
     }
 
 
-def output_github_value(name: str, value: dict) -> None:
+def output_github_value(name: str, value: dict | tuple[str, ...]) -> None:
     value_json = json.dumps(value, separators=(",", ":"))
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
@@ -284,8 +322,28 @@ def main():
         print(f"Error: {exc}")
         sys.exit(1)
 
-    suites = collect_diffusion_suites(case_config_path, baseline_path)
+    families = ()
+    changed_files = os.environ.get("DIFFUSION_PR_FILES")
+    if changed_files and not args.case_ids and not USE_NPU_CONFIGS:
+        families = tuple(
+            sorted(pr_model_families(json.loads(Path(changed_files).read_text())))
+        )
+    output_github_value("h100-pr-families", families)
+    suites = collect_diffusion_suites(
+        case_config_path, baseline_path, pr_families=families
+    )
     validate_suite_case_coverage(suites)
+
+    # A scan problem leaves the prefetch without a list, never fails the plan.
+    try:
+        repo_ids = item_repo_ids(
+            repo_root,
+            case_config_path,
+            {f for info in suites.values() for f in info.standalone_files},
+        )
+    except Exception as exc:
+        print(f"::warning::cannot scan the diffusion cases for repo ids: {exc}")
+        repo_ids = {}
 
     requested_case_ids = set(args.case_ids or [])
     if requested_case_ids:
@@ -348,7 +406,8 @@ def main():
         output_github_value(f"matrix-{output_name}", matrix)
         output_github_scalar(f"partition-count-{output_name}", str(partition_count))
         output_github_value(
-            f"plan-{output_name}", build_partition_plan(suite_name, partitions)
+            f"plan-{output_name}",
+            build_partition_plan(suite_name, partitions, repo_ids),
         )
 
 

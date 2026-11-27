@@ -12,6 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
@@ -29,6 +30,7 @@ def _handle_pd_request(mode, req):
         hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=120
     )
     scheduler.disaggregation_mode = mode
+    scheduler.transfer_backend = TransferBackend.MOONCAKE
     scheduler.disagg_metadata_buffers = SimpleNamespace(enable_sampling_mask=False)
     scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
     scheduler.tokenizer = None
