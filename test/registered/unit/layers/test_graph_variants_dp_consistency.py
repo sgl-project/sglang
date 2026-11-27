@@ -147,8 +147,9 @@ class TestMLPSyncDecodeBound(CustomTestCase):
             info._get_fallback_tensor("cpu"),
         )
         self.assertEqual(local.numel(), fallback.numel())
-        self.assertEqual(int(local[-1]), 1234)
-        self.assertEqual(int(fallback[-1]), 0)
+        # Column 13, the index finalize reads; departure_pending stays last.
+        self.assertEqual(int(local[13]), 1234)
+        self.assertEqual(int(fallback[13]), 0)
         info.finalize_local()
         self.assertEqual(info.global_decode_graph_max_seq_len, 1234)
 
