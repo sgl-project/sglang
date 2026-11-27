@@ -9,20 +9,27 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.hy_v4_dfly import DFLY_CHECKPOINT_PREFIX
-from sglang.srt.configs.model_config import dsa_layer_skips_topk, get_dsa_index_topk
+from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.layer_boundary import (
+    PLAIN_ADD,
     IHCState,
     append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
+    is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
@@ -40,6 +47,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
@@ -53,7 +65,7 @@ from sglang.srt.models.deepseek_v2 import (
     DeepseekV2MLP,
     DeepseekV2MoE,
 )
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import get_parallel, get_spec, get_stream
 from sglang.srt.utils import BumpAllocator, get_device_capability, is_cuda
 
 logger = logging.getLogger(__name__)
@@ -83,6 +95,53 @@ def _ihc_forward_mode(forward_batch):
     except ImportError:
         return contextlib.nullcontext()
     return hy4_ihc_forward_mode(forward_batch.forward_mode.is_decode_or_idle())
+
+
+def _reject_ffn_on_rank_rows():
+    # The dense MLP is TP-sharded, and the gated streams have no gather back
+    # from a rank's slice: either layout would compute wrong hidden states.
+    parallel = get_parallel()
+    if is_dense_ffn_fully_dp() and parallel.tp_size > 1:
+        raise ValueError("HYV4 does not support --moe-dense-tp-size 1 with TP > 1.")
+    if is_moe_input_scattered_across_dp_ranks() and parallel.attn_tp_size > 1:
+        raise ValueError(
+            "HYV4 does not support a MoE dispatched per attention-DP shard "
+            "(an all-to-all backend, the FP4 all-gather or DWDP) with attention "
+            "TP > 1."
+        )
+
+
+def _init_attn_tp_context(config, pp_group):
+    context = get_attn_tp_context()
+    use_dsa = is_deepseek_dsa(config)
+    # iHC keeps its streams on each rank's slice as mHC does, so DSA takes its
+    # input gathered at the stage entry.
+    context.init_context(config.q_lora_rank, use_dsa, is_mhc=True)
+    if not context.allow_input_scattered:
+        return
+    blockers = [
+        name
+        for name, blocked in (
+            # The output gate projects the attention input row for row.
+            ("attention without DSA", not use_dsa),
+            ("speculative decoding", get_spec().speculative_algorithm is not None),
+            ("pipeline parallelism", pp_group.world_size > 1),
+            ("decode context parallelism", get_parallel().dcp_enabled),
+            # A replicated table hands the entry complete rows, not a TP sum.
+            ("replicated embeddings", not get_embedding_tp_kwargs()["enable_tp"]),
+            (
+                "a prefill CUDA graph",
+                not check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED),
+            ),
+        )
+        if blocked
+    ]
+    if blockers:
+        logger.warning(
+            "HYV4 input-scattered attention is off: not supported with %s.",
+            ", ".join(blockers),
+        )
+        context.allow_input_scattered = False
 
 
 def permute_hyv4_indexer_weight(name, loaded_weight, config):
@@ -341,16 +400,10 @@ class HYV4HCLayer(nn.Module):
             except ImportError:
                 pass
             else:
-                fused = (
-                    fused_hy4_ihc_post_pre
-                    if _hpc_ihc_available(
-                        "fuse_ihc_post_pre",
-                        self.hc_mult,
-                        self.hidden_size,
-                        output.shape[0],
-                    )
-                    else hy4_ihc_post_pre_norm
+                use_hpc = _hpc_ihc_available(
+                    "fuse_ihc_post_pre", self.hc_mult, self.hidden_size, output.shape[0]
                 )
+                fused = fused_hy4_ihc_post_pre if use_hpc else hy4_ihc_post_pre_norm
                 try:
                     next_residual, reduced, next_post = fused(
                         output,
@@ -369,7 +422,10 @@ class HYV4HCLayer(nn.Module):
                 except Exception:
                     self._fused_ihc_post_pre_disabled = True
                     logger.warning(
-                        "fused iHC post_pre failed, disabling fused path",
+                        "%s failed, disabling fused path",
+                        "fused_hy4_ihc_post_pre"
+                        if use_hpc
+                        else "hy4_ihc_post_pre_norm",
                         exc_info=True,
                     )
         next_residual = self.post(output, residual, post)
@@ -957,6 +1013,7 @@ class HYV4Model(nn.Module):
         super().__init__()
         # Fail at startup: no hpc, or an empty batch, would otherwise skip the check.
         _validate_ihc_policy()
+        _reject_ffn_on_rank_rows()
         self.config = config
         self.pp_group = get_parallel().pp_group
         if self.pp_group.is_first_rank:
@@ -1004,6 +1061,10 @@ class HYV4Model(nn.Module):
                 self.embed_tokens(input_ids) if input_embeds is None else input_embeds
             )
             residual_batch.start(forward_batch)
+            if input_embeds is not None and get_attn_tp_context().input_scattered:
+                # Embeddings handed in are complete on every rank, so the entry
+                # takes this rank's slice instead of summing them over TP.
+                residual_batch.stream_of(forward_batch).record(hidden_states, PLAIN_ADD)
             topk_share = IndexTopKShareState(forward_batch, None)
         else:
             hidden_states = self._from_previous_stage(pp_proxy_tensors, forward_batch)
@@ -1117,6 +1178,7 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.logits_processor = LogitsProcessor(config)
         # A DFly worker sets this on the top-level target model only.
         self.dfly_execution = None
+        _init_attn_tp_context(config, self.pp_group)
 
     @property
     def start_layer(self):
@@ -1142,13 +1204,14 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.dfly_execution.draft_into_verify(
                 input_ids=input_ids, forward_batch=forward_batch
             )
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds=input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds=input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
         if not self.pp_group.is_last_rank:
             return hidden_states
         return self.logits_processor(

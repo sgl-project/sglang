@@ -167,8 +167,7 @@ _TINY_HC_CONFIG = SimpleNamespace(
 )
 
 
-def _tiny_hc_layers():
-    config = _TINY_HC_CONFIG
+def _tiny_hc_layers(config=_TINY_HC_CONFIG):
     with patch.object(hunyuan_v4, "ReplicatedLinear", _TupleLinear):
         pre_layer = hunyuan_v4.HYV4HCPreLayer(config, "pre").cuda()
         layer = hunyuan_v4.HYV4HCLayer(config, "layer").cuda()
@@ -285,6 +284,59 @@ class TestHy4DecodeKernels(CustomTestCase):
         self.assertEqual(len(logs.records), 1)
         for got, want in zip(actual, expected):
             self.assertTrue(torch.equal(got, want))
+
+    def test_shared_post_pre_matches_the_eager_chain(self):
+        """The shared wrapper against the eager post, pre and RMSNorm it stands
+        for, in bf16 on the served widths and on each of its token-count kernels
+        (per token, token-blocked, tensor-core dot)."""
+        torch.manual_seed(0)
+        for num_tokens, hidden_size in ((3, 6144), (65, 6144), (200, 4096)):
+            config = SimpleNamespace(
+                hidden_size=hidden_size,
+                hc_mult=4,
+                hc_magnitude=2.0,
+                hc_eps=1e-6,
+                rms_norm_eps=1e-5,
+            )
+            _, layer, next_layer, _, norm = _tiny_hc_layers(config)
+            hc_pre = next_layer.hc_pre
+            # Unit-variance gate logits, so the sigmoids stay off their plateaus.
+            hc_pre.hc_fn.weight.data.mul_((config.hc_mult * hidden_size) ** -0.5)
+            nn.init.normal_(hc_pre.hc_scale)
+            nn.init.normal_(hc_pre.hc_base)
+            norm.weight.data.uniform_(0.5, 1.5)
+            norm = norm.to(torch.bfloat16)
+            output = torch.randn(
+                num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
+            )
+            residual = torch.randn(
+                num_tokens, config.hc_mult, hidden_size, device="cuda"
+            ).to(torch.bfloat16)
+            post = 2 * torch.rand(num_tokens, config.hc_mult, device="cuda")
+            with (
+                self.subTest(num_tokens=num_tokens, hidden_size=hidden_size),
+                patch.object(hunyuan_v4, "_hpc_ihc_available", return_value=False),
+            ):
+                # A failing wrapper would fall back to the chain it is compared to.
+                with self.assertNoLogs(hunyuan_v4.logger, level="WARNING"):
+                    reduced, next_post, next_residual = layer.post_pre(
+                        output, residual, post, next_layer, norm
+                    )
+                layer._fused_ihc_post_disabled = True
+                hc_pre._fused_ihc_pre_disabled = True
+                want_reduced, want_post, want_residual = next_layer.pre(
+                    layer.post(output, residual, post), norm
+                )
+                self.assertEqual(next_post.dtype, torch.float32)
+                # One bf16 ulp on the written streams; the read reorders its
+                # fp32 reductions from 64 tokens on.
+                torch.testing.assert_close(
+                    next_residual.float(), want_residual.float(), rtol=2**-7, atol=1e-6
+                )
+                torch.testing.assert_close(next_post, want_post, rtol=1e-3, atol=1e-3)
+                torch.testing.assert_close(
+                    reduced.float(), want_reduced.float(), rtol=2e-2, atol=2e-2
+                )
 
     def test_ihc_policy_normalizes_each_path_exactly_once(self):
         """Whichever backend the policy picks, RMSNorm must run exactly once

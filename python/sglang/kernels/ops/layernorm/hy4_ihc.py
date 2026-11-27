@@ -843,6 +843,11 @@ def hy4_ihc_post_pre_norm(
     T, hc_mult, hidden_size = residual.shape
     k_total = hc_mult * hidden_size
     assert hc_fn.dtype == torch.float32 and hc_fn.shape == (2 * hc_mult, k_total)
+    if output is not None:
+        # Stage 1 indexes all three by the residual's rows.
+        assert output.shape == (T, hidden_size), (output.shape, residual.shape)
+        assert post.shape == (T, hc_mult), (post.shape, residual.shape)
+        assert post.dtype == torch.float32
     y = torch.empty((T, hidden_size), dtype=residual.dtype, device=residual.device)
     next_post = torch.empty((T, hc_mult), dtype=torch.float32, device=residual.device)
     if T == 0:
