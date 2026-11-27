@@ -24,10 +24,6 @@ class PoolLayout(msgspec.Struct, frozen=True):
     components: tuple[PageComponent, ...]
     format: str
 
-    @property
-    def bytes_per_page(self) -> int:
-        return sum(component.size for component in self.components)
-
 
 def describe_pool(name: str, pool) -> PoolLayout:
     """Derive the layout from the same accessor that performs storage IO.
@@ -140,7 +136,7 @@ class StorageKeyAdapter:
         return framework_key
 
     def encode_to_router(self, key: bytes) -> int:
-        # Inverts SGLang's hash_str_to_int64, as the unsigned router hash.
+        # hash_str_to_int64's value read as u64, the same as hints.router_hash.
         return int(key[:16], 16)
 
     def decode_from_router(self, router_key: int | bytes) -> bytes:
