@@ -143,25 +143,11 @@ class TestElasticRecover4To4(CustomTestCase):
             visible_devices=visible_devices[LOCAL_EP_SIZE:EP_SIZE],
             name="initial_joiner",
         )
-        try:
-            wait_for_http_ready(
-                f"{cls.base_url}/health_generate",
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                process=cls.primary,
-            )
-        except Exception:
-            # Startup failures previously exposed only the child exit code,
-            # which made CI failures impossible to diagnose from the run log.
-            for name, log_path in cls.log_paths.items():
-                print(f"===== {name} server log ({log_path}) =====")
-                try:
-                    lines = log_path.read_text(errors="replace").splitlines()
-                except OSError as exc:
-                    print(f"<unable to read log: {exc}>")
-                    continue
-                print("\n".join(lines[-120:]))
-                print(f"===== end {name} server log =====")
-            raise
+        wait_for_http_ready(
+            f"{cls.base_url}/health_generate",
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            process=cls.primary,
+        )
 
     @classmethod
     def _launch(
