@@ -118,6 +118,7 @@ class _Stage(SchedulerDisaggregationPrefillMixin):
             calls=calls,
             disagg_kv_sender=SimpleNamespace(
                 poll=lambda: KVPoll.Success,
+                check_transfer_timeout=lambda: None,
                 clear=lambda: None,
                 get_transfer_metric=lambda: None,
                 kv_mgr=None,
