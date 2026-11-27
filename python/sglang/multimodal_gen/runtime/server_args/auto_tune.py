@@ -900,6 +900,7 @@ class ServerArgsAutoTuner:
         Sized from the local checkpoint, so overrides, quantization and weights not
         yet downloaded keep the per-model policy; one request's activations are
         assumed, so batching and shared host/device pools are excluded too.
+        Components the pipeline config says it does not load are left out.
         """
         args = self.server_args
         if (
@@ -925,8 +926,11 @@ class ServerArgsAutoTuner:
         )
         if sizes is None:
             return False
+        unloaded = set(args.pipeline_config.unloaded_checkpoint_components(args))
         weight_bytes = 0
         for name, (num_params, stored_bytes) in sizes.items():
+            if name in unloaded:
+                continue
             # loaded in the component's configured precision, else as stored
             dtype = resolve_component_precision(args, name)
             nbytes = num_params * dtype.itemsize if dtype is not None else stored_bytes
