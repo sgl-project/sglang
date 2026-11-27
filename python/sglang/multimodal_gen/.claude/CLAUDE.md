@@ -54,7 +54,7 @@ runtime/
 ├── models/             # encoders/, dits/, vaes/, schedulers/
 ├── layers/             # attention/, lora/, quantization/
 ├── loader/             # Model loading, weight utils
-├── server_args.py      # ServerArgs (all CLI/config params)
+├── server_args/        # ServerArgs (all CLI/config params)
 └── distributed/        # Multi-GPU (TP, SP: ulysses/ring)
 configs/
 ├── pipeline_configs/    # Per-model pipeline configs
@@ -71,7 +71,7 @@ configs/
 | `Scheduler` | `runtime/managers/scheduler.py` | ZMQ event loop, request dispatch |
 | `GPUWorker` | `runtime/managers/gpu_worker.py` | GPU inference worker |
 | `Req` / `OutputBatch` | `runtime/pipelines_core/schedule_batch.py` | Request/output containers |
-| `ServerArgs` | `runtime/server_args.py` | All config params |
+| `ServerArgs` | `runtime/server_args/server_args.py` | All config params |
 | `SamplingParams` | `configs/sample/sampling_params.py` | Generation params |
 | `PipelineConfig` | `configs/pipeline_configs/base.py` | Model structure config |
 
@@ -116,7 +116,7 @@ python -m pytest python/sglang/multimodal_gen/test/
 
 ## Performance Tuning
 
-For questions about optimal performance, fastest commands, VRAM reduction, or best flag combinations for a given model/GPU setup, **read the [sglang-diffusion-performance skill](skills/sglang-diffusion-performance/SKILL.md)**. It contains a complete table of lossless and lossy optimization flags with trade-offs, quick recipes, and tuning tips.
+For questions about optimal performance, fastest commands, VRAM reduction, or best flag combinations for a given model/GPU setup, **read the [sglang-diffusion-performance skill](skills/sglang-diffusion-performance/SKILL.md)**. It contains tables of output-preserving and approximate optimization flags with trade-offs, generic recipes, and tuning tips; per-model commands are on the cookbook pages.
 
 ### Perf Measurement
 

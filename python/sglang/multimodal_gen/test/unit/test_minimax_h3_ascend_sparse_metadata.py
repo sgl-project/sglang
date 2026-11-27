@@ -397,7 +397,8 @@ class TestMiniMaxH3AscendSparseMetadata(_MockedMindIETestCase):
         model._resolved_attention_backend = AttentionBackendEnum.ASCEND_SPARSE_ATTN
         model.final_layer = SimpleNamespace(_pdd_heads=object())
         server_args = SimpleNamespace(
-            attention_backend_config={"skip_first_steps": 0, "skip_last_steps": 1}
+            num_gpus=1,
+            attention_backend_config={"skip_first_steps": 0, "skip_last_steps": 1},
         )
         stage = SimpleNamespace(
             transformer=model,
