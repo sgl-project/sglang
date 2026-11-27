@@ -2,7 +2,7 @@
 title: Praxis-1
 metatags:
     description: "Deploy Runway Praxis-1 (DROID single-arm and YAM bimanual), a video-action world model that denoises future video and robot actions jointly, with SGLang's native multimodal_gen runtime."
-tag: dVLA
+tag: WAM
 ---
 
 ## 1. Model Introduction

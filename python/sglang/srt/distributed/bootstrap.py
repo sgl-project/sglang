@@ -40,10 +40,12 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
+    is_gfx95_supported,
     is_host_cpu_arm64,
     is_npu,
     monkey_patch_p2p_access_check,
 )
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.patch_torch import register_sgl_tp_rank
 
@@ -109,6 +111,8 @@ def init_parallel_runtime(
             "through here."
         )
     _PARALLEL_INITIALISED = True
+    # Foundry binds this rank's allocation region before any communicator.
+    get_foundry_adapter().before_parallel_init(device)
 
     tic = time.perf_counter()
     logger.info("Init parallel begin.")
@@ -139,7 +143,7 @@ def init_parallel_runtime(
             get_parallel().tp_rank,
         )
         raise
-    if current_platform.is_rocm():
+    if current_platform.is_rocm() and is_gfx95_supported():
         from sglang.srt.distributed.bootstrap_rocm import reserve_runtime_memory
 
         reserve_runtime_memory(device=device, gpu_id=get_device().gpu_id)
@@ -216,10 +220,11 @@ def measure_pre_model_load_memory(*, device: str, is_draft_worker: bool) -> floa
     # Draft workers reuse the target pool config and may exist on only one PP
     # stage; including them in this WORLD reduction would deadlock on absent
     # peers.
+    solo = get_exec().moe.is_ep_offset_joiner  # Solo boot: no WORLD peers yet.
     pre_model_load_memory = get_available_gpu_memory(
         device,
         get_device().gpu_id,
-        distributed=get_world_group().world_size > 1 and not is_draft_worker,
+        distributed=get_world_group().world_size > 1 and not (is_draft_worker or solo),
         cpu_group=get_world_group().cpu_group,
     )
     local_gpu_memory = get_available_gpu_memory(device, get_device().gpu_id)
@@ -243,7 +248,7 @@ def _resolve_backend(*, device: str) -> str:
 
 
 def _resolve_dist_init_method(*, dist_port: int) -> str:
-    # Allow external orchestrators (e.g. trainpi) to override the distributed
+    # Allow external orchestrators to override the distributed
     # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
     # env-vars and an externally-created TCPStore, completely avoiding port
     # conflicts with intra-host collocation.
@@ -325,10 +330,14 @@ def _init_parallel_groups(
     tp_rank, pp_rank = parallel.tp_rank, parallel.pp_rank
     is_ep_joiner = get_exec().moe.is_ep_joiner
     is_scale_joiner = get_exec().moe.is_ep_scale_joiner
-    rank_offset = parallel.ep_join_rank_offset if is_scale_joiner else 0
+    is_offset_joiner = get_exec().moe.is_ep_offset_joiner
+    rank_offset = parallel.ep_join_rank_offset if is_offset_joiner else 0
     world_size = (
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
     )
+    # Recover-into-retired-slot: WORLD is the launch cohort, not tp*pp.
+    if is_offset_joiner and not is_scale_joiner:
+        world_size = (server_args.elastic_ep_initial_size or tp_size) * pp_size
     rank = rank_offset + tp_size * pp_rank + tp_rank
 
     init_distributed_environment(

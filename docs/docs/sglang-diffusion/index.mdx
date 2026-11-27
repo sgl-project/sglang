@@ -43,7 +43,7 @@ sglang serve --model-path Qwen/Qwen-Image --host 0.0.0.0 --port 30000
 - [CLI](/docs/sglang-diffusion/api/cli): run one-off generation jobs or launch a persistent server
 - [OpenAI-Compatible API](/docs/sglang-diffusion/api/openai_api): send image and video requests to the HTTP server
 - [Action Generation API](/docs/sglang-diffusion/api/openai_api#action-generation-sglang-extension): generate robot action chunks and discover policy metadata
-- [VLA Cookbook](/cookbook/vla/intro): deploy action policies with model-specific observation schemas and control-loop settings
+- [Action Models Cookbook](/cookbook/vla/intro): deploy action policies with model-specific observation schemas and control-loop settings
 - [ComfyUI plugin](/docs/sglang-diffusion/comfyui): use SGLang from ComfyUI in server mode or as a per-step DiT backend
 - [Performance Overview](/docs/sglang-diffusion/performance-optimization): choose speed, memory, parallelism, caching, and quality-tradeoff levers
 - [Caching Acceleration](/docs/sglang-diffusion/caching-acceleration): use Cache-DiT, TeaCache, or Spectrum to reduce denoising cost

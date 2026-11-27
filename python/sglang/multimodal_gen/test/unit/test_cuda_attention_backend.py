@@ -584,6 +584,8 @@ class TestFlashAttentionSingleSequence(unittest.TestCase):
             softmax_scale=self.HEAD_DIM**-0.5,
             causal=False,
             packed_trailing_padding=padding,
+            window_size=(-1, -1),
+            sinks=None,
         )
         calls = []
 

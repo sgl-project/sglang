@@ -9,7 +9,7 @@
 
 SGLang Diffusion features an end-to-end unified pipeline for accelerating diffusion models and action policies. It is designed to be modular and extensible, allowing users to easily add new models and optimizations.
 
-For robot action generation, see the [VLA cookbook](https://docs.sglang.io/cookbook/vla/intro) and [action API](https://docs.sglang.io/docs/sglang-diffusion/api/openai_api#action-generation-sglang-extension). Model-specific recipes define the supported observations, action layouts, and serving interfaces.
+For robot action generation, see the [Action Models cookbook](https://docs.sglang.io/cookbook/vla/intro) and [action API](https://docs.sglang.io/docs/sglang-diffusion/api/openai_api#action-generation-sglang-extension). Model-specific recipes define the supported observations, action layouts, and serving interfaces.
 
 ## Key Features
 
