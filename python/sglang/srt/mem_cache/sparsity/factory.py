@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 import json
 import logging
+import math
 from typing import Optional
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
@@ -15,7 +19,7 @@ from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,
     SparseCoordinator,
 )
-from sglang.srt.runtime_context import get_memory
+from sglang.srt.runtime_context import get_memory, get_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -152,3 +156,69 @@ def register_sparse_coordinator(coordinator: SparseCoordinator) -> None:
 
 def get_sparse_coordinator() -> Optional[SparseCoordinator]:
     return _global_sparse_coordinator
+
+
+class HiSparseHiCacheConfig(msgspec.Struct, frozen=True, kw_only=True):
+    top_k: int
+    buffer_tokens: int
+    expansion_ratio: float
+    block_size: int
+
+
+def parse_hisparse_hicache_config(*, model_top_k: int = 2048) -> HiSparseHiCacheConfig:
+    memory = get_memory()
+    return resolve_hisparse_hicache_config(
+        config=memory.hisparse_config,
+        model_top_k=model_top_k,
+        hicache_ratio=memory.hicache_ratio,
+        page_size=get_schedule().page_size,
+    )
+
+
+def resolve_hisparse_hicache_config(
+    *, config: str | None, model_top_k: int, hicache_ratio: float, page_size: int
+) -> HiSparseHiCacheConfig:
+    raw = json.loads(config or "{}")
+    if not isinstance(raw, dict):
+        raise ValueError("hisparse_config must be a JSON object")
+    top_k = raw.get("top_k", model_top_k)
+    if top_k != model_top_k:
+        raise ValueError(
+            "HiSparse HiCache backend top_k must match the model's index_topk"
+        )
+    buffer_tokens = raw.get("device_buffer_size", top_k)
+    block_size = raw.get("swap_in_block_size", 960)
+    for name, value in (
+        ("top_k", top_k),
+        ("device_buffer_size", buffer_tokens),
+        ("swap_in_block_size", block_size),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(
+                f"HiSparse HiCache backend {name} must be a positive integer"
+            )
+    if buffer_tokens < top_k or buffer_tokens > 32767:
+        raise ValueError(
+            "HiSparse HiCache backend device_buffer_size must be in [top_k, 32767]"
+        )
+    if buffer_tokens % page_size:
+        raise ValueError(
+            "HiSparse HiCache backend device_buffer_size must be page-aligned"
+        )
+    if block_size > 1024 or block_size % 32:
+        raise ValueError(
+            "HiSparse HiCache backend swap_in_block_size must be a warp multiple <= 1024"
+        )
+    expansion = raw.get("expansion_ratio", hicache_ratio)
+    if isinstance(expansion, bool) or not isinstance(expansion, (int, float)):
+        raise ValueError("HiSparse HiCache backend expansion_ratio must be numeric")
+    if not math.isfinite(expansion) or expansion <= 0:
+        raise ValueError(
+            "HiSparse HiCache backend expansion_ratio must be finite and positive"
+        )
+    return HiSparseHiCacheConfig(
+        top_k=top_k,
+        buffer_tokens=buffer_tokens,
+        expansion_ratio=float(expansion),
+        block_size=block_size,
+    )

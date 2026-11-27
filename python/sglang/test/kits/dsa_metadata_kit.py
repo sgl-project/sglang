@@ -29,7 +29,9 @@ def inputs(lengths, requests):
     )
 
 
-def make_backend(mode, seq, req, *, fusion=True):
+def make_backend(
+    mode, seq, req, *, fusion=True, index_kpool=POOL, hisparse_hicache_buffer=None
+):
     backend = object.__new__(DeepseekSparseAttnBackend)
     backend.device = torch.device("cuda")
     backend.device_sm_major = torch.cuda.get_device_capability()[0]
@@ -39,9 +41,15 @@ def make_backend(mode, seq, req, *, fusion=True):
     backend.dsa_shards_index_k = False
     backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
     backend.dsa_index_topk = TOPK
-    backend.dsa_index_kpool = POOL
+    backend.dsa_index_kpool = index_kpool
+    backend.dsa_kv_cache_store_fp8 = False
+    backend.hisparse_hicache_buffer = hisparse_hicache_buffer
+    backend.hisparse_coordinator = hisparse_hicache_buffer
+    backend.use_fused_topk = True
     backend.speculative_num_draft_tokens = NEXT_N
     backend.dsa_drop_wide_page_table = False
+    backend.dsa_packed_extend_topk = False
+    backend._kv_shard_pool = None
     backend.dsa_decode_impl = "fa3"
     backend.dsa_prefill_impl = "fa3"
     backend.enable_auto_select_prefill_impl = False
@@ -52,14 +60,19 @@ def make_backend(mode, seq, req, *, fusion=True):
     backend._get_device_sm = lambda: backend.device_sm_major * 10
     backend._is_blackwell = lambda: backend.device_sm_major == 10
     backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
-    backend.req_to_token = torch.arange(
-        8 * WIDTH, device="cuda", dtype=torch.int32
-    ).view(8, WIDTH)
+    backend.req_to_token = (
+        torch.arange(8 * WIDTH, device="cuda", dtype=torch.int32).view(8, WIDTH)
+        if hisparse_hicache_buffer is None
+        else hisparse_hicache_buffer.req_to_token
+    )
+    backend.req_to_token_pool = SimpleNamespace(req_to_token=backend.req_to_token)
     backend._arange_buf = torch.arange(
         BS * NEXT_N + 1, device="cuda", dtype=torch.int32
     )
     backend.decode_cuda_graph_metadata = {
-        "page_table": torch.zeros(BS * NEXT_N, WIDTH, device="cuda", dtype=torch.int32),
+        "page_table": torch.zeros(
+            BS * NEXT_N, backend.req_to_token.shape[1], device="cuda", dtype=torch.int32
+        ),
         "cu_seqlens_q": backend._arange_buf,
     }
     # fusion=False builds the ordinary-metadata reference on the same geometry.
