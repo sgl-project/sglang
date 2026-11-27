@@ -739,6 +739,8 @@ pub struct MetricsConfig {
     pub bucket_e2e_request_latency: Option<Vec<f64>>,
     pub bucket_prompt_tokens: Option<Vec<f64>>,
     pub bucket_generation_tokens: Option<Vec<f64>>,
+    /// `--goodput-slo`: request latency thresholds in milliseconds.
+    pub goodput_slo: Option<BTreeMap<String, f64>>,
 }
 
 #[pyo3::pymethods]
@@ -753,6 +755,7 @@ impl MetricsConfig {
         bucket_e2e_request_latency,
         bucket_prompt_tokens,
         bucket_generation_tokens,
+        goodput_slo=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
@@ -764,6 +767,7 @@ impl MetricsConfig {
         bucket_e2e_request_latency: Option<Vec<f64>>,
         bucket_prompt_tokens: Option<Vec<f64>>,
         bucket_generation_tokens: Option<Vec<f64>>,
+        goodput_slo: Option<BTreeMap<String, f64>>,
     ) -> Self {
         Self {
             multiproc_dir,
@@ -774,6 +778,7 @@ impl MetricsConfig {
             bucket_e2e_request_latency,
             bucket_prompt_tokens,
             bucket_generation_tokens,
+            goodput_slo,
         }
     }
 }
@@ -791,6 +796,7 @@ impl MetricsConfig {
             bucket_e2e_request_latency: None,
             bucket_prompt_tokens: None,
             bucket_generation_tokens: None,
+            goodput_slo: None,
         }
     }
 }
