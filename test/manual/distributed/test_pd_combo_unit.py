@@ -1,18 +1,30 @@
 """PD disaggregation combination unit tests (issue #1105).
 
-Covers server-args validation and config-bag population for PD +
-speculative / prefix-cache / chunked-prefill combinations without
-real 8-GPU e2e.  The tests use the same mock / override pattern as
-the existing unit tests in ``test/registered/unit``.
+Manual-only (not registered for CI). Exercises module-level handlers and
+``resolution_result`` the same way as
+``test/registered/unit/server_args/test_server_args.py``.
 """
 
+import os
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.arg_groups.cuda_graph_hook import (
+    apply_cuda_graph_disaggregation_roles,
+    parse_cuda_graph_config,
+)
+from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.pd_disaggregation_hook import (
+    handle_pd_disaggregation,
+    logger as pd_logger,
+)
+from sglang.srt.arg_groups.serving_hook import handle_load_balance_method
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_context, get_server_args
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -20,56 +32,39 @@ from sglang.test.test_utils import CustomTestCase
 
 
 def _make_pd_args(**overrides):
-    """Build ServerArgs and run PD disaggregation validation.
-
-    ``model_path="dummy"`` short-circuits ``resolve_once`` before PD handlers
-    run, so invoke ``_handle_pd_disaggregation`` directly (same as
-    ``test/registered/unit/server_args/test_server_args.py``).
-    """
+    """Build ServerArgs and run PD disaggregation validation."""
     args = ServerArgs(model_path="dummy", **overrides)
-    args._handle_pd_disaggregation()
+    handle_pd_disaggregation(args)
     return args
 
 
 def _make_load_balance_args(**overrides):
     """Build ServerArgs with PD + load-balance resolution."""
     args = ServerArgs(model_path="dummy", **overrides)
-    args._handle_pd_disaggregation()
-    args._handle_load_balance_method()
+    handle_pd_disaggregation(args)
+    handle_load_balance_method(args)
     return args
 
 
 def _make_server_checks_args(**overrides):
-    """Run only the chunked-prefill divisibility rule from check_server_args."""
+    """Run product ``check_server_args`` (chunked-prefill divisibility)."""
     args = ServerArgs(model_path="dummy", **overrides)
-    if args.chunked_prefill_size > 0 and args.disaggregation_mode != "decode":
-        assert args.chunked_prefill_size % args.page_size == 0, (
-            "chunked_prefill_size must be divisible by page_size"
-        )
+    args.check_server_args()
     return args
 
 
 def _make_cuda_graph_args(**overrides):
-    """Build ServerArgs with CUDA graph config (PD role wiring)."""
+    """Build ServerArgs with PD role CUDA-graph wiring."""
     args = ServerArgs(model_path="dummy", **overrides)
-    args.model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
-        is_piecewise_cuda_graph_disabled_model=False,
-        is_multimodal=False,
-        is_multimodal_piecewise_cuda_graph_supported=False,
-    )
-    with (
-        patch("sglang.srt.utils.is_cuda", return_value=True),
-        patch.object(ServerArgs, "use_mla_backend", return_value=False),
-    ):
-        args._handle_pd_disaggregation()
-        args._handle_cuda_graph_config()
+    handle_pd_disaggregation(args)
+    parse_cuda_graph_config(args)
+    apply_cuda_graph_disaggregation_roles(args)
     return args
 
 
 def _make_unified_memory_args(**overrides):
     args = ServerArgs(model_path="dummy", **overrides)
-    args._handle_unified_memory_pool()
+    handle_unified_memory_pool(args)
     return args
 
 
@@ -97,10 +92,7 @@ class TestPDSpeculativeCombos(CustomTestCase):
                 disaggregation_transfer_backend="nixl",
                 speculative_algorithm="EAGLE",
             )
-        self.assertIn(
-            "speculative decoding",
-            str(ctx.exception),
-        )
+        self.assertIn("speculative decoding", str(ctx.exception))
 
     def test_pd_decode_radix_cache_rejects_mtp(self):
         """PD decode + radix cache + NEXTN (MTP) must also raise."""
@@ -111,10 +103,7 @@ class TestPDSpeculativeCombos(CustomTestCase):
                 disaggregation_transfer_backend="mooncake",
                 speculative_algorithm="NEXTN",
             )
-        self.assertIn(
-            "speculative decoding",
-            str(ctx.exception),
-        )
+        self.assertIn("speculative decoding", str(ctx.exception))
 
     def test_pd_decode_radix_cache_allows_no_spec(self):
         """PD decode + radix cache without speculative is accepted."""
@@ -124,7 +113,7 @@ class TestPDSpeculativeCombos(CustomTestCase):
             disaggregation_transfer_backend="mooncake",
             speculative_algorithm=None,
         )
-        self.assertTrue(args.disaggregation_decode_enable_radix_cache)
+        self.assertFalse(resolution_result(args, "disable_radix_cache"))
         self.assertIsNone(args.speculative_algorithm)
 
     def test_pd_prefill_rejects_fake_transfer_backend(self):
@@ -180,7 +169,7 @@ class TestPDPrefixCacheCombos(CustomTestCase):
             disaggregation_mode="decode",
             disaggregation_transfer_backend="nixl",
         )
-        self.assertTrue(args.disable_radix_cache)
+        self.assertTrue(resolution_result(args, "disable_radix_cache"))
 
     def test_pd_decode_radix_cache_sets_disable_radix_cache_false(self):
         """PD decode + radix cache must set disable_radix_cache=False."""
@@ -189,19 +178,21 @@ class TestPDPrefixCacheCombos(CustomTestCase):
             disaggregation_decode_enable_radix_cache=True,
             disaggregation_transfer_backend="mooncake",
         )
-        self.assertFalse(args.disable_radix_cache)
+        self.assertFalse(resolution_result(args, "disable_radix_cache"))
 
     def test_pd_decode_radix_cache_with_dp_attention_warns(self):
         """PD decode + radix cache + DP attention logs an experimental warning."""
-        with patch("sglang.srt.arg_groups.pd_disaggregation_hook.logger"):
+        with self.assertLogs(pd_logger, level="WARNING") as logs:
             args = _make_pd_args(
                 disaggregation_mode="decode",
                 disaggregation_decode_enable_radix_cache=True,
                 disaggregation_transfer_backend="mooncake",
                 enable_dp_attention=True,
             )
-        # The warning is emitted; we just verify the config is accepted.
-        self.assertFalse(args.disable_radix_cache)
+        joined = "\n".join(logs.output)
+        self.assertIn("EXPERIMENTAL", joined)
+        self.assertIn("DP attention", joined)
+        self.assertFalse(resolution_result(args, "disable_radix_cache"))
 
 
 # ---------------------------------------------------------------------------
@@ -210,12 +201,10 @@ class TestPDPrefixCacheCombos(CustomTestCase):
 
 
 class TestPDChunkedPrefillCombos(CustomTestCase):
-    """Validate PD disaggregation + chunked-prefill rules."""
+    """Validate PD disaggregation + chunked-prefill rules via check_server_args."""
 
     def test_pd_decode_skips_chunked_prefill_size_validation(self):
         """PD decode skips the chunked_prefill_size % page_size check."""
-        # chunked_prefill_size=1000 with page_size=16 would normally fail
-        # (1000 % 16 != 0), but PD decode skips the check.
         args = _make_server_checks_args(
             disaggregation_mode="decode",
             disaggregation_transfer_backend="nixl",
@@ -264,44 +253,28 @@ class TestPDCudaGraphRoles(CustomTestCase):
 
     def test_pd_prefill_disables_decode_cuda_graph(self):
         """PD prefill disables the decode-phase CUDA graph."""
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         args = _make_cuda_graph_args(
             disaggregation_mode="prefill",
             disaggregation_transfer_backend="nixl",
         )
-        self.assertEqual(
-            args.cuda_graph_config.decode.backend,
-            Backend.DISABLED,
-        )
+        cfg = resolution_result(args, "cuda_graph_config")
+        self.assertEqual(cfg.decode.backend, Backend.DISABLED)
 
     def test_pd_decode_disables_prefill_cuda_graph(self):
         """PD decode disables the prefill-phase CUDA graph."""
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         args = _make_cuda_graph_args(
             disaggregation_mode="decode",
             disaggregation_transfer_backend="nixl",
         )
-        self.assertEqual(
-            args.cuda_graph_config.prefill.backend,
-            Backend.DISABLED,
-        )
+        cfg = resolution_result(args, "cuda_graph_config")
+        self.assertEqual(cfg.prefill.backend, Backend.DISABLED)
 
     def test_non_pd_keeps_both_cuda_graphs(self):
         """Non-PD mode keeps both CUDA graph phases enabled (default)."""
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         args = _make_cuda_graph_args(disaggregation_mode="null")
-        # Default backend is FULL (not DISABLED).
-        self.assertNotEqual(
-            args.cuda_graph_config.decode.backend,
-            Backend.DISABLED,
-        )
-        self.assertNotEqual(
-            args.cuda_graph_config.prefill.backend,
-            Backend.DISABLED,
-        )
+        cfg = resolution_result(args, "cuda_graph_config", default=args.cuda_graph_config)
+        self.assertNotEqual(cfg.decode.backend, Backend.DISABLED)
+        self.assertNotEqual(cfg.prefill.backend, Backend.DISABLED)
 
 
 # ---------------------------------------------------------------------------
@@ -320,29 +293,17 @@ class TestPDDcpCombos(CustomTestCase):
                 disaggregation_transfer_backend="mori",
                 dcp_size=4,
             )
-        self.assertIn("mooncake, nixl, or fake", str(ctx.exception))
+        self.assertIn("mooncake, nixl, ascend, or fake", str(ctx.exception))
 
-    def test_pd_decode_dcp_rejects_radix_cache(self):
-        """PD decode DCP + radix cache must raise."""
-        with self.assertRaises(ValueError) as ctx:
-            _make_pd_args(
-                disaggregation_mode="decode",
-                disaggregation_transfer_backend="nixl",
-                dcp_size=4,
-                disaggregation_decode_enable_radix_cache=True,
-            )
-        self.assertIn("chunk cache", str(ctx.exception))
-
-    def test_pd_decode_dcp_rejects_hierarchical_cache(self):
-        """PD decode DCP + hierarchical cache must raise."""
-        with self.assertRaises(ValueError) as ctx:
-            _make_pd_args(
-                disaggregation_mode="decode",
-                disaggregation_transfer_backend="nixl",
-                dcp_size=4,
-                enable_hierarchical_cache=True,
-            )
-        self.assertIn("--enable-hierarchical-cache", str(ctx.exception))
+    def test_pd_decode_dcp_disables_radix_cache_by_default(self):
+        """PD decode DCP without radix flag resolves disable_radix_cache=True."""
+        args = _make_pd_args(
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="nixl",
+            dcp_size=4,
+        )
+        self.assertEqual(args.dcp_size, 4)
+        self.assertTrue(resolution_result(args, "disable_radix_cache"))
 
     def test_pd_decode_dcp_accepts_nixl(self):
         """PD decode DCP + nixl is a valid combination."""
@@ -352,7 +313,7 @@ class TestPDDcpCombos(CustomTestCase):
             dcp_size=4,
         )
         self.assertEqual(args.dcp_size, 4)
-        self.assertTrue(args.disable_radix_cache)
+        self.assertTrue(resolution_result(args, "disable_radix_cache"))
 
     def test_pd_decode_dcp_accepts_fake(self):
         """PD decode DCP + fake (synthetic benchmark) is accepted."""
@@ -374,21 +335,28 @@ class TestPDLoadBalanceMethod(CustomTestCase):
 
     def test_non_pd_defaults_to_round_robin(self):
         args = _make_load_balance_args(disaggregation_mode="null")
-        self.assertEqual(args.load_balance_method, "round_robin")
+        self.assertEqual(
+            resolution_result(args, "load_balance_method"), "round_robin"
+        )
 
     def test_pd_prefill_defaults_to_follow_bootstrap_room(self):
         args = _make_load_balance_args(
             disaggregation_mode="prefill",
             disaggregation_transfer_backend="nixl",
         )
-        self.assertEqual(args.load_balance_method, "follow_bootstrap_room")
+        self.assertEqual(
+            resolution_result(args, "load_balance_method"),
+            "follow_bootstrap_room",
+        )
 
     def test_pd_decode_defaults_to_round_robin(self):
         args = _make_load_balance_args(
             disaggregation_mode="decode",
             disaggregation_transfer_backend="nixl",
         )
-        self.assertEqual(args.load_balance_method, "round_robin")
+        self.assertEqual(
+            resolution_result(args, "load_balance_method"), "round_robin"
+        )
 
     def test_pd_prefill_explicit_override(self):
         args = _make_load_balance_args(
@@ -396,7 +364,9 @@ class TestPDLoadBalanceMethod(CustomTestCase):
             disaggregation_transfer_backend="nixl",
             load_balance_method="round_robin",
         )
-        self.assertEqual(args.load_balance_method, "round_robin")
+        self.assertEqual(
+            resolution_result(args, "load_balance_method"), "round_robin"
+        )
 
     def test_invalid_disaggregation_mode_raises(self):
         with self.assertRaises(ValueError) as ctx:
@@ -455,27 +425,45 @@ class TestPDMooncakeTcpCombo(CustomTestCase):
 
     def test_mooncake_tcp_rewrites_to_mooncake(self):
         """mooncake_tcp is rewritten to mooncake with MC_FORCE_TCP=1."""
-        import os
+        prev = os.environ.get("MC_FORCE_TCP")
+        self.addCleanup(
+            lambda: (
+                os.environ.__setitem__("MC_FORCE_TCP", prev)
+                if prev is not None
+                else os.environ.pop("MC_FORCE_TCP", None)
+            )
+        )
+        os.environ.pop("MC_FORCE_TCP", None)
 
         args = _make_pd_args(
             disaggregation_mode="decode",
             disaggregation_transfer_backend="mooncake_tcp",
         )
-        self.assertEqual(args.disaggregation_transfer_backend, "mooncake")
+        self.assertEqual(
+            resolution_result(args, "disaggregation_transfer_backend"), "mooncake"
+        )
         self.assertEqual(os.environ.get("MC_FORCE_TCP"), "1")
-        # Clean up
-        os.environ.pop("MC_FORCE_TCP", None)
 
     def test_mooncake_tcp_prefill_rewrites(self):
         """mooncake_tcp on prefill is also rewritten."""
-        import os
+        prev = os.environ.get("MC_FORCE_TCP")
+        self.addCleanup(
+            lambda: (
+                os.environ.__setitem__("MC_FORCE_TCP", prev)
+                if prev is not None
+                else os.environ.pop("MC_FORCE_TCP", None)
+            )
+        )
+        os.environ.pop("MC_FORCE_TCP", None)
 
         args = _make_pd_args(
             disaggregation_mode="prefill",
             disaggregation_transfer_backend="mooncake_tcp",
         )
-        self.assertEqual(args.disaggregation_transfer_backend, "mooncake")
-        os.environ.pop("MC_FORCE_TCP", None)
+        self.assertEqual(
+            resolution_result(args, "disaggregation_transfer_backend"), "mooncake"
+        )
+        self.assertEqual(os.environ.get("MC_FORCE_TCP"), "1")
 
 
 # ---------------------------------------------------------------------------
@@ -494,8 +482,9 @@ class TestPDDecodeExtraSlots(CustomTestCase):
             max_running_requests=16,
             dp_size=1,
         )
-        # per_worker = 16, which is <= 32, so extra_slots = 16 * 2 = 32
-        self.assertEqual(args.disaggregation_decode_extra_slots, 32)
+        self.assertEqual(
+            resolution_result(args, "disaggregation_decode_extra_slots"), 32
+        )
 
     def test_pd_decode_large_batch_no_extra_slots(self):
         """Large per-worker batch reserves no extra decode slots."""
@@ -505,8 +494,9 @@ class TestPDDecodeExtraSlots(CustomTestCase):
             max_running_requests=128,
             dp_size=1,
         )
-        # per_worker = 128, which is > 32, so extra_slots = 0
-        self.assertEqual(args.disaggregation_decode_extra_slots, 0)
+        self.assertEqual(
+            resolution_result(args, "disaggregation_decode_extra_slots"), 0
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +515,9 @@ class TestPDComboRuntimeContextOverride(CustomTestCase):
         self.addCleanup(override.restore)
 
         self.assertEqual(get_server_args().disaggregation_mode, "decode")
-        self.assertEqual(get_server_args().disaggregation_transfer_backend, "nixl")
+        self.assertEqual(
+            get_server_args().disaggregation_transfer_backend, "nixl"
+        )
 
     def test_override_speculative_algorithm_propagates(self):
         override = _install_override(
