@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import zmq
@@ -37,6 +38,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import (
+    LTX25PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     FastH3PipelineConfig,
@@ -73,6 +77,7 @@ from sglang.multimodal_gen.registry import (
     get_non_diffusers_pipeline_name,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.entrypoints.cli import generate as cli_generate
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
@@ -606,6 +611,35 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         self.assertEqual(server_args.component_precisions, {"text_encoder_2": "fp32"})
+
+    def test_forced_args_win_over_the_cli_and_the_config_file(self):
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+        )
+
+        parser = FlexibleArgumentParser()
+        add_multimodal_gen_serve_args(parser)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as config:
+            config.write("load_diffusion_decoder: false\n")
+            config.flush()
+            argv = ["--model-path", "/fake", "--config", config.name]
+            with (
+                patch.object(sys, "argv", ["sglang"] + argv),
+                patch.object(
+                    PipelineConfig,
+                    "from_kwargs",
+                    return_value=QwenImagePipelineConfig(),
+                ),
+                mock_cuda_platform(),
+            ):
+                args, unknown_args = parser.parse_known_args(argv)
+                loaded = ServerArgs.from_cli_args(args, unknown_args)
+                forced = ServerArgs.from_cli_args(
+                    args, unknown_args, forced_args={"load_diffusion_decoder": True}
+                )
+
+        self.assertFalse(loaded.load_diffusion_decoder)
+        self.assertTrue(forced.load_diffusion_decoder)
 
     def test_dynamic_role_qualified_cli_args(self):
         parser = FlexibleArgumentParser()
@@ -2472,6 +2506,97 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertTrue(unsized.text_encoder_cpu_offload)
         self.assertFalse(sized.text_encoder_cpu_offload)
         self.assertEqual(set(self._residency(sized).values()), {RESIDENT})
+
+    # (parameters, stored bytes) of Lightricks/LTX-2.5-Diffusers, all bf16: 75.5 GiB
+    # declared in model_index.json, 65.2 GiB without the prompt enhancer and the
+    # diffusion decoder
+    LTX25_SIZES = {
+        "transformer": (18_987_859_200, 37_975_718_400),
+        "text_encoder": (11_959_730_224, 23_919_460_448),
+        "prompt_enhancer": (5_104_298_467, 10_208_596_934),
+        "connectors": (3_172_227_584, 6_344_455_168),
+        "vae": (726_106_225, 1_452_212_450),
+        "diffusion_decoder": (417_134_000, 834_268_000),
+        "vocoder": (129_085_032, 258_170_064),
+        "audio_vae": (53_248_402, 106_496_804),
+        "duration_head": (1_903_361, 3_806_722),
+    }
+
+    def _ltx25(self, *, available_memory_gb=139, **kwargs):
+        return self._from_dict_with_pipeline_config(
+            LTX25PipelineConfig(),
+            memory_gb=141,
+            available_memory_gb=available_memory_gb,
+            checkpoint_sizes=self.LTX25_SIZES,
+            kwargs={
+                "model_path": "Lightricks/LTX-2.5-Diffusers",
+                "performance_mode": "auto",
+                **kwargs,
+            },
+        )
+
+    def test_auto_tier_leaves_out_components_the_pipeline_does_not_load(self):
+        # an H200: the loaded weights fit twice, every declared component does not
+        args = self._ltx25()
+        self.assertEqual(set(self._residency(args).values()), {RESIDENT})
+
+        with patch.object(
+            LTX25PipelineConfig, "unloaded_checkpoint_components", return_value=()
+        ):
+            counted = self._ltx25()
+        self.assertEqual(counted.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
+
+    def test_auto_tier_keeps_the_full_ltx25_size_with_the_diffusion_decoder(self):
+        # the decoder's untiled decode needs the headroom the full size leaves
+        args = self._ltx25(load_diffusion_decoder=True)
+        self.assertEqual(args.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
+
+    def test_offline_generate_plans_memory_with_the_requested_diffusion_decoder(self):
+        # `sglang generate` loads the decoder as well when the CLI flag or the
+        # config file asks for it
+        def from_cli_args(args, unknown_args=None, default_args=None, **kwargs):
+            return self._ltx25(**(kwargs.get("forced_args") or {}))
+
+        def planned_text_encoder_mode(config=None, **flags):
+            cli_args = SimpleNamespace(
+                config=config,
+                diffusers_kwargs=None,
+                output_file_path=None,
+                perf_dump_path=None,
+                **flags,
+            )
+            sampling_params_cls = Mock()
+            sampling_params_cls.supported_override_fields.return_value = {
+                "use_diffusion_decoder"
+            }
+            sampling_params_cls.get_cli_args.return_value = {
+                "prompt": "a cat",
+                **flags,
+            }
+            with (
+                patch.object(ServerArgs, "from_cli_args", side_effect=from_cli_args),
+                patch.object(
+                    cli_generate,
+                    "_resolve_cli_sampling_params_cls",
+                    return_value=sampling_params_cls,
+                ),
+                patch.object(cli_generate.DiffGenerator, "from_pretrained") as load,
+            ):
+                cli_generate.generate_cmd(cli_args)
+            server_args = load.call_args.kwargs["server_args"]
+            self.assertTrue(server_args.load_diffusion_decoder)
+            return server_args.residency_mode("text_encoder")
+
+        self.assertEqual(
+            planned_text_encoder_mode(use_diffusion_decoder=True), LAYERWISE_OFFLOAD
+        )
+        for extra in ("", "load_diffusion_decoder: false\n"):
+            with tempfile.NamedTemporaryFile("w", suffix=".yaml") as config:
+                config.write("use_diffusion_decoder: true\n" + extra)
+                config.flush()
+                self.assertEqual(
+                    planned_text_encoder_mode(config=config.name), LAYERWISE_OFFLOAD
+                )
 
     def test_auto_lingbot_keeps_dit_resident_on_h100(self):
         args = self._from_dict_with_pipeline_config(

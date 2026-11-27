@@ -116,7 +116,7 @@ python -m pytest python/sglang/multimodal_gen/test/
 
 ## Performance Tuning
 
-For questions about optimal performance, fastest commands, VRAM reduction, or best flag combinations for a given model/GPU setup, **read the [sglang-diffusion-performance skill](skills/sglang-diffusion-performance/SKILL.md)**. It contains a complete table of lossless and lossy optimization flags with trade-offs, quick recipes, and tuning tips.
+For questions about optimal performance, fastest commands, VRAM reduction, or best flag combinations for a given model/GPU setup, **read the [sglang-diffusion-performance skill](skills/sglang-diffusion-performance/SKILL.md)**. It contains tables of output-preserving and approximate optimization flags with trade-offs, generic recipes, and tuning tips; per-model commands are on the cookbook pages.
 
 ### Perf Measurement
 
