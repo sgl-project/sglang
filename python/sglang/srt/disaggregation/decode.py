@@ -84,6 +84,8 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     is_unadmitted_reject,
     kv_layout_signature,
+    kv_transfer_fingerprint,
+    kv_transfer_prompt_ids,
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
@@ -1241,6 +1243,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             mgr=self.kv_manager,
             bootstrap_addr=_bootstrap_addr(req),
             bootstrap_room=req.bootstrap_room,
+            # output_ids[:-1] is what a rebootstrap adds to the prompt.
+            prompt_fingerprint=kv_transfer_fingerprint(
+                kv_transfer_prompt_ids(req),
+                req.output_ids[:-1],
+                lora_name=req.lora_name,
+                input_embeds=req.input_embeds,
+                positional_embed_overrides=req.positional_embed_overrides,
+            ),
         )
 
         decode_req = DecodeRequest(

@@ -64,6 +64,8 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     is_unadmitted_reject,
     kv_layout_signature,
+    kv_transfer_fingerprint,
+    kv_transfer_prompt_ids,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
@@ -554,6 +556,12 @@ class PrefillBootstrapQueue:
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
+            prompt_fingerprint=kv_transfer_fingerprint(
+                kv_transfer_prompt_ids(req),
+                lora_name=req.lora_name,
+                input_embeds=req.input_embeds,
+                positional_embed_overrides=req.positional_embed_overrides,
+            ),
         )
         req.pending_bootstrap = True
 

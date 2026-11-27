@@ -596,6 +596,9 @@ class Req(ReqDllmMixin):
         self.cache_salt = cache_salt or None
         self._user_cache_salt = self.cache_salt
         self.lora_id = lora_id
+        # The adapter name the client asked for, set by the scheduler from the tokenized request.
+        # Unlike lora_id, which a dynamic load mints per server, it is the same on prefill and decode.
+        self.lora_name: Optional[str] = None
         self.routing_key = routing_key
 
         # Lazy extra buffer + spec: False when the finishing verify wrote the
@@ -1664,6 +1667,8 @@ class Req(ReqDllmMixin):
             "return_logprob": False,
             "stream": False,
             "rid": self.rid,
+            # The recomputed KV must come from the same adapter as the original prefill.
+            "lora_path": self.lora_name,
             "bootstrap_host": self.bootstrap_host,
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,

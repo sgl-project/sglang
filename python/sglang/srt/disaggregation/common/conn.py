@@ -264,11 +264,16 @@ class AckTarget(NamedTuple):
     generation: int
 
 
+def room_in_use_reason(bootstrap_room: int) -> str:
+    return f"bootstrap_room {bootstrap_room} is in use by another request"
+
+
 class AbortNotification(msgspec.Struct, frozen=True):
     room: int
     decode_ip: Optional[str] = None
     decode_port: Optional[int] = None
     generation: Optional[int] = None
+    prompt_fingerprint: Optional[str] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]) -> Optional[AbortNotification]:
@@ -293,16 +298,24 @@ class AbortNotification(msgspec.Struct, frozen=True):
             return cls(room=room)
 
         generation = None
-        if len(msg) >= 5:
+        # An unarmed abort that carries a fingerprint sends an empty generation.
+        if len(msg) >= 5 and msg[4]:
             try:
                 generation = int(msg[4].decode("ascii"))
             except (ValueError, UnicodeDecodeError):
                 logger.warning("Malformed ABORT message: invalid generation")
+        prompt_fingerprint = None
+        if len(msg) >= 6 and msg[5]:
+            try:
+                prompt_fingerprint = msg[5].decode("ascii")
+            except UnicodeDecodeError:
+                logger.warning("Malformed ABORT message: invalid prompt fingerprint")
         return cls(
             room=room,
             decode_ip=decode_ip,
             decode_port=decode_port,
             generation=generation,
+            prompt_fingerprint=prompt_fingerprint,
         )
 
     def to_zmq(self) -> List[bytes]:
@@ -314,8 +327,14 @@ class AbortNotification(msgspec.Struct, frozen=True):
                     str(self.decode_port).encode("ascii"),
                 ]
             )
-            if self.generation is not None:
-                frames.append(str(self.generation).encode("ascii"))
+            if self.generation is not None or self.prompt_fingerprint is not None:
+                frames.append(
+                    b""
+                    if self.generation is None
+                    else str(self.generation).encode("ascii")
+                )
+            if self.prompt_fingerprint is not None:
+                frames.append(self.prompt_fingerprint.encode("ascii"))
         return frames
 
     def deferred_ack_target(self) -> Optional[AckTarget]:
@@ -399,6 +418,9 @@ class CommonKVManager(BaseKVManager):
     # Sender reports transfer_latency_s (first enqueue -> Success). Otherwise
     # the metric keeps its last-chunk fallback, so dashboards do not move.
     reports_transfer_latency: bool = False
+    # Opt-in per backend: the bootstrap thread files decode destinations through
+    # _add_transfer_info and its TransferInfo carries the prompt fingerprint.
+    verifies_bootstrap_room_owner: bool = False
 
     kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
@@ -574,6 +596,10 @@ class CommonKVManager(BaseKVManager):
             self.register_to_bootstrap()
             self.transfer_infos = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
+            # The prompt fingerprint of the live prefill sender owning each room.
+            self.room_owners: Dict[int, str] = {}
+            # Serializes filing decode destinations with a sender claiming the room.
+            self._room_owner_lock = threading.Lock()
             self.decode_kv_args_table = {}
             self.pp_group = get_parallel().pp_group
             if self.pp_size > 1:
@@ -846,6 +872,7 @@ class CommonKVManager(BaseKVManager):
         decode_prefix_len: Optional[int],
         is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        prompt_fingerprint: Optional[str] = None,
     ) -> List[bytes]:
         raise NotImplementedError
 
@@ -975,6 +1002,9 @@ class CommonKVManager(BaseKVManager):
                 room, self.deferred_bootstrap.register(room, endpoint)
             )
             return True
+        notification = AbortNotification.from_zmq(msg)
+        if notification is not None and self._is_foreign_abort(notification):
+            return False
         # Retain cancellation even if it beats source creation. Let the backend
         # process ABORT normally as well, including ACK/draining after allocation.
         self.deferred_bootstrap.fail(room)
@@ -985,6 +1015,126 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def _is_foreign_to_room(
+        self, *, bootstrap_room: int, prompt_fingerprint: Optional[str]
+    ) -> bool:
+        if prompt_fingerprint is None:
+            return False
+        owner = self.room_owners.get(bootstrap_room)
+        return owner is not None and owner != prompt_fingerprint
+
+    def _is_foreign_abort(self, notification: AbortNotification) -> bool:
+        return self._is_foreign_to_room(
+            bootstrap_room=notification.room,
+            prompt_fingerprint=notification.prompt_fingerprint,
+        )
+
+    def claim_bootstrap_room(
+        self, *, bootstrap_room: int, prompt_fingerprint: Optional[str]
+    ) -> bool:
+        """Bind the room to one prefill sender; False while another live sender
+        holds it, even one with the same fingerprint. The claim drops
+        destinations another request filed before it."""
+        if prompt_fingerprint is None or not self.verifies_bootstrap_room_owner:
+            return True
+        with self._room_owner_lock:
+            if bootstrap_room in self.room_owners:
+                return False
+            self.room_owners[bootstrap_room] = prompt_fingerprint
+            infos = self.transfer_infos.get(bootstrap_room, {})
+            foreign_peers = [
+                peer
+                for peer, info in infos.items()
+                if self._is_foreign_to_room(
+                    bootstrap_room=bootstrap_room,
+                    prompt_fingerprint=info.prompt_fingerprint,
+                )
+            ]
+            foreign = [infos.pop(peer) for peer in foreign_peers]
+            if foreign and not self._mark_room_ready_if_complete(
+                bootstrap_room=bootstrap_room,
+                required_dst_info_num=(
+                    next(iter(infos.values())).required_dst_info_num if infos else 0
+                ),
+            ):
+                if not infos:
+                    self.transfer_infos.pop(bootstrap_room, None)
+                self.req_to_decode_prefix_len.pop(bootstrap_room, None)
+                # update_status never lowers a status; same lock as its writes.
+                with self._status_lock:
+                    status = self.request_status.get(bootstrap_room)
+                    if status == KVPoll.WaitingForInput:
+                        self.request_status[bootstrap_room] = KVPoll.Bootstrapping
+        self._reject_transfer_infos(bootstrap_room=bootstrap_room, infos=foreign)
+        return True
+
+    def release_bootstrap_room(
+        self, *, bootstrap_room: int, prompt_fingerprint: Optional[str]
+    ) -> None:
+        if prompt_fingerprint is None or not self.verifies_bootstrap_room_owner:
+            return
+        with self._room_owner_lock:
+            self.room_owners.pop(bootstrap_room, None)
+
+    def _add_transfer_info(self, *, bootstrap_room: int, peer: str, info) -> None:
+        with self._room_owner_lock:
+            foreign = self._is_foreign_to_room(
+                bootstrap_room=bootstrap_room,
+                prompt_fingerprint=info.prompt_fingerprint,
+            )
+            if not foreign:
+                self.transfer_infos.setdefault(bootstrap_room, {})[peer] = info
+                self._mark_room_ready_if_complete(
+                    bootstrap_room=bootstrap_room,
+                    required_dst_info_num=info.required_dst_info_num,
+                )
+        if foreign:
+            self._reject_transfer_infos(bootstrap_room=bootstrap_room, infos=[info])
+
+    def _mark_room_ready_if_complete(
+        self, *, bootstrap_room: int, required_dst_info_num: int
+    ) -> bool:
+        infos = self.transfer_infos.get(bootstrap_room)
+        if not infos or len(infos) != required_dst_info_num:
+            return False
+        self.resolve_kv_replica_factor(infos)
+        self.req_to_decode_prefix_len[bootstrap_room] = next(
+            (
+                info.decode_prefix_len
+                for info in infos.values()
+                if info.decode_prefix_len is not None
+            ),
+            0,
+        )
+        logger.debug(f"room={bootstrap_room} is bootstrapped")
+        self.update_status(bootstrap_room, KVPoll.WaitingForInput)
+        return True
+
+    def _reject_transfer_infos(self, *, bootstrap_room: int, infos: List) -> None:
+        if not infos:
+            return
+        targets: List[Tuple[str, int]] = []
+        for info in infos:
+            target = (info.endpoint, info.dst_port)
+            if not info.is_dummy and target not in targets:
+                targets.append(target)
+        logger.warning(
+            "Rejected decode destinations from %s for bootstrap_room %s: "
+            "their transfer fingerprint differs from the prefill request's",
+            [(info.endpoint, info.dst_port) for info in infos],
+            bootstrap_room,
+        )
+        # The decode may be another request's, or the owner's with other inputs.
+        self.send_kv_status_message(
+            targets=targets,
+            bootstrap_room=bootstrap_room,
+            status=KVPoll.Failed,
+            failure_reason=(
+                f"the prefill request on bootstrap_room {bootstrap_room} has a "
+                "different transfer fingerprint"
+            ),
+        )
 
     def _room_notify_targets(self, bootstrap_room: int) -> List[Tuple[str, int]]:
         infos = self.transfer_infos.get(bootstrap_room)
@@ -2431,15 +2581,22 @@ class CommonKVManager(BaseKVManager):
 
 
 class CommonKVSender(BaseKVSender):
+    prompt_fingerprint: Optional[str] = None
+    _owns_bootstrap_room: bool = True
+    _holds_room_claim: bool = False
+    _failure_reason: Optional[str] = None
+
     def __init__(
         self,
         mgr: CommonKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        prompt_fingerprint: Optional[str] = None,
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
+        self.prompt_fingerprint = prompt_fingerprint
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
         self.conclude_state: Optional[KVPoll] = None
@@ -2467,14 +2624,28 @@ class CommonKVSender(BaseKVSender):
         if mgr.deferred_bootstrap is not None:
             room_state = mgr.deferred_bootstrap.open(bootstrap_room, self)
             self._owns_bootstrap_room = room_state is not None
+            if room_state is None:
+                # Another live sender owns the room, so fail only this one.
+                self._failure_reason = room_in_use_reason(bootstrap_room)
+                self.conclude_state = KVPoll.Failed
+                return
             mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
-            if room_state is None or room_state.failed:
+            if room_state.failed:
                 mgr.record_failure(
                     bootstrap_room, "Duplicate or cancelled bootstrap room"
                 )
                 mgr.update_status(bootstrap_room, KVPoll.Failed)
                 self.conclude_state = KVPoll.Failed
                 return
+        if not mgr.claim_bootstrap_room(
+            bootstrap_room=bootstrap_room, prompt_fingerprint=prompt_fingerprint
+        ):
+            # Fail alone: the room's state belongs to the request that holds it.
+            self._owns_bootstrap_room = False
+            self._failure_reason = room_in_use_reason(bootstrap_room)
+            self.conclude_state = KVPoll.Failed
+            return
+        self._holds_room_claim = True
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
@@ -2728,10 +2899,10 @@ class CommonKVSender(BaseKVSender):
         return KVPoll.Failed
 
     def clear(self) -> None:
+        if not self._owns_bootstrap_room:
+            return
         notification = None
         if self.kv_mgr.deferred_bootstrap is not None:
-            if not self._owns_bootstrap_room:
-                return
             notification = self.kv_mgr.deferred_bootstrap.close(
                 self.bootstrap_room,
                 self,
@@ -2757,6 +2928,7 @@ class CommonKVSender(BaseKVSender):
         self._retire_sends()
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        self._release_room_claim()
         with self.kv_mgr.failure_lock:
             self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
         # A sender can be cleared while a counted transfer is still writing:
@@ -2779,8 +2951,12 @@ class CommonKVSender(BaseKVSender):
 
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed
-        with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        failure_reason = self._failure_reason
+        if failure_reason is None:
+            with self.kv_mgr.failure_lock:
+                failure_reason = self.kv_mgr.failure_records.pop(
+                    self.bootstrap_room, None
+                )
         self.clear()
         self.trace_ctx.trace_req_finish()
         raise KVTransferError(
@@ -2794,8 +2970,16 @@ class CommonKVSender(BaseKVSender):
         worker report finds no record and is dropped."""
         self.kv_mgr._forget_sends(self.bootstrap_room)
 
+    def _release_room_claim(self) -> None:
+        if self._holds_room_claim:
+            self._holds_room_claim = False
+            self.kv_mgr.release_bootstrap_room(
+                bootstrap_room=self.bootstrap_room,
+                prompt_fingerprint=self.prompt_fingerprint,
+            )
+
     def abort(self):
-        if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
+        if not self._owns_bootstrap_room:
             return
         # A landed transfer stays Success. A nonzero count means a chunk can still
         # fail; with deferred allocation the entry itself means the worker is still
@@ -2827,6 +3011,7 @@ class CommonKVReceiver(BaseKVReceiver):
     _prefill_wait_start: Optional[float] = None
     _owns_bootstrap_room: bool = True
     _lifecycle_lock = nullcontext()
+    prompt_fingerprint: Optional[str] = None
 
     _ctx = zmq.Context()
     _ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
@@ -2839,9 +3024,11 @@ class CommonKVReceiver(BaseKVReceiver):
         mgr: CommonKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
+        prompt_fingerprint: Optional[str] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
+        self.prompt_fingerprint = prompt_fingerprint
         self.kv_mgr = mgr
         if mgr.defer_decode_allocation:
             self._lifecycle_lock = threading.RLock()
@@ -3231,6 +3418,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 decode_prefix_len=decode_prefix_len,
                 is_dummy=bootstrap_info["is_dummy"],
                 device_kv_indices=device_kv_indices,
+                prompt_fingerprint=self.prompt_fingerprint,
             )
             if not self._send_bootstrap_message(
                 bootstrap_info=bootstrap_info,
@@ -3358,6 +3546,7 @@ class CommonKVReceiver(BaseKVReceiver):
                             decode_ip=self.kv_mgr.local_ip,
                             decode_port=self.kv_mgr.rank_port,
                             generation=self._abort_generation,
+                            prompt_fingerprint=self.prompt_fingerprint,
                         ).to_zmq()
                     )
                 logger.debug(

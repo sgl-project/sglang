@@ -3605,6 +3605,7 @@ class Scheduler(
             self.tree_cache.bind_prefetch_ticket(req.rid)
         self._maybe_namespace_elastic_radix_cache(req)
         self._record_kv_event_lora_name(req, recv_req.lora_name)
+        req.lora_name = recv_req.lora_name
 
         if mm_input_error is not None:
             req.set_finish_with_abort(
