@@ -456,8 +456,32 @@ def _precompute_refined_prompt_embeds(
             refiner_cu = refiner_params["cu_seqlens_q"]
         else:
             refiner_cu = refiner_params.cu_seqlens_q
+        from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+            MiniMaxH3DiTModel,
+        )
+
         with torch.inference_mode():
-            refined = refine(prompt_embeds, refiner_cu, device=device)
+            bounds = (
+                refiner_params.get("cu_seqlens_q_host")
+                if isinstance(refiner_params, dict)
+                else getattr(refiner_params, "cu_seqlens_q_host", None)
+            )
+            if (
+                isinstance(model, MiniMaxH3DiTModel)
+                and bounds is not None
+                and tuple(bounds)
+                in (
+                    (0, prompt_embeds.shape[0]),
+                    (0, prompt_embeds.shape[0], prompt_embeds.shape[0]),
+                )
+            ):
+                if len(bounds) == 2:
+                    refiner_cu = torch.cat((refiner_cu, refiner_cu[-1:]))
+                refined = refine(
+                    prompt_embeds, refiner_cu, device=device, text_len=bounds[1]
+                )
+            else:
+                refined = refine(prompt_embeds, refiner_cu, device=device)
     if not torch.is_tensor(refined):
         raise TypeError("MiniMax H3 refine_prompt_embeds must return a torch.Tensor")
     if int(refined.shape[0]) != int(prompt_embeds.shape[0]):
@@ -969,6 +993,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     model=model,
                     model_forward=partial(
                         self._forward_dit,
+                        packed_branches={},
                         batch=batch,
                         attn_metadata=attn_metadata,
                         build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
@@ -1104,6 +1129,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     model=transformer,
                     model_forward=partial(
                         self._forward_dit,
+                        packed_branches={},
+                        capture_device_varlen=server_args.num_gpus == 1,
                         batch=batch,
                         attn_metadata=positive.attn_metadata,
                         num_steps=len(batch.sigmas) - 1,
@@ -1154,6 +1181,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         step_index: int,
         *,
         batch: Req,
+        packed_branches=None,
+        capture_device_varlen: bool = False,
+        capture_bcg: bool = False,
         attn_metadata: AscendFAMetadata | CubeSparseAttentionMetadata | None = None,
         build_vsa_h3_step_metadata: Callable[[int], Any] | None = None,
         num_steps: int | None = None,
@@ -1197,9 +1227,40 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             runner = self._maybe_get_bcg_runner(model)
             if runner is None:
                 return model(**call_kwargs)
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+                H3PackedPrompt,
+                live_packed_prompt,
+                supports_live_packed_bounds,
+            )
+
+            if packed_branches is None:
+                packed_branches = {}
+            psp = call_kwargs["packed_seq_params"]
+            key = id(psp)
+            if key not in packed_branches:
+                if not supports_live_packed_bounds(call_kwargs):
+                    return model(**call_kwargs)
+                text_len = call_kwargs["prompt_embeds"].shape[0]
+                packed_branches[key] = H3PackedPrompt(
+                    tuple(psp["cu_seqlens_q_host"]),
+                    text_len,
+                    capture_varlen=capture_device_varlen
+                    and model.supports_graph_device_varlen(),
+                    source_psp=psp,
+                )
             # timestep bits are eager memo keys, not graph specialization inputs
             call_kwargs.pop("adaln_timestep_bits", None)
-            return self._bcg_run(runner, call_kwargs, model)
+            token = live_packed_prompt.set(packed_branches[key])
+            try:
+                if capture_bcg and not self._bcg_is_warmup():
+                    padded = self._bcg_pad_prompt_kwargs(
+                        call_kwargs, current_model=model
+                    )
+                    runner.capture(**padded)
+                    return runner(**padded)
+                return self._bcg_run(runner, call_kwargs, model)
+            finally:
+                live_packed_prompt.reset(token)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         # The base checks minus batch.generator: H3 seeds its own noise from
