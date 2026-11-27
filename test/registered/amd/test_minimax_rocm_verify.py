@@ -13,7 +13,7 @@ register_amd_ci(est_time=15, suite="base-b-test-1-gpu-small-amd")
 @unittest.skipUnless(torch.version.hip, "ROCm verify integration")
 class TestMiniMaxROCmVerify(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.layers.attention.minimax_sparse_backend import (
+        from sglang.srt.layers.attention.minimax_sparse import (
             MiniMaxSparseAttnBackend,
         )
         from sglang.srt.model_executor.forward_mode import ForwardMode
