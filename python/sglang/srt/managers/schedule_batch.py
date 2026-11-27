@@ -2782,12 +2782,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_seqlen,
                 cache_chunk_size,
             )
+            earlier = mamba_track_seqlen_aligned - checkpoint_grid
             if branch is not None:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 # See _force_track_h() for more details.
                 mamba_track_seqlen = _force_track_h(branch)
                 mamba_track_seqlen_aligned = branch
+            elif (
+                mamba_track_seqlen_aligned == seq_end == len(req.origin_input_ids)
+                and earlier > prefix_len
+                and (earlier - prefix_len) % cache_chunk_size == 0
+                and get_exec().mamba.hybrid_cache_checkpoints_level < 3
+                and get_disagg().disaggregation_mode != "prefill"
+                and not self.tree_cache.supports_swa()
+            ):
+                # Chat templates may rewrite the prompt's last token next turn.
+                # Keep a resumable state before it, without displacing a branch.
+                mamba_track_seqlen_aligned = earlier
+                mamba_track_seqlen = _force_track_h(earlier)
             kv_storage_of(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).advance(

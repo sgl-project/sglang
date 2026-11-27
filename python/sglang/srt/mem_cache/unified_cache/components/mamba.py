@@ -980,8 +980,9 @@ class MambaComponent(TreeComponent):
             return False
         # The prompt's last checkpoint: a chat template that does not replay the
         # generated turn makes the next prompt diverge at the end of this one,
-        # before any decode checkpoint.
-        return not 0 <= prompt_len - checkpoint_len < self.mamba_checkpoint_grid
+        # before any decode checkpoint. A grid-aligned prompt can keep its
+        # checkpoint one grid step earlier (prepare_for_extend).
+        return not 0 <= prompt_len - checkpoint_len <= self.mamba_checkpoint_grid
 
     def prepare_for_caching_req(
         self,

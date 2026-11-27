@@ -216,6 +216,17 @@ class TestRequestEndCheckpoints(CustomTestCase):
         self.assertEqual(req.kv.mamba_last_track_seqlen, len(PROMPT) + 4)
         cache.sanity_check()
 
+    def test_level2_reuses_the_checkpoint_before_a_grid_aligned_prompt_end(self):
+        """Changing a grid-aligned prompt's last token still reuses its prefix."""
+        cache, allocator, pool = _build(2)
+        req = _running_req(cache, allocator, pool, up_to=12)
+        cache.checkpoint(req, up_to=len(PROMPT))
+        follow_up = PROMPT[:-1] + [100]
+        self.assertEqual(_cached_len(cache, follow_up), 12)
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+        cache.unlock(req.lock)
+        cache.sanity_check()
+
     def test_level2_keeps_every_chunk_with_sliding_window(self):
         cache, allocator, pool = _build(
             2,

@@ -12,7 +12,7 @@ then frees two kv-row segments that share the page holding 576.
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock, create_autospec, patch
+from unittest.mock import MagicMock, create_autospec
 
 from sglang.srt.managers.schedule_batch import (
     Req,
@@ -25,13 +25,14 @@ from sglang.srt.managers.schedule_policy import (
     mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.runtime_context import get_context, mamba_track_grid
+from sglang.srt.runtime_context import get_context, get_parallel, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -45,9 +46,19 @@ def _prepare_extend(
     extend_len: int,
     dcp_enabled: bool = False,
     next_idx: int = 0,
+    level: int = 3,
+    prompt_len: int | None = None,
+    branching_seqlen: int | None = None,
+    is_swa: bool = False,
+    disaggregation_mode: str | None = None,
 ) -> tuple[_MambaRadixCacheV2TrackEntry, Req]:
     """Run one extend through the tracker; return its track entry and the request."""
-    server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
+    server_args = ServerArgs(
+        model_path="dummy",
+        page_size=CHUNK,
+        hybrid_cache_checkpoints_level=level,
+        disaggregation_mode=disaggregation_mode,
+    )
     # The property would otherwise load the HF config for the dummy model.
     server_args._mamba_cache_chunk_size = CHUNK
     set_global_server_args_for_scheduler(server_args)
@@ -57,28 +68,25 @@ def _prepare_extend(
     req = Req(
         rid="req",
         origin_input_text="",
-        origin_input_ids=array("q", [1] * (prefix_len + extend_len)),
+        origin_input_ids=array("q", [1] * (prompt_len or prefix_len + extend_len)),
         sampling_params=sampling_params,
         vocab_size=128,
     )
     req.prefix_len = prefix_len
     req.extend_end = prefix_len + extend_len
     req.kv.mamba_next_track_idx = next_idx
-    req.mamba_branching_seqlen = None
+    req.mamba_branching_seqlen = branching_seqlen
 
     batch = ScheduleBatch(reqs=[req])
     batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
     batch.model_config = SimpleNamespace(
         hf_text_config=SimpleNamespace(mamba_chunk_size=CHUNK)
     )
-    batch.tree_cache = SimpleNamespace(page_size=tree_page)
+    batch.tree_cache = SimpleNamespace(page_size=tree_page, supports_swa=lambda: is_swa)
     batch.req_to_token_pool = MagicMock()
     batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1 - next_idx
 
-    with patch(
-        "sglang.srt.managers.schedule_batch.get_parallel",
-        return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
-    ):
+    with get_parallel().override(dcp_enabled=dcp_enabled):
         entry = batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
     return entry, req
 
@@ -92,7 +100,38 @@ def _track_seqlen(**kwargs) -> int | None:
     return req.kv.mamba_last_track_seqlen
 
 
-class TestMambaCheckpointDepth(unittest.TestCase):
+class TestMambaCheckpointDepth(CustomTestCase):
+    def test_grid_aligned_prompt_keeps_a_state_before_its_last_token(self):
+        """A chat template changes the prompt's last token on the next turn;
+        a state at the full prompt length cannot serve that shared prefix."""
+        for page, dcp, expected in ((64, False, 20416), (256, True, 20224)):
+            with self.subTest(page=page, dcp=dcp):
+                entry, req = _prepare_extend(
+                    tree_page=page,
+                    prefix_len=16384,
+                    extend_len=4096,
+                    level=2,
+                    dcp_enabled=dcp,
+                )
+                self.assertTrue(entry.track_mask)
+                self.assertEqual(req.kv.mamba_last_track_seqlen, expected)
+                self.assertEqual(entry.track_seqlen, expected + 1)
+
+    def test_prompt_end_shift_preserves_other_checkpoint_contracts(self):
+        cases = (
+            ({"level": 3}, 20480),
+            ({"is_swa": True}, 20480),
+            ({"disaggregation_mode": "prefill"}, 20480),
+            ({"prompt_len": 24576}, 20480),
+            ({"extend_len": 64}, 16448),
+            ({"branching_seqlen": 18432}, 18432),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                args = dict(tree_page=64, prefix_len=16384, extend_len=4096, level=2)
+                args.update(overrides)
+                self.assertEqual(_track_seqlen(**args), expected)
+
     def test_widened_tree_page_moves_the_donated_depth_onto_it(self):
         # 4066 tokens past a 16384 prefix: the chunk grid would stop at 20416,
         # which a 256-token page cannot name.
