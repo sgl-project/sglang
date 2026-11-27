@@ -16,14 +16,7 @@
 # limitations under the License.
 """EXAONE model configuration"""
 
-from typing import Any, Dict
-
 from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging
-
-logger = logging.get_logger(__name__)
-
-EXAONE_PRETRAINED_CONFIG_ARCHIVE_MAP: Dict[str, Any] = {}
 
 
 # ruff: noqa: E501

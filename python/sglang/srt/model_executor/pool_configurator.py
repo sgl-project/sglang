@@ -38,7 +38,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import get_spec_decode_reach
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -59,6 +59,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
@@ -68,33 +69,6 @@ from sglang.srt.utils.device import is_float4_e2m1fn_x2, is_hip, is_npu
 
 _is_hip = is_hip()
 _is_npu = is_npu()
-
-
-def spec_decode_alloc_len_per_request(
-    *,
-    page_size,
-    speculative_num_steps,
-    speculative_eagle_topk,
-    speculative_num_draft_tokens,
-) -> int:
-    """Per-request KV tokens a (spec-v1) decode step allocates: the draft-decode
-    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned. A pure
-    function of the resolved values its one caller reads off the bags.
-    """
-    len_per_topk = speculative_num_steps or 1
-    spec_topk = speculative_eagle_topk or 1
-    spec_tokens = speculative_num_draft_tokens or 1
-
-    if page_size > 1 and spec_topk > 1:
-        # last partial page and ceil alignment
-        len_per_topk = ceil_align(len_per_topk + page_size, page_size)
-        spec_tokens = ceil_align(spec_tokens, page_size)
-    elif page_size > 1:
-        # only page alignment
-        len_per_topk = ceil_align(len_per_topk, page_size)
-        spec_tokens = ceil_align(spec_tokens, page_size)
-
-    return max(len_per_topk * spec_topk, spec_tokens)
 
 
 @dataclass
@@ -160,6 +134,47 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * kvc.dflash_draft_loc_space_scale
+
+
+def _eagle_draft_kv_cache_dtype(kvc: KVCacheConfigurator) -> torch.dtype:
+    """KV dtype a private EAGLE/MTP draft pool resolves: the target's, unless
+    --speculative-draft-kv-cache-dtype gives the draft its own."""
+    from sglang.srt.mem_cache.kv_cache_configurator import _draft_quant_config
+    from sglang.srt.mem_cache.kv_cache_dtype import (
+        configure_kv_cache_dtype,
+        draft_reads_packed_dsa_kv,
+    )
+
+    draft_flag = get_spec().speculative_draft_kv_cache_dtype
+    # Inherited as it is, but for the INT8 record a draft may not read.
+    if draft_flag is None and kvc.kv_cache_dtype != torch.int8:
+        return kvc.kv_cache_dtype
+    draft_backend = get_spec().speculative_draft_attention_backend
+    aux_draft_model_config = kvc.spec_aux_config.draft_model_config
+    # An EAGLE/MTP draft without its own checkpoint config reuses the target's.
+    draft_model_config = aux_draft_model_config or kvc.model_config
+    if draft_flag is None:
+        if draft_reads_packed_dsa_kv(
+            draft_model_config=draft_model_config,
+            draft_attention_backend=draft_backend,
+        ):
+            return kvc.kv_cache_dtype
+        return kvc.model_dtype
+    _, draft_kv_cache_dtype = configure_kv_cache_dtype(
+        server_args_kv_cache_dtype=draft_flag,
+        quant_config=(
+            _draft_quant_config(aux_draft_model_config)
+            if draft_flag == "auto" and aux_draft_model_config is not None
+            else None
+        ),
+        model_dtype=kvc.model_dtype,
+        is_draft_worker=True,
+        is_dflash=False,
+        speculative_draft_attention_backend=draft_backend,
+        speculative_draft_kv_cache_dtype=draft_flag,
+        model_config=draft_model_config,
+    )
+    return draft_kv_cache_dtype
 
 
 def dflash_draft_kv_follows_target_swa(kvc: KVCacheConfigurator) -> bool:
@@ -376,16 +391,36 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    draft_kv_size = (
-                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
-                        * draft_loc_space_scale
-                    )
+                    draft_kv_cache_dtype = _eagle_draft_kv_cache_dtype(kvc)
+                    if draft_kv_cache_dtype == kvc.kv_cache_dtype:
+                        draft_kv_size = (
+                            int(
+                                target_kv_size * draft_num_layers / target_kv_num_layers
+                            )
+                            * draft_loc_space_scale
+                        )
+                    else:
+                        # A draft with its own KV dtype has its own row layout.
+                        from sglang.srt.mem_cache.kv_cache_configurator import (
+                            calculate_mla_kv_cache_dim,
+                        )
+
+                        draft_kv_size = (
+                            calculate_mla_kv_cache_dim(
+                                model_config=kvc.model_config,
+                                kv_cache_dtype=draft_kv_cache_dtype,
+                            )
+                            * torch._utils._element_size(draft_kv_cache_dtype)
+                            * draft_num_layers
+                            * draft_loc_space_scale
+                        )
                     # _compute_dsa_indexer_cell_size already applies the
                     # HiSparse logical-space ratio to the draft indexer.
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
+                        kv_cache_dtype=draft_kv_cache_dtype,
                     )
                     draft_kv_size *= dcp_size
                     draft_indexer_size *= dcp_size
@@ -652,6 +687,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size += (
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
+                if get_platform().is_sm120 and num_layers:
+                    # One BF16 row per token for FA4 (MHATokenToKVPoolMXFP8).
+                    cell_size += (
+                        n
+                        * (model_config.head_dim + model_config.v_head_dim)
+                        * torch._utils._element_size(torch.bfloat16)
+                    )
 
         cell_size += self._compute_qsa_cell_size(
             hf_config=model_config.hf_config,
@@ -693,7 +735,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         kvc: KVCacheConfigurator,
         num_layers: int,
         allocate_all_layers: bool = False,
+        kv_cache_dtype: Optional[torch.dtype] = None,
     ) -> int:
+        """``kv_cache_dtype`` is the main KV dtype the indexer sits next to,
+        the runner's by default; a draft with its own dtype passes that."""
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = ceil_div(
             DSATokenToKVPool.index_bytes_per_token_for(
@@ -707,12 +752,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
+            from sglang.srt.hardware_backend.npu.kv_capability import (
+                resolve_npu_kv_capability,
+            )
             from sglang.srt.mem_cache.kv_cache_dtype import (
                 QUANT_MODE_TOKEN_INT8,
                 resolve_indexer_quant_mode,
             )
 
-            dtype = kvc.kv_cache_dtype
+            dtype = kvc.kv_cache_dtype if kv_cache_dtype is None else kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
                 indexer_quant_mode = resolve_indexer_quant_mode(
@@ -731,7 +779,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     indexer_size_per_token = ceil_div(
                         index_head_dim, get_dsa_index_kpool(kvc.model_config.hf_config)
                     )
-                    element_size = torch._utils._element_size(dtype)
+                    # The unquantized indexer keeps its own dtype, which stays
+                    # BF16 under an INT8 main KV.
+                    element_size = torch._utils._element_size(
+                        resolve_npu_kv_capability(dtype).indexer_kv_dtype
+                    )
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
@@ -880,6 +932,20 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 model_config.get_swa_num_kv_heads(tp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
+        self._full_dequant_per_token = self._swa_dequant_per_token = 0
+        if self.kv_cache_dtype_str == "mxfp8" and get_platform().is_sm120:
+            bf16_size = torch._utils._element_size(torch.bfloat16)
+            if self._full_layers_num:
+                self._full_dequant_per_token = (
+                    model_config.get_num_kv_heads(tp_size)
+                    * (model_config.head_dim + model_config.v_head_dim)
+                    * bf16_size
+                )
+            self._swa_dequant_per_token = (
+                model_config.get_swa_num_kv_heads(tp_size)
+                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+                * bf16_size
+            )
 
         # Draft KV tensors use full, SWA, or full-capacity SWA geometry.
         self._draft_full_layers_num = 0
@@ -941,8 +1007,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         there, else the target's rows plus the private draft's full rows."""
         if self._fused_full_entry is not None:
             return self._fused_full_entry
-        return self._full_per_token * (
-            self._full_layers_num + self._draft_full_layers_num
+        return (
+            self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
+            + self._full_dequant_per_token
         )
 
     def _swa_cell_bytes(self) -> int:
@@ -950,6 +1017,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             return self._fused_swa_entry
         return (
             self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
+            + self._swa_dequant_per_token
             + self._draft_swa_cell_size
         )
 
@@ -959,6 +1027,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if self._full_layers_num == 0:
             self._cell_size = (
                 self._swa_per_token * self._swa_layers_num
+                + self._swa_dequant_per_token
                 + self._full_per_token * self._draft_full_layers_num
                 + self._swa_per_token * self._draft_swa_layers_num
                 + self._swa_per_token * self._draft_swa_full_layers_num
@@ -1108,18 +1177,8 @@ def compute_swa_request_cap(
     trailing_tokens = window + eviction_interval * draft_tokens + page_size
     if get_spec().speculative_algorithm is None:
         decode_alloc = page_size
-    elif get_schedule().disable_overlap_schedule:
-        # spec-v1: new_tokens_required_next_decode per request.
-        decode_alloc = spec_decode_alloc_len_per_request(
-            page_size=page_size,
-            speculative_num_steps=get_spec().speculative_num_steps,
-            speculative_eagle_topk=get_spec().speculative_eagle_topk,
-            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
-        )
     else:
-        # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
-        # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
-        decode_alloc = 2 * get_alloc_len_per_decode()
+        decode_alloc = get_spec_decode_reach(page_size)
     per_request = trailing_tokens + decode_alloc
 
     if max_running_requests is None:
@@ -1232,14 +1291,18 @@ class _DSV4PoolSizes:
 
 
 class DSV4PoolConfigurator(MemoryPoolConfigurator):
-    """DSV4 compressed attention: coeff is bytes_per_full_token, inflated by (T+D)/T
-    for a draft worker; bias is the request-scoped pools that do not scale with it."""
+    """DSV4 compressed attention budgets, including speculative draft storage.
+
+    The bias covers request-scoped pools that do not scale with full tokens.
+    """
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
+    _npu_low_ratio_bf16 = False
     # A subclass that adds the draft's KV to the per-token bytes itself sets this,
     # replacing the (T+D)/T inflation.
     _draft_kv_priced_exactly = False
+    _npu_dspark_draft_layers = 0
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1248,6 +1311,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            self._npu_low_ratio_bf16 = not is_npu_arch35() and any(
+                ratio in (1, 2) for ratio in cfg.compress_ratios
+            )
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
@@ -1335,10 +1404,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         }
 
         self.num_layers_total = len(self.stage_compress_ratios)
-        # The low-ratio indexer pools are built with force_fp4=True
-        # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
+        # Low-ratio pools use BF16 rows on A3 and packed FP4 rows elsewhere.
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
-            self.indexer_head_dim, use_fp4_indexer=True
+            self.indexer_head_dim,
+            use_fp4_indexer=not self._npu_low_ratio_bf16,
+            use_bf16_indexer=self._npu_low_ratio_bf16,
         )
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
@@ -1450,6 +1520,21 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             if self.encoder_replay and not self.paged_draft_layers
             else self._resolve_swa_cap_tokens()
         )
+        if (
+            self._npu_low_ratio_bf16
+            and kvc.spec_algorithm.is_dspark()
+            and not self.encoder_replay
+        ):
+            # A3 DSpark allocates a BF16 paged SWA pool for every draft stage,
+            # but no compressed KV/indexer pools. Reserve that exact footprint.
+            aux = kvc.spec_aux_config
+            self._npu_dspark_draft_layers = int(
+                aux.dspark_num_stages or aux.dflash_draft_num_layers or 0
+            )
+            assert self._npu_dspark_draft_layers > 0, (
+                "DSpark draft layer count is required"
+            )
+            self._draft_kv_priced_exactly = True
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if (
@@ -1563,6 +1648,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # Unified rings, the NPU pool and the trtllm uniform-FP8 pool do not go
         # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
+            if self._npu_low_ratio_bf16 and compress_ratio in (0, 1, 2):
+                return self.attn_head_dim * torch.bfloat16.itemsize
             return self.kv_bytes
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             resolve_compressed_kv_layout,
@@ -1594,7 +1681,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
-        return self._get_paged_kv_bytes_per_token() * self.num_swa_layers + (
+        return self._get_paged_kv_bytes_per_token() * (
+            self.num_swa_layers + self._npu_dspark_draft_layers
+        ) + (
             c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
             * self.num_layers(4)
@@ -1619,6 +1708,32 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
         """Reserved main/indexer pages beyond the token-scaled low-ratio bytes."""
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
+            if self._npu_low_ratio_bf16:
+                from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                    DSV41_INDEX_PAGE_SIZE,
+                )
+
+                # A3 physical NPU pools reserve one page beyond their `size`.
+                # Indexer size already includes the reserved FULL logical page.
+                # Include SWA's reserved page here as well (not in the token
+                # coefficient, regardless of whether SWA uses cap or ratio sizing).
+                padding = (
+                    self.page_size
+                    * self._get_paged_kv_bytes_per_token()
+                    * (self.num_layers_total + self._npu_dspark_draft_layers)
+                )
+                for ratio in (1, 2):
+                    page = self.page_size // ratio
+                    size = (full_tokens + self.page_size) // ratio
+                    index_slots = (
+                        (size + DSV41_INDEX_PAGE_SIZE + 1) // DSV41_INDEX_PAGE_SIZE
+                    ) * DSV41_INDEX_PAGE_SIZE
+                    padding += self.num_layers(ratio) * (
+                        page * self._get_paged_kv_bytes_per_token(ratio)
+                        + (index_slots - full_tokens // ratio)
+                        * self.low_ratio_index_bytes
+                    )
+                return padding
             return 0
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DSV41_INDEX_PAGE_SIZE,
@@ -1749,9 +1864,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_size = self.ring_sizes[2]
-        # CompressStatePool allocates `size + ring_size + 1` rows, padded to the ratio.
+        row_alignment = 2
+        if self._npu_low_ratio_bf16:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+                get_a3_c2_state_bank_count,
+            )
+
+            num_req_slots = get_a3_c2_state_bank_count(num_req_slots)
+            # A3 requests a 3-D view with state_cache_page_size=ring_size.
+            row_alignment = ring_size
         state_rows = num_req_slots * ring_size + ring_size + 1
-        state_rows = ceil_div(state_rows, 2) * 2
+        state_rows = ceil_align(state_rows, row_alignment)
         state_last_dim = 2 * self.attn_head_dim
         return state_rows * state_last_dim * torch.float32.itemsize * num_layers
 

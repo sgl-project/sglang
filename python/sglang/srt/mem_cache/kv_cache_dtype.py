@@ -11,6 +11,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 logger = logging.getLogger(__name__)
@@ -44,9 +45,13 @@ def configure_kv_cache_dtype(
     is_dflash: bool,
     speculative_draft_attention_backend: str,
     speculative_draft_kv_cache_dtype: Optional[str] = None,
+    model_config: Optional["ModelConfig"] = None,
 ) -> tuple[str, torch.dtype]:
     """(label, torch dtype) of a runner's KV cache; a pool in the compute
-    dtype is labelled "auto", which backends gate FP8 casts and descales on."""
+    dtype is labelled "auto", which backends gate FP8 casts and descales on.
+
+    ``model_config`` is the runner's own model, which decides whether a draft
+    can keep an INT8 target's packed DSA record."""
     if is_draft_worker and speculative_draft_kv_cache_dtype is not None:
         server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
     kv_cache_dtype_str = server_args_kv_cache_dtype
@@ -76,6 +81,9 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
+    elif server_args_kv_cache_dtype == "int8":
+        # Startup checks and the NPU capability admit it for DSA on A2 only.
+        kv_cache_dtype = torch.int8
     elif server_args_kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
         if hasattr(torch, "float4_e2m1fn_x2"):
             kv_cache_dtype = torch.float4_e2m1fn_x2
@@ -114,7 +122,44 @@ def configure_kv_cache_dtype(
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
         kv_cache_dtype_str = "auto"
 
+    # INT8 only exists as the packed DSA record. A draft with any other layout
+    # would cast its K/V to INT8 without scales, so it gets its own
+    # compute-dtype KV.
+    if (
+        is_draft_worker
+        and kv_cache_dtype == torch.int8
+        and not draft_reads_packed_dsa_kv(
+            draft_model_config=model_config,
+            draft_attention_backend=speculative_draft_attention_backend,
+        )
+    ):
+        logger.info(
+            "Draft cannot read the target's packed INT8 DSA KV record: "
+            "overriding its KV cache dtype %s -> %s.",
+            kv_cache_dtype,
+            model_dtype,
+        )
+        kv_cache_dtype = model_dtype
+        kv_cache_dtype_str = "auto"
+
     return kv_cache_dtype_str, kv_cache_dtype
+
+
+def draft_reads_packed_dsa_kv(
+    *,
+    draft_model_config: Optional["ModelConfig"],
+    draft_attention_backend: Optional[str],
+) -> bool:
+    """Whether a draft's own KV layout is the packed DSA record: a DSA draft
+    read by the Ascend backend's sparse attention. An unknown draft model is
+    taken as one that cannot read it."""
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    return (
+        draft_model_config is not None
+        and is_deepseek_dsa(draft_model_config.hf_config)
+        and draft_attention_backend in (None, "ascend")
+    )
 
 
 def resolve_indexer_quant_mode(
@@ -141,7 +186,7 @@ def resolve_indexer_quant_mode(
     if main_kv_cache_dtype == torch.float8_e4m3fn:
         raise ValueError(
             f"--indexer-kv-cache-dtype={indexer_kv_cache_dtype} requires a "
-            "non-FP8 main KV cache (--kv-cache-dtype auto or bf16), "
+            "non-FP8 main KV cache (--kv-cache-dtype auto, bf16 or int8), "
             f"got {main_kv_cache_dtype}."
         )
     return quant_mode
