@@ -124,7 +124,7 @@ def test_qsa_graph_request_updates(mode, batch_size, heads, runtime_context):
     backend.device, backend.token_to_kv_pool = torch.device("npu"), pool
     backend.req_to_token = req_to_token
     # Graph capacity follows 262144 / 4 even when the live request is short.
-    backend.max_context_len = 262144
+    backend.req_to_token_pool = SimpleNamespace(row_width=262144)
     backend.init_cuda_graph_state(batch_size, rows)
     lengths_cpu = torch.full((batch_size,), 2405, dtype=torch.int32)
     batch = SimpleNamespace(

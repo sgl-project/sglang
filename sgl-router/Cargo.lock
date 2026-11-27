@@ -931,66 +931,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
-name = "deepseek-recipe"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e9a3c713c6026c73883e20f51a91e21e6dcbb3dd1dd89d9eaaa82b11d97febc"
-dependencies = [
- "async-stream",
- "base64 0.22.1",
- "data-url",
- "deepseek-recipe-core",
- "deepseek-recipe-macros",
- "indexmap",
- "itertools 0.14.0",
- "jsonschema",
- "rand 0.9.5",
- "serde",
- "serde_json",
- "strum_macros 0.28.0",
- "tokenizers",
- "tokio-stream",
- "xxhash-rust",
-]
-
-[[package]]
-name = "deepseek-recipe-core"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82329b9b368a326f06eb0114710c86a085bc8792e6e5cffd259125b422cbabef"
-dependencies = [
- "deepseek-recipe-macros",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "deepseek-recipe-encoding"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "136e9554e91dc94beeb9dfa60e9955db1d1b0a4661429c626a2c6ff2c0f74d45"
-dependencies = [
- "aho-corasick",
- "deepseek-recipe-core",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokenizers",
- "tracing",
-]
-
-[[package]]
-name = "deepseek-recipe-macros"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1263cc15fcdc65e4ac61cdee44b1ac5f95868bdaab35579960a6cdc150fa5801"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "derive_builder"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3727,6 +3667,66 @@ dependencies = [
 ]
 
 [[package]]
+name = "sgl-deepseek-recipe"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d9d7216e715b2cf4a7860edf836fb60792e1407b3c0360a1241d9c390c21797"
+dependencies = [
+ "async-stream",
+ "base64 0.22.1",
+ "data-url",
+ "indexmap",
+ "itertools 0.14.0",
+ "jsonschema",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "sgl-deepseek-recipe-core",
+ "sgl-deepseek-recipe-macros",
+ "strum_macros 0.28.0",
+ "tokenizers",
+ "tokio-stream",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "sgl-deepseek-recipe-core"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fbe1e10dc8ec8248ac0276adcaaf0ed3bd3144b4643a6986a634830c720bbf5"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sgl-deepseek-recipe-macros",
+]
+
+[[package]]
+name = "sgl-deepseek-recipe-encoding"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "febd90c09508323617de22aae68d4ecf5655fe94258e846462c7ed1cb1855f89"
+dependencies = [
+ "aho-corasick",
+ "serde",
+ "serde_json",
+ "sgl-deepseek-recipe-core",
+ "thiserror 2.0.20",
+ "tokenizers",
+ "tracing",
+]
+
+[[package]]
+name = "sgl-deepseek-recipe-macros"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2f667efef4ee7a84bf688b04600beaa92b8ed50e3a409e07317f9a3207e7992"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "sgl-kv-indexer"
 version = "0.1.0"
 dependencies = [
@@ -3818,9 +3818,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
- "deepseek-recipe",
- "deepseek-recipe-core",
- "deepseek-recipe-encoding",
  "dynamo-protocols",
  "dynamo-renderer",
  "futures",
@@ -3829,6 +3826,9 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sgl-deepseek-recipe",
+ "sgl-deepseek-recipe-core",
+ "sgl-deepseek-recipe-encoding",
  "sglang-api-types",
  "thiserror 2.0.20",
  "tokenizers",
