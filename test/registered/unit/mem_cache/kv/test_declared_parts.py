@@ -78,6 +78,8 @@ class _StateRequestKV(_RequestKV):
     def __init__(self):
         super().__init__()
         self.mamba_pool_idx = None
+        self.beam_mamba_slot_count = 0
+        self.beam_mamba_slots = None
         self.mamba_needs_clear = False
         self.mamba_cow_src_index = None
         self.mamba_ping_pong_track_buffer = None

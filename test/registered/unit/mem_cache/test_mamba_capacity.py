@@ -54,6 +54,8 @@ def make_req(*, holds_mamba=False, has_buffer=False):
             mamba_ping_pong_track_buffer=object() if has_buffer else None,
             req_pool_idx=None,
             mamba_pool_idx=object() if holds_mamba else None,
+            beam_mamba_slot_count=0,
+            beam_mamba_slots=None,
         )
     )
 

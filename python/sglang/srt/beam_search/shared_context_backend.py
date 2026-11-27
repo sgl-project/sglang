@@ -33,13 +33,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def _has_shared_context(forward_batch: ForwardBatch) -> bool:
-    return (
-        forward_batch.beam is not None
-        and forward_batch.beam.attention_metadata is not None
-    )
-
-
 def flashinfer_backend_cls(base: type[FlashInferAttnBackend]):
     if envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.get():
         return BeamSharedContextFlashInferAttnBackend
@@ -52,7 +45,7 @@ class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
         shared_context_attention.supports_shared_context(model_runner)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if not _has_shared_context(forward_batch):
+        if not shared_context_attention.has_metadata(forward_batch):
             return super().init_forward_metadata(forward_batch)
         self.forward_metadata = DecodeMetadata([])
 
@@ -65,7 +58,10 @@ class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        if not _has_shared_context(forward_batch) or layer.is_cross_attention:
+        if (
+            not shared_context_attention.has_metadata(forward_batch)
+            or layer.is_cross_attention
+        ):
             return super().forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache
             )
@@ -81,4 +77,11 @@ class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
                     *self._kv_write_scales(layer),
                 )
 
-        return shared_context_attention.forward(q, layer, forward_batch, self.kv_layers)
+        k_buffer, v_buffer = self.kv_layers.read(layer.layer_id).kv()
+        return shared_context_attention.forward(
+            q=q,
+            layer=layer,
+            forward_batch=forward_batch,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+        )

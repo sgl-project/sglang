@@ -15,12 +15,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.beam_search import shared_context_attention
+from sglang.srt.beam_search.recurrent import (
+    GdnBeamReplayInputs,
+    build_gdn_beam_replay_inputs,
+    build_read_only_state_mask,
+)
 from sglang.srt.beam_search.trie_output_head import build_trie_row_levels
 
 if TYPE_CHECKING:
@@ -29,12 +34,13 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-@dataclass
-class BeamForwardInputs:
+class BeamForwardInputs(msgspec.Struct):
     # Per-row SID codebook depths for trie-conditioned decode batches.
     trie_levels: Optional[torch.Tensor] = None
     # Shared-context attention metadata for all-beam decode batches.
     attention_metadata: Optional[BeamAttentionMetadata] = None
+    read_only_state_rows: Optional[torch.Tensor] = None
+    gdn_replay: Optional[GdnBeamReplayInputs] = None
 
 
 def build_beam_forward_inputs(
@@ -42,6 +48,20 @@ def build_beam_forward_inputs(
 ) -> Optional[BeamForwardInputs]:
     trie_levels = build_trie_row_levels(batch, model_runner)
     attention_metadata = shared_context_attention.build_metadata(batch, model_runner)
-    if trie_levels is None and attention_metadata is None:
+    tail = batch.beam_tail
+    read_only_rows = replay = None
+    if tail is not None and batch.forward_mode.is_decode():
+        read_only_rows = build_read_only_state_mask(
+            tail=tail, num_rows=len(batch.req_pool_indices), device=batch.device
+        )
+        replay = build_gdn_beam_replay_inputs(
+            tail=tail, num_rows=len(batch.req_pool_indices), device=batch.device
+        )
+    if (
+        trie_levels is None
+        and attention_metadata is None
+        and read_only_rows is None
+        and replay is None
+    ):
         return None
-    return BeamForwardInputs(trie_levels, attention_metadata)
+    return BeamForwardInputs(trie_levels, attention_metadata, read_only_rows, replay)

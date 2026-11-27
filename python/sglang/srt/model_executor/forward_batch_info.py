@@ -1656,6 +1656,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
             return
 
+        if batch.beam_tail is not None:
+            mm_inputs = [
+                *mm_inputs,
+                *(
+                    mm_inputs[entry.leader_idx]
+                    for entry in batch.beam_tail.entries
+                    for _ in range(entry.end - entry.start)
+                ),
+            ]
+
         if not has_precomputed_mrope:
             # Device-resident deltas avoid a host sync that stalls overlap scheduling.
             device = model_runner.device

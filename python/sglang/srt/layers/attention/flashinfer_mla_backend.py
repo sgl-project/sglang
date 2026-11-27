@@ -26,6 +26,7 @@ import torch
 
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
+from sglang.srt.beam_search import shared_context_attention
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -445,6 +446,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if shared_context_attention.has_metadata(forward_batch):
+            self.forward_metadata = DecodeMetadata(self.decode_wrapper)
+            return
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.seq_lens,
@@ -819,8 +823,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        decode_wrapper = self.forward_metadata.decode_wrapper
-
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -851,14 +853,23 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
         k_buffer = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
+        k_nope = k_buffer[:, :, : layer.v_head_dim]
+        if shared_context_attention.has_metadata(forward_batch):
+            return shared_context_attention.forward(
+                q=torch.cat((q_nope, q_rope), dim=-1),
+                layer=layer,
+                forward_batch=forward_batch,
+                k_buffer=k_buffer,
+                v_buffer=k_nope,
+            )
 
         o = q_nope.new_empty(q_nope.shape)
         # for decode and dcp_world_size > 1, lse should be returned to compute final attn_out
         # Direct call to run without the wrapper
-        o = decode_wrapper.run(
+        o = self.forward_metadata.decode_wrapper.run(
             q_nope,
             q_rope,
-            k_buffer[:, :, : layer.v_head_dim],
+            k_nope,
             k_buffer[:, :, layer.v_head_dim :],
             out=o,
             # for decode forward_batch, each dcp rank computes total q and partial kv, thus, we need to return_lse for online softmax to get final attn_output

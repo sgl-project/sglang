@@ -8,6 +8,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.beam_replay_layout import (
+    GDN_BEAM_REPLAY_WINDOW,
+    records_per_state_slot,
+)
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
 from sglang.srt.utils import is_cuda
@@ -185,6 +189,45 @@ def fused_recurrent_gated_delta_rule_fwd(
 
 # Adapted from vllm project.
 @triton.jit
+def _replay_gdn_state(
+    b_h,
+    record,
+    o_v,
+    o_k,
+    mask_v,
+    mask_k,
+    V: tl.constexpr,
+    K: tl.constexpr,
+    CACHE_DTYPE: tl.constexpr,
+):
+    delta = tl.load(record + o_v, mask=mask_v, other=0)
+    key = tl.load(record + V + o_k, mask=mask_k, other=0)
+    decay = tl.load(record + V + K)
+    # Match the dense cache's rounding at each prior step boundary.
+    return (
+        tl.fma(delta[:, None], key[None, :], b_h * decay).to(CACHE_DTYPE).to(tl.float32)
+    )
+
+
+@triton.jit
+def _gdn_beam_record_ptr(
+    records,
+    index,
+    head,
+    stride_slot: tl.constexpr,
+    stride_head: tl.constexpr,
+    per_slot: tl.constexpr,
+    record_width: tl.constexpr,
+):
+    return (
+        records
+        + (index // per_slot).to(tl.int64) * stride_slot
+        + head * stride_head
+        + (index % per_slot) * record_width
+    )
+
+
+@triton.jit
 def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     mixed_qkv,
     a,
@@ -195,6 +238,11 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     h0,
     ht,
     ssm_state_indices,
+    read_only_state_rows,
+    beam_replay_group_ids,
+    beam_replay_slots,
+    beam_update_records,
+    beam_replay_window_rows,
     scale,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
@@ -202,6 +250,8 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     stride_init_state_token: tl.constexpr,
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
+    stride_record_slot: tl.constexpr,
+    stride_record_head: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -210,8 +260,13 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    HAS_READ_ONLY_STATE_ROWS: tl.constexpr,
+    HAS_BEAM_REPLAY: tl.constexpr,
+    BEAM_REPLAY_WINDOW: tl.constexpr,
+    RECORDS_PER_SLOT: tl.constexpr,
 ):
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    nv_tiles = tl.cdiv(V, BV)
+    i_nh, i_v = tl.program_id(0) // nv_tiles, tl.program_id(0) % nv_tiles
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
 
@@ -229,9 +284,70 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
         tl.store(p_o, zero, mask=mask_v)
         return
 
-    p_h0 = h0 + state_idx * stride_init_state_token
+    read_only = tl.full((), False, tl.int1)
+    if HAS_READ_ONLY_STATE_ROWS:
+        read_only = tl.load(read_only_state_rows + i_n)
+    read_idx = state_idx
+    if HAS_BEAM_REPLAY:
+        group = tl.load(beam_replay_group_ids + i_n)
+        has_anchor = group >= 0
+        anchor_idx = tl.load(
+            beam_replay_slots + group * 2, mask=has_anchor, other=-1
+        ).to(tl.int64)
+        is_leader = state_idx == anchor_idx
+        leader_record = tl.load(
+            beam_replay_slots + group * 2 + 1, mask=is_leader, other=0
+        ).to(tl.int64)
+        read_idx = tl.where(has_anchor, anchor_idx, state_idx)
+        record_slot = tl.where(is_leader, leader_record, state_idx)
+        record = (
+            beam_update_records
+            + record_slot * stride_record_slot
+            + i_hv * stride_record_head
+            + tl.where(is_leader, V + K + 1, 0)
+        )
+    write_idx = state_idx
+    if BEAM_REPLAY_WINDOW:
+        window_row = beam_replay_window_rows + i_n * (BEAM_REPLAY_WINDOW + 2)
+        checkpoint = tl.load(window_row).to(tl.int64)
+        windowed = checkpoint >= 0
+        read_idx = tl.where(windowed, checkpoint, read_idx)
+        write_idx = tl.where(windowed, checkpoint, write_idx)
+        record_out = tl.load(window_row + 1)
+
+    p_h0 = h0 + read_idx * stride_init_state_token
     p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
     b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+    if HAS_BEAM_REPLAY:
+        if has_anchor & read_only:
+            b_h = _replay_gdn_state(
+                b_h, record, o_v, o_k, mask_v, mask_k, V, K, h0.dtype.element_ty
+            )
+    if BEAM_REPLAY_WINDOW:
+        if windowed:
+            for step in tl.static_range(BEAM_REPLAY_WINDOW):
+                parent_idx = tl.load(window_row + step + 2)
+                if parent_idx >= 0:
+                    parent_record = _gdn_beam_record_ptr(
+                        beam_update_records,
+                        parent_idx,
+                        i_hv,
+                        stride_record_slot,
+                        stride_record_head,
+                        RECORDS_PER_SLOT,
+                        V + K + 1,
+                    )
+                    b_h = _replay_gdn_state(
+                        b_h,
+                        parent_record,
+                        o_v,
+                        o_k,
+                        mask_v,
+                        mask_k,
+                        V,
+                        K,
+                        h0.dtype.element_ty,
+                    )
 
     p_mixed = mixed_qkv + i_n * stride_mixed_qkv_tok
     q_off = i_h * K + o_k
@@ -255,15 +371,41 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     g_val = -tl.exp(A_log_val) * softplus_x
     beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
 
-    b_h *= exp(g_val)
+    decay = exp(g_val)
+    b_h *= decay
     b_v -= tl.sum(b_h * b_k[None, :], 1)
     b_v *= beta_val
     b_h += b_v[:, None] * b_k[None, :]
     b_o = tl.sum(b_h * b_q[None, :], 1)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
-    p_ht = ht + state_idx * stride_final_state_token
+    p_ht = ht + write_idx * stride_final_state_token
     p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+    if HAS_BEAM_REPLAY:
+        if has_anchor & ~read_only:
+            tl.store(record + o_v, b_v, mask=mask_v)
+            if i_v == 0:
+                tl.store(record + V + o_k, b_k, mask=mask_k)
+                tl.store(record + V + K, decay)
+        mask_h &= ~has_anchor
+    if BEAM_REPLAY_WINDOW:
+        if record_out >= 0:
+            output_record = _gdn_beam_record_ptr(
+                beam_update_records,
+                record_out,
+                i_hv,
+                stride_record_slot,
+                stride_record_head,
+                RECORDS_PER_SLOT,
+                V + K + 1,
+            )
+            tl.store(output_record + o_v, b_v, mask=mask_v)
+            if i_v == 0:
+                tl.store(output_record + V + o_k, b_k, mask=mask_k)
+                tl.store(output_record + V + K, decay)
+        mask_h &= record_out < 0
+    if HAS_READ_ONLY_STATE_ROWS:
+        mask_h &= ~read_only
     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
@@ -278,7 +420,20 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    *,
+    read_only_state_rows: Optional[torch.Tensor] = None,
+    beam_replay_group_ids: Optional[torch.Tensor] = None,
+    beam_replay_slots: Optional[torch.Tensor] = None,
+    beam_replay_window_rows: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Update a dense cache, or record/replay a single GDN state update.
+
+    Each group supplies ``[anchor_slot, leader_record_slot]``. The anchor is
+    immutable; records reuse member slots' dense backing storage, with the
+    leader's record beside the first member's. Negative group IDs take the
+    normal dense path. Windowed rows carry ``[checkpoint, new_record, history...]``;
+    each history entry is a packed address in a reserved state slot, or -1.
+    """
     if mixed_qkv.ndim != 2:
         raise ValueError(
             f"`mixed_qkv` must be a 2D tensor (got ndim={mixed_qkv.ndim})."
@@ -310,6 +465,12 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError("All inputs must be on the same device.")
 
     B = mixed_qkv.shape[0]
+    if read_only_state_rows is not None:
+        assert read_only_state_rows.shape == (B,)
+        assert read_only_state_rows.dtype == torch.bool
+        assert (
+            read_only_state_rows.is_contiguous() and read_only_state_rows.device == dev
+        )
     if a.shape[0] != B or b.shape[0] != B:
         raise ValueError(
             "Mismatched batch sizes: "
@@ -327,6 +488,31 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     if initial_state.stride(-1) != 1:
         raise ValueError("`initial_state` must be contiguous in the last dim.")
     HV, V, K = initial_state.shape[-3:]
+    beam_update_records = None
+    stride_record_slot = stride_record_head = 0
+    if beam_replay_group_ids is not None:
+        assert beam_replay_slots is not None
+        assert beam_replay_group_ids.shape == (B,)
+        assert beam_replay_slots.ndim == 1 and beam_replay_slots.numel() % 2 == 0
+        for indices in (beam_replay_group_ids, beam_replay_slots):
+            assert indices.dtype in (torch.int32, torch.int64)
+            assert indices.is_contiguous() and indices.device == dev
+    else:
+        assert beam_replay_slots is None
+    if beam_replay_window_rows is not None:
+        assert beam_replay_window_rows.shape == (B, 2 + GDN_BEAM_REPLAY_WINDOW)
+        assert beam_replay_window_rows.dtype == torch.int32
+        assert (
+            beam_replay_window_rows.is_contiguous()
+            and beam_replay_window_rows.device == dev
+        )
+    per_slot = 0
+    if beam_replay_group_ids is not None or beam_replay_window_rows is not None:
+        assert initial_state.stride(-2) == K
+        beam_update_records = initial_state.view(torch.float32)
+        stride_record_slot, stride_record_head = beam_update_records.stride()[:2]
+        per_slot = records_per_state_slot(V, K, initial_state.element_size())
+        assert per_slot >= 2
     if a.shape[1] != HV or b.shape[1] != HV:
         raise ValueError(
             f"`a`/`b` must have shape [B, HV] with HV={HV} (got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)})."
@@ -384,7 +570,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     stride_indices_seq = ssm_state_indices.stride(0)
 
     NV = triton.cdiv(V, BV)
-    grid = (NV, B * HV)
+    # The CUDA y-axis limit is too small for wide batches times value heads.
+    grid = (NV * B * HV,)
     fused_recurrent_gated_delta_rule_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,
         a=a,
@@ -395,6 +582,11 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         h0=initial_state,
         ht=initial_state,
         ssm_state_indices=ssm_state_indices,
+        read_only_state_rows=read_only_state_rows,
+        beam_replay_group_ids=beam_replay_group_ids,
+        beam_replay_slots=beam_replay_slots,
+        beam_update_records=beam_update_records,
+        beam_replay_window_rows=beam_replay_window_rows,
         scale=scale,
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,
@@ -402,6 +594,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         stride_init_state_token=stride_init_state_token,
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
+        stride_record_slot=stride_record_slot,
+        stride_record_head=stride_record_head,
         H=H,
         HV=HV,
         K=K,
@@ -410,6 +604,12 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        HAS_READ_ONLY_STATE_ROWS=read_only_state_rows is not None,
+        HAS_BEAM_REPLAY=beam_replay_group_ids is not None,
+        BEAM_REPLAY_WINDOW=0
+        if beam_replay_window_rows is None
+        else GDN_BEAM_REPLAY_WINDOW,
+        RECORDS_PER_SLOT=per_slot,
         num_warps=num_warps,
         num_stages=num_stages,
     )

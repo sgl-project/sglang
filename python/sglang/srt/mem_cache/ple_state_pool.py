@@ -32,6 +32,8 @@ class SlotIndexedState(Protocol):
 
     def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None: ...
 
+    def copy_beam_slots(self, *, src: torch.Tensor, dst: torch.Tensor) -> None: ...
+
     def get_cpu_slots(self, indices: torch.Tensor) -> Any: ...
 
     def load_cpu_slots(self, data: Any, indices: torch.Tensor) -> None: ...
@@ -119,6 +121,12 @@ class ShortConvPool:
     def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
         if self.conv_state is not None:
             self.conv_state[:, dst_index] = self.conv_state[:, src_index]
+
+    def copy_beam_slots(self, *, src: torch.Tensor, dst: torch.Tensor) -> None:
+        if self.conv_state is not None:
+            from sglang.kernels.ops.kvcache.copy_pages import copy_layered_pages
+
+            copy_layered_pages(self.conv_state, src=src, dst=dst)
 
     def get_cpu_slots(self, indices: torch.Tensor) -> Any:
         if self.conv_state is None:
@@ -236,6 +244,12 @@ class NGramPool:
             src = src_index.to(dtype=torch.long)
             dst = dst_index.to(dtype=torch.long)
             self.context[dst] = self.context[src]
+
+    def copy_beam_slots(self, *, src: torch.Tensor, dst: torch.Tensor) -> None:
+        if self.context is not None:
+            from sglang.kernels.ops.kvcache.copy_pages import copy_layered_pages
+
+            copy_layered_pages(self.context.unsqueeze(0), src=src, dst=dst)
 
     def get_cpu_slots(self, indices: torch.Tensor) -> Any:
         if self.context is None:

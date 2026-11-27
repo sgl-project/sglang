@@ -22,7 +22,7 @@ free-slot bookkeeping.
 
 from __future__ import annotations
 
-from typing import Iterator, Optional
+from typing import Optional
 
 import torch
 
@@ -35,7 +35,7 @@ class MambaSlotAllocator:
         self.size = size
         self.device = device
         # Set by alloc_group_begin(); alloc(1) drains it until alloc_group_end().
-        self._alloc_iter: Optional[Iterator] = None
+        self._alloc_reserve: Optional[torch.Tensor] = None
         self.clear()
 
     def translate(self, slot_ids: torch.Tensor) -> torch.Tensor:
@@ -54,27 +54,25 @@ class MambaSlotAllocator:
         """Whether ``count`` slots can be taken now."""
         return self.schedulable_available_size() >= count
 
+    def available_after_alloc_group(self) -> int:
+        reserve = self._alloc_reserve
+        return self.available_size() + (0 if reserve is None else len(reserve))
+
     def alloc_group_begin(self, num_reqs: int):
         """Pre-allocate a batch of slots for match_prefix to amortize overhead."""
-        self._alloc_iter = None
-        if num_reqs > 0:
-            result = self._do_alloc(num_reqs)
-            if result is not None:
-                self._alloc_iter = iter(result.split(1))
+        self._alloc_reserve = self._do_alloc(num_reqs) if num_reqs > 0 else None
 
     def alloc_group_end(self):
         """Return any unused pre-allocated slots from the current group."""
-        if self._alloc_iter is not None:
-            remaining = list(self._alloc_iter)
-            if remaining:
-                self.free(torch.cat(remaining))
-        self._alloc_iter = None
+        reserve, self._alloc_reserve = self._alloc_reserve, None
+        if reserve is not None:
+            self.free(reserve)
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        if self._alloc_iter is not None and need_size == 1:
-            slot = next(self._alloc_iter, None)
-            if slot is not None:
-                return slot
+        reserve = self._alloc_reserve
+        if need_size == 1 and reserve is not None and len(reserve):
+            self._alloc_reserve = reserve[1:]
+            return reserve[:1]
         return self._do_alloc(need_size)
 
     def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -91,6 +89,7 @@ class MambaSlotAllocator:
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
+        self._alloc_reserve = None
         # Slot 0 is reserved as a dummy write target for padded tokens.
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device

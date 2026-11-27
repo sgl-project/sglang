@@ -39,6 +39,8 @@ class MambaSSUBackend(ABC):
         cache_steps: int | None = None,
         retrieve_parent_token: torch.Tensor | None = None,
         intermediate_state_indices: torch.Tensor | None = None,
+        *,
+        read_only_state_rows: torch.Tensor | None = None,
     ) -> None: ...
 
 
@@ -83,6 +85,8 @@ class TritonSSUBackend(MambaSSUBackend):
         cache_steps: int | None = None,
         retrieve_parent_token: torch.Tensor | None = None,
         intermediate_state_indices: torch.Tensor | None = None,
+        *,
+        read_only_state_rows: torch.Tensor | None = None,
     ) -> None:
         self._kernel(
             state,
@@ -105,6 +109,7 @@ class TritonSSUBackend(MambaSSUBackend):
             intermediate_state_indices=intermediate_state_indices,
             enable_stochastic_rounding=self._enable_stochastic_rounding,
             cache_philox_rounds=self._cache_philox_rounds,
+            read_only_state_rows=read_only_state_rows,
         )
 
 
@@ -147,7 +152,11 @@ class FlashInferSSUBackend(MambaSSUBackend):
         cache_steps: int | None = None,
         retrieve_parent_token: torch.Tensor | None = None,
         intermediate_state_indices: torch.Tensor | None = None,
+        *,
+        read_only_state_rows: torch.Tensor | None = None,
     ) -> None:
+        if read_only_state_rows is not None:
+            raise ValueError("Read-only Mamba state rows require the Triton backend.")
         if retrieve_parent_token is not None:
             raise ValueError(
                 "FlashInfer backend does not support retrieve_parent_token. "
@@ -251,6 +260,8 @@ def selective_state_update(
     cache_steps: int | None = None,
     retrieve_parent_token: torch.Tensor | None = None,
     intermediate_state_indices: torch.Tensor | None = None,
+    *,
+    read_only_state_rows: torch.Tensor | None = None,
 ) -> None:
     """Dispatch selective-state-update to the configured backend.
 
@@ -277,6 +288,8 @@ def selective_state_update(
         retrieve_parent_token: (batch, T) tensor of parent token indices for EAGLE tree attention
         intermediate_state_indices: (batch,) tensor of indices for intermediate_states_buffer operations.
             If provided, uses these indices instead of state_batch_indices for the buffer.
+        read_only_state_rows: (batch,) bool mask of rows that skip state writeback
+            in Triton single-token decode.
     """
     assert _mamba_ssu_backend is not None, (
         "Mamba selective_state_update backend not initialized. "
@@ -302,4 +315,5 @@ def selective_state_update(
         cache_steps=cache_steps,
         retrieve_parent_token=retrieve_parent_token,
         intermediate_state_indices=intermediate_state_indices,
+        read_only_state_rows=read_only_state_rows,
     )

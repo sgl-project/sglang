@@ -448,6 +448,7 @@ class MambaMixer2(torch.nn.Module):
         metadata: Mamba2Metadata,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
+        read_only_state_rows: Optional[torch.Tensor] = None,
     ):
         # Returns the projected result. When `output` is given it is also
         # written into that buffer (required by the cuda-graph split ops, which
@@ -642,6 +643,8 @@ class MambaMixer2(torch.nn.Module):
         # Process decode requests
         if has_decode:
             is_target_verify = metadata.is_target_verify
+            if read_only_state_rows is not None:
+                assert not has_prefill and not is_target_verify
 
             # 2. Convolution sequence transformation
             if is_target_verify:
@@ -678,10 +681,14 @@ class MambaMixer2(torch.nn.Module):
                     1, 2
                 ).view(num_decode_tokens, -1)
             else:
-                ccu = (
-                    causal_conv1d_update
-                    if not use_triton_causal_conv
-                    else causal_conv1d_update_triton
+                if use_triton_causal_conv or read_only_state_rows is not None:
+                    ccu = causal_conv1d_update_triton
+                else:
+                    ccu = causal_conv1d_update
+                state_write_options = (
+                    {}
+                    if read_only_state_rows is None
+                    else {"read_only_state_rows": read_only_state_rows}
                 )
                 hidden_states_B_C_d = ccu(
                     hidden_states_B_C_d,
@@ -690,6 +697,7 @@ class MambaMixer2(torch.nn.Module):
                     self.conv1d.bias,
                     self.activation,
                     conv_state_indices=state_indices_tensor_d,
+                    **state_write_options,
                 )
 
             hidden_states_d, B_d, C_d = split_hidden_states_B_C_fn(hidden_states_B_C_d)
@@ -757,6 +765,7 @@ class MambaMixer2(torch.nn.Module):
                     dt_softplus=True,
                     state_batch_indices=state_indices_tensor_d,
                     out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
+                    read_only_state_rows=read_only_state_rows,
                 )
 
         # 4. gated MLP

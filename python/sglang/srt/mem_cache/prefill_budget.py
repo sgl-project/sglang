@@ -317,6 +317,49 @@ class PrefillBudget:
             )
 
 
+class StaticStatePrefillBudget(PrefillBudget):
+    """A fixed token pool with an independently allocated recurrent state pool."""
+
+    has_state_slots = True
+
+    def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens=0):
+        super().__init__(
+            allocator, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+        self.pending_state_slots = 0
+
+    def request_state_slots(self, req) -> int:
+        return self.allocator.state.pending_request_slots(
+            self.tree_cache.req_to_token_pool, req
+        )
+
+    def request_held_state_slots(self, req) -> int:
+        return self.allocator.state.held_request_slots(
+            self.tree_cache.req_to_token_pool, req
+        )
+
+    def state_slots_fit(self, state_slots: int) -> bool:
+        # The prefix matcher returns unused reservations before batch acquisition.
+        free = self.allocator.state_slots.available_after_alloc_group()
+        if self.tree_cache.supports_mamba() and not self.tree_cache.request_mamba_only:
+            free += self.tree_cache.mamba_evictable_size()
+        return self.pending_state_slots + state_slots <= free
+
+    def state_slots_exhausted(self) -> bool:
+        return not self.state_slots_fit(1)
+
+    def can_allocate_prefill(self, *, state_slots: int = 0, **kwargs) -> bool:
+        return self.state_slots_fit(state_slots) and super().can_allocate_prefill(
+            state_slots=state_slots, **kwargs
+        )
+
+    def reserve(self, extend_input_len, max_new_tokens, *, state_slots=0, **kwargs):
+        super().reserve(
+            extend_input_len, max_new_tokens, state_slots=state_slots, **kwargs
+        )
+        self.pending_state_slots += state_slots
+
+
 class SWAPrefillBudget(PrefillBudget):
     """Separate FULL/SWA partitions, including per-request SWA rings."""
 

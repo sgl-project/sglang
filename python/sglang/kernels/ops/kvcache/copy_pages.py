@@ -16,19 +16,44 @@ def _copy_pages_kernel(
     src_pages,
     dst_pages,
     page_words,
+    page_stride,
+    layer_stride,
     SRC_STRIDE: tl.constexpr,
     DST_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
+    LAYERS: tl.constexpr = 1,
+    STRIDED_TILES: tl.constexpr = False,
 ):
     pair = tl.program_id(0)
     src = tl.load(src_pages + pair * SRC_STRIDE).to(tl.int64)
     dst = tl.load(dst_pages + pair * DST_STRIDE).to(tl.int64)
-    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    # A pair naming one page for both ends (a padded `sink -> sink` pair of a
-    # fixed-shape move) copies nothing.
-    mask = (offsets < page_words) & (src != dst)
-    values = tl.load(buf + src * page_words + offsets, mask=mask)
-    tl.store(buf + dst * page_words + offsets, values, mask=mask)
+    if src != dst:
+        if STRIDED_TILES:
+            for layer in tl.range(LAYERS):
+                for tile in tl.range(
+                    tl.program_id(1), tl.cdiv(page_words, BLOCK), tl.num_programs(1)
+                ):
+                    _copy_page_tile(
+                        buf + layer.to(tl.int64) * layer_stride,
+                        src,
+                        dst,
+                        page_stride,
+                        page_words,
+                        tile,
+                        BLOCK,
+                    )
+        else:
+            _copy_page_tile(
+                buf, src, dst, page_stride, page_words, tl.program_id(1), BLOCK
+            )
+
+
+@triton.jit
+def _copy_page_tile(buf, src, dst, page_stride, page_words, tile, BLOCK: tl.constexpr):
+    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < page_words
+    values = tl.load(buf + src * page_stride + offsets, mask=mask)
+    tl.store(buf + dst * page_stride + offsets, values, mask=mask)
 
 
 _BLOCK = 2048
@@ -66,7 +91,45 @@ def copy_pages(
         src_pages,
         dst_pages,
         page_words,
+        page_words,
+        0,
         SRC_STRIDE=src_pages.stride(0),
         DST_STRIDE=dst_pages.stride(0),
         BLOCK=_BLOCK,
+    )
+
+
+def copy_layered_pages(
+    state: torch.Tensor, *, src: torch.Tensor, dst: torch.Tensor
+) -> None:
+    """Copy disjoint state rows in a [layers, slots, ...payload] tensor."""
+    if state.numel() == 0 or dst.numel() == 0:
+        return
+    if not state.is_cuda:
+        keep = src != dst
+        state[:, dst[keep]] = state[:, src[keep]]
+        return
+
+    layers, slots = state.shape[:2]
+    rows = state.view(layers, slots, -1)
+    assert rows.stride(-1) == 1, "state row payload must be contiguous"
+    wide = all(
+        value * rows.element_size() % 8 == 0
+        for value in (rows.storage_offset(), *rows.stride()[:2], rows.shape[-1])
+    )
+    words = rows.view(torch.int64 if wide else torch.uint8)
+    # Bound the launch size even when most pairs are no-ops on a wide beam.
+    tiles = min(triton.cdiv(words.shape[-1], _BLOCK), 8)
+    _copy_pages_kernel[(dst.numel(), tiles)](
+        words,
+        src,
+        dst,
+        words.shape[-1],
+        words.stride(1),
+        words.stride(0),
+        SRC_STRIDE=src.stride(0),
+        DST_STRIDE=dst.stride(0),
+        BLOCK=_BLOCK,
+        LAYERS=layers,
+        STRIDED_TILES=True,
     )

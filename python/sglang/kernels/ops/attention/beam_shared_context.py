@@ -51,10 +51,11 @@ def _shared_context_attention_kernel(
     BEAM_WIDTH: tl.constexpr,
     Q_PER_KV: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    MAX_DECODE: tl.constexpr,
+    VALUE_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_V: tl.constexpr,
 ):
     group = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -64,8 +65,10 @@ def _shared_context_attention_kernel(
     beam_offsets = beam_block * BLOCK_M + tl.arange(0, BLOCK_M)
     context_offsets = tl.arange(0, BLOCK_N)
     dim_offsets = tl.arange(0, BLOCK_D)
+    value_offsets = tl.arange(0, BLOCK_V)
     beam_mask = beam_offsets < BEAM_WIDTH
     dim_mask = dim_offsets < HEAD_DIM
+    value_mask = value_offsets < VALUE_DIM
 
     rows = tl.load(
         row_indices + group * stride_row_group + beam_offsets * stride_row_beam,
@@ -86,7 +89,7 @@ def _shared_context_attention_kernel(
     negative_infinity = -float("inf")
     max_values = tl.where(beam_mask, negative_infinity, 0.0)
     normalizers = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_M, BLOCK_V), dtype=tl.float32)
     softmax_scale_log2 = softmax_scale * 1.4426950408889634
 
     context_start = tl.load(context_cu_seqlens + group)
@@ -109,7 +112,7 @@ def _shared_context_attention_kernel(
         v_offsets = (
             slots[:, None] * stride_v_slot
             + kv_head * stride_v_head
-            + dim_offsets[None, :] * stride_v_dim
+            + value_offsets[None, :] * stride_v_dim
         )
         k_values = tl.load(
             k_buffer + k_offsets,
@@ -118,7 +121,7 @@ def _shared_context_attention_kernel(
         )
         v_values = tl.load(
             v_buffer + v_offsets,
-            mask=token_mask[:, None] & dim_mask[None, :],
+            mask=token_mask[:, None] & value_mask[None, :],
             other=0.0,
         )
 
@@ -140,15 +143,14 @@ def _shared_context_attention_kernel(
         max_values = new_max
 
     decode_length = tl.load(decode_lens + group)
-    for step in range(0, MAX_DECODE):
-        step_valid = step < decode_length
+    for step in tl.range(0, decode_length):
         decode_offsets = (
             group * stride_decode_group
             + (step * BEAM_WIDTH + beam_offsets) * stride_decode_token
         )
         slots = tl.load(
             decode_slots + decode_offsets,
-            mask=beam_mask & step_valid,
+            mask=beam_mask,
             other=0,
         )
         k_offsets = (
@@ -159,25 +161,23 @@ def _shared_context_attention_kernel(
         v_offsets = (
             slots[:, None] * stride_v_slot
             + kv_head * stride_v_head
-            + dim_offsets[None, :] * stride_v_dim
+            + value_offsets[None, :] * stride_v_dim
         )
         k_values = tl.load(
             k_buffer + k_offsets,
-            mask=beam_mask[:, None] & step_valid & dim_mask[None, :],
+            mask=beam_mask[:, None] & dim_mask[None, :],
             other=0.0,
         )
         v_values = tl.load(
             v_buffer + v_offsets,
-            mask=beam_mask[:, None] & step_valid & dim_mask[None, :],
+            mask=beam_mask[:, None] & value_mask[None, :],
             other=0.0,
         )
-        score_matrix = tl.dot(q_values, tl.trans(k_values))
-        diagonal_mask = tl.arange(0, BLOCK_M)[:, None] == tl.arange(0, BLOCK_M)[None, :]
         scores = tl.sum(
-            tl.where(diagonal_mask, score_matrix, 0.0),
+            q_values.to(tl.float32) * k_values.to(tl.float32),
             axis=1,
         )
-        scores = tl.where(beam_mask & step_valid, scores, negative_infinity)
+        scores = tl.where(beam_mask, scores, negative_infinity)
 
         new_max = tl.maximum(max_values, scores)
         previous_scale = tl.exp2((max_values - new_max) * softmax_scale_log2)
@@ -192,12 +192,12 @@ def _shared_context_attention_kernel(
     output_offsets = (
         rows[:, None] * stride_out_row
         + q_head * stride_out_head
-        + dim_offsets[None, :] * stride_out_dim
+        + value_offsets[None, :] * stride_out_dim
     )
     tl.store(
         output + output_offsets,
         result,
-        mask=beam_mask[:, None] & dim_mask[None, :],
+        mask=beam_mask[:, None] & value_mask[None, :],
     )
 
 
@@ -217,13 +217,19 @@ def shared_context_attention(
     """Apply shared prompt and per-beam suffix attention in one Triton kernel."""
     if q.ndim != 3:
         raise ValueError(f"Expected Q with 3 dimensions, got {q.shape}")
-    if k_buffer.ndim != 3 or v_buffer.shape != k_buffer.shape:
-        raise ValueError("K/V buffers must have matching [slots, heads, dim] shapes")
+    if (
+        k_buffer.ndim != 3
+        or v_buffer.ndim != 3
+        or k_buffer.shape[:2] != v_buffer.shape[:2]
+        or q.shape[-1] != k_buffer.shape[-1]
+    ):
+        raise ValueError("Expected matching K/V slots and heads and matching Q/K dims")
 
     if row_indices.ndim != 2:
         raise ValueError("Row indices must have shape [groups, beam_width]")
     num_groups, beam_width = row_indices.shape
     _, q_heads, head_dim = q.shape
+    value_dim = v_buffer.shape[-1]
     kv_heads = k_buffer.shape[1]
     if q_heads % kv_heads:
         raise ValueError(f"Q heads {q_heads} must be divisible by KV heads {kv_heads}")
@@ -235,16 +241,23 @@ def shared_context_attention(
         raise ValueError("Decode lengths must contain one value per beam group")
     if context_cu_seqlens.shape != (num_groups + 1,):
         raise ValueError("Context offsets must contain one boundary per beam group")
+    output_shape = (*q.shape[:2], value_dim)
     if output is None:
-        output = torch.empty_like(q)
-    elif output.shape != q.shape:
-        raise ValueError("Output must match Q shape")
+        output = q.new_empty(output_shape)
+    elif output.shape != output_shape:
+        raise ValueError("Output must match the Q rows and heads and the V dimension")
 
     high_group_count = num_groups >= 6
-    block_m = 64 if high_group_count else 128
-    block_n = 64 if high_group_count else 128
-    num_warps = 4 if high_group_count else 8
-    num_stages = 4 if high_group_count else 3
+    wide_head = max(head_dim, value_dim) > 128
+    small_tiles = high_group_count or wide_head
+    block_m = 64 if small_tiles else 128
+    block_n = 64 if small_tiles else 128
+    num_warps = 4 if small_tiles else 8
+    num_stages = 2 if wide_head else (4 if high_group_count else 3)
+    if max(head_dim, value_dim) > 256:
+        block_m = block_n = 32
+        num_warps = 8
+        num_stages = 1
 
     block_d = triton.next_power_of_2(head_dim)
     grid = (
@@ -282,10 +295,11 @@ def shared_context_attention(
         BEAM_WIDTH=beam_width,
         Q_PER_KV=q_heads // kv_heads,
         HEAD_DIM=head_dim,
-        MAX_DECODE=decode_slots.shape[1] // beam_width,
+        VALUE_DIM=value_dim,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_D=block_d,
+        BLOCK_V=triton.next_power_of_2(value_dim),
         num_warps=num_warps,
         num_stages=num_stages,
     )

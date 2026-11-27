@@ -1897,10 +1897,18 @@ class PrefillAdder:
         paged_input = storage_input_len + self.per_req_token_overhead
         request_slot_reserve = self._request_slot_reserve_for_req(req)
         paged_input += request_slot_reserve
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        max_new = self._swa_new_tokens(req)
+        decode_budget = beam_decode_budget(
+            req, min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
         )
+        beam_group = req.beam_group
+        if (
+            beam_group is not None
+            and beam_group.decode_slot_budget() is not None
+            and not self.memory_budget.admits_whole_requests
+            and paged_input + max_new > self.memory_budget.remaining_total
+        ):
+            return AddReqResult.NO_TOKEN
         # The chunk limit this request runs and commits at.
         chunk_limit = self.rem_chunk_tokens
         if self.memory_budget.admits_whole_requests:
@@ -1925,7 +1933,7 @@ class PrefillAdder:
             request_rows=self._request_rows_for_req(req),
             paged_input=paged_input,
             extend_input_len=cand_extend_input_len,
-            max_new_tokens=self._swa_new_tokens(req),
+            max_new_tokens=max_new,
             chunk_limit=self.rem_chunk_tokens,
             admitted_chunk_limit=chunk_limit,
             cached_tokens=req.prefix_len,
@@ -1973,7 +1981,7 @@ class PrefillAdder:
             paged_input=paged_input,
             reserve_tokens=IGNORE_EOS_RESERVE_TOKENS,
             extend_input_len=cand_extend_input_len,
-            max_new_tokens=self._swa_new_tokens(req),
+            max_new_tokens=max_new,
             chunk_limit=chunk_limit,
             state_slots=self._state_slots_for_req(req),
             request_rows=self._request_rows_for_req(req),
@@ -2022,7 +2030,7 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                decode_budget,
                 req.retracted_stain,
                 state_slots=self._state_slots_for_req(req),
                 request_rows=self._request_rows_for_req(req),
@@ -2062,9 +2070,7 @@ class PrefillAdder:
                 ),
                 # A budget that admitted the whole request commits the rest.
                 unfinished_input_len=cand_extend_input_len - trunc_len,
-                deferred_max_new_tokens=min(
-                    req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
-                ),
+                deferred_max_new_tokens=decode_budget,
                 admitted_chunk_limit=chunk_limit,
                 cached_tokens=req.prefix_len,
             )

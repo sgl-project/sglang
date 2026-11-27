@@ -376,6 +376,7 @@ def _fused_qkvzba_causal_conv1d_update_contiguous_kernel(
     conv_weight,
     conv_bias,
     conv_state_indices,
+    read_only_state_rows,
     stride_qkvz_batch: tl.constexpr,
     stride_qkvz_dim: tl.constexpr,
     stride_ba_batch: tl.constexpr,
@@ -393,6 +394,7 @@ def _fused_qkvzba_causal_conv1d_update_contiguous_kernel(
     STATE_LEN: tl.constexpr,
     KERNEL_WIDTH: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    HAS_READ_ONLY_STATE_ROWS: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -462,21 +464,24 @@ def _fused_qkvzba_causal_conv1d_update_contiguous_kernel(
     )
 
     # The direct-Triton wrapper sets effective state_len=width-1 for decode.
+    write_mask = qkv_mask & valid_slot
+    if HAS_READ_ONLY_STATE_ROWS:
+        write_mask &= ~tl.load(read_only_state_rows + batch_idx)
     for pos in tl.static_range(KERNEL_WIDTH - 2):
         next_value = tl.load(
             state_base + (pos + 1) * stride_state_pos,
-            mask=qkv_mask & valid_slot,
+            mask=write_mask,
             other=0.0,
         )
         tl.store(
             state_base + pos * stride_state_pos,
             next_value,
-            mask=qkv_mask & valid_slot,
+            mask=write_mask,
         )
     tl.store(
         state_base + (KERNEL_WIDTH - 2) * stride_state_pos,
         x,
-        mask=qkv_mask & valid_slot,
+        mask=write_mask,
     )
 
     # The first feature lanes also materialize the smaller downstream tensors.
@@ -554,6 +559,7 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
     head_v_dim: int,
     activation: str | None,
     pad_slot_id: int = -1,
+    read_only_state_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Decode-only fused Qwen3.5 projection unpack and Conv1D state update."""
     batch = mixed_qkvz.shape[0]
@@ -566,6 +572,13 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
     assert conv_state.shape[2] >= conv_weight.shape[1] - 1
     assert conv_state_indices.shape == (batch,)
     assert conv_state_indices.dtype in (torch.int32, torch.int64)
+    if read_only_state_rows is not None:
+        assert read_only_state_rows.shape == (batch,)
+        assert read_only_state_rows.dtype == torch.bool
+        assert (
+            read_only_state_rows.is_contiguous()
+            and read_only_state_rows.device == mixed_qkvz.device
+        )
     assert all(
         t.device == mixed_qkvz.device
         for t in (mixed_ba, conv_state, conv_weight, conv_state_indices)
@@ -612,6 +625,7 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
         conv_weight,
         conv_bias,
         conv_state_indices,
+        read_only_state_rows,
         mixed_qkvz.stride(0),
         mixed_qkvz.stride(1),
         mixed_ba.stride(0),
@@ -629,6 +643,7 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
         STATE_LEN=conv_state.shape[2],
         KERNEL_WIDTH=conv_weight.shape[1],
         HAS_BIAS=conv_bias is not None,
+        HAS_READ_ONLY_STATE_ROWS=read_only_state_rows is not None,
         SILU_ACTIVATION=activation in ("silu", "swish"),
         PAD_SLOT_ID=pad_slot_id,
         BLOCK_SIZE=block_size,
