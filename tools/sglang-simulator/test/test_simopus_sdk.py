@@ -19,7 +19,7 @@ def test_runtime_uses_only_public_sdk_imports_and_bindings():
                 or isinstance(node, ast.Import)
                 and any(alias.name.startswith("simopus.sdk.") for alias in node.names)
                 or isinstance(node, ast.Attribute)
-                and node.attr == "_native_region_assets"
+                and node.attr == "_native_segment_assets"
             ):
                 violations.append(f"{path.relative_to(root)}:{node.lineno}")
     assert not violations, violations

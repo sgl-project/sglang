@@ -159,7 +159,7 @@ def step_for(adapter, mode="DECODE", batch=2):
 @pytest.fixture
 def leaves(monkeypatch):
     from simopus.sdk import PerformanceResult
-    from simopus.sdk.estimator.operations.compute.region.cost import DSV41NativeSegment
+    from simopus.sdk.estimator.operations.compute.segment.cost import DSV41DSparkSegment
 
     calls = []
 
@@ -167,15 +167,15 @@ def leaves(monkeypatch):
         calls.append(dict(op.identity))
         return op._record_query(
             PerformanceResult(1.25, source="silicon"),
-            component="dsv41_native_segment_module",
+            component="dsv41_dspark_segment_module",
             requested_key=op.identity,
             resolved_key=op.identity,
             kernel_source="sglang",
-            kernel_impl=op.identity["kernel_impl"],
+            exec_mode=op.identity["exec_mode"],
             resolution="exact",
         )
 
-    monkeypatch.setattr(DSV41NativeSegment, "_query_measured", query)
+    monkeypatch.setattr(DSV41DSparkSegment, "_query_measured", query)
     return calls
 
 
@@ -294,7 +294,7 @@ def test_late_missing_cost_retains_evaluation_without_progress_or_commit(
     original = adapter.model.estimate_prepared_forward_result
 
     def estimate(**kwargs):
-        if kwargs["runtime"]["native_region_stage"]["phase"] == "target_verify":
+        if kwargs["runtime"]["native_segment_stage"]["phase"] == "target_verify":
             raise PerfDataNotAvailableError("CPU missing-cost control")
         return original(**kwargs)
 

@@ -114,7 +114,7 @@ def test_factory_loads_real_native_assets_and_public_umd(
         with pytest.raises(PredictorError, match="natural TP2"):
             SimOpusDSparkTimePredictor(**args)
         return
-    load_assets = sdk.load_native_region_assets
+    load_assets = sdk.load_native_segment_assets
     asset_loads = []
 
     def load_once(*args, **kwargs):
@@ -124,12 +124,12 @@ def test_factory_loads_real_native_assets_and_public_umd(
         asset_loads.append(assets)
         return assets
 
-    monkeypatch.setattr(sdk, "load_native_region_assets", load_once)
+    monkeypatch.setattr(sdk, "load_native_segment_assets", load_once)
     result = SimOpusDSparkTimePredictor(**args)
     assert len(asset_loads) == 1
     costs = result.dspark_runtime.session.cost_model
     assert costs.assets is asset_loads[0]
-    assert costs.model.native_region_assets is costs.assets
+    assert costs.model.native_segment_assets is costs.assets
     assert (
         result.dspark_runtime.session.cost_model.assets.execution_profile_id
         == options["native_segment_profile_id"]

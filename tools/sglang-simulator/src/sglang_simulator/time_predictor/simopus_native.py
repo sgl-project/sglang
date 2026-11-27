@@ -48,10 +48,10 @@ class SimOpusNativeCostAdapter:
         model_revision="main",
         cost_evidence_path=None,
     ):
-        from simopus.sdk import build_umd_static_model, load_native_region_assets
+        from simopus.sdk import build_umd_static_model, load_native_segment_assets
 
         try:
-            assets = load_native_region_assets(
+            assets = load_native_segment_assets(
                 database,
                 execution_profile=execution_profile,
                 native_segment_profile_id=native_segment_profile_id,
@@ -65,7 +65,7 @@ class SimOpusNativeCostAdapter:
                 backend="sglang",
                 revision=model_revision,
                 allow_download=False,
-                native_region_assets=assets,
+                native_segment_assets=assets,
             )
         except (OSError, TypeError, ValueError, KeyError, NotImplementedError) as error:
             raise PredictorError(
@@ -81,12 +81,12 @@ class SimOpusNativeCostAdapter:
     @classmethod
     def from_prepared_sdk(cls, model, assets, *, cost_evidence_path=None):
         """Reuse one public-factory model and its exact already-loaded assets."""
-        from simopus.sdk import NativeRegionAssets, UMDStaticModel
+        from simopus.sdk import NativeSegmentAssets, UMDStaticModel
 
         if (
             type(model) is not UMDStaticModel
-            or type(assets) is not NativeRegionAssets
-            or getattr(model, "native_region_assets", None) is not assets
+            or type(assets) is not NativeSegmentAssets
+            or getattr(model, "native_segment_assets", None) is not assets
             or not callable(getattr(model, "estimate_prepared_forward_ms", None))
         ):
             raise PredictorError(
@@ -286,7 +286,7 @@ class SimOpusNativeCostAdapter:
                 "forward_mode": mode,
                 "requests": requests,
                 "execution_profile": self.assets.capture_profile,
-                "runtime": {"native_region_stage": {"phase": phase, **inputs}},
+                "runtime": {"native_segment_stage": {"phase": phase, **inputs}},
             }
             if self._omit_cpu_detail:
                 milliseconds = self._numeric_forward(**arguments)
@@ -346,7 +346,7 @@ class SimOpusNativeCostAdapter:
                 and scope["native_segment_runtime_profile_sha256"]
                 == hashlib.sha256(step.runtime_profile_json.encode()).hexdigest()
                 and scope["complete_worker_partition"] is False
-                and scope["unmodeled_worker_regions"]
+                and scope["unmodeled_worker_segments"]
                 and scope["token_progress_modeled"] is False
                 and result.operation
                 == ("prefill" if mode == "EXTEND" else "decode_forward")

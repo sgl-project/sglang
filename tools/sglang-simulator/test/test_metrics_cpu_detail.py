@@ -184,7 +184,7 @@ def test_numeric_late_failure_does_not_draw_progress_or_commit(
     original = adapter._numeric_forward
 
     def fail_late(**kwargs):
-        if kwargs["runtime"]["native_region_stage"]["phase"] == "target_verify":
+        if kwargs["runtime"]["native_segment_stage"]["phase"] == "target_verify":
             raise PerfDataNotAvailableError("synthetic missing numeric cost")
         return original(**kwargs)
 

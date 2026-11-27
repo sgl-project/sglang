@@ -15,7 +15,7 @@ evidence. No simulator cost graph or legacy cost fallback is installed.
 
 Source-binding roots are opaque SDK inputs. Configuration resolution delegates to
 `sdk.resolve_native_source_binding(binding, base_dir=...)`; native policy, source
-validation and profile loading remain with `sdk.load_native_region_assets`.
+validation and profile loading remain with `sdk.load_native_segment_assets`.
 The adapter does not inspect SQLite paths or PerfDB metadata layouts. A compatible
 SDK providing both interfaces is required; unsupported SDKs are not replaced by
 filesystem readers. The factory opens `simopus.sdk.PerfDB` with the configured
@@ -126,12 +126,12 @@ accuracy acceptance, or establish a wall-clock speedup.
 The structured route requires `estimate_prepared_forward_result`. The optional
 numeric route additionally requires a callable public
 `UMDStaticModel.estimate_prepared_forward_ms` and reuses one already initialized
-model/assets pair from `load_native_region_assets` and
-`build_umd_static_model(..., native_region_assets=assets)`. Entering numeric mode
+model/assets pair from `load_native_segment_assets` and
+`build_umd_static_model(..., native_segment_assets=assets)`. Entering numeric mode
 must not load assets or construct a second pair again.
 
 The adapter retains exact model/assets type checks, numeric-API callability and
-the model's public, read-only `native_region_assets` identity property. The
+the model's public, read-only `native_segment_assets` identity property. The
 SDK owns the binding; adapters do not inspect its private fields. A missing
 API or an incompatible pair fails initialization with
 `provider_initialization_failed`; numeric mode does not silently fall back or

@@ -162,7 +162,7 @@ class SimOpusDSparkTimePredictor(InferTimePredictor):
                 native_capture_profile, "native_capture_profile"
             )
             capture = sdk.DecodeExecutionProfile.from_dict(json.loads(capture_raw))
-            assets = sdk.load_native_region_assets(
+            assets = sdk.load_native_segment_assets(
                 database,
                 execution_profile=capture,
                 native_segment_profile_id=native_segment_profile_id,
@@ -219,7 +219,7 @@ class SimOpusDSparkTimePredictor(InferTimePredictor):
                 backend="sglang",
                 revision=model_revision,
                 allow_download=False,
-                native_region_assets=assets,
+                native_segment_assets=assets,
             )
             if metrics_cpu_detail_enabled():
                 costs = SimOpusNativeCostAdapter(

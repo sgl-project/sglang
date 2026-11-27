@@ -259,7 +259,7 @@ class SimOpusTimePredictor(InferTimePredictor):
                 ExtendExecutionProfile,
                 execution_profile,
             )
-            self._execution_profile.validate_for_kernel_impl(str(attn_kernel_impl))
+            self._execution_profile.validate_for_exec_mode(str(attn_kernel_impl))
         except (TypeError, ValueError) as error:
             raise _error(
                 "invalid_execution_profile",
@@ -270,7 +270,7 @@ class SimOpusTimePredictor(InferTimePredictor):
                 DecodeExecutionProfile,
                 decode_execution_profile,
             )
-            profile_decode_impl = self._decode_execution_profile.kernel_impl
+            profile_decode_impl = self._decode_execution_profile.exec_mode
             if (
                 decode_attn_kernel_impl is not None
                 and self._decode_attn_kernel_impl != profile_decode_impl
@@ -421,9 +421,7 @@ class SimOpusTimePredictor(InferTimePredictor):
         try:
             if mode == "DECODE":
                 latency_ms = self._provider.estimate_profiled_decode_forward_ms(
-                    history_lengths=tuple(
-                        request.past_kv_length for request in batch.reqs
-                    ),
+                    seq_lens=tuple(request.past_kv_length for request in batch.reqs),
                     execution_profile=self._decode_execution_profile,
                     **self._runtime,
                 )
@@ -438,7 +436,7 @@ class SimOpusTimePredictor(InferTimePredictor):
                         for request in batch.reqs
                     ),
                     execution_profile=self._execution_profile,
-                    attn_kernel_impl=self._context_attn_kernel_impl,
+                    exec_mode=self._context_attn_kernel_impl,
                     **self._runtime,
                 )
         except Exception as error:

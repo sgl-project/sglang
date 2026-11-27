@@ -53,7 +53,7 @@ class _ExecutionProfile:
             raise TypeError("execution profile must be a mapping")
         return cls(payload)
 
-    def validate_for_kernel_impl(self, kernel_impl):
+    def validate_for_exec_mode(self, kernel_impl):
         if kernel_impl != "cuda_graph":
             raise ValueError("profile requires cuda_graph")
 
@@ -67,7 +67,7 @@ class _ExecutionProfile:
 
 class _DecodeExecutionProfile(_ExecutionProfile):
     @property
-    def kernel_impl(self):
+    def exec_mode(self):
         return (
             "eager"
             if self.payload["decode_graph_backend"] == "disabled"
@@ -305,9 +305,9 @@ def test_decode_passes_ordered_histories_and_profile_once():
     assert len(provider.calls) == 1
     method, arguments = provider.calls[0]
     assert method == "estimate_profiled_decode_forward_ms"
-    assert arguments["history_lengths"] == (127, 1025, 4097, 8191)
+    assert arguments["seq_lens"] == (127, 1025, 4097, 8191)
     assert arguments["execution_profile"].to_dict() == _DECODE_PROFILE
-    assert "attn_kernel_impl" not in arguments
+    assert "exec_mode" not in arguments
     metrics = predictor.get_metrics()["simopus"]
     assert metrics["contract"] == PROVIDER_CONTRACT
     assert metrics["decode_execution_profile"] == _DECODE_PROFILE
@@ -591,9 +591,9 @@ def test_real_sdk_decode_profile_is_independent_of_context(canonical_predictor):
     assert len(provider.calls) == 1
     method, arguments = provider.calls[0]
     assert method == "estimate_profiled_decode_forward_ms"
-    assert arguments["history_lengths"] == (513, 511)
+    assert arguments["seq_lens"] == (513, 511)
     assert arguments["execution_profile"] == eager
-    assert "attn_kernel_impl" not in arguments
+    assert "exec_mode" not in arguments
     metrics = predictor.get_metrics()["simopus"]
     assert metrics["runtime"]["attn_kernel_impl"] == "cuda_graph"
     assert metrics["runtime"]["decode_attn_kernel_impl"] == "eager"
