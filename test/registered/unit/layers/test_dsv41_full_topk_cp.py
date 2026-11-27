@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 
 from sglang.srt.layers.attention.dsv4.v41_indexer.full_topk import FullTopKIndexer
@@ -120,6 +121,20 @@ class TestDSV41FullTopKCP(CustomTestCase):
         req = torch.tensor([7, 5, 7])
         pos = torch.tensor([12, 8, 14])
         self._check(self._inputs(req, pos, [1, 0, 2], 2, explicit=True), req)
+
+    def test_dense_host_layout_does_not_read_device_request_metadata(self):
+        req = torch.tensor([5] * 3 + [7] * 6)
+        pos = torch.cat([torch.arange(17, 20), torch.arange(14, 20)])
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                inputs = self._inputs(req, pos, [3, 0, 6], ratio, explicit=True)
+                inputs = msgspec.structs.replace(
+                    inputs,
+                    request_layout_cpu=[(5, 3, 20), (2, 0, 0), (7, 6, 20)],
+                    req_pool_indices=torch.empty(3, dtype=torch.int64, device="meta"),
+                    req_rows=torch.empty(req.numel(), dtype=torch.int64, device="meta"),
+                )
+                self._check(inputs, req)
 
 
 if __name__ == "__main__":

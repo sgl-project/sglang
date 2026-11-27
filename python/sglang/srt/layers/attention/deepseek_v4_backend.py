@@ -4231,6 +4231,22 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu=seq_lens_cpu,
                 ratio=layer.compress_ratio,
             )
+        request_layout_cpu = None
+        if (
+            req is not None
+            and get_parallel().attn_cp_size == 1
+            and forward_batch.req_pool_indices_cpu is not None
+            and rows_per_request is not None
+            and seq_lens_cpu is not None
+            and sum(rows_per_request) == pos.numel()
+        ):
+            request_layout_cpu = list(
+                zip(
+                    forward_batch.req_pool_indices_cpu.tolist(),
+                    rows_per_request,
+                    seq_lens_cpu,
+                )
+            )
         return PrefillInputs(
             indexer=layer.indexer,
             layer_id=layer.layer_id,
@@ -4254,6 +4270,7 @@ class DeepseekV4AttnBackend(
                 else None
             ),
             row_shard=row_shard,
+            request_layout_cpu=request_layout_cpu,
         )
 
     def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:

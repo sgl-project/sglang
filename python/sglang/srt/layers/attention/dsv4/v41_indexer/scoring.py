@@ -455,10 +455,16 @@ def prefill_requests(
             inputs.req_pool_indices, repeats, output_size=pos.numel()
         )
     assert inputs.seq_lens_cpu is not None
+    layout = inputs.request_layout_cpu
+    request_ids = (
+        [r for r, _, _ in layout]
+        if layout is not None
+        else inputs.req_pool_indices.tolist()
+    )
     # First flattened-K column of each request row, as inputs.k_slots lays them out.
     k_starts = dict(
         zip(
-            inputs.req_pool_indices.tolist(),
+            request_ids,
             itertools.accumulate((s // ratio for s in inputs.seq_lens_cpu), initial=0),
         )
     )
@@ -468,10 +474,22 @@ def prefill_requests(
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
-    for r in torch.unique_consecutive(req).tolist():
-        tok = (req == r).nonzero().squeeze(1)
+    if layout is not None:
+        request_rows = []
+        start = 0
+        for r, rows, length in layout:
+            if rows:
+                tok = torch.arange(start, start + rows, device=pos.device)
+                request_rows.append((r, tok, length // ratio))
+            start += rows
+    else:
+        request_rows = (
+            (r, (req == r).nonzero().squeeze(1), None)
+            for r in torch.unique_consecutive(req).tolist()
+        )
+    for r, tok, visible in request_rows:
         lens = compress_lens[tok]
-        lc = int(lens.max().item())
+        lc = visible if visible is not None else int(lens.max().item())
         if lc == 0:
             continue
         j = torch.arange(lc, device=pos.device)

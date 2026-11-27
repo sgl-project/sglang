@@ -711,6 +711,58 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 91)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
+    def test_swa_request_cap_counts_pipeline_microbatches(self):
+        from sglang.srt.model_executor.pool_configurator import compute_swa_request_cap
+
+        _publish_config(
+            self,
+            max_running_requests=8,
+            chunked_prefill_size=8192,
+            disable_overlap_schedule=True,
+            speculative_algorithm=None,
+            speculative_num_draft_tokens=None,
+            disaggregation_mode="prefill",
+        )
+        # Every live request keeps its window and page slack. Each pipeline
+        # microbatch can additionally retain a full chunk until its result
+        # arrives from the final stage, even with overlap scheduling disabled.
+        request_slots = (128 + 4 + 256 + 256) * 8
+        for pp_size, async_depth in ((1, 0), (2, 0), (2, 1), (4, 2)):
+            with (
+                self.subTest(pp_size=pp_size, async_depth=async_depth),
+                mock_cpu_env(),
+                get_parallel().override(
+                    pp_size=pp_size, pp_async_batch_depth=async_depth
+                ),
+            ):
+                cap = compute_swa_request_cap(page_size=256, window=128, attn_dp_size=1)
+            self.assertEqual(cap, request_slots + (pp_size + async_depth) * 8192 + 256)
+
+    def test_swa_request_cap_pipeline_pool_stays_within_memory_budget(self):
+        available = 1_000_000
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            disable_radix_cache=True,
+            chunked_prefill_size=16,
+            sliding_window_size=8,
+            page_size=4,
+            max_running_requests=8,
+            disaggregation_mode="prefill",
+            disable_overlap_schedule=True,
+        )
+        with mock_cpu_env(), get_parallel().override(pp_size=4, pp_async_batch_depth=2):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=4)
+        self.assertEqual(config.swa_max_total_num_tokens, 20 * 8 + 6 * 16 + 4)
+        self.assertLessEqual(_actual_memory_used(mr, config), available)
+
     def test_swa_request_cap_accounts_for_draft_swa_layers(self):
         """Draft SWA tensors consume the same fixed-capacity pool as target SWA."""
         available = 1_000_000
