@@ -115,3 +115,40 @@ def gather_spec_extras(
         BLOCK=block,
     )
     return topk_p, topk_index, bonus_tokens, hidden_states
+
+
+@triton.jit
+def _gather_seq_lens_and_bonus_kernel(
+    idx_ptr, seq_src, seq_dst, bonus_src, bonus_dst, m, BLOCK: tl.constexpr
+):
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = rows < m
+    src = tl.load(idx_ptr + rows, mask=mask, other=0).to(tl.int64)
+    tl.store(seq_dst + rows, tl.load(seq_src + src, mask=mask), mask=mask)
+    tl.store(bonus_dst + rows, tl.load(bonus_src + src, mask=mask), mask=mask)
+
+
+def gather_seq_lens_and_bonus(
+    indices: torch.Tensor,
+    new_seq_lens_buf: torch.Tensor,
+    output_tokens_buf: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(new_seq_lens_buf[indices], output_tokens_buf[indices])`` in one launch:
+    the spec v2 relay's committed lengths and bonus tokens for the next step."""
+    assert new_seq_lens_buf.dim() == 1 and output_tokens_buf.dim() == 1
+    indices = indices.contiguous()
+    m = indices.shape[0]
+    seq_lens = _empty_like_rows(new_seq_lens_buf, m)
+    bonus_tokens = _empty_like_rows(output_tokens_buf, m)
+    if m > 0:
+        block = min(1024, triton.next_power_of_2(m))
+        _gather_seq_lens_and_bonus_kernel[(triton.cdiv(m, block),)](
+            indices,
+            new_seq_lens_buf,
+            seq_lens,
+            output_tokens_buf,
+            bonus_tokens,
+            m,
+            BLOCK=block,
+        )
+    return seq_lens, bonus_tokens

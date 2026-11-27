@@ -19,6 +19,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.dspark.static_accept_tail import CommitStage
 from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
@@ -121,6 +122,25 @@ class DeferredDraftKVStore:
         torch.cuda.current_stream().wait_event(self._proj_done)
         self._proj_unjoined = False
         return True
+
+    def will_join_projection(self) -> bool:
+        """Whether join_projection would join a projection now."""
+        return self._proj_unjoined
+
+    def stage_targets(
+        self, *, cache_loc: torch.Tensor, positions: torch.Tensor, with_state_slot: bool
+    ) -> CommitStage:
+        """stage()'s operands, for a launch that stages the commit itself (the greedy
+        accept tail); the state slots are the request slots of the verify rows."""
+        self._with_state_slot = with_state_slot
+        return CommitStage(
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_dst=self.cache_loc,
+            positions_dst=self.positions,
+            commit_lens_dst=self.commit_lens,
+            state_slot_dst=self.state_slot if with_state_slot else None,
+        )
 
     def stage(
         self,
