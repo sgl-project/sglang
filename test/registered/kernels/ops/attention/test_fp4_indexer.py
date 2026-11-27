@@ -8,6 +8,8 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
@@ -24,6 +26,12 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_prefill_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_gluon import (
+    _decode_key_words,
+    _key_word_layout,
+    _tile_key_words,
+    fp4_index_logits_paged_gluon_supported,
 )
 from sglang.kernels.ops.attention.dsv4.rope import (
     apply_rotary_emb_triton,
@@ -627,11 +635,42 @@ def _decode_index_k_kernel(table, slots, valid, k_low, k_high, page_size, row_st
     tl.store(k_high + rows[:, None] * 64 + cols[None, :], high)
 
 
+@gluon.jit
+def _decode_index_k_gluon_kernel(
+    table, slots, valid, k_low, k_high, row_stride, PAGE: gl.constexpr, WL: gl.constexpr
+):
+    MMA: gl.constexpr = gl.NVMMADistributedLayout(
+        version=[2, 0], warps_per_cta=[1, 4], instr_shape=[16, 8]
+    )
+    KL: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MMA, k_width=4)
+    rows = gl.program_id(0) * 128 + gl.arange(0, 128, layout=gl.SliceLayout(0, WL))
+    words = gl.arange(0, 16, layout=gl.SliceLayout(1, WL))
+    pay, exps = _tile_key_words(
+        table,
+        gl.load(slots + rows),
+        gl.load(valid + rows) != 0,
+        words,
+        PAGE,
+        row_stride,
+    )
+    low, high = _decode_key_words(
+        pay, exps, gl.expand_dims(8 * (words // 4), 1), KL, 128
+    )
+    cols = gl.arange(0, 64, layout=gl.SliceLayout(1, KL))
+    rows = gl.program_id(0) * 128 + gl.arange(0, 128, layout=gl.SliceLayout(0, KL))
+    offs = gl.expand_dims(rows, 0) * 64 + gl.expand_dims(cols, 1)
+    gl.store(k_low + offs, low)
+    gl.store(k_high + offs, high)
+
+
 @pytest.mark.skipif(_is_xpu, reason="Paged decode decodes keys with CUDA inline PTX")
-def test_fp4_index_k_tile_decodes_every_code_and_exponent():
+@pytest.mark.parametrize("decoder", ["triton", "gluon"])
+def test_fp4_index_k_tile_decodes_every_code_and_exponent(decoder):
     """Every payload byte against every block exponent the quantizer writes (1..254),
     in every block position, decodes to the bits of the fp32 reference; masked rows
-    decode to +0."""
+    decode to +0. Both the Triton tile and the Gluon mma-operand decode."""
+    if decoder == "gluon" and not fp4_index_logits_paged_gluon_supported(32):
+        pytest.skip("Gluon paged Indexer needs SM80 / SM90")
     device = get_device()
     exponents = torch.arange(1, 255, device=device)
     slots_used = exponents.numel() * 4
@@ -651,9 +690,22 @@ def test_fp4_index_k_tile_decodes_every_code_and_exponent():
     valid[-64:] = 0
     k_low = torch.empty(slots.numel(), 64, device=device, dtype=torch.bfloat16)
     k_high = torch.empty_like(k_low)
-    _decode_index_k_kernel[(slots.numel() // 64,)](
-        table, slots, valid, k_low, k_high, PAGE_SIZE, table.stride(0)
-    )
+    if decoder == "triton":
+        _decode_index_k_kernel[(slots.numel() // 64,)](
+            table, slots, valid, k_low, k_high, PAGE_SIZE, table.stride(0)
+        )
+    else:
+        _decode_index_k_gluon_kernel[(slots.numel() // 128,)](
+            table,
+            slots,
+            valid,
+            k_low,
+            k_high,
+            table.stride(0),
+            PAGE=PAGE_SIZE,
+            WL=_key_word_layout(128, 4),
+            num_warps=4,
+        )
 
     levels = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device)
     codes = payload[slots.long()].long()
@@ -669,6 +721,53 @@ def test_fp4_index_k_tile_decodes_every_code_and_exponent():
 
     assert torch.equal(k_low.view(torch.int16), reference(codes & 15))
     assert torch.equal(k_high.view(torch.int16), reference(codes >> 4))
+
+
+@pytest.mark.skipif(
+    not fp4_index_logits_paged_gluon_supported(32), reason="Gluon needs SM80 / SM90"
+)
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("ratio,masked", [(1, False), (2, False), (1, True)])
+def test_fp4_paged_logits_gluon_matches_triton(heads, ratio, masked):
+    """Quantized gaussian keys on shuffled pages, rows from empty to several shares
+    long: the Gluon balanced kernel gives the Triton balanced kernel's bits."""
+    from sglang.kernels.ops.attention.dsv4 import fp4_indexer
+
+    torch.manual_seed(5)
+    device = get_device()
+    lengths = [0, 1, 63, 64, 65, 127, 128, 129, 3000, 40000, 70001, 5]
+    batch, capacity = len(lengths), 70016
+    pages = sum(triton.cdiv(n, PAGE_SIZE) for n in lengths) + 1
+    table = torch.zeros(pages, PAGE_SIZE * 68, device=device, dtype=torch.uint8)
+    order = torch.randperm(pages, device=device)
+    req_table = torch.full(
+        (batch, capacity * ratio), -1, device=device, dtype=torch.int32
+    )
+    used = 0
+    for row, n in enumerate(lengths):
+        count = triton.cdiv(n, PAGE_SIZE)
+        loc = (
+            order[used : used + count, None] * PAGE_SIZE
+            + torch.arange(PAGE_SIZE, device=device)
+        ).flatten()[:n]
+        used += count
+        keys = torch.randn(n, HEAD_DIM, device=device, dtype=torch.bfloat16) * 3
+        store_fp4_index_k_cache(keys, table, loc, page_size=PAGE_SIZE, rne=True)
+        req_table[row, : n * ratio : ratio] = (loc * ratio).to(torch.int32)
+    q = torch.randn(batch, heads, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    weights = torch.randn(batch, heads, device=device, dtype=torch.bfloat16)
+    req = torch.arange(batch, device=device, dtype=torch.int32)
+    lens = torch.tensor(lengths, device=device, dtype=torch.int32)
+    mask = torch.rand(batch, capacity, device=device) > 0.3 if masked else None
+    args = (q, weights, req, req_table, lens, table, PAGE_SIZE, capacity, ratio, mask)
+
+    actual = fp4_index_logits_paged(*args)
+    with patch.object(fp4_indexer, "_paged_gluon_supported", lambda heads: False):
+        expected = fp4_index_logits_paged(*args)
+    visible = torch.arange(capacity, device=device)[None, :] < lens[:, None]
+    assert torch.equal(
+        actual[visible].view(torch.int32), expected[visible].view(torch.int32)
+    )
 
 
 @pytest.mark.skipif(

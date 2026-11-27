@@ -672,7 +672,10 @@ def fp4_index_logits_paged(
         )
         return out
     if batch <= _PAGED_BALANCED_MAX_BATCH:
-        _launch_fp4_index_logits_paged_balanced(
+        launch = _launch_fp4_index_logits_paged_balanced
+        if _paged_gluon_supported(heads):
+            launch = _launch_fp4_index_logits_paged_balanced_gluon
+        launch(
             q,
             weights,
             req,
@@ -961,6 +964,19 @@ def _fp4_index_logits_paged_balanced_kernel(
         t = stop
         b += 1
         row_start = row_end
+
+
+def _paged_gluon_supported(heads: int) -> bool:
+    from .fp4_indexer_gluon import fp4_index_logits_paged_gluon_supported
+
+    return fp4_index_logits_paged_gluon_supported(heads)
+
+
+def _launch_fp4_index_logits_paged_balanced_gluon(*args):
+    """Same scores as _launch_fp4_index_logits_paged_balanced, bit for bit."""
+    from .fp4_indexer_gluon import launch_fp4_index_logits_paged_balanced_gluon
+
+    launch_fp4_index_logits_paged_balanced_gluon(*args)
 
 
 def _launch_fp4_index_logits_paged_balanced(
