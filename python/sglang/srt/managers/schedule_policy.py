@@ -363,6 +363,8 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
+            else:
+                waiting_queue.sort(key=lambda req: req.time_stats.wait_queue_entry_time)
         elif policy == CacheAwarePolicy.UNIBOOST:
             self._sort_by_uniboost(waiting_queue)
         elif isinstance(policy, CacheAwarePolicy):

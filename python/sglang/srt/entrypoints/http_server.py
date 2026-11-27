@@ -167,6 +167,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    SchedulePolicySwitchReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
@@ -1679,6 +1680,23 @@ async def pd_role_switch(
     Requires --enable-pd-role-switch; the instance must be idle."""
     try:
         result = await _global_state.tokenizer_manager.pd_role_switch(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        msgspec_to_builtins(result),
+        status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/schedule_policy_switch", methods=["POST"])
+async def schedule_policy_switch(
+    obj: Annotated[SchedulePolicySwitchReqInput, Body()], request: Request
+):
+    """Switch this scheduler's schedule policy at runtime."""
+    try:
+        result = await _global_state.tokenizer_manager.schedule_policy_switch(
+            obj, request
+        )
     except Exception as e:
         return _create_error_response(e)
     return ORJSONResponse(

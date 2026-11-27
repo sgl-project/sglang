@@ -204,6 +204,7 @@ from sglang.srt.managers.io_struct import (
     RpcReqOutput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
+    SchedulePolicySwitchReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -256,6 +257,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
     mamba_prefill_chunk_grid,
 )
+from sglang.srt.managers.scheduler_components import schedule_policy_switch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -1417,6 +1419,8 @@ class Scheduler(
         # Set if a role switch tore down the old role but failed to rebuild
         # either the new or the old role; the instance can no longer serve.
         self._pd_role_switch_unhealthy = False
+        # Guard against reentrant schedule-policy switches.
+        self._schedule_policy_switch_in_progress = False
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue = IndexedReqList(ListKind.WAITING, abort=self._abort_waiting)
@@ -1564,33 +1568,7 @@ class Scheduler(
 
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
-        self.policy = SchedulePolicy(
-            self.schedule_policy,
-            self.tree_cache,
-            self.enable_hierarchical_cache,
-            self.enable_priority_scheduling,
-            self.schedule_low_priority_values_first,
-            shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
-            bounded_lpm_enabled=self.dllm_config is None,
-            uniboost_gamma=get_schedule().uniboost_gamma,
-            enable_uniboost_gamma_ada=get_schedule().enable_uniboost_gamma_ada,
-            # Every rank of a TP or PP group must admit the same batch.
-            uniboost_rank_invariant=get_parallel().tp_size > 1
-            or get_parallel().pp_size > 1,
-            uniboost_step_clock=lambda: self.forward_ct,
-            shortest_prefill_load_scaling=ShortestPrefillLoadScaling.resolve(
-                chunked_prefill_size=self.chunked_prefill_size,
-                halving_chunks=get_schedule().shortest_prefill_boundary_halving_chunks,
-                decay_start_chunks=get_schedule().shortest_prefill_boundary_decay_start_chunks,
-                budget_min_ratio=get_schedule().shortest_prefill_budget_min_ratio,
-                budget_doubling_chunks=get_schedule().shortest_prefill_budget_doubling_chunks,
-            ),
-        )
-        self.policy._on_bounded_state_change = lambda active: (
-            self.waiting_queue.set_on_leave(
-                self.policy.retire_waiting_members if active else None
-            )
-        )
+        self.policy = self._create_schedule_policy(self.schedule_policy)
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
             window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
@@ -1625,6 +1603,54 @@ class Scheduler(
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
+
+    def _create_schedule_policy(
+        self, policy_name: str, *, switching: bool = False
+    ) -> SchedulePolicy:
+        """Use the same policy configuration at startup and during a switch."""
+        config = get_schedule()
+        shortest_prefill = policy_name == "shortest-prefill-first"
+        # Runtime switches suspend options for other policies; startup still
+        # validates the original combination of policy and options.
+        policy = SchedulePolicy(
+            policy_name,
+            self.tree_cache,
+            self.enable_hierarchical_cache,
+            self.enable_priority_scheduling,
+            self.schedule_low_priority_values_first,
+            shortest_prefill_aging_factor=(
+                config.shortest_prefill_aging_factor
+                if not switching or shortest_prefill
+                else 0.0
+            ),
+            bounded_lpm_enabled=self.dllm_config is None,
+            uniboost_gamma=config.uniboost_gamma,
+            enable_uniboost_gamma_ada=(
+                config.enable_uniboost_gamma_ada
+                and (not switching or policy_name == "uniboost")
+            ),
+            # Every rank of a TP or PP group must admit the same batch.
+            uniboost_rank_invariant=get_parallel().tp_size > 1
+            or get_parallel().pp_size > 1,
+            uniboost_step_clock=lambda: self.forward_ct,
+            shortest_prefill_load_scaling=(
+                ShortestPrefillLoadScaling.resolve(
+                    chunked_prefill_size=self.chunked_prefill_size,
+                    halving_chunks=config.shortest_prefill_boundary_halving_chunks,
+                    decay_start_chunks=config.shortest_prefill_boundary_decay_start_chunks,
+                    budget_min_ratio=config.shortest_prefill_budget_min_ratio,
+                    budget_doubling_chunks=config.shortest_prefill_budget_doubling_chunks,
+                )
+                if not switching or shortest_prefill
+                else None
+            ),
+        )
+        policy._on_bounded_state_change = lambda active: (
+            self.waiting_queue.set_on_leave(
+                policy.retire_waiting_members if active else None
+            )
+        )
+        return policy
 
     def feed_watchdog(self) -> None:
         """Tell the watchdogs the scheduler is alive while it waits on the host
@@ -2088,6 +2114,7 @@ class Scheduler(
                 ),
                 (SlowDownReqInput, self.slow_down),
                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
+                (SchedulePolicySwitchReqInput, self.handle_schedule_policy_switch),
                 (
                     ProfileReq,
                     lambda req: self.profiler_manager._profile(req),
@@ -3076,10 +3103,11 @@ class Scheduler(
 
     def maybe_wire_uniboost_gamma_ada(self) -> None:
         # gamma-Ada records the latency of every request that ends.
-        if self.policy.uniboost_gamma_ada is not None:
-            self.request_retirer.release_observer = (
-                self.policy.uniboost_gamma_ada.record_finish
-            )
+        self.request_retirer.release_observer = (
+            self.policy.uniboost_gamma_ada.record_finish
+            if self.policy.uniboost_gamma_ada is not None
+            else None
+        )
 
     def maybe_init_decode_offload_manager(self) -> None:
         self.decode_offload_manager = None
@@ -7250,6 +7278,9 @@ class Scheduler(
 
     def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
         return role_switch.handle_pd_role_switch(self, recv_req)
+
+    def handle_schedule_policy_switch(self, recv_req: SchedulePolicySwitchReqInput):
+        return schedule_policy_switch.handle_schedule_policy_switch(self, recv_req)
 
     def _sync_disaggregation_mode_to_subcomponents(self):
         # Push the (possibly flipped) mode into sub-components that cache it.

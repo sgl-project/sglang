@@ -75,6 +75,8 @@ from sglang.srt.managers.io_struct import (
     RpcReqInput,
     RpcReqOutput,
     ScaleElasticEPReqOutput,
+    SchedulePolicySwitchReqInput,
+    SchedulePolicySwitchReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -136,6 +138,7 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
+    ("schedule_policy_switch", SchedulePolicySwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
@@ -984,6 +987,42 @@ class TokenizerControlMixin:
             old_role=results[0].old_role if results else "",
             new_role=obj.new_role,
             safe_to_restore=safe_to_restore,
+        )
+
+    async def schedule_policy_switch(
+        self: TokenizerManager,
+        obj: SchedulePolicySwitchReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> SchedulePolicySwitchReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.schedule_policy_switch_communicator(obj)
+        all_success = bool(results) and all(r.success for r in results)
+        effective_policy = (
+            results[0].new_schedule_policy if results else obj.new_schedule_policy
+        )
+        if all_success and any(
+            r.new_schedule_policy != effective_policy for r in results
+        ):
+            return SchedulePolicySwitchReqOutput(
+                success=False,
+                message="scheduler workers reported different effective policies",
+                old_schedule_policy=results[0].old_schedule_policy,
+                new_schedule_policy=effective_policy,
+            )
+        if all_success:
+            self.record_config_updates(
+                "tokenizer.schedule_policy_switch", schedule_policy=effective_policy
+            )
+            msg = "ok"
+        else:
+            msg = "; ".join(r.message for r in results if not r.success)
+            if not results:
+                msg = "no scheduler workers responded"
+        return SchedulePolicySwitchReqOutput(
+            success=all_success,
+            message=msg,
+            old_schedule_policy=results[0].old_schedule_policy if results else "",
+            new_schedule_policy=effective_policy,
         )
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
