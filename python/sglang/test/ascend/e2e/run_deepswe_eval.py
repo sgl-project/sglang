@@ -63,6 +63,65 @@ def install_eval_env():
     subprocess.run(["bash", script], cwd=WORK_DIR, env=env, check=True)
 
 
+# pier's mini-swe-agent install step fetches the uv binary from GitHub releases,
+# which this network cannot reach. Swap that download for the OBS mirror and
+# point uv at a reachable PyPI index (via ~/.local/bin/env, which pier sources
+# right after).
+UV_TARBALL_URL = os.environ.get(
+    "DEEPSWE_UV_TARBALL_URL",
+    "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/ci/tools/uv-x86_64-unknown-linux-gnu.tar.gz",
+)
+UV_INDEX_URL = os.environ.get("DEEPSWE_UV_INDEX_URL", PIP_MIRROR)
+_UV_INSTALL_PATTERN = re.compile(
+    r"curl\s+-LsSf\s+https://astral\.sh/uv/\S*install\.sh\s*\|\s*sh"
+)
+_UV_INSTALL_REPLACEMENT = (
+    "mkdir -p $HOME/.local/bin && "
+    f"curl -fsSL {UV_TARBALL_URL} -o /tmp/uv.tgz && "
+    "tar -xzf /tmp/uv.tgz -C $HOME/.local/bin --strip-components=1 && "
+    "printf 'export PATH=$HOME/.local/bin:$PATH\\n"
+    f"export UV_DEFAULT_INDEX={UV_INDEX_URL}\\n"
+    f"export UV_INDEX_URL={UV_INDEX_URL}\\n' > $HOME/.local/bin/env"
+)
+_PATCH_SUFFIXES = (
+    ".py",
+    ".sh",
+    ".dockerfile",
+    ".j2",
+    ".jinja",
+    ".yaml",
+    ".yml",
+    ".tmpl",
+)
+
+
+def patch_agent_install():
+    """Replace pier's GitHub uv download with the OBS mirror (idempotent)."""
+    site_packages = glob.glob(
+        os.path.join(WORK_DIR, "test_env_evalscope", "lib", "python*", "site-packages")
+    )
+    patched = []
+    for sp in site_packages:
+        for package in ("pier", "evalscope"):
+            for dirpath, _, filenames in os.walk(os.path.join(sp, package)):
+                for name in filenames:
+                    if not name.endswith(_PATCH_SUFFIXES):
+                        continue
+                    path = os.path.join(dirpath, name)
+                    try:
+                        with open(path, encoding="utf-8", errors="ignore") as f:
+                            text = f.read()
+                        new_text = _UV_INSTALL_PATTERN.sub(_UV_INSTALL_REPLACEMENT, text)
+                        if new_text == text:
+                            continue
+                        with open(path, "w", encoding="utf-8") as f:
+                            f.write(new_text)
+                        patched.append(path)
+                    except OSError as e:  # noqa: BLE001 - diagnostics only
+                        print(f"WARNING: failed to patch {path}: {e}")
+    print(f"[env] uv install patched in {len(patched)} file(s): {patched}")
+
+
 def log_eval_env():
     """Print the interpreter and key package versions for triage."""
     print(f"[env] python: {VENV_PYTHON}")
@@ -191,6 +250,7 @@ def find_report_path(output_lines, work_dir):
 
 def main():
     install_eval_env()
+    patch_agent_install()
     log_eval_env()
     config = build_config()
     print(f"DeepSWE evalscope config: {json.dumps(config, ensure_ascii=False)}")
