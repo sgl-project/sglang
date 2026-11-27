@@ -212,6 +212,7 @@ def test_held_responses_do_not_change_idle_state():
     # release must still see the same idle state on every rank.
     scheduler = _scheduler()
     scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
+    object.__setattr__(scheduler.request_receiver, "input_blocker", None)
     scheduler.pause_state = PauseState()
     scheduler.enable_overlap = False
     scheduler.last_batch = None

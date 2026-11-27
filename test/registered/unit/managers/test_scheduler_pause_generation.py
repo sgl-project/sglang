@@ -396,6 +396,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_unified_cache_external_linker = False
         scheduler.draft_worker = None
         scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
+        object.__setattr__(scheduler.request_receiver, "input_blocker", None)
         scheduler.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
@@ -1006,7 +1007,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.mbs = [mb_a, mb_b]
         scheduler.last_mbs = [mb_a, None]
         scheduler.mb_metadata = [None, None]
-        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=True)
         # A pause, then a later input, arrive while b is in flight.
         pause = PauseGenerationReqInput(mode="retract")
         later = MagicMock()

@@ -115,7 +115,7 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
         params = CacheInitParams(
             req_to_token_pool=ReqToTokenPool(
                 size=2,
-                max_context_len=8,
+                row_width=8,
                 device="cpu",
                 enable_memory_saver=False,
             ),

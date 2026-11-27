@@ -800,6 +800,7 @@ class TestPrefillAdder(CustomTestCase):
             full_attention_layer_ids=[0],
             total_bytes=8192,
             model_context_len=128,
+            req_to_token_row_width=128,
             max_num_reqs=2,
             enable_memory_saver=False,
             need_sort=False,

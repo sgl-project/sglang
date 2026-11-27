@@ -491,7 +491,7 @@ class _UnifiedHiCacheCase(_ConfigCase):
         self.allocator = bundle.token_to_kv_pool_allocator
         self.rows = _Rows(bundle)
         self.req_to_token_pool = ReqToTokenPool(
-            size=4, max_context_len=tokens, device="cpu", enable_memory_saver=False
+            size=4, row_width=tokens, device="cpu", enable_memory_saver=False
         )
         params = CacheInitParams(
             req_to_token_pool=self.req_to_token_pool,

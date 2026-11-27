@@ -18,7 +18,7 @@ def _table(*, size=8, pre_alloc_size=0, state=False):
     return RequestTable(
         size=size,
         pre_alloc_size=pre_alloc_size,
-        max_context_len=16,
+        row_width=16,
         state_sub_pool="mamba" if state else None,
         tracking=(
             StateTracking(extra_buffer=True, lazy=False, track_slots=2, initial_slots=2)
@@ -51,7 +51,7 @@ class TestRequestTable(CustomTestCase):
         rng = random.Random(0)
         table = _table()
         static = ReqToTokenPool(
-            size=8, max_context_len=16, device="cpu", enable_memory_saver=False
+            size=8, row_width=16, device="cpu", enable_memory_saver=False
         )
         for _ in range(400):
             op = rng.random()

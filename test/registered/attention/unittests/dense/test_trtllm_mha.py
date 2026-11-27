@@ -515,7 +515,7 @@ class TestTRTLLMMHADecodeGroupHoist(CustomTestCase):
         backend = types.SimpleNamespace(
             q_data_type=torch.bfloat16,
             workspace_buffer=None,
-            max_context_len=4096,
+            max_kv_len=4096,
             _multi_ctas_kv_counter_buffer=None,
             decode_seq_len_splits=4,
             decode_split_hoist=hoist,

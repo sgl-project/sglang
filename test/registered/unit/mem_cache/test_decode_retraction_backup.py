@@ -166,7 +166,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
 
         req_to_token_pool = ReqToTokenPool(
             size=2,
-            max_context_len=self.pool_size,
+            row_width=self.pool_size,
             device=self.device,
             enable_memory_saver=False,
         )

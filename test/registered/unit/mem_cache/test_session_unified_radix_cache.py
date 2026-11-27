@@ -48,7 +48,7 @@ def make_params(enable_session: bool) -> CacheInitParams:
     )
     req_pool = ReqToTokenPool(
         size=8,
-        max_context_len=128,
+        row_width=128,
         device="cpu",
         enable_memory_saver=False,
     )
