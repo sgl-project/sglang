@@ -280,8 +280,9 @@ def condition(device="cpu", dtype=torch.float32, padded=True):
     not torch.cuda.is_available() or torch.version.hip is not None,
     reason="requires CUDA graph capture",
 )
+@pytest.mark.parametrize("with_camera", [False, True])
 @torch.inference_mode()
-def test_offline_graph_replays_with_current_action_mask():
+def test_offline_graph_replays_with_current_action_mask(with_camera):
     from functools import partial
 
     from msgspec.structs import replace
@@ -290,9 +291,17 @@ def test_offline_graph_replays_with_current_action_mask():
     runner = model.offline_graph(warmup=True)
     results = []
     shape = (2, 2, 2)
-    for index, padded in enumerate((True, False, True)):
+    padding = (True, False, True, True, True) if with_camera else (True, False, True)
+    for index, padded in enumerate(padding):
         event = condition("cuda", torch.bfloat16, padded)
-        event = replace(event, camera_embedding=None, camera_has_mask=None)
+        if not with_camera:
+            event = replace(event, camera_embedding=None, camera_has_mask=None)
+        elif index == 2:
+            event = replace(event, camera_embedding=-event.camera_embedding)
+        elif index == 3:
+            event = replace(
+                event, camera_has_mask=torch.zeros_like(event.camera_has_mask)
+            )
 
         def generate(graph_predict=None):
             session = NomasLatentSession(model, cache_capacity=0, seed=11, steps=2)
@@ -305,8 +314,9 @@ def test_offline_graph_replays_with_current_action_mask():
         assert len(runner.entries) == 1
         assert torch.equal(result, expected)
         results.append(result)
-    assert torch.equal(results[0], results[2])
-    assert not torch.equal(results[0], results[1])
+    assert torch.equal(results[0], results[-1])
+    for changed in results[1:-1]:
+        assert not torch.equal(results[0], changed)
     model.release_cuda_graphs()
     assert not runner.entries and model.offline_graph(warmup=False) is None
 
@@ -969,7 +979,6 @@ def test_pixelumm_mrope_fusion_matches_compiled_reference_and_fallback(monkeypat
 
 
 def test_scheduler_loader_uses_effective_shift(tmp_path):
-
     from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
         SchedulerLoader,
     )
@@ -1270,7 +1279,6 @@ def _fp8_linear(in_features, out_features, device=None):
 @pytest.mark.parametrize("tokens", [1, 127, 128, 129, 257])
 @torch.inference_mode()
 def test_pixelumm_fp8_linear_quantized_reference(tokens):
-
     torch.manual_seed(17)
     layer = _fp8_linear(256, 256, device="cuda").eval()
     weight = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16) / 16

@@ -31,7 +31,16 @@ class _SegmentPrediction(nn.Module):
         # The valid prefix and action windows can change without changing the shape.
         return self.attention.get()(q, k, v)
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states, text_mask, rope):
+    def forward(
+        self,
+        hidden_states,
+        timestep,
+        encoder_hidden_states,
+        text_mask,
+        rope,
+        camera_embedding=None,
+        camera_has_mask=None,
+    ):
         context = NomasSegmentContext(
             self.attend, rope, tuple(hidden_states.shape[2:]), 0, 0
         )
@@ -40,6 +49,8 @@ class _SegmentPrediction(nn.Module):
             timestep,
             encoder_hidden_states,
             text_mask,
+            camera_embedding=camera_embedding,
+            camera_has_mask=camera_has_mask,
             cache=self.empty_cache,
             _context=context,
         )[0]
@@ -57,6 +68,10 @@ class NomasGraphRunner(BaseBreakableCudaGraphRunner):
             text_mask=condition.text_mask,
             rope=context.rope,
         )
+        if condition.camera_embedding is not None:
+            inputs["camera_embedding"] = condition.camera_embedding
+        if condition.camera_has_mask is not None:
+            inputs["camera_has_mask"] = condition.camera_has_mask
         token = self.transformer.attention.set(context.attention)
         try:
             if warmup:

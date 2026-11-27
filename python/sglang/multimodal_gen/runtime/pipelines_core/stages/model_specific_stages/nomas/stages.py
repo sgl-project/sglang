@@ -232,7 +232,7 @@ class NomasDenoisingStage(PipelineStage):
         self.transformer.release_cuda_graphs()
 
     @staticmethod
-    def _offline_graph_predict(batch, server_args, model, capacity, camera):
+    def _offline_graph_predict(batch, server_args, model, capacity):
         if not (
             server_args.enable_breakable_cuda_graph
             and server_args.warmup_mode == "server"
@@ -247,7 +247,6 @@ class NomasDenoisingStage(PipelineStage):
             and batch.latents.is_cuda
             and torch.version.hip is None
             and batch.latents.dtype == torch.bfloat16
-            and camera is None
             and capacity == 0
             and model.quant_config is None
             and model.attention_backend == "flex"
@@ -301,7 +300,7 @@ class NomasDenoisingStage(PipelineStage):
             )
             session = self._new_session(model, batch, config, capacity, generator)
             graph_predict = self._offline_graph_predict(
-                batch, server_args, model, capacity, camera
+                batch, server_args, model, capacity
             )
             segments = []
             for index, (condition, segment) in enumerate(
