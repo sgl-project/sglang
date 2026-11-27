@@ -2442,8 +2442,7 @@ def _check_implicit_cutlass_global_scales(w13_weight_scale_2: torch.Tensor) -> N
             "this model, and it applies one global weight scale per expert to both "
             "halves. Passing --moe-runner-backend flashinfer_cutlass "
             "(--speculative-moe-runner-backend flashinfer_cutlass for a draft "
-            "model) skips this check, but w3 is then still scaled by w1's global "
-            "scale, as before this check existed."
+            "model) skips this check, but w3 is then scaled by w1's global scale."
         )
 
 
@@ -2522,7 +2521,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         f"Under auto, NVFP4 MoE layers on SM{capability[0]}"
                         f"{capability[1]} run on flashinfer_cutlass, which needs an "
                         f"expert parallel size of 1 or {tp} (the tensor parallel "
-                        f"size), not {ep}. Pass --moe-runner-backend marlin."
+                        f"size), not {ep}. Pass --moe-runner-backend marlin, and "
+                        "--speculative-moe-runner-backend marlin too if it was passed."
                     )
                 backend = MoeRunnerBackend.FLASHINFER_CUTLASS
             logger.info_once(f"ModelOpt NVFP4 MoE: auto uses {backend.value}")
