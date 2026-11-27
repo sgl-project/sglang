@@ -4,7 +4,7 @@ import threading
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 
@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.utils import FastQueue, TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -23,10 +24,11 @@ ROOM = 7
 
 def _manager(probe_rc: int = -1, idle_timeout: float = 600.0) -> MooncakeKVManager:
     manager = MooncakeKVManager.__new__(MooncakeKVManager)
+    peer = attach_mooncake_transport(manager, MagicMock(), sessions=(SESSION,))[SESSION]
     manager.session_lock = threading.Lock()
-    manager.failed_sessions = {SESSION}
-    manager.session_failures = defaultdict(int, {SESSION: 1})
-    manager.failed_session_probes = {}
+    manager.failed_peers = {peer}
+    manager.peer_failures = defaultdict(int, {peer: 1})
+    manager.failed_peer_probes = {}
     manager.failed_session_probe_interval = 30.0
     manager.failed_session_probe_max_interval = 300.0
     manager.failed_session_idle_timeout = idle_timeout
@@ -37,7 +39,7 @@ def _manager(probe_rc: int = -1, idle_timeout: float = 600.0) -> MooncakeKVManag
 def _run_passes(manager, until: float, step: float = 30.0) -> list:
     """Run the probe loop every `step` seconds; return when probes were sent."""
     sent = []
-    manager.transport.send_probe.side_effect = lambda session_id: (
+    manager.transport.send_probe.side_effect = lambda remote: (
         sent.append(now) or manager.transport.send_probe.return_value
     )
     now = 0.0
@@ -62,14 +64,12 @@ def _request_blacklisted_session(manager, now: float) -> None:
     manager.failure_lock = threading.Lock()
     manager.failure_records = {}
     manager._staging_outstanding = defaultdict(int)
-    manager.state_layout_rejections = {}
-    manager.state_strides_validated = set()
-    manager.decode_kv_args_table = {}
+    manager.fan_in_rejections = {}
     manager.req_to_decode_prefix_len = {ROOM: 0}
     manager.request_status = {ROOM: KVPoll.Transferring}
     manager.transfer_infos = {
         ROOM: {
-            SESSION: TransferInfo(
+            manager._peers[SESSION]: TransferInfo(
                 room=ROOM,
                 endpoint="10.0.0.2",
                 dst_port=1234,
@@ -105,32 +105,34 @@ def _request_blacklisted_session(manager, now: float) -> None:
 class TestMooncakeFailedSessionProbe(CustomTestCase):
     def test_failing_probe_backs_off_to_the_cap(self):
         manager = _manager(idle_timeout=1e9)
+        peer = manager._peers[SESSION]
 
         sent = _run_passes(manager, until=1200)
 
         self.assertEqual(sent, [0, 60, 180, 420, 720, 1020])
-        self.assertIn(SESSION, manager.failed_sessions)
+        self.assertIn(peer, manager.failed_peers)
 
     def test_recovery_unblacklists_and_resets_the_schedule(self):
         manager = _manager()
+        peer = manager._peers[SESSION]
         _run_passes(manager, until=60)
-        self.assertEqual(manager.failed_session_probes[SESSION].interval, 120)
+        self.assertEqual(manager.failed_peer_probes[peer].interval, 120)
 
         manager.transport.send_probe.return_value = 0
         with patch(CLOCK, return_value=180):
             manager._run_one_probe_pass()
-        self.assertFalse(manager.failed_sessions)
-        self.assertFalse(manager.session_failures)
-        self.assertFalse(manager.failed_session_probes)
+        self.assertFalse(manager.failed_peers)
+        self.assertFalse(manager.peer_failures)
+        self.assertFalse(manager.failed_peer_probes)
 
         # Blacklisted again later: probed on the next pass, from the base interval.
-        manager.failed_sessions.add(SESSION)
+        manager.failed_peers.add(peer)
         manager.transport.send_probe.return_value = -1
         manager.transport.send_probe.reset_mock()
         with patch(CLOCK, return_value=500):
             manager._run_one_probe_pass()
-        manager.transport.send_probe.assert_called_once_with(SESSION)
-        self.assertEqual(manager.failed_session_probes[SESSION].interval, 60)
+        manager.transport.send_probe.assert_called_once_with(peer.remote)
+        self.assertEqual(manager.failed_peer_probes[peer].interval, 60)
 
     def test_unrequested_session_is_dropped(self):
         # E.g. the old session id of a restarted decode.
@@ -139,24 +141,25 @@ class TestMooncakeFailedSessionProbe(CustomTestCase):
         sent = _run_passes(manager, until=1200)
 
         self.assertEqual(sent, [0, 60, 180, 420])
-        self.assertFalse(manager.failed_sessions)
-        self.assertFalse(manager.session_failures)
-        self.assertFalse(manager.failed_session_probes)
+        self.assertFalse(manager.failed_peers)
+        self.assertFalse(manager.peer_failures)
+        self.assertFalse(manager.failed_peer_probes)
 
     def test_requested_session_stays_blacklisted_and_probed(self):
         manager = _manager()
+        peer = manager._peers[SESSION]
         with patch(CLOCK, return_value=0):
             manager._run_one_probe_pass()
 
         _request_blacklisted_session(manager, now=590)
         with patch(CLOCK, return_value=600):
             manager._run_one_probe_pass()
-        self.assertIn(SESSION, manager.failed_sessions)
-        self.assertEqual(manager.failed_session_probes[SESSION].last_requested, 590)
+        self.assertIn(peer, manager.failed_peers)
+        self.assertEqual(manager.failed_peer_probes[peer].last_requested, 590)
 
         with patch(CLOCK, return_value=1190):
             manager._run_one_probe_pass()
-        self.assertFalse(manager.failed_sessions)
+        self.assertFalse(manager.failed_peers)
 
 
 if __name__ == "__main__":

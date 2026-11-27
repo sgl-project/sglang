@@ -14,8 +14,13 @@ from sglang.srt.disaggregation.mooncake.buffers import (
     BufferKind,
     MooncakeBufferKey,
 )
-from sglang.srt.disaggregation.mooncake.conn import PeerBuffers
-from sglang.srt.disaggregation.mooncake.transport import MooncakeTransport, Registration
+from sglang.srt.disaggregation.common.peer import PeerLayout
+from sglang.srt.disaggregation.mooncake.peer import MooncakePeer
+from sglang.srt.disaggregation.mooncake.transport import (
+    MooncakeBufferExport,
+    MooncakeTransport,
+    Registration,
+)
 from sglang.test.server_fixtures.disaggregation_fixture import (
     get_rdma_devices_args,
 )
@@ -220,6 +225,54 @@ def engine_writes(fn):
     )
 
 
+def peer_layout(**fields) -> PeerLayout:
+    """A decode's PeerLayout: an empty TP1 layout with `fields` overriding it."""
+    empty = dict(
+        dst_tp_rank=0,
+        dst_attn_tp_size=1,
+        dst_kv_item_len=0,
+        dst_state_item_lens=[],
+        dst_state_dim_per_tensor=[],
+        dst_kv_layer_ids=[],
+        dst_state_layer_ids=[],
+    )
+    return PeerLayout(**{**empty, **fields})
+
+
+def mooncake_peer(
+    transport,
+    name,
+    *,
+    kv=(),
+    aux=(),
+    state=(),
+    staging=0,
+    layout=None,
+    dcp_token_item_lens=None,
+) -> MooncakePeer:
+    """A not yet layout-checked MooncakePeer whose buffers `transport` imported
+    at the given base addresses."""
+    ptrs = (list(kv), list(aux), [list(s) for s in state])
+    keys = BufferKeys.for_buffers(*ptrs)
+    import_keys = keys.flat()
+    bases = [ptr for _, ptr in keys.pair(*ptrs)]
+    if staging:
+        import_keys.append(PEER_STAGING_KEY)
+        bases.append(staging)
+    return MooncakePeer(
+        name=name,
+        remote=transport.import_buffers(
+            MooncakeBufferExport(session_id=name, bases=bases), import_keys
+        ),
+        rejection=None,
+        layout=layout if layout is not None else peer_layout(),
+        dcp_token_item_lens=dcp_token_item_lens,
+        keys=keys,
+        has_staging=bool(staging),
+        state_strides_validated=False,
+    )
+
+
 def attach_mooncake_transport(
     manager,
     engine,
@@ -233,9 +286,12 @@ def attach_mooncake_transport(
     peer_state=(),
     peer_staging=0,
     sessions=("session",),
+    layout=None,
+    dcp_token_item_lens=None,
 ):
     """Give `manager` a real MooncakeTransport over `engine`: this side's buffers
-    registered, and every session in `sessions` importing the peer's."""
+    registered, and a MooncakePeer in manager._peers for every session in
+    `sessions`, importing the peer's buffers. Returns manager._peers."""
     transport = MooncakeTransport(engine=engine)
     staging_keys = {
         ptr: MooncakeBufferKey(BufferKind.STAGING, i) for i, ptr in enumerate(staging)
@@ -250,18 +306,20 @@ def attach_mooncake_transport(
             for key, ptr in local_buffers
         ]
     )
-    peer = (list(peer_kv), list(peer_aux), [list(s) for s in peer_state])
-    peer_keys = BufferKeys.for_buffers(*peer)
-    peer_bases = dict(peer_keys.pair(*peer))
-    if peer_staging:
-        peer_bases[PEER_STAGING_KEY] = peer_staging
     manager.transport = transport
     manager._staging_keys = staging_keys
     manager._local_keys = local_keys
     manager._peers = {
-        session: PeerBuffers(
-            remote=transport.import_registration(session_id=session, bases=peer_bases),
-            keys=peer_keys,
+        session: mooncake_peer(
+            transport,
+            session,
+            kv=peer_kv,
+            aux=peer_aux,
+            state=peer_state,
+            staging=peer_staging,
+            layout=layout,
+            dcp_token_item_lens=dcp_token_item_lens,
         )
         for session in sessions
     }
+    return manager._peers

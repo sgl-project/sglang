@@ -2,12 +2,17 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import msgspec
 import numpy as np
 
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
+from sglang.test.mooncake_utils import (
+    attach_mooncake_transport,
+    engine_writes,
+    peer_layout,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -53,28 +58,29 @@ class TestAscendPageDcpSend(CustomTestCase):
         )
         dst_ptrs = [10_000, 20_000, 30_000, 40_000, 50_000]
         writes = Mock(return_value=0)
-        attach_mooncake_transport(
+        peers = attach_mooncake_transport(
             mgr,
             engine_writes(writes),
             kv=mgr.kv_args.kv_data_ptrs,
             peer_kv=dst_ptrs,
             sessions=("decode",),
+            layout=peer_layout(
+                dst_dcp_size=2,
+                dst_dcp_rank=1,
+                dst_kv_layer_ids=mgr.kv_args.kv_layer_ids,
+                dst_kv_item_lens=[20, 8, 8, 40, 16],
+            ),
+            dcp_token_item_lens=[10, 4, 2, 10, 4],
         )
         self.assertEqual(
             mgr.send_kvcache_dcp(
-                "decode",
+                peers["decode"],
                 np.array([5, 6, 7], dtype=np.int32),
-                dst_ptrs,
                 np.array([10, 11], dtype=np.int32),
-                dcp_token_item_lens=[10, 4, 2, 10, 4],
-                dst_dcp_size=2,
-                dst_dcp_rank=1,
                 src_page_offset=0,
                 decode_prefix_len=0,
                 num_kv_tokens=6,
                 executor=None,
-                dst_layer_ids=mgr.kv_args.kv_layer_ids,
-                dst_kv_item_lens=[20, 8, 8, 40, 16],
             ),
             0,
         )
@@ -104,29 +110,30 @@ class TestAscendPageDcpSend(CustomTestCase):
             num_draft_entries=0,
         )
         mgr._dcp_remote_decode_layout = [False, True, True]
-        attach_mooncake_transport(
+        peers = attach_mooncake_transport(
             mgr,
             engine_writes(Mock(return_value=0)),
             kv=mgr.kv_args.kv_data_ptrs,
             peer_kv=[10_000, 20_000, 30_000],
             sessions=("decode",),
+            layout=peer_layout(
+                dst_dcp_size=4,
+                dst_dcp_rank=0,
+                dst_kv_layer_ids=[],
+                dst_kv_item_lens=[20, 8, 16],
+            ),
+            dcp_token_item_lens=[10, 4, 2],
         )
 
         with self.assertRaisesRegex(RuntimeError, "destination geometry"):
             mgr.send_kvcache_dcp(
-                "decode",
+                peers["decode"],
                 np.array([5], dtype=np.int32),
-                [10_000, 20_000, 30_000],
                 np.array([7], dtype=np.int32),
-                dcp_token_item_lens=[10, 4, 2],
-                dst_dcp_size=4,
-                dst_dcp_rank=0,
                 src_page_offset=0,
                 decode_prefix_len=0,
                 num_kv_tokens=2,
                 executor=None,
-                dst_layer_ids=[],
-                dst_kv_item_lens=[20, 8, 16],
             )
 
     def _hybrid_case(self, stage_ids, with_draft):
@@ -160,27 +167,28 @@ class TestAscendPageDcpSend(CustomTestCase):
         )
         mgr.get_mla_kv_ptrs_with_pp = Mock(side_effect=AssertionError("legacy pairing"))
         writes = Mock(return_value=0)
-        attach_mooncake_transport(
+        peers = attach_mooncake_transport(
             mgr,
             engine_writes(writes),
             kv=src_ptrs,
             peer_kv=dst_ptrs,
             sessions=("decode",),
+            layout=peer_layout(
+                dst_dcp_size=2,
+                dst_dcp_rank=1,
+                dst_kv_layer_ids=dst_ids,
+                dst_kv_item_lens=dst_widths,
+            ),
+            dcp_token_item_lens=[width // 2 for width in widths],
         )
         kwargs = dict(
-            mooncake_session_id="decode",
+            peer=peers["decode"],
             prefill_kv_indices=np.array([5, 6, 7], dtype=np.int32),
-            dst_kv_ptrs=dst_ptrs,
             dst_kv_indices=np.array([10, 11], dtype=np.int32),
-            dcp_token_item_lens=[width // 2 for width in widths],
-            dst_dcp_size=2,
-            dst_dcp_rank=1,
             src_page_offset=0,
             decode_prefix_len=0,
             num_kv_tokens=6,
             executor=None,
-            dst_layer_ids=dst_ids,
-            dst_kv_item_lens=dst_widths,
         )
         expected = []
         for group, width in enumerate((20, 8)):
@@ -211,14 +219,20 @@ class TestAscendPageDcpSend(CustomTestCase):
                         mgr, kwargs, expected, writes = self._hybrid_case(
                             stage_ids, with_draft
                         )
+                        peer = kwargs["peer"]
                         self.assertEqual(
                             mgr.prepare_dcp_token_item_lens(
-                                kwargs["dst_kv_item_lens"], kwargs["dst_dcp_size"]
+                                peer.layout.dst_kv_item_lens, peer.layout.dst_dcp_size
                             ),
-                            kwargs["dcp_token_item_lens"],
+                            peer.dcp_token_item_lens,
                         )
                         if not with_widths:
-                            kwargs.pop("dst_kv_item_lens")
+                            kwargs["peer"] = msgspec.structs.replace(
+                                peer,
+                                layout=msgspec.structs.replace(
+                                    peer.layout, dst_kv_item_lens=[]
+                                ),
+                            )
                         self.assertEqual(mgr.send_kvcache_dcp(**kwargs), 0)
                         if expected:
                             writes.assert_called_once_with("decode", expected)
@@ -230,12 +244,27 @@ class TestAscendPageDcpSend(CustomTestCase):
         for missing_metadata in (False, True):
             with self.subTest(missing_metadata=missing_metadata):
                 mgr, kwargs, _, writes = self._hybrid_case([11, 15], True)
+                peer = kwargs["peer"]
+                layout = peer.layout
                 if missing_metadata:
-                    kwargs["dst_layer_ids"] = []
+                    kwargs["peer"] = msgspec.structs.replace(
+                        peer,
+                        layout=msgspec.structs.replace(layout, dst_kv_layer_ids=[]),
+                    )
                 else:
                     # Keep latent layer 11 but remove its RoPE entry.
-                    for name in ("dst_layer_ids", "dst_kv_ptrs", "dst_kv_item_lens"):
-                        kwargs[name].pop(6)
+                    layer_ids = layout.dst_kv_layer_ids
+                    item_lens = layout.dst_kv_item_lens
+                    kv = peer.keys.kv[:6] + peer.keys.kv[7:]
+                    kwargs["peer"] = msgspec.structs.replace(
+                        peer,
+                        keys=msgspec.structs.replace(peer.keys, kv=kv),
+                        layout=msgspec.structs.replace(
+                            layout,
+                            dst_kv_layer_ids=layer_ids[:6] + layer_ids[7:],
+                            dst_kv_item_lens=item_lens[:6] + item_lens[7:],
+                        ),
+                    )
                 with self.assertRaises(RuntimeError):
                     mgr.send_kvcache_dcp(**kwargs)
                 writes.assert_not_called()

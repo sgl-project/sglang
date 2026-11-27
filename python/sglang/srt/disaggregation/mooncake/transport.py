@@ -6,6 +6,7 @@ import msgspec
 import numpy as np
 
 from sglang.srt.disaggregation.transport.base import (
+    BufferExport,
     BufferKey,
     Copy,
     Handle,
@@ -25,6 +26,18 @@ class Registration(msgspec.Struct, frozen=True):
     length: int
     # GPU index, or -1 for page-locked host memory.
     device: int
+
+
+def _joined(parts: List[np.ndarray]) -> np.ndarray:
+    """One array of `parts`, without a copy when there is a single part."""
+    return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+
+class MooncakeBufferExport(BufferExport):
+    def __init__(self, session_id: str, bases: Sequence[int]):
+        self.session_id = session_id
+        # One base address per exported key, in export order.
+        self.bases = tuple(bases)
 
 
 class MooncakeRemoteBuffers(RemoteBuffers):
@@ -78,34 +91,49 @@ class MooncakeTransport(Transport):
         registered_regions = set(self._registrations.values())
         new_regions = []
         for r in registrations:
-            if r.length == 0:
-                # Elided DSA index-K layers keep a 0-row buffer for alignment;
-                # the engine rejects zero-length regions and nothing writes them.
-                continue
             region = (r.ptr, r.length)
-            if region not in registered_regions:
+            # Elided DSA index-K layers keep a 0-row buffer for alignment; the
+            # engine rejects zero-length regions, but the key is still exported.
+            if r.length and region not in registered_regions:
                 registered_regions.add(region)
                 new_regions.append(region)
-            self._registrations[r.key] = region
         if new_regions:
             ptrs, lens = zip(*new_regions)
             self._engine.batch_register(list(ptrs), list(lens))
+        # Only after the engine accepted them: a failed batch leaves no key behind.
+        for r in registrations:
+            self._registrations[r.key] = (r.ptr, r.length)
 
     def deregister(self, keys: Sequence[BufferKey]) -> None:
         """Unregister `keys`, preserving regions still held by other keys."""
         released_regions = {
             self._registrations.pop(key) for key in keys if key in self._registrations
         }
-        unused_regions = released_regions - set(self._registrations.values())
+        unused_regions = {
+            region
+            for region in released_regions - set(self._registrations.values())
+            if region[1]
+        }
         if unused_regions:
             self._engine.batch_deregister([ptr for ptr, _ in unused_regions])
 
-    def import_registration(
-        self, *, session_id: str, bases: Dict[BufferKey, int]
+    def export_buffers(self, keys: Sequence[BufferKey]) -> MooncakeBufferExport:
+        return MooncakeBufferExport(
+            session_id=self.session_id,
+            bases=[self._registrations[key][0] for key in keys],
+        )
+
+    def import_buffers(
+        self, desc: MooncakeBufferExport, keys: Sequence[BufferKey]
     ) -> MooncakeRemoteBuffers:
-        """Import the current registration fields; the first write triggers
-        the engine handshake with this session."""
-        return MooncakeRemoteBuffers(session_id=session_id, bases=bases)
+        """The first write to the result triggers the engine handshake with
+        the peer's session."""
+        return MooncakeRemoteBuffers(
+            session_id=desc.session_id, bases=dict(zip(keys, desc.bases, strict=True))
+        )
+
+    def release_remote(self, remote: MooncakeRemoteBuffers) -> None:
+        """Nothing to drop: import_buffers() leaves no engine state."""
 
     def write(
         self,
@@ -131,9 +159,9 @@ class MooncakeTransport(Transport):
         lengths = [c.ranges[:, 2] for c in copies]
         ret = self._engine.batch_transfer_sync(
             remote.session_id,
-            np.concatenate(src_addrs).tolist(),
-            np.concatenate(dst_addrs).tolist(),
-            np.concatenate(lengths).tolist(),
+            _joined(src_addrs).tolist(),
+            _joined(dst_addrs).tolist(),
+            _joined(lengths).tolist(),
             # Decode waits on every PD write, so all of them ride the foreground lane.
             TransferIntent.FOREGROUND,
         )
@@ -149,9 +177,9 @@ class MooncakeTransport(Transport):
     def status(self, handle: MooncakeHandle) -> Result:
         return handle.result
 
-    def send_probe(self, session_id: str) -> int:
-        """Lifts the engine's blacklist of a failed session when it answers."""
-        return self._engine.send_probe(session_id)
+    def send_probe(self, remote: MooncakeRemoteBuffers) -> int:
+        """Lifts the engine's blacklist of a failed peer when it answers."""
+        return self._engine.send_probe(remote.session_id)
 
     def close(self) -> None:
         self.deregister(list(self._registrations))

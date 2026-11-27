@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import logging
 import queue
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import msgspec
 import numpy as np
 import numpy.typing as npt
 import torch
+
+from sglang.srt.disaggregation.transport.base import BufferKey, Copy
 
 # Arbitrary; bounds the staging memory, not the request length.
 _MAX_PAGES_PER_BATCH = 256
@@ -25,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 class DraftEntryJob(msgspec.Struct, frozen=True):
     entry: int  # index into the draft tensor list
-    dst_base_ptr: int
+    dst_key: BufferKey
     head_start: int
     num_heads: int
 
@@ -34,6 +36,8 @@ class _StagingBuffer:
     def __init__(self, *, nbytes: int, device: torch.device):
         self.data = torch.empty(nbytes, dtype=torch.uint8, device=device)
         self.stream = torch.cuda.Stream(device=device)
+        # Set once the buffer is registered with the Transport.
+        self.key: Optional[BufferKey] = None
 
 
 class DraftHeadPacker:
@@ -43,7 +47,7 @@ class DraftHeadPacker:
         tensors: List[torch.Tensor],
         page_size: int,
         window_pages: int,
-        register: Callable[[List[int], List[int]], None],
+        register: Callable[[List[Tuple[int, int]]], List[BufferKey]],
     ):
         self._tensors = tensors
         self._page_size = page_size
@@ -65,10 +69,9 @@ class DraftHeadPacker:
             for _ in range(_NUM_BUFFERS)
         ]
         # The engine raises when it rejects a region; there is no status to check.
-        register(
-            [b.data.data_ptr() for b in buffers], [self._batch_bytes] * len(buffers)
-        )
-        for b in buffers:
+        keys = register([(b.data.data_ptr(), self._batch_bytes) for b in buffers])
+        for b, key in zip(buffers, keys, strict=True):
+            b.key = key
             self._free.put(b)
 
     def send(
@@ -77,19 +80,19 @@ class DraftHeadPacker:
         src_page_indices: npt.NDArray,
         dst_page_indices: npt.NDArray,
         jobs: List[DraftEntryJob],
-        transfer: Callable[[List[int], List[int], List[int]], int],
+        transfer: Callable[[List[Copy]], int],
     ) -> int:
         buffer = self._free.get()
         try:
             for start in range(0, len(src_page_indices), self._pages_per_batch):
                 end = start + self._pages_per_batch
-                src, dst, lengths = self._pack(
+                copies = self._pack(
                     buffer=buffer,
                     src_pages=src_page_indices[start:end],
                     dst_pages=dst_page_indices[start:end],
                     jobs=jobs,
                 )
-                ret = transfer(src, dst, lengths)
+                ret = transfer(copies)
                 if ret != 0:
                     return ret
             return 0
@@ -108,9 +111,9 @@ class DraftHeadPacker:
         src_pages: npt.NDArray,
         dst_pages: npt.NDArray,
         jobs: List[DraftEntryJob],
-    ) -> Tuple[List[int], List[int], List[int]]:
+    ) -> List[Copy]:
         num_pages = len(src_pages)
-        src, dst, lengths = [], [], []
+        copies = []
         offset = 0
         with torch.cuda.device(self._device), torch.cuda.stream(buffer.stream):
             pages = torch.from_numpy(src_pages.astype(np.int64)).to(
@@ -132,10 +135,13 @@ class DraftHeadPacker:
                 page_bytes = picked[0].numel()
                 out = buffer.data[offset : offset + num_pages * page_bytes]
                 out.view(picked.shape).copy_(picked)
-                base = buffer.data.data_ptr() + offset
-                src.extend(base + np.arange(num_pages, dtype=np.int64) * page_bytes)
-                dst.extend(job.dst_base_ptr + dst_pages.astype(np.int64) * page_bytes)
-                lengths.extend([page_bytes] * num_pages)
+                ranges = np.empty((num_pages, 3), dtype=np.uint64)
+                ranges[:, 0] = (
+                    offset + np.arange(num_pages, dtype=np.uint64) * page_bytes
+                )
+                ranges[:, 1] = dst_pages.astype(np.uint64) * page_bytes
+                ranges[:, 2] = page_bytes
+                copies.append(Copy(src=buffer.key, dst=job.dst_key, ranges=ranges))
                 offset += num_pages * page_bytes
             buffer.stream.synchronize()
-        return [int(x) for x in src], [int(x) for x in dst], lengths
+        return copies

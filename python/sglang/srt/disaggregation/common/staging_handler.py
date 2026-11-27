@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 STAGING_WATERMARK_WAIT_S = 0.001
 
 if TYPE_CHECKING:
+    from sglang.srt.disaggregation.common.peer import Peer
     from sglang.srt.disaggregation.decode import DecodeRequest
 
 
@@ -618,6 +619,41 @@ def handle_watermark_msg(staging_ctx, msg_parts) -> None:
         staging_ctx.watermark_cv.notify_all()
 
 
+def _room_infos_by_name(transfer_infos: dict, room: int) -> dict:
+    """One room of a Peer-keyed table, keyed by the name the staging messages
+    carry."""
+    return {peer.name: info for peer, info in transfer_infos.get(room, {}).items()}
+
+
+def handle_staging_rsp_by_peer(msg_parts, transfer_infos: dict) -> None:
+    """handle_staging_rsp for a room table keyed by Peer."""
+    room = int(msg_parts[1].decode("ascii"))
+    handle_staging_rsp(msg_parts, {room: _room_infos_by_name(transfer_infos, room)})
+
+
+def prefetch_staging_reqs_by_peer(
+    room: int,
+    transfer_infos: dict,
+    kv_buffer_tensors: dict,
+    chunked_prefill_size: int,
+    staging_requested: set,
+    prefetch_sockets: dict,
+    requester_pp_rank: Optional[int] = None,
+    upto_tokens: Optional[int] = None,
+) -> None:
+    """prefetch_staging_reqs for a room table keyed by Peer."""
+    prefetch_staging_reqs(
+        room,
+        {room: _room_infos_by_name(transfer_infos, room)},
+        kv_buffer_tensors,
+        chunked_prefill_size,
+        staging_requested,
+        prefetch_sockets,
+        requester_pp_rank=requester_pp_rank,
+        upto_tokens=upto_tokens,
+    )
+
+
 def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
     """Process a STAGING_RSP message and update transfer info with allocation."""
     stg_room = int(msg_parts[1].decode("ascii"))
@@ -803,6 +839,29 @@ class PrefillStagingStrategy:
             raise RuntimeError(
                 f"[Staging] KV transfer via staging buffer failed: {e}. "
                 f"session={session_id}"
+            ) from e
+
+    def transfer_by_peer(
+        self,
+        peer: Peer,
+        prefill_kv_indices,
+        dst_staging_offset: int,
+        dst_staging_size: int,
+    ) -> int:
+        """transfer() for a backend keyed by Peer: writes at an offset in the
+        peer's staging ring instead of an absolute address."""
+        try:
+            return self.kv_manager.send_kvcache_staged(
+                peer,
+                prefill_kv_indices,
+                dst_staging_offset,
+                dst_staging_size,
+                staging_buffer=self.staging_buffer,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[Staging] KV transfer via staging buffer failed: {e}. "
+                f"session={peer.name}"
             ) from e
 
 
