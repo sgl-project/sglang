@@ -14,7 +14,7 @@ from sglang.srt.utils.device import async_h2d, is_cuda
 
 from ..batch_layout import num_prefill_rows
 from ..config import SYNTHID_CONFIG_FIELDS, WatermarkRequestConfig
-from ..interface import NO_WATERMARK_VIEW_FIELDS, SampleStep
+from ..interface import NO_WATERMARK_VIEW_FIELDS, SampleWatermarkOutput
 from .algorithm import SynthIDConfig
 from .watermark import FilterProbs, SynthIDWatermark
 
@@ -249,7 +249,9 @@ class SynthIDSample:
         self.forward_batch = forward_batch
         self.allow_fused_sample = allow_fused_sample
 
-    def apply(self, logits: torch.Tensor, *, keep_logits: bool) -> SampleStep:
+    def apply(
+        self, logits: torch.Tensor, *, keep_logits: bool
+    ) -> SampleWatermarkOutput:
         forward_batch = self.forward_batch
         sampling_info = forward_batch.sampling_info
         rows = self.rows
@@ -267,7 +269,7 @@ class SynthIDSample:
         sanitize_nan_logits(logits, "watermark: next_token_logits")
 
         if self._can_fuse(keep_logits):
-            return SampleStep(
+            return SampleWatermarkOutput(
                 sampling_info=sampling_info,
                 logprob_logits=None,
                 token_ids=self.watermark.sample(logits, temperatures, slots),
@@ -279,7 +281,7 @@ class SynthIDSample:
             rows=rows.take_index,
             filter_probs=_request_filter(sampling_info, rows),
         )
-        return SampleStep(
+        return SampleWatermarkOutput(
             sampling_info=_without_request_filters(sampling_info, rows),
             logprob_logits=logprob_logits,
         )
