@@ -151,7 +151,9 @@ class AutoencoderKLFlux2(AutoencoderKLMixin, ParallelTiledVAE):
             assert x.shape[2] == 1
             x = x.squeeze(2)
 
-        with use_vae_fast_path(self.encoder, use_fast_path and x.dtype == torch.bfloat16):
+        with use_vae_fast_path(
+            self.encoder, use_fast_path and x.dtype == torch.bfloat16
+        ):
             if self.use_slicing and x.shape[0] > 1:
                 encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
                 h = torch.cat(encoded_slices)
