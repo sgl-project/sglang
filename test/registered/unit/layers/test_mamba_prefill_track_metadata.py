@@ -1,7 +1,7 @@
 import random
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -23,6 +23,110 @@ from sglang.srt.speculative import spec_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestMamba2ConvLayout(unittest.TestCase):
+    def test_tracking_uses_window_length_on_each_platform(self):
+        """NPU channels must not become the checkpoint's convolution window."""
+        settings = SimpleNamespace(
+            mamba=SimpleNamespace(
+                enable_mamba_extra_buffer=True, mamba_track_interval=128
+            )
+        )
+        module = "sglang.srt.layers.attention.hybrid_linear_attn_backend"
+        for npu_layout in (False, True):
+            with self.subTest(npu_layout=npu_layout):
+                shape = (1, 2, 3, 768) if npu_layout else (1, 2, 768, 3)
+
+                def init_base(backend, model_runner):
+                    backend.device = "cpu"
+                    backend._mamba_chunk_size = 128
+                    backend.state_pool = SimpleNamespace(
+                        mamba_cache=SimpleNamespace(conv=[torch.empty(shape)])
+                    )
+
+                with (
+                    patch.object(MambaAttnBackendBase, "__init__", init_base),
+                    patch(f"{module}.is_npu", return_value=npu_layout, create=True),
+                    patch(f"{module}.get_exec", return_value=settings),
+                ):
+                    backend = Mamba2AttnBackend(None)
+                batch = SimpleNamespace(
+                    mamba_track_aligned_lens=lambda: torch.tensor([128]),
+                    mamba_track_mask=torch.tensor([True]),
+                )
+                indices = backend._init_track_conv_indices(
+                    torch.tensor([0, 128]), batch
+                )
+                torch.testing.assert_close(indices, torch.tensor([[125, 126, 127]]))
+
+
+class TestMamba2CausalConvDispatch(unittest.TestCase):
+    def setUp(self):
+        self.backend = object.__new__(Mamba2AttnBackend)
+        self.backend.forward_metadata = Mamba2Metadata(
+            query_start_loc=torch.tensor([0, 1]),
+            mamba_cache_indices=torch.tensor([0]),
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=1,
+        )
+        self.backend.state_layer_cache = Mock()
+        self.hidden_states = torch.empty(1)
+        self.batch = SimpleNamespace(mamba_track_mask=None)
+        self.mixer = SimpleNamespace(forward=Mock(return_value=(None, None, None)))
+
+    def test_model_preference_and_page_major_requirement(self):
+        module = "sglang.srt.layers.attention.hybrid_linear_attn_backend"
+        for native_only, requested_triton, page_major, expected_triton in (
+            (False, False, False, False),
+            (False, True, False, True),
+            (False, False, True, True),
+            (True, True, False, False),
+        ):
+            with (
+                self.subTest(
+                    native_only=native_only,
+                    requested_triton=requested_triton,
+                    page_major=page_major,
+                ),
+                patch(
+                    f"{module}.get_memory",
+                    return_value=SimpleNamespace(
+                        enable_page_major_kv_layout=page_major
+                    ),
+                ),
+            ):
+                self.backend._native_causal_conv_only = native_only
+                self.backend.forward(
+                    self.mixer,
+                    self.hidden_states,
+                    None,
+                    0,
+                    self.batch,
+                    use_triton_causal_conv=requested_triton,
+                )
+                self.assertIs(
+                    self.mixer.forward.call_args.kwargs["use_triton_causal_conv"],
+                    expected_triton,
+                )
+
+    def test_ascend_rejects_target_verification(self):
+        self.backend._native_causal_conv_only = True
+        self.backend.forward_metadata.is_target_verify = True
+        with self.assertRaisesRegex(
+            NotImplementedError, "speculative target verification"
+        ):
+            self.backend.forward(
+                self.mixer,
+                self.hidden_states,
+                None,
+                0,
+                self.batch,
+                use_triton_causal_conv=True,
+            )
+        self.backend.state_layer_cache.assert_not_called()
+        self.mixer.forward.assert_not_called()
 
 
 class NoHostRead(torch.Tensor):

@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_npu_ci,
+)
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=34, suite="base-b-test-1-gpu-small-amd")
+register_npu_ci(est_time=180, suite="full-test-1-npu-a3", nightly=True)
 
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
 
@@ -22,6 +27,76 @@ from sglang.utils import is_in_ci
 
 if is_hip():
     os.environ["AMDGCN_USE_BUFFER_OPS"] = "0"
+
+
+@pytest.mark.parametrize(
+    "lengths,dstate",
+    [((2,), 128), ((2, 3), 128), ((128, 2), 128), ((130,), 128), ((2, 3), 256)],
+)
+def test_cached_chunk_scan_matches_recurrence(lengths, dstate):
+    """Cached multi-token scans must compile and use each sequence's own state.
+
+    Ascend used to fail compilation when the kernel merged pointers to chunk
+    and initial states. Packed sequences exercise both sides of that choice.
+    """
+    device = get_device()
+    if device not in ("cuda", "xpu", "npu"):
+        pytest.skip("requires an accelerator")
+    generator = torch.Generator().manual_seed(419)
+    heads, groups, hdim, chunk_size = 4, 2, 80, 128
+    total = sum(lengths)
+    x = torch.randn(1, total, heads, hdim, generator=generator).bfloat16()
+    b = torch.randn(1, total, groups, dstate, generator=generator).bfloat16()
+    c = torch.randn(1, total, groups, dstate, generator=generator).bfloat16()
+    dt = torch.rand(1, total, heads, generator=generator) * 0.05 + 0.01
+    a = -torch.rand(heads, generator=generator) - 0.5
+    initial = torch.randn(len(lengths), heads, hdim, dstate, generator=generator)
+    seq_idx = torch.repeat_interleave(torch.arange(len(lengths)), torch.tensor(lengths))
+    cu_seqlens = torch.tensor([0, *lengths], dtype=torch.int32).cumsum(0).to(device)
+    chunk_indices, chunk_offsets = (
+        Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
+            cu_seqlens, chunk_size, total
+        )
+    )
+    expected = torch.empty_like(x, dtype=torch.float32)
+    expected_states = initial.clone()
+    for pos, seq in enumerate(seq_idx.tolist()):
+        step_dt = dt[0, pos, :, None, None]
+        step_b = b[0, pos].float().repeat_interleave(heads // groups, dim=0)
+        step_c = c[0, pos].float().repeat_interleave(heads // groups, dim=0)
+        expected_states[seq] = (
+            torch.exp(step_dt * a[:, None, None]) * expected_states[seq]
+            + step_dt * x[0, pos].float()[:, :, None] * step_b[:, None, :]
+        )
+        expected[0, pos] = (expected_states[seq] * step_c[:, None, :]).sum(-1)
+
+    out = torch.empty_like(x, device=device)
+    states = mamba_chunk_scan_combined(
+        x.to(device),
+        dt.to(device),
+        a.to(device),
+        b.to(device),
+        c.to(device),
+        chunk_size,
+        initial_states=initial.to(device),
+        seq_idx=seq_idx.to(device=device, dtype=torch.int32).unsqueeze(0),
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        cu_seqlens=cu_seqlens,
+        out=out,
+        return_varlen_states=True,
+    )
+    # Scan casts intermediate states to the bf16 input dtype for its dot product.
+    observed = out.cpu().float()
+    observed_states = states.cpu().float()
+    torch.testing.assert_close(observed, expected, atol=0.25, rtol=0.02)
+    torch.testing.assert_close(observed_states, expected_states, atol=0.02, rtol=0.02)
+    print(
+        f"lengths={lengths} dstate={dstate} "
+        f"output_max_abs={(observed - expected).abs().max().item():.6g} "
+        f"state_max_abs={(observed_states - expected_states).abs().max().item():.6g}"
+    )
+
 
 # Added by the IBM Team, 2024
 

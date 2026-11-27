@@ -13,6 +13,7 @@ import torch
 # accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.
 import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=5, suite="extra-a-test-npu")
 
@@ -444,14 +445,16 @@ class TestGetSwaMask(unittest.TestCase):
         mask = self.builder.get_swa_mask(seq_lens, s2=30, left_context=5)
         row0 = mask[0, 0]
         self.assertTrue(row0[0].item())
-        self.assertTrue(row0[4].item())
+        self.assertTrue(row0[3].item())
+        self.assertFalse(row0[4].item())
         self.assertFalse(row0[5].item())
         self.assertFalse(row0[9].item())
         self.assertTrue(row0[10].item())
         self.assertTrue(row0[29].item())
         row1 = mask[1, 0]
         self.assertTrue(row1[0].item())
-        self.assertTrue(row1[14].item())
+        self.assertTrue(row1[13].item())
+        self.assertFalse(row1[14].item())
         self.assertFalse(row1[15].item())
         self.assertFalse(row1[19].item())
         self.assertTrue(row1[20].item())
@@ -1069,6 +1072,216 @@ class TestMlaPrefixFia(unittest.TestCase):
         for dtype in (torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 self._check_prefix([3, 1], [16, 32], dtype, 0, 4, page_size=16)
+
+
+class TestUnalignedCachedPrefix(unittest.TestCase):
+    """Partial private pages must not reach the page-aligned qlens kernel."""
+
+    def _run_prefix_batch(self, prefixes, queries, *, alibi=False, expect_qlens=False):
+        from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
+            AscendTorchNativeAttnBackend,
+        )
+
+        torch.manual_seed(419)
+        heads, kv_heads, dim, page_size = 4, 2, 16, 128
+        lengths = [p + q for p, q in zip(prefixes, queries)]
+        slots = torch.stack(
+            [
+                torch.arange(n) + (i + 1) * 512
+                for i, n in enumerate([512] * len(prefixes))
+            ]
+        )
+        key = torch.randn((len(prefixes) + 1) * 512, kv_heads, dim)
+        value = torch.randn_like(key)
+        query = torch.randn(sum(queries), heads, dim)
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_mla = backend.use_fia = backend.use_fa = False
+        backend.use_quant_flash_attn = False
+        backend.use_alibi = alibi
+        backend.is_dllm_model = backend.is_hybrid_swa = False
+        backend.page_size = page_size
+        backend.native_attn = AscendTorchNativeAttnBackend()
+        backend.mask = torch.ones(128, 128).triu(1)
+        backend.forward_metadata = ForwardMetadata(
+            block_tables=slots[:, ::page_size] // page_size,
+            seq_lens_cpu_int=torch.tensor(lengths, dtype=torch.int32),
+            extend_seq_lens_cpu_int=torch.tensor(queries, dtype=torch.int32),
+        )
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=slots)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: key,
+            get_value_buffer=lambda _: value,
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=heads,
+            tp_k_head_num=kv_heads,
+            tp_v_head_num=kv_heads,
+            qk_head_dim=dim,
+            v_head_dim=dim,
+            scaling=dim**-0.5,
+            is_cross_attention=False,
+            attn_type=None,
+            logit_cap=0,
+            logit_capping_method="tanh",
+            sliding_window_size=-1,
+        )
+        batch = SimpleNamespace(
+            encoder_lens=None,
+            req_pool_indices=torch.arange(len(prefixes)),
+            seq_lens=torch.tensor(lengths),
+            extend_prefix_lens=torch.tensor(prefixes),
+            extend_seq_lens=torch.tensor(queries),
+            extend_prefix_lens_cpu=prefixes,
+            extend_seq_lens_cpu=queries,
+            forward_mode=SimpleNamespace(
+                is_context_parallel_extend=lambda: False,
+                is_target_verify=lambda: False,
+                is_draft_extend_v2=lambda: False,
+            ),
+        )
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        slopes = torch.tensor([0.1, 0.2, 0.3, 0.4]) if alibi else None
+        sentinel = torch.full((sum(queries), heads * dim), 17.0)
+        if alibi:
+            backend.attn_alibi = MagicMock(return_value=sentinel)
+
+        def qlens(**kwargs):
+            if not expect_qlens:
+                raise AssertionError("unaligned history reached the qlens kernel")
+            kwargs["out"].copy_(sentinel)
+
+        with (
+            patch(f"{module}.is_mla_preprocess_enabled", return_value=False),
+            patch(
+                f"{module}.torch_npu._npu_flash_attention_qlens",
+                side_effect=qlens,
+            ) as kernel,
+        ):
+            actual = backend.forward_extend(
+                query, None, None, layer, batch, save_kv_cache=False, slopes=slopes
+            )
+        if alibi:
+            backend.attn_alibi.assert_called_once()
+            self.assertIs(backend.attn_alibi.call_args.kwargs["slopes"], slopes)
+            kernel.assert_not_called()
+            torch.testing.assert_close(actual, sentinel)
+            return
+        if expect_qlens:
+            kernel.assert_called_once()
+            torch.testing.assert_close(actual, sentinel)
+            return
+        expected = []
+        offset = 0
+        for index, (prefix, count, length) in enumerate(
+            zip(prefixes, queries, lengths)
+        ):
+            q = query[offset : offset + count].double().transpose(0, 1)
+            k = (
+                key[slots[index, :length]]
+                .double()
+                .repeat_interleave(heads // kv_heads, dim=1)
+                .transpose(0, 1)
+            )
+            v = (
+                value[slots[index, :length]]
+                .double()
+                .repeat_interleave(heads // kv_heads, dim=1)
+                .transpose(0, 1)
+            )
+            scores = q @ k.transpose(-1, -2) * layer.scaling
+            visible = (
+                torch.arange(length)[None, :] <= prefix + torch.arange(count)[:, None]
+            )
+            scores.masked_fill_(~visible, -float("inf"))
+            expected.append((scores.softmax(-1) @ v).transpose(0, 1))
+            offset += count
+        expected = torch.cat(expected).reshape(sum(queries), -1).float()
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+    def test_single_token_partial_pages(self):
+        for prefix in (1, 127, 129, 255, 257):
+            with self.subTest(prefix=prefix):
+                self._run_prefix_batch([prefix], [1])
+
+    def test_multiple_tokens_and_mixed_prefixes(self):
+        self._run_prefix_batch([127, 128, 129, 0], [2, 1, 3, 2])
+
+    def test_alibi_keeps_its_bias_path_for_partial_pages(self):
+        self._run_prefix_batch([129], [1], alibi=True)
+
+    def test_aligned_prefixes_keep_qlens(self):
+        self._run_prefix_batch([0, 128, 256], [3, 1, 2], expect_qlens=True)
+
+
+class TestDecodeGraphWithoutAttentionSinks(CustomTestCase):
+    def test_hybrid_window_and_full_layers_keep_their_visible_tokens(self):
+        """Graph decode without sinks must use the layer's cache and window mask."""
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_mla = backend.use_fia = backend.use_quant_flash_attn = False
+        backend.is_hybrid_swa = True
+        backend.sliding_window_size = 63
+        backend.page_size = 128
+        key = torch.zeros(256, 2, 72)
+        value = torch.arange(256).float()[:, None, None].expand_as(key).contiguous()
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: key,
+            get_value_buffer=lambda _: value,
+        )
+        backend.forward_metadata = ForwardMetadata(
+            block_tables=torch.tensor([[1]], dtype=torch.int32),
+            block_tables_swa=torch.tensor([[0]], dtype=torch.int32),
+            seq_lens_cpu_list=[128],
+            swa_mask=(torch.arange(128) < 64).reshape(1, 1, 128),
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=4,
+            tp_k_head_num=2,
+            tp_v_head_num=2,
+            qk_head_dim=72,
+            v_head_dim=72,
+            scaling=72**-0.5,
+        )
+
+        def paged_attention(query, key_cache, value_cache, **kwargs):
+            # Uniform logits expose a wrong page table or a missing window mask.
+            slots = kwargs["block_table"].long().flatten() * kwargs["block_size"]
+            slots = (slots[:, None] + torch.arange(128)).flatten()
+            visible = value_cache.reshape(-1, 2, 72)[slots]
+            if kwargs["atten_mask"] is not None:
+                visible = visible[~kwargs["atten_mask"].flatten()]
+            kwargs["out"][0].copy_(
+                visible.mean(0).repeat_interleave(2, dim=0).reshape(1, 1, -1)
+            )
+
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        with (
+            patch(
+                f"{module}.attention_sinks",
+                side_effect=AssertionError("no sinks supplied"),
+            ),
+            patch(
+                f"{module}.torch_npu._npu_fused_infer_attention_score_get_max_workspace",
+                return_value=None,
+            ),
+            patch(
+                f"{module}.torch_npu.npu_fused_infer_attention_score.out",
+                side_effect=paged_attention,
+            ),
+        ):
+            for window, expected in ((63, 95.5), (-1, 191.5)):
+                with self.subTest(window=window):
+                    layer.sliding_window_size = window
+                    output = backend.forward_decode_graph(
+                        torch.zeros(1, 4, 72),
+                        None,
+                        None,
+                        layer,
+                        None,
+                        save_kv_cache=False,
+                    )
+                    torch.testing.assert_close(output, torch.full((1, 288), expected))
 
 
 if __name__ == "__main__":

@@ -292,7 +292,7 @@ class AscendAttnMaskBuilder:
         b = seq_lens.size(0)
         device = seq_lens.device
         indices = torch.arange(s2, device=device).unsqueeze(0).expand(b, -1)
-        start_indices = torch.clamp(seq_lens - left_context, min=0)
+        start_indices = torch.clamp(seq_lens - 1 - left_context, min=0)
         mask = (indices < start_indices) | (indices >= seq_lens)
         return mask.unsqueeze(1).to(self.device, non_blocking=True)
 
@@ -1330,7 +1330,7 @@ class AscendAttnBackend(AttentionBackend):
                     seq_lens_int = seq_lens_cpu[:bs].int().to(self.device)
                 else:
                     seq_lens_int = seq_lens[:bs].int()
-                starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
+                starts = torch.clamp(seq_lens_int - 1 - self.sliding_window_size, min=0)
                 indices = self.graph_metadata["swa_indices"]
                 start_exp = starts.unsqueeze(1)
                 seq_exp = seq_lens_int.unsqueeze(1)
@@ -2844,6 +2844,17 @@ class AscendAttnBackend(AttentionBackend):
                     and forward_batch.encoder_lens is None
                     and layer.logit_cap == 0
                     and not getattr(self, "use_native_sdpa", False)
+                    and layer.sliding_window_size == -1
+                    # Keep partial-page prefixes on the native path: qlens
+                    # can return without writing its output for these inputs.
+                    # ALiBi uses a separate implementation below.
+                    and (
+                        self.use_alibi
+                        or all(
+                            prefix_len % self.page_size == 0
+                            for prefix_len in forward_batch.extend_prefix_lens_cpu
+                        )
+                    )
                 ):
                     if not self.use_alibi:
                         query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -3984,7 +3995,7 @@ class AscendAttnBackend(AttentionBackend):
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             return attn_output
 
-        if sinks is not None or self.is_hybrid_swa:
+        if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):
                 block_tables = self.forward_metadata.block_tables_swa
@@ -4544,7 +4555,11 @@ class AscendAttnBackend(AttentionBackend):
                 )
             # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
             # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
-            elif forward_batch.encoder_lens is None and layer.logit_cap == 0:
+            elif (
+                forward_batch.encoder_lens is None
+                and layer.logit_cap == 0
+                and layer.sliding_window_size == -1
+            ):
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 if not self.use_alibi:

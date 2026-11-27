@@ -589,19 +589,35 @@ def _chunk_state_varlen_kernel(
                 offs_m[:, None] * stride_chunk_states_hdim
                 + offs_n[None, :] * stride_chunk_states_dstate
             )
+            past_states = tl.load(
+                past_states_ptrs,
+                mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate),
+                other=0.0,
+            ).to(tl.float32)
         else:
-            # - this seems repetitive, buts its to help the compiler
+            # Select values after loading: merging pointers from different
+            # allocations is unsupported by Ascend Triton.
             if start_idx < pid_c * chunk_size:
                 past_states_ptrs = chunk_states_ptr + (
                     offs_m[:, None] * stride_chunk_states_hdim
                     + offs_n[None, :] * stride_chunk_states_dstate
                 )
+                past_states = tl.load(
+                    past_states_ptrs,
+                    mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate),
+                    other=0.0,
+                ).to(tl.float32)
             else:
-                past_states_ptrs = initstates_ptr + (
+                initial_states_ptrs = initstates_ptr + (
                     pid_b * stride_init_states_batch
                     + offs_m[:, None] * stride_init_states_hdim
                     + offs_n[None, :] * stride_init_states_dstate
                 )
+                past_states = tl.load(
+                    initial_states_ptrs,
+                    mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate),
+                    other=0.0,
+                ).to(tl.float32)
 
                 # need to adjust the boundary
                 if start_idx > pid_c * chunk_size:
@@ -609,12 +625,6 @@ def _chunk_state_varlen_kernel(
                         dA_cumsum_ptr
                         + (start_idx - pid_c * chunk_size - 1) * stride_dA_cs_csize
                     ).to(tl.float32)
-
-        past_states = tl.load(
-            past_states_ptrs,
-            mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate),
-            other=0.0,
-        ).to(tl.float32)
 
         scale = tl.exp(dA_cs_last - dA_cs_boundary)
         acc += past_states * scale

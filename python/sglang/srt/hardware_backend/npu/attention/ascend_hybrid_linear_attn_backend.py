@@ -11,6 +11,7 @@ from sgl_kernel_npu.operators.mamba import (
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
+    Mamba2AttnBackend,
     MambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
@@ -247,8 +248,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         return 0  # Mamba attn does not use seq lens to index kv cache
 
 
-class AscendMamba2AttnBackend(AscendMambaAttnBackendBase):
-    pass
+class AscendMamba2AttnBackend(AscendMambaAttnBackendBase, Mamba2AttnBackend):
+    _native_causal_conv_only = True
 
 
 class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
