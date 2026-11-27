@@ -119,10 +119,9 @@ export const popularModels = [
     vendor: "MiniMax",
     href: "/cookbook/diffusion/MiniMax/MiniMax-H3",
     logo: "/cards/logos/minimax.png",
-    badge: "New",
     tags: ["7 platforms", "Video + audio", "BF16 / FP8"],
     hero: {
-      eyebrow: "Featured model · New",
+      eyebrow: "Featured model",
       headline: "Meet MiniMax-H3 on SGLang",
       blurb:
         "MiniMax's video-and-audio diffusion model — one request returns an MP4 carrying 24 fps video and a synchronized stereo audio track. SGLang Diffusion serves all three task profiles — text, first/last frame, and image / video / audio reference conditioning — with Ulysses × Ring sequence parallelism and recipes across B200, B300, H200, H100, AMD MI300X / MI355X, and 2× RTX 5090.",
