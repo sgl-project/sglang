@@ -451,6 +451,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type
             == "minimax_m3_vl"
         )
+        self.is_gigachat4 = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gigachat4"
+        )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
@@ -639,6 +644,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 model_path=self.tokenizer_manager.model_path,
                 revision=get_model().revision,
                 default_chat_template_kwargs=get_serving().default_chat_template_kwargs,
+                inkling2_tool_call_author_name_mode=get_model().inkling2_tool_call_author_name_mode,
             )
         )
 
@@ -998,6 +1004,10 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.tool_call_parser or request._response_parser_json_response_format:
             return False
+        if request._drops_unlisted_tool_calls:
+            # The model may call a tool it cannot call now, under `none` or before
+            # the tool loads; parsing drops the call, where skipping it leaks markup.
+            return True
         if not self._effective_tools(request):
             # With no tools declared, tool_choice only holds its default and limits nothing.
             detector = FunctionCallParser.ToolCallParserEnum[self.tool_call_parser]
@@ -1739,25 +1749,7 @@ class OpenAIServingChat(OpenAIServingBase):
         output_constrained: bool = False,
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
-        if self.is_minimax_m3:
-            # Settle the request's own thinking and effort first; server defaults
-            # only fill what it left unset.
-            _normalize_minimax_m3_request(request)
-        if self.default_chat_template_kwargs:
-            ctk = dict(request.chat_template_kwargs or {})
-            for k, v in self.default_chat_template_kwargs.items():
-                ctk.setdefault(k, v)
-            request.chat_template_kwargs = ctk
-            effort = ctk.get("reasoning_effort")
-            if effort is not None and request.reasoning_effort is None:
-                request.reasoning_effort = effort
-
-        if self.is_minimax_m3:
-            _normalize_minimax_m3_request(request)
-
-        normalize_hunyuan_reasoning_effort(
-            request, self.reasoning_parser, self.template_manager.reasoning_config
-        )
+        self._apply_request_defaults(request)
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
@@ -1899,7 +1891,7 @@ class OpenAIServingChat(OpenAIServingBase):
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
-                image_data=None,
+                image_data=request._input_image_data,
                 audio_data=None,
                 video_data=None,
                 modalities=[],
@@ -1958,6 +1950,69 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             result.reasoning_end_token_ids = list(token_ids)
         return result
+
+    def _apply_request_defaults(self, request: ChatCompletionRequest) -> None:
+        """Settle the thinking and effort that rendering reads; repeating it
+        changes nothing."""
+        if self.is_minimax_m3:
+            # Settle the request's own thinking and effort first; server defaults
+            # only fill what it left unset.
+            _normalize_minimax_m3_request(request)
+        if self.default_chat_template_kwargs:
+            ctk = dict(request.chat_template_kwargs or {})
+            for k, v in self.default_chat_template_kwargs.items():
+                ctk.setdefault(k, v)
+            request.chat_template_kwargs = ctk
+            effort = ctk.get("reasoning_effort")
+            if effort is not None and request.reasoning_effort is None:
+                request.reasoning_effort = effort
+
+        if self.is_minimax_m3:
+            _normalize_minimax_m3_request(request)
+
+        normalize_hunyuan_reasoning_effort(
+            request, self.reasoning_parser, self.template_manager.reasoning_config
+        )
+
+    @property
+    def native_tool_loading(self) -> bool:
+        """Whether Responses and Messages requests that load tools mid-conversation
+        render from their own wire form (see `prepare_native_prompt`)."""
+        return (
+            self._encoding_adapter is not None
+            and self._encoding_adapter.native_encoder is not None
+        )
+
+    def prepare_native_prompt(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        protocol: chat_encoding_adapters.NativeProtocol,
+        body: dict[str, Any],
+    ) -> chat_encoding_adapters.NativePrompt:
+        """Render `body`, the Responses or Messages form of `request`, into its
+        `input_ids` and images, and set its `tools` to the tools the model can call
+        after the history; rendering then keeps only grammar, stops and parsing."""
+        self._apply_request_defaults(request)
+        response_format = request.response_format
+        prompt = self._encoding_adapter.native_encoder.encode_native(
+            protocol=protocol,
+            body=body,
+            thinking=self._get_reasoning_from_request(request),
+            effort=request.reasoning_effort,
+            response_schema=(
+                response_format.json_schema.schema_
+                if response_format is not None and response_format.json_schema
+                else None
+            ),
+        )
+        if prompt.image_data and not self.tokenizer_manager.model_config.is_multimodal:
+            raise ValueError("image input is not supported for this model")
+        request.input_ids = prompt.prompt_ids
+        request.tools = prompt.tools or None
+        request._input_image_data = prompt.image_data or None
+        request._drops_unlisted_tool_calls = True
+        return prompt
 
     def _apply_jinja_template(
         self,
@@ -2072,13 +2127,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
         else:
-            # The M3 template renders tool results by position, not by tool_call_id.
+            # These templates pair tool results by position.
+            sort_text_runs = self.is_minimax_m3 or self.is_gigachat4
             if (
                 self.template_manager.jinja_template_may_reorder_tool_results
-                or self.is_minimax_m3
+                or sort_text_runs
             ):
                 messages = self._canonicalize_tool_message_order(
-                    messages, sort_text_runs=self.is_minimax_m3
+                    messages, sort_text_runs=sort_text_runs
                 )
             for msg_dict in copy.deepcopy(messages):
                 if msg_dict.get("content") is None:
@@ -2094,9 +2150,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     modalities,
                 )
 
-                processed_msg["content"] = normalize_tool_content(
-                    processed_msg["role"], processed_msg.get("content")
-                )
+                if not self.is_gigachat4:
+                    processed_msg["content"] = normalize_tool_content(
+                        processed_msg["role"], processed_msg.get("content")
+                    )
 
                 openai_compatible_messages.append(processed_msg)
 
@@ -3453,6 +3510,8 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
         elif self.reasoning_parser == "muse":
             request.skip_special_tokens = False
+        elif self.reasoning_parser == "gigachat4" and request.separate_reasoning:
+            request.skip_special_tokens = False
 
     def supports_native_reasoning_history(self) -> bool:
         """Whether the chat encoder or template takes history as ``reasoning_content``
@@ -3498,7 +3557,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return config.toggle_param
 
         mode = self._reasoning_default_mode()
-        if mode in ("thinking", "enable_thinking"):
+        if mode in ("thinking", "enable_thinking", "reasoning"):
             return mode
         if mode in ("explicit_thinking", "explicit_enable_thinking"):
             return mode.replace("explicit_", "")
@@ -3648,7 +3707,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.reasoning_effort is not None
                     and request.reasoning_effort != "none"
                 )
-            if mode in ("thinking", "enable_thinking"):
+            if mode in ("thinking", "enable_thinking", "reasoning"):
                 return (
                     not request.chat_template_kwargs
                     or request.chat_template_kwargs.get(mode) is not False

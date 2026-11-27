@@ -1835,7 +1835,6 @@ def _run_benchmark_once_impl(
     )
 
     env = os.environ.copy()
-    env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     # Perf dumps are consumed as stage-attributed denoise measurements.  Drain
     # the device queue at stage boundaries so asynchronous denoise work cannot
     # leak into a later stage (most visibly DecodingStage).  An explicit 0 in
