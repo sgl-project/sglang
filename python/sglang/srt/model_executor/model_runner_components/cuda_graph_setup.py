@@ -295,7 +295,10 @@ def sync_elastic_cuda_graph_config(
 
 
 def refresh_deep_gemm_layout_memory_budget(
-    model_runner: ModelRunner, *, only_if_initialized: bool = False
+    model_runner: ModelRunner,
+    *,
+    only_if_initialized: bool = False,
+    joined: bool = False,
 ) -> None:
     """Set the all-rank budget before capture, then refresh after startup."""
     global _deep_gemm_layout_memory_budget_initialized
@@ -349,10 +352,12 @@ def refresh_deep_gemm_layout_memory_budget(
     )
 
     world_group = get_parallel().world_group
+    # No WORLD peers to all_reduce with until joined.
+    solo_join = get_exec().moe.is_ep_offset_joiner and not joined
     available_memory_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=get_parallel().launch_world_size > 1,
+        distributed=not solo_join and get_parallel().launch_world_size > 1,
         cpu_group=world_group.cpu_group,
     )
     budget_bytes = set_masked_standard_layout_memory_budget(
@@ -370,7 +375,7 @@ def recapture_elastic_cuda_graph(
     *,
     model_runner: ModelRunner,
 ) -> GraphCapture:
-    refresh_deep_gemm_layout_memory_budget(model_runner)
+    refresh_deep_gemm_layout_memory_budget(model_runner, joined=True)
     # Warmup may communicate, so every rank repeats it after the rendezvous.
     model_runner._kernel_warmed_up = False
     capture = capture_decode_graph(model_runner=model_runner)
@@ -707,12 +712,20 @@ def capture_prefill_graph(
             end_layer=model_runner.layer_info.end_layer,
         )
     )
+    # A decoder may own fewer attention layers than the runner's layer range,
+    # e.g. looped passes that share KV cache layers but keep per-visit states.
+    attention_start_layer = getattr(
+        layer_model, "start_layer", model_runner.layer_info.start_layer
+    )
+    attention_end_layer = getattr(
+        layer_model, "end_layer", model_runner.layer_info.end_layer
+    )
     if not supports_hybrid_graph and not has_standard_gqa_for_all_local_layers(
         attention_layer_count=sum(
             layer is not None for layer in model_runner.attention_layers
         ),
-        start_layer=model_runner.layer_info.start_layer,
-        end_layer=model_runner.layer_info.end_layer,
+        start_layer=attention_start_layer,
+        end_layer=attention_end_layer,
     ):
         # TODO(yuwei): support Non-Standard GQA
         log_info_on_rank0(

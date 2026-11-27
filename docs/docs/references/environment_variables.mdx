@@ -7,6 +7,8 @@ SGLang supports various environment variables that can be used to configure its 
 
 *Note: The canonical prefix for all SGLang environment variables is `SGLANG_`. The legacy `SGL_` prefix was removed in SGLang 1.0: a server started with an `SGL_*` variable whose `SGLANG_*` name is a supported variable stops and names the `SGLANG_*` name to use. A few variables keep an upstream/vendor prefix (e.g. `MOONCAKE_*`, `ASCEND_*`) because that is their canonical name.*
 
+*A server also stops at startup when a variable defined in `python/sglang/srt/environ.py` is set to a value that does not parse as its type, and the error names the variable. For example, `SGLANG_PORT=abc` stops it, and so does a boolean set to anything other than `true`, `1`, `yes`, `y`, `on`, `false`, `0`, `no`, `n`, or `off` (case-insensitive). An empty value counts as unset, except for a string or comma-separated list variable, where it is the value.*
+
 ## General Configuration
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -1700,6 +1702,16 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>MOONCAKE_OFFLOAD_FILE_STORAGE_PATH</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>File storage path for Mooncake SSD offload.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>MOONCAKE_ENABLE_EGM_STORE_POOL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Back each rank's Mooncake Store segment with EGM host memory that other trays of the NVLink domain read over NVLink. Requires <code>MOONCAKE_PROTOCOL=nvlink</code> and Mooncake 0.3.14 or later built with MNNVL.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>MOONCAKE_EGM_NUMA_NODES</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Host NUMA nodes for the EGM pool: <code>auto</code> or a comma-separated list. When unset, each rank uses the host NUMA node of its own GPU.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
     <tr>

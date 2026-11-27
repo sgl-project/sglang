@@ -13,6 +13,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ inputs.branch || 'main' }}
   cancel-in-progress: true
 
+# Read-only GITHUB_TOKEN; nothing here writes through the API.
+permissions:
+  contents: read
+
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'
@@ -32,6 +36,8 @@ jobs:
           ref: ${{ inputs.branch || 'main' }}
           path: sglang-nightly-build
           fetch-depth: 0
+          # Long-lived self-hosted host: keep the job token out of .git/config.
+          persist-credentials: false
 
       - name: Set date and commit hash
         id: image_meta
@@ -100,7 +106,7 @@ jobs:
             --build-arg SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git \
             --build-arg SG_LANG_KERNEL_BRANCH="${KERNEL_REF}" \
             --build-arg SG_LANG_KERNEL_SOURCE="${KERNEL_SOURCE}" \
-            --no-cache --progress=plain \
+            --pull --no-cache --progress=plain \
             -t "intel/sglang-dev:${IMAGE_TAG}" \
             "${latest_tag[@]}"
 
