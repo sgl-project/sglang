@@ -272,6 +272,20 @@ class TestHy4DecodeKernels(CustomTestCase):
         self.assertEqual(len(logs.records), 4)
         self.assertTrue(all(record.exc_info is not None for record in logs.records))
 
+        _, layer, next_layer, _, norm = _tiny_hc_layers()
+        with (
+            patch.object(hy4_ihc, "hy4_ihc_post_pre_norm", fail("post_pre")),
+            patch.object(hunyuan_v4, "_hpc_ihc_available", return_value=False),
+            self.assertLogs(hunyuan_v4.logger, level="WARNING") as logs,
+        ):
+            for _ in range(2):
+                actual = layer.post_pre(output, residual, post, next_layer, norm)
+            expected = next_layer.pre(layer.post(output, residual, post), norm)
+        self.assertEqual(counts["post_pre"], 2)
+        self.assertEqual(len(logs.records), 1)
+        for got, want in zip(actual, expected):
+            self.assertTrue(torch.equal(got, want))
+
     def test_ihc_policy_normalizes_each_path_exactly_once(self):
         """Whichever backend the policy picks, RMSNorm must run exactly once
         (model norm or folded hpc op), never the multi-kernel torch fallback."""
@@ -303,9 +317,9 @@ class TestHy4DecodeKernels(CustomTestCase):
         all_folded = [("pre", True), ("post_pre", True), ("head", True)]
         cases = [
             ("hpc", False, all_folded, 0),
-            ("triton", False, [], 3),
+            ("triton", False, [], 2),
             ("mode", False, all_folded, 0),
-            ("mode", True, [], 3),
+            ("mode", True, [], 2),
             ("batch", True, [("post_pre", True), ("head", True)], 1),
         ]
         self.addCleanup(hy4_ihc._ihc_policy.cache_clear)
@@ -322,12 +336,21 @@ class TestHy4DecodeKernels(CustomTestCase):
                     hy4_ihc, "_rms_norm", wraps=hy4_ihc._rms_norm
                 ) as torch_norm,
                 patch.object(norm, "forward", wraps=norm.forward) as norm_forward,
+                patch.object(
+                    hy4_ihc,
+                    "hy4_ihc_post_pre_norm",
+                    wraps=hy4_ihc.hy4_ihc_post_pre_norm,
+                ) as shared_post_pre,
                 self.assertNoLogs(hunyuan_v4.logger, level="WARNING"),
             ):
                 layer.pre(hidden_states, norm)
                 layer.post_pre(output, hidden_states, post, next_layer, norm)
                 head_layer(hidden_states, norm)
                 self.assertEqual(folded, expected_folded)
+                self.assertEqual(
+                    shared_post_pre.call_count,
+                    int(("post_pre", True) not in expected_folded),
+                )
                 self.assertEqual(norm_forward.call_count, expected_norms)
                 self.assertEqual(torch_norm.call_count, 0)
 

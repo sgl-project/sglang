@@ -332,22 +332,27 @@ class HYV4HCLayer(nn.Module):
         return (result + residual.float()).to(output.dtype)
 
     def post_pre(self, output, residual, post, next_layer, norm):
-        if (
-            output.is_cuda
-            and not self._fused_ihc_post_pre_disabled
-            and _hpc_ihc_available(
-                "fuse_ihc_post_pre", self.hc_mult, self.hidden_size, output.shape[0]
-            )
-        ):
+        if output.is_cuda and not self._fused_ihc_post_pre_disabled:
             try:
                 from sglang.kernels.ops.layernorm.hy4_ihc import (
                     fused_hy4_ihc_post_pre,
+                    hy4_ihc_post_pre_norm,
                 )
             except ImportError:
                 pass
             else:
+                fused = (
+                    fused_hy4_ihc_post_pre
+                    if _hpc_ihc_available(
+                        "fuse_ihc_post_pre",
+                        self.hc_mult,
+                        self.hidden_size,
+                        output.shape[0],
+                    )
+                    else hy4_ihc_post_pre_norm
+                )
                 try:
-                    next_residual, reduced, next_post = fused_hy4_ihc_post_pre(
+                    next_residual, reduced, next_post = fused(
                         output,
                         residual,
                         post,
@@ -364,7 +369,7 @@ class HYV4HCLayer(nn.Module):
                 except Exception:
                     self._fused_ihc_post_pre_disabled = True
                     logger.warning(
-                        "fused_hy4_ihc_post_pre failed, disabling fused path",
+                        "fused iHC post_pre failed, disabling fused path",
                         exc_info=True,
                     )
         next_residual = self.post(output, residual, post)
