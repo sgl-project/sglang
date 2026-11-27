@@ -14,6 +14,10 @@ hopper = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
     reason="Requires a Hopper or newer GPU",
 )
+sm90 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="The interior tiles run only on SM90",
+)
 
 EXTENT, CLIP, HEAD_DIM = 1024, 22.627416997969522, 128
 SCALE = HEAD_DIM**-0.5
@@ -134,7 +138,7 @@ def test_decode_partials_matches_reference(heads_q, heads_k, qlen, window, page)
     _check_partials(partials, inputs, window)
 
 
-@hopper
+@sm90
 @pytest.mark.parametrize("splits", [1, 7, 64])
 def test_interior_split_partition(monkeypatch, splits):
     """On global-layer verify, any split count partitions the interior tiles and
@@ -152,7 +156,7 @@ def test_interior_split_partition(monkeypatch, splits):
     _check_partials(partials, inputs, None)
 
 
-@hopper
+@sm90
 def test_sequences_without_interior_tiles_keep_main_split(monkeypatch):
     """In a batch that mixes sequences with and without interior tiles, the ones
     without get the same keys in each split as on the launch with no interior path,
