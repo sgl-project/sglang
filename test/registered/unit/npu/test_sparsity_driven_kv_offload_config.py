@@ -217,7 +217,7 @@ class TestSparseKVRequestAllocHook(unittest.TestCase):
         slot map of each fresh row and keep the map of a request that keeps its row."""
         manager_module = _import_manager_module()
         pool = ReqToTokenPool(
-            size=3, max_context_len=8, device="cpu", enable_memory_saver=False
+            size=3, row_width=8, device="cpu", enable_memory_saver=False
         )
         manager = manager_module.SparseKVCacheManager.__new__(
             manager_module.SparseKVCacheManager

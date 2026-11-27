@@ -25,6 +25,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    FlushCacheReqInput,
     MMInputsProcessError,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -60,7 +61,6 @@ if TYPE_CHECKING:
         RequestRetirer,
     )
     from sglang.srt.rust_server.server import RustServer
-    from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
@@ -75,7 +75,6 @@ class SchedulerRequestReceiver:
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
-    server_args: ServerArgs
     model_config: ModelConfig
     max_recv_per_poll: int
     request_retirer: RequestRetirer
@@ -337,9 +336,8 @@ class SchedulerRequestReceiver:
     def _split_work_and_control_reqs(self, recv_reqs: List):
         # An AbortReq arrives behind its request on this DP group's own socket;
         # the work channel keeps that order, the broadcast from global rank 0 does not.
-        work_reqs = [
-            req
-            for req in recv_reqs
+        work_reqs, control_reqs = [], []
+        for req in recv_reqs:
             if isinstance(
                 req,
                 (
@@ -349,22 +347,10 @@ class SchedulerRequestReceiver:
                     BatchTokenizedEmbeddingReqInput,
                     AbortReq,
                 ),
-            )
-        ]
-        control_reqs = [
-            req
-            for req in recv_reqs
-            if not isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                    AbortReq,
-                ),
-            )
-        ]
+            ) or (isinstance(req, FlushCacheReqInput) and req.pp_probe):
+                work_reqs.append(req)
+            else:
+                control_reqs.append(req)
         return work_reqs, control_reqs
 
 

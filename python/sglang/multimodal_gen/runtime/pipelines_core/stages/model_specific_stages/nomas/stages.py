@@ -6,11 +6,13 @@ against the session state kept on the worker.
 """
 
 import math
+from functools import partial
 
 import torch
 import torch.distributed as dist
 from msgspec.structs import replace
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
     get_local_torch_device,
@@ -226,6 +228,34 @@ class NomasDenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
 
+    def drop_breakable_cuda_graphs(self, reason):
+        self.transformer.release_cuda_graphs()
+
+    @staticmethod
+    def _offline_graph_predict(batch, server_args, model, capacity, camera):
+        if not (
+            server_args.enable_breakable_cuda_graph
+            and server_args.warmup_mode == "server"
+            and not server_args.enable_torch_compile
+            and server_args.lora_path is None
+            and not (
+                batch.sampling_params.enable_cache_dit or envs.SGLANG_CACHE_DIT_ENABLED
+            )
+            and server_args.num_gpus == 1
+            and server_args.explicit_residency_mode("transformer") == "resident"
+            and batch.sampling_params.quality == "lossless"
+            and batch.latents.is_cuda
+            and torch.version.hip is None
+            and batch.latents.dtype == torch.bfloat16
+            and camera is None
+            and capacity == 0
+            and model.quant_config is None
+            and model.attention_backend == "flex"
+        ):
+            return None
+        runner = model.offline_graph(batch.is_warmup)
+        return partial(runner.predict, warmup=batch.is_warmup) if runner else None
+
     @property
     def role_affinity(self):
         return RoleType.DENOISER
@@ -270,6 +300,9 @@ class NomasDenoisingStage(PipelineStage):
                 model.embed_camera(camera[None]) if camera is not None else None
             )
             session = self._new_session(model, batch, config, capacity, generator)
+            graph_predict = self._offline_graph_predict(
+                batch, server_args, model, capacity, camera
+            )
             segments = []
             for index, (condition, segment) in enumerate(
                 zip(conditions, plan, strict=True)
@@ -284,6 +317,7 @@ class NomasDenoisingStage(PipelineStage):
                         condition,
                         initial_latents=initial,
                         cache_segment=index < len(plan) - 1,
+                        graph_predict=graph_predict,
                     )
                 )
             batch.latents = torch.cat(segments, dim=2)
