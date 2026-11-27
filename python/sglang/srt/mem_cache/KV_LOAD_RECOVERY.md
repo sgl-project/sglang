@@ -32,3 +32,13 @@ existing single middle-chunk request, while normal prefill/decode may share work
 No attention kernel changes are required. Normal compilation and CUDA graphs stay
 enabled. Validate correctness before measuring; exclude all startup compilation,
 graph capture and workload warmup from timed comparisons.
+
+## Adapter stream ownership
+
+External transfers must fence the stream that executes the consuming forward.
+SGLang TP1 without overlap uses the scheduler's current stream; overlap and PP
+use the model runner's dedicated forward stream. The LMCache adapter selects
+that stream for its producer event and H2D consumer wait. Waiting on the unused
+runner stream leaves a healthy large-prefix load racy even though partial-load
+recovery happens to drain its GPU completion before changing allocations.
+This fix uses normal stream ordering, without adding a CPU wait for healthy hits.

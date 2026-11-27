@@ -33,7 +33,13 @@ from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.kv_load_recovery import prepare_partial_kv_load
-from sglang.srt.runtime_context import get_disagg, get_memory, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -102,6 +108,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def is_backuped(self, node_id: NodeId) -> bool:
         # LMCache rebuilds lookup keys from tokens, so any L1 node is valid.
         return True
+
+    def _load_stream(self, device: torch.device) -> Any:
+        # Non-overlap TP1 runs forwards on the scheduler's current stream,
+        # whereas overlap/PP run on the model runner's dedicated stream.
+        # Fence the stream that will actually consume the H2D destinations.
+        if get_schedule().disable_overlap_schedule and get_parallel().pp_size == 1:
+            return torch.get_device_module(device).current_stream()
+        return self._forward_stream
 
     def supports_partial_load_recovery(self) -> bool:
         return (
@@ -652,6 +666,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             req.kv.mamba_needs_clear = False
 
         try:
+            load_stream = self._load_stream(device_indices.device)
             load_start = local_hit // self.lmcache_connector.chunk_size
             load_start *= self.lmcache_connector.chunk_size
             # Submit asynchronously while admission can still fall back to prefill.
@@ -664,10 +679,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 ),
                 local_hit_tokens=local_hit,
                 owned_device_indices=device_indices,
-                producer_stream=self._forward_stream,
+                producer_stream=load_stream,
             )
             if not self.lmcache_connector.prepare_load_on_stream(
-                flow.load, self._forward_stream,
+                flow.load, load_stream,
                 allow_partial=(self.supports_partial_load_recovery() and local_hit % self.lmcache_connector.chunk_size == 0),
             ):
                 raise RuntimeError("LMCache server rejected the retrieve request")

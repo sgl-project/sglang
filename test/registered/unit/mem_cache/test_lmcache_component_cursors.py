@@ -180,3 +180,28 @@ def test_external_slots_on_a_shared_memory_reclaim_the_load_demand(
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize(
+    "disable_overlap,pp_size,current_is_consumer",
+    [(True, 1, True), (False, 1, False), (True, 2, False)],
+)
+def test_lmcache_load_fences_actual_execution_stream(
+    cache_class, disable_overlap, pp_size, current_is_consumer
+):
+    cache = cache_class.__new__(cache_class)
+    cache._forward_stream = object()
+    current = object()
+    device_module = SimpleNamespace(current_stream=lambda: current)
+    with mock.patch.dict(
+        cache_class._load_stream.__globals__,
+        {
+            "get_schedule": lambda: SimpleNamespace(
+                disable_overlap_schedule=disable_overlap
+            ),
+            "get_parallel": lambda: SimpleNamespace(pp_size=pp_size),
+            "torch": SimpleNamespace(get_device_module=lambda device: device_module),
+        },
+    ):
+        consumer = cache._load_stream(torch.device("cuda"))
+    assert consumer is (current if current_is_consumer else cache._forward_stream)
