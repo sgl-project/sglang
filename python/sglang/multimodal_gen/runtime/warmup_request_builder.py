@@ -24,6 +24,7 @@ from copy import copy
 from dataclasses import fields, replace
 from typing import Any
 
+from sglang.multimodal_gen.configs.sample.nomas import NomasSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     align_num_frames_for_num_gpus,
@@ -350,13 +351,15 @@ def lighten_warmup_req(server_args: ServerArgs, req: Req) -> Req | None:
     cutting them leaves the spatial kernels at their serving shape.
     """
     params = req.sampling_params
-    if params is None:
+    if params is None or not params.supports_warmup_lightening:
         return None
 
-    num_frames = params.num_frames or 1
-    lighter_frames = _lighter_valid_num_frames(server_args, num_frames)
-    if lighter_frames < num_frames:
-        return _replace_warmup_workload(req, num_frames=lighter_frames)
+    # Explicit Nomas events must span exactly num_frames.
+    if not (isinstance(params, NomasSamplingParams) and params.segments is not None):
+        num_frames = params.num_frames or 1
+        lighter_frames = _lighter_valid_num_frames(server_args, num_frames)
+        if lighter_frames < num_frames:
+            return _replace_warmup_workload(req, num_frames=lighter_frames)
 
     width = params.width
     height = params.height

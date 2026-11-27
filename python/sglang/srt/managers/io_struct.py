@@ -644,6 +644,8 @@ class GenerateReqInput:
             self.sampling_params = self.sampling_params.copy()
         if self.rid is None:
             self.rid = uuid.uuid4().hex
+        elif not isinstance(self.rid, str):
+            raise ValueError("rid should be a string for a single request.")
         if self.return_logprob is None:
             self.return_logprob = False
         if self.logprob_start_len is None:
@@ -1521,6 +1523,8 @@ class EmbeddingReqInput:
         if self.is_single:
             if self.rid is None:
                 self.rid = uuid.uuid4().hex
+            elif not isinstance(self.rid, str):
+                raise ValueError("rid should be a string for a single request.")
             if self.sampling_params is None:
                 self.sampling_params = {}
             else:
@@ -2067,6 +2071,8 @@ class ClearHiCacheReqOutput(BaseReq, kw_only=True):
 
 class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
+    # Internal PP relay: PP0 asks the stages of this DP replica to vote.
+    pp_probe: bool = False
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):
@@ -2577,13 +2583,19 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     # DPC capacity and worker activation use logical DP slots.
     slot_offset: int = 0
     slot_count: int = 0
+    direction: str = "grow"  # "grow" adds DPC routing slots; "shrink" removes them.
     error: Optional[str] = None
+
+
+class ElasticDrainClearReq(BaseReq, kw_only=True):
+    """Tell the DPC to route to the retiring slots again: the shrink is off."""
 
 
 class ScaleElasticEPReqInput(BaseReq, kw_only=True):
     """Request to scale EP by changing the effective EP size (dp_attention mode)."""
 
     new_ep_size: int
+    operation_id: Optional[str] = None  # Caller tag echoed by /is_scaling_elastic_ep.
 
 
 class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
@@ -2593,6 +2605,16 @@ class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     new_ep_size: int = 0
     pending_ep_size: Optional[int] = None
     scale_phase: str = "idle"
+    required_ep_size: Optional[int] = None  # Width a waiting recover joiner sized for.
+    retry_when_joiner_announces: bool = False  # No joiner announced yet; resend later.
+
+
+class ElasticControlOutput(BaseReq, kw_only=True):
+    """A control reply stamped with its sender's DP rank, so a fan-out that narrows
+    mid-call can drop the replies retirees sent and wait on the survivors."""
+
+    sender_dp_rank: int
+    payload: PickleWrapper
 
 
 class GetInternalStateReq(BaseReq, kw_only=True):
@@ -3011,12 +3033,12 @@ def msgpack_decode(data: bytes) -> Any:
     return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
 
 
-def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
+def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0):
+    """Return enqueue completion for async sockets; sync sockets return None."""
     if _USE_PICKLE_IPC:
-        socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
-        return
+        return socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
 
-    socket.send(msgpack_encode(obj), flags=flags)
+    return socket.send(msgpack_encode(obj), flags=flags)
 
 
 def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:

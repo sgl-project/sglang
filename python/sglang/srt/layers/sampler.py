@@ -63,7 +63,7 @@ if is_musa() or is_xpu():
     )
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter = envs.SGLANG_USE_AITER.get() and is_hip()
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
 
@@ -918,7 +918,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 
         if need_min_p_sampling:
-            min_p_thresholds = probs_top_k_top_p.max(dim=-1) * min_ps
+            min_p_thresholds = probs_top_k_top_p.max(dim=-1).values * min_ps
             min_p_mask = probs_top_k_top_p < min_p_thresholds.view(-1, 1)
             probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
 

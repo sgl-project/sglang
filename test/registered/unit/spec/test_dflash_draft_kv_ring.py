@@ -250,7 +250,7 @@ class TestDraftKVRingLayout(CustomTestCase):
 
     def test_the_floor_resets_when_the_slot_is_allocated_again(self):
         pool = ReqToTokenPool(
-            size=3, max_context_len=8, device="cpu", enable_memory_saver=False
+            size=3, row_width=8, device="cpu", enable_memory_saver=False
         )
         ring = _ring(1)
         slot = pool.alloc_rows(1)[0]
