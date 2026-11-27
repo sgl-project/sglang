@@ -601,6 +601,13 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         # experts but cannot add replicas.
         if get_exec().moe.ep_num_redundant_experts:
             raise ValueError("Kimi-K3 does not support redundant experts.")
+        if get_moe_a2a_backend().is_megamoe() and not _is_hip:
+            from sglang.srt.layers.moe.mega_moe import check_mega_moe_num_experts
+
+            check_mega_moe_num_experts(
+                getattr(config, "n_routed_experts", config.num_experts),
+                get_parallel().moe_ep_size,
+            )
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
         moe_renormalize = config.moe_renormalize
