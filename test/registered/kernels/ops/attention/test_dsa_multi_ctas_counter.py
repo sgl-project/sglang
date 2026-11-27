@@ -54,6 +54,7 @@ def _make_backend(*, allocate_counter: bool = True):
     backend.req_to_token = torch.zeros(
         8, _MAX_CTX_LEN, dtype=torch.int32, device="cuda"
     )
+    backend.max_kv_len = _MAX_CTX_LEN
     backend._multi_ctas_kv_counter_buffer = (
         make_persistent_multi_ctas_kv_counter_buffer(
             device=torch.device("cuda"),

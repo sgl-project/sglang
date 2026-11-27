@@ -9,7 +9,7 @@ via ``MiniMaxH3DenoiseBranch.forward_kwargs`` and writes unpacked
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import torch
@@ -696,6 +696,7 @@ class MiniMaxH3ComfyUIRunState:
     refined: bool = False
     steps_done: int = 0
     signature: tuple[Any, ...] | None = None
+    packed_branches: dict[int, Any] = field(default_factory=dict)
 
 
 class MiniMaxH3ComfyUIStepStage(PipelineStage):
@@ -745,6 +746,7 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
             self._cache_stage._unmount_cache_dit()
             state.cache_mounted = False
         state.branch = None
+        state.packed_branches.clear()
 
     def _read_step_tensors(
         self, batch: Req
@@ -834,10 +836,6 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
     def _run_dit(
         self, batch: Req, fk: dict[str, Any], state: MiniMaxH3ComfyUIRunState
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from sglang.multimodal_gen.runtime.managers.forward_context import (
-            set_forward_context,
-        )
-
         stage = self._cache_dit_stage()
         step = state.steps_done
         n_sigmas = _sample_sigmas_len(state.sample_sigmas)
@@ -850,18 +848,17 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
             if state.step_attn_metadata is not None
             else None
         )
-        runner = stage._maybe_get_bcg_runner(self.transformer)
-        if runner is not None:
-            # Integrated mode never warms up, so capture here; it is a no-op
-            # once this signature has a graph.
-            with set_forward_context(
-                current_timestep=step, attn_metadata=attn_metadata, forward_batch=batch
-            ):
-                runner.capture(
-                    **stage._bcg_pad_prompt_kwargs(fk, current_model=self.transformer)
-                )
+        # Integrated mode never warms up, so capture inside _forward_dit's
+        # branch scope with the same padded kwargs used for replay; capture is
+        # a no-op once this signature has a graph.
         return stage._forward_dit(
-            self.transformer, fk, step, batch=batch, attn_metadata=attn_metadata
+            self.transformer,
+            fk,
+            step,
+            batch=batch,
+            packed_branches=state.packed_branches,
+            capture_bcg=True,
+            attn_metadata=attn_metadata,
         )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
