@@ -6427,6 +6427,9 @@ class Scheduler(
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
+                if idle:
+                    # Waited, not polled, so every rank agrees on idle.
+                    tc.wait_fenced_writes()
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
