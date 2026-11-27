@@ -249,6 +249,11 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def needs_incremental_component_backup(self, node_id: NodeId) -> bool:
+        """Whether an auxiliary component has device data missing from host."""
+        ...
+
+    @abstractmethod
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
         ...
@@ -634,6 +639,11 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def set_host_memory_buffer_only(self) -> None:
         """Mark the host tier as buffer-only: one node staged per backup intent."""
+        ...
+
+    @abstractmethod
+    def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
+        """Make the per-path Mamba cap count and free host copies (HiCache init)."""
         ...
 
     @abstractmethod

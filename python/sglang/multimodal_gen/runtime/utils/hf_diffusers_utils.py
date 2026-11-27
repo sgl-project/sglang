@@ -673,6 +673,63 @@ def _local_model_index_path(model_path: str) -> str:
     return os.path.join(model_path, "modular_model_index.json")
 
 
+_EXTERNAL_COMPONENT_OPTIONAL_KEYS = frozenset({"type_hint", "variant", "revision"})
+_EXTERNAL_COMPONENT_REQUIRED_KEYS = frozenset(
+    {"pretrained_model_name_or_path", "subfolder"}
+)
+
+
+def external_component_path(name: str, spec: Any) -> str | None:
+    """Where a model_index.json component from another repository lives.
+
+    Such a component is a ``[library, class, source]`` triple whose ``source``
+    is a diffusers modular-pipeline component spec,
+    ``{"type_hint": [library, class], "pretrained_model_name_or_path": repo,
+    "subfolder": folder, "variant": null, "revision": null}``. Returns
+    ``repo/folder`` (an HF ``namespace/repo/subfolder`` or a local path), or
+    None for an ordinary ``[library, class]`` component of this snapshot.
+    Variants and revisions are not supported.
+    """
+    if not (isinstance(spec, list) and len(spec) == 3 and isinstance(spec[2], dict)):
+        return None
+    source = spec[2]
+    keys = set(source)
+    missing = _EXTERNAL_COMPONENT_REQUIRED_KEYS - keys
+    unknown = (
+        keys - _EXTERNAL_COMPONENT_REQUIRED_KEYS - _EXTERNAL_COMPONENT_OPTIONAL_KEYS
+    )
+    if missing or unknown:
+        raise ValueError(
+            f"model_index.json component {name!r} source must have "
+            f"{sorted(_EXTERNAL_COMPONENT_REQUIRED_KEYS)}; missing {sorted(missing)}, "
+            f"unknown {sorted(unknown)}"
+        )
+    repo, subfolder = source["pretrained_model_name_or_path"], source["subfolder"]
+    for key, value in (
+        ("pretrained_model_name_or_path", repo),
+        ("subfolder", subfolder),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"model_index.json component {name!r} {key} must be a non-empty "
+                f"string, got {value!r}"
+            )
+    if "type_hint" in source and list(source["type_hint"]) != list(spec[:2]):
+        raise ValueError(
+            f"model_index.json component {name!r} type_hint {source['type_hint']!r} "
+            f"differs from {spec[:2]!r}"
+        )
+    for key in ("variant", "revision"):
+        if source.get(key) is not None:
+            raise ValueError(
+                f"model_index.json component {name!r}: {key} is not supported, "
+                f"got {source[key]!r}"
+            )
+    if os.path.isabs(repo):
+        return os.path.join(repo, subfolder)
+    return f"{repo}/{subfolder}"
+
+
 def _read_model_index(path: str) -> dict[str, Any]:
     with open(path) as f:
         config = json.load(f)
@@ -686,6 +743,11 @@ def _read_model_index(path: str) -> dict[str, Any]:
                         f"Modular component {name!r} must use its own subfolder"
                     )
                 config[name] = spec[:2]
+        return config
+    # Validate external-component triples here;
+    # ComposedPipelineBase.load_modules resolves them.
+    for name, spec in config.items():
+        external_component_path(name, spec)
     return config
 
 
@@ -915,6 +977,7 @@ def maybe_download_model(
     force_diffusers_model: bool = False,
     revision: str | None = None,
     skip_overlay_resolution: bool = False,
+    model_subfolder: str | None = None,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -926,6 +989,8 @@ def maybe_download_model(
         is_lora: If True, skip model completeness verification (LoRA models don't have transformer/vae directories)
         force_diffusers_model: If True, apply diffusers model check. Otherwise it should be a component model
         revision: Specific Hugging Face Hub revision to resolve
+        model_subfolder: Pipeline subfolder whose metadata and local component weights
+            must be cached. The returned path remains the repository snapshot root.
     Returns:
         Local path to the model
     """
@@ -1011,6 +1076,19 @@ def maybe_download_model(
             for path in required_files
             if not os.path.isfile(os.path.join(local_path, path))
         ]
+        pipeline_path = (
+            os.path.join(local_path, model_subfolder)
+            if model_subfolder is not None
+            else local_path
+        )
+        if model_subfolder is not None:
+            if not os.path.isfile(_local_model_index_path(pipeline_path)):
+                missing_required_files.append(f"{model_subfolder}/model_index.json")
+            else:
+                missing_required_files.extend(
+                    f"{model_subfolder}/{path}"
+                    for path in _get_missing_declared_weight_components(pipeline_path)
+                )
         if missing_required_files:
             if not download:
                 raise ValueError(
@@ -1028,7 +1106,7 @@ def maybe_download_model(
             # maybe_download_model_index's model_index.json fetch materializes a full
             # cache entry, so this resolve reports that stub as a hit; returning it
             # would skip the download. LoRA repos declare no components.
-            if not is_lora and _is_metadata_only_pipeline_snapshot(local_path):
+            if not is_lora and _is_metadata_only_pipeline_snapshot(pipeline_path):
                 if not download:
                     raise ValueError(
                         f"Model {model_name_or_path} found in cache but only contains "

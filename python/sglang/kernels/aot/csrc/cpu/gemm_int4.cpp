@@ -379,12 +379,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_int4_weight_packed_with_c
   return std::make_tuple(std::move(blocked_weight), std::move(blocked_scales), std::move(blocked_qzeros));
 }
 
-std::tuple<at::Tensor, at::Tensor> int4pack(at::Tensor qweight, at::Tensor qzeros, int64_t quant_method_4bit) {
+std::tuple<at::Tensor, at::Tensor>
+int4pack(at::Tensor qweight, at::Tensor qzeros, int64_t quant_method_4bit, bool is_symmetric) {
   TORCH_CHECK(qweight.scalar_type() == at::kInt, "qweight must be int32");
   TORCH_CHECK(qzeros.scalar_type() == at::kInt, "qzeros must be int32");
   qweight = qweight.contiguous();
   qzeros = qzeros.contiguous();
   if (quant_method_4bit == CPUQuantAlgo::AWQ) {
+    // is_symmetric is GPTQ-only: symmetric AWQ/AutoRound checkpoints store their zero point in qzeros, so it is read
+    // as-is.
     auto bitshifts = at::tensor({0, 4, 1, 5, 2, 6, 3, 7}, at::kInt) * 4;
     auto qweight_final = (at::bitwise_right_shift(qweight.unsqueeze(-1), bitshifts) & 0xF)
                              .flatten(-2)
@@ -401,8 +404,16 @@ std::tuple<at::Tensor, at::Tensor> int4pack(at::Tensor qweight, at::Tensor qzero
                              .transpose(-1, -2)
                              .contiguous()
                              .to(at::kByte);
-    auto qzeros_final =
-        ((at::bitwise_right_shift(qzeros.unsqueeze(-1), bitshifts) & 0xF) + 1).flatten(-2).contiguous().to(at::kByte);
+    at::Tensor qzeros_final;
+    if (is_symmetric) {
+      // Symmetric uint4 uses zero point 2^(4-1)=8.
+      auto qz_sizes = qzeros.sizes().vec();
+      qz_sizes.back() *= 8;
+      qzeros_final = at::full(qz_sizes, 1 << (4 - 1), qzeros.options().dtype(at::kByte));
+    } else {
+      qzeros_final =
+          ((at::bitwise_right_shift(qzeros.unsqueeze(-1), bitshifts) & 0xF) + 1).flatten(-2).contiguous().to(at::kByte);
+    }
     return std::make_tuple(qweight_final, qzeros_final);
   } else {
     TORCH_CHECK(false, "CPU int4 pack only support AWQ or GPTQ...");
@@ -413,11 +424,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
     at::Tensor qweight,  // awq: (*, K, N / 8)  ||  gptq: (*, K / 8, N) , int32
     at::Tensor qzeros,   // awq: (*, K / group_size, N / 8) ||  gptq: (*, K / group_size, N / 8) , int32
     at::Tensor scales,   // awq: (*, K / group_size, N) ||  gptq: (*, K / group_size, N) , bfloat16
-    int64_t quant_method_4bit) {
+    int64_t quant_method_4bit,
+    bool is_symmetric) {  // GPTQ only: true forces zero point 8; ignored for AWQ
   at::Tensor _qweight;
   at::Tensor _qzeros;
 
-  auto res = int4pack(qweight, qzeros, quant_method_4bit);
+  auto res = int4pack(qweight, qzeros, quant_method_4bit, is_symmetric);
   _qweight = std::get<0>(res);
   _qzeros = std::get<1>(res);
 

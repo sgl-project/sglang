@@ -40,6 +40,7 @@ import torch.distributed
 
 from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_location import get_eplb_group
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
@@ -141,10 +142,10 @@ class ExpertDistributionRecorder(ABC):
     ):
         if get_exec().moe.expert_distribution_recorder_mode is not None:
             assert expert_location_metadata is not None, (
-                "ExpertLocationMetadata is required for expert distribution recording. One possible"
+                "ExpertLocationMetadata is required for expert distribution recording. One possible "
+                "reason is that you are using a model that does not support expert distribution "
+                "recording. Try setting `get_model_config_for_expert_location` in your model."
             )
-            "reason is that you are using a model that does not support expert distribution"
-            "recording. Try setting `get_model_config_for_expert_location` in your model."
             return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
@@ -188,6 +189,9 @@ class ExpertDistributionRecorder(ABC):
     def on_deepep_dispatch_low_latency(
         self, local_physical_count_of_layer: torch.Tensor
     ):
+        pass
+
+    def adopt_single_pass_gatherers(self, previous: ExpertDistributionRecorder):
         pass
 
     def start_record(self):
@@ -239,6 +243,19 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
             )
             self.start_record()
+
+    def adopt_single_pass_gatherers(self, previous: ExpertDistributionRecorder):
+        """Take over ``previous``'s gatherers, which a kept decode graph writes.
+        Shrink only: a grow recaptures and needs gatherers at its own width."""
+        if not isinstance(previous, _ExpertDistributionRecorderReal):
+            return
+        kept = previous._single_pass_gatherers
+        assert kept.keys() == self._single_pass_gatherers.keys(), (
+            f"{sorted(kept)} != {sorted(self._single_pass_gatherers)}"
+        )
+        for gatherer in kept.values():
+            gatherer.reset()
+        self._single_pass_gatherers = kept
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
@@ -626,7 +643,10 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
 
     def collect(self) -> Dict:
         if self._enable_global_physical_experts:
-            global_physical_count = self._data
+            # Wider than the live width after a shrink that kept these gatherers.
+            global_physical_count = self._data[
+                :, : self._expert_location_metadata.num_physical_experts
+            ]
         else:
             # Can optimize if bottleneck
             global_physical_count = _convert_local_to_global_physical_count(
@@ -780,6 +800,7 @@ class _Accumulator(ABC):
     ):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
+        self._communication_group = get_eplb_group()
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -854,7 +875,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            gpu_physical_count,
+            dst=0,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._communication_group,
         )
 
         if self._rank == 0:
@@ -927,12 +951,6 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._records = []
-
-    def get_single_pass_gatherer_keys(self):
-        return super().get_single_pass_gatherer_keys()
-
-    def get_single_pass_gatherer_key(self, debug_name: Optional[str]):
-        return super().get_single_pass_gatherer_key(debug_name)
 
     def append(
         self,
@@ -1022,7 +1040,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            logical_count_of_buffered_step,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._communication_group,
         )
 
         output = dict(
@@ -1065,7 +1085,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 dtype=torch.float32,
                 device=get_device_namespace().device,
             )
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
+        torch.distributed.broadcast(
+            avg_rate_tensor, src=0, group=self._communication_group
+        )
         return avg_rate_tensor.item()
 
 

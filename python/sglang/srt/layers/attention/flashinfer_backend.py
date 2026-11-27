@@ -53,7 +53,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import (
     window_read,
 )
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -72,7 +72,7 @@ from sglang.srt.speculative.spec_utils import (
     fill_draft_window_rail,
     resolve_draft_decode_window,
 )
-from sglang.srt.utils import get_int_env_var, is_flashinfer_available, next_power_of_2
+from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -193,6 +193,20 @@ global_override_indptr_cpu = None
 global_override_window_indptr_cpu = None
 
 
+def _verify_plan_uniform_q_len(spec_info) -> Optional[int]:
+    """EAGLE verify gives every request exactly num_tokens_per_req query rows.
+    Every plan through a captured verify wrapper must carry the same
+    per-request q length: capture fixes the kernel's query tile from it.
+    None keeps plan() unchanged."""
+    if spec_info is None or spec_info.spec_input_type != SpecInputType.EAGLE_VERIFY:
+        return None
+    # SpecInput defaults num_tokens_per_req to -1 ("not set"). EagleVerifyInput
+    # sets it to draft_token_num (>= 1), so real verify batches never return here.
+    if spec_info.num_tokens_per_req <= 0:
+        return None
+    return int(spec_info.num_tokens_per_req)
+
+
 def fast_prefill_plan(
     self,
     qo_indptr: torch.Tensor,
@@ -227,6 +241,7 @@ def fast_prefill_plan(
     max_q_len: int,
     max_kv_len: int,
     uniform_verify_width: Optional[int] = None,
+    uniform_q_len: int = 0,
 ) -> None:
     """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
     draft-extend or uniform-width verify CUDA graph (FlashInfer fa2 only).
@@ -289,7 +304,8 @@ def fast_prefill_plan(
         packed_lengths = (kv_lens_host * uniform_verify_width + 7) // 8
         packed_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cpu")
         packed_indptr[1:] = torch.cumsum(packed_lengths, dim=0)
-        assert int(packed_indptr[-1]) <= self._custom_mask_buf.numel()
+        # FlashInfer's SM90 fp8-KV verify kernel reads up to 8 bytes past the mask.
+        assert int(packed_indptr[-1]) + 8 <= self._custom_mask_buf.numel()
         self._mask_indptr_buf.copy_(packed_indptr, non_blocking=non_blocking)
         pack_verify_mask_into(
             custom_mask,
@@ -307,9 +323,8 @@ def fast_prefill_plan(
     )
     self._cached_o_data_type = o_data_type
     self._block_tables = None
-    # FlashInfer's plan() clears this on every call and may set it again for its
-    # SM90 fp8-KV verify kernel. This plan never takes that route, so clear it
-    # here too rather than let run() launch it with a previous plan's state.
+    # The captured graph may hold FlashInfer's SM90 fp8-KV verify kernel, which
+    # reads only the buffers refreshed above; this plan does not rebuild its state.
     self._eagle_verify_fp8kv_sm90_state = None
 
     args = [
@@ -332,7 +347,7 @@ def fast_prefill_plan(
         fixed_split_size if fixed_split_size is not None else -1,
         False,  # disable_split_kv
         0,  # num_colocated_ctas
-        0,  # uniform_q_len
+        uniform_q_len,
         False,  # fixed_uniform_q_len
     ]
     self._plan_info = self._cached_module.plan(*args)
@@ -359,6 +374,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_backend = "fa2"
 
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.req_to_token_pool.row_width
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.runner_ids = model_runner.runner_ids
         self._swa_kv_pool = resolve_window_kv_pool(model_runner)
@@ -424,7 +440,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
         )
-        self.max_context_len = model_runner.model_config.context_len
         self.page_size = model_runner.page_size
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -466,11 +481,11 @@ class FlashInferAttnBackend(AttentionBackend):
         self.disable_cuda_graph_kv_split = False
         if self.enable_deterministic:
             self.decode_use_tensor_cores = True
-            self.prefill_split_tile_size = get_int_env_var(
-                "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096
+            self.prefill_split_tile_size = (
+                envs.SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE.get()
             )
-            self.decode_split_tile_size = get_int_env_var(
-                "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
+            self.decode_split_tile_size = (
+                envs.SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE.get()
             )
             self.disable_cuda_graph_kv_split = True
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
@@ -1236,7 +1251,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len,),
+                (max_num_tokens * self.max_kv_len,),
                 dtype=torch.int32,
                 device="cuda",
             )
@@ -1270,7 +1285,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                (max_num_tokens * self.max_kv_len),
                 dtype=torch.uint8,
                 device="cuda",
             )
@@ -1395,7 +1410,7 @@ class FlashInferAttnBackend(AttentionBackend):
         captured bucket. The request-slot count is fixed at capture (the
         runner pads real batches up to it with zero-length sentinel
         requests); kv indices cover up to num_slots sequences of
-        max_context_len.
+        max_kv_len.
         """
         device = self.workspace_buffer.device
         self.full_cg_prefill_req_slots = num_slots
@@ -1430,7 +1445,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # indices; size the fixed buffer for the worst case.
         self.full_cg_prefill_kv_indices = [
             torch.zeros(
-                (num_slots * self.max_context_len + 256,),
+                (num_slots * self.max_kv_len + 256,),
                 dtype=torch.int32,
                 device=device,
             )
@@ -1591,7 +1606,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc.for_layer(
                         forward_batch,
                         layer,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -1686,7 +1703,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc.for_layer(
                         forward_batch,
                         layer,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -1717,7 +1736,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc.for_layer(
                         forward_batch,
                         layer,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -1830,7 +1851,6 @@ class FlashInferIndicesUpdaterDecode:
         plan: IterationIds,
         req_pool_indices: torch.Tensor,
     ):
-        decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
             decode_wrappers[0],
             seq_lens,
@@ -2578,6 +2598,12 @@ class FlashInferIndicesUpdaterPrefill:
         ):
             paged_plan_kwargs["window_left"] = window.window_left
 
+        # A captured kernel keeps the tile size FlashInfer picked from this hint,
+        # so every replay must pass the same hint, including fast_prefill_plan.
+        uniform_q_len = _verify_plan_uniform_q_len(spec_info)
+        if uniform_q_len is not None:
+            paged_plan_kwargs["uniform_q_len"] = uniform_q_len
+
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
@@ -2704,11 +2730,8 @@ class FlashInferMultiStepDraftBackend:
                 )
             )
 
-        self.max_context_len = self.attn_backends[0].max_context_len
-
         # Cached variables for generate_draft_decode_kv_indices
-        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.attn_backends[0].max_kv_len
         self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
             model_runner
         )
@@ -2740,17 +2763,15 @@ class FlashInferMultiStepDraftBackend:
         assert_buffer_fits(
             required_kv_indices_len,
             kv_indices_buffer.shape[1],
-            "EAGLE draft kv_indices row (size max_bs * topk * max_context_len)",
+            "EAGLE draft kv_indices row (size max_bs * topk * req_to_token_row_width)",
             bs=bs,
             seq_lens_sum=seq_lens_sum,
         )
 
         # Blocks from the length sum (upper bound on the longest live row),
-        # capped by the draft window, not from the table width. pool_len is
-        # the req_to_token row width, the same table width the other call
-        # sites size from.
+        # capped by the draft window, not from the table width.
         num_token_blocks = spec_kv_index_token_blocks(
-            table_width=self.pool_len,
+            table_width=self.max_kv_len,
             kv_lens_sum=seq_lens_sum,
             batch_size=num_seqs,
             base_programs=self.speculative_num_steps * num_seqs * self.topk,
@@ -2875,7 +2896,7 @@ class FlashInferMultiStepDraftBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
-            forward_batch.batch_size, self.topk, self.max_context_len
+            forward_batch.batch_size, self.topk, self.max_kv_len
         )
         kv_indices = torch.empty(
             (self.speculative_num_steps, kv_indices_width),
@@ -2921,9 +2942,9 @@ class FlashInferMultiStepDraftBackend:
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         # generate_draft_decode_kv_indices packs topk per-branch sequences per row,
         # so the row needs the topk factor -- same as the eager init_forward_metadata
-        # (batch_size * topk * max_context_len). Dropping it overflows the buffer.
+        # (batch_size * topk * max_kv_len). Dropping it overflows the buffer.
         kv_indices_width = draft_kv_indices_buffer_width(
-            max_bs, self.topk, self.max_context_len
+            max_bs, self.topk, self.max_kv_len
         )
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),

@@ -421,6 +421,9 @@ _DIT_SUBFOLDER = "transformer"
 _DIT_SINGLE_FILE = "diffusion_pytorch_model.safetensors"
 _FLOAT_DTYPE_BYTES = {"F64": 8, "F32": 4, "F16": 2, "BF16": 2}
 _FLOAT_DTYPES = frozenset(_FLOAT_DTYPE_BYTES)
+# BatchNorm's int64 step counter (the FLUX.2 VAE has one) is not a weight;
+# counting its dtype would make the checkpoint look quantized and unsized.
+_NON_WEIGHT_BUFFER_SUFFIXES = (".num_batches_tracked",)
 _UNSIZED_WEIGHT_SUFFIXES = (".bin", ".pt", ".pth", ".ckpt", ".gguf")
 
 
@@ -442,7 +445,10 @@ def _local_dit_parameter_counts(folder: str) -> Counter[str] | None:
         return None
     counts: Counter[str] = Counter()
     for shard in shards:
-        counts.update(parse_local_safetensors_file_metadata(shard).parameter_count)
+        tensors = parse_local_safetensors_file_metadata(shard).tensors
+        for name, info in tensors.items():
+            if not name.endswith(_NON_WEIGHT_BUFFER_SUFFIXES):
+                counts[info.dtype] += info.parameter_count
     return counts
 
 
@@ -458,12 +464,22 @@ def _hub_dit_parameter_counts(
         shards = _index_shard_names(index_path)
     except RemoteEntryNotFoundError:
         shards = [_DIT_SINGLE_FILE]
-    counts: Counter[str] = Counter()
-    for shard in shards:
-        metadata = parse_safetensors_file_metadata(
+
+    def shard_counts(shard: str) -> dict[str, int]:
+        return parse_safetensors_file_metadata(
             repo_id=repo_id, filename=f"{folder}/{shard}", revision=revision
-        )
-        counts.update(metadata.parameter_count)
+        ).parameter_count
+
+    if len(shards) == 1:
+        return Counter(shard_counts(shards[0]))
+
+    # Overlap independent Hub range requests, not the checkpoint downloads.
+    from concurrent.futures import ThreadPoolExecutor
+
+    counts: Counter[str] = Counter()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for per_dtype in pool.map(shard_counts, shards):
+            counts.update(per_dtype)
     return counts
 
 
@@ -744,11 +760,6 @@ class MappedRegions:
 
     def __init__(self) -> None:
         self._maps = _read_process_mappings()
-
-    @property
-    def available(self) -> bool:
-        """False where /proc is absent, in which case nothing is classified."""
-        return self._maps is not None
 
     def holds_pointer(self, pointer: int) -> bool:
         if self._maps is None or pointer == 0:

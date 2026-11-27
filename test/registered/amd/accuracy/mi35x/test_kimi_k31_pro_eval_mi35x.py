@@ -30,7 +30,7 @@ with a fixed seed, so a failure is a regression rather than a reroll.
 This replaces Kimi-K3 as the scheduled MI35x Kimi nightly. The K3 test files
 stay registered and can still be run by hand.
 
-Registry: nightly-amd-accuracy-8-gpu-mi35x-kimi-k31-pro suite
+Registry: nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k31-pro suite
 """
 
 import os
@@ -55,7 +55,7 @@ from sglang.test.test_utils import (
 # cache added about 80 min on the first run.
 register_amd_ci(
     est_time=1200,
-    suite="nightly-amd-accuracy-8-gpu-mi35x-kimi-k31-pro",
+    suite="nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k31-pro",
     nightly=True,
 )
 
