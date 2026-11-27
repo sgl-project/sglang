@@ -621,35 +621,23 @@ class TestDpPadRows(CustomTestCase):
             ),
         ):
             routed = select_experts(x, logits, config)
-            self.assertEqual(gatherer._data.sum().item(), 24)
-            gatherer._data.zero_()
-            weights, ids = torch.topk(logits.softmax(-1), 4)
-            precomputed = topk_mod.build_precomputed_topk_output(
-                weights, ids.int(), config, 0
-            )
-            self.assertEqual(gatherer._data.sum().item(), 24)
-            self.assertTrue(
-                torch.all(precomputed.topk_ids[~_dp_live_rows(12, counts)] == -1)
-            )
-            self.assertTrue(
-                torch.all(routed.topk_ids[~_dp_live_rows(12, counts)] == -1)
-            )
+        self.assertEqual(gatherer._data.sum().item(), 24)
+        self.assertTrue(torch.all(routed.topk_ids[~_dp_live_rows(12, counts)] == -1))
 
     @unittest.skipIf(_IS_HIP, "DP padding suppression requires CUDA routing")
-    def test_k3_dp_padding_uses_masked_routes_at_handoff(self):
+    def test_k3_routes_leave_dp_padding_routed(self):
+        # K3's radix route (896 experts, top-16) declines the DP counts: the
+        # fused handoff is tried as without counts, no fill launches, and every
+        # row matches the call without counts.
         self._publish_dummy_config()
         x = torch.randn(8, 3584, device=self.DEVICE, dtype=torch.bfloat16)
         logits = torch.randn(8, 896, device=self.DEVICE, dtype=torch.bfloat16)
         bias = torch.randn(896, device=self.DEVICE)
-        counts = torch.tensor([1, 3], device=self.DEVICE)
-        route_quant_handoff.stage(x)
-        try:
-            with patch.object(
-                route_quant_handoff,
-                "try_route_quant_fused",
-                side_effect=AssertionError("unmasked handoff"),
-            ):
-                weights, ids = topk_mod.biased_grouped_topk_gpu(
+
+        def route(**kwargs):
+            route_quant_handoff.stage(x)
+            try:
+                out = topk_mod.biased_grouped_topk_gpu(
                     x,
                     logits,
                     bias,
@@ -657,14 +645,63 @@ class TestDpPadRows(CustomTestCase):
                     True,
                     num_expert_group=1,
                     topk_group=1,
-                    dp_pad_rows=topk_mod._DpPadRows(counts),
+                    **kwargs,
                 )
-            self.assertIsNone(route_quant_handoff.take(x))
-            self.assertIsNone(route_quant_handoff.take_prepared_routing(ids))
-            self.assertTrue(torch.all(ids[~_dp_live_rows(8, counts)] == -1))
-            self.assertTrue(torch.all(weights[~_dp_live_rows(8, counts)] == 0))
-        finally:
-            route_quant_handoff.clear()
+                return out, route_quant_handoff.take(x)
+            finally:
+                route_quant_handoff.clear()
+
+        (ref_weights, ref_ids), ref_handed = route()
+        dp_pad_rows = topk_mod._DpPadRows(torch.tensor([1, 3], device=self.DEVICE))
+        with patch.object(
+            gate_mod,
+            "_fill_dp_pad_rows",
+            side_effect=AssertionError("DP mask launched for a K3 route"),
+        ):
+            (weights, ids), handed = route(dp_pad_rows=dp_pad_rows)
+        self.assertTrue(dp_pad_rows.declined)
+        self.assertFalse(dp_pad_rows.masked)
+        self.assertTrue(torch.equal(ids, ref_ids))
+        self.assertTrue(torch.equal(weights, ref_weights))
+        self.assertEqual(handed is None, ref_handed is None)
+        if handed is not None:
+            for got, ref in zip(handed, ref_handed):
+                self.assertTrue(torch.equal(got, ref))
+
+    @unittest.skipIf(_IS_HIP, "DP padding suppression requires CUDA routing")
+    def test_select_experts_leaves_k3_dp_padding_routed(self):
+        # The decline reaches select_experts, which then masks nothing either.
+        self._publish_dummy_config()
+        x = torch.randn(8, 256, device=self.DEVICE, dtype=torch.bfloat16)
+        logits = torch.randn(8, 896, device=self.DEVICE, dtype=torch.bfloat16)
+        config = TopKConfig(
+            top_k=16,
+            use_grouped_topk=True,
+            num_expert_group=1,
+            topk_group=1,
+            correction_bias=torch.randn(896, device=self.DEVICE),
+            scoring_func="sigmoid",
+            renormalize=True,
+            routed_scaling_factor=2.5,
+            allow_routed_experts_capture=False,
+        )
+        ref = select_experts(hidden_states=x, router_logits=logits, topk_config=config)
+        counts = torch.tensor([1, 3], device=self.DEVICE)
+        extra_mask = AssertionError("DP mask launched for a K3 route")
+        with (
+            forward_context(
+                ForwardContext(attn_backend=None, moe_dp_real_rows=lambda: counts)
+            ),
+            patch.object(
+                topk_mod, "_mask_topk_ids_dp_pad_rows", side_effect=extra_mask
+            ),
+            patch.object(gate_mod, "_fill_dp_pad_rows", side_effect=extra_mask),
+        ):
+            got = select_experts(
+                hidden_states=x, router_logits=logits, topk_config=config
+            )
+        self.assertTrue(torch.equal(got.topk_ids, ref.topk_ids))
+        self.assertTrue(torch.equal(got.topk_weights, ref.topk_weights))
 
     @unittest.skipIf(_IS_HIP, "DP padding suppression requires CUDA routing")
     def test_fused_moe_skips_dp_pad_rows(self):
