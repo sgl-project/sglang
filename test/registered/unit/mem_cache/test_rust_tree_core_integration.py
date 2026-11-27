@@ -5176,6 +5176,37 @@ def test_mamba_path_cap_evicts_excess_states_through_the_adapter():
     assert core.mamba_evictable_size() == 1
 
 
+def test_mamba_path_cap_counts_host_copies_through_the_adapter():
+    from collections import defaultdict
+
+    from sglang.srt.mem_cache.unified_cache.cache_action import (
+        MambaEvictExcessPathStates,
+    )
+
+    core = _mamba_tree_core_with_cap(1)
+    core.set_hicache_enabled()
+    core.set_mamba_path_cap_counts_host(True)
+    _mamba_insert(core, [1], [10], 7)
+    node = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
+    _, transfers = core.build_backup_spec(node)
+    transfers[ComponentType.MAMBA][0].host_indices = torch.tensor(
+        [70], dtype=torch.int64
+    )
+    core.commit_backup(node, torch.tensor([100], dtype=torch.int64), transfers)
+    core.mark_write_through_pending([node], ack_id=node)
+    core.finish_write_through([node], ack_id=node)
+    result = _mamba_insert(core, [1, 2], [10, 11], 8)
+    (action,) = [
+        a for a in result.cache_actions if isinstance(a, MambaEvictExcessPathStates)
+    ]
+    device_frees, host_frees = defaultdict(list), defaultdict(list)
+    core.evict_excess_path_states(action.tail_node_id, device_frees, host_frees, [])
+    assert [t.item() for t in device_frees[ComponentType.MAMBA]] == [7]
+    assert [t.item() for t in host_frees[ComponentType.MAMBA]] == [70]
+    assert not core.component_has_host_value_only(node, ComponentType.MAMBA)
+    core.sanity_check([], [])
+
+
 def test_eagle_with_mamba_falls_back_to_the_unigram_binding():
     core = _mamba_tree_core(is_eagle=True)
     assert core.is_eagle is False

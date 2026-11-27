@@ -101,7 +101,7 @@ sglang serve \
   --port 30000
 ```
 
-SGLang detects the quantization format from checkpoint metadata; no additional quantization flag is needed. INT8 DiT weights are dequantized to BF16 for linear computation, while the VAE uses FP8 GEMM. You can use either weight override independently. The requests in the following sections work with these checkpoints.
+SGLang detects the quantization format from checkpoint metadata; no additional quantization flag is needed. INT8 DiT weights are dequantized to BF16 for linear computation, while the VAE uses FP8 GEMM. You can use either weight override independently. On SM103, the FP8 VAE quantizes BF16 activations directly into the FP8 GEMM input and shares one FP32 scale per 128×128 block. The requests in the following sections work with these checkpoints.
 
 ## 4. Offline and HTTP generation
 
