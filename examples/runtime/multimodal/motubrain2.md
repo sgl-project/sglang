@@ -1,14 +1,30 @@
 # Motubrain 2.0 action inference
 
-Install SGLang Diffusion and the Motubrain2 inference package in the same Python environment. This example requires access to the Motubrain runtime, robot profile, policy weights and the encoders used by the checkpoint. Astribot uses the DA3 DinoV2 geometry encoder. [Motubrain runtime and assets](https://github.com/shengshu-ai/Motubrain-2.0)
+Install the Motubrain2 inference package in the GPU server's Python environment. You will need the robot profile, policy weights and the encoders used by the checkpoint. Astribot uses the DA3 DinoV2 geometry encoder. [Motubrain runtime and assets](https://github.com/shengshu-ai/Motubrain-2.0)
 
-Run `sglang serve` on a compute node with the local model directory as its positional argument. Set `--model-type diffusion`, `--pipeline-class-name Motubrain2Pipeline`, `--num-gpus 1` and `--pipeline-config-path` with an absolute path to a JSON configuration. SGLang discovers this pipeline automatically. Its action stage runs the Motubrain observation encoder and native policy. It can reuse encoded inputs when the instruction, camera frames, robot state, camera transform and history are identical.
+Install SGLang Diffusion and its Motubrain backend registration from the same checkout. The following commands assume that checkout is at `/opt/sglang`. Substitute the absolute paths to your checkout, model and pipeline configuration on the GPU server.
+
+```bash
+python -m pip install -e '/opt/sglang/python[diffusion]' /opt/sglang/examples/runtime/multimodal/motubrain2_backend
+sglang serve --model-type motubrain2 --help
+```
+
+Start the policy on a compute node. For an existing robot deployment, keep the model path expected by the bridge and reuse its configured server address and port. The example uses the Astribot S1 Distill deployment.
+
+```bash
+sglang serve /opt/motubrain-s1/models/Distill \
+  --model-type motubrain2 --num-gpus 1 \
+  --pipeline-config-path /opt/motubrain-s1/config/sglang.json --warmup-mode off \
+  --host 127.0.0.1 --port 30000
+```
+
+The same command accepts Base weights. The action stage runs the Motubrain observation encoder and native policy. It can reuse encoded inputs when the instruction, camera frames, robot state, camera transform and history are identical.
 
 The JSON fields `wan`, `text_encoder` and `profile` identify the Wan VAE, T5Gemma encoder and robot profile. For Astribot, also provide `da3` and, for standalone weight files, `wan_config` and `da3_config`. Keep the profile's normalization assets beside the profile, or use its native `action_stats` override. The model directory may contain the released policy weights directly or a serving bundle with a `policy` directory and profile. The checkpoint supplies the sampler, diffusion shifts and default step count.
 
 Read model metadata at `GET /v1/actions/metadata` for the required cameras, frame counts, state width and output shape. Send `POST /v1/actions/generations` with the instruction at `input.task` and the observed cameras, state and extrinsic at `input.observation`. The `images` dictionary accepts an RGB image or ordered RGB clip per camera. MessagePack can carry uint8 arrays directly. The response contains decoded controller actions at `data[0].action.values`.
 
-Each named HTTP session and each Action WebSocket or OpenPI connection has its own random number generator. Omit `parameters.seed` to advance that generator from its configured starting seed (default 0). An explicit seed applies to a single request and preserves the session's generator state. Set `input.observation.reset` to restart the episode, including its generator and action prefix.
+WebSocket clients use `/v1/actions/realtime` for the action envelope and `/openpi/policy` for raw observations and actions. Each named HTTP session and each WebSocket connection has its own random number generator. Omit `parameters.seed` to advance that generator from its configured starting seed (default 0). An explicit seed applies to a single request and preserves the session's generator state. Set `input.observation.reset` to restart the episode, including its generator and action prefix.
 
 Enable realtime chunking in server configuration with `rtc_enabled`, `rtc_execute_prefix` and `rtc_delay`. HTTP clients must then send a distinct `input.observation.session_id` per episode. With RTC disabled, an HTTP request that omits the session ID starts from the configured seed each time. Set `parameters.num_inference_steps` to override the checkpoint step count.
 

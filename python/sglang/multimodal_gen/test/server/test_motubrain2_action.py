@@ -38,6 +38,26 @@ def _json(url, payload=None, timeout=90):
 
 
 class NativeOutputValidityTest(unittest.TestCase):
+    def test_dedicated_app_mounts_each_action_route_once(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.motubrain2 import (
+            Motubrain2PipelineConfig,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.action.motubrain2 import router
+        from sglang.multimodal_gen.runtime.entrypoints.motubrain2_backend import (
+            create_motubrain2_app,
+        )
+
+        args = SimpleNamespace(
+            pipeline_config=Motubrain2PipelineConfig(),
+            enable_metrics=False,
+            media_gateway_key_file=None,
+        )
+        app = create_motubrain2_app(args)
+        for route in router.routes:
+            with self.subTest(path=route.path):
+                endpoints = [r.endpoint for r in app.routes if r.path == route.path]
+                self.assertEqual(endpoints, [route.endpoint])
+
     def test_dit_cache_options_reach_native_policy_loader(self):
         from sglang.multimodal_gen.configs.pipeline_configs.motubrain2 import (
             Motubrain2PipelineConfig,
@@ -555,9 +575,7 @@ class TinyServingTest(unittest.TestCase):
                     "serve",
                     str(root),
                     "--model-type",
-                    "diffusion",
-                    "--pipeline-class-name",
-                    "Motubrain2Pipeline",
+                    "motubrain2",
                     "--pipeline-config-path",
                     str(config_path),
                     "--warmup-mode",

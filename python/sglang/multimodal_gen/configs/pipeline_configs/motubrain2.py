@@ -307,16 +307,9 @@ class Motubrain2PipelineConfig(PipelineConfig):
         }
 
     # ------------------------------------------------- SGLang server contract
-    def get_action_router(self):
-        from sglang.multimodal_gen.runtime.entrypoints.action.motubrain2 import router
-
-        return router
-
     def supports_action_endpoint(self) -> bool:
-        return True
-
-    def supports_openpi_endpoint(self) -> bool:
-        return True
+        # The dedicated serve backend mounts both robot protocols with session handling.
+        return False
 
     def supports_dynamic_batching(self) -> bool:
         return False
