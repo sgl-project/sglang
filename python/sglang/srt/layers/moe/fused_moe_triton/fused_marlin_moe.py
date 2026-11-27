@@ -17,6 +17,8 @@ if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
     from sglang.kernels.ops.activation.activation import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
         silu_and_mul,
         silu_and_mul_with_activation_rounding,
     )
@@ -385,6 +387,10 @@ def fused_marlin_moe(
             situ_beta=gemm1_alpha if gemm1_alpha is not None else 4.0,
             linear_beta=clamp_limit,
         )
+    elif activation == "gelu" and is_gated:
+        gelu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
+    elif activation == "gelu_tanh" and is_gated:
+        gelu_tanh_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
     elif activation == "relu2" and not is_gated:
