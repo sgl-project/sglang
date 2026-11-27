@@ -2080,6 +2080,18 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>none</code>, <code>mooncake</code>, <code>nixl</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--elastic-ep-retiree-lifecycle`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Who ends a retired rank's process. 'self_exit' exits it once local cleanup finishes. 'external' parks it instead, so an orchestrator can terminate it after /is_scaling_elastic_ep reports the survivors committed.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`self_exit`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>self_exit</code>, <code>external</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--elastic-ep-reuse-cuda-graph`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep the decode CUDA graphs across an elastic EP scale-down instead of recapturing them. NIXL a2a only. The dispatch keeps the width it was captured at, and the transport masks the retired ranks. A scale-up still recaptures.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-elastic-expert-backup`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable elastic EP backend to backup expert weights in DRAM feature. Currently supports 'mooncake'.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
@@ -3333,6 +3345,12 @@ This option does not disable required attention or MoE collectives, including ex
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When to reserve per-request decode KV slots. Set the same policy on prefill and decode. See <a href="/docs/advanced_features/pd_disaggregation#decode-allocation-policy">requirements and tradeoffs</a>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`early`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>early</code>, <code>prefill_complete</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-decode-first-token-stream`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When a PD decode server streams a request's first output token, which prefill sampled: <code>admission</code> sends it as soon as decode admits the request; <code>first_decode</code> holds it to go out with the request's first decode output. No token arrives earlier in either mode. The choice only moves when the first token is sent, so TTFT trades against TPOT measured as (e2e latency - TTFT) / (output tokens - 1): <code>admission</code> has the lower TTFT, by about one decode step; <code>first_decode</code> counts the wait for the second token in TTFT instead of that TPOT. Default: <code>first_decode</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>admission</code>, <code>first_decode</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-decode-enable-offload-kvcache`</td>
