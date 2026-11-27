@@ -26,6 +26,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.attention.dsa import dsa_npu_indexer
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
     _get_indexer_query_shard,
     _IndexerQueryShard,
@@ -181,6 +182,116 @@ class TestLocalTopkWithTokenShard(CustomTestCase):
         _, _, local, gathered = self._resolve([0], [16384], 16, 3, plan_rank=5)
         self.assertFalse(local)
         self.assertTrue(gathered)
+
+
+class TestFp8PcpIndexerQueryShard(CustomTestCase):
+    def test_local_rows_are_quantized_with_matching_metadata(self):
+        batch = types.SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            attn_cp_metadata=object(),
+            dsa_cp_metadata_prepared=True,
+            out_cache_loc=torch.arange(4),
+        )
+        metadata = types.SimpleNamespace(
+            seq_lens_cpu_int=None,
+            seq_lens=torch.tensor([101, 103, 501, 503], dtype=torch.int32),
+            actual_seq_lengths_q=torch.arange(1, 5, dtype=torch.int32),
+            block_tables=torch.tensor([[1, 2], [1, 2], [5, 6], [5, 6]]),
+        )
+        metadata.actual_seq_lengths_kv = metadata.seq_lens
+        indexer = dsa_npu_indexer.DSANPUIndexerMixin()
+        indexer.dsa_enable_prefill_cp = True
+        indexer.hidden_size = indexer.n_heads = 1
+        indexer.num_init_tokens = indexer.num_local_tokens = 0
+        indexer.head_dim = 128
+        indexer.index_topk = 2
+        indexer.rotary_emb = None
+        indexer.weights_proj = mock.Mock(
+            side_effect=lambda x: (x,), weight=torch.empty(1, dtype=torch.bfloat16)
+        )
+        indexer.wq_b = indexer.wk = mock.Mock(
+            side_effect=lambda x: (x.expand(-1, 128).contiguous(),)
+        )
+        indexer.k_norm = mock.Mock(side_effect=lambda x: x)
+        cache = torch.empty((8, 16, 1, 128), dtype=torch.float8_e4m3fn)
+        scales = torch.ones(8, 16, 1)
+        pool = types.SimpleNamespace(
+            index_k_scale_buffer=scales,
+            indexer_hadamard_128=None,
+            index_k_store_dtype=torch.float8_e4m3fn,
+            index_k_scale_dtype=torch.float32,
+            set_index_k_buffer=mock.Mock(),
+            set_index_k_scale_buffer=mock.Mock(),
+            get_index_k_buffer=lambda _: cache,
+            get_index_k_scale_buffer=lambda _: scales,
+        )
+        inputs = torch.arange(4, dtype=torch.bfloat16).view(-1, 1)
+        quantize = mock.Mock(side_effect=lambda x, *_: (x, x[..., 0].float()))
+        op = mock.Mock(
+            side_effect=lambda **kw: torch.zeros(
+                (kw["query"].shape[0], 1, 2), dtype=torch.int32
+            )
+        )
+        with (
+            mock.patch.object(
+                dsa_npu_indexer,
+                "get_attn_backend",
+                return_value=types.SimpleNamespace(forward_metadata=metadata),
+            ),
+            mock.patch.object(
+                dsa_npu_indexer, "get_token_to_kv_pool", return_value=pool
+            ),
+            mock.patch.object(
+                dsa_npu_indexer,
+                "cp_gather_full_sequence_states",
+                side_effect=lambda k, *_: k,
+            ),
+            mock.patch.object(
+                dsa_npu_indexer, "_quantize_npu_indexer_activation", quantize
+            ),
+            mock.patch.object(
+                dsa_npu_indexer.envs.SGLANG_NPU_USE_MULTI_STREAM,
+                "get",
+                return_value=False,
+            ),
+            mock.patch.object(
+                torch,
+                "npu",
+                types.SimpleNamespace(current_stream=lambda: None),
+                create=True,
+            ),
+            mock.patch.object(
+                torch.ops.npu, "npu_quant_lightning_indexer", op, create=True
+            ),
+            get_parallel().override(attn_tp_size=2, attn_tp_rank=1, dcp_enabled=False),
+        ):
+            topk = indexer.forward_npu(
+                inputs, inputs, torch.arange(4), batch, 0, allow_pcp_query_shard=True
+            )
+            self.assertEqual(tuple(topk.shape), (2, 2))
+            shard = batch.npu_dsa_pcp_query_shard
+            kwargs = op.call_args.kwargs
+            torch.testing.assert_close(kwargs["query"][..., 0], inputs[2:])
+            torch.testing.assert_close(kwargs["weights"], inputs[2:])
+            torch.testing.assert_close(
+                kwargs["query_dequant_scale"], inputs[2:].float()
+            )
+            self.assertIs(kwargs["key"], cache)
+            self.assertIs(kwargs["key_dequant_scale"], scales)
+            self.assertIs(kwargs["block_table"], shard.block_table)
+            torch.testing.assert_close(shard.block_table, metadata.block_tables[2:])
+            torch.testing.assert_close(
+                shard.query_ends, metadata.actual_seq_lengths_q[:2]
+            )
+            torch.testing.assert_close(
+                shard.key_lens, metadata.actual_seq_lengths_kv[2:]
+            )
+            self.assertEqual(quantize.call_args.args[0].shape[0], 2)
+
+            topk = indexer.forward_npu(inputs, inputs, torch.arange(4), batch, 0)
+            self.assertEqual(tuple(topk.shape), (4, 2))
+            self.assertIsNone(batch.npu_dsa_pcp_query_shard)
+            self.assertIs(op.call_args.kwargs["block_table"], metadata.block_tables)
 
 
 if __name__ == "__main__":
