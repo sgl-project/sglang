@@ -80,6 +80,12 @@ def test_component_offload_releases_preferred_component_after_request():
     strategy.finish_use.assert_called_once_with(module, use, state)
 
 
+def _expects_mapped_component_snapshot() -> bool:
+    return (
+        current_platform.is_cuda() and not current_platform.device_shares_host_memory()
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "host_storage,residency",
@@ -94,6 +100,8 @@ def test_component_offload_releases_preferred_component_after_request():
 def test_snapshot_offload_preserves_host_storage_and_live_buffers(
     tmp_path, monkeypatch, host_storage, residency, prefetch
 ):
+    if residency == "component-offload" and not current_platform.is_cuda():
+        pytest.skip("the mapped-weight snapshot in component-offload is CUDA-only")
     monkeypatch.setattr(host_memory_budget, "host_memory_available_bytes", lambda: 0)
     module = torch.nn.Linear(16, 16, bias=False)
     if host_storage == "pinned":
@@ -115,6 +123,9 @@ def test_snapshot_offload_preserves_host_storage_and_live_buffers(
 
     original_to = torch.Tensor.to
     weight_d2h = []
+    expect_snapshot = (
+        residency == "snapshot-offload" or _expects_mapped_component_snapshot()
+    )
 
     def tracked_to(tensor, *args, **kwargs):
         device = kwargs.get("device", args[0] if args else None)
@@ -134,17 +145,27 @@ def test_snapshot_offload_preserves_host_storage_and_live_buffers(
         else:
             strategy.prepare_for_use(module, use, state)
         strategy.wait_for_use(module, use, state)
-        assert weight_snapshot(module)["weight"].data_ptr() == pointer
+        snapshot = weight_snapshot(module)
+        if expect_snapshot:
+            assert snapshot["weight"].data_ptr() == pointer
+        else:
+            assert snapshot is None
         totals = component_residency_bytes(module)
-        assert sum(totals[k] for k in ("host", "host_pinned", "host_mapped")) == 1024
+        host_bytes = sum(totals[k] for k in ("host", "host_pinned", "host_mapped"))
+        assert host_bytes == (1024 if expect_snapshot else 0)
         torch.testing.assert_close(module(x), expected, rtol=0, atol=0)
         module.counter.add_(1)
         strategy.finish_use(module, use, state)
         assert module.weight.device.type == "cpu"
-        assert module.weight.data_ptr() == pointer
+        if expect_snapshot:
+            assert module.weight.data_ptr() == pointer
+        else:
+            # Ordinary offload can return before the device-to-host copy finishes.
+            torch.cuda.synchronize()
+            torch.testing.assert_close(module.weight, original_host, rtol=0, atol=0)
         assert module.counter.item() == iteration + 1
         assert weight_snapshot(module) is None
-    assert not weight_d2h
+    assert weight_d2h == ([] if expect_snapshot else [original_host.numel()] * 3)
 
 
 @pytest.mark.parametrize("free_gib, loads", [(0.5, False), (64, True)])
@@ -217,7 +238,10 @@ def test_component_offload_does_not_retain_unbudgeted_host_weights(
             assert not module.weight.is_pinned()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and current_platform.is_cuda()),
+    reason="the mapped-weight snapshot in component-offload is CUDA-only",
+)
 def test_mapped_component_reuses_snapshot_mutation_and_sleep_boundaries(
     tmp_path, monkeypatch
 ):
@@ -236,8 +260,12 @@ def test_mapped_component_reuses_snapshot_mutation_and_sleep_boundaries(
     pipeline = SimpleNamespace(modules={"transformer": module})
     pipeline._lora_module = LoRAPipeline._lora_module.__get__(pipeline)
     controller = MemoryOccupationController(pipeline, rank=0, use_fsdp_inference=False)
+    expect_snapshot = _expects_mapped_component_snapshot()
+    assert (weight_snapshot(module) is not None) == expect_snapshot
     controller._move_modules(["transformer"], "cpu")
-    assert module.weight.data_ptr() == pointer
+    if expect_snapshot:
+        assert module.weight.data_ptr() == pointer
+    torch.testing.assert_close(module.weight, original, rtol=0, atol=0)
     strategy.prepare_for_use(module, use, state)
     _load_weights_into_module(module, [("weight", torch.full((4, 4), 2.0))])
     strategy.prepare_for_use(module, use, state)

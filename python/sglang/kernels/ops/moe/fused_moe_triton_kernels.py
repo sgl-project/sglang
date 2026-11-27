@@ -376,6 +376,9 @@ def fused_moe_kernel(
     A_OUTPUT_SLICES: tl.constexpr = 1,
     A_OUTPUT_SLICE_WIDTH: tl.constexpr = 0,
     A_OUTPUT_SLICE_K: tl.constexpr = 0,
+    SWIGLU_ALPHA: tl.constexpr = 0.0,
+    SWIGLU_LIMIT: tl.constexpr = 0.0,
+    HAS_SWIGLU_ALPHA: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -654,8 +657,19 @@ def fused_moe_kernel(
         acc_pairs = tl.reshape(accumulator, (BLOCK_SIZE_M, BLOCK_SIZE_N // 2, 2))
         gate_b, up_b = tl.split(acc_pairs)
         gate_f = gate_b.to(tl.float32)
-        silu_f = silu_approx_f32(gate_f)
-        out_act = (silu_f * up_b.to(tl.float32)).to(compute_type)
+        if HAS_SWIGLU_ALPHA:
+            # Accurate ops, not the approximate helper below: the unfused swiglu
+            # path this replaces uses tl.sigmoid on an fp32 tile.
+            gate_c = tl.minimum(gate_f, SWIGLU_LIMIT)
+            up_c = tl.maximum(
+                tl.minimum(up_b.to(tl.float32), SWIGLU_LIMIT), -SWIGLU_LIMIT
+            )
+            out_act = (gate_c * tl.sigmoid(SWIGLU_ALPHA * gate_c) * (up_c + 1.0)).to(
+                compute_type
+            )
+        else:
+            silu_f = silu_approx_f32(gate_f)
+            out_act = (silu_f * up_b.to(tl.float32)).to(compute_type)
         offs_half = pid_n * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2)
         if c_sorted:
             c_ptrs = (
@@ -818,6 +832,8 @@ def invoke_fused_moe_kernel(
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
     a_output_slices: int = 1,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> None:
     """Skip inactive experts, including with filter_expert=False.
 
@@ -1102,6 +1118,9 @@ def invoke_fused_moe_kernel(
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             FUSE_SWIGLU=fuse_swiglu,
+            SWIGLU_ALPHA=float(swiglu_alpha or 0.0),
+            SWIGLU_LIMIT=float(swiglu_limit or 0.0),
+            HAS_SWIGLU_ALPHA=swiglu_alpha is not None,
             **pdl_kwargs,
             **config,
         )

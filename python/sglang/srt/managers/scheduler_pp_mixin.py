@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -10,13 +11,17 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    all_reduce_flags,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import FlushCacheReqInput
 from sglang.srt.managers.mm_utils import strip_mm_features_for_pp_relay
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.req_types import FINISH_ABORT
@@ -134,6 +139,8 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    _pp_flush_probe = False
+
     # Gated PP+spec relay flow. Class-level default so schedulers that never
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
@@ -259,6 +266,7 @@ class SchedulerPPMixin:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
                 self._pp_answer_verdict_requests()
+                self._pp_finish_flush()
 
                 self.pp_outputs = next_pp_outputs
                 if cur_batch:
@@ -387,6 +395,7 @@ class SchedulerPPMixin:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
                 self._pp_answer_verdict_requests()
+                self._pp_finish_flush()
 
                 self.pp_outputs = next_pp_outputs
                 if cur_batch:
@@ -589,6 +598,7 @@ class SchedulerPPMixin:
                     if cur_batch and not cur_batch.forward_mode.is_prebuilt():
                         self._pp_send_proxy_to_next_stage(result)
                 self._pp_answer_verdict_requests()
+                self._pp_finish_flush()
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -619,7 +629,61 @@ class SchedulerPPMixin:
         """Hold a pause, and the inputs after it, until no micro-batch is
         unprocessed."""
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
-        return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
+        received = self.ingest_requests(stop_at_pause=has_unprocessed_mb)
+        if self.pp_group.is_first_rank:
+            self._pp_flush_probe = self.flush_wrapper.prepare_pp_probe(
+                self._pp_vote_on_flush_probe
+            )
+            if self._pp_flush_probe:
+                return [*received, FlushCacheReqInput(pp_probe=True)]
+        else:
+            # The raw relay includes requests held behind a pause. Every stage
+            # must vote on the same iteration, even if its dispatcher is held.
+            self._pp_flush_probe = any(
+                isinstance(req, FlushCacheReqInput) and req.pp_probe for req in received
+            )
+        return received
+
+    def _pp_flush_idle(self: Scheduler) -> bool:
+        return self.is_fully_idle(ignore_waiting=self.pause_state.paused)
+
+    def _pp_flush_vote(self: Scheduler, values, *, across_stages=False):
+        # A DP replica receives its own probe on the work channel. Only the
+        # ranks that share its queue may enter these conditional collectives.
+        groups = (
+            [self.attn_tp_group, self.attn_cp_group]
+            if get_parallel().attn_dp_enabled
+            else [self.tp_group]
+        )
+        if across_stages:
+            groups.append(self.pp_group)
+        for group in groups:
+            if group.world_size > 1:
+                values = all_reduce_flags(
+                    values, group.cpu_group, torch.distributed.ReduceOp.MIN
+                )
+        return values
+
+    def _pp_vote_on_flush_probe(self: Scheduler, deadline: float):
+        parallel = get_parallel()
+        leader = parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0
+        return self._pp_flush_vote(
+            [self._pp_flush_idle(), not leader or time.monotonic() < deadline]
+        )
+
+    def _pp_finish_flush(self: Scheduler) -> None:
+        if not self._pp_flush_probe:
+            return
+        self._pp_flush_probe = False
+        # All request, tensor and PD sends for this turn have been issued. A
+        # busy PP0 never waits here while later stages still need its sends.
+        (idle,) = self._pp_flush_vote([self._pp_flush_idle()], across_stages=True)
+        if idle:
+            # Fence every reset before PP0 can enqueue another storage ticket.
+            success = self.flush_cache(pp_all_idle=True)
+            (idle,) = self._pp_flush_vote([success], across_stages=True)
+        if self.pp_group.is_first_rank:
+            self.flush_wrapper.finish_pp_probe(bool(idle))
 
     def _pp_apply_war_barrier(self: Scheduler) -> None:
         """Order later schedule-stream writes after the launched forward's reads.
@@ -1578,10 +1642,9 @@ class SchedulerPPMixin:
             if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
                 seq_lens_sum = 0  # preallocated / bs-sized -> kernel ignores it
             else:
-                # Conservative upper bound; backend-agnostic (not every
-                # attention backend exposes max_context_len).
+                # Conservative upper bound: no request outgrows its row.
                 req_to_token_pool = self.tp_worker.model_runner.req_to_token_pool
-                seq_lens_sum = bs * req_to_token_pool.max_context_len
+                seq_lens_sum = bs * req_to_token_pool.row_width
 
         (
             tree_mask,
