@@ -554,7 +554,6 @@ def forward_dsa_prepare_npu(
                 topk_indices,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
-                interleave_size=forward_context.get_attn_backend().page_size,
             )
     else:
         topk_indices = prev_topk_indices
@@ -585,6 +584,10 @@ def prepare_dcp_extend_metadata_npu(
     NPU decode and short-tail extends gather the query and read rank-local
     metadata off the attention backend instead.
     """
+    # Draft KV is replicated and never uses this target KV gather plan.
+    if get_mla_dcp_backend(forward_context.get_attn_backend()).is_draft_worker:
+        return None
+
     # The gathered-KV operator path is bf16/fp16 only; any other KV dtype keeps
     # the query gather rather than raising there.
     if not m.use_dsa or kv_cache_dtype not in (torch.bfloat16, torch.float16):
@@ -605,9 +608,8 @@ def prepare_dcp_extend_metadata_npu(
         seq_lens_sum=seq_lens_sum,
         extend_prefix_lens_cpu=extend_prefix_lens_cpu,
         **planner_kwargs,
-        # NPU pools shard in page_size runs, and the gather reuses its own
-        # buffers rather than a context-sized dcp_kv_buffer per forward.
-        interleave_size=forward_context.get_attn_backend().page_size,
+        # Target KV is token-interleaved. The gather reuses its own buffers
+        # rather than a context-sized dcp_kv_buffer per forward.
         allocate_kv_buffer=False,
     )
     if metadata is None:

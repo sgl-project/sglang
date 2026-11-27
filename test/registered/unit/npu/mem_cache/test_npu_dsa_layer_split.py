@@ -129,22 +129,23 @@ class TestShardBookkeeping(CustomTestCase):
         pool.indexer_layer_ids = (5, 7)
         cases = [
             # (dsa_kv_cache_store_c8, expected ids)
-            (False, [5, 6, 7, 5, 6, 7, 5, 7]),  # k + v + indexer k
-            (True, [5, 6, 7, 5, 7]),  # packed k/v + indexer k
+            (False, [5, 6, 7, 5, 6, 7]),  # k + v
+            (True, [5, 6, 7]),  # packed k/v
         ]
         for packed, expected in cases:
             pool.dsa_kv_cache_store_c8 = packed
             ptrs, _, _ = pool.get_contiguous_buf_infos()
             self.assertEqual(pool.get_kv_layer_ids(), expected)
             self.assertEqual(len(ptrs), len(expected))
+            self.assertEqual(pool.get_state_layer_ids(), [5, 7])
 
     def test_get_kv_transfer_layer_span_counts_buffer_groups(self):
         pool = _make_pool()
         cases = [
             # (dsa_kv_cache_store_c8, has_scale, expected_groups)
-            (False, False, 3),  # k + v + indexer k
-            (True, False, 2),  # packed k/v + indexer k
-            (True, True, 3),  # packed k/v + indexer k + fp32 scale
+            (False, False, 2),  # k + v
+            (True, False, 1),  # packed k/v
+            (True, True, 1),  # indexer scales remain separate state
         ]
         for c8, has_scale, groups in cases:
             pool.dsa_kv_cache_store_c8 = c8

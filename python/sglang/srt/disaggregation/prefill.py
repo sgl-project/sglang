@@ -434,13 +434,6 @@ class PrefillBootstrapQueue:
             kv_item_lens += draft_kv_item_lens
             num_draft_entries = len(draft_kv_data_ptrs)
 
-        dcp_remote_decode_layout = []
-        if self.transfer_backend == TransferBackend.ASCEND:
-            for pool in (self.token_to_kv_pool, draft_kv_pool):
-                get_layout = getattr(pool, "get_dcp_remote_decode_layout", None)
-                if get_layout is not None:
-                    dcp_remote_decode_layout.extend(get_layout())
-
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
@@ -495,17 +488,11 @@ class PrefillBootstrapQueue:
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager_kwargs = (
-            {"dcp_remote_decode_layout": dcp_remote_decode_layout}
-            if self.transfer_backend == TransferBackend.ASCEND
-            else {}
-        )
         kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
-            **kv_manager_kwargs,
         )
         # main_kv_page_row implies the Mooncake manager, the only one that packs.
         if kv_args.main_kv_page_row and kv_args.draft_kv_head_num:

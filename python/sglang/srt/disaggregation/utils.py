@@ -1103,6 +1103,12 @@ def get_kv_class(
         return KVArgs
 
     if transfer_backend == TransferBackend.MOONCAKE:
+        if class_type == KVClassType.MANAGER and is_npu():
+            from sglang.srt.hardware_backend.npu.disaggregation import (
+                NPUMooncakeKVManager,
+            )
+
+            return NPUMooncakeKVManager
         from sglang.srt.disaggregation.mooncake import (
             MooncakeKVBootstrapServer,
             MooncakeKVManager,
@@ -1978,7 +1984,7 @@ def setup_state_kv_args(
         is_mla_backend(owner_view) and StateType.MAMBA in kv_args.state_types
     )
     if isinstance(owner_view, NPUMLATokenToKVPool):
-        kv_args.kv_buf_groups = 3 if owner_view.index_head_dim is not None else 2
+        owner_view.configure_pd_dcp(kv_args)
         kv_args.hidden_kv_layers = total_kv_layers
         kv_args.draft_kv_layers = (
             _token_kv_view(draft_token_to_kv_pool).layer_num

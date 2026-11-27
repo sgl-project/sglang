@@ -369,6 +369,8 @@ def _uses_flat_entry_layout(
 
 
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
+    _dsa_index_k_relayout = True
+
     sender_trace_module = "mooncake"
 
     AUX_DATA_HEADER = b"AUX_DATA"
@@ -1807,6 +1809,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def dsa_index_k_dcp_entries(
         self, registration_info: KVArgsRegisterInfo
     ) -> Optional[_DcpIndexK]:
+        if not self._dsa_index_k_relayout:
+            return None
         state_types = self.kv_args.state_types
         if StateType.DSA not in state_types:
             return None
@@ -2757,6 +2761,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 st == StateType.DSA
                 and target_rank_registration_info is not None
                 and target_rank_registration_info.requires_dcp_relayout
+                and self._dsa_index_k_relayout
             ):
                 continue
             src_keys = self._local_keys.state[i]
@@ -3925,9 +3930,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if decode_kv_args.requires_dcp_relayout:
                         num_entries = len(self.kv_args.kv_item_lens)
                         num_draft = self.kv_args.num_draft_entries
-                        dst_item_lens: List[Optional[int]] = [
-                            decode_kv_args.dst_kv_item_len
-                        ] * (num_entries - num_draft) + [None] * num_draft
+                        dst_item_lens = decode_kv_args.dst_kv_item_lens
+                        if dst_item_lens:
+                            if (
+                                self.kv_args.kv_layer_ids
+                                or decode_kv_args.dst_kv_layer_ids
+                            ):
+                                dst_indices = resolve_dcp_dst_entry_indices(
+                                    self.kv_args.kv_layer_ids,
+                                    decode_kv_args.dst_kv_layer_ids,
+                                    num_entries,
+                                    len(dst_item_lens),
+                                )
+                                dst_item_lens = [dst_item_lens[j] for j in dst_indices]
+                            else:
+                                _, dst_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                                    self.kv_args.kv_item_lens, dst_item_lens
+                                )
+                        else:
+                            dst_item_lens = [decode_kv_args.dst_kv_item_len] * (
+                                num_entries - num_draft
+                            ) + [None] * num_draft
                         decode_kv_args.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
                             dst_item_lens,
                             decode_kv_args.dst_dcp_size,

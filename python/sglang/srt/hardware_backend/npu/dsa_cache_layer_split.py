@@ -694,18 +694,10 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
     def get_kv_transfer_layer_span(self, num_entries: int) -> int:
         """Layer count covered by ``num_entries`` contiguous buf entries.
 
-        ``get_contiguous_buf_infos`` reports one entry per layer per buffer
-        group (the groups of ``_get_disagg_buffer_entries``: latent k, non-c8
-        v, indexer k, index scale), so the owned layer count is the entry
-        count divided by the group count — not the raw entry count.
+        ``get_contiguous_buf_infos`` reports attention KV groups only;
+        indexer K and scales are registered separately as state.
         """
-        groups = 1  # latent k (v stays packed into k in c8 mode)
-        if not self.dsa_kv_cache_store_c8:
-            groups += 1  # v
-        if self.index_head_dim is not None:
-            groups += 1  # indexer k
-            if self.index_k_scale_buffer is not None:
-                groups += 1  # index scale
+        groups = self._pd_kv_buffer_groups
         assert groups > 0 and num_entries % groups == 0, (
             f"layer-split transfer reported {num_entries} entries, "
             f"not a multiple of {groups} buffer groups"

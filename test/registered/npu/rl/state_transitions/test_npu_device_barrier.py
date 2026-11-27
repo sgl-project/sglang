@@ -103,8 +103,10 @@ class TestNpuDeviceBarrier(CustomTestCase):
                 lambda: events.append(("barrier", None)),
             ),
             patch(
-                "torch.npu.synchronize",
-                lambda: events.append(("sync", None)),
+                "torch.get_device_module",
+                return_value=SimpleNamespace(
+                    synchronize=lambda: events.append(("sync", None))
+                ),
             ),
             # release_memory_occupation gates on the TP ranks being idle.
             patch.object(
