@@ -1,0 +1,81 @@
+---
+title: "Last-layer FFN pruning"
+description: "Skip unused final-layer FFN rows during ordinary next-token prefill."
+---
+
+For ordinary next-token generation, only the hidden state at each request's last new token is needed after the final decoder layer. This path computes that layer's FFN and final normalization on those rows. Attention and every KV-cache write still run for the full prefill. Model weights are unchanged.
+
+There is no environment variable or server flag. A supported model uses the pruned path when the architecture, runtime, and input shape all match. Unsupported configurations keep the original computation.
+
+Reduced-precision GEMM rounding can change when the number of rows changes. The requested outputs follow the same mathematical expression, but results are not guaranteed to be bitwise identical.
+
+## Supported architectures
+
+The gate checks the exact model implementation and `model_type`, rather than a checkpoint name:
+
+| Implementation | `model_type` | Included models | Verified checkpoints | Minimum new tokens |
+|---|---|---|---|---:|
+| `Qwen2ForCausalLM` | `qwen2` | Dense Qwen2 and Qwen2.5 | Qwen2.5-7B-Instruct | 512 |
+| `Qwen3ForCausalLM` | `qwen3` | Dense Qwen3 | Qwen3-4B, Qwen3-32B | 512 |
+| `LlamaForCausalLM` | `llama` | Llama checkpoints using this exact class, including Llama 2 and Llama 3 | Llama-3.2-1B-Instruct | 2048 |
+
+The token minima were selected from paired BF16 prefill measurements on RTX 4090 using Qwen2.5-7B-Instruct, Qwen3-4B, and Llama-3.2-1B-Instruct. They apply to the architecture; they are not separate performance guarantees for every model size, dtype, or CUDA device. Qwen3-32B was subsequently tested with end-to-end serving on NVIDIA L20X, as described below.
+
+All of the following must also hold:
+
+- The model weights are not quantized.
+- The runtime is CUDA, with tensor, pipeline, attention-data-parallel, and attention-context-parallel sizes of one.
+- Prefill runs eagerly or with Breakable Prefill CUDA Graph. Other prefill graph backends keep the original path.
+
+## Input shape and graph capture
+
+The token count is the sum of newly extended prefill positions across the batch. Cached prefix tokens are not included. Every request in the batch must finish its prefill, and the total must reach the architecture minimum. For example, four Qwen requests extending 128 tokens each meet the 512-token minimum.
+
+Eager execution selects one final row per request without an additional batch-size cap from this optimization.
+
+Breakable Prefill CUDA Graph supports up to 16 requests. It selects the smallest captured row count that can hold the batch:
+
+| Requests in the batch | Captured FFN rows |
+|---|---:|
+| 1 | 1 |
+| 2–4 | 4 |
+| 5–8 | 8 |
+| 9–16 | 16 |
+
+Pruned variants reuse the server's existing input-token capture buckets at or above the architecture minimum. There is no separate token-bucket whitelist. Eligibility still uses the actual newly extended total, so padding a short input to a larger bucket does not enable pruning.
+
+Only row counts reachable under the server's maximum running-request count are captured. A maximum of 4 captures row counts `1/4`; a maximum of 5 captures `1/4/8`. Ordinary graphs are retained for unsupported requests, including graph batches larger than 16. Standard graph eligibility checks still apply.
+
+Additional variants increase graph capture time and memory. The cost depends on the existing token buckets and reachable row counts.
+
+## Original computation path
+
+These cases keep the full final-layer FFN:
+
+- Unsupported model implementations, quantized weights, unsupported parallel layouts, or unsupported prefill graph backends.
+- Decode and other non-ordinary-prefill modes, two-batch overlap, or speculative requests carrying speculative or auxiliary-hidden-state metadata.
+- Prompt logprobs, returned hidden states, embeddings or pooling outputs, LoRA requests, multimodal inputs, or external input embeddings.
+- An intermediate chunk of chunked prefill. The final chunk can be pruned; selection uses only new rows and leaves cached KV unchanged.
+- Newly extended totals below the architecture minimum, or batches with no unused final-layer rows to skip.
+- Graph batches larger than 16 or mixed prefill/decode batches. Eager execution is not limited to 16 requests.
+
+When LoRA is enabled on the graph runner, pruning variants are not captured, even for requests without an adapter.
+
+## Measured serving performance
+
+The following measurements use Qwen3-32B BF16 on one NVIDIA L20X, with baseline commit `2be81e0ddc572fea3229960b2d9dd7c864cde883` and pruning applied to the same base. Both versions enable Breakable Prefill CUDA Graph and Decode Graph, disable radix cache, and use a chunked-prefill size of 8192 and a KV capacity of 24,576 tokens.
+
+Six paired runs use 512 input tokens, client concurrency 16, and 128 output tokens. Each run has 64 warmup requests and 512 measured requests. The order alternates between baseline-first and pruning-first; seeds 42–47 generate frozen input-token datasets shared within each pair. All 6,144 measured requests succeeded, with 100% pruning coverage in the pruned runs. Scheduling is not constrained to produce identical batches.
+
+The client uses the official `sglang.benchmark.serving` metric calculations, with symmetric instrumentation for loading frozen inputs and collecting observations. The intervals below use the six paired percentage changes as samples, rather than treating requests within a run as independent repetitions.
+
+| Metric | Mean paired change | Two-sided 95% confidence interval |
+|---|---:|---:|
+| Output-token throughput | +0.326% | [+0.163%, +0.489%] |
+| Mean TTFT | −1.174% | [−2.241%, −0.107%] |
+| p95 TTFT | −1.279% | [−1.561%, −0.997%] |
+| Mean end-to-end latency | −0.324% | [−0.485%, −0.163%] |
+
+Output throughput is the primary metric. Latency intervals are exploratory and are not adjusted for multiple comparisons. These results support a small throughput improvement for this workload; they do not establish a benefit for every supported model or workload. TTFT uses the official client's first-nonempty-text timing convention.
+
+In a separate startup comparison at the same maximum running-request count of 16, total Prefill and Decode Graph capture time increased from 24.79 seconds to 98.19 seconds. Capture-stage memory growth increased from 2.396 GiB to 3.379 GiB. The pruned run captured 116 additional prefill variants. Steady-state gains should be considered alongside this startup cost, particularly for short-lived servers.
