@@ -135,6 +135,23 @@ class TestSamplingParamsVerify(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "n must be an integer >= 1"):
                 self._make(n=0).verify(self.VOCAB_SIZE)
 
+    def test_trace_replay_rejects_invalid_params(self):
+        cases = (
+            ([], {}, "must not be empty"),
+            ([-1], {}, "non-negative integers"),
+            ([self.VOCAB_SIZE], {}, "out-of-vocabulary"),
+            ([1], {"regex": "[a-z]+"}, "structured outputs"),
+            ([1], {"n": 2}, "only supported when n=1"),
+        )
+        for trace, kwargs, error in cases:
+            with (
+                self.subTest(trace=trace, kwargs=kwargs),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                self._make(trace_decode_token_ids=trace, **kwargs).verify(
+                    self.VOCAB_SIZE
+                )
+
     def test_request_reasoning_end_token_ids_are_vocab_bounded_integers(self):
         self._make(
             custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: [17, 18]}
@@ -646,6 +663,61 @@ class TestSamplingParamsNormalize(CustomTestCase):
         sp.normalize(self._mock_tokenizer())
         self.assertEqual(sp.regex, pattern)
         self.assertEqual(sp.stop_strs, [pattern])
+
+    def test_trace_decode_token_ids_basic(self):
+        sampling_params = SamplingParams(trace_decode_token_ids=[7, 8])
+        sampling_params.normalize(tokenizer=None)
+        sampling_params.normalize_trace_decode_token_ids(
+            prompt_len=1, context_len=16, vocab_size=32000
+        )
+
+        self.assertEqual(sampling_params.trace_decode_token_ids, [7, 8])
+        self.assertEqual(sampling_params.max_new_tokens, 2)
+
+        # Longer than the default max_new_tokens=128 must still replay in full.
+        long_trace = [7] * 200
+        long_params = SamplingParams(
+            trace_decode_token_ids=long_trace, max_new_tokens=16
+        )
+        long_params.normalize(tokenizer=None)
+        long_params.normalize_trace_decode_token_ids(
+            prompt_len=1, context_len=256, vocab_size=32000
+        )
+        self.assertEqual(long_params.max_new_tokens, 200)
+
+    def test_trace_decode_token_ids_rejects_sampling_conflicts(self):
+        conflict_cases = [
+            {"custom_logit_processor": "processor"},
+            {"custom_params": {"thinking_budget": 16}},
+            {"require_reasoning": True},
+            {"enable_strict_thinking": True},
+        ]
+        for kwargs in conflict_cases:
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(
+                ValueError, "trace_decode_token_ids cannot be combined"
+            ):
+                SamplingParams.validate_trace_decode_compatibility(
+                    [7], **kwargs
+                )
+
+    def test_trace_decode_token_ids_rejects_empty_context_truncation(self):
+        sampling_params = SamplingParams(trace_decode_token_ids=[7])
+        with self.assertRaisesRegex(ValueError, "no tokens remaining"):
+            sampling_params.normalize_trace_decode_token_ids(
+                prompt_len=8, context_len=8, vocab_size=32000
+            )
+
+    def test_trace_decode_token_ids_truncates_to_context_and_coerces_tuple(self):
+        sampling_params = SamplingParams(
+            trace_decode_token_ids=tuple(range(10)), max_new_tokens=64
+        )
+        sampling_params.normalize(tokenizer=None)
+        sampling_params.normalize_trace_decode_token_ids(
+            prompt_len=10, context_len=16, reserved_tokens=2, vocab_size=32000
+        )
+        self.assertEqual(sampling_params.trace_decode_token_ids, [0, 1, 2, 3])
+        self.assertIsInstance(sampling_params.trace_decode_token_ids, list)
+        self.assertEqual(sampling_params.max_new_tokens, 4)
 
 
 class TestSamplingParamsMsgspecStruct(CustomTestCase):

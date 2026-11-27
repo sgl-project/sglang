@@ -20,6 +20,31 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestGenerateContract(CustomTestCase):
+    def test_trace_replay_sampling_params_are_admitted(self):
+        """The HTTP schema must admit trace replay before sampling validates it."""
+        for sampling_params in (
+            {"trace_decode_token_ids": [1, 2, 3]},
+            {"trace_decode_token_ids": None},
+            {"trace_decode_token_ids": []},
+            [{"trace_decode_token_ids": [1]}, {"trace_decode_token_ids": [2, 3]}],
+        ):
+            with self.subTest(sampling_params=sampling_params):
+                self.assertIsNone(
+                    generate_contract_error(
+                        {"text": "hi", "sampling_params": sampling_params}
+                    )
+                )
+        for trace in ([True], [1.5], ["1"], {"items": [1]}):
+            with self.subTest(trace=trace):
+                self.assertIsNotNone(
+                    generate_contract_error(
+                        {
+                            "text": "hi",
+                            "sampling_params": {"trace_decode_token_ids": trace},
+                        }
+                    )
+                )
+
     def test_every_media_container_form_is_accepted(self):
         for image_data in (
             "u",

@@ -1163,6 +1163,11 @@ pub struct SamplingParams {
     /// grammar compilation, matching the legacy native gRPC contract.
     #[prost(string, repeated, tag = "28")]
     pub choice: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Replay these decode tokens while retaining their model log probabilities.
+    /// A wrapper preserves absent/null versus an explicitly empty trace, which
+    /// sampling validation rejects rather than treating it as ordinary decoding.
+    #[prost(message, optional, tag = "29")]
+    pub trace_decode_token_ids: ::core::option::Option<Int64List>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatermarkRequestConfig {

@@ -18,6 +18,7 @@ from sglang.srt.sampling.custom_logit_processor import (
 )
 from sglang.srt.sampling.logit_bias import build_logit_bias
 from sglang.srt.sampling.penalties import StepPenalties
+from sglang.srt.sampling.trace_replay import TraceReplayBatch
 from sglang.srt.sampling.watermarking.interface import WatermarkRows
 from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.log_utils import print_warning_once
@@ -110,6 +111,11 @@ class SamplingBatchInfo:
     logit_bias: Optional[torch.Tensor] = None
     # The step's grammar objects, None when no request has one (see grammar_mask.py).
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
+    trace_replay: Optional[TraceReplayBatch] = None
+
+    def advance_trace_decode_steps(self) -> None:
+        if self.trace_replay is not None:
+            self.trace_replay = self.trace_replay.advance()
 
     def set_sampler_params(self, params: SamplerParams) -> None:
         for name, value in zip(params._fields, params):

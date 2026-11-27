@@ -153,6 +153,7 @@ from sglang.srt.sampling.sampler_params import SamplerParams
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.trace_replay import TraceReplayBatch
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
@@ -2702,7 +2703,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Per-request sampling state is built at each launch.
         self.sampling_info = SamplingBatchInfo(
-            vocab_size=self.model_config.vocab_size, device=self.device
+            vocab_size=self.model_config.vocab_size,
+            device=self.device,
+            trace_replay=TraceReplayBatch.from_requests(reqs, self.req_to_token_pool),
         )
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
@@ -3333,6 +3336,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
+        # Replay progress is request-local and must advance with the decode
+        # batch, independently of model positions (which can be offset by
+        # prefixes, chunked prefill, or mixed batches). This relies on
+        # sampling_info not being rebuilt for decode (PD disaggregation and
+        # HiSparse staging-to-decode are rejected for this reason).
+        if self.sampling_info.trace_replay is not None:
+            assert len(self.sampling_info.trace_replay.slots) == len(self.reqs), (
+                "TraceReplayBatch row count diverged from ScheduleBatch.reqs"
+            )
+        self.sampling_info.advance_trace_decode_steps()
+
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(
                 self.seq_lens,
@@ -3399,6 +3413,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Filter out all requests. Stale tensors are left as-is: is_empty()
             # keys off reqs, so callers drop the batch before a forward reads them.
             self.reqs = []
+            if self.sampling_info is not None:
+                self.sampling_info.trace_replay = None
             self.return_hidden_states = False
             self.return_hidden_states_mode = CaptureHiddenMode.NULL
             return
@@ -3459,6 +3475,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states_mode = get_batch_return_hidden_states_mode(self.reqs)
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
+        if (
+            self.sampling_info is not None
+            and self.sampling_info.trace_replay is not None
+        ):
+            self.sampling_info.trace_replay = self.sampling_info.trace_replay.filter(
+                keep_indices, keep_indices_device
+            )
+
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
@@ -3516,6 +3540,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         elif other.return_logprob:
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
+        if self.sampling_info is not None:
+            other_trace = (
+                other.sampling_info.trace_replay
+                if other.sampling_info is not None
+                else None
+            )
+            self.sampling_info.trace_replay = TraceReplayBatch.merge(
+                self.sampling_info.trace_replay,
+                other_trace,
+                len(self.reqs),
+                len(other.reqs),
+            )
         self.reqs = self.reqs + other.reqs
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = self.multimodal_inputs + other.multimodal_inputs

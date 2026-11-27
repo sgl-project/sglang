@@ -3627,6 +3627,51 @@ class Scheduler(
             )
             return
 
+        if req.sampling_params.trace_decode_token_ids is not None:
+            error_msg = None
+            if not get_exec().features.enable_trace_replay:
+                error_msg = (
+                    "The server is not configured to enable trace replay. "
+                    "Please set `--enable-trace-replay` to enable this feature."
+                )
+            elif self.spec_algorithm.is_speculative():
+                error_msg = (
+                    "trace_decode_token_ids is only supported without speculative decoding."
+                )
+            elif self.disaggregation_mode != DisaggregationMode.NULL:
+                error_msg = (
+                    "trace_decode_token_ids is not supported with PD disaggregation."
+                )
+            elif self.hisparse_coordinator is not None:
+                error_msg = (
+                    "trace_decode_token_ids is not supported with --enable-hisparse."
+                )
+            elif get_exec().dllm.dllm_algorithm is not None:
+                error_msg = (
+                    "trace_decode_token_ids is not supported with --dllm-algorithm."
+                )
+            elif req.return_sampling_mask:
+                error_msg = (
+                    "trace_decode_token_ids is not supported with return_sampling_mask."
+                )
+            else:
+                try:
+                    req.sampling_params.validate_trace_decode_compatibility(
+                        req.sampling_params.trace_decode_token_ids,
+                        custom_logit_processor=req.custom_logit_processor,
+                        custom_params=req.sampling_params.custom_params,
+                        require_reasoning=req.require_reasoning,
+                        enable_strict_thinking=get_serving().enable_strict_thinking,
+                        watermark=req.sampling_params.watermark,
+                    )
+                except ValueError as e:
+                    error_msg = str(e)
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(
                 req,

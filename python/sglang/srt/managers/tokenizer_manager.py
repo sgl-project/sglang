@@ -1565,8 +1565,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"model's context length ({self.context_len} tokens)."
                 )
 
-        # Validate total tokens (input + max_new_tokens)
-        max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        # Trace replay applies its own max_new_tokens limit after the effective
+        # prompt length is known. Do not reject it here based on the raw request
+        # value before that normalization happens.
+        request_sampling_params = (
+            {**self.preferred_sampling_params, **obj.sampling_params}
+            if self.preferred_sampling_params
+            else obj.sampling_params
+        )
+        trace_decode_token_ids = request_sampling_params.get(
+            "trace_decode_token_ids"
+        )
+        if (
+            trace_decode_token_ids is not None
+            and not get_exec().features.enable_trace_replay
+        ):
+            raise ValueError(
+                "The server is not configured to enable trace replay. "
+                "Please set `--enable-trace-replay` to enable this feature."
+            )
+        if isinstance(obj, GenerateReqInput):
+            SamplingParams.validate_trace_decode_compatibility(
+                trace_decode_token_ids,
+                custom_logit_processor=obj.custom_logit_processor,
+                require_reasoning=obj.require_reasoning,
+                max_thinking_tokens=obj.max_thinking_tokens,
+                enable_strict_thinking=get_serving().enable_strict_thinking,
+            )
+        max_new_tokens = (
+            None
+            if trace_decode_token_ids is not None
+            else obj.sampling_params.get("max_new_tokens")
+        )
         if (
             self.validate_total_tokens
             and max_new_tokens is not None
@@ -1883,6 +1913,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_kwargs["custom_params"] = custom_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
+        sampling_params.normalize_trace_decode_token_ids(
+            prompt_len=len(input_ids) if input_ids is not None else 0,
+            context_len=self.context_len,
+            reserved_tokens=self.num_reserved_tokens,
+            vocab_size=self.model_config.token_id_vocab_size,
+        )
         sampling_params.verify(self.model_config.token_id_vocab_size)
         _validate_watermark_request(sampling_params)
 
