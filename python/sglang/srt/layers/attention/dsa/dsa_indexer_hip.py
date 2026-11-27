@@ -312,6 +312,7 @@ def hist_topk_paged(
         logits,
         ws.ghist[:rows],
         loader.LOGITS_BLOCKS_PER_ROW,
+        0,  # Keep the original per-row logits kernel.
     )
     topk_mod.topk_transform(
         logits,
