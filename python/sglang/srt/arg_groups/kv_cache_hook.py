@@ -419,17 +419,13 @@ def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
     actually has a DSA lightning indexer. The recipe itself is resolved
     against the resolved KV cache dtype later, at pool-build time.
     """
-    from sglang.srt.configs.model_config import get_dsa_index_kpool
-
     cfg = resolving_view(server_args)
 
     if cfg.indexer_kv_cache_dtype is None:
         return
 
     if cfg.enable_hierarchical_cache and not (
-        cfg.indexer_kv_cache_dtype == "int8"
-        and get_platform().is_npu
-        and get_dsa_index_kpool(model_config_of(server_args).hf_config) > 1
+        cfg.indexer_kv_cache_dtype == "int8" and get_platform().is_npu
     ):
         raise ValueError(
             f"--indexer-kv-cache-dtype={cfg.indexer_kv_cache_dtype} is not "
