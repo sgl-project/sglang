@@ -69,7 +69,7 @@ jobs:
             --build-arg SG_LANG_REPO=https://github.com/sgl-project/sglang.git \
             --build-arg SG_LANG_BRANCH=v${version} \
             -t lmsysorg/sglang:${tag} \
-            --no-cache --progress=plain
+            --pull --no-cache --progress=plain
 
           push_with_retry() {
             for i in 1 2 3 4 5; do

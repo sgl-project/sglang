@@ -1,6 +1,7 @@
 """Scheduler containment for unsupported MLX output logprobs."""
 
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -35,8 +36,7 @@ class TestSchedulerMlxRequestValidation(CustomTestCase):
             is_dflash_family=lambda: False,
             is_uno=lambda: False,
         )
-        scheduler.init_req_max_new_tokens = MagicMock()
-        scheduler._add_request_to_queue = MagicMock()
+        scheduler.request_retirer = MagicMock()
 
         recv_req = MagicMock(
             session_params=None,
@@ -63,11 +63,13 @@ class TestSchedulerMlxRequestValidation(CustomTestCase):
         ):
             scheduler.handle_generate_request(recv_req)
 
-        req.set_finish_with_abort.assert_called_once_with(
-            "Output logprobs on the MLX backend require --mlx-enable-sampling."
+        reason = req.finish_outside_step.call_args.args[0]
+        self.assertEqual(reason.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertEqual(
+            reason.message,
+            "Output logprobs on the MLX backend require --mlx-enable-sampling.",
         )
-        scheduler.init_req_max_new_tokens.assert_called_once_with(req)
-        scheduler._add_request_to_queue.assert_called_once_with(req)
+        scheduler.request_retirer.retire_unadmitted.assert_called_once_with(req)
 
 
 if __name__ == "__main__":
