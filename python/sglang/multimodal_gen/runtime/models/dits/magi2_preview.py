@@ -28,7 +28,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionImpl,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
-from sglang.multimodal_gen.runtime.layers.moe_multihead import Magi2MultiHeadMoE
 from sglang.multimodal_gen.runtime.layers.utils import direct_register_custom_op
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -46,6 +45,7 @@ from sglang.multimodal_gen.runtime.models.dits.magi2_layers import (
     sharded_cu_seqlens,
     swiglu7_interleaved,
 )
+from sglang.multimodal_gen.runtime.models.dits.magi2_moe import Magi2MultiHeadMoE
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 MAGI2_PREVIEW_FORWARD_KWARGS = frozenset(
