@@ -449,21 +449,22 @@ class MambaComponent(TreeComponent):
         Full KV and any existing host backup are retained. The tail, forks,
         locked nodes (including a pending backup chain's write-through locks),
         and device leaves are preserved, so the cap is a best-effort soft
-        limit. Freed slots are collected into the caller's dicts.
+        limit. Freed slots are collected into the caller's dicts. With
+        ``mamba_path_cap_counts_host``, host copies count toward the cap too and
+        a capped state loses its host copy unless it is locked or in flight.
         """
         cap = self.mamba_max_states_per_path
         if cap < 0:
             return
 
         ct = self.component_type
-        host_only = self._mamba_host_only_checkpoint()
+        count_host = self.tree_core.mamba_path_cap_counts_host
+        host_holders = self._mamba_host_only_checkpoint() or count_host
         holders = []
         node = tail
         while node is not None and node is not self.tree_core.root_node:
             cd = node.component_data[ct]
-            if cd.value is not None or (
-                host_only and cd.value is None and cd.host_value is not None
-            ):
+            if cd.value is not None or (host_holders and cd.host_value is not None):
                 holders.append(node)
             node = node.parent
 
@@ -476,32 +477,50 @@ class MambaComponent(TreeComponent):
             if excess <= 0 or node is tail:
                 break
             cd = node.component_data[ct]
-            host_only_holder = cd.value is None and cd.host_value is not None
+            has_device = cd.value is not None
             if cd.lock_ref > 0 or len(node.children) != 1:
                 continue
-            if host_only_holder and cd.host_lock_ref > 0:
+            # With count_host, a host copy in flight (backup or load-back) also stays.
+            host_freeable = cd.host_lock_ref == 0 and not (
+                count_host
+                and (
+                    node.write_through_pending_id is not None
+                    or node.load_back_pending_id is not None
+                )
+            )
+            if not has_device and not host_freeable:
                 continue
             if node in self.tree_core.evictable_device_leaves:
                 continue
-            target = EvictLayer.HOST if host_only_holder else EvictLayer.DEVICE
-            self.tree_core._evict_component_and_detach_lru(
-                node,
-                self,
-                device_frees,
-                host_frees,
-                target=target,
-                tracker=tracker,
-                cache_actions=cache_actions,
+            free_host = (
+                cd.host_value is not None
+                and host_freeable
+                and (count_host or not has_device)
             )
-            self.tree_core._cascade_evict(
-                node,
-                self,
-                tracker,
-                device_frees,
-                host_frees,
-                cache_actions=cache_actions,
-                target=target,
-            )
+            for evict, target in (
+                (has_device, EvictLayer.DEVICE),
+                (free_host, EvictLayer.HOST),
+            ):
+                if not evict:
+                    continue
+                self.tree_core._evict_component_and_detach_lru(
+                    node,
+                    self,
+                    device_frees,
+                    host_frees,
+                    target=target,
+                    tracker=tracker,
+                    cache_actions=cache_actions,
+                )
+                self.tree_core._cascade_evict(
+                    node,
+                    self,
+                    tracker,
+                    device_frees,
+                    host_frees,
+                    cache_actions=cache_actions,
+                    target=target,
+                )
             excess -= 1
 
     def redistribute_on_node_split(

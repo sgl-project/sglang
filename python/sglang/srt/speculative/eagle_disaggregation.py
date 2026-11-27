@@ -87,11 +87,11 @@ def build_eagle_disagg_draft_input(
         no_seed = torch.all(dsa_topk_indices_cpu < 0, dim=1)
         remap = should_remap_pd_dsa_seed_to_local_slots()
         if remap:
-            table_width = batch.req_to_token_pool.req_to_token.shape[1]
+            req_to_token_row_width = batch.req_to_token_pool.row_width
             no_seed |= torch.any(
                 (dsa_topk_indices_cpu < -1)
                 | (dsa_topk_indices_cpu >= batch.seq_lens_cpu[:, None])
-                | (dsa_topk_indices_cpu >= table_width),
+                | (dsa_topk_indices_cpu >= req_to_token_row_width),
                 dim=1,
             )
         no_seed_row = bool(torch.any(no_seed))
@@ -100,18 +100,17 @@ def build_eagle_disagg_draft_input(
             # PD sends request-relative positions; fused TopK consumes
             # decode-local physical slots. Remap once before the draft loop/graph.
             req_to_token = batch.req_to_token_pool.req_to_token
-            table_width = req_to_token.shape[1]
             valid_positions = dsa_topk_indices >= 0
-            gather_positions = dsa_topk_indices.clamp(min=0, max=table_width - 1).to(
-                torch.int64
-            )
+            gather_positions = dsa_topk_indices.clamp(
+                min=0, max=req_to_token_row_width - 1
+            ).to(torch.int64)
             local_slots = req_to_token[
                 batch.req_pool_indices[:, None], gather_positions
             ]
             invalid_rows = torch.any(
                 (dsa_topk_indices < -1)
                 | (dsa_topk_indices >= batch.seq_lens[:, None])
-                | (dsa_topk_indices >= table_width)
+                | (dsa_topk_indices >= req_to_token_row_width)
                 # Slot 0 is the reserved padding sink; real KV allocations
                 # start at 1, and untouched req-to-token entries remain 0.
                 | (valid_positions & (local_slots <= 0)),
