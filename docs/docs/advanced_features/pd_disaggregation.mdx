@@ -391,9 +391,11 @@ If a greater mean TTFT is acceptable, you can `export SGLANG_DISAGGREGATION_WAIT
 
 ## Heterogeneous TP with GPU Staging Buffer
 
-When prefill and decode use different tensor parallelism (TP) sizes (e.g., prefill TP=4, decode DP attention with TP=1), the KV cache memory layout differs between the two sides. The **GPU staging buffer** solves this by gathering KV head slices into a contiguous buffer on the prefill side, performing bulk RDMA transfer, then scattering into the correct KV cache pages on the decode side. This provides **2–5x throughput improvement** over the default per-token slice approach at high concurrency and matches homogeneous TP baselines within ~5%.
+When prefill and decode use different attention tensor parallelism (TP) sizes (e.g., prefill TP=4, decode DP attention with TP=1), the KV cache memory layout differs between the two sides. The **GPU staging buffer** gathers KV head slices into a contiguous buffer on the prefill side, transfers them in bulk, then scatters them into the correct KV cache pages on the decode side. With Mooncake, staging provided **2–5x throughput improvement** over the default per-token slice approach at high concurrency and matched homogeneous TP baselines within ~5%.
 
-Enable the staging buffer when prefill and decode use **different TP sizes** with the **Mooncake** transfer backend. When both sides use the same TP size, staging is automatically bypassed even if enabled.
+To enable staging with Mooncake or NIXL, set `SGLANG_DISAGG_STAGING_BUFFER=1` on both the prefill and decode servers. For NIXL on CUDA, pass `--disaggregation-transfer-backend nixl` to both servers (for example, `--tp 1` on prefill and `--tp 2` on decode). Both backends bypass staging when the attention TP sizes match.
+
+When sending a chunk to multiple decode peers, the NIXL prefill worker can reuse its registered source buffer as soon as the preceding write completes. If the write is still in flight and the peers' slices fit in separate regions of that buffer, the worker can prepare the next peer's slice while the write is pending. Otherwise it waits for completion before reusing the source region.
 
 > **Note:** The staging buffer is designed for non-MLA models (e.g. GQA, MHA). MLA models (e.g. DeepSeek-V2/V3) should not enable this flag.
 

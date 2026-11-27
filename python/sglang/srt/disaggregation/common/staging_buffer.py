@@ -12,6 +12,7 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 from typing import List, Optional, Tuple
@@ -406,6 +407,15 @@ class StagingBuffer:
 
     def get_size(self) -> int:
         return self.size_bytes
+
+    def view(self, offset: int, size: int) -> StagingBuffer:
+        """A byte range of the same registered allocation and gather stream."""
+        view = copy.copy(self)
+        view.buffer = self.buffer.narrow(0, offset, size)
+        view.size_bytes = size
+        view.data_ptr = view.buffer.data_ptr()
+        view._gather_stream = self.get_gather_stream()
+        return view
 
     def fits(self, required_bytes: int) -> bool:
         return required_bytes <= self.size_bytes

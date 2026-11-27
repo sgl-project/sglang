@@ -2,6 +2,7 @@ import concurrent.futures
 import ctypes
 import dataclasses
 import os
+import sys
 import threading
 import unittest
 from collections import defaultdict, deque
@@ -20,7 +21,9 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingHandler,
     PrefillStagingContext,
+    PrefillStagingStrategy,
     handle_staging_req,
+    handle_staging_rsp,
     prefetch_staging_reqs,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -98,6 +101,42 @@ def _static_storage(pool, draft=None, total_kv_layers=None) -> StaticKVStorage:
 
 
 class TestBatchStagingReservations(CustomTestCase):
+    def test_worker_sees_only_complete_staging_replies(self):
+        peer = SimpleNamespace(staging=None, mooncake_session_id="peer")
+        strategy = object.__new__(PrefillStagingStrategy)
+        strategy.full_chunk_pages = 1
+        strategy.kv_manager = object.__new__(NixlKVManager)
+        strategy.kv_manager._staging_ctx = PrefillStagingContext()
+        replies = [(b"64", b"0", b"96"), (b"128", b"1", b"160")]
+        observed = set()
+
+        # Let the worker check after each bootstrap-handler line. This exercises
+        # publication and replacement deterministically, without thread sleeps.
+        def observe(frame, _event, _arg):
+            if frame.f_globals is handle_staging_rsp.__globals__:
+                observed.add(strategy.check_ready(peer, 2, 1))
+                return observe
+
+        previous_trace = sys.gettrace()
+        try:
+            sys.settrace(observe)
+            for reply in (*replies, replies[-1]):
+                handle_staging_rsp(
+                    [b"STAGING_RSP", b"7", b"2", *reply, b"peer"], {7: {"peer": peer}}
+                )
+        finally:
+            sys.settrace(previous_trace)
+
+        self.assertEqual(
+            observed,
+            {(False, 2, -1, 0, -1), (True, 2, 64, 0, 96), (False, 2, 128, 1, 160)},
+        )
+        self.assertEqual(strategy.check_ready(peer, 0, 1), (False, 0, -1, 0, -1))
+        strategy.kv_manager._staging_ctx.remote_watermarks["peer"] = (0, 160)
+        self.assertEqual(
+            strategy.check_ready(peer, 2, 1, "peer"), (True, 2, 128, 1, 160)
+        )
+
     def test_incremental_reservations_cover_each_chunk_once(self):
         socket = Mock()
         session = SimpleNamespace(
