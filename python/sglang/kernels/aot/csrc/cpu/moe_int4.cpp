@@ -2,22 +2,6 @@
 #include "gemm.h"
 #include "moe.h"
 
-template <int64_t N>
-inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m, int64_t ldn) {
-  using Vec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = Vec::size();
-  static_assert(N % kVecSize == 0, "copy_bias requires N to be a multiple of Vectorized<float>::size()");
-  const bool has_bias = bias_ptr != nullptr;
-  const Vec zero_vec(0.f);
-  for (int i = 0; i < m; ++i) {
-#pragma GCC unroll 2
-    for (int j = 0; j < N; j += kVecSize) {
-      Vec vec = has_bias ? Vec::loadu(bias_ptr + j) : zero_vec;
-      vec.store(y_buf + i * ldn + j);
-    }
-  }
-}
-
 template <typename scalar_t>
 void fused_experts_int4_w4a8_kernel_impl(
     scalar_t* __restrict__ output,
@@ -108,8 +92,8 @@ void fused_experts_int4_w4a8_kernel_impl(
         As[m] = As_tmp[index];
       }
       const int64_t offset = offsets[mb];
-      copy_bias<BLOCK_N>(nullptr, C0, m_size, BLOCK_N);
-      copy_bias<BLOCK_N>(nullptr, C1, m_size, BLOCK_N);
+      fill_stub(C0, 0.f, m_size * BLOCK_N);
+      fill_stub(C1, 0.f, m_size * BLOCK_N);
       for (int kci = 0; kci < Kc; ++kci) {
         int32_t* compensation_ptr =
             (int32_t*)(void*)(B + (nb * Kc + kci) * (BLOCK_N * (_block_k / 2 + sizeof(int32_t))) +
@@ -214,7 +198,7 @@ void fused_experts_int4_w4a8_kernel_impl(
       // so as to avoid copy A to tmp buffer again
       const uint8_t* __restrict__ A = Aq_tmp + offsets[mb] * IC;
       const float* __restrict__ As = As_tmp + offsets[mb];
-      copy_bias<BLOCK_N>(nullptr, C2, m_size, BLOCK_N);
+      fill_stub(C2, 0.f, m_size * BLOCK_N);
       for (int kci = 0; kci < Kc; ++kci) {
         int32_t* compensation_ptr =
             (int32_t*)(void*)(B + (nb * Kc + kci) * (BLOCK_N * (_block_k / 2 + sizeof(int32_t))) +
