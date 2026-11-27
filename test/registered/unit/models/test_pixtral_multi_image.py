@@ -102,3 +102,7 @@ def test_images_encoded_together_match_one_at_a_time(tower, monkeypatch):
     assert together.shape[0] == sum(counts)
     for got, want in zip(together.split(counts), alone):
         torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
