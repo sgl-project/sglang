@@ -156,7 +156,7 @@ from sglang.srt.speculative.ragged_verify import (
     compute_uniform_extend_lengths,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_sail, is_xpu
 from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
@@ -1499,9 +1499,11 @@ class DeepseekV4AttnBackend(
             ratio: SparsePrefillKVBuffer(self.device) for ratio in (1, 2)
         }
         spec_alg = model_runner.spec_algorithm
-        self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
+        self.needs_cpu_seq_lens = not (spec_alg.is_dspark() or spec_alg.is_dfly()) and (
             not _is_cuda or self.online_c128_mtp.enabled()
         )
+        # Target layer_id -> list of [max_rows, topk] int32 capture buffers for DFly2.
+        self.dfly_topk_capture: Dict[int, List[torch.Tensor]] = {}
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
@@ -4127,6 +4129,8 @@ class DeepseekV4AttnBackend(
                 self.decode_candidates.consume_decode(inputs, published)
             else:
                 self.full_topk_indexer.topk_decode(inputs)
+            if layer.layer_id in self.dfly_topk_capture:
+                self._capture_dfly_topk_decode(layer.layer_id, inputs.out_page_indices)
         else:
             inputs = self._make_low_ratio_prefill_indexer_inputs(
                 layer,
@@ -4145,6 +4149,8 @@ class DeepseekV4AttnBackend(
                 self.prefill_candidates.consume_prefill(inputs, published)
             else:
                 self.full_topk_indexer.topk_prefill(inputs)
+            if layer.layer_id in self.dfly_topk_capture:
+                self._capture_dfly_topk_prefill(layer.layer_id, inputs, forward_batch)
 
     def _low_ratio_index_topk_captured(self, layer, projected_q, projected_w) -> None:
         ratio = layer.compress_ratio
@@ -4163,6 +4169,48 @@ class DeepseekV4AttnBackend(
         self.prefill_candidates.consume_prefill_captured(
             inputs, self.forward_metadata.candidate_metadata
         )
+        if layer.layer_id in self.dfly_topk_capture:
+            replay_batch = self.prefill_graph_replay_batch
+            if replay_batch is not None:
+                self._capture_dfly_topk_prefill(layer.layer_id, inputs, replay_batch)
+
+    def _capture_dfly_topk_decode(
+        self, layer_id: int, out_page_indices: torch.Tensor
+    ) -> None:
+        rows = out_page_indices.shape[0]
+        for buf in self.dfly_topk_capture[layer_id]:
+            width = min(out_page_indices.shape[1], buf.shape[1])
+            buf[:rows, :width].copy_(out_page_indices[:rows, :width])
+            if buf.shape[1] > width:
+                buf[:rows, width:].fill_(-1)
+
+    def _capture_dfly_topk_prefill(
+        self, layer_id: int, inputs, forward_batch: ForwardBatch
+    ) -> None:
+        tail = self.forward_metadata.late_layer_tail
+        extend_lens = (
+            tail.extend_seq_lens if tail is not None else forward_batch.extend_seq_lens
+        )
+        if extend_lens is None or extend_lens.numel() == 0:
+            return
+        bs = forward_batch.batch_size
+        last_rows = torch.cumsum(extend_lens[:bs].to(torch.int64), dim=0) - 1
+        page_indices = inputs.out_page_indices
+        if page_indices is not None:
+            selected = page_indices[last_rows]
+        else:
+            raw = inputs.out_raw_indices[last_rows]
+            req = forward_batch.req_pool_indices[:bs].to(torch.int64)
+            valid = raw >= 0
+            max_col = self.req_to_token.shape[1] - 1
+            safe_raw = raw.to(torch.int64).clamp(min=0, max=max_col)
+            mapped = self.req_to_token[req[:, None], safe_raw].to(torch.int32)
+            selected = torch.where(valid, mapped, torch.full_like(mapped, -1))
+        for buf in self.dfly_topk_capture[layer_id]:
+            width = min(selected.shape[1], buf.shape[1])
+            buf[:bs, :width].copy_(selected[:, :width])
+            if buf.shape[1] > width:
+                buf[:bs, width:].fill_(-1)
 
     def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
         ratio = layer.compress_ratio
@@ -4647,6 +4695,148 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def forward_dfly_attention(
+        self,
+        *,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        extra_indices: torch.Tensor,
+        extra_topk_lengths: torch.Tensor,
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute dual-source (SWA + ratio-1 global C1) attention for a DFly2
+        draft layer or attentive correction step without committing target SWA."""
+        layer_id = layer.layer_id
+        metadata = self.forward_metadata
+        core_attn_metadata = metadata.core_attn_metadata
+        token_to_kv_pool = self.token_to_kv_pool
+        assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        assert isinstance(core_attn_metadata, DSV4AttnMetadata)
+
+        if is_sail():
+            attn_tp_size = get_parallel().attn_tp_size
+            if attn_tp_size > 1:
+                attn_tp_rank = get_parallel().attn_tp_rank
+                n_local_heads = attn_sink.shape[0] // attn_tp_size
+                attn_sink = attn_sink[
+                    attn_tp_rank * n_local_heads : (attn_tp_rank + 1) * n_local_heads
+                ]
+
+        swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+        swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()
+        k_cache_total_dim = token_to_kv_pool.get_swa_key_bytes_per_token()
+        swa_k_cache = swa_k_cache[:, : swa_kv_page_size * k_cache_total_dim].view(
+            swa_k_cache.shape[0], swa_kv_page_size, 1, k_cache_total_dim
+        )
+
+        extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+        extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+        extra_total_dim = token_to_kv_pool.get_extra_key_bytes_per_token(layer_id)
+        extra_k_cache = extra_k_cache[:, : extra_page_size * extra_total_dim].view(
+            extra_k_cache.shape[0], extra_page_size, 1, extra_total_dim
+        )
+
+        if self.trtllm_attn:
+            raise NotImplementedError(
+                "DFly2 is not supported with --dsv4-attn-backend trtllm; use flashmla."
+            )
+
+        if q.ndim == 3:
+            q = q.unsqueeze(1)
+        if swa_page_indices.ndim == 2:
+            swa_page_indices = swa_page_indices.unsqueeze(1)
+        if extra_indices.ndim == 2:
+            extra_indices = extra_indices.unsqueeze(1)
+
+        if (
+            self.is_dsv41
+            and get_platform().is_sm100
+            and can_use_swapab_attention(
+                q,
+                swa_k_cache,
+                extra_k_cache,
+                layer.tp_q_head_num,
+                self.head_dim_v,
+                self.softmax_scale,
+            )
+        ):
+            from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
+                swapab_attention,
+            )
+
+            return swapab_attention(
+                q[..., : layer.tp_q_head_num, :],
+                swa_k_cache,
+                swa_page_indices,
+                swa_topk_lengths,
+                attn_sink,
+                extra_k_cache,
+                extra_indices,
+                extra_topk_lengths,
+            )
+
+        if get_platform().is_sm120:
+            from sglang.kernels.ops.attention.flash_mla_sm120 import (
+                flash_mla_with_kvcache_sm120,
+            )
+
+            o = flash_mla_with_kvcache_sm120(
+                q=q,
+                k_cache=swa_k_cache,
+                head_dim_v=self.head_dim_v,
+                softmax_scale=self.softmax_scale,
+                indices=swa_page_indices,
+                topk_length=swa_topk_lengths,
+                attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices_in_kvcache=extra_indices,
+                extra_topk_length=extra_topk_lengths,
+            )[0]
+        else:
+            if _is_xpu:
+                from sgl_kernel import flash_mla_with_kvcache
+            else:
+                flash_mla_with_kvcache = self._flash_mla_with_kvcache
+
+            flashmla_metadata = _create_flashmla_metadata()
+            if self.is_dsv41 and (
+                not self._swa_interleaved
+                or _flashmla_v41_splits_kv(
+                    swa_page_indices,
+                    extra_indices,
+                    self._flashmla_split_kv_min_topk,
+                )
+            ):
+                _maybe_precompute_flashmla_sched_meta(
+                    flashmla_metadata,
+                    q=q,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )
+            o = flash_mla_with_kvcache(
+                q=q,
+                k_cache=swa_k_cache,
+                head_dim_v=self.head_dim_v,
+                block_table=None,
+                cache_seqlens=None,
+                tile_scheduler_metadata=flashmla_metadata,
+                softmax_scale=self.softmax_scale,
+                is_fp8_kvcache=True,
+                indices=swa_page_indices,
+                topk_length=swa_topk_lengths,
+                attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices_in_kvcache=extra_indices,
+                extra_topk_length=extra_topk_lengths,
+            )[0]
+
+        return o.squeeze(1)
 
     def _forward_prefill_sparse(
         self,

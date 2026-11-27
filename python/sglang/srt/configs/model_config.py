@@ -477,6 +477,7 @@ def is_deepseek_v4(config) -> bool:
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForCausalLMNextN",
         "DeepseekV4ForCausalLMDSpark",
+        "DFlyDeepseekV41DraftModel",
     )
 
 
@@ -2800,6 +2801,7 @@ piecewise_cuda_graph_disabled_model_archs = [
     "Ernie5_5_MoeForCausalLM",
     "Ernie5_5_MoeForCausalLMNextN",
     "Ernie5_5_MoeForCausalLMDSpark",
+    "DFlyDeepseekV41DraftModel",
     "Qwen3NextForCausalLM",
     "Glm5NextForConditionalGeneration",
     "BailingMoeV2_5ForCausalLM",
@@ -3026,6 +3028,7 @@ def _is_listed_hybrid_swa_model(
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForCausalLMNextN",
         "DeepseekV4ForCausalLMDSpark",
+        "DFlyDeepseekV41DraftModel",
         *SWA_SINK_ARCHS,
         *MIMO_V2_MODEL_ARCHS,
         "MiMoV2MTP",

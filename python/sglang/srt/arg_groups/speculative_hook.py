@@ -447,6 +447,100 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
 
+DEFAULT_DFLY_BLOCK_SIZE = 6
+
+
+def _dfly_block_size_from_checkpoint(cfg) -> Optional[int]:
+    from sglang.srt.hf_transformers import get_config
+
+    path = cfg.speculative_draft_model_path or cfg.model_path
+    revision = (
+        cfg.speculative_draft_model_revision
+        if cfg.speculative_draft_model_path is not None
+        else cfg.revision
+    )
+    hf_config = get_config(
+        path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=revision,
+    )
+    dfly_cfg = getattr(hf_config, "dfly_config", None)
+    if isinstance(dfly_cfg, dict) and dfly_cfg.get("block_size") is not None:
+        return int(dfly_cfg["block_size"])
+    block_size = getattr(hf_config, "dfly_block_size", None)
+    if block_size is not None:
+        return int(block_size)
+    spec = getattr(hf_config, "speculative_config", None)
+    if isinstance(spec, dict) and spec.get("num_speculative_tokens") is not None:
+        return int(spec["num_speculative_tokens"]) + 1
+    return None
+
+
+def _handle_dfly(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.device.startswith("cuda"):
+        raise ValueError("DFLY speculative decoding requires CUDA.")
+    if attn_dp_enabled_of(cfg) or cfg.pp_size != 1 or cfg.attn_cp_size != 1:
+        raise ValueError("DFLY does not support DP attention, PP or CP.")
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("DFLY does not support PD disaggregation.")
+    if cfg.enable_lora:
+        raise ValueError("DFLY does not support LoRA.")
+    if cfg.speculative_draft_attention_backend is not None:
+        raise ValueError("DFLY drafts run on the target attention backend.")
+    for name in ("speculative_num_steps", "speculative_eagle_topk"):
+        if getattr(cfg, name) not in (None, 1):
+            raise ValueError(f"DFLY requires {name} == 1.")
+        declare_resolution(server_args, "_handle_dfly", **{name: 1})
+    if cfg.speculative_dfly_block_size is not None:
+        block_size = int(cfg.speculative_dfly_block_size)
+        if block_size <= 0:
+            raise ValueError(
+                "DFLY requires --speculative-dfly-block-size to be positive, "
+                f"got {block_size}."
+            )
+        if cfg.speculative_num_draft_tokens not in (None, block_size):
+            raise ValueError(
+                "--speculative-num-draft-tokens and --speculative-dfly-block-size "
+                f"differ ({cfg.speculative_num_draft_tokens} vs {block_size}); "
+                "for DFLY they must match."
+            )
+        declare_resolution(
+            server_args, "_handle_dfly", speculative_num_draft_tokens=block_size
+        )
+    elif cfg.speculative_num_draft_tokens is None:
+        block_size = None
+        try:
+            block_size = _dfly_block_size_from_checkpoint(cfg)
+        except Exception as e:
+            logger.warning(
+                "Failed to infer DFLY block_size from checkpoint config; "
+                "defaulting to %d. Error: %s",
+                DEFAULT_DFLY_BLOCK_SIZE,
+                e,
+            )
+        if block_size is None:
+            block_size = DEFAULT_DFLY_BLOCK_SIZE
+            logger.warning(
+                "The checkpoint declares no DFly block size; defaulting to %d.",
+                block_size,
+            )
+        declare_resolution(
+            server_args, "_handle_dfly", speculative_num_draft_tokens=block_size
+        )
+    if not 2 <= int(cfg.speculative_num_draft_tokens) <= 17:
+        raise ValueError("DFLY requires a block size in [2, 17].")
+    if cfg.enable_mixed_chunk:
+        declare_resolution(server_args, "_handle_dfly", enable_mixed_chunk=False)
+        logger.warning("Mixed chunked prefill is disabled for DFLY.")
+    if cfg.max_running_requests is None:
+        declare_resolution(server_args, "_handle_dfly", max_running_requests=48)
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. You "
+            "can override this by explicitly setting --max-running-requests."
+        )
+
+
 def _handle_uno(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 

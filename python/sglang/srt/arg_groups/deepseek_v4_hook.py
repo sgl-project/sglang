@@ -203,8 +203,9 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         assert cfg.speculative_algorithm in (
             "EAGLE",
             "DSPARK",
+            "DFLY",
         ), (
-            f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
+            f"Only EAGLE, DSPARK, and DFLY speculative algorithms are supported for {model_arch}"
         )
         if cfg.speculative_algorithm == "EAGLE":
             assert cfg.speculative_eagle_topk == 1, (
@@ -376,9 +377,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
     unsupported = (
         (
-            "speculative decoding other than DSpark",
+            "speculative decoding other than DSpark or DFly",
             cfg.speculative_algorithm is not None
-            and str(cfg.speculative_algorithm).upper() != "DSPARK",
+            and str(cfg.speculative_algorithm).upper() not in ("DSPARK", "DFLY"),
         ),
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
