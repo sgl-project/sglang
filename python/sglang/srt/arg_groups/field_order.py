@@ -595,5 +595,6 @@ POSITIONAL_FIELD_ORDER = (
     "inkling2_loop_num_passes",
     "inkling2_loop_share_cache",
     "inkling2_tool_call_author_name_mode",
+    "eplb_max_rebalance_count",
 )
 # fmt: on
