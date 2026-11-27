@@ -1007,17 +1007,6 @@ class Engine(EngineScoreMixin, EngineBase):
 
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
-            if any("kv_event_sources" in info for info in infos):
-                # Both gRPC entrypoints consume the first scheduler info. Keep
-                # the sources from every local scheduler, not just the first.
-                infos[0]["kv_event_sources"] = sorted(
-                    (
-                        source
-                        for info in infos
-                        for source in info.get("kv_event_sources", [])
-                    ),
-                    key=lambda source: source["dp_rank"],
-                )
             # Each PP stage reports only its own L3 pools; give every info the merged layout.
             merge_scheduler_info_layouts(infos)
             scheduler_infos.extend(infos)

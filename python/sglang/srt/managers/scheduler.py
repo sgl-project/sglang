@@ -2139,13 +2139,6 @@ class Scheduler(
             # The main process waits for this process's crash dump.
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
-
-        if get_serving().grpc_port is not None:
-            result_dict["kv_event_sources"] = (
-                self.kv_events_publisher.local_kv_event_sources(
-                    self.page_size * get_parallel().dcp_size
-                )
-            )
         return result_dict
 
     def release_host_resources(self) -> None:
