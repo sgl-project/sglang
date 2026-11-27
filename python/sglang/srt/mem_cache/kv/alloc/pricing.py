@@ -480,16 +480,18 @@ def _gap_weights(
     right: Optional[str],
     growth: Dict[str, int],
 ) -> Tuple[int, ...]:
-    """Expected growth into each gap of a segment, in half-units: a float's
-    growth splits between its two gaps, an end's goes to its one gap."""
+    """Weight the byte gaps by expected byte growth. An end grows into one
+    gap and a float splits its growth between two, hence the factor of two."""
     weights = [0] * (len(segment) + 1)
     for name, gap in ((left, 0), (right, len(segment))):
         if name is not None:
-            whole = snapshot.band(name).grow != "float"
-            weights[gap] += growth.get(name, 0) * (2 if whole else 1)
+            band = snapshot.band(name)
+            weight = growth.get(name, 0) * band.page_bytes
+            weights[gap] += weight * (2 if band.grow != "float" else 1)
     for i, (b, _) in enumerate(segment):
-        weights[i] += growth.get(b.name, 0)
-        weights[i + 1] += growth.get(b.name, 0)
+        weight = growth.get(b.name, 0) * b.page_bytes
+        weights[i] += weight
+        weights[i + 1] += weight
     return tuple(weights)
 
 
