@@ -782,6 +782,16 @@ class KVStorage:
             for s in self._plan.owner_first()
         )
 
+    def kv_bytes_usage(self, full_tokens: int, swa_tokens: int) -> Optional[float]:
+        """The arena's byte share of the pages that hold ``full_tokens`` owner
+        tokens and ``swa_tokens`` window tokens. None unless the chain is the
+        owner band and exactly one window band, with no state band."""
+        allocator = self._allocator
+        if len(allocator.window_allocators) != 1 or allocator.roles.state is not None:
+            return None
+        used_bytes = allocator.shared_bytes(full_tokens, swa_tokens)
+        return used_bytes / allocator.arena.total_bytes
+
     def page_envelope_pair(self) -> Optional[Tuple[str, str]]:
         """The two sub-pools whose host pools may share one page-envelope
         backing, owner first (kv/memory/host.py)."""
