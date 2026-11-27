@@ -51,6 +51,7 @@ def _prepare_extend(
     branching_seqlen: int | None = None,
     is_swa: bool = False,
     disaggregation_mode: str | None = None,
+    previous_track_seqlen: int | None = None,
 ) -> tuple[_MambaRadixCacheV2TrackEntry, Req]:
     """Run one extend through the tracker; return its track entry and the request."""
     server_args = ServerArgs(
@@ -75,6 +76,8 @@ def _prepare_extend(
     req.prefix_len = prefix_len
     req.extend_end = prefix_len + extend_len
     req.kv.mamba_next_track_idx = next_idx
+    req.kv.mamba_last_track_seqlen = previous_track_seqlen
+    req.kv.mamba_last_track_idx = 1 - next_idx
     req.mamba_branching_seqlen = branching_seqlen
 
     batch = ScheduleBatch(reqs=[req])
@@ -101,6 +104,42 @@ def _track_seqlen(**kwargs) -> int | None:
 
 
 class TestMambaCheckpointDepth(CustomTestCase):
+    def test_single_grid_tail_preserves_the_previous_chunks_checkpoint(self):
+        """The final chunk must not overwrite the only state shared by the next turn."""
+        for page, dcp in ((64, False), (256, True)):
+            with self.subTest(page=page, dcp=dcp):
+                entry, req = _prepare_extend(
+                    tree_page=page,
+                    prefix_len=20480,
+                    extend_len=page,
+                    level=2,
+                    dcp_enabled=dcp,
+                    previous_track_seqlen=20480,
+                )
+                self.assertFalse(entry.track_mask)
+                self.assertEqual(entry.track_seqlen, -1)
+                self.assertEqual(req.kv.mamba_last_track_seqlen, 20480)
+                self.assertEqual(req.kv.mamba_last_track_idx, 1)
+                self.assertEqual(req.kv.mamba_next_track_idx, 0)
+        for overrides in (
+            {"level": 3},
+            {"is_swa": True},
+            {"disaggregation_mode": "prefill"},
+            {"previous_track_seqlen": 20416},
+        ):
+            with self.subTest(overrides=overrides):
+                args = dict(
+                    tree_page=64,
+                    prefix_len=20480,
+                    extend_len=64,
+                    level=2,
+                    previous_track_seqlen=20480,
+                )
+                args.update(overrides)
+                entry, req = _prepare_extend(**args)
+                self.assertTrue(entry.track_mask)
+                self.assertEqual(req.kv.mamba_last_track_seqlen, 20544)
+
     def test_grid_aligned_prompt_keeps_a_state_before_its_last_token(self):
         """A chat template changes the prompt's last token on the next turn;
         a state at the full prompt length cannot serve that shared prefix."""

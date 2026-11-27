@@ -227,6 +227,31 @@ class TestRequestEndCheckpoints(CustomTestCase):
         cache.unlock(req.lock)
         cache.sanity_check()
 
+    def test_single_grid_tail_reuses_the_previous_chunks_checkpoint(self):
+        """A final one-grid prefill chunk must not discard the resumable state."""
+        cache, allocator, pool = _build(2)
+        req = _running_req(cache, allocator, pool, up_to=12)
+        req.kv.mamba_last_track_seqlen = None
+        batch = ScheduleBatch(reqs=[req])
+        batch.tree_cache = cache
+        batch.req_to_token_pool = pool
+        batch.token_to_kv_pool_allocator = allocator
+        batch.model_config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(mamba_chunk_size=4)
+        )
+        req.prefix_len = 0
+        batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
+        cache.checkpoint(req, up_to=12)
+        self.assertEqual(_cached_len(cache, PROMPT), 0)
+        req.prefix_len = 12
+        req.extend_end = len(PROMPT)
+        batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
+        cache.checkpoint(req, up_to=len(PROMPT))
+        self.assertEqual(_cached_len(cache, PROMPT[:-1] + [100]), 12)
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+        cache.unlock(req.lock)
+        cache.sanity_check()
+
     def test_level2_keeps_every_chunk_with_sliding_window(self):
         cache, allocator, pool = _build(
             2,
