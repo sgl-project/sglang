@@ -1563,11 +1563,10 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
 
   // ==== Recipe ratings (👍/👎 per cell) ====
   // Votes live in an external service (sgl-project/sglang-cookbook-ratings);
-  // the browser talks to it directly. It accepts votes only from
-  // https://docs.sglang.io, so local and preview builds show counts but
-  // their votes are refused. Off when the endpoint is empty, for builder
-  // pages (no discrete cells to rate), or when a page sets
-  // `config.ratings: false`.
+  // the browser talks to it directly. It answers only https://docs.sglang.io
+  // (CORS and an Origin check), so local and preview builds show no row.
+  // Off when the endpoint is empty, for builder pages (no discrete cells to
+  // rate), or when a page sets `config.ratings: false`.
   const RATINGS_ENDPOINT = "https://sglang-cookbook-ratings.vercel.app/";
   const ratingsEnabled =
     !!RATINGS_ENDPOINT && !commandBuilder && config.ratings !== false;
