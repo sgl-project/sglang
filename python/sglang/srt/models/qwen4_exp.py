@@ -535,10 +535,13 @@ def _ple_track_targets(
     return dst, aligned[:rows].clamp(min=0).minimum(batch.lengths)
 
 
-def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
+def _pad_token_rows(
+    x: torch.Tensor, total_tokens: int, *, pad_value: int | torch.Tensor = 0
+) -> torch.Tensor:
     if x.shape[0] == total_tokens:
         return x
-    out = x.new_zeros((total_tokens, *x.shape[1:]))
+    out = x.new_empty((total_tokens, *x.shape[1:]))
+    out[x.shape[0] :] = pad_value
     out[: x.shape[0]] = x
     return out
 
@@ -807,7 +810,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if not self.gather_dp_tokens:
             return ngram_ids, semantic_tokens
 
-        padded_ngram_ids = _pad_token_rows(ngram_ids, physical_tokens)
+        # Idle DP ranks still join the global lookup. Padding must name a valid
+        # row in every head; zero is outside all but the first head.
+        padded_ngram_ids = _pad_token_rows(
+            ngram_ids, physical_tokens, pad_value=self.ngram_heads_offsets
+        )
         global_tokens = forward_batch.global_dp_buffer_len
         if global_tokens is None:
             raise RuntimeError(

@@ -324,5 +324,44 @@ class TestEngramRemoteConfig(CustomTestCase):
             storage.close()
 
 
+class TestQwen4ExpNGramPadding(CustomTestCase):
+    def test_idle_and_partial_dp_ranks_have_valid_per_head_rows(self):
+        from sglang.srt.models import qwen4_exp
+
+        offsets = torch.tensor([0, 5, 12])
+        limits = torch.tensor([5, 12, 15])
+        layer = SimpleNamespace(gather_dp_tokens=True, ngram_heads_offsets=offsets)
+        batch = SimpleNamespace(global_dp_buffer_len=16)
+
+        def gather(output, local, forward_batch):
+            output.copy_(torch.cat([local] * 4))
+
+        for real_rows in (0, 1, 4):
+            with (
+                self.subTest(real_rows=real_rows),
+                mock.patch.object(qwen4_exp, "dp_gather_replicate", side_effect=gather),
+            ):
+                ids = torch.tensor([[2, 7, 14]]).expand(real_rows, -1).clone()
+                actual, semantic = (
+                    qwen4_exp.Qwen4ExpNGramEmbedding._prepare_embedding_lookup(
+                        layer, ids, batch, 4
+                    )
+                )
+                self.assertEqual(semantic, real_rows)
+                # The real remote backend checks this before translating IDs.
+                self.assertTrue(torch.all((actual >= offsets) & (actual < limits)))
+                for shard in actual.reshape(4, 4, 3):
+                    torch.testing.assert_close(shard[:real_rows], ids)
+
+    def test_hidden_state_padding_stays_zero(self):
+        from sglang.srt.models import qwen4_exp
+
+        values = torch.ones(2, 3)
+        actual = qwen4_exp._pad_token_rows(values, 4)
+        torch.testing.assert_close(actual[:2], values)
+        self.assertFalse(torch.any(actual[2:]))
+        self.assertIs(qwen4_exp._pad_token_rows(values, 2), values)
+
+
 if __name__ == "__main__":
     unittest.main()
