@@ -250,6 +250,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.req_to_token_pool.row_width
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.runner_ids = model_runner.runner_ids
         self.enable_chunk_kv = (
@@ -535,7 +536,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
-                (max_bs * self.req_to_token_pool.row_width,),
+                (max_bs * self.max_kv_len,),
                 dtype=torch.int32,
                 device="cuda",
             )
@@ -1263,7 +1264,7 @@ class FlashInferMLAMultiStepDraftBackend:
         self.forward_metadata = None
 
         # Cached variables for generate_draft_decode_kv_indices
-        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.attn_backends[0].max_kv_len
         self.page_size = get_schedule().page_size
         self.runner_ids = model_runner.runner_ids
 
@@ -1354,7 +1355,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
-            forward_batch.batch_size, self.topk, self.req_to_token_pool.row_width
+            forward_batch.batch_size, self.topk, self.max_kv_len
         )
         kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),
@@ -1377,7 +1378,7 @@ class FlashInferMLAMultiStepDraftBackend:
         # Row holds topk per-branch sequences (generate_draft_decode_kv_indices), so
         # it needs the topk factor, matching the eager init_forward_metadata.
         kv_indices_width = draft_kv_indices_buffer_width(
-            max_bs, self.topk, self.req_to_token_pool.row_width
+            max_bs, self.topk, self.max_kv_len
         )
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),
