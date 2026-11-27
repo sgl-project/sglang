@@ -36,8 +36,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     supports_track_state_snapshot: bool = True
 
     def __init__(self):
-        # Lazily allocate per-shape scratch dicts on first UBTree call so
-        # non-UBTree runs keep zero extra host footprint.
+        # Defer per-shape UBTree scratch dicts until first tree verify call.
         self._tree_factor_scratch = None
         self._tree_transform_scratch = None
 

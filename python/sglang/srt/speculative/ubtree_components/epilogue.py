@@ -23,14 +23,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 
 
 class UBTreeVerifyResult(msgspec.Struct, frozen=True):
     predict: torch.Tensor
     accept_lens: torch.Tensor
-    accept_index: torch.Tensor
     bonus_tokens: torch.Tensor
     new_seq_lens: torch.Tensor
 
@@ -195,20 +193,6 @@ class UBTreeVerifyEpilogue:
             retrieve_next_sibling=tree.retrieve_next_sibling,
             seq_lens=seq_lens,
             bs=tree.batch_size,
-        )
-
-    def begin_step(
-        self, verify_input: UBTreeVerifyInput, seq_lens: torch.Tensor, bs: int
-    ) -> None:
-        """Copy one dynamic tree batch into graph-stable input buffers."""
-
-        self._stage_tree_inputs(
-            draft_token=verify_input.draft_token,
-            retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
-            retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            seq_lens=seq_lens,
-            bs=bs,
         )
 
     def capture_hook(self, runner, out, forward_batch, num_tokens: int) -> None:
@@ -540,7 +524,6 @@ class UBTreeVerifyEpilogue:
         return UBTreeVerifyResult(
             predict=self.compact_predict_buf[:bs].reshape(-1),
             accept_lens=self.accept_lens_buf[:bs],
-            accept_index=self.accept_index_buf[:bs],
             bonus_tokens=self.bonus_tokens_buf[:bs],
             new_seq_lens=self.new_seq_lens_buf[:bs],
         )

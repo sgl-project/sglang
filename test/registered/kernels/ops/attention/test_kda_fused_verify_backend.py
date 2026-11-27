@@ -597,7 +597,6 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                     rtol=0,
                     atol=0,
                 )
-                # Verify the BS=1 contract rejects batched factorized verify.
                 tree_backend.forward_metadata.query_start_loc = torch.tensor(
                     [0, width, 2 * width], device="cuda", dtype=torch.int32
                 )

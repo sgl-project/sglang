@@ -183,6 +183,7 @@ def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(algorithm,
     k = torch.randn(3 * 512, 1, 2, 64, dtype=torch.bfloat16, device="cuda")
     v = torch.randn_like(k)
     mode = TreeMaskMode.QLEN_ONLY if algorithm == "UBTREE" else TreeMaskMode.FULL_MASK
+    extra = {"tree_mask_mode": mode} if algorithm == "UBTREE" else {}
     spec_cls = UBTreeVerifyInput if algorithm == "UBTREE" else EagleVerifyInput
     spec = spec_cls(
         draft_token=None,
@@ -198,7 +199,7 @@ def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(algorithm,
         capture_hidden_mode=None,
         seq_lens_sum=None,
         seq_lens_cpu=None,
-        tree_mask_mode=mode,
+        **extra,
     )
     batch = SimpleNamespace(
         forward_mode=ForwardMode.TARGET_VERIFY,
@@ -511,25 +512,16 @@ def test_verify_epilogue_folds_factorized_kda_commit(monkeypatch, track):
         mamba_index_mapping=mapping,
         mamba_track_interval=64,
     )
-    verify_input = UBTreeVerifyInput(
-        draft_token=torch.arange(10, dtype=torch.int64),
+    tree = SimpleNamespace(
+        tokens=torch.arange(10, dtype=torch.int64).view(2, 5),
         retrieve_index=torch.arange(10, dtype=torch.int64).view(2, 5),
         retrieve_next_token=torch.full((2, 5), -1, dtype=torch.int64),
         retrieve_next_sibling=torch.full((2, 5), -1, dtype=torch.int64),
-        custom_mask=None,
-        positions=None,
-        retrieve_cum_len=None,
-        spec_steps=2,
-        topk=2,
-        draft_token_num=5,
-        capture_hidden_mode=None,
-        seq_lens_sum=None,
-        seq_lens_cpu=None,
-        logical_max_depth=3,
+        batch_size=2,
     )
     seq_lens = torch.tensor([60, 20], dtype=torch.int64)
     req_pool_indices = torch.tensor([2, 0], dtype=torch.int64)
-    epilogue.begin_step(verify_input, seq_lens, 2)
+    epilogue.begin_tree_step(tree, seq_lens)
 
     def fake_verify(**kwargs):
         kwargs["predicts"].copy_(kwargs["target_predict"].reshape(-1))
@@ -816,6 +808,7 @@ def test_compact_topk_capture_follows_accepted_branch(overlap):
             out, cap, epilogue, 1, accept_lens
         )
         assert compacted is not None
+        compacted.map_device_tensors(lambda t: t.clone())
         compacted.finalize()
     else:
         cap.host_cache.buffer[locs] = rows
@@ -901,7 +894,6 @@ def _reference_ubtree_batch(
         tokens=tokens.gather(1, old_nodes),
         parent_ids=parent_ids,
         depths=depths.gather(1, old_nodes),
-        path_scores=scores.gather(1, old_nodes),
         visibility=visibility,
         retrieve_index=retrieve_index,
         retrieve_next_token=next_token,
@@ -931,6 +923,10 @@ def test_tree_metadata_all_widths_matches_cpu_after_replay(width):
     _assert_tree_batches_equal(proposal, _reference_ubtree_batch(**proposal_args))
     assert torch.all(proposal.parent_ids[:, 1:] >= 0)
     assert torch.all(proposal.parent_ids[:, 1:] < torch.arange(1, width, device="cuda"))
+    if width == 2:
+        for bad_bonus in (float("-inf"), float("nan")):
+            with pytest.raises(ValueError, match="depth_bonus"):
+                build_ubtree_batch(**proposal_args, depth_bonus=bad_bonus)
 
     parent_values = [
         [-1] + [(node - 1) // 2 for node in range(1, width)],

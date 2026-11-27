@@ -44,6 +44,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_page_size,
+    get_spec_decode_reach,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -574,15 +578,12 @@ class TpModelWorker(BaseTpWorker):
         max_req_input_len = max_req_len - 5
         spec = get_spec()
         if spec.speculative_algorithm == "UBTREE":
-            # Row width already reserves both in-flight verify allocations past
-            # context_len, so only cap the physical KV side by one verify width.
-            headroom = max(
-                spec.speculative_num_steps,
-                spec.speculative_num_draft_tokens,
-            )
+            # Reserve the double-buffered speculative decode reach on the
+            # physical KV pool so admitted requests fit spec_decode_alloc_lens.
+            reserve = get_spec_decode_reach(get_alloc_page_size())
             max_req_len = min(
                 self.model_config.context_len - 1,
-                max(1, kv_capacity - 1 - headroom),
+                max(1, kv_capacity - 1 - reserve),
             )
             max_req_input_len = max(1, min(max_req_input_len, max_req_len - 5))
         if self.dllm_algorithm is not None:

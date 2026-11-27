@@ -201,6 +201,40 @@ class TestUBTreeState(CustomTestCase):
                         - (slots + 1) * _params().mamba_cache_per_req,
                     )
 
+    def test_worker_info_reserves_spec_decode_reach(self):
+        from sglang.srt.managers.tp_worker import TpModelWorker
+
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                effective_logical_max_total_num_tokens=512,
+                logical_max_total_num_tokens=512,
+                max_running_requests=1,
+                forward_stream=None,
+                req_to_token_pool=SimpleNamespace(size=1, row_width=4096),
+                token_to_kv_pool=SimpleNamespace(size=512),
+                token_to_kv_pool_allocator=None,
+            ),
+            model_config=SimpleNamespace(context_len=2048),
+            random_seed=0,
+            device="cpu",
+            dllm_algorithm=None,
+        )
+        for width, expected_reach in ((49, 98), (24, 60)):
+            with (
+                self.subTest(width=width),
+                get_context().override_server_args(
+                    speculative_algorithm="UBTREE",
+                    speculative_num_steps=15,
+                    speculative_eagle_topk=2,
+                    speculative_num_draft_tokens=width,
+                    page_size=1,
+                ),
+            ):
+                info = TpModelWorker.get_worker_info(worker)
+                expected_max_req = 512 - 1 - expected_reach
+                self.assertEqual(info[4], expected_max_req)
+                self.assertEqual(info[5], expected_max_req - 5)
+
 
 if __name__ == "__main__":
     unittest.main()

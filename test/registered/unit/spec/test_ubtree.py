@@ -275,6 +275,14 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
         self.assertEqual(
             resolve_verify_width(replace(config, tree_budget=39), None), 40
         )
+        for block_size in (50, 64):
+            with self.subTest(block_size=block_size):
+                self.assertEqual(
+                    resolve_verify_width(
+                        replace(config, block_size=block_size), None
+                    ),
+                    block_size,
+                )
         for width in (4, 66):
             with self.subTest(width=width), self.assertRaises(ValueError):
                 resolve_verify_width(config, width)
@@ -286,6 +294,13 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
             parse_ubtree_config(
                 SimpleNamespace(**vars(_config()), dflash_contract="other")
             )
+        for bonus in (float("-inf"), float("inf"), float("nan")):
+            with self.subTest(bonus=bonus), self.assertRaisesRegex(
+                ValueError, "tree_depth_bonus"
+            ):
+                bad = _config()
+                bad.ubtree_config = dict(bad.ubtree_config, tree_depth_bonus=bonus)
+                parse_ubtree_config(bad)
         with self.assertRaisesRegex(ValueError, "vocab_size 17 must match"):
             _run_ubtree_hook(target_vocab_size=18)
         with self.assertRaisesRegex(ValueError, "--context-length 2048"):

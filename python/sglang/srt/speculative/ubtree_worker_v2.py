@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -56,6 +57,19 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
+
+
+@dataclass
+class _UBTreeTopkCaptureOutput(TopkCaptureOutput):
+    valid_len: torch.Tensor
+
+    def map_device_tensors(self, fn):
+        super().map_device_tensors(fn)
+        self.valid_len = fn(self.valid_len)
+
+    def finalize(self):
+        n = int(self.valid_len.item())
+        self.host_cache.buffer[self.out_cache_loc[:n]] = self.topk[:n]
 
 
 class UBTreeWorkerV2(DFlashWorkerV2):
@@ -430,7 +444,7 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         if capture_output is not None:
             safe_index = epilogue.safe_accept_index_buf[:bs].reshape(-1)
             dst_locs = epilogue.target_cache_loc_buf[:bs].reshape(-1).clone()
-            return TopkCaptureOutput(
+            return _UBTreeTopkCaptureOutput(
                 out_cache_loc=dst_locs,
                 topk=capture_output.topk.index_select(0, safe_index),
                 host_cache=capture_output.host_cache,

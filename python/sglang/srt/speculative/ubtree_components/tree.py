@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import math
+
 import msgspec
 import torch
 import triton
@@ -16,7 +18,6 @@ class UBTreeBatch(msgspec.Struct):
     tokens: torch.Tensor
     parent_ids: torch.Tensor
     depths: torch.Tensor
-    path_scores: torch.Tensor
     visibility: torch.Tensor
     retrieve_index: torch.Tensor
     retrieve_next_token: torch.Tensor
@@ -276,12 +277,10 @@ def _materialize_selected_tree_kernel(
     super_tokens,
     super_parents,
     super_depths,
-    super_scores,
     selected_old_ids,
     selected_tokens,
     selected_parents,
     selected_depths,
-    selected_scores,
     anchor_stride: tl.constexpr,
     selected_nodes: tl.constexpr,
     super_stride: tl.constexpr,
@@ -308,11 +307,6 @@ def _materialize_selected_tree_kernel(
         0,
         tl.load(super_depths + super_offsets, mask=valid, other=0),
     )
-    score = tl.where(
-        lanes == 0,
-        0.0,
-        tl.load(super_scores + super_offsets, mask=valid, other=-3.402823466e38),
-    )
     parent_old = tl.where(
         lanes == 0,
         -1,
@@ -337,7 +331,6 @@ def _materialize_selected_tree_kernel(
     tl.store(selected_tokens + output_offsets, token, mask=valid)
     tl.store(selected_parents + output_offsets, parent_new, mask=valid)
     tl.store(selected_depths + output_offsets, depth, mask=valid)
-    tl.store(selected_scores + output_offsets, score, mask=valid)
 
 
 def _build_ubtree_batch_fused(
@@ -412,9 +405,6 @@ def _build_ubtree_batch_fused(
     )
     selected_parents = torch.empty_like(selected_tokens)
     selected_depths = torch.empty_like(selected_tokens)
-    selected_scores = torch.empty(
-        (batch, selected_nodes), dtype=torch.float32, device=device
-    )
     selected_old_ids = torch.empty_like(selected_tokens)
     _select_tree_nodes_kernel[(batch,)](
         super_depths,
@@ -434,12 +424,10 @@ def _build_ubtree_batch_fused(
         super_tokens,
         super_parents,
         super_depths,
-        super_scores,
         selected_old_ids,
         selected_tokens,
         selected_parents,
         selected_depths,
-        selected_scores,
         anchor_stride=anchor_tokens.stride(0),
         selected_nodes=selected_nodes,
         super_stride=max_nodes,
@@ -454,7 +442,6 @@ def _build_ubtree_batch_fused(
         tokens=selected_tokens,
         parent_ids=selected_parents,
         depths=selected_depths,
-        path_scores=selected_scores,
         visibility=visibility,
         retrieve_index=retrieve_index,
         retrieve_next_token=next_token,
@@ -488,8 +475,10 @@ def build_ubtree_batch(
         raise ValueError("supertree_width must be in [1, candidate_k]")
     if budget <= 0 or budget > depth_count * supertree_width:
         raise ValueError("budget must be in [1, depth * supertree_width]")
-    if depth_bonus > 0:
-        raise ValueError("depth_bonus must be non-positive for prefix closure")
+    if not math.isfinite(depth_bonus) or depth_bonus > 0:
+        raise ValueError(
+            "depth_bonus must be finite and non-positive for prefix closure"
+        )
     return _build_ubtree_batch_fused(
         anchor_tokens=anchor_tokens,
         candidate_ids=candidate_ids,

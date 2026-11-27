@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping
 
 import msgspec
@@ -84,8 +85,8 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
         raise ValueError("UBTree tree_supertree_width cannot exceed candidate_k")
     if parsed.tree_budget > parsed.depth_count * parsed.supertree_width:
         raise ValueError("UBTree tree_budget exceeds the generated supertree")
-    if parsed.depth_bonus > 0:
-        raise ValueError("UBTree tree_depth_bonus must be non-positive")
+    if not math.isfinite(parsed.depth_bonus) or parsed.depth_bonus > 0:
+        raise ValueError("UBTree tree_depth_bonus must be finite and non-positive")
     if metadata.get("objective") != "kl" or not metadata.get("adds_unary_logits"):
         raise ValueError("UBTree serving requires the trained S1/S3 KL selector")
     if metadata.get("token_factorizer", "target_embedding_mlp") != (
@@ -109,9 +110,10 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
 
 def resolve_verify_width(config: UBTreeConfig, requested: int | None) -> int:
     """Select one fixed KDA verification shape for the process lifetime."""
-    # Keep the existing default for larger exports without restricting explicit
-    # widths to the shapes with tuned kernels.
-    width = min(49, config.verify_node_count) if requested is None else requested
+    # Default to 49 nodes when the checkpoint supports it, widening up to
+    # block_size for larger draft blocks while staying within tree_budget.
+    default_width = min(max(49, config.block_size), config.verify_node_count)
+    width = default_width if requested is None else requested
     if not config.block_size <= width <= config.verify_node_count:
         raise ValueError(
             "UBTREE --speculative-num-draft-tokens must be at least the draft "

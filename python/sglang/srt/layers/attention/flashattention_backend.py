@@ -59,13 +59,13 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
 )
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
 from sglang.srt.utils import get_compiler_backend
 from sglang.srt.utils.device import get_device_capability
 
@@ -81,7 +81,7 @@ from sgl_kernel import merge_state_v2
 
 def _is_qlen_only_mask(spec_info: SpecInput) -> bool:
     return (
-        isinstance(spec_info, EagleVerifyInput)
+        isinstance(spec_info, UBTreeVerifyInput)
         and spec_info.tree_mask_mode == TreeMaskMode.QLEN_ONLY
     )
 

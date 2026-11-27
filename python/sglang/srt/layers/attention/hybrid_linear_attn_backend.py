@@ -50,6 +50,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
 from sglang.srt.utils import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -377,13 +378,13 @@ class MambaAttnBackendBase(AttentionBackend):
                     retrieve_next_sibling = (
                         forward_batch.spec_info.retrieve_next_sibling
                     )
-                    direct_parent = (
-                        forward_batch.spec_info.retrieve_parent_token
-                        if isinstance(forward_batch.spec_info, EagleVerifyInput)
-                        else None
-                    )
-                    if direct_parent is not None:
-                        retrieve_parent_token = direct_parent
+                    if (
+                        isinstance(forward_batch.spec_info, UBTreeVerifyInput)
+                        and forward_batch.spec_info.retrieve_parent_token is not None
+                    ):
+                        retrieve_parent_token = (
+                            forward_batch.spec_info.retrieve_parent_token
+                        )
                         tree_depths = forward_batch.spec_info.tree_depths
                         tree_max_depth = forward_batch.spec_info.max_tree_depth
                         has_direct_parent = forward_batch.spec_info.uses_direct_parent
@@ -500,10 +501,12 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_sibling_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
             spec_info.retrieve_next_sibling
         )
-        direct_parent = spec_info.retrieve_parent_token
-        if direct_parent is not None:
+        if (
+            isinstance(spec_info, UBTreeVerifyInput)
+            and spec_info.retrieve_parent_token is not None
+        ):
             self.retrieve_parent_token_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
-                direct_parent
+                spec_info.retrieve_parent_token
             )
             live_depths = spec_info.tree_depths
             if self.tree_depth_list is not None and live_depths is not None:
@@ -887,7 +890,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     spec_info.max_tree_depth if self.tree_depth_list is not None else 0
                 ),
                 has_direct_parent=(
-                    self.tree_depth_list is not None and spec_info.uses_direct_parent
+                    self.tree_depth_list is not None
+                    and isinstance(spec_info, UBTreeVerifyInput)
+                    and spec_info.uses_direct_parent
                 ),
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
@@ -1082,14 +1087,12 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
                     spec_info.retrieve_next_sibling
                 )
-                direct_parent = (
-                    spec_info.retrieve_parent_token
-                    if isinstance(spec_info, EagleVerifyInput)
-                    else None
-                )
-                if direct_parent is not None:
+                if (
+                    isinstance(spec_info, UBTreeVerifyInput)
+                    and spec_info.retrieve_parent_token is not None
+                ):
                     self.retrieve_parent_token_list[bs - 1][:bs_without_pad].copy_(
-                        direct_parent
+                        spec_info.retrieve_parent_token
                     )
                     live_depths = spec_info.tree_depths
                     if self.tree_depth_list is not None and live_depths is not None:
@@ -1110,7 +1113,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     spec_info.max_tree_depth if self.tree_depth_list is not None else 0
                 ),
                 has_direct_parent=(
-                    self.tree_depth_list is not None and spec_info.uses_direct_parent
+                    self.tree_depth_list is not None
+                    and isinstance(spec_info, UBTreeVerifyInput)
+                    and spec_info.uses_direct_parent
                 ),
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
