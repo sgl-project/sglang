@@ -1905,6 +1905,22 @@ class TestCosmosDreamsUnifiedContract(unittest.TestCase):
 
 
 class TestCosmosDreamsRuntime(unittest.TestCase):
+    def test_releasing_model_memory_drops_the_denoise_graph(self):
+        from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
+            _release_cuda_graphs,
+        )
+
+        model = cosmos_dreams.CosmosDreamsTransformer.__new__(
+            cosmos_dreams.CosmosDreamsTransformer
+        )
+        torch.nn.Module.__init__(model)
+        runner = mock.Mock()
+        model.denoise_runner = runner
+        _release_cuda_graphs(model)
+        _release_cuda_graphs(model)
+        self.assertIsNone(model.denoise_runner)
+        runner.reset.assert_called_once()
+
     def test_scalar_domain_tensor_is_reused_across_chunks(self):
         domains = torch.tensor([2], dtype=torch.long)
         context = _RolloutContext(
