@@ -210,3 +210,13 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         )
     )
 del _mod, _fn, _desc
+register_kernel(
+    KernelSpec(
+        op="quantization.inkling2_mxfp8_weight_scales_sm120",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.quantization.inkling2_mxfp8_scales_sm120:mxfp8_weight_scales",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
+        ),
+    )
+)

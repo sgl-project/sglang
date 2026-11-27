@@ -78,7 +78,7 @@ class CanaryDeviceState:
             write_position assert. allocate() defaults to 1; CanaryManager zeros it during
             __init__ for the warmup window and mark_init_finished() flips it back to 1.
         req_to_verify_expected_tokens: Optional int32 device tensor shape
-            ``[req_to_token_alloc_size, max_context_len]``. Mirrors ReqToTokenPool layout;
+            ``[req_to_token_alloc_size, req_to_token_row_width]``. Mirrors ReqToTokenPool layout;
             ``pool[req_idx, p]`` = source-of-truth token at logical position ``p`` for the
             req in slot ``req_idx``. Allocated only when
             ``CanaryConfig.enable_verify_token_assert`` is True. The plan-side entries
@@ -101,7 +101,7 @@ class CanaryDeviceState:
         device: torch.device,
         num_tags: int,
         req_to_token_alloc_size: Optional[int] = None,
-        max_context_len: Optional[int] = None,
+        req_to_token_row_width: Optional[int] = None,
     ) -> CanaryDeviceState:
         if num_tags <= 0:
             raise ValueError(
@@ -114,13 +114,13 @@ class CanaryDeviceState:
         slot_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
         enable_chain_position_assert = torch.ones(1, dtype=torch.int32, device=device)
         if config.enable_verify_token_assert:
-            if req_to_token_alloc_size is None or max_context_len is None:
+            if req_to_token_alloc_size is None or req_to_token_row_width is None:
                 raise ValueError(
                     "kv-canary: CanaryDeviceState.allocate requires req_to_token_alloc_size "
-                    "and max_context_len when CanaryConfig.enable_verify_token_assert is on"
+                    "and req_to_token_row_width when CanaryConfig.enable_verify_token_assert is on"
                 )
             req_to_verify_expected_tokens = torch.empty(
-                (req_to_token_alloc_size, max_context_len),
+                (req_to_token_alloc_size, req_to_token_row_width),
                 dtype=torch.int32,
                 device=device,
             )
