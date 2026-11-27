@@ -75,8 +75,6 @@ def draft_kv_ring_unsupported_reason(
     enable_dp_attention: bool = False,
     draft_window_size: Optional[int] = None,
     is_cuda: bool = True,
-    is_hip: bool = False,
-    is_dspark: bool = False,
 ) -> Optional[str]:
     """Why a ring cannot serve this draft, or None. Loads the draft config only
     once the launch flags allow a ring."""
@@ -89,18 +87,6 @@ def draft_kv_ring_unsupported_reason(
         return "decode host KV buffering receives only SWA state"
     if enable_unified_memory:
         return "--enable-unified-memory places the draft KV in the target's pool"
-    if is_dspark:
-        if not (is_hip and draft_backend == "triton"):
-            return "the DSpark draft KV ring runs only on ROCm's Triton draft backend"
-        from sglang.srt.speculative.dspark_components.dspark_draft_ring_hip import (
-            rocm_dspark_gqa_ring_unsupported_reason,
-        )
-
-        return rocm_dspark_gqa_ring_unsupported_reason(
-            load_draft_hf_config,
-            disaggregation_mode=disaggregation_mode,
-            draft_window_size=draft_window_size,
-        )
     if draft_backend in DFLASH_MHA_RING_DRAFT_BACKENDS:
         return _mha_ring_unsupported_reason(
             load_draft_hf_config,

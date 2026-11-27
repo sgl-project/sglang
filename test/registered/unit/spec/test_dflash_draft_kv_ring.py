@@ -11,14 +11,12 @@ from sglang.srt.disaggregation.utils import draft_kv_ring_row_pairs
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
     draft_kv_ring_paged_rows_per_req,
     draft_kv_ring_pool_rows,
     draft_kv_ring_rows_per_req,
-    draft_kv_ring_unsupported_reason,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -495,79 +493,6 @@ class TestPagedDraftKVRingPDTransfer(CustomTestCase):
                 rel = keys - floor
                 read = table[0, rel // page].to(torch.int64) * page + rel % page
                 self.assertTrue(torch.equal(dst_pool[read], keys))
-
-
-class TestDSparkGqaDraftKVRingRocm(CustomTestCase):
-    def test_gqa_ring_pool_page_size_is_not_widened_by_target_dcp(self):
-        """A private GQA ring must use the page width charged by its target."""
-        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-
-        configurator = object.__new__(KVCacheConfigurator)
-        configurator.is_draft_worker = True
-        configurator.use_mla_backend = False
-        configurator.model_config = SimpleNamespace(hf_config=self._gqa_config())
-        for ring_enabled, expected_scale in ((False, 8), (True, 1)):
-            with (
-                self.subTest(ring_enabled=ring_enabled),
-                get_context().override_server_args(
-                    tp_size=8,
-                    dcp_size=8,
-                    page_size=16,
-                    speculative_dflash_draft_kv_ring=ring_enabled,
-                ),
-                get_parallel().override(attn_dcp_size=8),
-            ):
-                self.assertEqual(configurator.loc_space_scale, expected_scale)
-                self.assertEqual(configurator.pool_page_size, 16 * expected_scale)
-
-    def _gqa_config(self):
-        return SimpleNamespace(
-            layer_types=["sliding_attention"] * 5,
-            sliding_window=2048,
-            num_hidden_layers=5,
-            dflash_config={
-                "mask_token_id": 163839,
-                "target_layer_ids": [75, 79, 83, 87, 91],
-                "aux_hidden_stream": "prefix",
-            },
-        )
-
-    def _reason(self, **overrides):
-        cfg = self._gqa_config()
-        kwargs = dict(
-            draft_backend="triton",
-            dcp_size=8,
-            is_cuda=False,
-            is_hip=True,
-            is_dspark=True,
-        )
-        kwargs.update(overrides)
-        return draft_kv_ring_unsupported_reason(lambda: cfg, **kwargs)
-
-    def test_rocm_triton_gqa_dspark_ring_is_allowed(self):
-        self.assertIsNone(self._reason())
-
-    def test_dspark_ring_is_rejected_off_rocm_triton(self):
-        """The DSpark ring only has a ROCm Triton reader; other platforms and draft
-        backends must not fall through to the DFLASH ring paths."""
-        for overrides in (
-            dict(is_cuda=True, is_hip=False),
-            dict(is_cuda=False, is_hip=False),
-            dict(draft_backend="fa3"),
-            dict(draft_backend="flashinfer"),
-            # CUDA's MHA ring backends would admit this GQA sliding-window draft.
-            dict(is_cuda=True, is_hip=False, draft_backend="fa4", dcp_size=1),
-            dict(is_cuda=True, is_hip=False, draft_backend="trtllm_mha", dcp_size=1),
-            dict(disaggregation_mode="prefill"),
-        ):
-            with self.subTest(**overrides):
-                self.assertIsNotNone(self._reason(**overrides))
-
-    def test_dspark_ring_needs_static_ragged_verify(self):
-        """Compact and cap-accept verify inject draft KV by pool ids, not ring rows."""
-        for mode in ("compact", "cap-accept"):
-            with self.subTest(mode=mode), envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
-                self.assertIn("SGLANG_RAGGED_VERIFY_MODE", self._reason())
 
 
 if __name__ == "__main__":

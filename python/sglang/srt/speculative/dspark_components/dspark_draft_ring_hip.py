@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
@@ -19,17 +20,53 @@ from sglang.srt.speculative.dflash_utils import (
 logger = logging.getLogger(__name__)
 
 
+def resolve_rocm_dspark_draft_kv_ring(
+    server_args: Any, load_draft_hf_config: Callable[[Any], Any]
+) -> None:
+    """SGLANG_ENABLE_DSPARK_DRAFT_KV_RING=1 turns the ring on for this draft, or fails
+    at startup naming why it cannot. Runs after the draft backend is final, which it
+    reads; ``load_draft_hf_config(cfg)`` is called only once the flags allow a ring."""
+    if not envs.SGLANG_ENABLE_DSPARK_DRAFT_KV_RING.get():
+        return
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    cfg = resolving_view(server_args)
+    reason = rocm_dspark_gqa_ring_unsupported_reason(
+        lambda: load_draft_hf_config(cfg),
+        draft_backend=cfg.speculative_draft_attention_backend,
+        disaggregation_mode=cfg.disaggregation_mode,
+        draft_window_size=cfg.speculative_draft_window_size,
+        enable_unified_memory=cfg.enable_unified_memory,
+    )
+    if reason is not None:
+        raise ValueError(f"SGLANG_ENABLE_DSPARK_DRAFT_KV_RING=1, but {reason}.")
+    logger.info("DSpark draft KV ring: on.")
+    declare_resolution(
+        server_args,
+        "resolve_rocm_dspark_draft_kv_ring",
+        speculative_dflash_draft_kv_ring=True,
+    )
+
+
 def rocm_dspark_gqa_ring_unsupported_reason(
     load_draft_hf_config: Callable[[], Any],
     *,
+    draft_backend: Optional[str],
     disaggregation_mode: str,
     draft_window_size: Optional[int],
+    enable_unified_memory: bool = False,
 ) -> Optional[str]:
     """Return why a ROCm Triton GQA DSpark ring cannot be enabled, or None."""
     from sglang.srt.speculative.ragged_verify import (
         RaggedVerifyMode,
         read_ragged_verify_mode,
     )
+
+    if draft_backend != "triton":
+        return "the DSpark draft KV ring runs only on ROCm's Triton draft backend"
+    if enable_unified_memory:
+        return "--enable-unified-memory places the draft KV in the target's pool"
 
     # Only the static verify path writes draft KV through the ring; the ragged
     # (compact, cap-accept) injector writes by pool ids.

@@ -11,9 +11,17 @@ import torch
 from sglang.kernels.ops.attention.dspark_ring_window_hip import (
     fill_dspark_ring_window_buffer_hip,
 )
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
     draft_kv_ring_rows_per_req,
+)
+from sglang.srt.speculative.dspark_components.dspark_draft_ring_hip import (
+    resolve_rocm_dspark_draft_kv_ring,
+    rocm_dspark_gqa_ring_unsupported_reason,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -29,6 +37,16 @@ register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd-mi35x")
 pytestmark = pytest.mark.skipif(not is_hip(), reason="ROCm-only draft KV ring")
 
 POOL, WINDOW, BLOCK = 16, 64, 6
+GQA_DRAFT = SimpleNamespace(
+    layer_types=["sliding_attention"] * 5,
+    sliding_window=2048,
+    num_hidden_layers=5,
+    dflash_config={
+        "mask_token_id": 163839,
+        "target_layer_ids": [75, 79, 83, 87, 91],
+        "aux_hidden_stream": "prefix",
+    },
+)
 
 
 def _value(slots: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -139,6 +157,86 @@ def test_window_reads_what_the_dspark_worker_wrote():
         read = kv[indices[indptr[b] : indptr[b + 1]]]
         expected = _value(slots[b].expand(positions.numel()), positions)
         assert torch.equal(read, expected)
+
+
+def test_gqa_ring_pool_page_size_is_not_widened_by_target_dcp():
+    """A private GQA ring must use the page width charged by its target."""
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+    configurator = object.__new__(KVCacheConfigurator)
+    configurator.is_draft_worker = True
+    configurator.use_mla_backend = False
+    configurator.model_config = SimpleNamespace(hf_config=GQA_DRAFT)
+    for ring_enabled, expected_scale in ((False, 8), (True, 1)):
+        with (
+            get_context().override_server_args(
+                tp_size=8,
+                dcp_size=8,
+                page_size=16,
+                speculative_dflash_draft_kv_ring=ring_enabled,
+            ),
+            get_parallel().override(attn_dcp_size=8),
+        ):
+            assert configurator.loc_space_scale == expected_scale
+            assert configurator.pool_page_size == 16 * expected_scale
+
+
+def _reason(**overrides):
+    kwargs = dict(
+        draft_backend="triton", disaggregation_mode="null", draft_window_size=None
+    )
+    kwargs.update(overrides)
+    return rocm_dspark_gqa_ring_unsupported_reason(lambda: GQA_DRAFT, **kwargs)
+
+
+def test_triton_gqa_ring_is_allowed():
+    assert _reason() is None
+
+
+def test_ring_is_rejected_where_it_has_no_reader_or_writer():
+    """Only ROCm's Triton draft backend reads the ring, PD does not send it, and
+    unified memory puts the draft KV in the target's pool."""
+    for overrides in (
+        dict(draft_backend="aiter"),
+        dict(draft_backend="flashinfer"),
+        dict(disaggregation_mode="prefill"),
+        dict(enable_unified_memory=True),
+        dict(draft_window_size=2048),
+    ):
+        assert _reason(**overrides) is not None, overrides
+
+
+def test_ring_needs_static_ragged_verify():
+    """Compact and cap-accept verify inject draft KV by pool ids, not ring rows."""
+    for mode in ("compact", "cap-accept"):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
+            assert "SGLANG_RAGGED_VERIFY_MODE" in _reason()
+
+
+def _resolve(*, dspark, dflash=False):
+    args = ServerArgs(
+        model_path="dummy",
+        speculative_algorithm="DSPARK",
+        speculative_draft_model_path="draft",
+        speculative_num_draft_tokens=8,
+        speculative_draft_attention_backend="triton",
+        dcp_size=8,
+    )
+    with (
+        envs.SGLANG_ENABLE_DSPARK_DRAFT_KV_RING.override(dspark),
+        envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING.override(dflash),
+    ):
+        resolve_rocm_dspark_draft_kv_ring(args, lambda cfg: GQA_DRAFT)
+    return resolution_result(args, "speculative_dflash_draft_kv_ring")
+
+
+def test_dspark_switch_turns_the_ring_on():
+    assert _resolve(dspark=True)
+
+
+def test_dflash_switch_alone_leaves_the_dspark_ring_off():
+    """The DFLASH ring switch must not turn on the DSpark ring."""
+    assert not _resolve(dspark=False, dflash=True)
 
 
 if __name__ == "__main__":

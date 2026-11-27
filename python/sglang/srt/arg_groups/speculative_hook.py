@@ -885,7 +885,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
     if current_platform.is_rocm():
-        _resolve_dflash_draft_kv_ring(server_args, is_dspark=True)
+        from sglang.srt.speculative.dspark_components.dspark_draft_ring_hip import (
+            resolve_rocm_dspark_draft_kv_ring,
+        )
+
+        resolve_rocm_dspark_draft_kv_ring(server_args, _load_draft_hf_config)
 
     from sglang.srt.speculative.ragged_verify import (
         RaggedVerifyMode,
@@ -1115,9 +1119,7 @@ def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
         )
 
 
-def _resolve_dflash_draft_kv_ring(
-    server_args: ServerArgs, *, is_dspark: bool = False
-) -> None:
+def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
     """Runs after the draft backend is final, which it reads."""
     from sglang.srt.speculative.dflash_draft_ring import (
         draft_kv_ring_unsupported_reason,
@@ -1140,8 +1142,6 @@ def _resolve_dflash_draft_kv_ring(
         enable_dp_attention=attn_dp_enabled_of(cfg),
         draft_window_size=cfg.speculative_draft_window_size,
         is_cuda=current_platform.is_cuda(),
-        is_hip=current_platform.is_rocm(),
-        is_dspark=is_dspark,
     )
     if reason is not None:
         raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
