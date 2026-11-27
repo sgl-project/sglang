@@ -233,6 +233,7 @@ def _cache_for_wrapper(**kwargs):
         "pp_size": 1,
         "pp_group": None,
         "metrics_collector": None,
+        "token_to_kv_pool_allocator": None,
     }
     defaults.update(kwargs)
     # The stand-in's window slots, as a tree with these slots reports them.
@@ -844,6 +845,7 @@ def test_cache_linker_attachment_is_backend_independent():
     cache.tree_components = (ComponentType.FULL,)
     index_slots(cache, cache.tree_components)
     cache.linker = None
+    cache.token_to_kv_pool_allocator = None
     cache._components_tuple = ()
     cache.components = {}
     index_slots(cache, cache.components)
@@ -2643,9 +2645,10 @@ class TestTransferReadyEvents(CustomTestCase):
         linker.stats = {"offload": 1}
         linker.offload_results = queue.Queue()
         linker.offload_queue = queue.Queue()
+        transfer = PoolTransfer(name=PoolName.KV, keys=["k"])
         linker.offload_queue.put(
             (
-                ["transfer"],
+                [transfer],
                 1,
                 TransferReady(order.indices_ready, order.forward_done),
                 "session-a",
@@ -2659,7 +2662,7 @@ class TestTransferReadyEvents(CustomTestCase):
                 call.indices_ready.synchronize(),
                 call.forward_done.synchronize(),
                 call.storage.batch_set_v2(
-                    ["transfer"],
+                    [transfer],
                     HiCacheStorageExtraInfo(extra_info={"session_id": "session-a"}),
                 ),
             ],

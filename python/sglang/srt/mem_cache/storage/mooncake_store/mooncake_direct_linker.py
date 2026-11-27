@@ -43,12 +43,14 @@ MAX_RANGES_PER_READ = 4096
 
 
 def _storage_suffix(
-    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
+    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int | None, pp_rank: int
 ) -> str:
     parts = []
     if not rank_replicated:
         parts.append(f"tp{tp_rank}")
-    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
+    if attn_cp_rank is not None:
+        parts.append(f"cp{attn_cp_rank}")
+    parts.append(f"pp{pp_rank}")
     return "_".join(parts)
 
 
@@ -59,7 +61,7 @@ def _shared_pool_suffix(
     *,
     tp_shared: bool,
     tp_rank: int,
-    attn_cp_rank: int,
+    attn_cp_rank: int | None,
     pp_rank: int,
     dcp_sharded: bool,
     dcp_size: int,
@@ -70,7 +72,9 @@ def _shared_pool_suffix(
     parts = ["tpshared_v1" if tp_shared else f"tp{tp_rank}"]
     if dcp_sharded:
         parts.append(f"dcp{dcp_size}r{dcp_rank}")
-    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
+    if attn_cp_rank is not None:
+        parts.append(f"cp{attn_cp_rank}")
+    parts.append(f"pp{pp_rank}")
     return "_".join(parts)
 
 
@@ -80,7 +84,7 @@ def _storage_sharing(
     rank_replicated: bool,
     tp_rank: int,
     tp_size: int,
-    attn_cp_rank: int,
+    attn_cp_rank: int | None,
     pp_rank: int,
     offload_owner: bool,
     dcp_size: int,
@@ -183,10 +187,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage = storage
         self.storage.mem_pool_host = self.pool_group
         self.storage.registered_pools = self.pools
+        # A page-interleaved page has one owner rank, and a load may place it
+        # on another CP rank than the one that offloaded it.
+        key_cp_rank = (
+            None
+            if any(pool.placement is not None for pool in self.pools.values())
+            else params.attn_cp_rank
+        )
         storage_suffix = _storage_suffix(
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
-            attn_cp_rank=params.attn_cp_rank,
+            attn_cp_rank=key_cp_rank,
             pp_rank=params.pp_rank,
         )
         self.storage.mla_suffix = storage_suffix
@@ -196,7 +207,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
             tp_size=tp_size,
-            attn_cp_rank=params.attn_cp_rank,
+            attn_cp_rank=key_cp_rank,
             pp_rank=params.pp_rank,
             offload_owner=self.offload_owner,
             dcp_size=get_parallel().attn_dcp_size,
@@ -679,7 +690,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if session_id
                     else None
                 )
-                results = self.storage.batch_set_v2(expanded, extra_info)
+                # A shard rank may own none of the pages; it still ACKs in order.
+                expanded = [transfer for transfer in expanded if transfer.keys]
+                results = (
+                    self.storage.batch_set_v2(expanded, extra_info) if expanded else {}
+                )
                 success = all(all(pool_results) for pool_results in results.values())
                 if success:
                     self.stats["offload"] += 1
