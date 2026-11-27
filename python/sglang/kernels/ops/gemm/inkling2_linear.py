@@ -3,7 +3,10 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.gemm.sm12x_bf16_gemv import b12x_bf16_gemv
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -247,6 +250,24 @@ def uses_k_groups(
     )
 
 
+def _uses_sm120_gemv(x, weight, bias, out_dtype) -> bool:
+    # cuBLAS on SM120 leaves its GEMV for a 16x16 WMMA tile kernel at 2+ rows
+    # (2304->32 BF16: 15 us on RTX PRO 6000); b12x's SIMT GEMV stays under 5.5 us
+    # up to 16 rows. At 17-32 rows it takes 0.54-0.66x cuBLAS's time on 2304->32
+    # but 0.89-1.60x on 2304->128 (RTX PRO 6000, RTX 5090).
+    max_rows = 32 if weight.shape[0] <= 32 else 16
+    return (
+        bias is None
+        and x.is_cuda
+        and x.dtype == weight.dtype == torch.bfloat16
+        and out_dtype in (torch.bfloat16, torch.float32)
+        and weight.shape[0] <= 1024 <= weight.shape[1] == x.shape[-1]
+        and 0 < x.numel() // x.shape[-1] <= max_rows
+        and current_arch().is_sm(12)
+        and not is_batch_invariant_mode_enabled()
+    )
+
+
 def linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -255,6 +276,13 @@ def linear(
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     out_dtype = out_dtype or x.dtype
+    if _uses_sm120_gemv(x, weight, bias, out_dtype):
+        flat = x.reshape(-1, x.shape[-1])
+        out = torch.empty(
+            (flat.shape[0], weight.shape[0]), device=x.device, dtype=out_dtype
+        )
+        b12x_bf16_gemv(x=flat, weight=weight, out=out)
+        return out.view(*x.shape[:-1], weight.shape[0])
     if uses_k_groups(x, weight):
         flat = x.reshape(-1, x.shape[-1])
         out = torch.empty(

@@ -774,6 +774,53 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertEqual(canonical, messages)
 
+    def test_jinja_text_tool_result_order_follows_model_not_parser(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        cases = (
+            ("gigachat4", None, ["call-a", "call-b"]),
+            ("gigachat4", "gigachat4", ["call-a", "call-b"]),
+            ("gigachat3_5", None, ["call-b", "call-a"]),
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Compare both results."},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": call_id, "arguments": "{}"},
+                        }
+                        for call_id in ("call-a", "call-b")
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-b", "content": "result-b"},
+                {"role": "tool", "tool_call_id": "call-a", "content": "result-a"},
+            ],
+        )
+        self.tm.tokenizer.apply_chat_template.return_value = "rendered"
+        for model_type, parser, expected_order in cases:
+            with self.subTest(model_type=model_type, parser=parser):
+                self.tm.model_config.hf_config.model_type = model_type
+                self.tm.server_args.tool_call_parser = parser
+                chat = OpenAIServingChat(self.tm, self.template_manager)
+
+                chat._apply_jinja_template(request, None, is_multimodal=False)
+
+                rendered = self.tm.tokenizer.apply_chat_template.call_args[0][0]
+                self.assertEqual(
+                    [m["tool_call_id"] for m in rendered if m["role"] == "tool"],
+                    expected_order,
+                )
+                self.assertEqual(
+                    [m.tool_call_id for m in request.messages if m.role == "tool"],
+                    ["call-b", "call-a"],
+                )
+
     def test_jinja_path_recovers_tool_result_images_only_when_template_needs_it(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "openai"
@@ -4728,6 +4775,53 @@ class ServingChatTestCase(CustomTestCase):
         ]
         self.assertEqual(tokens, ["b", "c"])
         self.assertEqual(alternatives, [["b", "y"], ["c", "z"]])
+
+    def test_gigachat4_reasoning_mode_follows_each_request(self):
+        self.chat.reasoning_parser = "gigachat4"
+        self.chat._reasoning_detector = ReasoningParser("gigachat4").detector
+        for enabled in (True, False, True):
+            text = (
+                "Thought</think>\n\nAnswer."
+                if enabled
+                else "Answer mentioning <think>literally</think>."
+            )
+            expected = ("Thought", "\n\nAnswer.") if enabled else ("", text)
+            request = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                chat_template_kwargs={"reasoning": enabled},
+                separate_reasoning=True,
+            )
+            self.assertEqual(self.chat._get_reasoning_from_request(request), enabled)
+            self.assertEqual(
+                ReasoningParser(
+                    "gigachat4",
+                    force_reasoning=self.chat._get_reasoning_from_request(request),
+                    request=request,
+                ).parse_non_stream(text),
+                expected,
+            )
+            for chunks in ([text], list(text)):
+                with self.subTest(reasoning=enabled, chunks=chunks):
+                    parsers = {}
+                    results = [
+                        self.chat._process_reasoning_stream(
+                            0, chunk, parsers, {}, request
+                        )
+                        for chunk in chunks
+                    ]
+                    results.append(
+                        self.chat._process_reasoning_stream(
+                            0, "", parsers, {}, request, finish_reason_type="stop"
+                        )
+                    )
+                    self.assertEqual(
+                        tuple(
+                            "".join(result[i] or "" for result in results)
+                            for i in (0, 1)
+                        ),
+                        expected,
+                    )
 
     def test_streaming_logprobs_attached_with_reasoning_parser(self):
         """Logprobs must ride on the reasoning chunk when a reasoning parser is active."""

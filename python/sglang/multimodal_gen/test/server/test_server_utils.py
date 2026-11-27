@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import math
 import os
 import re
@@ -15,14 +16,16 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 import pytest
 from openai import Client
+from PIL import Image
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -60,6 +63,9 @@ from sglang.multimodal_gen.test.test_utils import (
     validate_video_file,
 )
 from sglang.test.test_utils import ADMIN_LAUNCH_ARGS_FOR_TEST
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.test.server.common.gpu_headroom import GpuHeadroomSampler
 
 logger = init_logger(__name__)
 
@@ -191,6 +197,14 @@ class ServerContext:
     _stdout_fh: Any = field(repr=False)
     _log_thread: threading.Thread | None = field(default=None, repr=False)
     load_time_ms: float | None = None
+    load_finished_ns: int | None = None
+    server_ready_ns: int | None = None
+    headroom_sampler: GpuHeadroomSampler | None = None
+
+    def minimum_free_vram(self) -> dict[str, list[float]]:
+        assert self.headroom_sampler is not None, "GPU headroom sampler missing"
+        assert self.load_finished_ns is not None and self.server_ready_ns is not None
+        return self.headroom_sampler.minima(self.load_finished_ns, self.server_ready_ns)
 
     def log_tail(self, lines: int = 200) -> str:
         """Return recent server output for failure diagnostics."""
@@ -491,9 +505,11 @@ class ServerManager:
         )
         try:
             self._wait_for_ready(process, stdout_path)
+            context.server_ready_ns = time.monotonic_ns()
             # health includes warmup; the worker marker's clock excludes it
             load_ready.wait(timeout=5)
             if load_finished_ns is not None:
+                context.load_finished_ns = load_finished_ns
                 context.load_time_ms = (load_finished_ns - load_started_ns) / 1e6
         except BaseException:
             context.cleanup()
@@ -617,14 +633,30 @@ class PerformanceValidator:
     ) -> None:
         assert summary.load_peak_vram_mb > 0, "Load peak VRAM metric missing"
         assert summary.runtime_peak_vram_mb > 0, "Runtime peak VRAM metric missing"
-        self._assert_peak_vram(
-            "Load Peak VRAM",
-            reserved=summary.load_peak_vram_mb,
-            allocated=summary.load_peak_allocated_mb,
-            expected_reserved=expected_load_peak_vram_mb,
-            expected_allocated=expected_load_peak_allocated_mb,
-            tolerance=self.tolerances.load_peak_vram,
-        )
+        floors = self.scenario.min_free_vram_mb
+        if floors is None:
+            self._assert_peak_vram(
+                "Load Peak VRAM",
+                reserved=summary.load_peak_vram_mb,
+                allocated=summary.load_peak_allocated_mb,
+                expected_reserved=expected_load_peak_vram_mb,
+                expected_allocated=expected_load_peak_allocated_mb,
+                tolerance=self.tolerances.load_peak_vram,
+            )
+        else:
+            # auto placement may keep more weights resident to reduce request time
+            assert {"load", "serving"} <= floors.keys(), (
+                "Missing load or serving GPU headroom floor"
+            )
+            minima = summary.min_free_vram_mb
+            for phase, floor in floors.items():
+                assert math.isfinite(floor) and floor > 0, (
+                    f"Invalid {phase} GPU headroom floor"
+                )
+                assert phase in minima, f"Missing {phase} GPU headroom measurement"
+                assert minima[phase] >= floor, (
+                    f"{phase} minimum free VRAM: {minima[phase]:.0f} MiB, need {floor:.0f} MiB"
+                )
         self._assert_peak_vram(
             "Runtime Peak VRAM",
             reserved=summary.runtime_peak_vram_mb,
@@ -1342,34 +1374,28 @@ def get_generate_fn(
             pytest.skip(f"{case_id}: no edit config")
 
         image_paths = sampling_params.image_path
-
         if not isinstance(image_paths, list):
             image_paths = [image_paths]
 
-        new_image_paths = []
-        for image_path in image_paths:
-            if is_image_url(image_path):
-                new_image_paths.append(download_image_from_url(str(image_path)))
+        extra_body = {
+            "num_frames": sampling_params.num_frames,
+            **sampling_params.extras,
+        }
+        with ExitStack() as stack:
+            images = []
+            if sampling_params.direct_url_test:
+                for url in image_paths:
+                    assert is_image_url(url), (
+                        f"{case_id}: expected an image URL, got {url}"
+                    )
+                extra_body["url"] = image_paths
             else:
-                local_path = Path(image_path)
-                new_image_paths.append(local_path)
-                if not local_path.exists():
-                    pytest.skip(f"{case_id}: file missing: {image_path}")
-
-        image_paths = new_image_paths
-
-        # Request parameters that affect output format
-        req_output_format = (
-            sampling_params.output_format
-        )  # Not specified in current request
-        req_background = None  # Not specified in current request
-
-        # Build extra_body for optional features
-        extra_body = {"num_frames": sampling_params.num_frames}
-        extra_body.update(sampling_params.extras)
-
-        images = [open(image_path, "rb") for image_path in image_paths]
-        try:
+                for path in image_paths:
+                    if is_image_url(path):
+                        path = download_image_from_url(str(path))
+                    if not Path(path).exists():
+                        pytest.skip(f"{case_id}: file missing: {path}")
+                    images.append(stack.enter_context(open(path, "rb")))
             response = client.images.with_raw_response.edit(
                 model=model_path,
                 image=images,
@@ -1377,21 +1403,29 @@ def get_generate_fn(
                 n=n,
                 size=output_size,
                 response_format="b64_json",
-                output_format=req_output_format,
+                output_format=sampling_params.output_format,
                 extra_body=extra_body,
             )
-        finally:
-            for img in images:
-                img.close()
 
         result = response.parse()
+        if sampling_params.expect_rgba_layers:
+            expected = n * sampling_params.num_frames
+            assert len(result.data) == expected, (
+                f"{case_id}: expected {expected} layers, got {len(result.data)}"
+            )
+            for index, item in enumerate(result.data):
+                with Image.open(io.BytesIO(base64.b64decode(item.b64_json))) as layer:
+                    assert (layer.format, layer.mode) == ("PNG", "RGBA"), (
+                        f"{case_id}: layer {index} is {layer.format}/{layer.mode}"
+                    )
+                    layer.load()
         validate_image(result.data[0].b64_json)
 
         img_data = base64.b64decode(result.data[0].b64_json)
         rid = result.id
 
         # Infer expected format from request parameters
-        expected_ext = get_expected_image_format(req_output_format, req_background)
+        expected_ext = get_expected_image_format(sampling_params.output_format, None)
         expected_filename = f"{rid}.{expected_ext}"
         tmp_path = expected_filename
         with open(tmp_path, "wb") as f:
@@ -1404,8 +1438,7 @@ def get_generate_fn(
             expected_filename,
             expected_width,
             expected_height,
-            output_format=req_output_format,
-            background=req_background,
+            output_format=sampling_params.output_format,
         )
 
         upload_file_to_slack(
@@ -1414,75 +1447,6 @@ def get_generate_fn(
             prompt=sampling_params.prompt,
             file_path=tmp_path,
             origin_file_path=sampling_params.image_path,
-        )
-        os.remove(tmp_path)
-
-        return (rid, img_data)
-
-    def generate_image_edit_url(case_id, client) -> tuple[str, bytes]:
-        """TI2I: Text + Image ? Image edit using direct URL transfer (no pre-download)."""
-        if not sampling_params.prompt or not sampling_params.image_path:
-            pytest.skip(f"{case_id}: no edit config")
-        # Handle both single URL and list of URLs
-        image_urls = sampling_params.image_path
-        if not isinstance(image_urls, list):
-            image_urls = [image_urls]
-
-        # Validate all URLs
-        for url in image_urls:
-            if not is_image_url(url):
-                pytest.skip(
-                    f"{case_id}: image_path must be a URL for URL direct test: {url}"
-                )
-
-        # Request parameters that affect output format
-        req_output_format = (
-            sampling_params.output_format
-        )  # Not specified in current request
-        req_background = None  # Not specified in current request
-
-        response = client.images.with_raw_response.edit(
-            model=model_path,
-            prompt=sampling_params.prompt,
-            image=[],  # Only for OpenAI verification
-            n=n,
-            size=sampling_params.output_size,
-            response_format="b64_json",
-            output_format=req_output_format,
-            extra_body={"url": image_urls, "num_frames": sampling_params.num_frames},
-        )
-
-        result = response.parse()
-        rid = result.id
-
-        validate_image(result.data[0].b64_json)
-
-        # Save and upload result for verification
-        img_data = base64.b64decode(result.data[0].b64_json)
-        # Infer expected format from request parameters
-        expected_ext = get_expected_image_format(req_output_format, req_background)
-        expected_filename = f"{rid}.{expected_ext}"
-        tmp_path = expected_filename
-        with open(tmp_path, "wb") as f:
-            f.write(img_data)
-
-        # Validate output file
-        expected_width, expected_height = parse_dimensions(sampling_params.output_size)
-        validate_image_file(
-            tmp_path,
-            expected_filename,
-            expected_width,
-            expected_height,
-            output_format=req_output_format,
-            background=req_background,
-        )
-
-        upload_file_to_slack(
-            case_id=case_id,
-            model=model_path,
-            prompt=sampling_params.prompt,
-            file_path=tmp_path,
-            origin_file_path=str(sampling_params.image_path),
         )
         os.remove(tmp_path)
 
@@ -1880,10 +1844,7 @@ def get_generate_fn(
         else:
             fn = generate_video
     elif sampling_params.prompt and sampling_params.image_path:
-        if getattr(sampling_params, "direct_url_test", False):
-            fn = generate_image_edit_url
-        else:
-            fn = generate_image_edit
+        fn = generate_image_edit
     else:
         fn = generate_image
 
