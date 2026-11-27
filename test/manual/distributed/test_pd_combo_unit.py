@@ -20,8 +20,9 @@ from sglang.srt.arg_groups.pd_disaggregation_hook import (
     logger as pd_logger,
 )
 from sglang.srt.arg_groups.serving_hook import handle_load_balance_method
+from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.runtime_context import get_context, get_server_args
+from sglang.srt.runtime_context import get_context, get_server_args, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
@@ -38,6 +39,14 @@ def _make_pd_args(**overrides):
     return args
 
 
+def _make_spec_pd_args(**overrides):
+    """PD validation + speculative hook (radix+spec rules live there)."""
+    args = ServerArgs(model_path="dummy", **overrides)
+    handle_pd_disaggregation(args)
+    handle_speculative_decoding(args)
+    return args
+
+
 def _make_load_balance_args(**overrides):
     """Build ServerArgs with PD + load-balance resolution."""
     args = ServerArgs(model_path="dummy", **overrides)
@@ -48,6 +57,8 @@ def _make_load_balance_args(**overrides):
 
 def _make_server_checks_args(**overrides):
     """Run product ``check_server_args`` (chunked-prefill divisibility)."""
+    # served_model_name must be non-None: check_server_args does ``":" not in name``.
+    overrides.setdefault("served_model_name", "dummy")
     args = ServerArgs(model_path="dummy", **overrides)
     args.check_server_args()
     return args
@@ -70,6 +81,7 @@ def _make_unified_memory_args(**overrides):
 
 def _install_override(**fields):
     """Install a scoped ServerArgs override on the runtime context."""
+    reset_context()
     override = get_context().override_server_args(**fields)
     override.install()
     return override
@@ -84,24 +96,25 @@ class TestPDSpeculativeCombos(CustomTestCase):
     """Validate PD disaggregation + speculative / MTP server-args rules."""
 
     def test_pd_decode_radix_cache_rejects_speculative(self):
-        """PD decode + radix cache + speculative algorithm must raise."""
+        """PD decode + radix cache rejects non-allowlisted speculative algos."""
+        # EAGLE/EAGLE3/DFLASH/DSPARK are allowlisted; NGRAM/UNO still raise.
         with self.assertRaises(ValueError) as ctx:
-            _make_pd_args(
+            _make_spec_pd_args(
                 disaggregation_mode="decode",
                 disaggregation_decode_enable_radix_cache=True,
                 disaggregation_transfer_backend="nixl",
-                speculative_algorithm="EAGLE",
+                speculative_algorithm="NGRAM",
             )
         self.assertIn("speculative decoding", str(ctx.exception))
 
     def test_pd_decode_radix_cache_rejects_mtp(self):
-        """PD decode + radix cache + NEXTN (MTP) must also raise."""
+        """PD decode + radix cache + UNO must also raise."""
         with self.assertRaises(ValueError) as ctx:
-            _make_pd_args(
+            _make_spec_pd_args(
                 disaggregation_mode="decode",
                 disaggregation_decode_enable_radix_cache=True,
                 disaggregation_transfer_backend="mooncake",
-                speculative_algorithm="NEXTN",
+                speculative_algorithm="UNO",
             )
         self.assertIn("speculative decoding", str(ctx.exception))
 
@@ -187,7 +200,8 @@ class TestPDPrefixCacheCombos(CustomTestCase):
                 disaggregation_mode="decode",
                 disaggregation_decode_enable_radix_cache=True,
                 disaggregation_transfer_backend="mooncake",
-                enable_dp_attention=True,
+                # attn_dp_enabled_of() keys off attn_dp_size > 1
+                attn_dp_size=2,
             )
         joined = "\n".join(logs.output)
         self.assertIn("EXPERIMENTAL", joined)
@@ -270,8 +284,14 @@ class TestPDCudaGraphRoles(CustomTestCase):
         self.assertEqual(cfg.prefill.backend, Backend.DISABLED)
 
     def test_non_pd_keeps_both_cuda_graphs(self):
-        """Non-PD mode keeps both CUDA graph phases enabled (default)."""
-        args = _make_cuda_graph_args(disaggregation_mode="null")
+        """Non-PD mode does not force-disable either phase when both are set."""
+        # Prefill defaults to disabled; pin both backends so the role hook
+        # is the only thing that could clear them.
+        args = _make_cuda_graph_args(
+            disaggregation_mode="null",
+            cuda_graph_backend_prefill="full",
+            cuda_graph_backend_decode="full",
+        )
         cfg = resolution_result(args, "cuda_graph_config", default=args.cuda_graph_config)
         self.assertNotEqual(cfg.decode.backend, Backend.DISABLED)
         self.assertNotEqual(cfg.prefill.backend, Backend.DISABLED)
@@ -287,13 +307,14 @@ class TestPDDcpCombos(CustomTestCase):
 
     def test_pd_decode_dcp_requires_supported_backend(self):
         """PD decode DCP rejects unsupported transfer backends."""
+        # mooncake/nixl/mori/ascend/fake are allowlisted; anything else raises.
         with self.assertRaises(ValueError) as ctx:
             _make_pd_args(
                 disaggregation_mode="decode",
-                disaggregation_transfer_backend="mori",
+                disaggregation_transfer_backend="libfabric",
                 dcp_size=4,
             )
-        self.assertIn("mooncake, nixl, ascend, or fake", str(ctx.exception))
+        self.assertIn("mooncake, nixl, mori, ascend, or fake", str(ctx.exception))
 
     def test_pd_decode_dcp_disables_radix_cache_by_default(self):
         """PD decode DCP without radix flag resolves disable_radix_cache=True."""
@@ -514,9 +535,10 @@ class TestPDComboRuntimeContextOverride(CustomTestCase):
         )
         self.addCleanup(override.restore)
 
-        self.assertEqual(get_server_args().disaggregation_mode, "decode")
+        args = get_server_args()
+        self.assertEqual(resolution_result(args, "disaggregation_mode"), "decode")
         self.assertEqual(
-            get_server_args().disaggregation_transfer_backend, "nixl"
+            resolution_result(args, "disaggregation_transfer_backend"), "nixl"
         )
 
     def test_override_speculative_algorithm_propagates(self):
@@ -525,7 +547,9 @@ class TestPDComboRuntimeContextOverride(CustomTestCase):
         )
         self.addCleanup(override.restore)
 
-        self.assertEqual(get_server_args().speculative_algorithm, "EAGLE")
+        self.assertEqual(
+            resolution_result(get_server_args(), "speculative_algorithm"), "EAGLE"
+        )
 
     def test_override_chunked_prefill_size_propagates(self):
         override = _install_override(
@@ -533,7 +557,9 @@ class TestPDComboRuntimeContextOverride(CustomTestCase):
         )
         self.addCleanup(override.restore)
 
-        self.assertEqual(get_server_args().chunked_prefill_size, 8192)
+        self.assertEqual(
+            resolution_result(get_server_args(), "chunked_prefill_size"), 8192
+        )
 
 
 if __name__ == "__main__":
