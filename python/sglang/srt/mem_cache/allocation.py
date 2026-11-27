@@ -653,16 +653,28 @@ def alloc_paged_token_slots_decode(
     req_to_token_write: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
-    out_cache_loc = _storage(tree_cache).take_decode(
-        rows=req_pool_indices,
-        seq_lens=seq_lens,
-        seq_lens_cpu=seq_lens_cpu,
-        last_loc=last_loc,
-        make_room=_room_in(tree_cache),
-        req_to_token_write=req_to_token_write,
-        tree_cache=tree_cache,
-        batch=batch,
-    )
+    reserved = getattr(batch, "write_back_overlap_pages", None)
+    if reserved is not None:
+        # Reserved pages are not part of the free list. The forward owning this
+        # allocation waits at each Full KV layer's first store.
+        out_cache_loc = tree_cache.token_to_kv_pool_allocator.alloc_decode(
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            req_to_token_write=req_to_token_write,
+            reserved_pages=reserved if isinstance(reserved, torch.Tensor) else None,
+        )
+    else:
+        out_cache_loc = _storage(tree_cache).take_decode(
+            rows=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+            make_room=_room_in(tree_cache),
+            req_to_token_write=req_to_token_write,
+            tree_cache=tree_cache,
+            batch=batch,
+        )
 
     if out_cache_loc is None:
         error_msg = (

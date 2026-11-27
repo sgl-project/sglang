@@ -46,7 +46,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import get_exec, get_memory, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.eagle_utils import draft_step_writes
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -354,6 +354,19 @@ class TritonAttnBackend(AttentionBackend):
         # BLOCK_M for Lean partial-result buffers; kept as an attribute so the
         # cuda-graph / eager buffer allocators (separate methods) can size them.
         self.lean_block_m = _LEAN_BLOCK_M
+        self.write_back_fences = None
+        if (
+            envs.SGLANG_HICACHE_WRITE_BACK_OVERLAP.get()
+            and not self.use_mla
+            and get_memory().enable_hierarchical_cache
+            and get_memory().hicache_write_policy == "write_back"
+            and torch.device(self.device).type == "cuda"
+        ):
+            from sglang.srt.mem_cache.hybrid_cache.write_back_overlap import (
+                WriteBackFences,
+            )
+
+            self.write_back_fences = WriteBackFences()
         self.static_kv_splits = envs.SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS.get()
         self.max_kv_splits = get_exec().kernel.triton_attention_num_kv_splits
         if self.use_mla and not _is_xpu:
@@ -1723,6 +1736,11 @@ class TritonAttnBackend(AttentionBackend):
             return output, lse
         return output
 
+    def get_decode_graph_variants(self, capture_forward_mode, captured_req_width):
+        if capture_forward_mode.is_decode() and captured_req_width == 1:
+            return self.write_back_fences
+        return None
+
     def _set_kv_buffer(
         self,
         forward_batch: ForwardBatch,
@@ -1753,6 +1771,11 @@ class TritonAttnBackend(AttentionBackend):
         else:
             loc = loc_info
             kwargs = {}
+        if (
+            self.write_back_fences is not None
+            and forward_batch.forward_mode.is_decode()
+        ):
+            self.write_back_fences.wait_before_store(layer.layer_id)
         if k_scale is None and v_scale is None:
             self.kv_layers.layer(layer.layer_id).store(layer, loc, k, v, **kwargs)
         else:

@@ -379,6 +379,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
+        self.write_back_overlap = None
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
         # Host backups of restores whose host-to-device copies may still be in
         # flight, each with its copy's finish event; their host slots are
@@ -505,6 +506,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if self.write_back_overlap is not None:
+            self.writing_check(write_back=True)
+            self.write_back_overlap.staged.clear()
         # In-flight restores still read their host slots; finish them first.
         self._discard_restore_backups()
         self.tree_core.reset()
@@ -1186,6 +1190,8 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> Optional[BackupKV]:
         """Evict one device leaf, consuming its step result; returns the
         deferred write-back BackupKV when one must run before the demote."""
+        if self.write_back_overlap is not None:
+            self.write_back_overlap.staged.pop(node_id, None)
         result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
         self._apply_eviction_result(result)
         if self._tracks_write_through_unbacked_evictions():
@@ -1198,6 +1204,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _demote(self, node_id: NodeId, tracker: dict[ComponentType, int]) -> None:
         """Demote a backed-up node, consuming its step result."""
+        if self.write_back_overlap is not None:
+            self.write_back_overlap.staged.pop(node_id, None)
         result = self.tree_core.demote(node_id)
         self._apply_eviction_result(result)
         self._accumulate_tracker(tracker, result.tracker)
@@ -1206,6 +1214,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self, node_id: NodeId, tracker: dict[ComponentType, int]
     ) -> bool:
         """Run the write-back drop fallback, consuming its step result."""
+        if self.write_back_overlap is not None:
+            self.write_back_overlap.staged.pop(node_id, None)
         result = self.tree_core.drop_subtree_no_host(node_id)
         self._apply_eviction_result(result)
         if result.is_dropped:
@@ -1533,6 +1543,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if lock is None:
             return
         self.dec_lock_ref(lock.node, lock.receipt, skip_swa=lock.swa_released)
+        if self.write_back_overlap is not None:
+            self.write_back_overlap.stage(lock.node)
 
     def release_swa(self, lock: Optional[TreeLock]) -> None:
         """Release the SWA part of ``lock`` early, once."""
@@ -2430,6 +2442,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.tree_core.finish_write_through(publish_node_ids, ack_id)
         if lock_params is not None:
             self.dec_lock_ref(lock_node_id, lock_params)
+        if self.write_back_overlap is not None:
+            self.write_back_overlap.finish(ack_id)
         if self.enable_storage:
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
@@ -4444,6 +4458,9 @@ class UnifiedRadixCache(BasePrefixCache):
         return get_shm_exchange(group, "hicache", multihost=True)
 
     def _can_fence_write_back_on_streams(self) -> bool:
+        overlap = self.write_back_overlap
+        if overlap is not None and (overlap.pending or overlap.background):
+            return False
         # Freed slots must only be rewritten in current/forward/load stream
         # order, and host pages must not be read by the CPU before their copy lands.
         cc = self.cache_controller
@@ -4495,6 +4512,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self._log_fenced_write_acks()
 
         if write_back:
+            if self.write_back_overlap is not None:
+                self.write_back_overlap.submit_background(drain=True)
             # Blocking: submit what is still queued, then wait for every ack.
             cc.start_writing()
             while self.ongoing_write_through:
@@ -5031,7 +5050,9 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.full_evictable_size()
 
     def full_protected_size(self) -> int:
-        return self.tree_core.full_protected_size() + (
+        overlap = self.write_back_overlap
+        leased = overlap.protected_size(ComponentType.FULL) if overlap is not None else 0
+        return leased + self.tree_core.full_protected_size() + (
             self.linker.prefetch_size(PoolName.KV) if self.linker is not None else 0
         )
 
@@ -5057,7 +5078,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def mamba_protected_size(self) -> int:
-        return self.tree_core.mamba_protected_size() + (
+        overlap = self.write_back_overlap
+        leased = overlap.protected_size(self.slot_id(TREE_STATE)) if overlap is not None else 0
+        return leased + self.tree_core.mamba_protected_size() + (
             self.linker.prefetch_size(PoolName.MAMBA) if self.linker is not None else 0
         )
 
