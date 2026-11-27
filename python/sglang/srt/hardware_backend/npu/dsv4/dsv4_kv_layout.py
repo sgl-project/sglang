@@ -115,28 +115,3 @@ class NPUDSV4KVLayout(str, enum.Enum):
 # outside the class body — a tuple there would be unpacked into str.__new__
 # during member creation.
 NPUDSV4KVLayout.COMPRESSED_RATIOS = (1, 2)
-
-
-def resolve_npu_dsv4_kv_layout(
-    *, is_v41: bool, arch35: bool, compress_ratio: int = 0
-) -> NPUDSV4KVLayout:
-    if is_v41:
-        if compress_ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS:
-            return NPUDSV4KVLayout.V41_CMP_FP4
-        if compress_ratio == 0:
-            return NPUDSV4KVLayout.V41_SWA_FP8
-    return NPUDSV4KVLayout.V4_FP8 if arch35 else NPUDSV4KVLayout.V4_BF16
-
-
-def npu_dsv4_num_pages(size: int, page_size: int) -> int:
-    # Includes the reserved page used by flat cache locations.
-    return (size + page_size + 1) // page_size
-
-
-def validate_npu_dsv4_c128_page_size(page_size: int) -> int:
-    if page_size <= 0 or page_size % 16 != 0:
-        raise ValueError(
-            "c128_page_size must be a positive multiple of 16 for the NPU "
-            f"sparse-attention operator, got {page_size}"
-        )
-    return page_size

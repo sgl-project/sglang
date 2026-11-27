@@ -27,12 +27,7 @@ from sgl_kernel_npu.operators.mem_cache import (
 )
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
-    NPUDSV4KVLayout,
-    npu_dsv4_num_pages,
-    resolve_npu_dsv4_kv_layout,
-    validate_npu_dsv4_c128_page_size,
-)
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4IndexerBufferInfo,
@@ -100,7 +95,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         self.bytes_per_page_padded = self.kernel_page_size * kv_dim * kv_dtype.itemsize
         # Writes are flat-indexed by loc; kernel_page_size is the physical page
         # layout the NPU operators see.
-        npu_num_pages = npu_dsv4_num_pages(self.size, self.kernel_page_size)
+        npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
         return torch.zeros(
             npu_num_pages,
             self.kernel_page_size,
@@ -150,7 +145,7 @@ class DSV41NPUSingleKVPool(NPUDeepSeekV4SingleKVPool):
         self.kv_cache_total_dim = kv_dim
         # The HiCache assembler uses bytes_per_page_padded as host item_bytes.
         self.bytes_per_page_padded = self.kernel_page_size * kv_dim * kv_dtype.itemsize
-        npu_num_pages = npu_dsv4_num_pages(self.size, self.kernel_page_size)
+        npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
         return torch.zeros(
             npu_num_pages,
             self.kernel_page_size,
@@ -260,7 +255,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         # generic ``is not None`` checks.
         self.index_k_with_scale_buffer = None
         kp = self._kernel_page_size
-        npu_num_pages = npu_dsv4_num_pages(self.size, kp)
+        npu_num_pages = (self.size + kp + 1) // kp
         (
             k_dim,
             scale_dim,
@@ -299,7 +294,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         packed fp4 with one uint8 scale per 32 values (see
         :class:`DSV41NPUIndexerPool`).
         """
-        layout = resolve_npu_dsv4_kv_layout(is_v41=False, arch35=is_npu_arch35())
+        layout = NPUDSV4KVLayout.V4_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16
         return layout.indexer_kv_info(self.index_head_dim)
 
     def indexer_buffer_info(self) -> DSV4IndexerBufferInfo:
@@ -406,9 +401,13 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         npu_window_generation: Optional[str] = None,
         **kwargs,
     ):
-        self.c128_page_size = validate_npu_dsv4_c128_page_size(
-            get_schedule().c128_page_size
-        )
+        c128_page_size = get_schedule().c128_page_size
+        if c128_page_size <= 0 or c128_page_size % 16 != 0:
+            raise ValueError(
+                "c128_page_size must be a positive multiple of 16 for the NPU "
+                f"sparse-attention operator, got {c128_page_size}"
+            )
+        self.c128_page_size = c128_page_size
         # Pin the row generation instead of inferring it from
         # ``compression_ratios``: a draft worker's builder empties that list but
         # its rows must stay V4.
@@ -431,11 +430,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def compressed_kv_layout(self, compress_ratio: int):
         """Row format of a compressed pool. V4.1's low ratios always take the
         epilog_v2 fp4 row; the V4 ratios follow the part."""
-        return resolve_npu_dsv4_kv_layout(
-            is_v41=self._is_v41_model(),
-            arch35=is_npu_arch35(),
-            compress_ratio=compress_ratio,
-        )
+        if compress_ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS and self._is_v41_model():
+            return NPUDSV4KVLayout.V41_CMP_FP4
+        return NPUDSV4KVLayout.V4_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16
 
     def _window_kv_layout(self):
         """Row format of the non-compressed (full/swa/window) pools.
@@ -444,9 +441,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         sparse-attention op even when the target is V4.1. ``_build_dsv4_kv_pool``
         pins that through ``npu_window_generation``.
         """
-        return resolve_npu_dsv4_kv_layout(
-            is_v41=self._is_v41_model(), arch35=is_npu_arch35()
-        )
+        if self._is_v41_model():
+            return NPUDSV4KVLayout.V41_SWA_FP8
+        return NPUDSV4KVLayout.V4_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16
 
     def _make_kv_pool(
         self,

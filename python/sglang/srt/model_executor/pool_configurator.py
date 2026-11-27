@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -1498,11 +1498,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
 
-    def _init_npu_row_bytes(self, model_ratios: Sequence[int]) -> None:
+    def _init_npu_row_bytes(self, model_ratios) -> None:
         from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
             NPUDSV4KVLayout,
-            resolve_npu_dsv4_kv_layout,
-            validate_npu_dsv4_c128_page_size,
         )
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
@@ -1510,31 +1508,35 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         is_v41 = any(
             ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS for ratio in model_ratios
         )
+        v4_layout = NPUDSV4KVLayout.V4_FP8 if arch35 else NPUDSV4KVLayout.V4_BF16
         self._npu_kv_row_bytes = {}
         for ratio in (0, *self.stage_owner_layers):
-            layout = resolve_npu_dsv4_kv_layout(
-                is_v41=is_v41, arch35=arch35, compress_ratio=ratio
-            )
+            layout = v4_layout
+            if is_v41:
+                if ratio == 0:
+                    layout = NPUDSV4KVLayout.V41_SWA_FP8
+                elif ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS:
+                    layout = NPUDSV4KVLayout.V41_CMP_FP4
             dim, dtype = layout.kv_info(self.qk_nope_head_dim, self.qk_rope_head_dim)
             self._npu_kv_row_bytes[ratio] = dim * dtype.itemsize
         self.kv_bytes = self._npu_kv_row_bytes[0]
-        index_layout = resolve_npu_dsv4_kv_layout(is_v41=False, arch35=arch35)
-        k, scale, k_dtype, scale_dtype = index_layout.indexer_kv_info(
+        k, scale, k_dtype, scale_dtype = v4_layout.indexer_kv_info(
             self.indexer_head_dim
         )
         self.indexer_bytes_per_token = (
             k * k_dtype.itemsize + scale * scale_dtype.itemsize
         )
-        self._npu_c128_page_size = validate_npu_dsv4_c128_page_size(
-            get_schedule().c128_page_size
-        )
+        self._npu_c128_page_size = get_schedule().c128_page_size
+        if self._npu_c128_page_size <= 0 or self._npu_c128_page_size % 16 != 0:
+            raise ValueError(
+                "c128_page_size must be a positive multiple of 16 for the NPU "
+                f"sparse-attention operator, got {self._npu_c128_page_size}"
+            )
 
     def _npu_swa_pool_bytes(self, swa_tokens: int) -> int:
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
-            npu_dsv4_num_pages,
-        )
-
-        swa_rows = npu_dsv4_num_pages(swa_tokens, self.page_size) * self.page_size
+        # Same reserved-page rule as NPUDeepSeekV4SingleKVPool.create_buffer.
+        swa_pages = (swa_tokens + self.page_size + 1) // self.page_size
+        swa_rows = swa_pages * self.page_size
         kv_bytes = swa_rows * self.kv_bytes * self.num_swa_layers
         if not self.num_layers(4):
             return kv_bytes
@@ -1549,9 +1551,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
 
     def _npu_variable_pool_bytes(self, full_tokens: int) -> float:
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
-            npu_dsv4_num_pages,
-        )
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV41_INDEX_PAGE_SIZE
 
         total = 0
@@ -1562,16 +1561,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         for ratio, layers in self.stage_owner_layers.items():
             size = full_tokens // ratio
             page = self._npu_c128_page_size if ratio == 128 else self.page_size // ratio
-            rows = npu_dsv4_num_pages(size, page) * page
+            rows = ((size + page + 1) // page) * page
             layer_bytes = rows * self._npu_kv_row_bytes[ratio]
             if ratio == 4:
                 layer_bytes += rows * self.indexer_bytes_per_token
             elif ratio in (1, 2):
                 index_size = (full_tokens + self.page_size) // ratio
-                index_rows = (
-                    npu_dsv4_num_pages(index_size, DSV41_INDEX_PAGE_SIZE)
-                    * DSV41_INDEX_PAGE_SIZE
-                )
+                index_page = DSV41_INDEX_PAGE_SIZE
+                index_rows = ((index_size + index_page + 1) // index_page) * index_page
                 layer_bytes += index_rows * self.low_ratio_index_bytes
             total += layer_bytes * len(layers)
         return total * self._spec_infl
