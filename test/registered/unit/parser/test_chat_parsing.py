@@ -473,6 +473,16 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
             },
         )
 
+    def test_gemma4_quoted_tool_argument_with_key_like_text(self):
+        model_out = r'<|tool_call>call:f{"text":"See \"{days:3}\""}<tool_call|>'
+        message = parse_response(model_out, gemma4_template, prefix="")
+        self.assertEqual(message["tool_calls"][0]["function"]["arguments"], {"text": 'See "{days:3}"'})
+
+    def test_gemma4_whitespace_around_bare_tool_argument_keys(self):
+        model_out = "<|tool_call>call:f{days:3, unit :4}<tool_call|>"
+        message = parse_response(model_out, gemma4_template, prefix="")
+        self.assertEqual(message["tool_calls"][0]["function"]["arguments"], {"days": 3, "unit": 4})
+
     def test_gemma4_complex_tool_call(self):
         model_out = (
             "<|channel>thought\nLet me call the tool.<channel|>"
