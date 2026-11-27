@@ -1029,6 +1029,17 @@ class Scheduler(
                         self.tokenizer
                     )
                 )
+            elif (
+                isinstance(detector, ResponseTemplateReasoningDetector)
+                and detector.tool_start_token
+                and detector.get_think_end_lookahead_id(self.tokenizer) is None
+            ):
+                logger.warning(
+                    "Reasoning end lookahead %r must encode to a single added token "
+                    "for scheduler accounting. Disabling reasoning token counting "
+                    "and grammar-gated reasoning.",
+                    detector.tool_start_token,
+                )
             else:
                 logger.warning(
                     "Reasoning parser think_end_token %r could not be encoded; "

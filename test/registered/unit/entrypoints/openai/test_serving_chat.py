@@ -1243,24 +1243,26 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertEqual(request._response_parser_grammar_start, grammar_start)
 
     def test_json_schema_after_reasoning_close_pattern(self):
-        """The tool lookahead in Qwen3.6-27B must not force JSON from token one."""
+        """A literal regex closer defers JSON with or without a tool lookahead."""
         template = copy.deepcopy(_DELIMITED_RESPONSE_TEMPLATE)
-        template["fields"]["thinking"] = {
-            "open": "<think>",
-            "close_pattern": "</think>|(?=<tool_call>)",
-        }
-        self._use_delimited_response_template("response_template", template)
         vocab = {"</think>": 248069, "<tool_call>": 248058}
-        self.tm.tokenizer.get_added_vocab.return_value = vocab
-        self.tm.tokenizer.encode.side_effect = lambda text, **_: (
-            [vocab[text]] if text in vocab else []
-        )
-        _, request = self._convert_rendered_as(
-            "<assistant><think>", response_format={"type": "json_object"}
-        )
-        self.assertEqual(
-            request._response_parser_grammar_start, GRAMMAR_AFTER_REASONING
-        )
+        for pattern in ("</think>", "</think>|(?=<tool_call>)"):
+            with self.subTest(pattern=pattern):
+                template["fields"]["thinking"] = {
+                    "open": "<think>",
+                    "close_pattern": pattern,
+                }
+                self._use_delimited_response_template("response_template", template)
+                self.tm.tokenizer.get_added_vocab.return_value = vocab
+                self.tm.tokenizer.encode.side_effect = lambda text, **_: (
+                    [vocab[text]] if text in vocab else []
+                )
+                _, request = self._convert_rendered_as(
+                    "<assistant><think>", response_format={"type": "json_object"}
+                )
+                self.assertEqual(
+                    request._response_parser_grammar_start, GRAMMAR_AFTER_REASONING
+                )
 
     def test_call_ended_by_another_stop_token_is_complete(self):
         """A complete call ended by a stop token other than its closer must not be

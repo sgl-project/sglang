@@ -804,10 +804,9 @@ class TestReasonerGrammarBackend(CustomTestCase):
                 )
                 self.assertIs(grammar, backend._dispatch_result)
 
-    def test_inkling_scheduler_uses_native_reasoning_end(self):
+    def _init_scheduler_tokenizer(self, tokenizer, reasoning_parser):
         from sglang.srt.managers.scheduler import Scheduler
 
-        tokenizer = _DummyTokenizer({END_MESSAGE: [27, 91, 406, 62, 65752, 91, 29]})
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.server_args = SimpleNamespace(skip_tokenizer_init=False)
         scheduler.skip_tokenizer_init = False
@@ -818,7 +817,7 @@ class TestReasonerGrammarBackend(CustomTestCase):
             tokenizer_path="unused",
             tokenizer_mode="auto",
             tokenizer_backend="default",
-            reasoning_parser="inkling",
+            reasoning_parser=reasoning_parser,
         )
         with (
             patch(
@@ -831,10 +830,35 @@ class TestReasonerGrammarBackend(CustomTestCase):
             ),
         ):
             scheduler.init_tokenizer()
+        return scheduler.model_config
 
+    def test_inkling_scheduler_uses_native_reasoning_end(self):
+        tokenizer = _DummyTokenizer({END_MESSAGE: [27, 91, 406, 62, 65752, 91, 29]})
+        config = self._init_scheduler_tokenizer(tokenizer, "inkling")
         self.assertEqual(
-            scheduler.model_config.think_end_ids,
+            config.think_end_ids,
             [INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]],
+        )
+
+    def test_scheduler_reports_non_atomic_response_template_lookahead(self):
+        """A split tool opener disables gating even when the explicit closer encodes."""
+        tokenizer = _DummyTokenizer({"</think>": [248069], "<tool_call>": [10, 11]})
+        tokenizer.get_added_vocab = lambda: {"</think>": 248069}
+        tokenizer.response_template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "thinking": {
+                    "open": "<think>",
+                    "close_pattern": "</think>|(?=<tool_call>)",
+                }
+            },
+        }
+        with self.assertLogs("sglang.srt.managers.scheduler", level="WARNING") as logs:
+            config = self._init_scheduler_tokenizer(tokenizer, "response_template")
+        self.assertIsNone(config.think_end_ids)
+        self.assertIn(
+            "lookahead '<tool_call>' must encode to a single added token",
+            "\n".join(logs.output),
         )
 
     def test_response_template_reasoning_gives_the_thinking_opener(self):
@@ -939,6 +963,35 @@ class _RecordingGrammar(BaseGrammarObject):
 
 class TestImplicitToolReasoningBoundary(CustomTestCase):
     """A tool marker ends thinking but also belongs to the inner grammar."""
+
+    def test_response_template_replays_the_qwen_tool_opener_once(self):
+        """A call can open inside thinking and its first token belongs to the tool."""
+        vocab = {"</think>": 248069, "<tool_call>": 248058}
+        tokenizer = SimpleNamespace(
+            get_added_vocab=lambda: vocab,
+            encode=lambda text, **_: [vocab[text]],
+        )
+        detector = ResponseTemplateReasoningDetector(
+            response_template={
+                "start_anchor": "<|im_start|>assistant\n",
+                "fields": {
+                    "reasoning_content": {
+                        "open": "<think>",
+                        "close_pattern": "</think>|(?=<tool_call>)",
+                    }
+                },
+            }
+        )
+        backend = _DummyGrammarBackend()
+        backend._dispatch_result = _RecordingGrammar()
+        reasoner = ReasonerGrammarBackend(
+            backend, SimpleNamespace(detector=detector), tokenizer
+        )
+        self.assertEqual(reasoner.tool_start_ids, [248058])
+        grammar = reasoner._init_value_dispatch(("structural_tag", "{}"), True)
+        for token in (10083, 248058, 23):
+            grammar.accept_token(token)
+        self.assertEqual(grammar.grammar.tokens, [248058, 23])
 
     def _make_object(self, tool_ids=(3, 4), reasoning=True, at_line_start=False):
         backend = _DummyGrammarBackend()
