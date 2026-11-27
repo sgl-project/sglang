@@ -10,6 +10,7 @@ from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 _T = TypeVar("_T")
 
@@ -46,18 +47,19 @@ class InputLogprobChunkCap:
         page_size: int,
         truncation_align_size: Optional[int],
         exact_chunk_fill: bool,
+        tree_cache: BasePrefixCache,
     ) -> None:
         """A first chunk is cut down to the truncation alignment, and to whole pages
         unless admission fills chunks exactly (`uses_exact_chunk_fill`); a prefix
-        hit's encoder replay rows also take chunk room ahead of its extend. A cap
-        below the replay rows plus that step cuts an input-logprob prompt longer
-        than the cap to zero tokens, and the request would wait in the queue
-        forever."""
+        hit's encoder replay rows (`PrefillAdder.max_replay_len`) also take chunk
+        room ahead of its extend. A cap below the replay rows plus that step cuts
+        an input-logprob prompt longer than the cap to zero tokens, and the
+        request would wait in the queue forever."""
         cap = cls.for_batch(chunked_prefill_size).room
         align = truncation_align_size or 1
         if not exact_chunk_fill:
             align = math.lcm(page_size, align)
-        replay = PrefillAdder.max_replay_len()
+        replay = PrefillAdder.max_replay_len(tree_cache)
         if cap is None or cap >= replay + align:
             return
         page_note = "" if exact_chunk_fill else f"page size {page_size}, "

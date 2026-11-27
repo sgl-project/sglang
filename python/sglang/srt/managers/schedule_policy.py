@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_serving,
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
 )
@@ -1486,11 +1487,18 @@ class PrefillAdder:
         return 0
 
     @staticmethod
-    def max_replay_len() -> int:
-        """The most replay rows `_replay_len` adds to a first chunk."""
-        if get_exec().features.enable_encoder_swa_bounded_replay:
-            return encoder_swa_replay.MAX_REPLAY_LEN
-        return 0
+    def max_replay_len(tree_cache: BasePrefixCache) -> int:
+        """The most replay rows `_replay_len` adds to a first chunk. Only a prefix
+        hit replays: a disabled cache matches nothing, but a retracted streaming
+        turn re-enters its session's prefix with a reset window."""
+        if not get_exec().features.enable_encoder_swa_bounded_replay:
+            return 0
+        if (
+            not tree_cache.supports_prefix_sharing()
+            and not get_serving().enable_streaming_session
+        ):
+            return 0
+        return encoder_swa_replay.MAX_REPLAY_LEN
 
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
         if req.retracted_stain:

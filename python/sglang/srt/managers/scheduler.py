@@ -784,6 +784,7 @@ class Scheduler(
                 exact_chunk_fill=uses_exact_chunk_fill(
                     self.tree_cache, self.dllm_config
                 ),
+                tree_cache=self.tree_cache,
             )
 
         self.init_weight_updater()

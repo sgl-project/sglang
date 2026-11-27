@@ -1381,7 +1381,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_token_allocator.available_size.return_value = 100000
         self.mock_tree_cache.supports_mamba.return_value = False
 
-        def admit(cap_tokens, align, prefix_len):
+        def admit(cap_tokens, align, prefix_len, retracted):
             with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(cap_tokens):
                 cap = InputLogprobChunkCap.for_batch(4096)
             adder = self.create_adder(
@@ -1394,6 +1394,7 @@ class TestPrefillAdder(CustomTestCase):
                 prefix_len + 128, rid=f"lp_{cap_tokens}_{align}_{prefix_len}"
             )
             req.prefix_len = prefix_len
+            req.is_retracted = retracted
             req.return_logprob, req.logprob_start_len = True, prefix_len
             req.origin_input_ids = req.full_untruncated_fill_ids
             cap.add_one_req(
@@ -1411,40 +1412,58 @@ class TestPrefillAdder(CustomTestCase):
                         exact_chunk_fill=schedule_policy.uses_exact_chunk_fill(
                             self.mock_tree_cache, None
                         ),
+                        tree_cache=self.mock_tree_cache,
                     )
                 except ValueError:
                     return False
             return True
 
-        # (exact chunk fill, truncation alignment, encoder replay, cap,
-        #  first chunk admitted); a replay case is a 256-token prefix hit.
+        # (exact chunk fill, truncation alignment, encoder replay, cache, cap,
+        #  first chunk admitted). With replay, a request is a 256-token prefix hit
+        # under a radix cache; under a disabled one ("off") only a fresh prompt;
+        # with streaming sessions on a disabled cache, a retracted turn that
+        # re-enters its 256-token session prefix.
         cases = (
-            (False, None, False, 32, []),
-            (False, None, False, 64, [64]),
-            (True, None, False, 32, [32]),
-            (True, 64, False, 32, []),
-            (True, 64, False, 64, [64]),
-            (False, None, True, 128, []),
-            (False, None, True, 192, [64]),
-            (True, None, True, 128, []),
-            (True, None, True, 129, [1]),
+            (False, None, False, "radix", 32, []),
+            (False, None, False, "radix", 64, [64]),
+            (True, None, False, "radix", 32, [32]),
+            (True, 64, False, "radix", 32, []),
+            (True, 64, False, "radix", 64, [64]),
+            (False, None, True, "radix", 128, []),
+            (False, None, True, "radix", 192, [64]),
+            (True, None, True, "radix", 128, []),
+            (True, None, True, "radix", 129, [1]),
+            (False, None, True, "off", 32, []),
+            (False, None, True, "off", 64, [64]),
+            (True, None, True, "off", 1, [1]),
+            (False, None, True, "session", 128, []),
+            (False, None, True, "session", 192, [64]),
         )
-        for exact, align, replay, cap_tokens, admitted in cases:
+        for exact, align, replay, cache, cap_tokens, admitted in cases:
             override = get_context().override_server_args(
-                enable_encoder_swa_bounded_replay=replay
+                enable_encoder_swa_bounded_replay=replay,
+                enable_streaming_session=cache == "session",
             )
             override.install()
+            self.mock_tree_cache.supports_prefix_sharing.return_value = cache == "radix"
             try:
                 with (
                     self.subTest(
-                        exact=exact, align=align, replay=replay, cap=cap_tokens
+                        exact=exact,
+                        align=align,
+                        replay=replay,
+                        cache=cache,
+                        cap=cap_tokens,
                     ),
                     patch.object(
                         schedule_policy, "_use_exact_chunk_fill", return_value=exact
                     ),
                 ):
-                    prefix_len = 256 if replay else 0
-                    self.assertEqual(admit(cap_tokens, align, prefix_len), admitted)
+                    prefix_len = 256 if replay and cache != "off" else 0
+                    self.assertEqual(
+                        admit(cap_tokens, align, prefix_len, cache == "session"),
+                        admitted,
+                    )
                     self.assertEqual(
                         accepted_at_startup(cap_tokens, align), bool(admitted)
                     )
