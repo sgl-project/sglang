@@ -5830,6 +5830,15 @@ class AiterAttnBackend(AttentionBackend):
         """
         if not getattr(self.token_to_kv_pool, "mla_seg_page_layout", False):
             return False
+        prefill_backend = getattr(model_runner, "prefill_attention_backend_str", None)
+        decode_backend = getattr(model_runner, "decode_attention_backend_str", None)
+        if prefill_backend != "aiter" or decode_backend != "aiter":
+            # Other backends read the pool as token-major rows.
+            raise ValueError(
+                "SGLANG_AITER_MLA_GFX1250_ASM=1 needs the aiter attention backend "
+                "for both prefill and decode; set --attention-backend aiter (got "
+                f"prefill={prefill_backend!r}, decode={decode_backend!r})."
+            )
         if not (
             is_gfx1250_supported()
             and self.use_mla
