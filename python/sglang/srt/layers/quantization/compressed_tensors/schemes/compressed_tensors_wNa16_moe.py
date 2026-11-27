@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors import CompressionFormat
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
     gptq_marlin_moe_repack,
 )
@@ -27,7 +28,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from compressed_tensors.quantization import QuantizationArgs
@@ -49,13 +50,23 @@ __all__ = [
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _use_aiter:
     pass
 
 
 logger = logging.getLogger(__name__)
+
+# compressed-tensors keeps the actorder string as written, so its alias-aware
+# enum equality never runs here; map the aliases to the forms compared below.
+_ACTORDER_ALIASES = {"weight": "static", "dynamic": "group"}
+
+
+def _normalize_actorder(actorder: str | None) -> str | None:
+    if actorder is None:
+        return None
+    return _ACTORDER_ALIASES.get(actorder, actorder)
 
 
 class GPTQMarlinState(Enum):
@@ -78,7 +89,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         self.packed_factor = 32 // config.num_bits
         self.strategy = config.strategy
         self.group_size = config.group_size
-        self.actorder = config.actorder
+        self.actorder = _normalize_actorder(config.actorder)
         self.sym = config.symmetric
 
         if not (
@@ -86,10 +97,10 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             and self.num_bits in WNA16_SUPPORTED_BITS
         ):
             raise ValueError(
-                "For Fused MoE layers, only ",
-                f"{CompressionFormat.pack_quantized.value} ",
-                "is supported for the following bits: ",
-                f"{WNA16_SUPPORTED_BITS}",
+                "For Fused MoE layers, only "
+                f"{CompressionFormat.pack_quantized.value} "
+                "is supported for the following bits: "
+                f"{WNA16_SUPPORTED_BITS}"
             )
         self.num_gpu_experts = num_gpu_experts
 
@@ -465,9 +476,12 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
-        )
+        activation = self.moe_runner_config.activation
+        assert self.moe_runner_config.is_gated and activation in (
+            "silu",
+            "gelu",
+            "gelu_tanh",
+        ), f"Only gated SiLU and GELU activations are supported, got {activation}."
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -505,6 +519,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
             clamp_limit=self.moe_runner_config.swiglu_limit,
+            activation=activation,
             workspace=layer.workspace,
         )
         return StandardCombineInput(hidden_states=output)
@@ -569,10 +584,6 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
-        )
-
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
 

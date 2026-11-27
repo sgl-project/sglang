@@ -72,7 +72,7 @@ def _make_backend(batch_size, capture_width=7):
     backend.device = torch.device("cpu")
     backend.num_draft_tokens = 9
     backend.target_verify_num_tokens_per_req = capture_width
-    backend.max_context_len = 128
+    backend.max_kv_len = 128
     backend.qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
     backend.kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
     backend.window_lengths = {}
