@@ -567,11 +567,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
-            return self.draft_runtime.run_draft_extend(
+            ret = self.draft_runtime.run_draft_extend(
                 runner=self,
                 forward_batch=forward_batch,
                 stock=run_stock,
             )
+            # A forward that read no metadata still joins a forked metadata branch.
+            self.draft_extend_attn_backend.join_forward_metadata()
+            return ret
 
         with forward_context(
             ForwardContext(attn_backend=self.draft_extend_attn_backend),

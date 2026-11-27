@@ -17,7 +17,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
 )
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
-from sglang.srt.runtime_context import get_context, get_exec, get_parallel
+from sglang.srt.runtime_context import get_context, get_device, get_exec, get_parallel
 from sglang.srt.server_args import compute_world_size, redact_server_args_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
@@ -56,6 +56,7 @@ class SchedulerInternalStateController:
             self._add_step_times,
             self._add_rust_server,
             self._add_env_vars,
+            self._add_chain_topp,
         ):
             contribute(state)
         # A bound signal handler is not msgpack-serializable, and no reader
@@ -145,6 +146,24 @@ class SchedulerInternalStateController:
     def _add_env_vars(self, state: Dict[str, Any]) -> None:
         if envs.SGLANG_EXPOSE_OWN_ENV_VARS.get():
             state["env_vars"] = exportable_env_vars()
+
+    def _add_chain_topp(self, state: Dict[str, Any]) -> None:
+        # SGLANG_OPT_SPEC_CHAIN_TOPP_SAMPLING engagement: device counters (.item()), per query only.
+        if not envs.SGLANG_OPT_SPEC_CHAIN_TOPP_SAMPLING.get():
+            return
+        import torch
+
+        from sglang.srt.speculative.chain_topp_sampling import chain_topp_record
+
+        try:
+            record = chain_topp_record(torch.device("cuda", get_device().gpu_id))
+            state["chain_topp"] = {
+                "tp_rank": get_parallel().tp_rank,
+                "status": "OK" if record is not None else "NOT_CALLED",
+                **(record or {}),
+            }
+        except Exception as error:
+            state["chain_topp"] = {"status": f"ERROR {type(error).__name__}: {error}"}
 
     # ------------------------------------------------------------------ update
 

@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Dict,
     List,
     Literal,
@@ -63,7 +64,10 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
     _KPoolForwardInputs,
@@ -120,6 +124,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
     trtllm_padded_heads,
 )
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import (
     cp_live_store_rows,
@@ -763,6 +768,36 @@ def _validate_unified_pool_backend(
         )
 
 
+_replay_metadata_streams: dict = {}
+
+
+def _replay_metadata_side_stream() -> torch.cuda.Stream:
+    """The side stream forked from the current one at this point."""
+    main = torch.cuda.current_stream()
+    side = _replay_metadata_streams.get(main.device)
+    if side is None:
+        side = _replay_metadata_streams[main.device] = torch.cuda.Stream(
+            device=main.device
+        )
+    side.wait_stream(main)
+    return side
+
+
+def _run_on(side: torch.cuda.Stream, write: Callable[[], None]) -> torch.cuda.Event:
+    with torch.cuda.stream(side):
+        write()
+    ready = torch.cuda.Event()
+    ready.record(side)
+    return ready
+
+
+def _fork_replay_metadata(write: Callable[[], None]) -> torch.cuda.Event:
+    """Run ``write`` (replay-metadata device work) on a side stream forked from the
+    current one; return the event its readers wait on. Under capture this records a
+    parallel branch of the graph."""
+    return _run_on(_replay_metadata_side_stream(), write)
+
+
 class DeepseekSparseAttnBackend(
     DSAMetadataManagementMixin,
     DeepseekSparseAttnBackendKPoolMixin,
@@ -780,6 +815,18 @@ class DeepseekSparseAttnBackend(
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+    # The qlen x qlen chain mask of SGLANG_OPT_DSA_CHAIN_VERIFY_TREE (never read:
+    # sparse MLA masks the verify rows by position); None keeps the FULL_MASK build.
+    _verify_mask: Optional[VerifyMask] = None
+    # Event of the forked in-graph replay metadata (SGLANG_OPT_DSA_DE_META_IN_GRAPH)
+    # that the forward's first metadata reader waits on.
+    _replay_metadata_ready: Optional[torch.cuda.Event] = None
+    # SGLANG_OPT_DSA_META_FORK_LATE: the branch forked at the graph head whose kernels
+    # are enqueued at the first reader, so the graph front's nodes come first.
+    _pending_metadata: Optional[tuple] = None
+    # Bounded replay metadata grids (SGLANG_DSA_BOUNDED_REPLAY_METADATA); default
+    # False so in-graph replay metadata stays disabled unless explicitly enabled.
+    dsa_meta_bounded: bool = False
     draft_decode_len: int = 0
 
     def _call_flash_mla_sparse_fwd_small_heads(self, *args):
@@ -856,6 +903,10 @@ class DeepseekSparseAttnBackend(
         if self.dsa_shards_index_k and self.dsa_index_kpool > 1:
             raise ValueError("DSA index kpool does not support --dcp-size > 1.")
         self._init_kpool_metadata_fusion()
+        self._is_draft_worker = model_runner.is_draft_worker
+        self._skip_prefill = skip_prefill
+        # (forward mode, bs) whose captured graph records the replay metadata.
+        self._metadata_recorded_in_graph: set = set()
         self._memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=get_exec().features.enable_memory_saver
             and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
@@ -1476,7 +1527,16 @@ class DeepseekSparseAttnBackend(
             return
         from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
-        metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
+        seqlens = metadata.dsa_seqlens_expanded
+        if (
+            envs.SGLANG_OPT_DSA_TOPK_PLAN_IN_PLACE.get()
+            and metadata.topk_v2_plan.shape[0] == seqlens.shape[0] + 1
+        ):
+            # The planner writes nothing when the transform takes its small-batch
+            # kernel, which reads no plan; the copy then moved uninitialized bytes.
+            plan_topk_v2(seqlens, out=metadata.topk_v2_plan)
+            return
+        metadata.topk_v2_plan.copy_(plan_topk_v2(seqlens))
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
@@ -1502,6 +1562,7 @@ class DeepseekSparseAttnBackend(
 
         # Prefill addresses concatenated logical KV, but fused draft decode
         # consumes allocator-local physical slots. Leave prefill's input intact.
+        self._join_replay_metadata()
         metadata = self.forward_metadata
         page_table = metadata.page_table_1_flattened
         if page_table is None:
@@ -1612,6 +1673,17 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        key = (forward_batch.forward_mode, forward_batch.batch_size)
+        if not in_capture and key in self._metadata_recorded_in_graph:
+            # The captured graph rebuilds the device metadata from its static
+            # seq_lens / req_pool_indices; only the host-side state is left.
+            self.set_dsa_prefill_impl(forward_batch=None)
+            self.forward_metadata = self.decode_cuda_graph_metadata[key[1]]
+            return
+        if in_capture:
+            self._metadata_recorded_in_graph.discard(key)
+            self._replay_metadata_ready = None
+            self._pending_metadata = None
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -1639,8 +1711,76 @@ class DeepseekSparseAttnBackend(
         """Refresh custom kernel state after eager or out-of-graph metadata setup."""
         pass
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        bs = forward_batch.batch_size
+        max_bs = envs.SGLANG_OPT_SPEC_STEP_SEAMS_MAX_BS.get()
+        if (
+            not self._records_replay_metadata_in_graph(forward_batch.forward_mode)
+            or bs not in self.decode_cuda_graph_metadata
+            or 0 < max_bs < bs
+        ):
+            return
+
+        def write_metadata():
+            # The eager replay's device work, from the runner's static buffers.
+            self._apply_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                seq_lens_cpu=None,
+                forward_mode=forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+                out_cache_loc=forward_batch.out_cache_loc,
+                actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
+            )
+
+        if envs.SGLANG_OPT_DSA_META_FORK_LATE.get():
+            # Forked here (no dependency on the front), enqueued at the first reader.
+            self._pending_metadata = (_replay_metadata_side_stream(), write_metadata)
+            self._replay_metadata_ready = None
+        else:
+            self._replay_metadata_ready = _fork_replay_metadata(write_metadata)
+        if torch.cuda.is_current_stream_capturing():
+            self._metadata_recorded_in_graph.add((forward_batch.forward_mode, bs))
+
+    def _records_replay_metadata_in_graph(self, forward_mode: ForwardMode) -> bool:
+        """Whether this mode's graph records its replay metadata on a branch beside the
+        graph front (bounded grids: bs-only shapes): draft extend with
+        SGLANG_OPT_DSA_DE_META_IN_GRAPH, target verify with
+        SGLANG_OPT_DSA_TV_META_IN_GRAPH."""
+        if not self.dsa_meta_bounded or self.dsa_decode_impl == "flashmla_kv":
+            return False
+        if forward_mode.is_draft_extend_v2():
+            return envs.SGLANG_OPT_DSA_DE_META_IN_GRAPH.get()
+        if forward_mode.is_target_verify():
+            return envs.SGLANG_OPT_DSA_TV_META_IN_GRAPH.get()
+        return False
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        # A forked verify metadata branch may read req_to_token after the graph-head
+        # marker; only a post-replay event covers it.
+        if fm.is_target_verify() and self._records_replay_metadata_in_graph(fm):
+            return SharedReadEnds.POST_REPLAY
+        return super().shared_read_ends(fm)
+
+    def join_forward_metadata(self) -> None:
+        self._join_replay_metadata()
+
+    def _join_replay_metadata(self) -> None:
+        """Order the current stream after the forked replay metadata; every reader
+        of forward_metadata calls this first."""
+        pending, self._pending_metadata = self._pending_metadata, None
+        if pending is not None:
+            self._replay_metadata_ready = _run_on(*pending)
+        ready = self._replay_metadata_ready
+        if ready is not None:
+            torch.cuda.current_stream().wait_event(ready)
+            self._replay_metadata_ready = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        self._replay_metadata_ready = None
+        self._pending_metadata = None
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -2172,6 +2312,20 @@ class DeepseekSparseAttnBackend(
         # Sized by query rows, not requests: target verify captures
         # speculative_num_draft_tokens rows per request.
         self._ensure_multi_ctas_kv_counter_capacity(max(max_bs, max_num_tokens))
+        if envs.SGLANG_OPT_DSA_CHAIN_VERIFY_TREE.get():
+            self._verify_mask = maybe_create_verify_mask(
+                is_draft_runner=self._is_draft_worker,
+                skip_prefill=self._skip_prefill,
+                max_bs=max_bs,
+                max_kv_len=self.max_kv_len,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                device=self.device,
+                is_read=False,
+            )
+
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def _multi_ctas_kv_counter_for(self, num_query_rows: int) -> Optional[torch.Tensor]:
         # A prefill batch wider than TRTLLM_MLA_MAX_BATCH_SIZE takes a temporary;
@@ -3193,6 +3347,7 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
+        self._join_replay_metadata()
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
@@ -5200,6 +5355,7 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
+        self._join_replay_metadata()
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
             and (

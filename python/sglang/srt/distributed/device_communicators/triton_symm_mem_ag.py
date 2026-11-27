@@ -248,7 +248,7 @@ def _blockwise_barrier(
             _wait_signal_acquire(wait_addrs)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["total_tokens"])
 def _all_gather_kernel_inner(
     input_ptr,
     multicast_ptr,
@@ -468,6 +468,7 @@ class MultimemAllGatherer:
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
+        self._multinode = False
         # None => always NCCL; _UNINIT => build on first eager call.
         if not get_platform().is_cuda:
             # Multimem symmetric-memory all-gather is an NVLink/CUDA feature;
@@ -487,6 +488,7 @@ class MultimemAllGatherer:
                 get_tp_group,
                 in_the_same_node_as,
             )
+            from sglang.srt.environ import envs
 
             tp_group = get_tp_group()
             # Only probe node topology when the deployment can actually span
@@ -495,14 +497,20 @@ class MultimemAllGatherer:
             # offline paths). On a single node every TP rank is co-located, so skip the
             # in_the_same_node_as() all-reduce, which can segfault under some
             # EP/mooncake setups, and keep multimem enabled.
-            if (
+            # SGLANG_OPT_MULTIMEM_AG_MNNVL: the nodes share one NVLink domain, so
+            # the multicast object spans them (_create_state checks every rank got one).
+            self._multinode = (
                 tp_group.world_size > 1
                 and get_parallel().nnodes > 1
                 and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
-            ):
-                if is_cuda() and is_one_nvlink_clique(
-                    tp_group.cpu_group,
-                    torch.device("cuda", torch.cuda.current_device()),
+            )
+            if self._multinode:
+                if envs.SGLANG_OPT_MULTIMEM_AG_MNNVL.get() or (
+                    is_cuda()
+                    and is_one_nvlink_clique(
+                        tp_group.cpu_group,
+                        torch.device("cuda", torch.cuda.current_device()),
+                    )
                 ):
                     return
                 logger.warning(
@@ -577,7 +585,15 @@ class MultimemAllGatherer:
                 max_tokens=self._max_tokens,
                 hidden_size=hidden_size * tp_group.world_size,
             )
-            if state.symm_mem_hdl.multicast_ptr == 0:
+            multicast = state.symm_mem_hdl.multicast_ptr != 0
+            if self._multinode:
+                # Across nodes every rank must have its multicast pointer (a
+                # rank-local failure would split the ranks between multimem and
+                # NCCL): agree on the CPU group, outside capture.
+                ok = torch.tensor([int(multicast)], dtype=torch.int32)
+                dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=tp_group.cpu_group)
+                multicast = bool(ok.item())
+            if not multicast:
                 # No multicast for this world size / arch; multimem.st would
                 # write nowhere. Fall back to NCCL.
                 logger.warning(
@@ -585,6 +601,14 @@ class MultimemAllGatherer:
                     tp_group.world_size,
                 )
                 return None
+            if self._multinode and tp_group.rank_in_group == 0:
+                logger.info(
+                    "multimem all-gather on across nodes (MNNVL): world_size=%d, "
+                    "max_tokens=%d, hidden=%d",
+                    tp_group.world_size,
+                    self._max_tokens,
+                    state.hidden_dim,
+                )
             return state
         except Exception as e:
             logger.warning("multimem all-gather disabled (%s)", e)

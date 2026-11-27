@@ -1819,6 +1819,64 @@ class Envs:
     # Speculative decoding
     # ===================================================================
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # GLM-5.2 low latency (T90a): trim the eager seams between the target-verify,
+    # post-verify, draft-extend and draft-decode graphs of an EAGLE step. Umbrella,
+    # default off; each item below follows it unless set on its own.
+    SGLANG_OPT_SPEC_STEP_SEAMS = EnvBool(False)
+    # A topk=1 chain over DSA (whose target never reads spec_info.custom_mask) builds
+    # the verify tokens / positions / retrieve arrays with the one chain-tree launch
+    # into a qlen x qlen mask, instead of cat + 2 fills + build_tree_efficient over a
+    # FULL_MASK of bs x context bools.
+    SGLANG_OPT_DSA_CHAIN_VERIFY_TREE = EnvBool(SGLANG_OPT_SPEC_STEP_SEAMS.get)
+    # SGLang's post-verify graph body (sampling, acceptance, commit outputs) launched
+    # eagerly on the round's inputs: no staging launch and no graph entry / exit gaps
+    # (the host runs a round ahead). Same kernels and values as a replay.
+    SGLANG_OPT_SPEC_EAGER_POST_VERIFY = EnvBool(SGLANG_OPT_SPEC_STEP_SEAMS.get)
+    # eagle_prepare_for_decode stages the page-aligned KV lengths on the device only
+    # for a round that allocates (the only reader), not every decode round.
+    SGLANG_OPT_SPEC_LAZY_ALLOC_H2D = EnvBool(SGLANG_OPT_SPEC_STEP_SEAMS.get)
+    # A spec_v2 batch whose backends need no host seq_lens gathers them from the
+    # FutureMap on the forward stream (stream-ordered after the publish, as on HIP)
+    # instead of on the schedule stream, which the forward then waits for.
+    SGLANG_OPT_SPEC_STREAM_ORDERED_SEQ_LENS = EnvBool(SGLANG_OPT_SPEC_STEP_SEAMS.get)
+    # DSA graph-replay metadata plans the top-k v2 routing straight into the captured
+    # plan buffer: no temporary and no copy launch (the copy is all a small batch,
+    # whose planner writes nothing, ever launched).
+    SGLANG_OPT_DSA_TOPK_PLAN_IN_PLACE = EnvBool(SGLANG_OPT_SPEC_STEP_SEAMS.get)
+    # The DSA draft-extend graph records its replay metadata (bounded metadata kernel,
+    # DeepGEMM schedule, top-k plan) on a branch forked at the graph head and joined by
+    # the first metadata reader, beside the draft front; the replay installs only the
+    # host state. Needs SGLANG_DSA_BOUNDED_REPLAY_METADATA.
+    SGLANG_OPT_DSA_DE_META_IN_GRAPH = EnvBool(SGLANG_OPT_SPEC_STEP_SEAMS.get)
+    # The same for the DSA target-verify graph (joined at the first metadata reader,
+    # the layer-0 indexer; scheduler-shared reads then end post-replay). Separate
+    # switch, default off: not under the umbrella until measured.
+    SGLANG_OPT_DSA_TV_META_IN_GRAPH = EnvBool(False)
+    # Largest batch (requests) the eager post-verify and the in-graph draft-extend /
+    # target-verify metadata apply to; larger batches keep the graph / eager path.
+    # 0: no limit.
+    SGLANG_OPT_SPEC_STEP_SEAMS_MAX_BS = EnvInt(0)
+    # T90a wave 2: more step seams (umbrella, default off; items follow it).
+    SGLANG_OPT_SPEC_STEP_SEAMS2 = EnvBool(False)
+    # An unchanged batch takes the draft extend's bonus tokens as the post-verify
+    # wrote them (int32) instead of converting them to the relay buffer's int64; the
+    # chain verify tree widens them. Needs SGLANG_OPT_DSA_CHAIN_VERIFY_TREE.
+    SGLANG_OPT_SPEC_RELAY_NATIVE_BONUS = EnvBool(SGLANG_OPT_SPEC_STEP_SEAMS2.get)
+    # The draft-decode replay copies its hidden state and DSA top-k seed in the same
+    # small-copy launch as its other inputs, instead of two more memcpy launches.
+    SGLANG_OPT_SPEC_DRAFT_PREP_ONE_COPY = EnvBool(SGLANG_OPT_SPEC_STEP_SEAMS2.get)
+    # An unchanged batch takes the last round's new seq_lens as its seq_lens instead
+    # of gathering them back from the FutureMap (the scatter still runs). Only for
+    # rounds whose post-verify ran eagerly, within SGLANG_OPT_SPEC_STEP_SEAMS_MAX_BS.
+    SGLANG_OPT_SPEC_SEQ_LENS_RELAY = EnvBool(SGLANG_OPT_SPEC_STEP_SEAMS2.get)
+    # The forked in-graph replay metadata (SGLANG_OPT_DSA_DE_META_IN_GRAPH) is forked
+    # at the graph head but enqueued at its first reader, so the graph's front nodes
+    # come first in the graph and launch first.
+    SGLANG_OPT_DSA_META_FORK_LATE = EnvBool(SGLANG_OPT_SPEC_STEP_SEAMS2.get)
+    # A replicated (tp 1) unquantized embedding looks up <= 64 ids with a one-program-
+    # per-(id, column block) row gather (bit copies) instead of index_select's
+    # small-index kernel, which loads the ids one after another (~6.6 us at 8 rows).
+    SGLANG_OPT_SMALL_EMBEDDING_GATHER = EnvBool(SGLANG_OPT_SPEC_STEP_SEAMS2.get)
     # Experimental: allow pipeline parallelism x speculative decoding
     # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
     # (non-overlap schedule, no DP attention).
@@ -1953,6 +2011,19 @@ class Envs:
     # to the gather when the TP all-reduce would go to NCCL or the LM head layout
     # is not plain vocab-parallel.
     SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE = EnvBool(False)
+    # The multimem (NVLS) logits all-gather also when the TP group spans the trays of
+    # one multi-node NVLink domain (MNNVL, e.g. GB300 / Rubin NVL72 racks): the
+    # symmetric buffer's multicast object then spans the nodes. Without it a TP group
+    # across nodes gathers on NCCL. Every rank must get a multicast pointer, else all
+    # fall back to NCCL.
+    SGLANG_OPT_MULTIMEM_AG_MNNVL = EnvBool(False)
+    # EAGLE topk-1 chain verify at T > 0 (top-p or not): one target sample per row
+    # from a single cluster kernel (kernels/ops/speculative/verify_topp_chain.py),
+    # then the fused chain acceptance; replaces softmax + top-p renorm + tree sampling
+    # + the rank-0 broadcasts. Needs the fused chain accept (NV mega runtime umbrella).
+    SGLANG_OPT_SPEC_CHAIN_TOPP_SAMPLING = EnvBool(False)
+    # Debug: compare that path's samples across the TP group on every eager call.
+    SGLANG_OPT_SPEC_CHAIN_TOPP_SAMPLING_CHECK = EnvBool(False)
     # Same exchange for the replicated --enable-dp-lm-head head on a pure-DP-attention
     # decode node: the draft's LM head runs vocab-parallel over the DP ranks (their
     # rows all-gathered, a row slice of the full weight per rank). Target untouched.

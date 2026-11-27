@@ -94,3 +94,48 @@ def vocab_parallel_embedding(
         num_warps=8,
     )
     return output
+
+
+@triton.jit(
+    do_not_specialize=["num_rows"],
+    do_not_specialize_on_alignment=["input_ptr", "out_ptr"],
+)
+def _row_gather_kernel(
+    input_ptr,
+    weight_ptr,
+    out_ptr,
+    num_rows,
+    hidden_dim: tl.constexpr,
+    weight_stride0: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = cols < hidden_dim
+    token = tl.load(input_ptr + row).to(tl.int64)
+    values = tl.load(weight_ptr + token * weight_stride0 + cols, mask=mask)
+    tl.store(out_ptr + row * hidden_dim + cols, values, mask=mask)
+
+
+def small_row_gather(input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``F.embedding(input_, weight)`` (bit copies of the rows) for a few ids: one
+    program per (id, 1024 columns) instead of index_select's small-index kernel,
+    which walks the ids one dependent load at a time."""
+    num_rows = input_.numel()
+    hidden_dim = weight.shape[1]
+    out = torch.empty(
+        (*input_.shape, hidden_dim), dtype=weight.dtype, device=weight.device
+    )
+    if num_rows:
+        block_h = 1024
+        _row_gather_kernel[(num_rows, triton.cdiv(hidden_dim, block_h))](
+            input_.reshape(-1),
+            weight,
+            out,
+            num_rows,
+            hidden_dim=hidden_dim,
+            weight_stride0=weight.stride(0),
+            BLOCK_H=block_h,
+            num_warps=4,
+        )
+    return out

@@ -72,6 +72,20 @@ _is_npu = is_npu()
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
 # via the existing SGLANG_IS_IN_CI; off in production.
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
+# SGLANG_OPT_SPEC_RELAY_NATIVE_BONUS (only with the chain verify tree, which widens
+# them): an unchanged batch keeps the bonus tokens' own dtype.
+_RELAY_NATIVE_BONUS = (
+    envs.SGLANG_OPT_SPEC_RELAY_NATIVE_BONUS.get()
+    and envs.SGLANG_OPT_DSA_CHAIN_VERIFY_TREE.get()
+)
+# SGLANG_OPT_SPEC_SEQ_LENS_RELAY: rounds whose post-verify ran eagerly (fresh output
+# tensors) up to this many requests hand their new seq_lens to an unchanged next batch.
+_SEQ_LENS_RELAY_MAX_BS = (
+    (envs.SGLANG_OPT_SPEC_STEP_SEAMS_MAX_BS.get() or (1 << 30))
+    if envs.SGLANG_OPT_SPEC_SEQ_LENS_RELAY.get()
+    and envs.SGLANG_OPT_SPEC_EAGER_POST_VERIFY.get()
+    else 0
+)
 
 
 def spec_relay_bypass_enabled(
@@ -391,6 +405,9 @@ class FutureMap:
             tuple[torch.Tensor, RelayPayload, EagleDraftInput]
         ] = None
         self._relay: Optional[FutureRelayBuffers] = None
+        # (future_indices, new_seq_lens) of the last publish a next batch may take
+        # as its seq_lens (SGLANG_OPT_SPEC_SEQ_LENS_RELAY); the scatter still runs.
+        self._published_seq_lens: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         if (
             _offered_relay is not None
             and _offered_relay.new_seq_lens.shape[0] == self.req_pool_size
@@ -582,9 +599,10 @@ class FutureMap:
             # the worker left topk / hidden / bonus on this very draft input; the
             # gather would return the bonus in the relay buffer's dtype
             self._deferred_relay = None
-            draft_input.bonus_tokens = draft_input.bonus_tokens.to(
-                self.output_tokens_buf.dtype
-            )
+            if not _RELAY_NATIVE_BONUS:
+                draft_input.bonus_tokens = draft_input.bonus_tokens.to(
+                    self.output_tokens_buf.dtype
+                )
             if not draft_input.future_dsa_topk_indices_available:
                 draft_input.dsa_topk_indices = None
             return
@@ -699,6 +717,8 @@ class FutureMap:
             return
         if self.publish_ready is not None and stream_ordered:
             self._publish_fresh = False
+            if self._take_published_seq_lens(batch, fi):
+                return
         elif self.publish_ready is not None:
             if _DEBUG_ASSERT:
                 # Consume-once: every event wait must be re-armed by a fresh
@@ -746,6 +766,23 @@ class FutureMap:
             # mirror is not poisoned.
             _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
 
+    def _take_published_seq_lens(self, batch: ScheduleBatch, fi: torch.Tensor) -> bool:
+        """An unchanged batch (its rows and draft input the last round's) takes that
+        round's new seq_lens as they are: the gather of the rows just scattered
+        would return the same values in the same order."""
+        published, self._published_seq_lens = self._published_seq_lens, None
+        if (
+            published is None
+            or published[0] is not fi
+            or self.needs_cpu_seq_lens
+            or not self.takes_deferred_relay(batch)
+        ):
+            return False
+        batch.seq_lens = published[1].to(self.new_seq_lens_buf.dtype)
+        batch.seq_lens_cpu = None
+        batch.seq_lens_sum = None
+        return True
+
     def publish(
         self,
         future_indices: torch.Tensor,
@@ -755,6 +792,11 @@ class FutureMap:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
+        self._published_seq_lens = (
+            (indices, new_seq_lens)
+            if 0 < indices.shape[0] <= _SEQ_LENS_RELAY_MAX_BS
+            else None
+        )
         relay = self._relay
         if relay is not None and new_seq_lens is relay.published_seq_lens:
             relay.published_seq_lens = None
