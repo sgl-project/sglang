@@ -306,6 +306,40 @@ class TestModelSlimMapping(CustomTestCase):
             ):
                 self.make_linear(ModelSlimConfig(entries), "visual.attn.qkv_proj")
 
+    def test_single_shard_mapper_alias_is_not_an_ambiguous_layout(self):
+        """GLM-5.3-Flash describes a renamed tensor under checkpoint and runtime names.
+
+        forget_gate.f_a_proj is mapped to f_a_proj, so the single-shard packed
+        alias and the mapped whole entry name the same tensor, not a conflict.
+        """
+        parent = "model.language_model.layers.0.self_attn."
+        config = ModelSlimConfig(
+            {
+                parent + "forget_gate.f_a_proj." + field: value
+                for field, value in (
+                    ("weight", "W8A8"),
+                    ("weight_scale", "FLOAT"),
+                    ("input_scale", "FLOAT"),
+                )
+            }
+        )
+        config.apply_weight_name_mapper(
+            WeightsMapper(
+                orig_to_new_substr={".forget_gate.": "."},
+                orig_to_new_prefix={"model.language_model.": "model."},
+            )
+        )
+        config.update_packed_modules_mapping({"f_a_proj": ["forget_gate.f_a_proj"]})
+        runtime = "model.layers.0.self_attn.f_a_proj"
+        self.assertEqual(
+            config._resolve_linear_quant_prefixes(runtime),
+            [parent + "forget_gate.f_a_proj"],
+        )
+        layer = self.make_linear(config, runtime)
+        self.assertIsInstance(layer.quant_method, ModelSlimLinearMethod)
+        self.assertEqual(layer.weight.dtype, torch.int8)
+        self.assertTrue(hasattr(layer, "weight_scale"))
+
     def test_zero_width_components_are_optional_only_with_matching_sizes(self):
         """Allow missing V for sizes [8, 4, 0], but not for a shorter size list."""
         parent = "model.layers.0.self_attn."
