@@ -543,7 +543,9 @@ def _compute_logit_penalties(
         if frequency is not None:
             additive.addcmul_(counts, frequency, value=-1)
         if presence is not None:
-            additive.addcmul_(present, presence, value=-1)
+            mask = present.to(additive.dtype) if _is_npu else present
+            # aclnnInplaceAddcmul rejects DT_BOOL tensors; promote on NPU only.
+            additive.addcmul_(mask, presence, value=-1)
         if min_new_tokens is not None:
             stop_penalties = torch.zeros(
                 (counts.shape[0], vocab_size + 1), dtype=torch.float32, device=device

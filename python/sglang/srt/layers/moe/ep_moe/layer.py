@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import (
@@ -42,7 +41,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
@@ -54,8 +53,7 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 
 logger = logging.getLogger(__name__)
@@ -66,8 +64,6 @@ class DeepEPMoE(FusedMoE):
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
     Mooncake EP shares the same class, as they expose the same interface.
     """
-
-    _has_printed = False
 
     def __init__(
         self,
@@ -153,19 +149,7 @@ class DeepEPMoE(FusedMoE):
         if self.deprecate_flag:
             return
 
-        if isinstance(quant_config, Fp8Config):
-            self.use_block_quant = getattr(self.quant_method, "block_quant", False)
-            self.use_fp8_w8a8 = True
-            self.fp8_dtype = torch.float8_e4m3fn
-            self.use_w4afp8 = False
-        elif isinstance(quant_config, W4AFp8Config):
-            self.use_w4afp8 = True
-            self.use_fp8_w8a8 = False
-            self.use_block_quant = False
-        else:
-            self.use_w4afp8 = False
-            self.use_fp8_w8a8 = False
-            self.use_block_quant = False
+        self.use_w4afp8 = isinstance(quant_config, W4AFp8Config)
 
         self.deepep_mode = get_deepep_mode()
         if (
@@ -253,16 +237,6 @@ class DeepEPMoE(FusedMoE):
         combine_input = self.run_moe_core(dispatch_output)
         return self.dispatcher.combine(combine_input=combine_input)
 
-    def dispatch(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-    ):
-        return self.dispatcher.dispatch(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
-
     def run_moe_core(
         self,
         dispatch_output: DispatchOutput,
@@ -298,20 +272,6 @@ class DeepEPMoE(FusedMoE):
             hidden_states=output,
             topk_ids=dispatch_output.topk_ids,
             topk_weights=dispatch_output.topk_weights,
-        )
-
-    def combine(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        overlap_args: Optional[Dict[str, Any]] = None,
-    ):
-        return self.dispatcher.combine(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            overlap_args=overlap_args,
         )
 
     def forward_cutlass_w4afp8(

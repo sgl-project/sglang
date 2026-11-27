@@ -498,14 +498,12 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 assert sum(metrics.linker_prefetch_requests.values.values()) == 1
                 self._assert_balanced(cache, allocator)
 
-    def test_timeout_config_overrides_legacy_including_empty_object(self):
+    def test_timeout_config_including_empty_object(self):
         cache, backend, _, _ = self._fixture()
-        for config, legacy, expected in (
-            (None, '{"prefetch_timeout_base":2}', (2, 0.25)),
-            ({}, "@missing-legacy-config.json", (1, 0.25)),
+        for config, expected in (
+            ({}, (1, 0.25)),
             (
                 {"prefetch_timeout_base": 10, "prefetch_timeout_per_ki_token": 512},
-                "@missing-legacy-config.json",
                 (10, 512),
             ),
         ):
@@ -513,7 +511,6 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 self.subTest(config=config),
                 get_context().override_server_args(
                     unified_cache_external_linker_config=config,
-                    hicache_storage_backend_extra_config=legacy,
                 ),
             ):
                 cache.init_cache_linker(backend)
@@ -1840,6 +1837,23 @@ def test_restorable_prefix_intersects_sparse_rank_results():
     hit_pages = wrapper._sync_restorable_prefix([2, 4], num_pages=4, device_hit_pages=0)
 
     assert hit_pages == 2
+
+
+def test_restorable_prefix_ignores_candidates_outside_the_tail():
+    cache = _cache_for_wrapper(_all_reduce_attn_groups=lambda mask, op: None)
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+
+    # Candidates at or below the device hit and beyond the tail are dropped.
+    assert (
+        wrapper._sync_restorable_prefix(
+            [1, 2, 3, 5, 9], num_pages=5, device_hit_pages=2
+        )
+        == 5
+    )
+    assert (
+        wrapper._sync_restorable_prefix([1, 2, 9], num_pages=5, device_hit_pages=2) == 0
+    )
+    assert wrapper._sync_restorable_prefix([], num_pages=5, device_hit_pages=0) == 0
 
 
 def test_async_offload_pins_node_until_completion():
