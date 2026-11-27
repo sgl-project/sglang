@@ -299,8 +299,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if need_size > self.swa_attn_allocator.available_size():
             return None
 
+        full_free = self.full_attn_allocator.free_pages
+        full_released = self.full_attn_allocator.release_pages
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
-        alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+        try:
+            alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+        except RuntimeError:
+            self.full_attn_allocator.free_pages = full_free
+            self.full_attn_allocator.release_pages = full_released
+            raise
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
