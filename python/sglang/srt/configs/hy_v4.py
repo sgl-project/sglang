@@ -1,5 +1,30 @@
 from transformers.configuration_utils import PreTrainedConfig
 
+from sglang.srt.configs.hy_v4_vl_processing import HYV4VLProcessor
+from sglang.srt.multimodal.customized_mm_processor_utils import (
+    register_customized_processor,
+)
+
+
+def _resolve_final_logit_softcapping(
+    final_logit_softcapping, soft_logits_capping, soft_logits_capping_logits
+):
+    # Vendor configs gate the cap with soft_logits_capping and carry the value
+    # in soft_logits_capping_logits; the cap is off when the gate is falsy.
+    if not soft_logits_capping:
+        return final_logit_softcapping
+    if not soft_logits_capping_logits or soft_logits_capping_logits <= 0:
+        raise ValueError(
+            "HYV4 soft_logits_capping needs a positive soft_logits_capping_logits, "
+            f"got {soft_logits_capping_logits!r}"
+        )
+    if final_logit_softcapping not in (None, soft_logits_capping_logits):
+        raise ValueError(
+            f"HYV4 final_logit_softcapping={final_logit_softcapping!r} conflicts "
+            f"with soft_logits_capping_logits={soft_logits_capping_logits!r}"
+        )
+    return soft_logits_capping_logits
+
 
 class HYV4Config(PreTrainedConfig):
     model_type = "hy_v4"
@@ -46,9 +71,29 @@ class HYV4Config(PreTrainedConfig):
         swiglu_limit=10.0,
         rope_parameters=None,
         num_nextn_predict_layers=1,
+        mtp_quant_algo=None,
+        tie_word_embeddings=False,
+        final_logit_softcapping=None,
+        soft_logits_capping=False,
+        soft_logits_capping_logits=None,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        # PreTrainedConfig renames layer types to the installed Transformers'
+        # spelling (indexed_attention from 5.19), which its save validator requires.
+        super().__init__(
+            layer_types=(
+                layer_types
+                if layer_types is not None
+                else ["deepseek_sparse_attention"] * num_hidden_layers
+            ),
+            **kwargs,
+        )
+        self.tie_word_embeddings = tie_word_embeddings
+        self.final_logit_softcapping = _resolve_final_logit_softcapping(
+            final_logit_softcapping=final_logit_softcapping,
+            soft_logits_capping=soft_logits_capping,
+            soft_logits_capping_logits=soft_logits_capping_logits,
+        )
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -92,17 +137,13 @@ class HYV4Config(PreTrainedConfig):
         self.indexer_rope_interleave = True
         self.router_fp32 = True
         self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.mtp_quant_algo = mtp_quant_algo
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.head_dim = qk_rope_head_dim
         self.mlp_layer_types = (
             mlp_layer_types
             if mlp_layer_types is not None
             else ["dense"] + ["sparse"] * (num_hidden_layers - 1)
-        )
-        self.layer_types = (
-            layer_types
-            if layer_types is not None
-            else ["deepseek_sparse_attention"] * num_hidden_layers
         )
         self.indexer_types = (
             indexer_types
@@ -152,6 +193,10 @@ class HYV4Config(PreTrainedConfig):
             raise ValueError("HYV4 requires learnable attention sinks")
         if self.q_lora_rank is None:
             raise ValueError("HYV4 sparse attention requires q_lora_rank")
+        if self.tie_word_embeddings:
+            raise ValueError(
+                "HYV4 builds a separate lm_head; tie_word_embeddings=True is not supported"
+            )
 
 
 class HYV4VLVisionConfig(PreTrainedConfig):
@@ -188,8 +233,14 @@ class HYV4VLVisionConfig(PreTrainedConfig):
         add_patchemb_bias=True,
         video_spatial_compression=False,
         video_temporal_compression=False,
+        quantization_config=None,
         **kwargs,
     ):
+        if quantization_config is not None:
+            raise ValueError(
+                "HYV4 vision tower runs unquantized; "
+                "vision_config.quantization_config is not supported"
+            )
         super().__init__(**kwargs)
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -234,4 +285,103 @@ class HYV4VLVisionConfig(PreTrainedConfig):
             raise ValueError("HYV4 vision does not support video token compression")
 
 
-__all__ = ["HYV4Config", "HYV4VLVisionConfig"]
+@register_customized_processor(HYV4VLProcessor)
+class HYV4VLConfig(PreTrainedConfig):
+    model_type = "hy_v4_vl"
+    sub_configs = {"text_config": HYV4Config, "vision_config": HYV4VLVisionConfig}
+    keys_to_ignore_at_inference = ["past_key_values"]
+    ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
+
+    def __init__(
+        self,
+        text_config=None,
+        vision_config=None,
+        image_start_token_id=120118,
+        image_end_token_id=120119,
+        image_token_id=120120,
+        image_newline_token_id=120121,
+        video_start_token_id=120122,
+        video_end_token_id=120123,
+        video_token_id=120124,
+        **kwargs,
+    ):
+        metadata_keys = {"model_type", "architectures", "auto_map", "processor_class"}
+        # Serving reads these off the parent; the text model keeps its own copy.
+        serving_keys = {
+            "quantization_config",
+            "compression_config",
+            "language_model_only",
+        }
+        outer_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in metadata_keys | serving_keys
+        }
+        if isinstance(text_config, HYV4Config):
+            text_architectures = text_config.architectures
+        else:
+            text_architectures = (text_config or {}).get("architectures")
+            # Nested text fields take precedence; flat fields supply missing values.
+            text_kwargs = {**kwargs, **(text_config or {})}
+            for key in metadata_keys:
+                text_kwargs.pop(key, None)
+            rope = dict(text_kwargs.pop("rope_scaling", None) or {})
+            rope.update(text_kwargs.get("rope_parameters") or {})
+            rope.setdefault("rope_theta", 10000000.0)
+            rope.setdefault("rope_type", "default")
+            rope.setdefault("mrope_interleaved", True)
+            rope.setdefault("mrope_section", [12, 10, 10])
+            text_kwargs["rope_parameters"] = rope
+            text_config = HYV4Config(**text_kwargs)
+        # DeepseekV2 attention enables DSA (and builds indexers) by architecture.
+        if text_architectures is None:
+            text_architectures = ["HYV4ForCausalLM"]
+        if list(text_architectures) not in (
+            ["HYV4ForCausalLM"],
+            ["HYV4VLForConditionalGeneration"],
+        ):
+            raise ValueError(
+                "HYV4 VL text_config.architectures must be ['HYV4ForCausalLM'], "
+                f"['HYV4VLForConditionalGeneration'] or absent, got {text_architectures!r}"
+            )
+        text_config.architectures = ["HYV4ForCausalLM"]
+        super().__init__(**outer_kwargs)
+        self.text_config = text_config
+        self.vision_config = (
+            vision_config
+            if isinstance(vision_config, HYV4VLVisionConfig)
+            else HYV4VLVisionConfig(**(vision_config or {}))
+        )
+        if self.vision_config.out_hidden_size is None:
+            self.vision_config.out_hidden_size = text_config.hidden_size
+        if self.vision_config.out_hidden_size != text_config.hidden_size:
+            raise ValueError("HYV4 VL projector output must match text hidden_size")
+        self.vision_config.text_hidden_size = text_config.hidden_size
+        self.image_start_token_id = image_start_token_id
+        self.image_end_token_id = image_end_token_id
+        self.image_token_id = image_token_id
+        self.image_newline_token_id = image_newline_token_id
+        self.video_start_token_id = video_start_token_id
+        self.video_end_token_id = video_end_token_id
+        self.video_token_id = video_token_id
+        for name in (
+            "dtype",
+            "tie_word_embeddings",
+            "bos_token_id",
+            "eos_token_id",
+            "pad_token_id",
+        ):
+            setattr(self, name, getattr(text_config, name, None))
+        if self.architectures is None:
+            self.architectures = ["HYV4VLForConditionalGeneration"]
+
+    def __getattr__(self, name):
+        # DSA/MLA runtime helpers read text fields (index_topk, indexer_types, ...)
+        # off the parent config, so they resolve exactly as for HYV4ForCausalLM.
+        text_config = self.__dict__.get("text_config")
+        if text_config is None or name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(text_config, name)
+
+
+__all__ = ["HYV4Config", "HYV4VLConfig", "HYV4VLVisionConfig"]

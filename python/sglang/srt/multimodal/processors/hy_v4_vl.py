@@ -5,13 +5,17 @@ from typing import List, Optional, Union
 import torch
 from transformers.video_utils import VideoMetadata
 
+from sglang.srt.configs.hy_v4 import HYV4VLConfig
 from sglang.srt.configs.hy_v4_flash import HYV4FlashConfig
 from sglang.srt.configs.hy_v4_vl_processing import (
     vision_token_count,
     vision_token_grid,
 )
-from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
-from sglang.srt.models.hunyuan_v4_flash import HYV4FlashForConditionalGeneration
+from sglang.srt.managers.req_types import (
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
+from sglang.srt.models.hunyuan_v4_vl import HYV4VLForConditionalGeneration
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -33,7 +37,7 @@ def get_hy_v4_vl_mrope_positions(
     input_ids: List[int],
     image_grid_thw: List[List[int]],
     video_grid_thw: List[List[int]],
-    hf_config: HYV4FlashConfig,
+    hf_config: Union[HYV4VLConfig, HYV4FlashConfig],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tokens = torch.tensor(input_ids, dtype=torch.long)
     positions = torch.arange(len(input_ids)).repeat(3, 1)
@@ -135,8 +139,10 @@ def _collect_grids(
 
 
 class HYV4VLMultimodalProcessor(SGLangBaseProcessor):
-    models = [HYV4FlashForConditionalGeneration]
+    models = [HYV4VLForConditionalGeneration]
     video_preprocessing_device = "cpu"
+    # The checkpoint chat template renders text parts only.
+    string_content_media_placeholders = {"image": IMAGE_MARKER, "video": VIDEO_MARKER}
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -306,12 +312,12 @@ class HYV4VLMultimodalProcessor(SGLangBaseProcessor):
         input_ids = list(input_ids)
         for item in mm_items:
             pad_id = self.mm_tokens.get_token_id_by_modality(item.modality)
-            if item.pad_value is None:
-                continue
-            pad_values = set(item.padding_values())
             for start, end in item.offsets:
                 span = input_ids[start : end + 1]
-                if all(token in pad_values for token in span):
+                if item.pad_value is not None and (
+                    list(span) == list(item.padding_sequence(len(span)))
+                    or all(token == item.pad_value for token in span)
+                ):
                     input_ids[start : end + 1] = [pad_id] * len(span)
         return input_ids
 

@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""HYV4 vision tower (ViT + spatial-merge projector)."""
+"""Inference-only HYV4 VL model compatible with HuggingFace weights."""
 
-from typing import Iterable, Optional
+from array import array
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -22,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 
-from sglang.srt.configs.hy_v4 import HYV4VLVisionConfig
+from sglang.srt.configs.hy_v4 import HYV4VLConfig, HYV4VLVisionConfig
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
     VisionAttentionMetadata,
@@ -33,7 +34,19 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    prepare_mm_inputs,
+)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.hunyuan_v4 import (
+    HYV4_PACKED_MODULES_MAPPING,
+    HYV4ForCausalLM,
+    hyv4_mrope_rows_are_equal,
+)
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -374,3 +387,210 @@ class HYV4VisionTransformer(nn.Module):
                 weight_loader(param, loaded_weight)
             loaded.add(name)
         return loaded
+
+
+# No HYV4 text attention parameter is known to own these checkpoint norms;
+# fail instead of guessing a destination.
+_UNMAPPED_TEXT_NORM_NAMES = (".self_attn.query_layernorm.", ".self_attn.key_layernorm.")
+
+
+def _check_unquantized_vision_weight(name, loaded_weight):
+    # The tower is always built unquantized, so the default loader would cast
+    # quantized bytes to bf16 without their scales.
+    if (
+        "scale" in name.rsplit(".", 1)[-1]
+        or not loaded_weight.is_floating_point()
+        or loaded_weight.element_size() == 1
+    ):
+        raise ValueError(
+            "HYV4 vision tower runs unquantized; the checkpoint carries "
+            f"quantized vision tensor {name} ({loaded_weight.dtype})"
+        )
+
+
+# prepare_mm_inputs reads the embedding table off the language model.
+class HYV4VLLanguageModel(HYV4ForCausalLM):
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+
+class HYV4VLForConditionalGeneration(nn.Module):
+    packed_modules_mapping = HYV4_PACKED_MODULES_MAPPING
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "vit.vit.": "visual.",
+            "vit.": "visual.",
+            "model.": "language_model.model.",
+            "lm_head.": "language_model.lm_head.",
+        },
+        orig_to_new_substr={"mlp.gate.wg": "mlp.gate"},
+    )
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        return HYV4ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config.text_config, quant_config
+        )
+
+    def __init__(
+        self,
+        config: HYV4VLConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.pp_group = get_parallel().pp_group
+        self.language_model_only = getattr(config, "language_model_only", False)
+        # Only the first pipeline stage embeds the prompt.
+        if self.language_model_only or not self.pp_group.is_first_rank:
+            self.visual = None
+        else:
+            # The vision tower stays unquantized, including under FP8/MXFP8
+            # checkpoints (same split as the reference implementation).
+            self.visual = HYV4VisionTransformer(
+                config.vision_config,
+                quant_config=None,
+                prefix=add_prefix("visual", prefix),
+            )
+        self.is_mrope_enabled = (
+            not self.language_model_only
+            and "mrope_section" in config.text_config.rope_parameters
+        )
+        self.language_model = HYV4VLLanguageModel(
+            config.text_config,
+            quant_config,
+            prefix=add_prefix("language_model", prefix),
+            use_mrope=self.is_mrope_enabled,
+        )
+        # A DFly worker sets this here; the language model's stays None, so a
+        # verify drafts once, before its media and text are embedded.
+        self.dfly_execution = None
+
+    @property
+    def start_layer(self):
+        return self.language_model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.language_model.end_layer
+
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        if mm_inputs and mm_inputs.mm_items and self.language_model_only:
+            raise RuntimeError(
+                "HYV4 VL was loaded language_model_only; multimodal inputs are "
+                "not supported."
+            )
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        return self._get_visual_feature(items, "image_grid_thw")
+
+    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        return self._get_visual_feature(items, "video_grid_thw")
+
+    def _get_visual_feature(
+        self, items: List[MultimodalDataItem], grid_key: str
+    ) -> torch.Tensor:
+        if self.visual is None:
+            raise RuntimeError(
+                "HYV4 VL was loaded language_model_only; multimodal inputs are "
+                "not supported."
+            )
+        pixel_values = torch.cat([item.feature for item in items], dim=0)
+        grid_thw = torch.cat(
+            [getattr(item, grid_key) for item in items], dim=0
+        ).tolist()
+        embeddings = self.visual(pixel_values, grid_thw)
+        return torch.cat(embeddings, dim=0)
+
+    def prepare_cp_inputs(self, forward_batch: ForwardBatch, **kwargs):
+        """Embed text and media over the full sequence before the CP runner shards tokens."""
+        positions = (
+            forward_batch.mrope_positions
+            if self.is_mrope_enabled
+            else forward_batch.positions
+        )
+        input_embeds = kwargs.pop("input_embeds", None)
+        if input_embeds is None:
+            input_embeds = prepare_mm_inputs(
+                input_ids=forward_batch.input_ids,
+                forward_batch=forward_batch,
+                language_model=self.language_model,
+                kwargs=kwargs,
+                multimodal_model=self,
+            )
+        return input_embeds, positions, kwargs
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        if (
+            self.dfly_execution is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            self.dfly_execution.draft_into_verify(
+                input_ids=input_ids, forward_batch=forward_batch
+            )
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+            if hyv4_mrope_rows_are_equal(forward_batch.forward_mode):
+                positions = positions[0]
+            elif forward_batch.contains_mm_inputs() and (
+                positions is None or positions.ndim != 2 or positions.size(0) != 3
+            ):
+                raise ValueError(
+                    "HYV4 VL multimodal batches require (3, num_tokens) mRoPE "
+                    f"positions; got {None if positions is None else positions.size()}"
+                )
+        input_embeds = None
+        if not self.language_model_only:
+            input_embeds = prepare_mm_inputs(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.language_model,
+                kwargs={},
+                multimodal_model=self,
+            )
+        return self.language_model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # One pass over the checkpoint: the text loader keeps its cross-weight
+        # fusion state, and vision tensors load as they stream past it.
+        def language_weights():
+            for name, loaded_weight in self.hf_to_sglang_mapper.apply(weights):
+                if any(alias in name for alias in _UNMAPPED_TEXT_NORM_NAMES):
+                    raise ValueError(
+                        f"Unsupported HYV4 VL checkpoint weight {name}: text "
+                        "attention norms load as q_a_layernorm/kv_a_layernorm."
+                    )
+                if name.startswith("visual."):
+                    if self.visual is not None:
+                        _check_unquantized_vision_weight(name, loaded_weight)
+                        self.visual.load_weights(
+                            [(name.removeprefix("visual."), loaded_weight)]
+                        )
+                elif name.startswith("language_model."):
+                    yield name.removeprefix("language_model."), loaded_weight
+                else:
+                    raise ValueError(f"Unmapped HYV4 VL weight name: {name}")
+
+        self.language_model.load_weights(language_weights())
+
+
+EntryClass = [HYV4VLForConditionalGeneration]

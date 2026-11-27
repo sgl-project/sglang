@@ -18,6 +18,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -37,10 +38,7 @@ def _handle_pd_request(mode, req):
     scheduler.dllm_config = None
     scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
     scheduler._record_kv_event_lora_name = MagicMock()
-    scheduler.spec_algorithm = SimpleNamespace(
-        is_dflash_family=lambda: False,
-        is_uno=lambda: False,
-    )
+    scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
     scheduler._add_request_to_queue = MagicMock()
     scheduler.output_streamer = MagicMock()
     scheduler.tree_cache = MagicMock()
@@ -133,11 +131,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 )
                 scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
                 scheduler._record_kv_event_lora_name = MagicMock()
-                scheduler.spec_algorithm = SimpleNamespace(
-                    is_dflash_family=lambda: False,
-                    is_uno=lambda: False,
-                    is_none=lambda: True,
-                )
+                scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
                 scheduler.send_abort_output = MagicMock()
                 scheduler.output_streamer = MagicMock()
                 scheduler.tree_cache = MagicMock()

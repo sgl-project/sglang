@@ -598,7 +598,7 @@ def test_accept_commits_the_block_in_one_launch_into_the_accept_ring(
 
     def commit_block(**kwargs):
         launches.append(kwargs)
-        tokens, num_accept = worker_mod._commit_accept(
+        tokens, num_accept = worker_mod.commit_accept(
             kwargs["candidates"], kwargs["num_correct_drafts"], kwargs["bonus_tokens"]
         )
         kwargs["out_tokens"].copy_(tokens)

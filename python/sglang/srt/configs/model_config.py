@@ -217,6 +217,8 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
+            "HYV4ForCausalLMDFly",
+            "HYV4VLForConditionalGeneration",
             "HYV4FlashForConditionalGeneration",
             "Ernie5_5_MoeForCausalLM",
             "Ernie5_5_MoeForCausalLMNextN",
@@ -480,6 +482,32 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
+HYV4_ARCHS = (
+    "HYV4ForCausalLM",
+    "HYV4ForCausalLMNextN",
+    "HYV4VLForConditionalGeneration",
+)
+
+
+def hyv4_routed_experts_are_mxfp4(quant_cfg: dict) -> bool:
+    """HYV4 FP8 checkpoints declare the routed-expert format as ``expert_dtype``."""
+    expert_dtype = quant_cfg.get("expert_dtype")
+    if expert_dtype is None:
+        return False
+    if quant_cfg.get("quant_method") != "fp8" or expert_dtype not in ("fp8", "mxfp4"):
+        raise ValueError(
+            "HYV4 supports expert_dtype 'fp8' or 'mxfp4' under quant_method 'fp8'; "
+            f"got expert_dtype={expert_dtype!r}, "
+            f"quant_method={quant_cfg.get('quant_method')!r}"
+        )
+    if expert_dtype == "mxfp4" and quant_cfg.get("group_size", 32) != 32:
+        raise ValueError(
+            "HYV4 MXFP4 routed experts require group_size=32; "
+            f"got {quant_cfg['group_size']!r}"
+        )
+    return expert_dtype == "mxfp4"
+
+
 def is_ernie5_5(config) -> bool:
     return _hf_arch(config) in ERNIE5_5_ARCHS
 
@@ -501,13 +529,16 @@ def resolve_spec_hidden_size(
     hf_config, hidden_size: int, hc_mult: int
 ) -> tuple[int, Optional[int]]:
     # DSV4, ERNIE 5.5 and Qwen4-Exp carry the hc-flattened stream across the
-    # target->draft boundary; other hc models (hy_v4) collapse to hidden_size first.
-    if hc_mult <= 1 or not (
-        uses_compressed_kv_attention(hf_config) or is_qwen4_exp(hf_config)
-    ):
+    # target->draft boundary; hy_v4 collapses to hidden_size first but hands its
+    # pipeline stages the flattened streams.
+    if hc_mult <= 1:
         return hidden_size, None
     hc_hidden_size = hidden_size * hc_mult
-    return hc_hidden_size, hc_hidden_size
+    if uses_compressed_kv_attention(hf_config) or is_qwen4_exp(hf_config):
+        return hc_hidden_size, hc_hidden_size
+    if _hf_arch(hf_config) in HYV4_ARCHS:
+        return hidden_size, hc_hidden_size
+    return hidden_size, None
 
 
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
@@ -900,6 +931,11 @@ class ModelConfig:
         ):
             self.is_fp4_experts = True
             logger.info("Detected MiMo-V2 mxfp4 routed-expert layout.")
+
+        if not self.is_fp4_experts and _hf_arch(self.hf_config) in HYV4_ARCHS:
+            self.is_fp4_experts = hyv4_routed_experts_are_mxfp4(quantization_config)
+            if self.is_fp4_experts:
+                logger.info("Detected HYV4 MXFP4 routed experts (expert_dtype).")
 
         # DSV4 mxfp4 layout applies only when the ckpt does not opt in above.
         if is_deepseek_v4(self.hf_config) and routed_experts_quant_method is None:
@@ -1423,9 +1459,15 @@ class ModelConfig:
             self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] == "HYV4ForCausalLM":
-            self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
-            self.hf_config.num_nextn_predict_layers = 1
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "HYV4ForCausalLM",
+            "HYV4VLForConditionalGeneration",
+        ):
+            if self.speculative_algorithm == "DFLY":
+                self.hf_config.architectures[0] = "HYV4ForCausalLMDFly"
+            else:
+                self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
+                self.hf_config.num_nextn_predict_layers = 1
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
@@ -1619,6 +1661,8 @@ class ModelConfig:
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "HYV4ForCausalLM" in self.hf_config.architectures
             or "HYV4ForCausalLMNextN" in self.hf_config.architectures
+            or "HYV4ForCausalLMDFly" in self.hf_config.architectures
+            or "HYV4VLForConditionalGeneration" in self.hf_config.architectures
             or "HYV4FlashForConditionalGeneration" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
             or "Dots3NoteForCausalLM" in self.hf_config.architectures
@@ -2723,6 +2767,7 @@ multimodal_model_archs = [
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "GlmImageForConditionalGeneration",
+    "HYV4VLForConditionalGeneration",
     "HYV4FlashForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
@@ -2836,6 +2881,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "KimiK3ForConditionalGeneration",
     "KimiK31ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
+    "HYV4VLForConditionalGeneration",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
 ]

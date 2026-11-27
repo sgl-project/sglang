@@ -150,6 +150,36 @@ class TestSamplingMaskValidation(CustomTestCase):
             forwarded_counts.append(tokenized_request.top_logprobs_num)
         self.assertEqual(forwarded_counts, [5, 0, 0, 7])
 
+    def test_hy4_dfly_native_sampling_defaults_preserve_explicit_policy(self):
+        self.manager.model_config.vocab_size = 32
+        self.manager.model_config.token_id_vocab_size = 32
+        self.manager.model_config.hf_config = SimpleNamespace(
+            architectures=["HYV4VLForConditionalGeneration"]
+        )
+        self.manager.sampling_params_class = SamplingParams
+        self.manager.tokenizer = None
+        self.manager.fake_bootstrap_room_counter = 0
+        for preferred, requested, greedy in [
+            (None, {}, True),
+            (None, {"temperature": 0.9}, False),
+            ({"temperature": 0.9}, {}, False),
+            ({"temperature": 0.9}, {"temperature": 0}, True),
+        ]:
+            with (
+                self.subTest(preferred=preferred, requested=requested),
+                get_context().override_server_args(speculative_algorithm="DFLY"),
+            ):
+                self.manager.preferred_sampling_params = preferred
+                req = GenerateReqInput(input_ids=[1, 2], sampling_params=requested)
+                req.normalize_batch_and_arguments()
+                self.manager.rid_to_state = {
+                    req.rid: SimpleNamespace(time_stats=APIServerReqTimeStats())
+                }
+                tokenized = self.manager._create_tokenized_object(
+                    req, "", req.input_ids
+                )
+                self.assertEqual(tokenized.sampling_params.top_k == 1, greedy)
+
     def test_accepts_hard_exclusion(self):
         class BoundMask(DisallowedTokensLogitsProcessor):
             def __call__(self, logits, custom_param_list=None):

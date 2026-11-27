@@ -6,13 +6,118 @@ from typing import Any, Dict
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     is_attention_backend_not_set,
+    model_config_of,
     reject_dp_size_under_context_parallel,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
+
+
+def _reject_unsupported_hyv4_prefill_cp(cfg: Any, model_arch: str) -> None:
+    unsupported = []
+    if model_arch != "HYV4VLForConditionalGeneration":
+        unsupported.append(f"architecture={model_arch!r}")
+    cp_strategy = getattr(cfg, "cp_strategy", None)
+    if cp_strategy != "interleave":
+        unsupported.append(f"cp_strategy={cp_strategy!r}")
+    if cfg.pp_size > 1:
+        unsupported.append(f"pp_size={cfg.pp_size!r}")
+    if cfg.speculative_algorithm is not None:
+        unsupported.append(f"speculative_algorithm={cfg.speculative_algorithm!r}")
+    attn_dp_size = getattr(cfg, "attn_dp_size", 1) * getattr(cfg, "dp_size", 1)
+    if attn_dp_size > 1:
+        unsupported.append(f"attention DP size {attn_dp_size!r}")
+    if cfg.disaggregation_mode != "null":
+        unsupported.append(f"disaggregation_mode={cfg.disaggregation_mode!r}")
+    if unsupported:
+        raise ValueError(
+            "--enable-prefill-cp for HYV4 is qualified only for "
+            "HYV4VLForConditionalGeneration with --cp-strategy interleave, "
+            "without pipeline parallelism, speculative decoding, attention DP "
+            "or PD disaggregation. Got " + ", ".join(unsupported) + "."
+        )
+
+
+def _reject_unsupported_hyv4_dcp(cfg: Any, model_arch: str) -> None:
+    unsupported = []
+    if model_arch != "HYV4VLForConditionalGeneration":
+        unsupported.append(f"architecture={model_arch!r}")
+    if cfg.pp_size > 1:
+        unsupported.append(f"pp_size={cfg.pp_size!r}")
+    attn_dp_size = getattr(cfg, "attn_dp_size", 1) * getattr(cfg, "dp_size", 1)
+    if attn_dp_size > 1:
+        unsupported.append(f"attention DP size {attn_dp_size!r}")
+    # DCP auto-disables the prefill graph, but an explicit backend bypasses that
+    # cascade and capture then fails on the DCP-gathered q.
+    prefill_backend = cfg.cuda_graph_config.prefill.backend
+    if prefill_backend != Backend.DISABLED:
+        unsupported.append(f"prefill CUDA graph backend={prefill_backend!r}")
+    if unsupported:
+        raise ValueError(
+            "--dcp-size > 1 for HYV4 is qualified only for "
+            "HYV4VLForConditionalGeneration without pipeline parallelism, "
+            "attention DP or a prefill CUDA graph. Got " + ", ".join(unsupported) + "."
+        )
+
+
+def _hyv4_serves_media(cfg: Any, model_arch: str) -> bool:
+    # is_lm_only folds in both --language-model-only and the checkpoint flag.
+    return (
+        model_arch == "HYV4VLForConditionalGeneration"
+        and not model_config_of(cfg).is_lm_only
+    )
+
+
+def _reject_unsupported_hyv4_parallelism(cfg: Any, model_arch: str) -> None:
+    if cfg.enable_prefill_cp:
+        _reject_unsupported_hyv4_prefill_cp(cfg, model_arch)
+    if getattr(cfg, "dcp_size", 1) > 1:
+        _reject_unsupported_hyv4_dcp(cfg, model_arch)
+    if cfg.pp_size > 1 and cfg.speculative_algorithm is not None:
+        if not envs.SGLANG_ENABLE_PP_SPEC.get() or cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "--pp-size > 1 with speculative decoding is supported for HYV4 "
+                "only in aggregated serving with SGLANG_ENABLE_PP_SPEC=1, where "
+                "the last pipeline stage drafts; PD-prefill pipeline MTP is "
+                f"unqualified. Got architecture={model_arch!r}, "
+                f"pp_size={cfg.pp_size!r}, "
+                f"speculative_algorithm={cfg.speculative_algorithm!r}, "
+                f"disaggregation_mode={cfg.disaggregation_mode!r} and "
+                f"SGLANG_ENABLE_PP_SPEC={envs.SGLANG_ENABLE_PP_SPEC.get()!r}."
+            )
+        prefill_backend = cfg.cuda_graph_config.prefill.backend
+        if prefill_backend != Backend.DISABLED and _hyv4_serves_media(cfg, model_arch):
+            raise ValueError(
+                "A prefill CUDA graph with --pp-size > 1 and speculative decoding "
+                "is not supported for HYV4 VL multimodal serving: the graph captures the stage "
+                "hand-off without the media embeddings that the last-stage MTP "
+                "draft reads. Drop --cuda-graph-backend-prefill; pipeline "
+                "parallelism disables the prefill graph by default. "
+                f"Got prefill backend={prefill_backend!r}."
+            )
+
+
+def _reject_unsupported_hyv4_flash_parallelism(cfg: Any, model_arch: str) -> None:
+    if cfg.enable_prefill_cp:
+        raise ValueError(
+            "--enable-prefill-cp is not supported for HYV4 because its "
+            "attention path does not implement DSA context-parallel metadata "
+            f"and sharding. Got architecture={model_arch!r} and "
+            f"enable_prefill_cp={cfg.enable_prefill_cp!r}."
+        )
+    dcp_size = getattr(cfg, "dcp_size", 1)
+    if dcp_size > 1:
+        raise ValueError(
+            "--dcp-size > 1 is not supported for HYV4 because decode context "
+            "parallelism gathers query heads across DCP ranks but does not "
+            "provide single-owner semantics for learnable attention sinks. "
+            f"Got architecture={model_arch!r} and dcp_size={dcp_size!r}."
+        )
 
 
 def _dsa_dcp_overrides(cfg: Any) -> dict:
@@ -45,7 +150,8 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
 
 def _reject_unsupported_hyv4_flash(cfg: Any) -> None:
     unsupported = {
-        "speculative decoding": cfg.speculative_algorithm is not None,
+        "speculative decoding other than DFLY": cfg.speculative_algorithm
+        not in (None, "DFLY"),
         "DP attention": attn_dp_enabled_of(cfg),
         "--moe-a2a-backend": cfg.moe_a2a_backend != "none" or cfg.enable_waterfill,
         "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
@@ -69,6 +175,7 @@ def _reject_unsupported_hyv4_flash(cfg: Any) -> None:
     "Glm5NextForConditionalGeneration",
     "HYV4ForCausalLM",
     "HYV4ForCausalLMNextN",
+    "HYV4VLForConditionalGeneration",
     "HYV4FlashForConditionalGeneration",
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
@@ -82,39 +189,24 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Declare DeepSeek/DSA defaults; ordered CP, KV-cache, and MoE passes run in model_hook."""
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
+        HYV4_ARCHS,
         get_dsa_index_kpool,
+        hyv4_routed_experts_are_mxfp4,
         is_deepseek_dsa,
         is_kimi_k31,
         unwrap_modelopt_quantization_config,
     )
 
     model_arch = (getattr(hf_config, "architectures", None) or [None])[0]
-    if model_arch in (
-        "HYV4ForCausalLM",
-        "HYV4ForCausalLMNextN",
-        "HYV4FlashForConditionalGeneration",
-    ):
-        if cfg.enable_prefill_cp:
-            raise ValueError(
-                "--enable-prefill-cp is not supported for HYV4 because its "
-                "attention path does not implement DSA context-parallel metadata "
-                f"and sharding. Got architecture={model_arch!r} and "
-                f"enable_prefill_cp={cfg.enable_prefill_cp!r}."
-            )
-        dcp_size = getattr(cfg, "dcp_size", 1)
-        if dcp_size > 1:
-            raise ValueError(
-                "--dcp-size > 1 is not supported for HYV4 because decode context "
-                "parallelism gathers query heads across DCP ranks but does not "
-                "provide single-owner semantics for learnable attention sinks. "
-                f"Got architecture={model_arch!r} and dcp_size={dcp_size!r}."
-            )
-        if model_arch == "HYV4FlashForConditionalGeneration":
-            _reject_unsupported_hyv4_flash(cfg)
+    if model_arch in HYV4_ARCHS:
+        _reject_unsupported_hyv4_parallelism(cfg, model_arch)
+    elif model_arch == "HYV4FlashForConditionalGeneration":
+        _reject_unsupported_hyv4_flash_parallelism(cfg, model_arch)
+        _reject_unsupported_hyv4_flash(cfg)
 
     overrides: Dict[str, Any] = {}
 
-    if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+    if model_arch in HYV4_ARCHS:
         quant_cfg = getattr(hf_config, "quantization_config", None) or {}
         quant_algo = unwrap_modelopt_quantization_config(quant_cfg).get(
             "quant_algo", ""
@@ -132,6 +224,17 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     logger.info(
                         "HYV4 MXFP8: defaulting MoE/FP8 GEMM backends to deep_gemm."
                     )
+        elif (
+            hyv4_routed_experts_are_mxfp4(quant_cfg)
+            and cfg.moe_runner_backend == "auto"
+            and cfg.device == "cuda"
+            and cfg.moe_a2a_backend == "none"
+            and (get_platform().is_sm90 or get_platform().is_sm100)
+        ):
+            overrides["moe_runner_backend"] = "flashinfer_mxfp4"
+            logger.info(
+                "HYV4 MXFP4 experts: defaulting MoE backend to flashinfer_mxfp4."
+            )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         if not is_kimi_k31(hf_config):

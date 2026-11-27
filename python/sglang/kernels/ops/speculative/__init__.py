@@ -102,3 +102,12 @@ register_kernel(
 )
 
 __all__ = []
+
+register_kernel(
+    KernelSpec(
+        op="speculative.plan_dfly_inputs",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.dfly:plan_dfly_inputs",
+        capabilities=CUDA_ONLY,
+    )
+)

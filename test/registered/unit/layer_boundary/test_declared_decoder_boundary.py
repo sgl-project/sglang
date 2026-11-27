@@ -50,12 +50,14 @@ from sglang.srt.layers.layer_boundary.ops import (
     residual_slice_output,
     update_attn_tp_gather_output,
 )
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual import mhc as mhc_module
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_READOUT,
     PLAIN_RESIDUAL_OPS,
     REPLACE_AT_EXIT,
 )
+from sglang.srt.layers.layer_boundary.residual.ihc import IHCState
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -2095,6 +2097,186 @@ class TestTheFfnInputReduction(CustomTestCase):
                         update=update,
                     )
                 self.assertEqual(calls, [reduction])
+
+
+# ---------------------------------------------------------------------------
+# Gated hyper-connection streams, rank by rank.
+
+IHC_MULT = 3
+
+
+def _ihc_expand(hidden):
+    return hidden if hidden.ndim == 3 else hidden.unsqueeze(1).repeat(1, IHC_MULT, 1)
+
+
+def _ihc_pre(seed, seen_rows=None):
+    """A gated mix whose fp32 post gates depend on every stream of the row."""
+
+    def pre(streams, norm=None):
+        if seen_rows is not None:
+            seen_rows.append(streams.shape[0])
+        mix = torch.tanh(streams.flatten(1).sum(-1, keepdim=True) / 64 + seed)
+        gate = (mix + torch.arange(IHC_MULT) / 4).float()
+        mixed = (torch.sigmoid(gate).double().unsqueeze(-1) * streams).sum(1)
+        return norm(mixed), gate, streams
+
+    return pre
+
+
+def _ihc_post(output, streams, gate):
+    return gate.double().unsqueeze(-1) * output.unsqueeze(1) + streams
+
+
+def ihc_reference(embeddings, num_layers):
+    """The streams after ``num_layers`` of Norm / attention / FFN on one rank."""
+    streams = _ihc_expand(embeddings)
+    for _ in range(num_layers):
+        hidden, gate, streams = _ihc_pre(1)(streams, Norm())
+        streams = _ihc_post(3 * hidden, streams, gate)
+        hidden, gate, streams = _ihc_pre(2)(streams, Norm())
+        streams = _ihc_post(5 * hidden, streams, gate)
+    return streams
+
+
+class TestIHCLayersAcrossRanks(CustomTestCase):
+    """A dense layer then two MoE layers over attention TP: every rank ends
+    with the single-rank streams, with the residual on the attention's rows or,
+    for input-scattered attention, on each rank's slice."""
+
+    SPARSE = (False, True, True)
+
+    def run_world(self, *, attn_tp, rows, input_scattered=False, embeds=False):
+        world = World(attn_tp)
+        WORLD[0] = world
+        tp_group = Group(world, "tp", range(attn_tp))
+        # The runner pads an input-scattered batch to a multiple of the TP size.
+        padded = -(-rows // attn_tp) * attn_tp
+        generator = torch.Generator().manual_seed(0)
+        embeddings = torch.zeros(padded, HIDDEN).double()
+        embeddings[:rows] = torch.randint(
+            -4, 4, (rows, HIDDEN), generator=generator
+        ).double()
+        states = [
+            SimpleNamespace(
+                rank=rank,
+                parallel=parallel_of(
+                    attn_dp=1,
+                    attn_tp=attn_tp,
+                    tp_rank=rank,
+                    attn_tp_rank=rank,
+                    tp_group=tp_group,
+                    attn_tp_group=tp_group,
+                    enable_attn_tp_input_scattered=input_scattered,
+                ),
+                flags=ForwardFlags(),
+                calls=[],
+                seen_rows=[],
+                dp=0,
+                rows=padded,
+                offset=0,
+                local_rows=padded,
+                global_rows=padded,
+                dp_rows=[padded],
+            )
+            for rank in range(attn_tp)
+        ]
+        num_layers = len(self.SPARSE)
+
+        def forward(rank):
+            s = states[rank]
+            forward_batch = SimpleNamespace(
+                forward_mode=SimpleNamespace(
+                    is_context_parallel_extend=lambda: False,
+                    is_decode_or_idle=lambda: False,
+                ),
+                dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
+                global_dp_buffer_len=padded,
+                input_ids=torch.zeros(padded),
+            )
+            layers = []
+            for i, sparse in enumerate(self.SPARSE):
+                state = IHCState(
+                    expand=_ihc_expand,
+                    attn_pre=_ihc_pre(1, s.seen_rows),
+                    ffn_pre=_ihc_pre(2, s.seen_rows),
+                    attn_post=_ihc_post,
+                    ffn_post=_ihc_post,
+                )
+                layers.append(
+                    make_test_stages(
+                        **layer_case(
+                            i,
+                            num_layers,
+                            sparse=sparse,
+                            previous_sparse=i > 0 and self.SPARSE[i - 1],
+                            next_layer_sparse=i + 1 < num_layers and self.SPARSE[i + 1],
+                        ),
+                        attention_norm=Norm(),
+                        ffn_norm=Norm(),
+                        residual=state.residual_ops(),
+                    )
+                )
+            residual_batch.start(forward_batch)
+            if embeds:
+                # Embeddings handed in complete on every rank.
+                hidden = embeddings.clone()
+                if input_scattered:
+                    residual_batch.stream_of(forward_batch).record(
+                        hidden, comm.PLAIN_ADD
+                    )
+            elif input_scattered:
+                # The vocab-parallel embedding leaves its TP sum to the entry.
+                hidden = embeddings * WEIGHTS[attn_tp][rank]
+            else:
+                hidden = embeddings.clone()
+            for layer, sparse in zip(layers, self.SPARSE):
+                hidden = layer.attn.prepare(hidden, forward_batch)
+                hidden = layer.attn.finish(attention(hidden, s), forward_batch)
+                hidden = layer.ffn.prepare(hidden, forward_batch)
+                with layer.ffn.exit(forward_batch) as ffn_exit:
+                    hidden = moe(hidden, s) if sparse else dense_mlp(hidden, s)
+                    hidden = ffn_exit.finish(hidden)
+            return residual_batch.take_output(hidden, forward_batch)
+
+        with ExitStack() as stack:
+            stack.enter_context(running(reduce_scatterv=False))
+            stack.enter_context(
+                patch_communicator(
+                    "get_attn_tp_context",
+                    lambda: SimpleNamespace(
+                        input_scattered=input_scattered,
+                        is_dsa=True,
+                        set_attn_inputs=lambda x: None,
+                    ),
+                )
+            )
+            results, errors = world.run(states, forward)
+        for rank, error in enumerate(errors):
+            if error is not None:
+                raise AssertionError(f"rank {rank} raised") from error
+        want = ihc_reference(embeddings[:rows], num_layers)
+        for streams in results:
+            self.assertEqual(streams.shape, (padded, IHC_MULT, HIDDEN))
+            torch.testing.assert_close(streams[:rows], want, rtol=1e-12, atol=0)
+        self.assertEqual(len({tuple(s.calls) for s in states}), 1)
+        return [s.seen_rows for s in states], padded
+
+    def test_streams_match_one_rank_on_every_residual_layout(self):
+        for attn_tp, rows in itertools.product((2, 4), (8, 5)):
+            with self.subTest(attn_tp=attn_tp, rows=rows, layout="attention rows"):
+                seen, padded = self.run_world(attn_tp=attn_tp, rows=rows)
+                self.assertEqual({n for rank in seen for n in rank}, {padded})
+            for embeds in (False, True):
+                with self.subTest(
+                    attn_tp=attn_tp, rows=rows, layout="scattered", embeds=embeds
+                ):
+                    seen, padded = self.run_world(
+                        attn_tp=attn_tp, rows=rows, input_scattered=True, embeds=embeds
+                    )
+                    # Every gated read ran on this rank's slice only.
+                    self.assertEqual(
+                        {n for rank in seen for n in rank}, {padded // attn_tp}
+                    )
 
 
 if __name__ == "__main__":

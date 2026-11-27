@@ -203,6 +203,7 @@ def _request_stage(
 
     from sglang.srt.disaggregation.mode import DisaggregationMode
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     s = Scheduler.__new__(Scheduler)
     s.token_to_kv_pool_allocator = allocator
@@ -226,7 +227,7 @@ def _request_stage(
     s.metrics_reporter = NS(enable_metrics=False)
     s.tokenizer = s.dllm_config = None
     s._embedding_preserve_last_token_id = None
-    s.spec_algorithm = NS(is_dflash_family=lambda: False, is_uno=lambda: False)
+    s.spec_algorithm = SpeculativeAlgorithm.NONE
     s._maybe_namespace_elastic_radix_cache = lambda req: None
     s._record_kv_event_lora_name = lambda req, name: None
     s.invariant_checker = NS(expect_output=lambda req: None)

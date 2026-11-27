@@ -789,3 +789,12 @@ for _op, _module in (
         )
     )
 del _op, _module
+
+register_kernel(
+    KernelSpec(
+        op="attention.build_dfly_sparse_indices_stacked",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dfly:build_dfly_sparse_indices_stacked",
+        capabilities=CUDA_ONLY,
+    )
+)

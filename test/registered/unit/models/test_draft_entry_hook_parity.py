@@ -23,6 +23,7 @@ GATE_WITHOUT_COUNT = frozenset(
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
         "HYV4FlashForConditionalGeneration",
+        "HYV4VLForConditionalGeneration",
         "InternS2MobiusForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV",
