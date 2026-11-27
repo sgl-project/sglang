@@ -1059,6 +1059,7 @@ class Glm45Detector(BaseReasoningFormatDetector):
             "<eop>",
             "<|user|>",
             "<|endoftext|>",
+            "<|observation|>",
         ]
         super().__init__(
             "<think>",
