@@ -185,7 +185,16 @@ class SchedulerWeightUpdaterManager:
             self.scheduler.wait_for_launched_forward()
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners():
+            runners = self._select_runners()
+            # Reject before any runner writes, so a draft that cannot reload
+            # does not leave the target on new weights.
+            rejection = self._first_load_rejection(runners, "update_weights_from_disk")
+            if rejection is not None:
+                logger.error(rejection)
+                return UpdateWeightFromDiskReqOutput(
+                    success=False, message=rejection, num_paused_requests=0
+                )
+            for role, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_disk(
                     recv_req.model_path,
                     recv_req.load_format,
@@ -228,6 +237,15 @@ class SchedulerWeightUpdaterManager:
         if "draft" in roles and self.draft_worker is not None:
             runners += self.draft_worker.weight_update_runners()
         return runners
+
+    @staticmethod
+    def _first_load_rejection(runners: List[Tuple[str, Any]], op: str) -> Optional[str]:
+        """The first startup-determined, rank-uniform reason a runner refuses ``op``."""
+        for _, runner in runners:
+            rejection = runner.weight_updater.load_rejection(op)
+            if rejection is not None:
+                return rejection
+        return None
 
     def update_weights_from_distributed(
         self,
@@ -332,7 +350,13 @@ class SchedulerWeightUpdaterManager:
             self.scheduler.wait_for_launched_forward()
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners():
+            runners = self._select_runners()
+            rejection = self._first_load_rejection(runners, "update_weights_from_ipc")
+            if rejection is not None:
+                logger.error(rejection)
+                control_request_barrier()
+                return UpdateWeightsFromIPCReqOutput(success=False, message=rejection)
+            for role, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_ipc(
                     recv_req
                 )

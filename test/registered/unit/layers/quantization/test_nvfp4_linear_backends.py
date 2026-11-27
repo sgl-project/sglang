@@ -229,6 +229,27 @@ class TestNvFp4LinearBackends(CustomTestCase):
                     row_err = (out.float() - ref).norm(dim=1) / ref.norm(dim=1)
                     self.assertLess(row_err.max().item(), 0.02)
 
+    def test_online_cuda_graph_matches_eager(self):
+        # M=1 is the bs=1 decode graph: mm_fp4 takes its scalar-alpha path there.
+        torch.manual_seed(7)
+        with _cutedsl_backend():
+            layer = _make_online_layer(1024, 1024)
+            layer.quant_method.process_weights_after_loading(layer)
+            for m in (1, 2, 8):
+                with self.subTest(m=m):
+                    x = torch.randn((m, 1024), device="cuda", dtype=torch.bfloat16)
+                    eager, _ = layer(x)
+                    for _ in range(2):
+                        layer(x)
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        out, _ = layer(x)
+                    x.copy_(torch.randn_like(x))
+                    graph.replay()
+                    eager, _ = layer(x)
+                    torch.testing.assert_close(out, eager)
+
     def test_online_moe_model_keeps_dense_linears(self):
         with _cutedsl_backend():
             config = NvFp4OnlineConfig(quantize_dense_linears=False)
@@ -279,17 +300,28 @@ class TestNvFp4LinearBackends(CustomTestCase):
                     layer.weight.weight_loader(layer.weight, w)
                     layer.quant_method.process_weights_after_loading(layer)
                     self.assertEqual(layer.weight.dtype, dtype)
-                    self.assertIsNone(
-                        getattr(layer, "_derived_weight_cache_error", None)
-                    )
                     x = torch.randn((8, k), device="cuda", dtype=dtype)
                     out, _ = layer(x)
                     assert_output_close(self, out, x.float() @ w.float().T)
 
-    def test_online_quantized_layer_refuses_weight_updates(self):
+    def test_online_weight_update_rejection_depends_only_on_config(self):
+        # Every linear carries the marker, so a pipeline stage whose layers are
+        # all ignored or in source precision still refuses with the others.
+        prefix = "model.layers.0.mlp.up_proj"
         with _cutedsl_backend():
-            layer = _make_online_layer(256, 512)
-        self.assertIsNotNone(layer._derived_weight_cache_error)
+            converted = _make_online_layer(256, 512)
+            fallback = make_tp1_column_parallel_linear(NvFp4OnlineConfig(), 48, 512)
+            with envs.SGLANG_FP4_IGNORED_LAYERS.override(prefix):
+                ignored = make_tp1_column_parallel_linear(
+                    NvFp4OnlineConfig(), 256, 512, prefix=prefix
+                )
+            moe_dense = make_tp1_column_parallel_linear(
+                NvFp4OnlineConfig(quantize_dense_linears=False), 256, 512
+            )
+        self.assertIsInstance(ignored.quant_method, UnquantizedLinearMethod)
+        for layer in (converted, fallback, ignored):
+            self.assertIsNotNone(layer._derived_weight_cache_error)
+        self.assertIsNone(getattr(moe_dense, "_derived_weight_cache_error", None))
 
     def test_online_ignores_fused_layer_name(self):
         prefix = "model.layers.0.mlp.gate_up_proj"

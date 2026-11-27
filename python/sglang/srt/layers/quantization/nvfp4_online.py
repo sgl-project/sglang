@@ -65,6 +65,13 @@ def _nvfp4_weight_quantization_scope():
 
 NVFP4_MAX = float(torch.finfo(torch.float8_e4m3fn).max) * 6.0
 
+_DENSE_LINEAR_WEIGHT_UPDATE_ERROR = (
+    "Online weight updates are not supported while --quantization nvfp4_online "
+    "converts dense linear layers: their weights are packed to NVFP4 at load "
+    "time and cannot take checkpoint-format tensors. Restart the server to load "
+    "new weights."
+)
+
 
 class NvFp4OnlineConfig(ModelOptQuantConfig):
     """Load-time NVFP4 expert weights with online activation handling.
@@ -142,6 +149,13 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
             quantize_dense_linears or envs.SGLANG_NVFP4_ONLINE_DENSE_LINEAR.get()
         )
 
+    def converts_dense_linears(self) -> bool:
+        return (
+            self.use_per_token_activation
+            and self.quantize_dense_linears
+            and not self.is_checkpoint_fp8_serialized
+        )
+
     def _is_fp4_ignored(self, prefix: str) -> bool:
         # is_layer_skipped matches a fused layer only through its shard names,
         # so also accept the fused name itself (e.g. mlp.gate_up_proj).
@@ -194,6 +208,12 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 
         if isinstance(layer, LinearBase):
+            if self.converts_dense_linears():
+                # Packed [N, K/2] weights cannot take checkpoint-format [N, K]
+                # tensors again. Mark every linear, including ignored and
+                # fallback ones, so the rejection depends only on the config
+                # and every pipeline stage refuses before any of them writes.
+                layer._derived_weight_cache_error = _DENSE_LINEAR_WEIGHT_UPDATE_ERROR
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
@@ -202,11 +222,7 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
                 if self.is_checkpoint_fp8_serialized:
                     return Fp8LinearMethod(self)
                 return UnquantizedLinearMethod()
-            if (
-                self.use_per_token_activation
-                and self.quantize_dense_linears
-                and not self.is_checkpoint_fp8_serialized
-            ):
+            if self.converts_dense_linears():
                 return NvFp4OnlineLinearMethod(self)
             if self.is_checkpoint_fp8_serialized:
                 return Fp8LinearMethod(self)
@@ -292,15 +308,6 @@ class NvFp4OnlineLinearMethod(LinearMethodBase):
                 weight_loader=extra_weight_attrs.get("weight_loader"),
             ),
         )
-        # The packed [N, K/2] weight cannot take checkpoint-format [N, K]
-        # tensors again, so online weight updates are refused before they
-        # write anything.
-        layer._derived_weight_cache_error = (
-            "Online weight updates are not supported for dense linear layers "
-            "converted by --quantization nvfp4_online: their weights are packed "
-            "to NVFP4 at load time and cannot take checkpoint-format tensors. "
-            "Restart the server to load new weights."
-        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not self._is_quantized(layer):
@@ -350,13 +357,20 @@ class NvFp4OnlineLinearMethod(LinearMethodBase):
         from flashinfer import SfLayout, nvfp4_quantize
 
         out_features = layer.weight.shape[0]
+        x_2d = x.reshape(-1, x.shape[-1])
         x_fp4, x_scale, alpha = nvfp4_quantize(
-            x.reshape(-1, x.shape[-1]),
+            x_2d,
             layer.input_global_scale_inv,
             sfLayout=SfLayout.layout_128x4,
             per_token_activation=True,
             backend="cute-dsl",
             out_scale=layer.weight_scale_2,
+            # With one row, mm_fp4 takes its scalar-alpha path, which in
+            # FlashInfer < 0.7.6 reads alpha before griddepcontrol.wait; under
+            # PDL in a CUDA graph (bs=1 decode) the GEMM then writes zeros.
+            # Fixed upstream in flashinfer-ai/flashinfer#7288; drop this once
+            # the pin reaches 0.7.6.
+            enable_pdl=False if x_2d.shape[0] == 1 else None,
         )
         out = fp4_gemm(
             x_fp4,

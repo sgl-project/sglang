@@ -394,6 +394,34 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
+    def test_draft_rejection_blocks_disk_update_before_target_writes(self):
+        """A draft that refuses reloads must not leave the target on new weights."""
+        target, draft = _runner(), _runner()
+        draft.weight_updater.load_rejection.return_value = "draft refuses"
+        manager = self._manager(target, draft=draft, session=False)
+
+        output = manager.update_weights_from_disk(_request())
+
+        self.assertFalse(output.success)
+        self.assertEqual(output.message, "draft refuses")
+        target.weight_updater.update_weights_from_disk.assert_not_called()
+        self.assertEqual(self.recorded, [])
+
+    def test_draft_rejection_blocks_ipc_update_before_target_writes(self):
+        """The IPC refit checks every runner before the first write, like disk."""
+        target, draft = _runner(), _runner()
+        draft.weight_updater.load_rejection.return_value = "draft refuses"
+        manager = self._manager(target, draft=draft, session=False)
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
+        ):
+            output = manager.update_weights_from_ipc(_request())
+
+        self.assertFalse(output.success)
+        target.weight_updater.update_weights_from_ipc.assert_not_called()
+        self.assertEqual(self.recorded, [])
+
     def test_successful_distributed_update_records_the_version(self):
         """The distributed refit is the path an RL trainer actually drives, so it must record too."""
         manager = self._manager(_runner())
