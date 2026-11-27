@@ -214,3 +214,15 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
+_SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
+register_kernel(
+    KernelSpec(
+        op="activation.inkling2_nvfp4_swiglu_quant_bf16_lowm_sm120",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.activation.inkling2_swiglu_quant_lowm_sm120:"
+            "nvfp4_swiglu_quant_bf16_lowm"
+        ),
+        capabilities=_SM12X,
+    )
+)
