@@ -382,6 +382,55 @@ class TestConcurrentPrefillRequests(CustomTestCase):
         self.assertGreater(sent[1], 2)  # a round plus the two logprob probes
         self.assertEqual(peak[0], 1)
 
+    def test_one_tokenizer_worker_sends_the_unchunked_probes(self):
+        """Chunking off, no queue limit, eight tokenizer workers: if each sent
+        its 513-token probe, one rank could batch them into a 4,104-row forward,
+        past the 4,096 rows of an Ascend arch22 fused MoE prefill. One worker
+        sends the probes, one at a time."""
+        in_flight, peak = [], [0]
+
+        class _Worker(_RecordingTokenizerManager):
+            def generate_request(self, req, request):
+                self.requests.append(req)
+                in_flight.append(req)
+                peak[0] = max(peak[0], sum(len(r.input_ids) for r in in_flight))
+
+                async def finished():
+                    await asyncio.sleep(0)
+                    in_flight.remove(req)
+                    yield {}
+
+                return finished()
+
+        workers = [
+            _Worker(effective_chunked_prefill_size=None, tokenizer_worker_num=8)
+            for _ in range(8)
+        ]
+
+        async def start_all():
+            await asyncio.gather(*(concurrent_prefill("null", tm) for tm in workers))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            claims = []
+
+            def claim():
+                fd = warmup_mod._try_lock(os.path.join(tmp, "elected.lock"))
+                claims.append(fd)
+                return fd is not None
+
+            with (
+                mock.patch.object(warmup_mod, "_claim_tokenizer_worker_warmup", claim),
+                mock.patch.object(warmup_mod.tempfile, "gettempdir", return_value=tmp),
+                mock.patch.object(warmup_mod, "_TOKENIZER_WORKER_POLL_S", 0.001),
+            ):
+                asyncio.run(start_all())
+            for fd in claims:
+                if fd is not None:
+                    os.close(fd)
+        sent = sorted(([len(r.input_ids) for r in tm.requests] for tm in workers))
+        self.assertEqual(sent, [[]] * 7 + [[513, 512]])
+        self.assertEqual(peak[0], 513)
+
     def test_other_tokenizer_workers_wait_for_the_elected_warmup(self):
         """Two tokenizer workers start together with --max-queued-requests 1:
         the worker that loses the election goes on to serve and to its default

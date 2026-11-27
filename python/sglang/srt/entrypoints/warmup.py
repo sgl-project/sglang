@@ -447,18 +447,22 @@ async def concurrent_prefill(
             return
         turn = None
         try:
-            if limits.max_queued_requests is not None and limits.tokenizer_workers > 1:
-                # The plan bounds one sender's requests per rank queue, so one
-                # worker sends it. The workers take this lock in turn and the
-                # elected one keeps it until its warmup ends (or it exits), so
-                # no worker serves or sends its default warmup before then.
+            if limits.tokenizer_workers > 1 and (
+                limits.max_queued_requests is not None
+                or limits.chunked_prefill_size is None
+            ):
+                # The plan bounds one sender's requests per rank queue, and
+                # without chunking one sender's probes per forward (several
+                # workers' probes would batch into one), so one worker sends it.
+                # The workers take this lock in turn and the elected one keeps
+                # it until its warmup ends (or it exits), so no worker serves or
+                # sends its default warmup before then.
                 turn = await _wait_for_lock(
                     _tokenizer_worker_lock_path(".turn"), _TOKENIZER_WORKER_WAIT_S
                 )
                 if not _claim_tokenizer_worker_warmup():
                     logger.info(
-                        "Skipping concurrent_prefill: another tokenizer worker runs "
-                        "it under the request queue limit"
+                        "Skipping concurrent_prefill: another tokenizer worker runs it"
                     )
                     return
             logger.info(
