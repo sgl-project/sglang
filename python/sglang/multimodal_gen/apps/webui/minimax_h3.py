@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
+    PiH3PipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
@@ -31,6 +32,13 @@ def is_minimax_h3(server_args: "ServerArgs") -> bool:
 
 
 def minimax_h3_tasks_for_server(server_args: "ServerArgs") -> tuple[str, ...]:
+    if isinstance(getattr(server_args, "pipeline_config", None), PiH3PipelineConfig):
+        # pi-H3 variants (2step, 4step, ...) name step counts; all are FL2VA
+        return tuple(
+            task
+            for task, task_partition in MINIMAX_H3_TASK_PARTITIONS.items()
+            if task_partition == "fl2va"
+        )
     variant = server_args.model_variant
     if variant is None and server_args.model_subfolder:
         variant = os.path.basename(os.path.normpath(server_args.model_subfolder))

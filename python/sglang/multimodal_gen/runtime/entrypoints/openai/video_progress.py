@@ -53,12 +53,7 @@ VIDEO_PROGRESS = VideoProgressTracker()
 
 async def apply_progress(job_id: str, progress: int) -> None:
     """Mark a queued/running job in_progress; progress only increases and is capped at 99."""
-    job = await VIDEO_STORE.get(job_id)
-    # no await between the check and the write, so a completed, failed or
-    # deleted job cannot be overwritten here
-    if job is not None and job["status"] in ("queued", "in_progress"):
-        job["status"] = "in_progress"
-        job["progress"] = max(job["progress"], min(progress, 99))
+    await VIDEO_STORE.record_scheduler_progress(job_id, progress)
 
 
 async def run_progress_listener(endpoint: str) -> None:
