@@ -747,11 +747,9 @@ class T5RelativeAttentionLogitBias(nn.Module):
             relative_position > self.max_distance - 1, self.max_distance - 1
         )
 
-        # mapping from relative position to index in the bias parameter
-        if self._skip_bucketing:
-            bias_idx = relative_position
-        else:
-            bias_idx = self._bucket_relative_position(relative_position)
+        # Bucketed positions are rejected in __init__, so the relative position
+        # indexes the bias parameter directly.
+        bias_idx = relative_position
         if self.symmetric:
             bias_idx = bias_idx.abs()
         else:
@@ -761,44 +759,6 @@ class T5RelativeAttentionLogitBias(nn.Module):
         t5_rel_att_bias = t5_rel_att_bias.permute(2, 0, 1).unsqueeze(0)  # [1, H, L, L]
 
         return t5_rel_att_bias
-
-    def _bucket_relative_position(self, relative_position):
-        # this is a placeholder (isn't tested, likely buggy) using HuggingFace
-        # implem as a reference this also needs to be extended to support
-        # asymmetric +/- ve positions
-        relative_buckets = 0
-        if not self.causal:
-            self.num_buckets //= 2
-            relative_buckets += (relative_position > 0).to(
-                torch.long
-            ) * self.num_buckets
-            relative_position = torch.abs(relative_position)
-        else:
-            relative_position = -torch.min(
-                relative_position, torch.zeros_like(relative_position)
-            )
-        # now relative_position is in the range [0, inf)
-
-        # half of the buckets are for exact increments in positions
-        max_exact = self.num_buckets // 2
-        is_small = relative_position < max_exact
-
-        # The other half of the buckets are for logarithmically bigger bins in
-        # positions up to max_distance
-        relative_position_if_large = max_exact + (
-            torch.log(relative_position.float() / max_exact)
-            / math.log(self.max_distance / max_exact)
-            * (self.num_buckets - max_exact)
-        ).to(torch.long)
-        relative_position_if_large = torch.min(
-            relative_position_if_large,
-            torch.full_like(relative_position_if_large, self.num_buckets - 1),
-        )
-
-        relative_buckets += torch.where(
-            is_small, relative_position, relative_position_if_large
-        )
-        return relative_buckets
 
 
 class AbsolutePositionalEncoding(nn.Module):
@@ -1083,8 +1043,6 @@ class NemoConvSubsampling(torch.nn.Module):
         super().__init__()
         self._subsampling = subsampling
         self._conv_channels = conv_channels
-        self._feat_in = feat_in
-        self._feat_out = feat_out
 
         if subsampling_factor % 2 != 0:
             raise ValueError("Sampling factor should be a multiply of 2!")
@@ -1358,12 +1316,6 @@ class NemoConvSubsampling(torch.nn.Module):
 
         self.conv = torch.nn.Sequential(*layers)
 
-    def get_sampling_frames(self):
-        return [1, self.subsampling_factor]
-
-    def get_streaming_cache_size(self):
-        return [0, self.subsampling_factor + 1]
-
     def forward(self, x, mask):
         """
         Forward method for NeMo subsampling.
@@ -1431,31 +1383,6 @@ class NemoConvSubsampling(torch.nn.Module):
             padding_length.size(0), -1
         ) < padding_length.unsqueeze(1)
         return x, pad_mask.unsqueeze(1)
-
-    def reset_parameters(self):
-        # initialize weights
-        if self._subsampling == "dw_striding":
-            with torch.no_grad():
-                # init conv
-                scale = 1.0 / self._kernel_size
-                dw_max = (self._kernel_size**2) ** -0.5
-                pw_max = self._conv_channels**-0.5
-
-                torch.nn.init.uniform_(self.conv[0].weight, -scale, scale)
-                torch.nn.init.uniform_(self.conv[0].bias, -scale, scale)
-
-                for idx in range(2, len(self.conv), 3):
-                    torch.nn.init.uniform_(self.conv[idx].weight, -dw_max, dw_max)
-                    torch.nn.init.uniform_(self.conv[idx].bias, -dw_max, dw_max)
-                    torch.nn.init.uniform_(self.conv[idx + 1].weight, -pw_max, pw_max)
-                    torch.nn.init.uniform_(self.conv[idx + 1].bias, -pw_max, pw_max)
-
-                # init fc (80 * 64 = 5120 from https://github.com/kssteven418/
-                # Squeezeformer/blob/13c97d6cf92f2844d2cb3142b4c5bfa9ad1a8951/
-                # src/models/conformer_encoder.py#L487
-                fc_scale = (self._feat_out * self._feat_in / self._sampling_num) ** -0.5
-                torch.nn.init.uniform_(self.out.weight, -fc_scale, fc_scale)
-                torch.nn.init.uniform_(self.out.bias, -fc_scale, fc_scale)
 
     def conv_split_by_batch(self, x):
         """Tries to split input by batch, run conv and concat results"""
@@ -1561,19 +1488,6 @@ class NemoConvSubsampling(torch.nn.Module):
 
         return torch.cat(out_chunks, 1)
 
-    def change_subsampling_conv_chunking_factor(
-        self, subsampling_conv_chunking_factor: int
-    ):
-        if (
-            subsampling_conv_chunking_factor != -1
-            and subsampling_conv_chunking_factor != 1
-            and subsampling_conv_chunking_factor % 2 != 0
-        ):
-            raise ValueError(
-                "subsampling_conv_chunking_factor should be -1, 1, or a power of 2"
-            )
-        self.subsampling_conv_chunking_factor = subsampling_conv_chunking_factor
-
 
 def calc_length(lengths, all_paddings, kernel_size, stride, ceil_mode, repeat_num=1):
     """Calculates the output length of a Tensor passed through a convolution or
@@ -1673,21 +1587,12 @@ class MultiHeadedAttention(nn.Module):
         self.linear_v = nn.Linear(n_value, attention_inner_dim // group_size)
         self.linear_out = nn.Linear(attention_inner_dim // group_size, n_value)
 
-        self.attn = torch.jit.Attribute(None, Optional[Tensor])
         self.dropout = nn.Dropout(p=dropout_rate)
         self.dropout_rate = dropout_rate
         self.use_pt_scaled_dot_product_attention = use_pt_scaled_dot_product_attention
 
         if use_pt_scaled_dot_product_attention and group_size > 1:
             raise ValueError("Cannot use PT Scaled Attention with GQA")
-
-        # Torchscript eager quantization.  Note that these functions below are
-        # NOOPs and have very little impact on performance unless quantization
-        # is enabled.
-        self.quant_q = torch.ao.quantization.QuantStub()
-        self.quant_x = torch.ao.quantization.QuantStub()
-        self.dequant = torch.ao.quantization.DeQuantStub()
-        self.ffunc = torch.ao.nn.quantized.FloatFunctional()
 
     def forward(
         self,
@@ -1787,8 +1692,6 @@ class MultiHeadedAttention(nn.Module):
 
             attn = masked_softmax(scores, mask)  # (batch, head, time1, time2)
 
-            self.attn = attn
-
             p_attn = self.dropout(attn)
             x = torch.matmul(p_attn.to(v.dtype), v)  # (batch, head, time1, d_k)
             if pos_v is not None:
@@ -1821,25 +1724,6 @@ class MultiSequential(torch.nn.Sequential):
         for m in self:
             args = m(*args)
         return args
-
-
-def get_offset(input_layer: str, time_reduction: int):
-    """Get an offset. We will use the offset for determining #frames of a
-    subsampled feature.
-
-    Args:
-        input_layer (str): Type of an input layer
-        time_reduction (int): time reduction factor for downsampling a feature
-    Returns:
-        int: offset
-    """
-    if input_layer in ("conv2d", "nemo_conv") and time_reduction == 4:
-        return 3
-    if input_layer in ("conv2d",) and time_reduction == 6:
-        return 1
-    if input_layer in ("conv2d", "nemo_conv") and time_reduction == 8:
-        return 7
-    return 0
 
 
 def unfold_tensor(xs_pad, max_seq_len):
