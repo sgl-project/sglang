@@ -109,6 +109,18 @@ Image models generate one image request as a bounded denoising job, usually with
     mode="card"
     href="/cookbook/diffusion/HiDream/HiDream-O1-Image"
   />
+  <Card
+    title="JoyAI-Image-Edit"
+    icon="image"
+    mode="card"
+    href="/cookbook/diffusion/JoyAI-Image/JoyAI-Image-Edit"
+  />
+  <Card
+    title="FireRed-Image-Edit"
+    icon="image"
+    mode="card"
+    href="/cookbook/diffusion/FireRed/FireRed-Image-Edit"
+  />
 </CardGroup>
 
 ## Video Models
@@ -171,6 +183,12 @@ Video models denoise a bounded latent video sequence for each request. Use these
     img="/cards/logos/inclusionai.png"
   />
   <Card
+    title="MAGI-2-preview"
+    icon="video"
+    mode="card"
+    href="/cookbook/diffusion/MAGI/MAGI-2"
+  />
+  <Card
     title="Kandinsky 6"
     icon="video"
     mode="card"
@@ -199,6 +217,19 @@ Realtime models keep a session alive and generate chunk by chunk with causal sta
     title="HY-Nomas"
     mode="card"
     href="/cookbook/diffusion/HY-Nomas/HY-Nomas"
+    img="/cards/logos/tencent.png"
+  />
+</CardGroup>
+
+## 3D Models
+
+3D models turn a reference image into a mesh: a diffusion model generates the shape latent, and an optional texture stage paints it.
+
+<CardGroup cols={3}>
+  <Card
+    title="Hunyuan3D 2"
+    mode="card"
+    href="/cookbook/diffusion/Tencent/Hunyuan3D-2"
     img="/cards/logos/tencent.png"
   />
 </CardGroup>

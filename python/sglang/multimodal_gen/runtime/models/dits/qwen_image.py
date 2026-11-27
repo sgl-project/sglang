@@ -34,10 +34,7 @@ from sglang.kernels.ops.diffusion import (
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
-from sglang.multimodal_gen.runtime.distributed import (
-    get_local_torch_device,
-    get_tp_world_size,
-)
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
@@ -946,6 +943,7 @@ class QwenImageCrossAttention(nn.Module):
         # self-attention: Q/K/V are concatenated before the kernel call.
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=self.num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -2338,10 +2336,6 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             prefix="proj_out",
         )
 
-        self.timestep_zero = torch.zeros(
-            (1,), dtype=torch.int, device=get_local_torch_device()
-        )
-
         self.layer_names = ["transformer_blocks"]
 
     def post_load_weights(self) -> None:
@@ -2450,7 +2444,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         timestep = (timestep / 1000).to(hidden_states.dtype)
 
         if self.zero_cond_t:
-            timestep = torch.cat([timestep, self.timestep_zero], dim=0)
+            timestep = torch.cat([timestep, torch.zeros_like(timestep)], dim=0)
             device = timestep.device
             modulate_index = self.build_modulate_index(to_hashable(img_shapes), device)
         else:
