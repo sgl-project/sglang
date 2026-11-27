@@ -115,7 +115,9 @@ def fused_experts_none_to_marlin(
         assert runner_config.activation in {
             "silu",
             "situ",
-        }, f"Only gated SiLU/SiTU is supported, got {runner_config.activation}."
+            "gelu",
+            "gelu_tanh",
+        }, f"Only gated SiLU/SiTU/GELU is supported, got {runner_config.activation}."
     elif runner_config.activation not in {"silu", "relu2"}:
         raise ValueError(
             f"Unsupported Marlin MoE activation: {runner_config.activation}"
