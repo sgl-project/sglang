@@ -1,5 +1,8 @@
 """A cache-free prefill outside the ModelRunner (prefill_only)."""
 
+import sys
+
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -92,3 +95,7 @@ def test_radix_attention_runs_through_the_callers_attention():
 
     assert calls == [SEQ_LENS]
     torch.testing.assert_close(out.view(-1, Q_HEADS, DIM), _reference(q, k, v, 0.3))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
