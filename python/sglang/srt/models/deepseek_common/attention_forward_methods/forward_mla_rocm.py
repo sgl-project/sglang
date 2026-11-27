@@ -244,6 +244,10 @@ def _gfx950_absorb_bmm_config(m: int, k: int) -> dict:
     }
 
 
+# The (heads, K, N) of w that _gfx950_absorb_bmm_config was swept at.
+_GFX950_ABSORB_BMM_SHAPES = frozenset({(16, 256, 512), (16, 512, 256)})
+
+
 def _gfx950_absorb_bmm(x: torch.Tensor, w: torch.Tensor, out=None) -> torch.Tensor:
     """``x [B, M, K] @ w [B, K, N]`` with aiter's Triton bf16 batched GEMM."""
     return batched_gemm_bf16(
@@ -266,6 +270,12 @@ def _bf16_absorb_bmm_ok(*, x: torch.Tensor, w: torch.Tensor, w_scale) -> bool:
         and w_scale == 1.0
         and x.shape[0] <= _ABSORB_BMM_DECODE_MAX_M
         and not is_in_tc_piecewise_cuda_graph()
+    )
+
+
+def _gfx950_absorb_bmm_ok(*, x: torch.Tensor, w: torch.Tensor, w_scale) -> bool:
+    return tuple(w.shape) in _GFX950_ABSORB_BMM_SHAPES and _bf16_absorb_bmm_ok(
+        x=x, w=w, w_scale=w_scale
     )
 
 
@@ -333,7 +343,7 @@ def rocm_absorb_q_bmm(
                 WQ=attn.w_kc.transpose(1, 2),
                 backend="gluon" if q_nope.shape[0] <= 4 else "triton",
             )
-        elif _use_gfx950_absorb_bmm and _bf16_absorb_bmm_ok(
+        elif _use_gfx950_absorb_bmm and _gfx950_absorb_bmm_ok(
             x=q_nope, w=attn.w_kc, w_scale=attn.w_scale
         ):
             q_nope_out = _gfx950_absorb_bmm(q_nope.transpose(0, 1), attn.w_kc)
@@ -427,7 +437,7 @@ def rocm_absorb_v_bmm(
                     YQ=_bmm_buf.transpose(0, 1),
                     backend="gluon",
                 )
-            elif _use_gfx950_absorb_bmm and _bf16_absorb_bmm_ok(
+            elif _use_gfx950_absorb_bmm and _gfx950_absorb_bmm_ok(
                 x=attn_output, w=attn.w_vc, w_scale=attn.w_scale
             ):
                 _gfx950_absorb_bmm(

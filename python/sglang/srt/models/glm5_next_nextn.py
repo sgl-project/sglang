@@ -14,8 +14,12 @@
 
 import logging
 
+from sglang.srt.models.deepseek_common.utils import _use_aiter_gfx95
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
-from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+from sglang.srt.models.glm5_next import (
+    Glm5NextForConditionalGeneration,
+    _dsa_qproj_to_bf16,
+)
 from sglang.srt.models.utils import WeightsMapper
 
 logger = logging.getLogger(__name__)
@@ -95,6 +99,11 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
         return Glm5NextForConditionalGeneration.load_weights(
             self, nextn_weights, is_nextn=True
         )
+
+    def post_load_weights(self, is_nextn=True, weight_names=None):
+        super().post_load_weights(is_nextn=True, weight_names=weight_names)
+        if _use_aiter_gfx95:
+            _dsa_qproj_to_bf16(self)
 
 
 EntryClass = [Glm5NextForConditionalGenerationNextN]

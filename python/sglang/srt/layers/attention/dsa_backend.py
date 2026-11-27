@@ -2028,17 +2028,20 @@ class DeepseekSparseAttnBackend(
         # causal chain from the top-k plan), so declare it unread: the worker
         # then builds a topk=1 chain with one kernel instead of filling a
         # seq_lens_sum-wide FULL_MASK.
-        from sglang.srt.layers.attention.verify_mask import maybe_create_verify_mask
+        if _is_hip:
+            from sglang.srt.layers.attention.verify_mask import (
+                maybe_create_verify_mask,
+            )
 
-        self._verify_mask = maybe_create_verify_mask(
-            is_draft_runner=self._is_draft_runner,
-            skip_prefill=self._skip_prefill,
-            max_bs=max_bs,
-            max_context_len=self.max_context_len,
-            num_draft_tokens=self.speculative_num_draft_tokens,
-            device=self.device,
-            is_read=False,
-        )
+            self._verify_mask = maybe_create_verify_mask(
+                is_draft_runner=self._is_draft_runner,
+                skip_prefill=self._skip_prefill,
+                max_bs=max_bs,
+                max_context_len=self.max_context_len,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                device=self.device,
+                is_read=False,
+            )
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices

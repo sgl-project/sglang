@@ -149,7 +149,8 @@ logger = logging.getLogger(__name__)
 def _dsa_qproj_to_bf16(model: nn.Module) -> None:
     """Dequantize the DSA layers' FP8 block-128 q_a (fused with kv_a) and q_b
     projections to bf16 before the loader's post-load pass; the forward then takes
-    the bf16 RMSNorm path and skips the activation group quant."""
+    the bf16 RMSNorm path and skips the activation group quant. A projection whose
+    weight process_weights_after_loading already re-laid out stays FP8."""
     n = 0
     for module in model.modules():
         for name in ("fused_qkv_a_proj_with_mqa", "q_b_proj"):
@@ -161,6 +162,8 @@ def _dsa_qproj_to_bf16(model: nn.Module) -> None:
                 or list(method.weight_block_size or ()) != [128, 128]
                 or scale is None
                 or proj.weight.dtype != torch.float8_e4m3fn
+                or getattr(proj, "aiter_bpreshuffled", False)
+                or getattr(proj, "block_fp8_mxfp8_ready", False)
             ):
                 continue
             rows, cols = proj.weight.shape
@@ -2147,7 +2150,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
             )
-        if _use_aiter_gfx95:
+        if _use_aiter_gfx95 and isinstance(self, nn.Module):
             _dsa_qproj_to_bf16(self)
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
@@ -2158,6 +2161,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         )
         # Loaders that skip load_weights (dummy, sharded state, remote instance)
         # call only this.
+        if _use_aiter_gfx95:
+            _dsa_qproj_to_bf16(self)
         if not is_nextn:
             self._prepare_fused_decode_layers()
 
