@@ -109,6 +109,22 @@ def _use_exact_chunk_fill() -> bool:
     return is_gfx95_supported()
 
 
+def uses_exact_chunk_fill(
+    tree_cache: BasePrefixCache, dllm_config: Optional[DllmConfig]
+) -> bool:
+    """Whether `PrefillAdder` cuts a chunk at the token budget itself; otherwise
+    it rounds the chunk down to whole pages."""
+    # Mamba checkpoints only land on page-aligned chunk ends.
+    # Exact fill ends a chunk off the page grid; deterministic mode keeps chunk
+    # ends on pages, which some batch-invariant kernels depend on.
+    return (
+        _use_exact_chunk_fill()
+        and dllm_config is None
+        and not (tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing())
+        and not get_exec().deterministic.enable_deterministic_inference
+    )
+
+
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (against existing cache) less than this value,
 # the scheduler runs the in-batch prefix caching check for this request.
@@ -1117,17 +1133,7 @@ class PrefillAdder:
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
-        # Mamba checkpoints only land on page-aligned chunk ends.
-        # Exact fill ends a chunk off the page grid; deterministic mode keeps chunk
-        # ends on pages, which some batch-invariant kernels depend on.
-        self.exact_chunk_fill = (
-            _use_exact_chunk_fill()
-            and dllm_config is None
-            and not (
-                tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing()
-            )
-            and not get_exec().deterministic.enable_deterministic_inference
-        )
+        self.exact_chunk_fill = uses_exact_chunk_fill(tree_cache, dllm_config)
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)

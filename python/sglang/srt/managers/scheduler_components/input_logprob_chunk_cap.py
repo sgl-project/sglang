@@ -46,19 +46,24 @@ class InputLogprobChunkCap:
         chunked_prefill_size: Optional[int],
         page_size: int,
         truncation_align_size: Optional[int],
+        exact_chunk_fill: bool,
     ) -> None:
-        """A first chunk is cut down to the page size and the truncation alignment, so
-        a cap below them cuts an input-logprob prompt longer than the cap to zero
-        tokens, and the request would wait in the queue forever."""
+        """A first chunk is cut down to the truncation alignment, and to whole pages
+        unless admission fills chunks exactly (`uses_exact_chunk_fill`). A cap below
+        that step cuts an input-logprob prompt longer than the cap to zero tokens,
+        and the request would wait in the queue forever."""
         cap = cls.for_batch(chunked_prefill_size).room
-        align = math.lcm(page_size, truncation_align_size or 1)
+        align = truncation_align_size or 1
+        if not exact_chunk_fill:
+            align = math.lcm(page_size, align)
         if cap is None or cap >= align:
             return
+        page_note = "" if exact_chunk_fill else f"page size {page_size}, "
         raise ValueError(
             f"SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS={cap} is below the prefill chunk "
-            f"alignment of {align} tokens (page size {page_size}, truncation "
-            f"alignment {truncation_align_size}); a request returning input logprobs "
-            f"longer than {cap} tokens could never be scheduled. Set it to at least "
+            f"alignment of {align} tokens ({page_note}truncation alignment "
+            f"{truncation_align_size}); a request returning input logprobs longer "
+            f"than {cap} tokens could never be scheduled. Set it to at least "
             f"{align}, or to 0 to disable the cap."
         )
 

@@ -1372,16 +1372,16 @@ class TestPrefillAdder(CustomTestCase):
         with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(1024):
             self.assertIsNone(InputLogprobChunkCap.for_batch(1024).room)
 
-    def test_input_logprob_cap_below_the_page_is_rejected_at_startup(self):
-        """A cap below the page size cuts a longer input-logprob prompt to an empty
-        chunk, so it would wait forever; the smallest cap accepted admits a page."""
+    def test_input_logprob_cap_below_the_chunk_step_is_rejected_at_startup(self):
+        """Admission cuts a first chunk down to the truncation alignment, and to
+        whole pages unless it fills chunks exactly. A cap below that step cuts a
+        longer input-logprob prompt to an empty chunk, so it would wait forever;
+        the startup check rejects exactly those caps."""
         self.mock_token_allocator.available_size.return_value = 100000
+        self.mock_tree_cache.supports_mamba.return_value = False
 
-        def admit(cap_tokens):
+        def admit(cap_tokens, align):
             with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(cap_tokens):
-                InputLogprobChunkCap.check_fits_alignment(
-                    chunked_prefill_size=4096, page_size=64, truncation_align_size=None
-                )
                 cap = InputLogprobChunkCap.for_batch(4096)
             adder = self.create_adder(
                 self.create_running_batch(),
@@ -1389,17 +1389,46 @@ class TestPrefillAdder(CustomTestCase):
                 rem_input_tokens=100000,
                 rem_chunk_tokens=4096,
             )
-            req = self._create_delayer_req(128, rid=f"lp_{cap_tokens}")
+            req = self._create_delayer_req(128, rid=f"lp_{cap_tokens}_{align}")
             req.return_logprob, req.logprob_start_len = True, 0
             req.origin_input_ids = req.full_untruncated_fill_ids
             cap.add_one_req(
-                adder, req, has_chunked_req=False, truncation_align_size=None
+                adder, req, has_chunked_req=False, truncation_align_size=align
             )
             return [r.extend_len for r in adder.can_run_list]
 
-        with self.assertRaises(ValueError):
-            admit(32)
-        self.assertEqual(admit(64), [64])
+        def accepted_at_startup(cap_tokens, align):
+            with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(cap_tokens):
+                try:
+                    InputLogprobChunkCap.check_fits_alignment(
+                        chunked_prefill_size=4096,
+                        page_size=64,
+                        truncation_align_size=align,
+                        exact_chunk_fill=schedule_policy.uses_exact_chunk_fill(
+                            self.mock_tree_cache, None
+                        ),
+                    )
+                except ValueError:
+                    return False
+            return True
+
+        # (exact chunk fill, truncation alignment, cap, first chunk admitted)
+        cases = (
+            (False, None, 32, []),
+            (False, None, 64, [64]),
+            (True, None, 32, [32]),
+            (True, 64, 32, []),
+            (True, 64, 64, [64]),
+        )
+        for exact, align, cap_tokens, admitted in cases:
+            with (
+                self.subTest(exact=exact, align=align, cap=cap_tokens),
+                patch.object(
+                    schedule_policy, "_use_exact_chunk_fill", return_value=exact
+                ),
+            ):
+                self.assertEqual(admit(cap_tokens, align), admitted)
+                self.assertEqual(accepted_at_startup(cap_tokens, align), bool(admitted))
 
     @patch(
         "sglang.srt.managers.schedule_policy.page_interleave_shard_size",

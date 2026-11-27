@@ -255,6 +255,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
+    uses_exact_chunk_fill,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -780,6 +781,9 @@ class Scheduler(
                 chunked_prefill_size=self.chunked_prefill_size,
                 page_size=self.page_size,
                 truncation_align_size=self.truncation_align_size,
+                exact_chunk_fill=uses_exact_chunk_fill(
+                    self.tree_cache, self.dllm_config
+                ),
             )
 
         self.init_weight_updater()
