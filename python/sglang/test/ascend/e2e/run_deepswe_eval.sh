@@ -127,24 +127,30 @@ fi
 docker compose version || echo "WARNING: docker compose plugin is still unavailable"
 
 # pier's egress-proxy Dockerfile builds FROM ubuntu:24.04 and runs
-# `apt-get update`; inside this pod's old dind (18.06) that fails signature
-# checks with "NO_PUBKEY 871920D1991BC93C", even though a plain `docker run` of
-# the same image works. The proxy only needs squid/apache2-utils, so retag
-# ubuntu:22.04 as ubuntu:24.04 and let compose build on 22.04 (verified working
-# here). A short diagnostic first records whether `docker run` + apt works.
+# `apt-get update && apt-get install ...`. In this pod's old dind (18.06) every
+# container it launches fails apt signature verification (NO_PUBKEY
+# 871920D1991BC93C) for both jammy and noble, while the pod-level eval
+# container is fine. Bake an apt config into the base image that tolerates
+# unsigned repos and unauthenticated packages, then retag it as ubuntu:24.04 so
+# pier's `FROM ubuntu:24.04` picks it up without touching its Dockerfile.
 seed_ubuntu_base() {
-    docker pull ubuntu:24.04 || true
-    if docker run --rm ubuntu:24.04 sh -c 'apt-get update -qq >/dev/null 2>&1'; then
-        echo "Diagnostic: apt-get update works in ubuntu:24.04 (docker run)."
+    local work
+    work="$(mktemp -d)"
+    cat > "${work}/99allow-insecure.conf" <<'EOF'
+Acquire::AllowInsecureRepositories "true";
+APT::Get::AllowUnauthenticated "true";
+EOF
+    cat > "${work}/Dockerfile" <<'EOF'
+FROM ubuntu:24.04
+COPY 99allow-insecure.conf /etc/apt/apt.conf.d/99allow-insecure.conf
+EOF
+    echo "Building a patched ubuntu:24.04 that tolerates unsigned apt repos ..."
+    if docker build -t ubuntu:24.04 "${work}"; then
+        echo "Patched ubuntu:24.04 base ready."
     else
-        echo "Diagnostic: apt-get update fails in ubuntu:24.04 (docker run)."
+        echo "WARNING: failed to build the patched ubuntu:24.04 base"
     fi
-    echo "Retagging ubuntu:22.04 as ubuntu:24.04 for the egress-proxy build ..."
-    if docker pull ubuntu:22.04 && docker tag ubuntu:22.04 ubuntu:24.04; then
-        echo "ubuntu:24.04 now resolves to Ubuntu 22.04."
-    else
-        echo "WARNING: failed to retag ubuntu:22.04 as ubuntu:24.04"
-    fi
+    rm -rf "${work}"
 }
 seed_ubuntu_base
 
