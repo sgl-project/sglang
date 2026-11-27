@@ -34,6 +34,34 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 1
     )
 
 
+@pytest.mark.parametrize(
+    ("length", "padding", "num_sms", "expected_m"),
+    [
+        (6177, 31, 188, 128),
+        (6205, 19, 188, 128),
+        (3329, 31, 188, 64),  # Eight long CTAs in the final wide-tile wave.
+        (6177, 128, 188, 64),
+        (6177, 31, 110, 64),
+    ],
+)
+def test_sm120_packed_global_mha_query_tile(length, padding, num_sms, expected_m):
+    from sglang.kernels.ops.attention.fa4_sm120.flash_fwd import (
+        FlashAttentionForwardSm120,
+    )
+
+    assert FlashAttentionForwardSm120.get_fwd_tile_size(
+        128,
+        128,
+        num_batch=2,
+        num_head_kv=56,
+        qhead_per_kvhead=1,
+        seqlen_q=length,
+        seqlen_k=length,
+        total_q_rows=(length + padding) * 56,
+        num_sms=num_sms,
+    ) == (expected_m, 64)
+
+
 def test_sm120_runtime_policy_delegates_decode_shapes():
     policy = get_flash_attention_v4_sm120_runtime_policy(
         device_capability=(12, 0),

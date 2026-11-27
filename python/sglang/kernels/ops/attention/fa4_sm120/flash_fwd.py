@@ -490,6 +490,27 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                     (48, 64, 1),
                     (32, 64, 1),
                 )
+        elif (
+            shape == (128, 128)
+            and num_sms == 188
+            and num_head_kv == 56
+            and qhead_per_kvhead == 1
+            and num_batch == 2
+            and not (is_local or is_causal or paged_kv)
+            and seqlen_q is not None
+            and seqlen_q == seqlen_k
+            and 3072 <= seqlen_q <= 6400
+            and total_q_rows is not None
+            and 0 < total_q_rows - seqlen_q * num_head_kv <= 64 * num_head_kv
+        ):
+            # One long sequence and a short padding sequence. Both M tiles fit
+            # one CTA per SM. M128 reuses K/V across more queries, but a thin
+            # final wave of long CTAs costs more than that reuse saves.
+            long_ctas = ((seqlen_q + 127) // 128) * num_head_kv
+            tail = long_ctas % num_sms
+            fallback_candidates = ((64, 64, 1),)
+            if tail == 0 or 2 * tail >= num_sms:
+                fallback_candidates = ((128, 64, 1),) + fallback_candidates
         elif qualified_shape:
             # M64 is the zero-spill fallback across the qualified exact shapes.
             # HD32 global benefits from N128 without giving up its second
