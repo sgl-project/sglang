@@ -96,7 +96,7 @@ def _drive(
     backend, chunk_ends, *, sibling, swa_size=128, unpublished=False, skip_insert=False
 ):
     pool = ReqToTokenPool(
-        size=4, max_context_len=128, device="cpu", enable_memory_saver=False
+        size=4, row_width=128, device="cpu", enable_memory_saver=False
     )
     kv = SWAKVPool(
         size=256,

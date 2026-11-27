@@ -34,18 +34,23 @@ def _resolve(
     draft_backend="fa3",
     head_dim=None,
     attention_arch=None,
+    arch=None,
 ):
     """The (label, dtype) a runner stamps from the given flags."""
     runner = ModelRunner.__new__(ModelRunner)
+    if arch is not None:
+        runner.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[arch], index_topk=2048)
+        )
     runner.model = SimpleNamespace(quant_config=quant_config)
     runner.dtype = torch.bfloat16
     runner.is_draft_worker = is_draft_worker
     runner.spec_algorithm = SpeculativeAlgorithm.from_string(algorithm)
     runner.draft_attention_backend = draft_backend
     if head_dim is not None:
-        runner.model_config = SimpleNamespace(
-            head_dim=head_dim, attention_arch=attention_arch or AttentionArch.MHA
-        )
+        runner.model_config = getattr(runner, "model_config", SimpleNamespace())
+        runner.model_config.head_dim = head_dim
+        runner.model_config.attention_arch = attention_arch or AttentionArch.MHA
     with (
         patch.object(
             model_runner_module,
@@ -100,6 +105,26 @@ class TestRunnerKvCacheDtypeLabel(CustomTestCase):
                     is_draft_worker=True,
                 )
                 self.assertEqual((label, dtype), expected)
+
+    def test_an_int8_draft_resolves_from_its_own_model(self):
+        """INT8 is the packed DSA record: the runner hands its own model to
+        the resolver, so a DSA draft on the Ascend backend keeps it and a
+        dense draft gets its compute dtype instead of unscaled INT8 K/V."""
+        for arch, algorithm, expected in (
+            ("GlmMoeDsaForCausalLMNextN", "EAGLE", ("int8", torch.int8)),
+            ("Qwen3ForCausalLM", "DFLASH", ("auto", torch.bfloat16)),
+        ):
+            with self.subTest(arch=arch):
+                self.assertEqual(
+                    _resolve(
+                        flag="int8",
+                        is_draft_worker=True,
+                        algorithm=algorithm,
+                        draft_backend="ascend",
+                        arch=arch,
+                    ),
+                    expected,
+                )
 
     def test_a_dflash_fa4_draft_is_labelled_unquantized(self):
         self.assertEqual(

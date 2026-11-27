@@ -24,7 +24,7 @@ from torch._C._distributed_c10d import _SymmetricMemory
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.benchmark import marker
-from sglang.kernels.jit.benchmark.marker import _calculate_rotation_count
+from sglang.kernels.jit.benchmark.marker.timing import _calculate_rotation_count
 from sglang.kernels.jit.benchmark.utils import get_benchmark_range, multigpu_bench_main
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication import gemma4_ar_fusion
@@ -114,7 +114,7 @@ def _buffers():
 
 
 @marker.parametrize("num_tokens", NUM_TOKENS)
-@marker.benchmark("provider", PROVIDERS)
+@marker.benchmark("provider", PROVIDERS, gate=["fused", "fused-nocopy"])
 def benchmark(num_tokens: int, provider: str):
     coord, comm = _init()
     world_size, rank = coord.world_size, coord.rank

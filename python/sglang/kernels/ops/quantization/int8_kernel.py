@@ -32,9 +32,13 @@ def _per_token_quant_int8(
     CAL_SUM: tl.constexpr,
     BLOCK: tl.constexpr,
     GENERIC_LIBDEVICE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr = False,
 ):
     # Adapted from https://github.com/InternLM/lmdeploy/blob/086481ed84b59bee3b8e4274e5fc69620040c048/lmdeploy/pytorch/kernels/cuda/w8a8_triton_kernels.py#L282
     row_id = tl.program_id(0)
+    # int64 only when x has >= 2^31 elements; other shapes keep int32 offsets
+    if USE_INT64_OFFSETS:
+        row_id = row_id.to(tl.int64)
 
     cols = tl.arange(0, BLOCK)
     mask = cols < N
@@ -92,6 +96,7 @@ def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
         CAL_SUM=cal_sum,
         BLOCK=BLOCK,
         GENERIC_LIBDEVICE=_is_hip or _is_xpu,
+        USE_INT64_OFFSETS=x.numel() >= 2**31,
         num_warps=num_warps,
         num_stages=1,
     )
@@ -120,6 +125,7 @@ def _per_token_group_quant_int8(
     int8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr = False,
 ):
     """A Triton-accelerated function to perform per-token-group quantization on a
     tensor.
@@ -128,6 +134,9 @@ def _per_token_group_quant_int8(
     """
     # Map the program id to the row of X and Y it should compute.
     g_id = tl.program_id(0)
+    # int64 only when x has >= 2^31 elements; other shapes keep int32 offsets
+    if USE_INT64_OFFSETS:
+        g_id = g_id.to(tl.int64)
     y_ptr += g_id * y_stride
     y_q_ptr += g_id * y_stride
     y_s_ptr += g_id
@@ -197,6 +206,7 @@ def per_token_group_quant_int8(
         int8_min=int8_min,
         int8_max=int8_max,
         BLOCK=BLOCK,
+        USE_INT64_OFFSETS=x.numel() >= 2**31,
         num_warps=num_warps,
         num_stages=num_stages,
     )

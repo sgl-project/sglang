@@ -2268,7 +2268,6 @@ class LayerwiseOffloadManager:
             )
             self._mapped_courier = None
             self._courier_retired = True
-            self._mapped_bytes = self._mapped_bytes  # unchanged; direct path
         return self._mapped_courier
 
     def _collect_mapped_layer(self, layer_idx: int) -> None:
@@ -3491,6 +3490,15 @@ def is_layerwise_offloaded_module(module: torch.nn.Module) -> bool:
     )
 
 
+def streams_layers_every_forward(module: torch.nn.Module) -> bool:
+    """True if at least one layer is copied from host memory on every forward,
+    i.e. the module is layerwise offloaded and not every layer is resident."""
+    return isinstance(module, LayerwiseOffloadableModuleMixin) and any(
+        manager.enabled and manager.resident_layers < manager.num_layers
+        for manager in module.layerwise_offload_managers
+    )
+
+
 def is_resident_layerwise_module(module: torch.nn.Module) -> bool:
     """True if the module keeps a resident DiT layer set beyond the streaming
     prefetch window.
@@ -3534,6 +3542,10 @@ def get_layerwise_offload_component_names_for_pipeline(
     select_dit_group = LAYERWISE_OFFLOAD_DIT_GROUP in selected_component_names
     selected_pipeline_component_names: list[str] = []
     for component_name, module in modules.items():
+        # A component can be absent (e.g. the refiner on the preview-only tier)
+        # while its slot stays in the module dict; there is nothing to stream.
+        if module is None:
+            continue
         if layerwise_component_matches_any_selection(
             component_name, explicit_component_names
         ):
@@ -3735,7 +3747,9 @@ def configure_layerwise_offload_modules(
         reverse=True,
     )
     if pin_budget is None:
-        pin_budget = HostPinBudget()
+        pin_budget = HostPinBudget(
+            node_local_ranks=server_args.node_local_gpu_worker_count
+        )
     logger.info("Layerwise offload host memory: %s", describe_host_memory())
 
     for component_name in selected_pipeline_component_names:
