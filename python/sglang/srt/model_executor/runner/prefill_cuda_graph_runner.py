@@ -437,7 +437,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
         self._validate_max_context_capacity(
             max_context_size=self.max_context_size,
-            req_to_token_row_width=model_runner.req_to_token_pool.req_to_token.shape[1],
+            req_to_token_row_width=model_runner.req_to_token_pool.row_width,
         )
         if (
             self.prefill_backend_name == Backend.TC_PIECEWISE
@@ -1107,7 +1107,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     @staticmethod
     def _max_addressable_prefix_len(model_runner) -> int:
-        req_to_token_row_width = model_runner.req_to_token_pool.req_to_token.shape[1]
+        req_to_token_row_width = model_runner.req_to_token_pool.row_width
         # This runner's own resolved context (a draft runs at the target's
         # positions), not the launcher's flag, which may be unset.
         configured_context = model_runner.model_config.context_len
