@@ -10,15 +10,18 @@
 // is the only published precision.
 //
 // SGLang reads the attention mode and turns off the radix cache and chunked
-// prefill itself, so no cell needs a flag for it. This first support PR has CPU
-// prompt/label coverage only; the launch cells stay marked unverified until a
-// GPU parity run is added.
+// prefill itself, so no cell needs a flag for it. H20 was measured end to end
+// on one 96 GB GPU; the H200 and GB300 commands remain unverified.
 export const config = {
   modelName: "PPLX-Decider-v1.3-27B",
 
   latencyPercentile: "P50",
 
-  supportedHardware: ["h200", "gb300"],
+  supportedHardware: ["h20", "h200", "gb300"],
+
+  hardware: [
+    { id: "h20", label: "H20", vram: "96GB", vendor: "hopper" },
+  ],
 
   variants: [
     { id: "default", label: "Default", subtitle: "27B dense, 1 GPU" },
@@ -43,12 +46,15 @@ export const config = {
   -H 'Content-Type: application/json' \\
   -d '{"model":"{{MODEL_NAME}}","state":"My Stripe integration keeps failing. Please help ASAP.","questions":{"urgency":{"type":"noul","instructions":"Does this message express urgency?"}}}'`,
 
-  // No benchmark card until v1.3 has its own GPU speed and accuracy run.
-  accuracyLabels: [],
+  accuracyLabels: [
+    ["belebele_pct", "Belebele (eng_Latn, 900)", "%"],
+    ["winogrande_pct", "WinoGrande (xl dev, 1267)", "%"],
+  ],
 
   // `lmsysorg/sglang:dev` is multi-arch (amd64 + arm64), so GB300 hosts pull
   // the same tag as H200 hosts.
   dockerImages: {
+    h20: "lmsysorg/sglang:dev",
     h200: "lmsysorg/sglang:dev",
     gb300: "lmsysorg/sglang:dev",
   },
@@ -87,7 +93,7 @@ export const config = {
           { id: "auto", label: "Auto" },
           { id: "trtllm", label: "TRT-LLM MHA",
             flags: ["--attention-backend trtllm_mha", "--page-size 64"],
-            disable: { hw: ["h200"] },
+            disable: { hw: ["h20", "h200"] },
             disableReason: "trtllm_mha is a Blackwell (SM100) kernel" },
           { id: "flashinfer", label: "FlashInfer", flags: ["--attention-backend flashinfer"] },
           { id: "triton", label: "Triton", flags: ["--attention-backend triton"] },
@@ -106,6 +112,19 @@ export const config = {
   },
 
   cells: [
+    {
+      // H20 (96 GB), one GPU. Auto resolves to FA3 for both text and vision.
+      // The server resolves --disable-radix-cache and --chunked-prefill-size -1.
+      match: { hw: "h20", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       // Same command as GB300, not run on H200 yet.
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },

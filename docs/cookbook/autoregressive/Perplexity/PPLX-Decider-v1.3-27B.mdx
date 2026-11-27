@@ -48,9 +48,9 @@ import { benchmarks } from "/src/snippets/configs/perplexity-ai/pplx-decider-v1.
 
 <Deployment config={config} benchmarks={benchmarks} />
 
-<Warning>
-  The launch cells are command recipes, not measured v1.3 benchmarks. This first support change has CPU unit coverage for the protocol-v4 prompt and marker readout. It does not claim GPU speed or parity numbers for this checkpoint.
-</Warning>
+<Note>
+  The H20 cell was measured end to end on one 96 GB H20, including speed, Belebele and WinoGrande accuracy, and per-item parity with the checkpoint's reference implementation. The H200 and GB300 cells use the same command without the H20 memory flag and have not been run yet. [§3](#3-benchmarks) has the method and tables.
+</Note>
 
 ## Playground
 
@@ -122,6 +122,7 @@ The checkpoint ships a `Qwen3_5Model` backbone, `readout.safetensors` with 255 r
 - **No prefix reuse.** The full-attention outputs depend on the whole prompt, so even repeated identical requests cannot reuse a prefix.
 - **Question limit.** There is no separate count limit beyond the context length. The checkpoint's reference implementation was trained on sequences up to 30,720 tokens and does not truncate.
 - **Score levels.** The System One API in SGLang accepts up to 10 score levels. The checkpoint readout itself supports more, but this route keeps the published API limit.
+- **H20 memory.** On a 96 GB H20, `--mem-fraction-static 0.85` leaves enough room for the noncausal attention workspace. The measured server also auto-selected FA3, Triton GDN kernels, and the Rust tree core, and allocated 253,578 KV tokens plus 95 Mamba state slots.
 
 ### Not yet served
 
@@ -129,7 +130,114 @@ The checkpoint ships a `Qwen3_5Model` backbone, `readout.safetensors` with 255 r
 - **Isolated multi-question packing.** The checkpoint can place several question blocks after one shared state in its reference `isolated` mode. SGLang currently uses the default `separate` mode, which is the evaluated computation.
 - **Fast path.** The reference package's packed CUDA path is not part of the SGLang serving path.
 
-## 3. Request example
+## 3. Benchmarks
+
+All numbers below come from one NVIDIA H20 with 96 GB of memory, driver `595.91.07`, BF16 weights, SGLang PR #53432 at code `9deba5ff7d`, PyTorch 2.14.1, and Transformers 5.19.0. The server used FA3 for text and vision attention, Triton for the Gated DeltaNet layers, and the Rust tree core. Radix cache and chunked prefill were disabled automatically. The command added `--mem-fraction-static 0.85`.
+
+### 3.1 Speed
+
+A closed-loop client keeps a fixed number of `/v1/systemone` requests in flight. Every request has a unique random state, so no request can reuse another's prompt. Each concurrency level runs after eight warmup requests and a cache flush. The table reports the P50 end-to-end decision latency from three measured repeats; because this model is prefill-only, that latency is also TTFT and there is no TPOT.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "19%"}} />
+    <col style={{width: "17%"}} />
+    <col style={{width: "17%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Request</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>Concurrent</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>P50 latency</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>Requests/s</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>Prompt tokens/s</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", textAlign: "left", backgroundColor: "rgba(255,255,255,0.02)"}}>Four-option choice, 382 tokens</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>159 ms</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>6.30</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>2,408</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", textAlign: "left", backgroundColor: "rgba(255,255,255,0.05)"}}>Four-option choice, 382 tokens</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>64</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>8,966 ms</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>7.10</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>2,711</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", textAlign: "left", backgroundColor: "rgba(255,255,255,0.02)"}}>Four-option choice, 8,224 tokens</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>3,231 ms</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>0.309</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>2,542</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", textAlign: "left", backgroundColor: "rgba(255,255,255,0.05)"}}>Four-option choice, 8,224 tokens</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>51,298 ms</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>0.312</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>2,565</td>
+    </tr>
+  </tbody>
+</table>
+
+H20 throughput stays close to 2.4-2.7 thousand prompt tokens/s across these shapes. Batching improves throughput only slightly while queueing latency grows; this page does not attribute that result to a specific kernel without a profiler trace. These numbers are not comparable to H200 or GB300 results with a much larger BF16 compute budget.
+
+### 3.2 Accuracy and parity
+
+Belebele `eng_Latn` test (900 items) sends the passage as the state, the question as the instructions, and answers `1` to `4` as choice criteria. WinoGrande `winogrande_xl` validation (1,267 items) sends the sentence as the state and asks which option fills the blank. The reference rows run the same items through the checkpoint's own `Decider` one at a time, with SDPA attention and PyTorch fallback kernels for causal convolution and Gated DeltaNet.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "36%"}} />
+    <col style={{width: "22%"}} />
+    <col style={{width: "22%"}} />
+    <col style={{width: "20%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Metric</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>SGLang /v1/systemone</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>Checkpoint reference</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>Agreement</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", textAlign: "left", backgroundColor: "rgba(255,255,255,0.02)"}}>Belebele eng_Latn (900)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>878 / 900 = 97.56%</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>879 / 900 = 97.67%</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>898 / 900</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", textAlign: "left", backgroundColor: "rgba(255,255,255,0.05)"}}>WinoGrande xl dev (1,267)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>1,203 / 1,267 = 94.95%</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>1,203 / 1,267 = 94.95%</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>1,267 / 1,267</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", textAlign: "left", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>All items</strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>2,081 / 2,167 = 96.03%</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>2,082 / 2,167 = 96.08%</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>2,165 / 2,167 = 99.91%</td>
+    </tr>
+  </tbody>
+</table>
+
+Across all 2,167 items, the maximum per-option probability difference has mean 0.0013, p99 0.024, and maximum 0.057. Both top-choice differences are Belebele near-ties.
+
+One additional text-only, image, score, and long-prompt pass compared the same five requests through both implementations:
+
+- A `noul` question, a four-level `score` question, a four-option text choice, a 1024×768 image choice, and an 18,585-token choice all chose the same top answer.
+- The largest probability difference over those five questions was 0.013.
+
+## 4. Request example
 
 ```bash Command
 curl http://localhost:30000/v1/systemone \
@@ -161,7 +269,7 @@ curl http://localhost:30000/v1/systemone \
 
 The response contains one answer per question id, `usage.input_tokens`, and no generated text.
 
-## 4. Validation status
+## 5. Validation status
 
 This support change adds CPU unit coverage for:
 
@@ -170,4 +278,4 @@ This support change adds CPU unit coverage for:
 - rendering the separator, question chunk, and final `<|fim_suffix|>` marker;
 - scoring the answer codes from the marker position and escaping control tokens found in user content.
 
-GPU speed, long-prompt behavior, image parity, and accuracy against the checkpoint's reference implementation still need a separate end-to-end run before this page can claim verified numbers.
+The H20 run above additionally covers real checkpoint loading, concurrency from 1 to 64, Belebele and WinoGrande accuracy, image input, an 18,585-token prompt, and probability parity against the reference implementation. H200, GB300, tensor parallelism, data-parallel replicas, and deterministic replay across server restarts remain unverified.
