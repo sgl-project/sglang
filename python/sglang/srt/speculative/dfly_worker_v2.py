@@ -21,6 +21,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_simulated_acceptance,
     commit_accept,
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
@@ -28,6 +29,13 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.speculative.dfly_utils import DFlyRequestState
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_LEN,
+    SIMULATE_ACC_METHOD,
+    SIMULATE_ACC_TOKEN_MODE,
+    check_simulate_acc_token_mode,
+    simulated_acc_len_generator,
+)
 from sglang.srt.speculative.target_verify import adjust_verify_logits
 
 
@@ -53,6 +61,12 @@ class DFlyWorkerV2(BaseSpecWorker):
         if self.block_size != self.dfly_config.block_size:
             raise ValueError("DFly draft and verify block sizes disagree")
         self._tp_sync = SpecTpSync(get_dp_tp_group())
+        check_simulate_acc_token_mode()
+        self._simulated_acc_len_rng = (
+            simulated_acc_len_generator(target_worker.random_seed)
+            if SIMULATE_ACC_LEN > 0
+            else None
+        )
         self._block_offsets = torch.arange(
             self.block_size, dtype=torch.int64, device=self.device
         )
@@ -195,10 +209,27 @@ class DFlyWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         candidates = self.dfly.candidates_out[: bs * width].view(bs, width)
-        num_correct_drafts, bonus = self._accept(
+        num_correct_drafts, bonus, target_predict = self._accept(
             batch, draft_input, candidates, logits_output.next_token_logits
         )
         out_tokens, commit_lens = commit_accept(candidates, num_correct_drafts, bonus)
+        if SIMULATE_ACC_LEN > 0:
+            apply_dflash_simulated_acceptance(
+                candidates=candidates,
+                target_predict=target_predict,
+                accept_len=num_correct_drafts,
+                commit_lens=commit_lens,
+                bonus=bonus,
+                out_tokens=out_tokens,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_method=SIMULATE_ACC_METHOD,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+                next_token_logits=logits_output.next_token_logits,
+                generator=self._simulated_acc_len_rng,
+            )
+            if target_predict is None:
+                self._tp_sync.sync(SpecTpSyncSite.DFLY_ACCEPT_SAMPLE, bonus)
+                self._tp_sync.sync(SpecTpSyncSite.DFLY_ACCEPT_SAMPLE, out_tokens)
         if batch.sampling_info is not None:
             commit_verify_accept(
                 batch.sampling_info,
@@ -298,12 +329,13 @@ class DFlyWorkerV2(BaseSpecWorker):
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLY_ACCEPT_SAMPLE, num_correct_drafts)
             self._tp_sync.sync(SpecTpSyncSite.DFLY_ACCEPT_SAMPLE, bonus)
-            return num_correct_drafts, bonus
+            return num_correct_drafts, bonus, None
         target_predict = torch.argmax(next_token_logits, dim=-1).view(candidates.shape)
         self._tp_sync.sync(SpecTpSyncSite.DFLY_ACCEPT_GREEDY, target_predict)
-        return compute_dflash_correct_drafts_and_bonus(
+        num_correct_drafts, bonus = compute_dflash_correct_drafts_and_bonus(
             candidates=candidates, target_predict=target_predict
         )
+        return num_correct_drafts, bonus, target_predict
 
     def _commit_state(self, batch, hidden_states, source_rows) -> None:
         self.state.write(
