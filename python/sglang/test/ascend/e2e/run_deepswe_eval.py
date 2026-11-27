@@ -166,12 +166,34 @@ def build_config():
     return config
 
 
+# DeepSWE tasks set ``allow_internet = false``. With that, pier runs the agent
+# container on an internal Docker network whose only egress is a squid proxy
+# limited to ports 80/443 and ``dstdomain`` matches. Our router is
+# ``http://<pod-ip>:6677/v1`` (a bare IP on a non-standard port), so squid
+# rejects every request and no inference traffic ever reaches the router. The
+# dedicated eval pod already restricts egress at cluster level, so force public
+# networking for these trials instead of silently hanging inside the proxy.
+_NETWORK_PATCH = (
+    "try:\n"
+    "    from pier.environments.docker.docker import DockerEnvironment\n"
+    "    _orig_start = DockerEnvironment.start\n"
+    "    async def _start(self, force_build):\n"
+    "        self.task_env_config.allow_internet = True\n"
+    "        return await _orig_start(self, force_build)\n"
+    "    DockerEnvironment.start = _start\n"
+    "    print('[env] pier network policy patched: allow_internet=True')\n"
+    "except Exception as exc:\n"
+    "    raise RuntimeError(f'failed to patch pier network policy: {exc}')\n"
+)
+
+
 def write_runner(config):
     config_json = json.dumps(config, ensure_ascii=False, indent=2)
     escaped = config_json.replace("\\", "\\\\").replace("'''", "\\'\\'\\'")
     script = (
         "import json\n"
         "from evalscope import TaskConfig, run_task\n\n"
+        f"{_NETWORK_PATCH}\n"
         f"config = json.loads('''{escaped}''')\n"
         "run_task(task_cfg=TaskConfig(**config))\n"
     )
