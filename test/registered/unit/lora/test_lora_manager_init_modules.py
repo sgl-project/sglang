@@ -28,6 +28,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora import lora_manager as lora_manager_module
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.utils import get_normalized_target_modules
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -42,6 +43,7 @@ LANGUAGE_EMBED_TOKENS = "language_model.model.embed_tokens"
 # Intern-S2-Mobius routed banks: a FusedMoE outside the decoder hierarchy, so
 # get_layer_id() returns None and should_apply_lora rejects the prefix.
 META_MLP_BANK = "model.meta_mlp.0.experts"
+LANGUAGE_EXPERTS = "language_model.model.layers.0.mlp.experts"
 
 
 class _TiedEmbedding(torch.nn.Module):
@@ -195,12 +197,41 @@ class TestShouldApplyLoRAGate(CustomTestCase):
         bank = FusedMoE.__new__(FusedMoE)
         manager = self._manager(
             modules=[(META_MLP_BANK, bank)],
-            target_modules={"gate_up_proj", "down_proj"},
+            target_modules={"gate_up_proj_moe", "down_proj_moe"},
         )
 
         with patch.object(manager, "set_lora_module", side_effect=lambda name, _: name):
             with self.assertRaisesRegex(ValueError, "meta_mlp routed banks"):
                 manager.init_lora_modules()
+
+    def test_a_moe_layer_is_wrapped_for_the_experts_it_serves(self):
+        """Routed experts need their own target modules; a shared-expert sink or fused
+        shared experts are also wrapped for the shared expert's."""
+        shared = {"gate_up_proj", "down_proj"}
+        routed = shared | {"gate_up_proj_moe", "down_proj_moe"}
+        for serves, target_modules, wrapped in (
+            ("routed", shared, False),
+            ("routed", routed, True),
+            ("routed and fused shared", shared, True),
+            ("shared sink", shared, True),
+        ):
+            moe = FusedMoE.__new__(FusedMoE)
+            moe.num_fused_shared_experts = int(serves == "routed and fused shared")
+            moe.is_shared_fused_moe = serves == "shared sink"
+            manager = self._manager(
+                modules=[(LANGUAGE_EXPERTS, moe)], target_modules=target_modules
+            )
+            manager.experts_shared_outer_loras = False
+            manager.max_lora_rank = 8
+            manager.lora_use_virtual_experts = False
+            with (
+                self.subTest(serves=serves, target_modules=sorted(target_modules)),
+                patch.object(
+                    manager, "set_lora_module", side_effect=lambda *_, **__: Mock()
+                ),
+            ):
+                manager.init_lora_modules()
+                self.assertEqual(LANGUAGE_EXPERTS in manager.lora_modules[0], wrapped)
 
 
 class TestTargetValidation(CustomTestCase):
@@ -265,6 +296,37 @@ class TestTargetValidation(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "DSA indexer Q/K fusion"):
             manager.init_lora_shapes(max_lora_rank=8, target_modules={"wk"})
+
+    def test_routed_expert_targets_come_only_from_names_that_match_them(self):
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        base_model = SimpleNamespace(
+            get_lora_target_module_name=DeepseekV4ForCausalLM.get_lora_target_module_name
+        )
+        shared = [f"layers.*.ffn.shared_experts.{leaf}" for leaf in ("w1", "w2", "w3")]
+        routed_targets = {"gate_up_proj_moe", "down_proj_moe"}
+        for targets, has_routed_targets in (
+            (shared, False),
+            (["mlp.experts.gate_up_proj", "mlp.experts.down_proj"], True),
+            (["mlp.experts.0.gate_proj", "mlp.experts.0.down_proj"], True),
+            (["gate_proj", "down_proj"], True),
+        ):
+            with self.subTest(targets=targets):
+                normalized = get_normalized_target_modules(
+                    targets, base_model=base_model
+                )
+                self.assertEqual(routed_targets <= normalized, has_routed_targets)
+
+    def test_a_routed_expert_adapter_is_refused_by_a_shared_expert_server(self):
+        manager = self._manager(["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
+        with self.assertRaisesRegex(ValueError, "gate_up_proj_moe"):
+            manager.init_lora_shapes(
+                max_lora_rank=8,
+                target_modules={
+                    "mlp.shared_expert.gate_proj",
+                    "mlp.shared_expert.down_proj",
+                },
+            )
 
 
 if __name__ == "__main__":
