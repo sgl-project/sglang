@@ -343,6 +343,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     allocate_distinct_stream,
+    get_context_max_new_tokens,
     get_preserve_last_token_id,
     is_health_check_generate_req,
     is_war_barrier_enabled,
@@ -2122,6 +2123,7 @@ class Scheduler(
         result_dict = {
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
+            "max_req_len": self.max_req_len,
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
         }
@@ -3118,12 +3120,7 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
-        # max_req_len is the largest number of tokens that can be forwarded for
-        # one request. The last generated token is sampled but never forwarded,
-        # so a request may generate max_req_len - input_len + 1 tokens.
-        context_max_new_tokens = self.max_req_len - input_len + 1
-
-        # Keep this bound consistent with PrefillAdder's admission budget.
+        context_max_new_tokens = get_context_max_new_tokens(self.max_req_len, input_len)
         max_new_tokens = max(
             0,
             min(
@@ -3716,11 +3713,11 @@ class Scheduler(
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) >= self.max_req_input_len:
+            if len(req.origin_input_ids) > self.max_req_input_len:
                 req.set_finish_with_abort(
                     error_msg=(
                         "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} > {self.max_req_input_len}."
                     )
                 )
                 self.init_req_max_new_tokens(req)
@@ -4246,11 +4243,11 @@ class Scheduler(
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) >= self.max_req_input_len:
+            if len(req.origin_input_ids) > self.max_req_input_len:
                 req.set_finish_with_abort(
                     error_msg=(
                         "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} > {self.max_req_input_len}."
                     )
                 )
                 self._add_request_to_queue(req)

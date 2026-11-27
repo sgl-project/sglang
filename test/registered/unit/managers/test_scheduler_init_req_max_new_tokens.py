@@ -342,7 +342,7 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
         size_full = scheduler.token_to_kv_pool_allocator.size_full
         scheduler.max_total_num_tokens = size_full // 4
         scheduler.max_req_len = size_full // 2
-        # The longest prompt the tokenizer lets through: max_req_len - 5.
+        # The longest prompt accepted, max_req_input_len: max_req_len - 5.
         input_len = scheduler.max_req_len - 5
         req = self._new_req(max_new_tokens=32, input_len=input_len)
         req.set_finish_with_abort = lambda msg: self.fail(f"aborted: {msg}")

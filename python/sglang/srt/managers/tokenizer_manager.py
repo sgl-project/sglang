@@ -145,6 +145,7 @@ from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
+    get_context_max_new_tokens,
     get_preserve_last_token_id,
     is_health_check_generate_req,
     truncate_input_ids,
@@ -754,7 +755,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
-        self.max_req_input_len = None  # Will be set later in engine.py
+        # Set from the scheduler's init info once the scheduler is ready.
+        self.max_req_len = None
+        self.max_req_input_len = None
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.default_priority_value = get_schedule().default_priority_value
         self.num_reserved_tokens = compute_num_reserved_tokens()
@@ -1495,7 +1498,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
-        # FIXME: unify the length validation logic with the one in the scheduler.
         if get_exec().features.enable_encoder_swa_bounded_replay:
             if obj.image_data is not None and not get_platform().is_cuda:
                 raise ValueError(
@@ -1517,51 +1519,54 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
         self._validate_joint_schema_request(obj, input_ids)
-        _max_req_len = self.context_len
+        # The scheduler's limits, with the reserved output slots counted as input.
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
 
         # Validate input length
-        if input_token_num >= self.context_len:
+        if input_token_num > self.max_req_input_len:
             if self.allow_auto_truncate:
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens). "
-                    "Truncating the input."
+                    f"model's context length allows ({self.max_req_input_len} "
+                    "tokens on this server). Truncating the input."
                 )
                 input_ids[:] = truncate_input_ids(
                     input_ids,
-                    max_len=_max_req_len,
+                    max_len=self.max_req_input_len - self.num_reserved_tokens,
                     preserve_last_token_id=self._embedding_preserve_last_token_id,
                 )
-                input_token_num = len(input_ids)
+                input_token_num = len(input_ids) + self.num_reserved_tokens
             else:
                 raise ValueError(
                     f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens)."
+                    f"model's context length allows ({self.max_req_input_len} "
+                    "tokens on this server)."
                 )
 
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        context_max_new_tokens = get_context_max_new_tokens(
+            self.max_req_len, input_token_num
+        )
         if (
             self.validate_total_tokens
             and max_new_tokens is not None
-            and (max_new_tokens + input_token_num) > _max_req_len
+            and max_new_tokens > context_max_new_tokens
         ):
+            max_total_tokens = input_token_num + context_max_new_tokens
             if self.allow_auto_truncate:
                 logger.warning(
                     f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
-                    f"exceeds the model's context length ({self.context_len} tokens). "
-                    "Truncating max_new_tokens."
+                    f"exceeds the model's context length ({max_total_tokens} tokens "
+                    "on this server). Truncating max_new_tokens."
                 )
-                obj.sampling_params["max_new_tokens"] = max(
-                    0, _max_req_len - input_token_num
-                )
+                obj.sampling_params["max_new_tokens"] = max(0, context_max_new_tokens)
             else:
                 total_tokens = max_new_tokens + input_token_num
                 error_msg = (
                     f"Requested token count exceeds the model's maximum context length "
-                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
+                    f"of {max_total_tokens} tokens. You requested a total of {total_tokens} "
                     f"tokens: {input_token_num} tokens from the input messages and "
                     f"{max_new_tokens} tokens for the completion. Please reduce the number "
                     f"of tokens in the input messages or the completion to fit within the limit."
@@ -1657,7 +1662,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "This checkpoint answers schema decisions, send them to /v1/systemone"
             )
         limit = max_joint_prompt_tokens(
-            context_len=self.context_len,
             num_reserved_tokens=self.num_reserved_tokens,
             max_req_input_len=self.max_req_input_len,
             max_prefill_tokens=get_schedule().max_prefill_tokens,

@@ -346,11 +346,15 @@ class OpenAIServingDecisions(OpenAIServingBase):
                 )
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
         # Refuse here because --allow-auto-truncate would cut off the answer position.
-        context_len = self.tokenizer_manager.context_len
-        if len(prompt_ids) + self.tokenizer_manager.num_reserved_tokens >= context_len:
+        max_prompt_tokens = (
+            self.tokenizer_manager.max_req_input_len
+            - self.tokenizer_manager.num_reserved_tokens
+        )
+        if len(prompt_ids) > max_prompt_tokens:
             raise ValueError(
                 f"the prompt has {len(prompt_ids)} tokens, which does not fit "
-                f"the context length of {context_len} tokens"
+                f"the context length on this server (at most {max_prompt_tokens} "
+                "prompt tokens)"
             )
         label_ids = _encode_labels(
             tokenizer=tokenizer,

@@ -43,7 +43,10 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.managers.utils import (
+    GenerationBatchResult,
+    get_request_length_limits,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -421,9 +424,9 @@ class TpModelWorker(BaseTpWorker):
 
         # Validation
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            self.model_runner.effective_logical_max_total_num_tokens - 1,
+        max_req_len, _ = get_request_length_limits(
+            self.model_config.context_len,
+            self.model_runner.effective_logical_max_total_num_tokens,
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
@@ -567,13 +570,13 @@ class TpModelWorker(BaseTpWorker):
                 kv_capacity,
                 self.model_config.context_len,
             )
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            kv_capacity - 1,
+        max_req_len, max_req_input_len = get_request_length_limits(
+            self.model_config.context_len,
+            kv_capacity,
+            dllm_block_size=(
+                self.dllm_algorithm.block_size if self.dllm_algorithm is not None else 0
+            ),
         )
-        max_req_input_len = max_req_len - 5
-        if self.dllm_algorithm is not None:
-            max_req_input_len -= self.dllm_algorithm.block_size
         return (
             self.model_runner.logical_max_total_num_tokens,
             get_schedule().max_prefill_tokens,

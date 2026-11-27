@@ -103,6 +103,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.utils import get_context_max_new_tokens
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
     ResponseTemplateReasoningDetector,
@@ -3109,12 +3110,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             if hasattr(sampling_params, "max_new_tokens") or isinstance(
                 sampling_params, dict
             ):
-                context_len = getattr(
-                    self.tokenizer_manager.model_config, "context_len", 4096
-                )
-                num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
-                remaining_tokens = (
-                    context_len - len(prompt_token_ids) - num_reserved_tokens
+                remaining_tokens = get_context_max_new_tokens(
+                    self.tokenizer_manager.max_req_len,
+                    len(prompt_token_ids) + self.tokenizer_manager.num_reserved_tokens,
                 )
 
                 if isinstance(sampling_params, dict):

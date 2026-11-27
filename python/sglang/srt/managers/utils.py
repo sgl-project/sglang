@@ -338,6 +338,34 @@ def truncate_input_ids(
     return truncated
 
 
+def get_request_length_limits(
+    context_len: int, kv_capacity: int, dllm_block_size: int = 0
+) -> tuple[int, int]:
+    """(max_req_len, max_req_input_len) for a model context and a KV pool.
+
+    A request holds at most min(context_len, kv_capacity) tokens, prompt and
+    output together. Its last output token is sampled but never forwarded, so
+    max_req_len, the most tokens one request forwards, is one less;
+    get_context_max_new_tokens adds that token back.
+
+    max_req_input_len is the longest prompt accepted. The 5 is a fixed margin
+    with no recorded purpose. A dLLM forward runs a whole block past the
+    prompt, so the prompt also leaves room for one block.
+    """
+    max_req_len = min(context_len, kv_capacity) - 1
+    max_req_input_len = max_req_len - 5 - dllm_block_size
+    return max_req_len, max_req_input_len
+
+
+def get_context_max_new_tokens(max_req_len: int, input_len: int) -> int:
+    """The most tokens a request with input_len prompt tokens may generate.
+
+    The +1 is the last output token, which is sampled but never forwarded:
+    the -1 in get_request_length_limits.
+    """
+    return max_req_len - input_len + 1
+
+
 def validate_input_length(
     req: Req,
     max_req_input_len: int,
@@ -348,14 +376,14 @@ def validate_input_length(
 
     Args:
         req: The request containing input_ids to validate
-        max_req_input_len: Maximum allowed input length
-        allow_auto_truncate: Whether to truncate long inputs
+        max_req_input_len: Maximum allowed input length, inclusive
+        allow_auto_truncate: Whether to truncate long inputs to that length
         preserve_last_token_id: See ``truncate_input_ids``.
 
     Returns:
         Error message if validation fails, None if successful
     """
-    if len(req.origin_input_ids) >= max_req_input_len:
+    if len(req.origin_input_ids) > max_req_input_len:
         if allow_auto_truncate:
             logger.warning(
                 "Request length is longer than the KV cache pool size or "
@@ -372,12 +400,10 @@ def validate_input_length(
             # OpenAI-compatible clients (e.g. LiteLLM) recognize a context
             # overflow by OpenAI's "This model's maximum context length is"
             # sentence; without it this is a generic 400 to them.
-            # Both sentences quote the largest accepted prompt.
-            max_prompt_len = max_req_input_len - 1
             error_msg = (
                 f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                f"the maximum allowed length ({max_prompt_len} tokens). "
-                f"This model's maximum context length is {max_prompt_len} "
+                f"the maximum allowed length ({max_req_input_len} tokens). "
+                f"This model's maximum context length is {max_req_input_len} "
                 f"tokens on this server. "
                 f"Use a shorter input or enable --allow-auto-truncate."
             )

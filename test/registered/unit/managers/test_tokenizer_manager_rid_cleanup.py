@@ -86,7 +86,9 @@ class TestSamplingParamsTruncation(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         manager = TokenizerManager.__new__(TokenizerManager)
-        manager.context_len = 100
+        # The scheduler's limits for context_len 100 and a larger KV pool.
+        manager.max_req_len = 99
+        manager.max_req_input_len = 94
         manager.num_reserved_tokens = 0
         manager.allow_auto_truncate = True
         manager.validate_total_tokens = True
@@ -112,6 +114,32 @@ class TestSamplingParamsTruncation(CustomTestCase):
                         [min(20, 100 - length) for length in lengths],
                     )
                     self.assertEqual(shared, {"max_new_tokens": 20})
+
+    def test_truncated_prompt_keeps_its_reserved_tokens(self):
+        """After truncation the reserved tokens still count as input, so the
+        completion budget leaves room for them."""
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.max_req_len = 99
+        manager.max_req_input_len = 94
+        manager.num_reserved_tokens = 3
+        manager._embedding_preserve_last_token_id = None
+        manager.allow_auto_truncate = True
+        manager.validate_total_tokens = True
+        manager.is_generation = True
+        manager.model_config = SimpleNamespace(
+            joint_head_config=None, pointer_head=None
+        )
+        req = GenerateReqInput(
+            input_ids=[1] * 120, sampling_params={"max_new_tokens": 20}
+        )
+        req.normalize_batch_and_arguments()
+        manager._validate_one_request(req, req.input_ids)
+
+        self.assertEqual(len(req.input_ids), 94 - 3)
+        self.assertEqual(req.sampling_params["max_new_tokens"], 99 - 94 + 1)
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet

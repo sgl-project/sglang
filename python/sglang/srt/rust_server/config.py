@@ -489,6 +489,7 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     scheduler_info = {
         "status": "ready",
         "max_total_num_tokens": scheduler.max_total_num_tokens,
+        "max_req_len": scheduler.max_req_len,
         "max_req_input_len": scheduler.max_req_input_len,
     }
     info = msgspec_to_builtins(
