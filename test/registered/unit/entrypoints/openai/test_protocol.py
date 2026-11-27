@@ -492,6 +492,33 @@ class TestChatCompletionRequest(CustomTestCase):
         )
         self.assertNotIn("json_schema", sampling_params)
 
+    def test_legacy_schema_must_be_an_object(self):
+        """A non-object legacy `schema` is a validation error (400), not a 500."""
+        for schema in (True, 1, "{}", [{"type": "object"}]):
+            with self.subTest(schema=schema):
+                with self.assertRaises(ValidationError):
+                    self._chat_request(
+                        response_format={"type": "json_schema", "schema": schema}
+                    )
+
+    def test_legacy_schema_keeps_non_model_strict_property(self):
+        """Only a model-field `strict` subschema is taken as the strict switch.
+
+        A boolean `strict` subschema or a non-object `properties` passes
+        through untouched instead of failing validation with a 500.
+        """
+        for properties in ({"strict": True}, ["strict"], "strict"):
+            with self.subTest(properties=properties):
+                request = self._chat_request(
+                    response_format={
+                        "type": "json_schema",
+                        "schema": {"type": "object", "properties": properties},
+                    }
+                )
+                json_schema = request.response_format.json_schema
+                self.assertIsNone(json_schema.strict)
+                self.assertEqual(json_schema.schema_["properties"], properties)
+
     def test_non_strict_response_format_constraint_gated_on_renderer(self):
         request = ChatCompletionRequest(
             model="test-model",
