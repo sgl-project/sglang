@@ -1970,7 +1970,7 @@ class AscendAttnBackend(AttentionBackend):
         # call against the full (gathered) KV, no prev/next balance split.
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
         if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
-            return self._forward_packed_sparse(
+            return self._forward_fp8_sparse(
                 q_nope,
                 q_pe,
                 k_nope,
@@ -2035,50 +2035,6 @@ class AscendAttnBackend(AttentionBackend):
         )
         return attn_out[:, :num_q_heads] if head_padding else attn_out
 
-    def _forward_packed_sparse(
-        self,
-        q_nope,
-        q_pe,
-        packed_kv,
-        topk_indices,
-        layer,
-        actual_seq_qlen,
-        actual_seq_lengths_kv,
-    ):
-        if packed_kv.dtype != torch.int8 or self.qk_rope_head_dim != 0:
-            # The existing packed reader also handles INT8 with RoPE64.
-            return self._forward_fp8_sparse(
-                q_nope,
-                q_pe,
-                packed_kv,
-                topk_indices,
-                layer,
-                actual_seq_qlen,
-                actual_seq_lengths_kv,
-            )
-
-        from sgl_kernel_npu.operators.attention import (
-            kv_quant_sparse_flash_attention,
-        )
-
-        # The SDK reader expects a 64-wide RoPE payload in INT8 records.
-        attn_out, _, _ = kv_quant_sparse_flash_attention(
-            query=q_nope,
-            query_rope=q_pe,
-            packed_kv=packed_kv,
-            sparse_indices=topk_indices,
-            block_table=self.forward_metadata.block_tables,
-            actual_seq_lengths_query=actual_seq_qlen.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            scale_value=layer.scaling,
-            return_softmax_lse=False,
-        )
-        return attn_out
-
     def _forward_fp8_sparse(
         self,
         q_nope,
@@ -2089,7 +2045,9 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen,
         actual_seq_lengths_kv,
     ):
-        if self.qk_rope_head_dim == 0 and is_npu_arch35():
+        if self.qk_rope_head_dim == 0 and (
+            packed_kv.dtype == torch.int8 or is_npu_arch35()
+        ):
             from sgl_kernel_npu.operators.attention import (
                 kv_quant_sparse_flash_attention,
             )
@@ -2097,10 +2055,12 @@ class AscendAttnBackend(AttentionBackend):
             # RoPE0 uses Q512 and packed KV528. The operator fills the
             # missing RoPE lanes without widening the physical KV cache.
             # DSA supplies indices that already encode causal visibility.
+            if packed_kv.dtype != torch.int8:
+                packed_kv = packed_kv.view(torch.uint8)
             output, _, _ = kv_quant_sparse_flash_attention(
                 query=q_nope,
                 query_rope=q_pe,
-                packed_kv=packed_kv.view(torch.uint8),
+                packed_kv=packed_kv,
                 sparse_indices=topk_indices,
                 block_table=self.forward_metadata.block_tables,
                 actual_seq_lengths_query=actual_seq_qlen.to(
@@ -2369,7 +2329,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             # The pool decides the layout: k_nope is then the packed record.
             if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
-                attn_out = self._forward_packed_sparse(
+                attn_out = self._forward_fp8_sparse(
                     q_nope,
                     q_pe,
                     k_nope,
