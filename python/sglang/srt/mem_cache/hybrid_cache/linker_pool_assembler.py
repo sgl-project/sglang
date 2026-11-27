@@ -494,10 +494,28 @@ def _with_draft_buffers(
     }
 
 
+def _merge_head_group_layers(
+    layer_mapping: dict[int, int],
+) -> dict[int, int | tuple[int, ...]]:
+    """Give the head groups of one model layer the same transfer layer, so that
+    a layer-wise load brings in a model layer at a time, in forward order."""
+    from sglang.srt.rocm_muse_spark.kv_head_groups import (
+        KV_GROUP_STRIDE,
+        kv_head_groups,
+    )
+
+    if kv_head_groups() == 1:
+        return layer_mapping
+    merged: dict[int, list[int]] = {}
+    for layer, index in layer_mapping.items():
+        merged.setdefault(layer % KV_GROUP_STRIDE, []).append(index)
+    return {layer: tuple(indices) for layer, indices in sorted(merged.items())}
+
+
 def _mha_device_pool_entry(
     name: PoolName,
     pool: Any,
-    layer_mapping: dict[int, int],
+    layer_mapping: dict[int, int | Sequence[int]],
     page_size: int,
     indices_from_pool: PoolName | None = None,
     draft_pools: Sequence[Any] = (),
@@ -540,8 +558,12 @@ def _mha_device_pool_entry(
         components=[buffers],
         layer_mapping=_with_draft_buffers(
             {
-                layer: tuple(part * num_layers + index for part in range(len(parts)))
-                for layer, index in layer_mapping.items()
+                layer: tuple(
+                    part * num_layers + index
+                    for part in range(len(parts))
+                    for index in ((indices,) if isinstance(indices, int) else indices)
+                )
+                for layer, indices in layer_mapping.items()
             },
             draft_buffer_indices,
         ),
@@ -560,7 +582,10 @@ def _split_sidecar_draft_pools(
 
     kv_drafts, swa_drafts = [], []
     for draft in draft_pools:
-        if type(draft) is MHATokenToKVPool:
+        # A pool kept as head groups is a plain MHA pool of more, narrower layers.
+        if type(draft) is MHATokenToKVPool or (
+            isinstance(draft, MHATokenToKVPool) and getattr(draft, "head_groups", 0) > 1
+        ):
             # A DFlash draft on the target's SWA ids is sized to the SWA pool.
             (swa_drafts if draft.follows_target_swa_ids else kv_drafts).append(draft)
             continue
@@ -686,6 +711,69 @@ def _build_mamba_swa_device_pool_group(
             params.token_to_kv_pool_allocator.state,
             kvcache.start_layer,
             params.mtp_draft_mamba_pools,
+        ),
+    ]
+    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
+    return DevicePoolGroup(
+        entries, num_layers + 1, page_size, restores_sidecar_drafts=split is not None
+    )
+
+
+def _build_swa_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _swa_layer_mappings,
+    )
+    from sglang.srt.mem_cache.memory_pool import (
+        MHATokenToKVPool,
+        MHATokenToKVPoolMXFP8,
+    )
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    pools = (kvcache.full_kv_pool, kvcache.swa_kv_pool)
+    # Sidecar drafts ride the target pages, as in the full + SWA + Mamba group.
+    split = _split_sidecar_draft_pools(params.sidecar_draft_device_pools)
+    kv_drafts, swa_drafts = split or ((), ())
+    if (
+        type(kvcache) is not SWAKVPool
+        or any(
+            type(pool) not in (MHATokenToKVPool, MHATokenToKVPoolMXFP8)
+            for pool in pools
+        )
+        # The entries address one row per token slot.
+        or any(
+            pool.kv_cache_layout != "nhd" for pool in (*pools, *kv_drafts, *swa_drafts)
+        )
+        or params.mtp_draft_device_pools
+    ):
+        raise ValueError(
+            "The direct external linker supports FULL + SWA models only with "
+            "slot-major (NHD) MHA pools, without packed draft KV."
+        )
+    if any(pool.page_size != page_size for pool in pools):
+        raise ValueError(
+            "FULL + SWA KV page size must match the tree page size: "
+            f"{[pool.page_size for pool in pools]} != {page_size}."
+        )
+
+    full_mapping, swa_mapping = map(
+        _merge_head_group_layers, _swa_layer_mappings(kvcache)
+    )
+    entries = [
+        _mha_device_pool_entry(
+            PoolName.KV,
+            kvcache.full_kv_pool,
+            full_mapping,
+            page_size,
+            draft_pools=kv_drafts,
+        ),
+        _mha_device_pool_entry(
+            PoolName.SWA,
+            kvcache.swa_kv_pool,
+            swa_mapping,
+            page_size,
+            draft_pools=swa_drafts,
         ),
     ]
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -42,6 +42,14 @@ CHUNK_PAGES = 64
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
+
+# Keys per existence query when pipeline stage 0 probes for every stage.
+PP_EXISTS_KEYS_PER_CALL = int(os.getenv("UMBP_PP_EXISTS_KEYS_PER_CALL", "4096"))
+# How long a later pipeline stage waits for a write stage 0 has already finished.
+PP_OFFLOAD_WAIT_S = float(os.getenv("UMBP_PP_OFFLOAD_WAIT_S", "120"))
+PP_OFFLOAD_REWRITES = 3
+# 1: stage 0 probes every page of a window pool instead of the last window first.
+PP_FULL_WINDOW_PROBE = os.getenv("UMBP_PP_FULL_WINDOW_PROBE") == "1"
 
 
 def _storage_suffix(
@@ -132,6 +140,8 @@ def _materialize_cpu_indices(indices: torch.Tensor) -> torch.Tensor:
 
 
 class UMBPDirectLinker(UnifiedCacheLinker):
+    supports_pp = True
+
     def __init__(
         self,
         server_args,
@@ -321,6 +331,26 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
             self.storage.kv_rank_suffix = rank_suffix
             self.storage.mha_suffix = rank_suffix
+            # Pipeline stage 0 answers lookups for every stage's objects.
+            self._lookup_suffixes: tuple[str | None, ...] = (None,)
+            if params.pp_size > 1:
+                if (
+                    distributed
+                    and torch.distributed.get_world_size(group=params.tp_cache_group)
+                    > 1
+                ):
+                    raise ValueError(
+                        "The UMBP linker supports pipeline stages of one TP rank only."
+                    )
+                self._lookup_suffixes = tuple(
+                    _storage_suffix(
+                        rank_replicated=rank_replicated,
+                        tp_rank=tp_rank,
+                        attn_cp_rank=params.attn_cp_rank,
+                        pp_rank=stage,
+                    )
+                    for stage in range(params.pp_size)
+                )
             self._register_buffers()
             # Report the mode rather than asserting it in the text: the line is
             # what every acceptance check greps to prove the linker attached at
@@ -346,6 +376,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         )
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
+        # A later pipeline stage keeps its failed writes until stage 0's verdict
+        # says whether to write them again; the lock keeps that off the thread's batch.
+        self._keep_failed_offloads = params.pp_size > 1 and params.pp_rank > 0
+        self._failed_offloads: deque[_OffloadTask] = deque()
+        self._offload_lock = threading.Lock()
+        self._pp_rank = params.pp_rank
         self._stats = {
             "lookup": 0,
             "load": 0,
@@ -353,6 +389,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # offload / offload_batches is the coalescing actually achieved.
             "offload_batches": 0,
         }
+        if params.pp_size > 1:
+            self._stats |= {"offload_failed": 0, "offload_rewritten": 0}
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
             daemon=True,
@@ -385,10 +423,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 self._registered.append(allocation)
 
     def _object_keys_for_pages(
-        self, page_keys: list[str], transfer: PoolTransfer
+        self,
+        page_keys: list[str],
+        transfer: PoolTransfer,
+        rank_suffix: str | None = None,
     ) -> tuple[list[str], int]:
         component_keys, multiplier = self.storage._get_hybrid_page_component_keys(
-            page_keys, transfer
+            page_keys, transfer, rank_suffix=rank_suffix
         )
         entry = self.pools[transfer.name]
         # One key names one stored object, and a packed entry stores a whole
@@ -405,6 +446,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return component_keys, multiplier
 
     def _page_exists(self, page_keys: list[str], transfer: PoolTransfer) -> list[bool]:
+        if len(self._lookup_suffixes) > 1:
+            return self._page_exists_on_every_stage(page_keys, transfer)
         entry = self.pools[transfer.name]
         objects_per_page = 1 if entry.packed else len(entry.components)
         max_objects = CHUNK_PAGES * self.num_layers
@@ -423,6 +466,41 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             page_exists.extend(
                 all(exists[index : index + objects_per_page])
                 for index in range(0, len(exists), objects_per_page)
+            )
+        return page_exists
+
+    def _page_exists_on_every_stage(
+        self, page_keys: list[str], transfer: PoolTransfer
+    ) -> list[bool]:
+        """A page is present when every pipeline stage's objects of it are; the
+        stages name them alike but for the suffix."""
+        entry = self.pools[transfer.name]
+        objects_per_page = 1 if entry.packed else len(entry.components)
+        suffixes = self._lookup_suffixes
+        per_page = objects_per_page * len(suffixes)
+        pages_per_call = max(1, PP_EXISTS_KEYS_PER_CALL // per_page)
+
+        page_exists = []
+        for start in range(0, len(page_keys), pages_per_call):
+            chunk_pages = page_keys[start : start + pages_per_call]
+            object_keys = [
+                key
+                for suffix in suffixes
+                for key in self._object_keys_for_pages(chunk_pages, transfer, suffix)[0]
+            ]
+            exists = np.fromiter(
+                self.storage.client.batch_exists(object_keys), dtype=bool
+            )
+            if len(exists) != len(object_keys):
+                raise RuntimeError(
+                    f"UMBP exists result-size mismatch for pool {transfer.name}: "
+                    f"expected={len(object_keys)} actual={len(exists)}."
+                )
+            # stage-major, then page, then the page's objects
+            page_exists.extend(
+                exists.reshape(len(suffixes), len(chunk_pages), objects_per_page)
+                .all(axis=(0, 2))
+                .tolist()
             )
         return page_exists
 
@@ -457,6 +535,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
 
         valid_pages = list(range(1, len(page_keys) + 1))
         for transfer in expanded:
+            if self._tail_window_present(page_keys, valid_pages[-1], transfer):
+                valid_pages = valid_pages[-1:]
+                continue
             # Probe only as far as the surviving boundary: no hit policy reads
             # past its own end offset, so pages beyond the longest candidate
             # cannot change the answer. This runs synchronously inside the
@@ -476,6 +557,21 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 len(valid_pages),
             )
         return valid_pages
+
+    def _tail_window_present(
+        self, page_keys: list[str], end: int, transfer: PoolTransfer
+    ) -> bool:
+        """Whether the window that ends the longest candidate prefix is stored.
+        Pipeline stage 0 intersects its lengths with no other rank, so only the
+        longest one counts."""
+        if (
+            len(self._lookup_suffixes) == 1
+            or transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES
+            or PP_FULL_WINDOW_PROBE
+        ):
+            return False
+        first = max(0, end - max(1, len(transfer.keys or ())))
+        return all(self._page_exists(page_keys[first:end], transfer))
 
     def prefetch(self, transfers: list[PoolTransfer]) -> None:
         return None
@@ -888,11 +984,14 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def _offload_batch(self, tasks: list[_OffloadTask]) -> None:
         success = False
         try:
-            success = self._run_offload(tasks)
+            with self._offload_lock:
+                success = self._run_offload(tasks)
         except BaseException:
             logger.exception("UMBP offload failed")
             success = False
         finally:
+            if not success and self._keep_failed_offloads:
+                self._failed_offloads.extend(tasks)
             # One result per task in submission order: the tree pairs them
             # positionally. A batch resolves as a unit because the first failed
             # pool stops the rest, leaving every task in it incomplete.
@@ -979,6 +1078,42 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def pop_completed_offload(self) -> bool:
         return self._offload_results.get_nowait()
 
+    def wait_completed_offload(self) -> bool:
+        try:
+            return self._offload_results.get(timeout=PP_OFFLOAD_WAIT_S)
+        except Empty:
+            raise RuntimeError(
+                f"UMBP offload on pipeline stage {self._pp_rank} did not complete "
+                f"within {PP_OFFLOAD_WAIT_S:.0f}s of stage 0 finishing it."
+            ) from None
+
+    def settle_failed_offload(self, *, rewrite: bool) -> bool:
+        task = self._failed_offloads.popleft()
+        self._stats["offload_failed"] += 1
+        if not rewrite:
+            return True
+        keys = [key for transfer in task[0] for key in transfer.keys or ()]
+        for attempt in range(1, PP_OFFLOAD_REWRITES + 1):
+            try:
+                with self._offload_lock:
+                    landed = self._run_offload([task])
+            except Exception:
+                logger.exception("UMBP offload rewrite failed")
+                landed = False
+            logger.warning(
+                "UMBP offload rewrite on pipeline stage %d: attempt=%d landed=%s "
+                "pages=%d first_key=%s",
+                self._pp_rank,
+                attempt,
+                landed,
+                len(keys),
+                keys[0] if keys else None,
+            )
+            if landed:
+                self._stats["offload_rewritten"] += 1
+                return True
+        return False
+
     def reset(self) -> None:
         self._pending.clear()
         self._load_queue.join()
@@ -988,6 +1123,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 self._offload_results.get_nowait()
             except Empty:
                 break
+        self._failed_offloads.clear()
         self.layer_done_counter.reset()
 
     def close(self) -> None:

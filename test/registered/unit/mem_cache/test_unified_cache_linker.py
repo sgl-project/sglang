@@ -231,6 +231,7 @@ def _cache_for_wrapper(**kwargs):
         "tree_components": (ComponentType.FULL,),
         "write_through_threshold": 256,
         "pp_size": 1,
+        "pp_rank": 0,
         "pp_group": None,
         "metrics_collector": None,
     }
@@ -846,6 +847,7 @@ def test_cache_linker_attachment_is_backend_independent():
     cache.linker = None
     cache._components_tuple = ()
     cache.components = {}
+    cache.pp_size = 1
     index_slots(cache, cache.components)
     linker = _FakeLinker()
 
@@ -877,11 +879,14 @@ def test_cache_linker_rejects_unsupported_tree_components(component_type, load_m
 
 def test_pipeline_parallelism_rejects_only_prefetch_mode():
     cache = _cache_for_wrapper(pp_size=2)
-    UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+    backend = _FakeLinker()
+    backend.supports_pp = True
+    UnifiedCacheLinkerWrapper(cache, backend)
     assert cache.tree_core.enable_external_cache_linker
 
     cache = _cache_for_wrapper(pp_size=2)
     backend = _FakeLinker()
+    backend.supports_pp = True
     backend.load_mode = "prefetch"
     with pytest.raises(ValueError, match="prefetch currently requires PP=1"):
         UnifiedCacheLinkerWrapper(cache, backend)
@@ -2288,6 +2293,7 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
 def test_check_hicache_events_commits_common_rank_results():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.pp_size = 1
     cache.linker = SimpleNamespace(
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,

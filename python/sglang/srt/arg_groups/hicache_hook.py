@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import resolving_view, use_mla_backend
 from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ def handle_hicache(server_args: Any):
     ):
         raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
     if cfg.enable_unified_cache_external_linker:
-        if cfg.pp_size > 1:
+        if cfg.pp_size > 1 and not envs.SGLANG_UNIFIED_CACHE_LINKER_PP.get():
             raise ValueError(
                 "--enable-unified-cache-external-linker does not support "
                 "pipeline parallelism; use --pp-size 1."

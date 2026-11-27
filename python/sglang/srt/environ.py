@@ -707,6 +707,10 @@ class Envs:
     # SWA pool) instead of its full-attention slots. Needs draft window <= the
     # target's sliding window; ignored (with the reason logged) where it does not apply.
     SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV = EnvBool(True)
+    # Under PD disaggregation keep that pool on the sliding-window slots and send
+    # it with the target's window state instead of as KV pages. Set it on both
+    # servers; mori transfer backend only.
+    SGLANG_ROCM_DFLASH_PD_WINDOW_DRAFT_KV = EnvBool(False)
 
     # ===================================================================
     # Scheduler token budgeting and admission
@@ -793,6 +797,14 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # PP PD prefill: a stage checkpoints and sends a finished prompt's KV once
+    # its own forward of the last chunk is done, instead of when that forward's
+    # output has come round the ring. Needs the mori transfer backend.
+    SGLANG_PP_DISAGG_PREFILL_EARLY_KV_SEND = EnvBool(False)
+    # PP PD prefill: every stage compares the batch it scheduled with the previous
+    # stage's and stops at the first difference; stages that schedule differently
+    # otherwise wait for each other forever.
+    SGLANG_PP_DISAGG_PREFILL_CHECK_STAGE_BATCHES = EnvBool(False)
     # PP rank 0 posts its output recv only after its own forward. Enable it if PP
     # hangs or stalls on kernels that need every SM (e.g. flashinfer MLA).
     SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD = EnvBool(False)
@@ -816,6 +828,10 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Allow the UMBP direct external linker with --pp-size > 1.
+    SGLANG_UNIFIED_CACHE_LINKER_PP = EnvBool(False)
+    # How long pipeline stage 0 holds a finished offload back before every stage commits it.
+    SGLANG_UNIFIED_CACHE_LINKER_PP_SETTLE_MS = EnvInt(300)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:
@@ -2432,6 +2448,9 @@ class Envs:
     # aiter attention backend (head_dim 64, GQA 8, page 16, SWA KV pool):
     # extend reuses the page tables / query offsets init_forward_metadata built.
     SGLANG_ROCM_MUSE_REUSE_EXTEND_METADATA = EnvBool(True)
+    # KV heads of a pipeline stage kept as this many groups, each laid out as one attention-TP rank of the
+    # decode it feeds (0 / 1: one pool layer per model layer).
+    SGLANG_ROCM_MUSE_PP_KV_GROUPS = EnvInt(0)
     # target-verify KV lengths once per batch / per graph replay, not per layer.
     SGLANG_ROCM_MUSE_REUSE_VERIFY_LENGTHS = EnvBool(True)
     # FP8 Q (per-tensor dynamic scale) for full-layer extend of >= 256 tokens.

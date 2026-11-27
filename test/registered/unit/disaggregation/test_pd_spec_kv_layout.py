@@ -30,7 +30,7 @@ SENTINEL_QUERY = dict.fromkeys(
 
 
 def layout(algorithm, *, num_draft_entries=6, num_draft_tokens=5, block_size_flag=4):
-    kv_args = SimpleNamespace(num_draft_entries=num_draft_entries)
+    kv_args = SimpleNamespace(num_draft_entries=num_draft_entries, kv_head_groups=None)
     with published_topology(
         speculative_algorithm=algorithm,
         speculative_num_draft_tokens=num_draft_tokens,
