@@ -92,7 +92,7 @@ export const InternS2PreviewDeployment = () => {
     }
     if (values.hardware === 'xeon') {
       flags.push('  --device cpu');
-      flags.push('  --disable-overlap-schedule')
+      flags.push('  --disable-overlap-schedule');
     }
     flags.push('  --mem-fraction-static 0.8');
     flags.push('  --host 0.0.0.0');
