@@ -2408,13 +2408,13 @@ class KimiK3DeltaAttention(nn.Module):
         if getattr(self, "_kda_dwdp", None) or not may_fuse():
             return False
 
-        # [q,k,v,g | f_a | b | pad]; f_a/b keep the same relative order. On CUDA
-        # pad to 16 rows (32B for bf16) so strided f_a satisfies SM100 32B vector
-        # alignment across all TP sizes (at TP8 6144+128+12 -> 6288, tail 144).
+        # [q,k,v,g | f_a | b | pad]; f_a/b keep the same relative order and the
+        # same pad_rows_to=8 layout as the split [f_a | b] merge and K3.1 verify
+        # binding (at TP8 6144+128+12 -> 6288, tail 144; at TP16 -> 3208, tail 136).
         previous = getattr(self, "_qkvgbfa_layer", None)
         merged, sizes = _merge_weights_as_views(
             [self.fused_qkvg_proj, self.f_a_proj, self.b_proj],
-            pad_rows_to=8 if _is_hip else 16,
+            pad_rows_to=8,
             target=None if previous is None else previous.weight,
         )
         self._bfa_fa_size, self._bfa_b_size = sizes[-2:]
@@ -2489,10 +2489,15 @@ class KimiK3DeltaAttention(nn.Module):
             return False
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
             return False
+        if not all(w.is_cuda for w in ws) or len({w.device for w in ws}) != 1:
+            return False
         # Whitelist the dtype rather than only require the three to agree: the
         # merged buffer carries only .weight, so quantized weights that happen to
-        # match each other still lose their per-channel scales.
+        # match each other still lose their per-channel scales. On CUDA keep FP16
+        # on the existing split layout (BF16-only tiny_gemm_bf16 / merged path).
         if not _is_unquantized_mergeable(ws):
+            return False
+        if not _is_hip and ws[0].dtype != torch.bfloat16:
             return False
         return len({(w.dtype, w.shape[1]) for w in ws}) == 1
 
@@ -3093,7 +3098,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             return False
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
             return False
-        if not _is_unquantized_mergeable(ws):
+        if not all(w.is_cuda for w in ws) or len({w.device for w in ws}) != 1:
+            return False
+        if not _is_unquantized_mergeable(ws) or ws[0].dtype != torch.bfloat16:
             return False
         if len({(w.dtype, w.shape[1]) for w in ws}) != 1:
             return False
