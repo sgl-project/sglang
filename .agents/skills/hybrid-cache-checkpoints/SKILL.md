@@ -12,7 +12,7 @@ A hybrid model can resume a prefix only from a position where the tree holds a r
 | `3` | Every prefill chunk and every `--mamba-track-interval` decode boundary, plus fork points and request ends. | Unlimited (or `--mamba-max-states-per-path N`). |
 | `2` (default) | Fork points (`mamba_branching_seqlen`) and request ends. A PD prefill worker treats the complete prompt as the request end. | Soft cap of 1 (or `--mamba-max-states-per-path N`). |
 
-`--mamba-max-states-per-path` is deprecated; an explicit value still sets the soft cap at either level (`-1` = unlimited). Its old meaning is the cap only; level 2 additionally skips intermediate checkpoints except on the paths described below. The cap is a pruning target, not a hard bound: tail, fork, locked, and device-leaf states can be preserved. Budget and measure retained checkpoints as well as running states; do not assume one state slot per session.
+`--mamba-max-states-per-path` is deprecated; an explicit value still sets the soft cap at either level (`-1` = unlimited). Its old meaning is the cap only; level 2 additionally skips intermediate checkpoints except on the paths described below. The cap is a pruning target, not a hard bound: tail, fork, locked, and device-leaf states can be preserved. Budget and measure retained checkpoints as well as running states; do not assume one state slot per session. With a HiCache host tier in cache mode the cap counts host copies too, and a pruned checkpoint loses its host copy unless that copy is host-locked or has a backup or load-back in flight (`MambaComponent._evict_excess_path_states`, enabled at HiCache init by `UnifiedRadixCache._init_mamba_path_cap_counts_host`).
 
 ## Where it lives
 
