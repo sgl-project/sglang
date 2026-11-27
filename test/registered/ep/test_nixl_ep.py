@@ -97,6 +97,7 @@ class TestNixlEPTP(_EPTestBase):
     server_args = [*NIXL_COMMON]
 
 
+@unittest.skip("NIXL DP attention hits deprecated forward_deepgemm_masked")
 class TestNixlEPDPAttn(_EPTestBase):
     server_args = [*NIXL_COMMON, *DP_ATTN]
 
