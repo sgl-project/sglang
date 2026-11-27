@@ -3862,6 +3862,7 @@ class ServerArgs(DisaggServerArgsMixin):
         default_args: dict[str, Any] | None = None,
         *,
         argv: list[str] | None = None,
+        forced_args: dict[str, Any] | None = None,
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
@@ -3900,6 +3901,9 @@ class ServerArgs(DisaggServerArgsMixin):
         if default_args:
             for key, value in default_args.items():
                 provided_args.setdefault(key, value)
+        if forced_args:
+            # unlike default_args, these win over the CLI and the config file
+            provided_args.update(forced_args)
 
         if dynamic_paths:
             existing = dict(provided_args.get("component_paths") or {})
