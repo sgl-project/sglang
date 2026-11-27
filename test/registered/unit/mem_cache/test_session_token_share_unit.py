@@ -24,6 +24,7 @@ import torch
 
 from sglang.srt.managers.io_struct import CloseSessionReqInput
 from sglang.srt.managers.req_types import (
+    FINISH_ABORT,
     FINISH_LENGTH,
     MultimodalDataItem,
     MultimodalInputs,
@@ -36,7 +37,7 @@ from sglang.test.test_utils import CustomTestCase
 VOCAB = 1 << 20
 
 
-def _recv(rid, input_ids, max_new_tokens=8, parent=None):
+def _recv(rid, input_ids, max_new_tokens=8, parent=None, lora_id=None):
     return SimpleNamespace(
         rid=rid,
         input_ids=array("q", input_ids),
@@ -49,7 +50,7 @@ def _recv(rid, input_ids, max_new_tokens=8, parent=None):
             drop_previous_output=False,
         ),
         sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
-        lora_id=None,
+        lora_id=lora_id,
         custom_logit_processor=None,
         stream=False,
         return_logprob=False,
@@ -80,9 +81,9 @@ class TestSessionTokenShare(CustomTestCase):
     def setUp(self):
         self.session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
 
-    def _create(self, rid, input_ids, max_new_tokens=8):
+    def _create(self, rid, input_ids, max_new_tokens=8, lora_id=None):
         return self.session.create_req(
-            _recv(rid, input_ids, max_new_tokens=max_new_tokens),
+            _recv(rid, input_ids, max_new_tokens=max_new_tokens, lora_id=lora_id),
             tokenizer=None,
             vocab_size=VOCAB,
         )
@@ -223,6 +224,33 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(len(r2.full_untruncated_fill_ids), 0)  # carry skipped
         r2.refresh_fill_ids()
         self.assertEqual(list(r2.full_untruncated_fill_ids), list(r2.origin_input_ids))
+
+    def test_streaming_session_rejects_lora_id_change(self):
+        """Switching lora_id across turns in a streaming session must abort
+        without mutating committed history or breaking valid follow-up turns."""
+        for first_lora, bad_lora in [
+            ("adapter-a", "adapter-b"),
+            ("adapter-a", None),
+            (None, "adapter-a"),
+        ]:
+            with self.subTest(first_lora=first_lora, bad_lora=bad_lora):
+                self.setUp()
+                r1 = self._create("r1", [10, 11], lora_id=first_lora)
+                self._decode_and_finish(r1, [12, 13])
+
+                bad = self._create("r2-bad", [20], lora_id=bad_lora)
+                self.assertIsInstance(bad.to_finish, FINISH_ABORT)
+                self.assertIn("lora_id", bad.to_finish.message)
+                self.assertFalse(self.session._inflight)
+                # Committed history of r1 must remain untouched.
+                self.assertEqual(list(r1.origin_input_ids), [10, 11])
+                self.assertEqual(self.session.committed_origin_len, 2)
+
+                # A valid follow-up turn with the original lora_id still works.
+                r2 = self._create("r2-ok", [30], lora_id=first_lora)
+                self.assertIsNone(r2.to_finish)
+                self.assertIs(r2.origin_input_ids, r1.origin_input_ids)
+                self.assertEqual(list(r2.origin_input_ids), [10, 11, 12, 13, 30])
 
 
 class TestSessionTeardown(CustomTestCase):

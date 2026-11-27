@@ -195,7 +195,15 @@ class Session:
                 assert len(self.turns) == 1
                 # Peek (don't pop) the single turn. turns is updated
                 # only in finish_req after the request completes successfully.
-                [last_req] = self.turns.values()
+                [candidate_last_req] = self.turns.values()
+                if req.lora_id != candidate_last_req.lora_id:
+                    abort = True
+                    abort_message = (
+                        "Streaming sessions do not support changing lora_id "
+                        "across turns."
+                    )
+                else:
+                    last_req = candidate_last_req
         else:
             if session_params.rid is not None:
                 if session_params.rid not in self.turns:
