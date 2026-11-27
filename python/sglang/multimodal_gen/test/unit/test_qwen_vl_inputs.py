@@ -103,10 +103,15 @@ def test_qwen_vl_embedding_and_decoder_accessors(model):
 @torch.no_grad()
 def test_qwen3vl_precomputed_image_features_match_pixel_inputs(model):
     model.eval()
+    # Inference layers normally populate their empty parameters from a checkpoint.
+    generator = torch.Generator().manual_seed(42)
+    for parameter in model.parameters():
+        parameter.normal_(std=0.1, generator=generator)
     # Two distinct references, each merged into one language-model token.
     grid = torch.tensor([[1, 2, 2], [1, 2, 2]])
     pixels = torch.arange(8 * 12, dtype=torch.float32).reshape(8, 12) / 96
     features = model._get_flat_visual_features(pixels, grid)
+    assert not torch.equal(features[0][0], features[0][1])
     for last_token in (4, 5):
         ids = torch.tensor([[1, 2, 6, 2, last_token]])
         kwargs = dict(
