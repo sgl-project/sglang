@@ -76,7 +76,7 @@ DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
     "--max-running-requests",
     32,
     "--chunked-prefill-size",
-    8192,
+    131072,
     "--max-prefill-tokens",
     131072,
     "--cuda-graph-bs-decode",

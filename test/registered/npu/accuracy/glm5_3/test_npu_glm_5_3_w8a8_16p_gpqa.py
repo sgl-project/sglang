@@ -48,7 +48,7 @@ GLM_5_3_W8A8_16P_TWO_NODE_OTHER_ARGS = [
     "--attn-dp-size",
     8,
     "--chunked-prefill-size",
-    8192,
+    65536,
     "--max-prefill-tokens",
     280000,
     "--trust-remote-code",

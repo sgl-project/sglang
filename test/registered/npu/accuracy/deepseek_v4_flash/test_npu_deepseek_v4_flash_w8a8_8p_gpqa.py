@@ -79,7 +79,7 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     "--max-prefill-tokens",
     80000,
     "--chunked-prefill-size",
-    8192,
+    131072,
     "--max-running-requests",
     192,
     "--attn-dp-size",
