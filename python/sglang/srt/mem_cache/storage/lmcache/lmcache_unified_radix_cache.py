@@ -314,7 +314,11 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._publish_external_loaded_prefix(req, token_ids_len=up_to)
         super().checkpoint(req, up_to=up_to, **kwargs)
         self._retire_loaded_flow(req.rid)
-        self._submit_store(req, req.full_untruncated_fill_ids[:up_to])
+        tokens = req.full_untruncated_fill_ids[:up_to]
+        if self.supports_partial_load_recovery():
+            for span in self.lmcache_connector.pending_writeback_ranges(req.rid, up_to):
+                self._submit_store(req, tokens[: span[1]], writeback_range=span)
+        self._submit_store(req, tokens)
         if req.finished():
             self._request_session_finish(req.rid)
 
@@ -948,7 +952,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.load_req = None
         flow.prefix_published = True
 
-    def _submit_store(self, req: Req, token_ids: list[int]) -> None:
+    def _submit_store(
+        self, req: Req, token_ids: list[int], *,
+        writeback_range: tuple[int, int] | None = None,
+    ) -> None:
         key = RadixKey(
             token_ids,
             req.extra_key,
@@ -978,7 +985,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             // self.lmcache_connector.chunk_size
             * self.lmcache_connector.chunk_size
         )
-        store_start = self.lmcache_connector.get_store_start(req.rid, len(key))
+        store_start = (
+            writeback_range[0] if writeback_range is not None
+            else self.lmcache_connector.get_store_start(req.rid, len(key))
+        )
         if resident_len <= store_start:
             logger.debug(
                 "LMCache store skipped for %s: no new resident chunk "
@@ -1046,6 +1056,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                     mamba_value=mamba_value,
                 ),
                 device_indices_start=store_start,
+                writeback_range=writeback_range,
                 cache_salt=self.lmcache_connector.build_cache_salt(
                     req.cache_salt, req.extra_key
                 ),
