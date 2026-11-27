@@ -1709,6 +1709,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
                 padding_bytes += (layer_bytes - logical_layer_bytes) * len(layers)
             return padding_bytes * self._spec_infl
+        # Reserved main/indexer pages beyond the token-scaled low-ratio bytes.
         if self._unified or get_exec().kernel.dsv4_attn_backend == "trtllm":
             return 0
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -1986,7 +1987,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
         full_token = full_token // page_size * page_size
-
         # The coefficient excludes reserved pages. Remove the few full pages
         # needed to cover them, including indexer rounding at this capacity.
         while full_token > 0 and (
