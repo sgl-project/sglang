@@ -40,7 +40,6 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     BaseReq,
@@ -448,8 +447,6 @@ class MultiTokenizerRouter:
                 port_args, caller="MultiTokenizerRouter"
             )
             self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
-
-        self.disaggregation_bootstrap_server = start_disagg_service()
 
         # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: set[str] = set()

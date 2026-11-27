@@ -87,7 +87,6 @@ from sglang.srt.layers.joint_schema_head import (
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
-from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import (
     PositionalEmbeds,
     validate_positional_embed_overrides,
@@ -742,10 +741,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.init_lora()
 
         # Init PD disaggregation and encoder disaggregation
-        # Behind MultiTokenizerRouter, the router runs the PD bootstrap service.
-        self.init_disaggregation(
-            start_pd_bootstrap_service=self.tokenizer_ipc_name is None
-        )
+        self.init_disaggregation()
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
@@ -990,13 +986,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for lora_ref in get_lora().lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
-    def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
+    def init_disaggregation(self):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
-        # Keep a reference so the bootstrap server is not garbage-collected.
-        self.bootstrap_server = (
-            start_disagg_service() if start_pd_bootstrap_service else None
-        )
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 

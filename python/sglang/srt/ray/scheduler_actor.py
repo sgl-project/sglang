@@ -16,7 +16,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 import ray
 
@@ -25,6 +26,25 @@ from sglang.srt.runtime_context import SpawnRanks, get_device, publish, spawn_wo
 from sglang.srt.server_args import PortArgs, ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_actor_gpu_ids(
+    *,
+    assigned_gpus: List[str],
+    fallback_gpu_id: int,
+    cuda_visible_devices: Optional[str],
+) -> Tuple[int, int]:
+    """Return (physical, local) ids for the actor's first GPU: the physical id
+    locates it in the host topology, the local one is its torch device ordinal."""
+    if not assigned_gpus:
+        return fallback_gpu_id, fallback_gpu_id
+    physical_gpu_id = int(assigned_gpus[0])
+    # Ray narrows CUDA_VISIBLE_DEVICES to the actor's GPUs unless
+    # RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES is set; torch numbers that view from 0.
+    visible = cuda_visible_devices.split(",") if cuda_visible_devices else []
+    if str(physical_gpu_id) in visible:
+        return physical_gpu_id, visible.index(str(physical_gpu_id))
+    return physical_gpu_id, physical_gpu_id
 
 
 @ray.remote
@@ -65,18 +85,15 @@ class SchedulerActor:
                 server_args, "ray.scheduler_actor", dist_init_addr=dist_init_addr
             )
 
-        # Get actual GPU IDs from Ray runtime context
         accelerator_ids = ray.get_runtime_context().get_accelerator_ids()
-        assigned_gpus = accelerator_ids.get("GPU", [])
-
-        if assigned_gpus:
-            # Ray assigned specific GPU(s), use the first one
-            actual_gpu_id = int(assigned_gpus[0])
-            logger.info(f"[TP{tp_rank}] Ray assigned GPU: {actual_gpu_id}")
-        else:
-            # Fallback to passed gpu_id
-            actual_gpu_id = gpu_id
-            logger.info(f"[TP{tp_rank}] Using passed gpu_id: {gpu_id}")
+        physical_gpu_id, local_gpu_id = resolve_actor_gpu_ids(
+            assigned_gpus=accelerator_ids.get("GPU", []),
+            fallback_gpu_id=gpu_id,
+            cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
+        )
+        logger.info(
+            f"[TP{tp_rank}] GPU: physical {physical_gpu_id}, device ordinal {local_gpu_id}"
+        )
 
         dp_rank = resolve_spawn_dp_rank(dp_rank)
 
@@ -90,23 +107,23 @@ class SchedulerActor:
                     server_args, tp_rank=tp_rank, pp_rank=pp_rank
                 ),
                 dp_rank=dp_rank,
-                gpu_id=actual_gpu_id,
+                gpu_id=local_gpu_id,
             ),
         )
 
         # Configure worker (logging, process title, etc.)
-        configure_scheduler_process(server_args, actual_gpu_id)
+        configure_scheduler_process(server_args, physical_gpu_id)
 
         # Ray actors can't use the numactl subprocess-wrapping approach
         # (SGLANG_NUMA_BIND_V2's normal path), so bind in-process via libnuma.
         # The V1 path inside configure_scheduler_process already handles
         # SGLANG_NUMA_BIND_V2=False.
         if envs.SGLANG_NUMA_BIND_V2.get():
-            numa_node = get_numa_node_if_available(server_args, actual_gpu_id)
+            numa_node = get_numa_node_if_available(server_args, physical_gpu_id)
             if numa_node is not None:
                 numa_bind_to_node(numa_node)
                 logger.info(
-                    f"[TP{tp_rank}] Bound to NUMA node {numa_node} for GPU {actual_gpu_id}"
+                    f"[TP{tp_rank}] Bound to NUMA node {numa_node} for GPU {physical_gpu_id}"
                 )
 
         # Create scheduler (loads model into GPU, initializes NCCL)
