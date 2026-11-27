@@ -1002,6 +1002,109 @@ def _minimax_h3_collective_pipelined_attention(
     return ulysses_head_group_pipelined_attention(q, k, v, attend, groups)
 
 
+def _minimax_h3_rocm_fill_pipelined_attention(
+    attention: MiniMaxH3Attention,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    rope_cache: tuple[torch.Tensor, torch.Tensor],
+    *,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...] | None,
+    max_seqlen: int,
+) -> torch.Tensor | None:
+    """ROCm: the collective head-group pipeline on the copy engines, with the
+    QK RMSNorm + RoPE written straight into the exchange blocks.
+
+    q/k are the raw projections. One pass replaces ``aten_head_rmsnorm`` on q
+    and on k, the destination-major pack and the copy of this rank's own
+    blocks, with the norm kernel's arithmetic, so the result is the bytes of
+    the norm followed by ``_minimax_h3_collective_pipelined_attention``.
+    Returns None, having written nothing, when that path would not run.
+    """
+    if os.environ.get("SGLANG_DIFFUSION_ROCM_CE_FILL", "0") != "1":
+        return None
+    q_norm, k_norm = attention.q_norm, attention.k_norm
+    cos_sin_cache, positions = rope_cache
+    # only once the norm the fill replicates was verified against eager (an
+    # unverified or disabled gate means the caller's path runs other kernels)
+    gate = _ATEN_HEAD_RMSNORM_ROPE
+    if (
+        torch.version.hip is None
+        or not gate.verified
+        or gate.disabled
+        or torch.compiler.is_compiling()
+        or torch.cuda.is_current_stream_capturing()
+        or is_in_breakable_cuda_graph()
+        or q_norm.eps is None
+        or k_norm.eps is None
+        or not can_use_aten_head_rmsnorm(q, q_norm.weight)
+        or not can_use_aten_head_rmsnorm(k, k_norm.weight)
+        or not can_use_aten_head_rmsnorm_rope(q, cos_sin_cache, positions)
+    ):
+        return None
+    _minimax_h3_bind_attention_backend(attention, q.dtype)
+    groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
+    if groups < 0:
+        groups = 2
+    world_size, _ = get_ulysses_ctx()
+    if (
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
+        or attention._attention_backend_enum
+        not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
+        or q.shape[1] % (world_size * groups)
+    ):
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ce_fill_rocm import (
+        can_fill,
+        qkv_fill,
+    )
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_rocm import (
+        IPC_A2A_ROCM,
+        rocm_ce_ready,
+    )
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
+
+    if not can_fill(
+        q, k, v, q_norm.weight, k_norm.weight, cos_sin_cache, positions
+    ) or not rocm_ce_ready(get_sp_group().ulysses_group):
+        return None
+    impl = attention._attention_impl
+
+    def attend(q_group, k_group, v_group):
+        return impl.forward_varlen(
+            q_group,
+            k_group,
+            v_group,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cu_seqlens_host=cu_seqlens_host,
+        )
+
+    def fill(send, own, first_group, n_groups):
+        qkv_fill(
+            send,
+            own,
+            q,
+            k,
+            v,
+            q_norm.weight,
+            k_norm.weight,
+            q_norm.eps,
+            k_norm.eps,
+            cos_sin_cache,
+            positions,
+            rank=IPC_A2A_ROCM.rank,
+            world=world_size,
+            groups=groups,
+            first_group=first_group,
+            n_groups=n_groups,
+        )
+
+    return IPC_A2A_ROCM.pipelined_attention(q, k, v, attend, groups, fill=fill)
+
+
 def _minimax_h3_qknorm_rope_pipelined_attention(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -1732,6 +1835,19 @@ class MiniMaxH3Attention(nn.Module):
                     round_norm_before_rope=True,
                 )
             else:
+                if ulysses_active and not ring_active:
+                    out = _minimax_h3_rocm_fill_pipelined_attention(
+                        self,
+                        q,
+                        k,
+                        v,
+                        rope_cache,
+                        cu_seqlens=cu_seqlens,
+                        cu_seqlens_host=cu_seqlens_host,
+                        max_seqlen=max_seqlen,
+                    )
+                    if out is not None:
+                        return out.reshape(total, self.num_heads * self.head_dim)
                 q, k = _apply_qk_norm_rope(
                     q,
                     k,
