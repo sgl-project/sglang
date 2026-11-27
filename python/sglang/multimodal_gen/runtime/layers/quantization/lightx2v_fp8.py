@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.rowwise_fp8 import (
     RowwiseFp8Config,
 )
 from sglang.multimodal_gen.runtime.models.parameter import ChannelQuantScaleParameter
+from sglang.srt.layers.quantization.fp8_utils import use_aiter_bpreshuffle_gemm
 
 
 class LightX2VFp8LinearMethod(Fp8LinearMethod):
@@ -29,6 +30,12 @@ class LightX2VFp8LinearMethod(Fp8LinearMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs: Any,
     ) -> None:
+        # The inherited rowwise path leaves checkpoint weights unshuffled.
+        if use_aiter_bpreshuffle_gemm(sum(output_partition_sizes)):
+            raise ValueError(
+                "LightX2V scaled FP8 checkpoints do not support AITER pre-shuffled "
+                "GEMM; set SGLANG_USE_AITER=0."
+            )
         weight_loader = extra_weight_attrs.get("weight_loader")
 
         def load_weight(
@@ -60,6 +67,9 @@ class LightX2VFp8LinearMethod(Fp8LinearMethod):
 
 
 class LightX2VFp8Config(RowwiseFp8Config):
+    # FSDP mixed precision does not preserve the required weight/scale dtypes.
+    supports_fsdp = False
+
     def get_quant_method(
         self, layer: nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:

@@ -53,6 +53,7 @@ class TestLightX2VFp8(unittest.TestCase):
         )
         assert detected
         assert isinstance(config, LightX2VFp8Config)
+        self.assertFalse(config.supports_fsdp)
         assert config.fp8_layers == frozenset({PREFIX})
         assert isinstance(
             config.get_quant_method(ReplicatedLinear(8, 4), PREFIX[:-2]),
@@ -91,6 +92,17 @@ class TestLightX2VFp8(unittest.TestCase):
         self.assertIs(type(resolved), RowwiseFp8Config)
         self.assertEqual(resolved.fp8_layers, frozenset({PREFIX}))
         fallback.assert_not_called()
+
+    def test_rejects_aiter_preshuffled_gemm(self):
+        config = LightX2VFp8Config(format_version="1.1", fp8_layers=frozenset({PREFIX}))
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.layers.quantization.lightx2v_fp8."
+            "use_aiter_bpreshuffle_gemm",
+            return_value=True,
+        ) as use_preshuffle:
+            with self.assertRaisesRegex(ValueError, "SGLANG_USE_AITER=0"):
+                ReplicatedLinear(8, 3072, quant_config=config, prefix=PREFIX[:-2])
+            use_preshuffle.assert_called_once_with(3072)
 
     def test_bf16_checkpoint_skips_fp8_fallback(self):
         tensors = _checkpoint_tensors()
