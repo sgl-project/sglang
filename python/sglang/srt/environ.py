@@ -950,6 +950,9 @@ class Envs:
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
+    # Remove a path's superseded Mamba states from storage (HiCache L3 and the
+    # external linker) once a newer state on the path persists.
+    SGLANG_ENABLE_HICACHE_MAMBA_TAIL_ONLY_STORAGE = EnvBool(True)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

@@ -109,6 +109,9 @@ from sglang.srt.mem_cache.unified_cache.components import (
     SWAComponent,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.mamba_storage_retention import (
+    MambaStorageRetention,
+)
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
@@ -397,6 +400,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        self.mamba_storage_retention: Optional[MambaStorageRetention] = None
         # Session of the insert whose actions are being applied (see ``insert``).
         self.insert_session_id: Optional[str] = None
         # Write-side dedupe: beliefs about what storage already holds, so
@@ -537,6 +541,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # ongoing_backup: the ack drain settles every write at a rank-agreed
         # written prefix of this span (buffer mode reads it from its entry).
         self._backup_requested_tokens: dict[int, int] = {}
+        # Mamba states each cache-mode storage write supersedes once it lands.
+        self._superseded_mamba_by_backup: dict[int, list[str]] = {}
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -670,6 +676,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        if (
+            envs.SGLANG_ENABLE_HICACHE_MAMBA_TAIL_ONLY_STORAGE.get()
+            and ComponentType.MAMBA in self.tree_components
+            and not self.tree_core.is_eagle
+        ):
+            self.mamba_storage_retention = MambaStorageRetention(self)
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -696,6 +708,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        if self.mamba_storage_retention is not None:
+            self.mamba_storage_retention.remover.close()
+            logger.info(
+                "Mamba storage retention stats: %s",
+                dict(self.mamba_storage_retention.stats),
+            )
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
@@ -2676,6 +2694,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self._backup_requested_tokens[operation_id] = (
             len(spec.hash_value) * self.page_size
         )
+        mamba = next(
+            (x for x in spec.comp_xfers.get(ComponentType.MAMBA, ()) if x.keys), None
+        )
+        if self.mamba_storage_retention is not None and mamba is not None:
+            superseded = self.mamba_storage_retention.supersede(node_id, mamba.keys[-1])
+            if superseded:
+                self._superseded_mamba_by_backup[operation_id] = superseded
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -3275,6 +3300,11 @@ class UnifiedRadixCache(BasePrefixCache):
             self._apply_cache_actions(commit_actions)
             # The commit emits via commit_actions only; the walk's were applied above.
             assert not insert_result.cache_actions
+            mamba = next(
+                (x for x in comp_xfers.get(ComponentType.MAMBA, ()) if x.keys), None
+            )
+            if self.mamba_storage_retention is not None and mamba is not None:
+                self.mamba_storage_retention.remember(mamba.keys[-1])
 
             self.cache_controller.mem_pool_host.free(
                 host_indices[: insert_result.prefix_len]
@@ -4199,18 +4229,37 @@ class UnifiedRadixCache(BasePrefixCache):
         page_size = self.page_size
         short = requested_tokens is not None and agreed_tokens < requested_tokens
         if self.buffer_pipeline is not None:
-            self.buffer_pipeline.finish_storage_write_ack(
+            entry = self.buffer_pipeline.finish_storage_write_ack(
                 operation.id,
                 written_pages=(
                     None if requested_tokens is None else agreed_tokens // page_size
                 ),
             )
+            superseded = entry.superseded_mamba_keys if entry is not None else None
         else:
             self._backup_requested_tokens.pop(operation.id, None)
             entry = self.ongoing_backup.pop(operation.id, None)
             if entry is not None:
                 node_id, lock_params = entry
                 self.dec_host_lock_ref(node_id, lock_params)
+            superseded = self._superseded_mamba_by_backup.pop(operation.id, None)
+        # These beliefs control backup admission, so every rank must invalidate
+        # the same snapshot, even when its local Mamba write failed. Actual
+        # deletion below still requires this rank's newer state to persist.
+        if superseded and not short:
+            self.storage_existence_cache.pool(PoolName.MAMBA).invalidate_beyond(
+                superseded, 0
+            )
+        result = getattr(operation, "pool_storage_result", None)
+        if (
+            superseded
+            and not short
+            and result is not None
+            and result.extra_pool_hit_pages.get(PoolName.MAMBA, 0) > 0
+        ):
+            self.mamba_storage_retention.remover.submit(
+                self.cache_controller.storage_backend, superseded
+            )
         if short:
             logger.warning(
                 "HiCache storage backup operation %d wrote %d of %d tokens; the "

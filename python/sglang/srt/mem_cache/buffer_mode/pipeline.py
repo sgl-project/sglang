@@ -128,6 +128,8 @@ class _UnifiedBufferBackupEntry(msgspec.Struct):
     lock_params: DecLockRefParams
     occupied_units: int
     keys_by_pool: dict[PoolName, list[str]]
+    # Mamba states this write supersedes, removed once it lands.
+    superseded_mamba_keys: list[str] = []
 
 
 class _StagedPrefetch(msgspec.Struct):
@@ -1145,6 +1147,12 @@ class BufferModePipeline:
         beliefs = cache.storage_existence_cache
         for pool, keys in keys_by_pool.items():
             beliefs.pool(pool).track_inflight(keys)
+        superseded = []
+        mamba_keys = keys_by_pool.get(PoolName.MAMBA)
+        if cache.mamba_storage_retention is not None and mamba_keys:
+            superseded = cache.mamba_storage_retention.supersede(
+                snapshot.node_id, mamba_keys[-1]
+            )
         # NOTE: no commit_backup — the node must never appear
         # host-resident in buffer mode; staging slots live in the entry.
         lock_params = cache.inc_lock_ref(snapshot.node_id).to_dec_params()
@@ -1156,6 +1164,7 @@ class BufferModePipeline:
             lock_params=lock_params,
             occupied_units=occupied_units,
             keys_by_pool=keys_by_pool,
+            superseded_mamba_keys=superseded,
         )
         self.write_staged_tokens_ += occupied_units
         self._release_queued_span(intent)
@@ -1250,7 +1259,7 @@ class BufferModePipeline:
 
     def finish_storage_write_ack(
         self, operation_id: int, written_pages: Optional[int] = None
-    ) -> None:
+    ) -> Optional[_UnifiedBufferBackupEntry]:
         """Storage ack (rank-synced drain): free the staging and feed each
         carried pool's beliefs with the written prefix. ``written_pages`` is
         the rank-agreed written prefix of the operation's KV chain (None: a
@@ -1260,7 +1269,7 @@ class BufferModePipeline:
         un-backed tail reads as absent until a later write-through covers it."""
         entry = self.ongoing_backup.pop(operation_id, None)
         if entry is None:
-            return
+            return None
         beliefs = self._cache.storage_existence_cache
         for pool, keys in entry.keys_by_pool.items():
             pool_beliefs = beliefs.pool(pool)
@@ -1269,6 +1278,7 @@ class BufferModePipeline:
         self._free_staging_now(entry.host_indices, entry.aux_xfers)
         self.write_staged_tokens_ -= entry.occupied_units
         self._finish_inflight(entry.intent.snapshot.node_id, entry.intent.pool)
+        return entry
 
     def _free_staging_now(
         self, host_indices: torch.Tensor, aux_xfers: list[PoolTransfer]
@@ -1808,6 +1818,12 @@ class BufferModePipeline:
                 beliefs.pool(transfer.name).add(staged.hash_values)
             elif transfer.keys:
                 beliefs.pool(transfer.name).add(transfer.keys)
+            if (
+                transfer.name == PoolName.MAMBA
+                and transfer.keys
+                and cache.mamba_storage_retention is not None
+            ):
+                cache.mamba_storage_retention.remember(transfer.keys[-1])
         self.staged_prefetches[request] = staged
         cache.prefetch_loaded_tokens_by_reqid[request] = staged.num_tokens
         cache.prefetch_loaded_storage_start_by_reqid[request] = operation.storage_start

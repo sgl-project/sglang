@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -52,6 +53,9 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
     TreeComponent,
+)
+from sglang.srt.mem_cache.unified_cache.mamba_storage_retention import (
+    MambaStorageRetention,
 )
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.session.streaming_session import is_virtual_node
@@ -202,6 +206,8 @@ class UnifiedCacheLinker(ABC):
     pools: dict[PoolName, object]
     load_mode = "layer_wise"
     prefetch_policy = "timeout"
+    # Whether offload() takes superseded_mamba_keys to remove after it persists.
+    removes_superseded_states = False
     # None when the current stream is the only one using the pages.
     forward_stream: Optional[torch.cuda.Stream] = None
 
@@ -352,6 +358,14 @@ class UnifiedCacheLinkerWrapper:
         self.cache = cache
         self.cache_linker = cache_linker
         self.load_mode = cache_linker.load_mode
+        self.mamba_retention = (
+            MambaStorageRetention(cache)
+            if envs.SGLANG_ENABLE_HICACHE_MAMBA_TAIL_ONLY_STORAGE.get()
+            and cache_linker.removes_superseded_states
+            and ComponentType.MAMBA in cache.tree_components
+            and not cache.tree_core.is_eagle
+            else None
+        )
         if self.load_mode == "prefetch" and cache.pp_size > 1:
             raise ValueError("External linker prefetch currently requires PP=1.")
         self._windows = tuple(cache.components[slot] for slot in windows)
@@ -639,6 +653,7 @@ class UnifiedCacheLinkerWrapper:
             # The normal insert protects the borrowed prefix and frees duplicate
             # fetched slots. Avoid writing the just-fetched data back to storage.
             mamba = by_pool.get(PoolName.MAMBA)
+            self._remember_loaded_mamba_key(mamba)
             if mamba is not None:
                 sub_pool = storage.tree_sub_pool(ComponentType.MAMBA.name)
                 # A restored checkpoint has no pending ReplaySSM updates.
@@ -774,6 +789,9 @@ class UnifiedCacheLinkerWrapper:
             component_transfers,
             prefix_len,
         )
+        self._remember_loaded_mamba_key(
+            next((t for _, t in component_transfers if t.name == PoolName.MAMBA), None)
+        )
 
         # Components omitted from the linker do not run their PREPARE hook.
         # Keep a non-restorable window range as tombstones instead of rebuilding
@@ -879,12 +897,24 @@ class UnifiedCacheLinkerWrapper:
             kept.append(transfer)
         return kept
 
+    def _remember_loaded_mamba_key(self, mamba: Optional[PoolTransfer]) -> None:
+        if self.mamba_retention is not None and mamba is not None and mamba.keys:
+            self.mamba_retention.remember(mamba.keys[-1])
+
     def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
         cache = self.cache
+        kwargs = {}
+        mamba = next((t for t in transfers if t.name == PoolName.MAMBA), None)
+        if self.mamba_retention is not None and mamba is not None and mamba.keys:
+            superseded = self.mamba_retention.supersede(node_id, mamba.keys[-1])
+            if superseded:
+                kwargs["superseded_mamba_keys"] = superseded
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
             queued = self.cache_linker.offload(
-                transfers, session_id=getattr(cache, "insert_session_id", None)
+                transfers,
+                session_id=getattr(cache, "insert_session_id", None),
+                **kwargs,
             )
         except BaseException:
             cache.dec_lock_ref(node_id, lock_params)

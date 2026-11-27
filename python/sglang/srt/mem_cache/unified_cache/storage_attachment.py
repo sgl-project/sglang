@@ -21,6 +21,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
+from sglang.srt.mem_cache.unified_cache.mamba_storage_retention import (
+    MambaStorageRetention,
+)
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
     StorageMetricsCollector,
@@ -203,6 +206,8 @@ class StorageAttachment:
         # Presence beliefs describe the previous backend; a retained positive
         # would skip that page's backup to the new one forever.
         cache.storage_existence_cache.clear()
+        if cache.mamba_storage_retention is not None:
+            cache.mamba_storage_retention = MambaStorageRetention(cache)
         return True, "Attached HiCache storage backend successfully."
 
     def detach(self) -> tuple[bool, str]:
@@ -226,6 +231,10 @@ class StorageAttachment:
             return False, "HiCache storage backend is not initialized."
 
         try:
+            # Stop before draining: late acks must not start new deletion work.
+            # A timeout aborts detach while the backend is still alive.
+            if cache.mamba_storage_retention is not None:
+                cache.mamba_storage_retention.remover.close()
             cache.drain_storage_control_queues_local()
             # Idempotent: ask the controller to clean up even when `enable_storage`
             # is already False, since that may be leftover state from an earlier

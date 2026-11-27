@@ -2649,6 +2649,7 @@ class TestTransferReadyEvents(CustomTestCase):
                 1,
                 TransferReady(order.indices_ready, order.forward_done),
                 "session-a",
+                None,
             )
         )
         linker.offload_queue.put(None)
