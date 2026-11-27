@@ -14,13 +14,13 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_ragged_verify_window,
     scatter_compact_to_strided,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.dspark_components.dspark_planner import DSparkScheduleConfig
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=10, suite="base-b-test-1-npu-a3")
-register_npu_ci(est_time=10, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=10, suite="extra-b-test-1-npu-a3")
+register_npu_ci(est_time=10, suite="nightly-test-1-npu-a3", nightly=True)
 
 pytestmark = pytest.mark.skipif(
     not (hasattr(torch, "npu") and torch.npu.is_available()),

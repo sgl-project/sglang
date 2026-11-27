@@ -13,7 +13,7 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     scatter_compact_to_strided,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components import dspark_verify
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout

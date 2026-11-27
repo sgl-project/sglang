@@ -315,3 +315,7 @@ def test_selected_path_rejects_incompatible_backend_before_draft_init():
     with pytest.raises(ValueError, match="GLM DSA ragged metadata support"):
         worker.init_attention_backends()
     worker._draft_worker.init_attention_backends.assert_not_called()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
