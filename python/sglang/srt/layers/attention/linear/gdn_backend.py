@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     KDAPrefillTrackRows,
     build_track_rows,
 )
+from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import FlyDSLGDNKernel
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
     PoolStaging,
@@ -62,10 +63,11 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.device import is_gfx95_supported, is_pin_memory_available
 from sglang.srt.utils.log_utils import rank0_log
 
 _is_hip = is_hip()
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
@@ -345,6 +347,15 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
         )
+    if (
+        get_exec().deterministic.enable_deterministic_inference
+        and backends.prefill.is_flydsl()
+    ):
+        raise ValueError(
+            "FlyDSL GDN prefill is not supported with "
+            "--enable-deterministic-inference. Use "
+            "--linear-attn-prefill-backend triton."
+        )
 
 
 def _validate_gdn_target_verify_layout(model_runner: ModelRunner) -> None:
@@ -371,8 +382,12 @@ class GDNKernelDispatcher:
         decode_backend: LinearAttnKernelBackend,
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: Optional[LinearAttnKernelBackend] = None,
+        *,
+        round_beta_to_input_dtype: bool = False,
     ):
-        triton_kernel = TritonGDNKernel()
+        triton_kernel = TritonGDNKernel(
+            round_beta_to_input_dtype=round_beta_to_input_dtype
+        )
         self.tree_verify_kernel = triton_kernel
         xpu_kernel = None
         if any(
@@ -453,6 +468,13 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
+        elif prefill_backend.is_flydsl():
+            if not _use_aiter or not is_gfx95_supported():
+                raise ValueError(
+                    "The FlyDSL GDN prefill backend requires AMD gfx95 and "
+                    "SGLANG_USE_AITER=1"
+                )
+            self.extend_kernel = FlyDSLGDNKernel()
         elif prefill_backend.is_helion():
             raise ValueError(
                 "The Helion linear-attention backend supports KDA only, not GDN."
@@ -662,13 +684,29 @@ class GDNAttnBackend(MambaAttnBackendBase):
     needs_cpu_seq_lens: bool = False
     supports_mis: bool = True
     requires_contiguous_prefill_state: bool = True
+    kernel_prefill_metadata = None
 
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
 
     def _create_kernel_dispatcher(self, backends):
-        return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+        self._round_beta_to_input_dtype = (
+            not is_cpu()
+            and not is_npu()
+            and backends.decode.is_triton()
+            and getattr(
+                self._model_runner.model_config.hf_config,
+                "gdn_round_beta_to_input_dtype",
+                False,
+            )
+        )
+        return GDNKernelDispatcher(
+            backends.decode,
+            backends.prefill,
+            backends.verify,
+            round_beta_to_input_dtype=self._round_beta_to_input_dtype,
+        )
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
@@ -683,6 +721,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
         backends = model_runner.linear_attn_backends
+        self._replayssm_verify_num_stages = (
+            envs.SGLANG_GDN_REPLAYSSM_VERIFY_NUM_STAGES.get()
+        )
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
@@ -890,6 +931,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        # Graph replay must not reuse an eager batch's schedule.
+        self.kernel_prefill_metadata = None
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._init_target_verify_qkv_routing(forward_batch)
 
@@ -899,6 +942,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
         super().init_forward_metadata(forward_batch)
         self._init_target_verify_qkv_routing(forward_batch)
         self.mis_metadata = None
+        self.kernel_prefill_metadata = None
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        if (
+            isinstance(extend_kernel, FlyDSLGDNKernel)
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_mixed()
+            and not forward_batch.eager_mixed_as_extend
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            self.kernel_prefill_metadata = extend_kernel.build_prefill_metadata(
+                forward_batch.extend_seq_lens_cpu,
+                cu_seqlens=self.forward_metadata.query_start_loc,
+            )
         if forward_batch.multi_item_delimiter_indices is not None:
             if not self.enable_mis:
                 raise ValueError("GDN MIS metadata requires --enable-mis")
@@ -1656,6 +1713,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
                 output=kwargs.get("linear_attn_output"),
+                prefill_metadata=self.kernel_prefill_metadata,
                 layer_id=layer.layer_id,
                 extend_prefix_lens=forward_batch.extend_prefix_lens,
                 track_state=h_track_buf,
@@ -1906,6 +1964,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             is_kda=False,
             disable_state_update=True,
             cache_ring=True,
+            round_beta_to_input_dtype=self._round_beta_to_input_dtype,
             replayssm_rawv=layer_cache.replayssm_rawv,
             replayssm_rawk=layer_cache.replayssm_rawk,
             replayssm_g=layer_cache.replayssm_g,
@@ -1996,6 +2055,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            num_stages=self._replayssm_verify_num_stages,
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)

@@ -10,11 +10,8 @@ import triton.language as tl
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
-    RunnerInput,
-    RunnerOutput,
     register_fused_func,
 )
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -55,31 +52,6 @@ def _fused_unpack_packed_topk(packed: torch.Tensor):
             packed, ids, w, numel, BLOCK=BLOCK
         )
     return ids, w
-
-
-@dataclass
-class MarlinRunnerInput(RunnerInput):
-    """Input bundle passed to the Marlin runner core."""
-
-    hidden_states: torch.Tensor
-    topk_weights: torch.Tensor
-    topk_ids: torch.Tensor
-    router_logits: torch.Tensor
-
-    @property
-    def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.MARLIN
-
-
-@dataclass
-class MarlinRunnerOutput(RunnerOutput):
-    """Output bundle returned from the Marlin runner core."""
-
-    hidden_states: torch.Tensor
-
-    @property
-    def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.MARLIN
 
 
 @dataclass
@@ -143,7 +115,9 @@ def fused_experts_none_to_marlin(
         assert runner_config.activation in {
             "silu",
             "situ",
-        }, f"Only gated SiLU/SiTU is supported, got {runner_config.activation}."
+            "gelu",
+            "gelu_tanh",
+        }, f"Only gated SiLU/SiTU/GELU is supported, got {runner_config.activation}."
     elif runner_config.activation not in {"silu", "relu2"}:
         raise ValueError(
             f"Unsupported Marlin MoE activation: {runner_config.activation}"

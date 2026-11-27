@@ -3,7 +3,6 @@
 import unittest
 
 import torch
-import torch_mlu  # noqa: F401 -- registers the MLU device backend
 
 from sglang.test.ci.ci_register import register_mlu_ci
 from sglang.test.test_utils import CustomTestCase
