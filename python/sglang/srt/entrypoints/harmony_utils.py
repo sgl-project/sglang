@@ -4,16 +4,12 @@
 # Slight differences in processing chat messages
 import datetime
 import logging
-from collections.abc import Iterable
 from typing import Optional, Union
 
 import orjson
 from openai.types.responses import (
     ResponseCodeInterpreterToolCall,
     ResponseOutputItem,
-)
-from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutputMessage
-from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
@@ -239,37 +235,6 @@ def parse_response_input(
     return msg
 
 
-def parse_response_output(output: ResponseOutputItem) -> Message:
-    if isinstance(output, OpenAIResponseOutputMessage):
-        role = output.role
-        contents = [TextContent(text=c.text) for c in output.content]
-        msg = Message.from_role_and_contents(role, contents)
-        phase = getattr(output, "phase", None)
-        if phase is not None:
-            msg = msg.with_channel("final" if phase == "final_answer" else "commentary")
-        return msg
-    elif isinstance(output, ResponseFunctionToolCall):
-        msg = Message.from_role_and_content(Role.ASSISTANT, output.arguments)
-        msg = msg.with_channel("commentary")
-        msg = msg.with_recipient(output.name)
-        msg = msg.with_content_type("json")
-        return msg
-    else:
-        raise ValueError(f"Unknown output type: {type(output)}")
-
-
-def parse_chat_input(chat_msg) -> Message:
-    role = chat_msg.role
-    content = chat_msg.content
-    if isinstance(content, str):
-        contents = [TextContent(text=content)]
-    else:
-        # TODO: Support refusal.
-        contents = [TextContent(text=c.text) for c in content]
-    msg = Message.from_role_and_contents(role, contents)
-    return msg
-
-
 def render_for_completion(messages: list[Message]) -> list[int]:
     conversation = Conversation.from_messages(messages)
     token_ids = get_encoding().render_conversation_for_completion(
@@ -470,10 +435,3 @@ def parse_remaining_state(parser: StreamableParser):
         )
         return [text_item]
     return []
-
-
-def parse_output_into_messages(token_ids: Iterable[int]):
-    parser = get_streamable_parser_for_assistant()
-    for token_id in token_ids:
-        parser.process(token_id)
-    return parser

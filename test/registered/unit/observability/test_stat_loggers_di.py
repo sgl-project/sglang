@@ -294,6 +294,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         queue.queue = []
         queue._deferred_releases = [object(), object(), object()]
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler_status_logger = None
         reporter.scheduler = SimpleNamespace(
             enable_hierarchical_cache=False,
             disaggregation_mode=DisaggregationMode.DECODE,
@@ -522,8 +523,9 @@ class TestHiCacheHostMambaStats(CustomTestCase):
 
     def _reporter(self, entry_map):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler_status_logger = None
         tree_cache = MagicMock(spec=UnifiedRadixCache)
-        tree_cache.token_to_kv_pool_host = SimpleNamespace(
+        tree_cache.full_kv_pool_host = SimpleNamespace(
             logical_size=1000, available_size=lambda: 400
         )
         tree_cache.host_pool_group = SimpleNamespace(entry_map=entry_map)
@@ -595,7 +597,7 @@ class TestHiCacheHostMambaStats(CustomTestCase):
         reporter = self._reporter(
             {PoolName.MAMBA: SimpleNamespace(host_pool=mamba_pool)}
         )
-        reporter.scheduler.tree_cache.token_to_kv_pool_host = SimpleNamespace(
+        reporter.scheduler.tree_cache.full_kv_pool_host = SimpleNamespace(
             logical_size=1000, available_size=lambda: 1000
         )
         reporter.scheduler.disaggregation_mode = DisaggregationMode.NULL

@@ -4,7 +4,6 @@ import hashlib
 import logging
 import threading
 import time
-from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
 from queue import Empty, Queue
@@ -40,6 +39,7 @@ device_module = get_device_module()
 
 DEFAULT_LOAD_LAYER_GROUP = 8
 DEFAULT_LOAD_THREADS = 4
+MAX_RANGES_PER_READ = 4096
 
 
 def _storage_suffix(
@@ -470,19 +470,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         list(transfer.keys), transfer
                     )
                     keys.extend(self.storage._tag_keys(component_keys))
-            # Wait before opening sessions so the slot fence does not consume
-            # their leases. Key preparation above still overlaps the GPU work.
+            # Locations need only the page indices, so resolving them overlaps
+            # the forward that may still use the slots.
             if ready_event is not None:
-                ready_event.synchronize()
-            # Track every submitted key: a failed batch can still open some sessions.
-            session_keys = [key for keys, _ in batches.values() for key in keys]
-            if session_keys:
-                result = self.storage.store.batch_get_session_start(session_keys)
-                if list(result) != [0] * len(session_keys):
-                    raise RuntimeError(
-                        f"Mooncake get session start failed: keys={len(session_keys)}, "
-                        f"results={result}"
-                    )
+                ready_event.synchronize_indices()
             for transfers in request_transfers:
                 for transfer in transfers:
                     batches[transfer.name][1].extend(
@@ -494,23 +485,48 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 name: (keys, np.asarray(locations, dtype=np.int64))
                 for name, (keys, locations) in batches.items()
             }
-
+            # Range building needs only the locations. Its Python contends with
+            # the I/O threads for the GIL, so finish it before any read starts.
             groups = [
                 range(start, min(start + self.load_layer_group, self.num_layers))
                 for start in range(0, self.num_layers, self.load_layer_group)
             ]
-            for group in groups:
+            reads = [
+                [
+                    read
+                    for name, (keys, locations) in batches.items()
+                    for read in self._range_get_reads(name, keys, locations, group)
+                ]
+                for group in groups
+            ]
+            # Wait before opening sessions so the slot fence does not consume
+            # their leases.
+            if ready_event is not None:
+                ready_event.synchronize()
+            # Track every submitted key: a failed batch can still open some sessions.
+            session_keys = [key for keys, _ in batches.values() for key in keys]
+            if session_keys:
+                result = self.storage.store.batch_get_session_start(session_keys)
+                if list(result) != [0] * len(session_keys):
+                    raise RuntimeError(
+                        f"Mooncake get session start failed: keys={len(session_keys)}, "
+                        f"results={result}"
+                    )
+            completed = 0
+            for group_reads in reads:
                 group_futures = []
                 futures.append(group_futures)
-                for name, (keys, locations) in batches.items():
-                    meta = self._group_range_meta(name, locations, group)
-                    if meta is not None:
-                        group_futures.extend(self._submit_range_gets(name, keys, *meta))
-            for group, group_futures in zip(groups, futures):
-                for future in group_futures:
-                    future.result()
-                for layer in group:
-                    self.layer_done_counter.complete(counter_index, layer)
+                # Retain each future even if a later submit fails.
+                for read in group_reads:
+                    group_futures.append(
+                        self.load_io_executor.submit(self._range_get, *read)
+                    )
+                # Publish groups that landed during this submit: the next submit
+                # can take longer than the earlier groups' reads.
+                completed = self._complete_groups(
+                    counter_index, groups, futures, completed, block=False
+                )
+            self._complete_groups(counter_index, groups, futures, completed, block=True)
         except BaseException as error:
             # Failure wakes consumers, which may release the destination rows.
             # Stop every submitted write before publishing it.
@@ -528,38 +544,55 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
 
-    def _group_range_meta(self, name: PoolName, locations: list[int], group: range):
-        merged = None
-        for layer in group:
-            meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
-            if meta is None:
-                continue
-            if merged is None:
-                # Pool metadata may share read-only size/offset rows.
-                # Grouping extends each row, so give it independent ownership.
-                merged = tuple([list(row) for row in rows] for rows in meta)
-                continue
-            for merged_rows, rows in zip(merged, meta):
-                for merged_row, row in zip(merged_rows, rows):
-                    merged_row.extend(row)
-        return merged
+    def _complete_groups(
+        self,
+        counter_index: int,
+        groups: list[range],
+        futures: list[list[Future]],
+        completed: int,
+        *,
+        block: bool,
+    ) -> int:
+        """Complete submitted groups in order, from ``completed``; return the next one.
 
-    def _submit_range_gets(
-        self, name: PoolName, keys: list[str], ptrs, sizes, offsets
-    ) -> Iterator[Future]:
-        if not keys:
-            return
-        step = -(-len(keys) // self.load_threads)
-        # Yield each future so the caller retains it even if a later submit fails.
-        for start in range(0, len(keys), step):
-            yield self.load_io_executor.submit(
-                self._range_get,
+        Without ``block``, stop at the first group with a read still in flight.
+        Order matters: the MLA broadcast of the layers up to a waited one
+        assumes they all landed. A failed read raises from here.
+        """
+        for group_index in range(completed, len(futures)):
+            group_futures = futures[group_index]
+            if not block and not all(future.done() for future in group_futures):
+                return group_index
+            for future in group_futures:
+                future.result()
+            for layer in groups[group_index]:
+                self.layer_done_counter.complete(counter_index, layer)
+        return len(futures)
+
+    def _range_get_reads(
+        self, name: PoolName, keys: list[str], locations: np.ndarray, group: range
+    ) -> list[tuple]:
+        """One pool's range gets for one layer group, split across the I/O threads."""
+        meta = self.pools[name].get_prepared_layers_range_meta(locations, group)
+        if meta is None or not keys:
+            return []
+        ptrs, sizes, offsets = meta
+        # Mooncake's RDMA submit is quadratic in queued ranges, so bound each read.
+        # TODO: remove once Mooncake fixes its submit path.
+        step = min(
+            -(-len(keys) // self.load_threads),
+            max(1, MAX_RANGES_PER_READ // len(sizes[0])),
+        )
+        return [
+            (
                 name,
                 keys[start : start + step],
                 ptrs[start : start + step],
                 sizes[start : start + step],
                 offsets[start : start + step],
             )
+            for start in range(0, len(keys), step)
+        ]
 
     def _get_layer_ranges(self, keys, ptrs, sizes, offsets):
         store = self.storage.store

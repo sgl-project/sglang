@@ -19,16 +19,18 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_inkling_all_reduce_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, world_size)
+    wrappers = [("multimem_full_oneshot", f"inkling_multimem_full_oneshot<{args}>")]
+    if dtype != torch.float32:
+        wrappers += [
+            ("two_shot_all_reduce_fused", f"inkling_two_shot_all_reduce_fused<{args}>"),
+            ("multimem_one_shot_fused", f"inkling_multimem_one_shot_fused<{args}>"),
+            ("multimem_push_oneshot", f"inkling_multimem_push_oneshot<{args}>"),
+        ]
     return load_jit(
         "inkling_all_reduce",
         *args,
         cuda_files=["inkling/inkling_all_reduce.cuh"],
-        cuda_wrappers=[
-            ("two_shot_all_reduce_fused", f"inkling_two_shot_all_reduce_fused<{args}>"),
-            ("multimem_one_shot_fused", f"inkling_multimem_one_shot_fused<{args}>"),
-            ("multimem_full_oneshot", f"inkling_multimem_full_oneshot<{args}>"),
-            ("multimem_push_oneshot", f"inkling_multimem_push_oneshot<{args}>"),
-        ],
+        cuda_wrappers=wrappers,
     )
 
 
@@ -248,8 +250,9 @@ def inkling_multimem_full_oneshot(
     reuse is not fenced by this kernel; the next AR's entry barrier orders it).
 
     Args:
-        in_buffer: this rank's symm data buffer (bf16), sliced to ``num_items``.
-        out_buffer: local output buffer (bf16, >= num_items); receives the sum.
+        in_buffer: this rank's symm data buffer (bf16 or fp32), sliced to
+            ``num_items``.
+        out_buffer: local output buffer (same dtype, >= num_items); receives the sum.
         multicast_ptr: ``hdl.multicast_ptr`` of the in_buffer.
         flag_ptrs_dev, state_ptr: barrier flags + local state (as above).
         rank, world_size, num_items: as above.

@@ -8,9 +8,15 @@ from unittest.mock import patch
 
 
 class _StatusCode(IntEnum):
+    # The members and values of mori.io.StatusCode.
     SUCCESS = 0
-    IN_PROGRESS = 1
-    FAILED = 2
+    INIT = 1
+    IN_PROGRESS = 2
+    ERR_INVALID_ARGS = 11
+    ERR_NOT_FOUND = 12
+    ERR_RDMA_OP = 13
+    ERR_BAD_STATE = 14
+    ERR_GPU_OP = 15
 
 
 def mori_stub():

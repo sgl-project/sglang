@@ -1,4 +1,5 @@
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -190,7 +191,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
@@ -228,10 +228,52 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "MoE-under-DP all-reduce."
             )
 
+        quarot_scope = nullcontext()
+        quarot_config = None
+        apply_quarot_to_draft = envs.SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT.get()
+        if apply_quarot_to_draft and not _is_npu:
+            logger.warning_once(
+                "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
+                "applied because this is not an NPU runtime."
+            )
+        elif apply_quarot_to_draft and self._draft_is_moe:
+            logger.warning_once(
+                "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
+                "applied because the QuaRot adapter supports dense drafts only."
+            )
+        elif apply_quarot_to_draft:
+            from sglang.srt.hardware_backend.npu.dspark_quarot import (
+                build_glm_dspark_quarot_config,
+                glm_dspark_quarot_scope,
+                validate_glm_dspark_quarot_draft_loader,
+            )
+
+            quarot_config = build_glm_dspark_quarot_config(
+                device=self.device,
+                enabled=apply_quarot_to_draft,
+                target_model_config=target_worker.model_runner.model_config,
+                target_model=target_worker.model_runner.model,
+            )
+            if quarot_config is None:
+                logger.warning_once(
+                    "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
+                    "applied because the target is not a supported GLM DSA "
+                    "ModelSlim model."
+                )
+            else:
+                validate_glm_dspark_quarot_draft_loader(
+                    load_format=(
+                        server_args.speculative_draft_load_format
+                        or server_args.load_format
+                    ),
+                    weight_cache_mode=server_args.weight_cache_mode,
+                )
+            quarot_scope = glm_dspark_quarot_scope(quarot_config)
+
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
         load_group = get_pp_stage_load_group()
-        with draft_pp_context(), self._draft_context():
+        with draft_pp_context(), self._draft_context(), quarot_scope:
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -249,6 +291,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.dspark_quarot import (
+                log_glm_dspark_quarot_runtime_status,
+            )
+
+            log_glm_dspark_quarot_runtime_status(
+                requested=apply_quarot_to_draft,
+                draft_model=self.draft_model,
+            )
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -543,7 +595,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             rejection_noise=self._rejection_noise,
         )
 
-        self._forced_budget_frac: Optional[float] = None
         self._need_mamba_verify_commit = False
 
         self._observers = DsparkStepObservers(
@@ -741,7 +792,6 @@ class DSparkWorkerV2(BaseSpecWorker):
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         if not self._hosts_draft:
             return
-        self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
