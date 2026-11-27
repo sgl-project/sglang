@@ -97,6 +97,27 @@ def _apply_token_bitmask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None
         raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
 
+def _admits_no_token(
+    ctx: CompiledGrammar, override_stop_tokens: Optional[Union[List[int], int]]
+) -> bool:
+    """True when the compiled grammar allows no first token at all.
+
+    XGrammar compiles some unsatisfiable grammars without error, for example a
+    rule that only refers back to itself. Such a grammar masks out every token,
+    so the request would otherwise be aborted mid-generation with an internal
+    error instead of being rejected up front.
+    """
+    vocab_size = ctx.tokenizer_info.vocab_size
+    if vocab_size == 0:
+        return False
+    matcher = GrammarMatcher(ctx, override_stop_tokens=override_stop_tokens)
+    if matcher.is_terminated():
+        return False
+    bitmask = torch.zeros(get_bitmask_shape(1, vocab_size), dtype=bitmask_dtype)
+    matcher.fill_next_token_bitmask(bitmask)
+    return not bool(bitmask.any())
+
+
 class XGrammarGrammar(BaseGrammarObject):
     def __init__(
         self,
@@ -357,6 +378,19 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             if structure.get("schema") is None:
                 structure["schema"] = {}
 
+    def _from_satisfiable_context(
+        self, ctx: CompiledGrammar, key_string: str, grammar_stats: GrammarStats
+    ) -> BaseGrammarObject:
+        if _admits_no_token(ctx, self.override_stop_tokens):
+            logger.error(
+                f"Hit unsatisfiable {grammar_stats.dispatch_type} grammar: "
+                f"{key_string=}"
+            )
+            return InvalidGrammarObject(
+                "grammar is unsatisfiable: no output can match it"
+            )
+        return self._from_context(ctx, key_string, grammar_stats)
+
     def _from_context(
         self, ctx: CompiledGrammar, key_string: str, grammar_stats: GrammarStats
     ) -> XGrammarGrammar:
@@ -398,7 +432,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         ) as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
-        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))
+        return self._from_satisfiable_context(
+            ctx, key_string, GrammarStats(dispatch_type="json")
+        )
 
     def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
         try:
@@ -418,7 +454,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 )
                 logger.error(f"Hit invalid grammar: {key_string=}, {error_message}")
                 return InvalidGrammarObject(error_message)
-        return self._from_context(
+        return self._from_satisfiable_context(
             ctx, key_string, GrammarStats(dispatch_type=dispatch_type)
         )
 
@@ -428,7 +464,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except RuntimeError as e:
             logger.error(f"Hit invalid regex: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
-        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="regex"))
+        return self._from_satisfiable_context(
+            ctx, key_string, GrammarStats(dispatch_type="regex")
+        )
 
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         try:
