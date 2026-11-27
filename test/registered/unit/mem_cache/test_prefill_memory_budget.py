@@ -979,6 +979,81 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
             ),
             (True, 16),
         )
+        # Once the final ring slot is taken (remaining_window_tokens == 0), a new
+        # request cannot enter, while a chunked continuation already holds its ring
+        # and remains bounded only by the FULL KV pool.
+        budget.reserve(12, 4, chunk_limit=16)
+        self.assertEqual(budget.remaining_window_tokens, 0)
+        self.assertFalse(
+            budget.can_allocate_prefill(
+                paged_input=16,
+                extend_input_len=12,
+                max_new_tokens=4,
+                chunk_limit=16,
+            )
+        )
+        self.assertTrue(
+            budget.can_allocate_prefill(
+                paged_input=16,
+                extend_input_len=12,
+                max_new_tokens=4,
+                chunk_limit=16,
+                is_chunked_continuation=True,
+            )
+        )
+        self.assertFalse(
+            budget.can_allocate_prefill(
+                paged_input=200,
+                extend_input_len=12,
+                max_new_tokens=4,
+                chunk_limit=16,
+                is_chunked_continuation=True,
+            )
+        )
+
+    def test_fit_chunk_honors_per_req_token_overhead(self):
+        allocator = self._allocator(TokenToKVPoolAllocator)
+        allocator.page_size = 64
+        allocator.available_size = lambda: 768
+        cache = _cache()
+        cache.supports_mamba = lambda: False
+        cache.evictable_size = lambda: 0
+        budget = create_prefill_budget(allocator, cache)
+        req = SimpleNamespace(prefix_len=64)
+        self.assertEqual(
+            budget.fit_chunk(
+                req,
+                extend_input_len=2048,
+                max_new_tokens=0,
+                chunk_limit=1024,
+                per_req_token_overhead=256,
+            ),
+            512,
+        )
+        allocator.available_size = lambda: 256
+        self.assertIsNone(
+            budget.fit_chunk(
+                req,
+                extend_input_len=2048,
+                max_new_tokens=0,
+                chunk_limit=1024,
+                per_req_token_overhead=256,
+            )
+        )
+
+        # ChainPrefillBudget also accounts for per-request overhead beyond page_size.
+        chain_alloc = _shared_allocator()
+        chain_budget = create_prefill_budget(chain_alloc, _cache())
+        with patch.object(chain_alloc, "admits", wraps=chain_alloc.admits) as fit:
+            chain_budget.fit_chunk(
+                req,
+                extend_input_len=8,
+                max_new_tokens=0,
+                chunk_limit=8,
+                per_req_token_overhead=12,
+            )
+            # 8 tokens + 12 overhead = 20 full_tokens (instead of 8 + 4 = 12).
+            self.assertEqual(fit.call_args.args[0].full_tokens, 20)
 
     def test_committed_rest_charges_the_total_and_one_chunk_of_window(self):
         """The FULL total commits the whole rest, a window pool one more chunk's

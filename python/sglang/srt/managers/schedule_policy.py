@@ -1792,6 +1792,7 @@ class PrefillAdder:
             chunk_limit=_rem_tokens,
             # A chunk cut short of the prompt lands on the cut grid.
             chunk_align=self.mamba_chunk_grid if self.mamba_chunk_grid > 1 else None,
+            per_req_token_overhead=self.per_req_token_overhead,
         )
         if _rem_tokens is None:
             return req
@@ -1829,6 +1830,7 @@ class PrefillAdder:
             chunk_limit=self.rem_chunk_tokens,
             admitted_chunk_limit=_rem_tokens,
             cached_tokens=req.prefix_len,
+            is_chunked_continuation=True,
         ):
             return req
         # The continuing chunk must fit. Keep reservation outside assert for -O.

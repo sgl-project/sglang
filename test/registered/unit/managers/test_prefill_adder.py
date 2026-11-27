@@ -600,18 +600,27 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(req.extend_end)
         self.assertEqual(adder.can_run_list, [])
 
-        # Extra per_req_token_overhead beyond page_size (e.g. interleaved shard).
-        self.mock_token_allocator.available_size.return_value = 512
-        adder = self.create_adder(
-            self.create_running_batch(), page_size=64, rem_chunk_tokens=512
-        )
-        adder.per_req_token_overhead = 256
-        req = self.create_shared_req("sharded-overhead")
-        req.prefix_len = 64
-        req.full_untruncated_fill_ids = list(range(1024))
-        self.assertIs(adder.add_chunked_req(req), req)
-        self.assertIsNone(req.extend_end)
-        self.assertEqual(adder.can_run_list, [])
+        # Extra per_req_token_overhead beyond page_size (e.g. interleaved shard):
+        # fit_chunk deducts the per-request overhead so shrunk chunks fit cleanly.
+        for avail, expected_len in ((768, 512), (512, 256), (256, None)):
+            with self.subTest(sharded_avail=avail):
+                self.mock_token_allocator.available_size.return_value = avail
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=64, rem_chunk_tokens=1024
+                )
+                adder.per_req_token_overhead = 256
+                req = self.create_shared_req(f"sharded-overhead-{avail}")
+                req.prefix_len = 64
+                req.full_untruncated_fill_ids = list(range(2048))
+                self.assertIs(adder.add_chunked_req(req), req)
+                if expected_len is None:
+                    self.assertIsNone(req.extend_end)
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertTrue(adder.chunked_req_waits)
+                else:
+                    self.assertEqual(req.extend_len, expected_len)
+                    self.assertEqual(adder.can_run_list, [req])
+                    self.assertEqual(adder.memory_budget.remaining_current, 0)
 
         # SSM / Mamba state_slot_cost deducted against PrefillBudget.
         self.mock_token_allocator.available_size.return_value = 512
@@ -628,30 +637,38 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.memory_budget.remaining_current, 0)
 
     def test_swa_continuation_respects_tight_full_pool(self):
-        """SWAPrefillBudget continuations also respect a tight FULL pool."""
-        adder, req = self._build_hybrid_swa_chunked_req(
-            page_size=64,
-            rem_swa=100_000,
-            rem_chunk=2048,
-            extend_input_len=500,
-            is_hybrid_swa=True,
-            full_available=100,
-        )
-        self.assertIs(adder.add_chunked_req(req), req)
-        self.assertIsNone(req.extend_end)
-        self.assertEqual(adder.can_run_list, [])
+        """SWAPrefillBudget continuations also respect a tight FULL pool and, for
+        per-request SWA rings, do not re-charge remaining_window_tokens."""
+        for req_ring, rem_swa in ((False, 100_000), (True, 0)):
+            with self.subTest(req_ring=req_ring, rem_swa=rem_swa):
+                adder, req = self._build_hybrid_swa_chunked_req(
+                    page_size=64,
+                    rem_swa=rem_swa,
+                    rem_chunk=2048,
+                    extend_input_len=500,
+                    is_hybrid_swa=True,
+                    full_available=100,
+                    req_ring=req_ring,
+                )
+                self.assertIs(adder.add_chunked_req(req), req)
+                self.assertIsNone(req.extend_end)
+                self.assertEqual(adder.can_run_list, [])
 
-        adder, req = self._build_hybrid_swa_chunked_req(
-            page_size=64,
-            rem_swa=100_000,
-            rem_chunk=2048,
-            extend_input_len=500,
-            is_hybrid_swa=True,
-            full_available=256,
-        )
-        self.assertIs(adder.add_chunked_req(req), req)
-        self.assertEqual(req.extend_len, 192)
-        self.assertEqual(adder.memory_budget.remaining_current, 0)
+                adder, req = self._build_hybrid_swa_chunked_req(
+                    page_size=64,
+                    rem_swa=rem_swa,
+                    rem_chunk=2048,
+                    extend_input_len=500,
+                    is_hybrid_swa=True,
+                    full_available=256,
+                    req_ring=req_ring,
+                )
+                self.assertIs(adder.add_chunked_req(req), req)
+                self.assertEqual(req.extend_len, 192)
+                self.assertEqual(adder.can_run_list, [req])
+                self.assertEqual(adder.memory_budget.remaining_current, 0)
+                if req_ring:
+                    self.assertEqual(adder.memory_budget.remaining_window_tokens, 0)
 
     def test_cp_sharded_padded_continuation_fits_tail_and_overhead(self):
         """CP padded continuations count existing prefix tail without exceeding
@@ -1866,10 +1883,25 @@ class TestPrefillAdder(CustomTestCase):
         extend_input_len=500,
         is_hybrid_swa=True,
         full_available=100_000,
+        req_ring=False,
+        swa_ring_cost_tokens=4096,
     ):
+        if req_ring:
+            self.mock_token_allocator.mock_add_spec(SWATokenToKVPoolAllocator)
+            self.mock_token_allocator.pools_share_memory = False
+            self.mock_token_allocator.has_window_pool = True
+            self.mock_token_allocator.size_swa = 1_000_000
+            self.mock_token_allocator.request_slot_reserve.return_value = 0
+            self.mock_token_allocator.create_prefill_budget.side_effect = (
+                lambda tree_cache, **kwargs: SWAPrefillBudget(
+                    self.mock_token_allocator, tree_cache, **kwargs
+                )
+            )
         self.mock_token_allocator.swa_available_size.return_value = rem_swa
         self.mock_token_allocator.full_available_size.return_value = full_available
         self.mock_token_allocator.available_size.return_value = full_available
+        self.mock_token_allocator.swa_req_ring = req_ring
+        self.mock_token_allocator.swa_ring_cost_tokens = swa_ring_cost_tokens
         self.mock_tree_cache.sliding_window_size = 128
         adder = self.create_adder(
             self.create_running_batch(),

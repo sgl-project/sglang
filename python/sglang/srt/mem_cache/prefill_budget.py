@@ -226,6 +226,7 @@ class PrefillBudget:
         window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         admitted_chunk_limit: int | None = None,
         cached_tokens: int = 0,
+        is_chunked_continuation: bool = False,
     ) -> bool:
         """Whether the selected shape fits. ``admitted_chunk_limit`` (the
         chunk limit admission chose) and ``cached_tokens`` are for budgets
@@ -277,10 +278,14 @@ class PrefillBudget:
         state_slots: int = 0,
         request_rows: int = 0,
         chunk_align: int | None = None,
+        per_req_token_overhead: int | None = None,
     ) -> int | None:
         remaining_full = (
             int(min(self.remaining_current, self.remaining_total))
             - state_slots * self.state_slot_cost
+        )
+        overhead = (
+            self.page_size if per_req_token_overhead is None else per_req_token_overhead
         )
         candidate = min(extend_input_len, chunk_limit)
         if is_cp_sharded_padded():
@@ -289,20 +294,20 @@ class PrefillBudget:
                 get_cp_sharded_padded_allocation_tokens(
                     candidate, prefix_tokens=prefix_tokens
                 )
-                + self.page_size
+                + overhead
             )
             if needed <= remaining_full:
                 return chunk_limit
-            if remaining_full < self.page_size:
+            if remaining_full < overhead:
                 return None
-            groups = (remaining_full - self.page_size) // self.page_size
+            groups = (remaining_full - overhead) // self.page_size
             tail = -(-prefix_tokens // self.page_size) * self.page_size - prefix_tokens
             cap = groups * self.page_size + tail
         else:
-            if self.ceil_paged_tokens(candidate) + self.page_size <= remaining_full:
+            if self.ceil_paged_tokens(candidate) + overhead <= remaining_full:
                 return chunk_limit
             cap = max(
-                ((remaining_full - self.page_size) // self.page_size) * self.page_size,
+                ((remaining_full - overhead) // self.page_size) * self.page_size,
                 0,
             )
         if chunk_align:
@@ -525,17 +530,24 @@ class SWAPrefillBudget(PrefillBudget):
         window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         admitted_chunk_limit: int | None = None,
         cached_tokens: int = 0,
+        is_chunked_continuation: bool = False,
     ) -> bool:
         # The window estimate reads the limit only through min(extend, limit),
         # and the extend is already cut to the admitted limit: keep ``chunk_limit``.
+        fits_full = super().can_allocate_prefill(
+            paged_input=paged_input,
+            extend_input_len=extend_input_len,
+            max_new_tokens=max_new_tokens,
+            chunk_limit=chunk_limit,
+            state_slots=state_slots,
+            is_chunked_continuation=is_chunked_continuation,
+        )
+        # A continuation on a per-request SWA ring already owns its ring slot
+        # (`reserve(..., is_chunked_continuation=True)` skips `swa_offset`).
+        if self.req_ring and is_chunked_continuation:
+            return fits_full
         return (
-            super().can_allocate_prefill(
-                paged_input=paged_input,
-                extend_input_len=extend_input_len,
-                max_new_tokens=max_new_tokens,
-                chunk_limit=chunk_limit,
-                state_slots=state_slots,
-            )
+            fits_full
             and self.swa_tokens(
                 extend_input_len,
                 max_new_tokens,
@@ -1145,16 +1157,23 @@ class ChainPrefillBudget(PrefillBudget):
         state_slots: int = 0,
         request_rows: int = 0,
         chunk_align: int | None = None,
+        per_req_token_overhead: int | None = None,
     ) -> int | None:
         """The next chunk of the admitted chunked request ``req``: it needs only
         the rows it writes now. Without them it waits while others hold rows,
         else shrinks onto the truncation grid, so a lone request always finishes."""
         candidate = min(extend_input_len, chunk_limit)
+        extra_tokens = (
+            0
+            if per_req_token_overhead is None
+            else per_req_token_overhead - self.page_size
+        )
         fits = dict(
             chunk_limit=chunk_limit,
             host_hit_lengths=None,
             state_slots=state_slots,
             request_rows=request_rows,
+            extra_tokens=extra_tokens,
             now=True,
         )
         if self._chunk_fits(candidate, 0, **fits):
@@ -1180,6 +1199,7 @@ class ChainPrefillBudget(PrefillBudget):
         window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         admitted_chunk_limit: int | None = None,
         cached_tokens: int = 0,
+        is_chunked_continuation: bool = False,
     ) -> bool:
         """Whether the selected shape fits, priced at ``admitted_chunk_limit`` as
         admission priced it, with ``paged_input`` as the token sub-pool's charge."""
