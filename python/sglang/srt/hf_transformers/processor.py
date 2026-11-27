@@ -102,7 +102,7 @@ def load_scheduler_tokenizer(*, is_multimodal: bool):
 
 
 def _prewarm_in_subprocess(
-    staging_dir, tokenizer_opts, processor_opts, python_frontend
+    staging_dir, tokenizer_opts, processor_opts, has_python_frontend
 ):
     # spawn inherits sys.path. Prefer staged packages even when the launcher
     # has already imported the checkpoint's AutoConfig from the shared cache.
@@ -111,23 +111,25 @@ def _prewarm_in_subprocess(
     load_plugins()
     if processor_opts is not None:
         get_processor(**tokenizer_opts, **processor_opts)
-    if processor_opts is None or python_frontend:
+    if processor_opts is None or has_python_frontend:
         # Python detokenizers load a standalone tokenizer even for MM models.
         get_tokenizer(**tokenizer_opts)
 
 
-def maybe_prewarm_scheduler_tokenizer():
+def maybe_prewarm_local_hf_modules():
     """Populate the shared HF modules cache before local tokenizer readers start."""
     try:
         serving = get_serving()
         parallel = get_parallel()
-        python_frontend = parallel.node_rank == 0 and not envs.SGLANG_RUST_SERVER.get()
+        has_python_frontend = (
+            parallel.node_rank == 0 and not envs.SGLANG_RUST_SERVER.get()
+        )
         if (
             serving.skip_tokenizer_init
             or not get_model().trust_remote_code
             or not Path(serving.tokenizer_path).is_dir()
             or (
-                not python_frontend
+                not has_python_frontend
                 and parallel.tp_size * parallel.pp_size * parallel.dp_size
                 <= parallel.nnodes
             )
@@ -146,7 +148,7 @@ def maybe_prewarm_scheduler_tokenizer():
             )
             proc = multiprocessing.get_context("spawn").Process(
                 target=_prewarm_in_subprocess,
-                args=(staging, tokenizer_opts, processor_opts, python_frontend),
+                args=(staging, tokenizer_opts, processor_opts, has_python_frontend),
             )
             proc.start()
             try:
