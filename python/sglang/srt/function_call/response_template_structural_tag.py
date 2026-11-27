@@ -342,6 +342,25 @@ def typed_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
     return {**parameters, "properties": typed_properties}
 
 
+@lru_cache(maxsize=32)
+def reasoning_end_markers(pattern: str) -> tuple[str, str | None]:
+    """Return the consumed closer and optional lookahead the token grammar can track."""
+    end, ahead = "", None
+    if _AHEAD in pattern:
+        return "", None
+    for branch in _literals(pattern, lookahead=True) or ():
+        if branch.startswith(_AHEAD) and ahead is None:
+            ahead = branch.removeprefix(_AHEAD)
+        elif branch and _AHEAD not in branch and not end:
+            end = branch
+        else:
+            return "", None
+    # Overlapping markers would make the regex branch order significant.
+    if ahead is not None and (end.startswith(ahead) or ahead.startswith(end)):
+        return "", None
+    return end, ahead
+
+
 def _closers(field: ResponseTemplateField) -> list[str] | None:
     """Return literal closers, an empty list if absent, or `None` if underivable."""
     if field.close_re is None:

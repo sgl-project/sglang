@@ -464,6 +464,34 @@ class TestGemma4ResponseTemplateParity(CustomTestCase):
 
 
 class TestResponseTemplateAdapters(CustomTestCase):
+    def test_reasoning_close_pattern_exposes_consumed_and_lookahead_markers(self):
+        """Qwen3.6-27B consumes </think> but gives <tool_call> to the tool parser."""
+        vocab = {"</think>": 248069, "<tool_call>": 248058}
+        tokenizer = SimpleNamespace(
+            get_added_vocab=lambda: vocab,
+            encode=lambda text, **_: [vocab[text]] if text in vocab else [],
+        )
+        template = copy.deepcopy(REASONING_CONTENT_JOIN_TEMPLATE)
+        field = template["fields"]["reasoning_content"]
+        del field["close"]
+        for pattern, end, ahead in (
+            ("</think>|(?=<tool_call>)", [248069], 248058),
+            ("(?=<tool_call>)|</think>", [248069], 248058),
+            ("</think>", [248069], None),
+            ("</think>|(?=<unregistered>)", [], None),
+            (r"</think>\s*|(?=<tool_call>)", [], None),
+            ("</think>(?=<tool_call>)", [], None),
+        ):
+            with self.subTest(pattern=pattern):
+                field["close_pattern"] = pattern
+                detector = ResponseTemplateReasoningDetector(
+                    tokenizer=tokenizer, response_template=template
+                )
+                self.assertEqual(detector.get_think_end_token_ids(tokenizer), end)
+                self.assertEqual(detector.get_think_end_lookahead_id(tokenizer), ahead)
+                if ahead is not None:
+                    self.assertEqual(detector.tool_start_token, "<tool_call>")
+
     def test_repeated_regions_join_in_streaming_and_nonstreaming(self):
         text = (
             "<think>first</think><think>second</think>"

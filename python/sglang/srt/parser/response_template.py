@@ -38,6 +38,7 @@ from sglang.srt.function_call.response_template_structural_tag import (
     holds_arguments,
     message_start_anchors,
     message_start_openers,
+    reasoning_end_markers,
     typed_parameters,
 )
 from sglang.srt.parser.chat_parsing.content_parsers import _apply_transform
@@ -613,6 +614,11 @@ class ResponseTemplateReasoningDetector:
             if thinking and thinking.close_literals
             else self._default_think_end
         )
+        self.tool_start_token = None
+        if not self.think_end_token and thinking and thinking.close_re:
+            self.think_end_token, self.tool_start_token = reasoning_end_markers(
+                thinking.close_re.pattern
+            )
         self._thinking_field = thinking
         self._content_field = templates.source.fields.get(_CONTENT_FIELD)
         self._tool_field = templates.source.fields.get(_TOOL_FIELD)
@@ -650,7 +656,25 @@ class ResponseTemplateReasoningDetector:
         )
 
     def get_think_end_token_ids(self, tokenizer) -> list[int]:
+        if not self.think_end_token or (
+            self.tool_start_token and self.get_think_end_lookahead_id(tokenizer) is None
+        ):
+            return []
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
+
+    def get_think_end_lookahead_id(self, tokenizer) -> int | None:
+        if self.tool_start_token is None:
+            return None
+        # An added token stays atomic next to the preceding reasoning text.
+        get_added_vocab = getattr(tokenizer, "get_added_vocab", None)
+        if get_added_vocab is None:
+            return None
+        token_id = get_added_vocab().get(self.tool_start_token)
+        if token_id is not None and tokenizer.encode(
+            self.tool_start_token, add_special_tokens=False
+        ) == [token_id]:
+            return token_id
+        return None
 
     def get_self_opened_think_start_token_ids(self, tokenizer) -> list[int] | None:
         return None
