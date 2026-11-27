@@ -760,17 +760,20 @@ class CommonKVManager(BaseKVManager):
         )
 
     def _init_dcp_pack_buffers_once(
-        self, dcp_size: int, *, include_draft: bool = False
+        self, dcp_size: int, *, include_draft: bool = False, allocator=None
     ) -> None:
         if self._dcp_pack_buffers is not None:
             return
         if not self.kv_args.kv_item_lens:
             return
-        from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
+        if allocator is None:
+            from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
+
+            allocator = init_dcp_pack_buffers
 
         max_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
         max_tokens = ceil_align(max_tokens, self.kv_args.page_size)
-        self._dcp_pack_buffers = init_dcp_pack_buffers(
+        self._dcp_pack_buffers = allocator(
             self._register_staging_memory,
             self.kv_args,
             len(self.transfer_queues),

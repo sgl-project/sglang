@@ -190,20 +190,24 @@ def _build_pool(
 
 
 class TestNpuMlaPoolLayout(CustomTestCase):
-    def assertLayerIdsAlign(self, pool, expected):
+    def assertLayerIdsAlign(self, pool, expected, expected_state):
         ptrs, _, item_lens = pool.get_contiguous_buf_infos()
         layer_ids = pool.get_kv_layer_ids()
         self.assertEqual(layer_ids, expected)
         self.assertEqual(len(layer_ids), len(ptrs))
         self.assertEqual(len(layer_ids), len(item_lens))
-        self.assertEqual(len(layer_ids), len(pool.get_dcp_remote_decode_layout()))
+        state_ptrs, _, state_item_lens = pool.get_state_buf_infos()
+        state_layer_ids = pool.get_state_layer_ids()
+        self.assertEqual(state_layer_ids, expected_state)
+        self.assertEqual(len(state_layer_ids), len(state_ptrs))
+        self.assertEqual(len(state_layer_ids), len(state_item_lens))
+        self.assertTrue(set(ptrs).isdisjoint(state_ptrs))
 
     def test_packed_pool_layer_ids_match_the_pd_entries(self):
-        """The packed record transfers no V buffers; the layer ids used to list
-        K and V per layer and so outnumbered the PD entries (8 ids, 6 buffers)."""
+        """Packed KV has no V entries; indexer keys/scales register as state."""
         pool = _build_pool(FP8)
         self.assertEqual(pool.v_buffer.shape[-1], 0)
-        self.assertLayerIdsAlign(pool, [0, 1] * 3)
+        self.assertLayerIdsAlign(pool, [0, 1], [0, 1] * 2)
 
     def test_int8_pool_transfers_packed_k_and_bf16_index_k(self):
         """INT8 main KV is the packed record; the indexer stays BF16 with no
@@ -213,13 +217,15 @@ class TestNpuMlaPoolLayout(CustomTestCase):
         self.assertEqual(pool.v_buffer.shape[-1], 0)
         self.assertEqual(pool.index_k_buffer.dtype, torch.bfloat16)
         self.assertIsNone(pool.index_k_scale_buffer)
-        self.assertLayerIdsAlign(pool, [0, 1] * 2)
+        self.assertLayerIdsAlign(pool, [0, 1], [0, 1])
         _, _, item_lens = pool.get_contiguous_buf_infos()
         page_size = pool.page_size
         self.assertEqual(
             item_lens,
-            [PACKED_KV_CACHE_DIM * page_size] * 2
-            + [INDEX_HEAD_DIM * 2 * page_size] * 2,
+            [PACKED_KV_CACHE_DIM * page_size] * 2,
+        )
+        self.assertEqual(
+            pool.get_state_buf_infos()[2], [INDEX_HEAD_DIM * 2 * page_size] * 2
         )
 
     def test_int8_main_kv_composes_with_the_int8_indexer(self):
@@ -230,14 +236,16 @@ class TestNpuMlaPoolLayout(CustomTestCase):
         self.assertEqual(pool.k_buffer.dtype, INT8)
         self.assertEqual(pool.index_k_buffer.dtype, INT8)
         self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
-        self.assertLayerIdsAlign(pool, [0, 1] * 3)
+        self.assertLayerIdsAlign(pool, [0, 1], [0, 1] * 2)
         _, _, item_lens = pool.get_contiguous_buf_infos()
         page_size = pool.page_size
         self.assertEqual(
             item_lens,
-            [PACKED_KV_CACHE_DIM * page_size] * 2
-            + [INDEX_HEAD_DIM * page_size] * 2
-            + [2 * page_size] * 2,
+            [PACKED_KV_CACHE_DIM * page_size] * 2,
+        )
+        self.assertEqual(
+            pool.get_state_buf_infos()[2],
+            [INDEX_HEAD_DIM * page_size] * 2 + [2 * page_size] * 2,
         )
 
     def test_fp8_record_keeps_its_own_quantized_indexer(self):
@@ -252,18 +260,19 @@ class TestNpuMlaPoolLayout(CustomTestCase):
         """Index K entries carry indexer_layer_ids (compact layout), unpacked
         pools keep their V entries, and a combined buffer has one per layer."""
         cases = (
-            (FP8, {"indexer_layer_ids": (5,)}, [4, 5, 5, 5]),
-            (torch.bfloat16, {"indexer_layer_ids": (5,)}, [4, 5, 4, 5, 5]),
+            (FP8, {"indexer_layer_ids": (5,)}, [4, 5], [5, 5]),
+            (torch.bfloat16, {"indexer_layer_ids": (5,)}, [4, 5, 4, 5], [5]),
             (
                 torch.bfloat16,
                 {"index_head_dim": None, "use_combined_kv_buffer": True},
                 [4, 5],
+                [],
             ),
         )
-        for dtype, kwargs, expected in cases:
+        for dtype, kwargs, expected, expected_state in cases:
             with self.subTest(dtype=dtype, kwargs=kwargs):
                 pool = _build_pool(dtype, start_layer=4, **kwargs)
-                self.assertLayerIdsAlign(pool, expected)
+                self.assertLayerIdsAlign(pool, expected, expected_state)
 
     def test_combined_packed_buffer_gives_a_bf16_rope_placeholder(self):
         """A combined buffer holds only the packed record. As in the split
@@ -281,7 +290,7 @@ class TestNpuMlaPoolLayout(CustomTestCase):
                 self.assertEqual(v_cache.dtype, torch.bfloat16)
                 self.assertEqual(v_cache.shape, (*k_cache.shape[:-1], 0))
                 # PD still moves only the combined record, one entry per layer.
-                self.assertLayerIdsAlign(pool, [0, 1])
+                self.assertLayerIdsAlign(pool, [0, 1], [0, 1] * (2 if arch35 else 1))
 
     def test_combined_unpacked_buffer_keeps_its_rope_slice(self):
         """Without the packed record, the combined buffer's rope cache stays
@@ -371,7 +380,12 @@ class TestHostPoolMirrorsTheDevicePool(CustomTestCase):
         self.addCleanup(host.destroy)
         return host
 
-    def test_int8_main_kv_mirrors_with_and_without_the_int8_indexer(self):
+    # This layout test does not depend on the CI worker's RAM allowance.
+    @patch(
+        "sglang.srt.mem_cache.pool_host.base.available_host_memory_bytes",
+        return_value=16 * 1024**3,
+    )
+    def test_int8_main_kv_mirrors_with_and_without_the_int8_indexer(self, _memory):
         # (main dtype, arch35, indexer recipe, index K dtype, scale dtype)
         cases = (
             (INT8, False, None, torch.bfloat16, None),

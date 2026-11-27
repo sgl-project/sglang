@@ -25,6 +25,8 @@ for _ in (
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.operators",
     "sgl_kernel_npu.operators.attention",
+    "sgl_kernel_npu.operators.matmul",
+    "sgl_kernel_npu.operators.norm",
     "sglang.srt.speculative",
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
@@ -32,6 +34,7 @@ for _ in (
 ):
     sys.modules.setdefault(_, MagicMock())
 
+from sglang.srt import runtime_context as rc
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMaskBuilder,
@@ -39,7 +42,19 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
+    NPUDecodeContextParallelMetadata,
+)
+from sglang.srt.model_executor import forward_context as fc
 from sglang.srt.model_executor.forward_mode import ForwardMode
+
+with (
+    patch("sglang.srt.utils.is_npu", return_value=False),
+    patch("sglang.srt.utils.device.is_npu", return_value=False),
+):
+    from sglang.srt.hardware_backend.npu.modules import (
+        deepseek_v2_attention_mla_npu as mla_npu,
+    )
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -615,7 +630,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
                         global_lens = (
                             local_lens
                             if size == 1
-                            else ([9, 3] if local_lens == [5, 3] else [8, 8])
+                            else ([9, 5] if local_lens == [5, 3] else [8, 8])
                         )
                         backend.forward_metadata = ForwardMetadata(
                             prefix_lens=torch.tensor(global_lens),
@@ -683,7 +698,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
                                 backend.forward_metadata.prefix_lens,
                             )
                             self.assertEqual(
-                                gather.call_args.kwargs, {"interleave_size": page}
+                                gather.call_args.kwargs.get("interleave_size", 1), 1
                             )
                             torch.testing.assert_close(
                                 torch.cat((result_k, result_pe), -1),
@@ -747,7 +762,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
             values = values + request * 10000
             full.append(values)
             positions = torch.arange(length)
-            local.append(values[(positions // page_size) % size == rank])
+            local.append(values[positions % size == rank])
         expected_local = torch.cat(local)
         expected_full = torch.cat(full)
         needs_compaction = any(len(values) % page_size for values in local)
@@ -788,11 +803,11 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
             get_value_buffer=lambda _: rope,
         )
 
-        def gather(kv, pe, global_lens, *, interleave_size):
+        def gather(kv, pe, global_lens, *, interleave_size=1):
             torch.testing.assert_close(kv, expected_local[..., :32], atol=0, rtol=0)
             torch.testing.assert_close(pe, expected_local[..., 32:], atol=0, rtol=0)
             self.assertEqual(global_lens.tolist(), lengths)
-            self.assertEqual(interleave_size, page_size)
+            self.assertEqual(interleave_size, 1)
             return expected_full
 
         with (
@@ -1069,6 +1084,78 @@ class TestMlaPrefixFia(unittest.TestCase):
         for dtype in (torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 self._check_prefix([3, 1], [16, 32], dtype, 0, 4, page_size=16)
+
+
+class TestDcpExtendMetadata(unittest.TestCase):
+    def test_replicated_draft_without_target_fields_skips_gather(self):
+        backend = SimpleNamespace(is_draft_worker=True)
+        for active in (backend, SimpleNamespace(full_attn_backend=backend)):
+            with (
+                self.subTest(wrapped=active is not backend),
+                fc.forward_context(fc.ForwardContext(attn_backend=active)),
+                patch.object(
+                    mla_npu, "prepare_decode_context_parallel_metadata"
+                ) as plan,
+            ):
+                # NextN has no target-only use_dsa field.
+                self.assertIsNone(
+                    mla_npu.prepare_dcp_extend_metadata_npu(
+                        SimpleNamespace(), torch.bfloat16, 1, [0]
+                    )
+                )
+            plan.assert_not_called()
+
+    def test_extend_metadata_reconstructs_token_owned_kv(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.device = torch.device("cpu")
+        backend.page_size, backend.dcp_size, backend.dcp_rank = 128, 2, 0
+        backend.use_mla = backend.use_dsa = backend.dsa_dcp_target = True
+        backend.use_quant_flash_attn = backend.dense_mla_dcp_target = False
+        backend.use_flash_mla = backend.use_paged_mtp = False
+        backend.is_hybrid_swa = backend.use_sliding_window_kv_pool = False
+        backend.req_to_token = torch.arange(768).reshape(1, -1)
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=backend.req_to_token)
+        metadata = NPUDecodeContextParallelMetadata()
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            seq_lens=torch.tensor([603]),
+            seq_lens_cpu=torch.tensor([603]),
+            extend_seq_lens=torch.tensor([91]),
+            extend_seq_lens_cpu=[91],
+            extend_prefix_lens=torch.tensor([512]),
+            extend_prefix_lens_cpu=[512],
+            req_pool_indices=torch.tensor([0]),
+            spec_info=None,
+            out_cache_loc=None,
+            origin_out_cache_loc=None,
+            attn_dcp_metadata=metadata,
+        )
+        with (
+            rc.get_parallel().override(
+                dcp_enabled=True,
+                dcp_size=2,
+                dcp_rank=0,
+                attn_dcp_size=2,
+                attn_dcp_rank=0,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.dcp_extend_gather.dsa_use_prefill_cp",
+                return_value=False,
+            ),
+        ):
+            backend.init_forward_metadata(batch)
+        # The generic planner suite covers other sizes, tails and empty ranks.
+        # Here check that the NPU backend selects token ownership at page=128.
+        prefix, own = torch.arange(512), torch.arange(512, 603)
+        sends = [prefix[rank::2] for rank in range(2)]
+        actual = torch.full((603,), -1)
+        for piece in metadata.extend_gather_plan.pieces:
+            scratch = torch.cat(
+                [send[piece.send_start : piece.send_end] for send in sends]
+                + [own[piece.extend_start : piece.extend_end]]
+            )
+            actual[piece.out_start : piece.out_end] = scratch[piece.index]
+        self.assertTrue(torch.equal(actual, torch.arange(603)))
 
 
 if __name__ == "__main__":

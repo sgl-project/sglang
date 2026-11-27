@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Sequence, Tuple
+from functools import partial
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -77,9 +78,14 @@ def try_pack_dcp_src(
     gather_stream = pack_buffer.get_gather_stream()
     gather_stream.wait_stream(pack_buffer.producer_stream())
     with device_stream_context(gather_stream):
-        copy_mla_rows_into_pack(
-            kv_data_ptrs, row_indices, pack, token_item_lens, src_token_item_lens
-        )
+        if pack.device.type == "npu":
+            pack_buffer.pack_rows(
+                kv_data_ptrs, row_indices, pack, token_item_lens, src_token_item_lens
+            )
+        else:
+            copy_mla_rows_into_pack(
+                kv_data_ptrs, row_indices, pack, token_item_lens, src_token_item_lens
+            )
     gather_stream.synchronize()
 
     packed_ptrs: List[int] = []
@@ -142,10 +148,24 @@ def init_dcp_pack_buffers(
     gpu_id = kv_args.gpu_id
     device = f"{device_type}:{gpu_id}"
     custom_mem_pool, _ = _get_custom_mem_pool(device)
+    make_buffer = partial(
+        StagingBuffer, size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool
+    )
+    return allocate_registered_pack_buffers(
+        register_fn, make_buffer, count, size_bytes, max_tokens
+    )
 
+
+def allocate_registered_pack_buffers(
+    register_fn,
+    make_buffer: Callable[[], StagingBuffer],
+    count: int,
+    size_bytes: int,
+    max_tokens: int,
+) -> List[StagingBuffer]:
     buffers = []
     for _ in range(count):
-        buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
+        buf = make_buffer()
         register_fn(buf.get_ptr(), buf.get_size())
         buffers.append(buf)
     logger.info(

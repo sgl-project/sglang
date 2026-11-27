@@ -437,7 +437,7 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
 class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
     def test_retraction_indices_map_target_kv_to_rank_local_slots(self):
         pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2)
-        indices = torch.tensor([0, 1, 4, 5, 6, 7, 12, 13], dtype=torch.int64)
+        indices = torch.tensor([0, 1, 2, 4, 5, 6, 7, 10, 12, 13, 14], dtype=torch.int64)
         got = NPUMLATokenToKVPool._copy_indices_for_buffer(
             pool, indices, uses_global_slots=False
         )
@@ -459,42 +459,41 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
         )
         self.assertTrue(torch.equal(got, indices))
 
-    def test_pd_buffer_infos_expand_only_global_page_strides(self):
+    def test_pd_exports_attention_kv_and_replicated_indexer_state(self):
         pool = object.__new__(NPUMLATokenToKVPool)
         pool.use_combined_kv_buffer = False
-        pool.k_buffer = [torch.empty(4, 8, 1, 2)]
-        pool.v_buffer = [torch.empty(4, 8, 1, 1)]
+        # Match the pool's stacked [layer, page, token, head, dim] tensors.
+        pool.k_buffer = torch.empty(2, 4, 8, 1, 2, dtype=torch.float32)
+        pool.v_buffer = torch.empty(2, 4, 8, 1, 1, dtype=torch.float32)
         pool.dcp_size = 4
-        pool.is_draft_worker = False
         pool.dsa_kv_cache_store_c8 = False
         pool.index_head_dim = 2
         pool.page_size = 8
         pool.index_page_size = 8
-        pool.index_k_buffer = [torch.empty(4, 8, 1, 2)]
-        pool.index_k_scale_buffer = [torch.empty(4, 8, 1)]
+        pool.index_k_buffer = torch.empty(2, 4, 8, 1, 2, dtype=torch.float32)
+        pool.index_k_scale_buffer = torch.empty(2, 4, 8, 1, dtype=torch.float32)
         pool.start_layer = 0
-        pool.layer_num = 1
-        pool.indexer_layer_ids = (0,)
+        pool.layer_num = 2
+        pool.indexer_layer_ids = (0, 1)
 
-        ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
-        buffers = (
-            pool.k_buffer
-            + pool.v_buffer
-            + pool.index_k_buffer
-            + pool.index_k_scale_buffer
-        )
-
-        self.assertEqual(ptrs, [buffer.data_ptr() for buffer in buffers])
-        self.assertEqual(lens, [buffer.nbytes for buffer in buffers])
-        self.assertEqual(
-            item_lens,
-            [
-                pool.k_buffer[0][0].nbytes,
-                pool.v_buffer[0][0].nbytes,
-                pool.index_k_buffer[0][0].nbytes * pool.dcp_size,
-                pool.index_k_scale_buffer[0][0].nbytes * pool.dcp_size,
-            ],
-        )
+        buffers = list(pool.k_buffer) + list(pool.v_buffer)
+        state_buffers = list(pool.index_k_buffer) + list(pool.index_k_scale_buffer)
+        for is_draft in (False, True):
+            with self.subTest(is_draft=is_draft):
+                pool.is_draft_worker = is_draft
+                ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+                self.assertEqual(ptrs, [buffer.data_ptr() for buffer in buffers])
+                self.assertEqual(lens, [buffer.nbytes for buffer in buffers])
+                # Eight float32 tokens per page: latent=64 B, RoPE=32 B.
+                self.assertEqual(
+                    item_lens, [256, 256, 128, 128] if is_draft else [64, 64, 32, 32]
+                )
+                state_ptrs, _, state_item_lens = pool.get_state_buf_infos()
+                self.assertEqual(
+                    state_ptrs, [buffer.data_ptr() for buffer in state_buffers]
+                )
+                self.assertEqual(state_item_lens, [64, 64, 32, 32])
+                self.assertTrue(set(ptrs).isdisjoint(state_ptrs))
 
     def test_lse_merge_world_size_one_is_identity(self):
         group = _FakeGroup(world_size=1)

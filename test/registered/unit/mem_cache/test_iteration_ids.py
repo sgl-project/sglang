@@ -698,8 +698,8 @@ class TestIterationIds(CustomTestCase):
                 for is_draft_worker in (False, True)
             )
         global_ids = torch.arange(8, 16)
-        # Rank 1 of 2 owns every other 4-slot page, compacted.
-        local_ids = torch.tensor([-1, -1, -1, -1, 4, 5, 6, 7])
+        # Rank 1 of 2 owns odd tokens, compacted into rank-local slots.
+        local_ids = torch.tensor([-1, 4, -1, 5, -1, 6, -1, 7])
         for source in (target, draft):
             plan = source.plan(
                 req_pool_indices=self.rpi,
@@ -745,7 +745,7 @@ class TestIterationIds(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 target.space(_FULL).write(global_ids),
-                torch.tensor([-1, -1, -1, -1, 4, 5, 6, 7]),
+                torch.tensor([-1, 4, -1, 5, -1, 6, -1, 7]),
             )
         )
 
