@@ -3627,12 +3627,13 @@ class Scheduler(
             )
             return
 
-        if self.spec_algorithm.is_dflash_family():
+        if self.spec_algorithm.uses_block_verify():
             error_msg = validate_dflash_request(
                 req,
                 self.enable_overlap,
                 bound_runtime=isinstance(self.draft_worker, BaseSpecWorker)
                 and self.draft_worker.has_bound_runtime,
+                supports_grammar=not self.spec_algorithm.is_dfly(),
             )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)

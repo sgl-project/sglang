@@ -4931,6 +4931,10 @@ class DeepseekV4ForCausalLM(
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+        from sglang.srt.runtime_context import get_spec
+
+        self._is_dfly = get_spec().speculative_algorithm == "DFLY"
+        self.dfly = None
         get_attn_tp_context().init_context(config.q_lora_rank, is_dsa=True)
 
         self._routed_experts_weights_of_layer = LazyValue(
@@ -5172,6 +5176,8 @@ class DeepseekV4ForCausalLM(
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if self.dfly is not None and forward_batch.forward_mode.is_target_verify():
+            self.dfly.draft_into_verify(input_ids, positions, forward_batch)
         input_ids, input_embeds = self.prepare_language_model_inputs(
             input_ids, forward_batch, input_embeds
         )
@@ -5276,7 +5282,9 @@ class DeepseekV4ForCausalLM(
             logits_metadata,
             aux_hidden_states,
             hidden_states_before_norm=(
-                None if aux_hidden_states is not None else pre_hc_head
+                None
+                if (aux_hidden_states is not None or self._is_dfly)
+                else pre_hc_head
             ),
         )
         if tail is not None:
