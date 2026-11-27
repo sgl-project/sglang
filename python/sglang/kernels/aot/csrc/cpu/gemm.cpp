@@ -102,62 +102,6 @@ inline void pack_vnni<uint8_t>(uint8_t* __restrict__ packed, const uint8_t* __re
   }
 }
 
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    auto [data0, data1] = load_float_vec2(input + d);
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d]);
-  }
-}
-
-template <typename scalar_t>
-inline void copy_stub(float* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    auto [data0, data1] = load_float_vec2(input + d);
-    data0.store(out + d);
-    data1.store(out + d + fVec::size());
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<float>(input[d]);
-  }
-}
-
-template <typename scalar_t>
-inline void copy_add_stub(
-    scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    auto [data0, data1] = load_float_vec2(input + d);
-    auto [bias0, bias1] = load_float_vec2(bias + d);
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0 + bias0, data1 + bias1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] + bias[d]);
-  }
-}
-
 template <typename scalar_t, bool has_bias>
 inline void scalar_sigmoid_and_mul(
     scalar_t* __restrict__ out,

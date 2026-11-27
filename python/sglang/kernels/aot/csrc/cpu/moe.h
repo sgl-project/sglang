@@ -1,4 +1,5 @@
 #pragma once
+#include "gemm.h"
 #include "vec.h"
 
 template <typename scalar_t>
@@ -20,23 +21,6 @@ inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ i
   }
   for (; d < size; ++d) {
     out[d] = input[d];
-  }
-}
-
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    auto [x0, x1] = load_float_vec2(input + d);
-    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d]);
   }
 }
 

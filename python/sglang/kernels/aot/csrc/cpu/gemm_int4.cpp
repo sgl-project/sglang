@@ -215,19 +215,6 @@ inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
   }
 }
 
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-#pragma GCC unroll 4
-  for (int64_t d = 0; d < size; d += Vec::size()) {
-    fVec x0 = fVec::loadu(input + d);
-    fVec x1 = fVec::loadu(input + d + fVec::size());
-    Vec res = convert_from_float_ext<scalar_t>(x0, x1);
-    res.store(out + d);
-  }
-}
-
 template <typename out_dtype>
 void _da8w4_linear_impl(
     const uint8_t* __restrict__ input,

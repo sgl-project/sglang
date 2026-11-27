@@ -2,6 +2,7 @@
 #include <ATen/native/CPUBlas.h>
 
 #include "common.h"
+#include "vec.h"
 
 // amx-bf16
 #define TILE_M 16
@@ -128,6 +129,60 @@ inline int64_t get_4bit_block_k_size(int64_t group_size) {
   return group_size > 128 ? 128 : group_size;
 }
 
+template <typename scalar_t>
+inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  constexpr int kVecSize = bVec::size();
+
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    auto [data0, data1] = load_float_vec2(input + d);
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
+    out_vec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<scalar_t>(input[d]);
+  }
+}
+
+template <typename scalar_t>
+inline void copy_stub(float* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    auto [data0, data1] = load_float_vec2(input + d);
+    data0.store(out + d);
+    data1.store(out + d + fVec::size());
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<float>(input[d]);
+  }
+}
+
+template <typename scalar_t>
+inline void copy_add_stub(
+    scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  constexpr int kVecSize = bVec::size();
+
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    auto [data0, data1] = load_float_vec2(input + d);
+    auto [bias0, bias1] = load_float_vec2(bias + d);
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0 + bias0, data1 + bias1);
+    out_vec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<scalar_t>(input[d] + bias[d]);
+  }
+}
+
 // pack weight to vnni format
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
@@ -161,9 +216,9 @@ void fused_experts_int8_kernel_impl(
     int64_t topk,
     int64_t num_tokens_post_pad);
 
-// moe implementations for fp8 w8a16 and mxfp4
-template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4>
-void fused_experts_fp_kernel_impl(
+// moe implementation for fp8 w8a16
+template <typename scalar_t>
+void fused_experts_fp8_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic0,
     scalar_t* __restrict__ ic1,
@@ -172,13 +227,46 @@ void fused_experts_fp_kernel_impl(
     scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
     const scalar_t* __restrict__ input,
-    const packed_t* __restrict__ packed_w1,
-    const packed_t* __restrict__ packed_w2,
+    const at::Float8_e4m3fn* __restrict__ packed_w1,
+    const at::Float8_e4m3fn* __restrict__ packed_w2,
     const float* __restrict__ w1_bias,
     const float* __restrict__ w2_bias,
-    const param_t* __restrict__ w1s,
-    const param_t* __restrict__ w2s,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
     int64_t block_size_N,
+    int64_t block_size_K,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad,
+    float alpha,
+    float limit,
+    CPUActMethod act_func,
+    bool with_bias);
+
+// moe implementation for mxfp4
+template <typename scalar_t>
+void fused_experts_fp4_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    scalar_t* __restrict__ A_tmp,
+    scalar_t* __restrict__ B_tmp,
+    float* __restrict__ C_tmp,
+    const scalar_t* __restrict__ input,
+    const uint8_t* __restrict__ packed_w1,
+    const uint8_t* __restrict__ packed_w2,
+    const float* __restrict__ w1_bias,
+    const float* __restrict__ w2_bias,
+    const uint8_t* __restrict__ w1s,
+    const uint8_t* __restrict__ w2s,
     int64_t block_size_K,
     const float* __restrict__ topk_weights,
     const int32_t* __restrict__ sorted_ids,
@@ -373,22 +461,3 @@ void tinygemm_kernel(
     bool store_out,
     bool use_brgemm,
     bool do_dequant = true);
-
-// mxfp4
-template <typename scalar_t>
-void tinygemm_kernel(
-    const scalar_t* __restrict__ A,
-    const uint8_t* __restrict__ B,
-    scalar_t* __restrict__ C,
-    scalar_t* __restrict__ Btmp,
-    float* __restrict__ Ctmp,
-    const uint8_t* __restrict__ scale,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    bool brg,
-    int64_t block_size_K,
-    bool do_unpack = true);

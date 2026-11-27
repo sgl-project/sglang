@@ -987,7 +987,7 @@ at::Tensor fused_experts_cpu(
       bool with_bias = w1_bias.has_value();
 
       CHECK_MOE_SCALES_FP8(1, 2);
-      fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
+      fused_experts_fp8_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
           intermediate_cache1,
@@ -1031,7 +1031,7 @@ at::Tensor fused_experts_cpu(
       auto w2s = w2_scale.value();
       TORCH_CHECK(w1s.numel() == (E * 2 * N * K >> 5));
       TORCH_CHECK(w2s.numel() == (E * K * N >> 5));
-      fused_experts_fp_kernel_impl<scalar_t, uint8_t, uint8_t, true>(
+      fused_experts_fp4_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
           intermediate_cache1,
@@ -1046,7 +1046,6 @@ at::Tensor fused_experts_cpu(
           with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
           w1s.data_ptr<uint8_t>(),
           w2s.data_ptr<uint8_t>(),
-          /*block_size_N*/ 1,
           /*block_size_K*/ group_size,
           topk_weights_.data_ptr<float>(),
           sorted_ids,
