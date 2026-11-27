@@ -1003,8 +1003,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
-        # Compact-trie logits and shared-context attention run eagerly.
-        if forward_batch.beam is not None:
+        # Compact-trie logits and shared-context attention run eagerly, unless a
+        # subclass captured a beam graph that fits the batch.
+        if forward_batch.beam is not None and not self._can_replay_beam(forward_batch):
             return False
 
         if self.require_mlp_tp_gather:
@@ -1064,6 +1065,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and is_tbo_supported
             and is_ngram_supported
         )
+
+    def _can_replay_beam(self, forward_batch: ForwardBatch) -> bool:
+        return False
 
     def _can_run_ragged_verify_graph(self, forward_batch: ForwardBatch, ragged_layout):
         if not self.attn_backend.supports_ragged_verify_graph:
