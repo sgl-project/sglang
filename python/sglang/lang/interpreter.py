@@ -834,11 +834,9 @@ class StreamExecutor:
                 setattr(clone, item, value)
 
         if self.chat_template.stop_str:
-            if clone.stop == ():
-                clone.stop = []
-            elif isinstance(clone.stop, str):
-                clone.stop = [clone.stop]
-            clone.stop += self.chat_template.stop_str
+            stop = [clone.stop] if isinstance(clone.stop, str) else list(clone.stop)
+            # A new list: clone.stop can be the very object the caller gave to gen().
+            clone.stop = stop + list(self.chat_template.stop_str)
 
         return clone
 

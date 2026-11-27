@@ -101,6 +101,40 @@ class TestRuntimeStartProfile(_StubServerTestCase):
         )
 
 
+class TestGenStopStrings(_StubServerTestCase):
+    def _run_gens(self, template, stop, num_gens):
+        @sgl.function
+        def program(s):
+            for i in range(num_gens):
+                s += sgl.gen(f"answer_{i}", stop=stop)
+
+        backend = RuntimeEndpoint(self.base_url, chat_template_name=template)
+        state = program.run(backend=backend)
+
+        self.assertIsNone(state.error())
+        return [
+            body["sampling_params"]["stop"]
+            for path, body in self.server.posts
+            if path == "/generate"
+        ]
+
+    def test_reused_stop_list_is_not_modified(self):
+        """Each gen sends its own stop strings plus the chat template's, once, and
+        the caller's list stays as it was."""
+        stop = ["\n"]
+
+        sent = self._run_gens("chatml", stop, num_gens=3)
+
+        self.assertEqual(sent, [["\n", "<|im_end|>"]] * 3)
+        self.assertEqual(stop, ["\n"])
+
+    def test_tuple_stop_with_a_list_of_template_stop_strings(self):
+        """A tuple of stop strings works with a template that lists its stop_str."""
+        sent = self._run_gens("interns1", ("\n",), num_gens=1)
+
+        self.assertEqual(sent, [["\n", "<|im_end|>", "<|action_end|>"]])
+
+
 @unittest.skipUnless(shutil.which("openssl"), "needs the openssl CLI for a test CA")
 class TestHttpRequestCustomCA(_StubServerTestCase):
     def setUp(self):
