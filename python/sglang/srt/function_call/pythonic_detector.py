@@ -62,11 +62,14 @@ class PythonicDetector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
-        # Only locate the opening "[func(": a regex spanning the whole call
-        # list backtracks exponentially on unterminated input (#52090).
-        # _find_call_list_end finds the closing bracket, and ast.parse
-        # validates the content.
-        self.tool_call_start_regex = re.compile(r"\[[a-zA-Z]\w*\(")
+        # Only locate the opening "[func()" or "[func(kw=": a regex spanning
+        # the whole call list backtracks exponentially on unterminated input
+        # (#52090). _find_call_list_end finds the closing bracket, and
+        # ast.parse validates the content. Requiring ")" or "kw=" keeps
+        # prose such as "items[len(items) - 1]" from matching.
+        self.tool_call_start_regex = re.compile(
+            r"\[[a-zA-Z]\w*\((?:\s*\)|[a-zA-Z]\w*\s*=)"
+        )
 
     @staticmethod
     def _text_strip(text: str) -> str:

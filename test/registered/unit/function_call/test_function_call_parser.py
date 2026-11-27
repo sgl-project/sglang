@@ -515,6 +515,16 @@ class TestPythonicDetector(unittest.TestCase):
         self.assertEqual(result.normal_text, text)
         self.assertLess(elapsed, 1.0)
 
+    def test_bracketed_expression_in_prose_is_not_a_tool_call(self):
+        """A "[name(" followed by a positional argument is prose, not a
+        tool call, and must come back unchanged."""
+        text = "Use `items[len(items) - 1]` to get the last item."
+
+        self.assertFalse(self.detector.has_tool_call(text))
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, text)
+
     def test_bracket_inside_string_argument(self):
         """A "]" inside a string argument does not end the call list."""
         text = "[search(query='a]b\\'c')] done"
