@@ -69,6 +69,11 @@ The same FL2VA / Ref2VA split applies in
 Review the license and usage terms in the MiniMax-H3 model card before production or commercial use. SGLang support does not grant additional model usage rights.
 </Warning>
 
+### Image checkpoints
+
+For the separate six-step text-to-image and editing checkpoint, see
+[MiniMax-H3-Image](/cookbook/diffusion/MiniMax/MiniMax-H3-Image).
+
 ## 3. Deployment details
 
 The builder accepts legal custom GPU counts and topologies, marking them

@@ -477,6 +477,7 @@ class ServerArgsAutoTuner:
             or args.use_fsdp_inference
             or args.layerwise_offload_components is not None
             or args.dit_layerwise_offload is True
+            or not self._deployment_config().auto_auxiliary_layerwise_offload
         ):
             return
 
@@ -719,7 +720,8 @@ class ServerArgsAutoTuner:
         components = [
             component_name
             for component_name, arg_name in DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES
-            if args.explicit_residency_mode(component_name) is None
+            if self._deployment_config().auto_auxiliary_layerwise_offload
+            and args.explicit_residency_mode(component_name) is None
         ]
         components = self._filter_high_memory_resident_components(components)
         if self._should_auto_enable_dit_layerwise_offload():
