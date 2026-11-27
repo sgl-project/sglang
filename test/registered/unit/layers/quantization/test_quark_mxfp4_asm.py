@@ -248,6 +248,18 @@ class TestQuarkMxfp4Gfx1250Fallback(CustomTestCase):
                 quark_w4a4_mxfp4._dequant_linear_to_bf16(torch.device("cpu"))
             )
 
+    def test_bf16_dequant_moves_the_scale_to_the_weight_device(self):
+        # Offload can leave the weight on the CPU and its scale on the GPU; the
+        # scale follows the weight so the bf16 expansion runs on one device.
+        weight = torch.tensor([[0x21] * 16], dtype=torch.uint8)  # codes 1, 2
+        scale = torch.tensor([[128]], dtype=torch.uint8)  # 2^1
+        gpu_scale = mock.MagicMock()
+        gpu_scale.to.return_value = scale
+        w = quark_w4a4_mxfp4._dequant_mxfp4_to_bf16(weight, gpu_scale)
+        gpu_scale.to.assert_called_once_with(weight.device)
+        expected = torch.tensor([[1.0, 2.0] * 16], dtype=torch.bfloat16)
+        torch.testing.assert_close(w, expected)
+
 
 class TestQuarkMxfp4BackendSelection(CustomTestCase):
     def setUp(self):

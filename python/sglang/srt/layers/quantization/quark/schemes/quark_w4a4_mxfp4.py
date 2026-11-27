@@ -140,6 +140,8 @@ def _dequant_mxfp4_to_bf16(
     ``(N, K//32)`` uint8 into a dense bf16 weight ``(N, K)``."""
     N, k_packed = weight.shape
     K = k_packed * 2
+    # CPU offload can park the weight on the CPU and leave its scale on the GPU.
+    weight_scale = weight_scale.to(weight.device)
     lut = torch.tensor(_MXFP4_VALUES, device=weight.device, dtype=torch.float32)
     lo = (weight & 0xF).long()
     hi = (weight >> 4).long()
