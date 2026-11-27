@@ -102,6 +102,8 @@ def w8a8_block_matmul(
         extra_kernel_args["needs_masking"] = needs_masking
     else:
         kernel = _w8a8_block_int8_matmul
+    # Same size check as the serving launchers, so large tuning shapes do not wrap
+    extra_kernel_args["USE_INT64_OFFSETS"] = max(A.numel(), C.numel()) >= 2**31
 
     kernel[grid](
         A,

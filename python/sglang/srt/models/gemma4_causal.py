@@ -206,7 +206,7 @@ class Gemma4Router(nn.Module):
             self.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
         )
         self._scale_fused = False
@@ -476,8 +476,10 @@ class Gemma4Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        output_tensor: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        """``output_tensor``: optional caller-owned storage for o_proj's result."""
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -574,7 +576,9 @@ class Gemma4Attention(nn.Module):
         )
         if attn_output.dim() == 3:
             attn_output = attn_output.flatten(-2, -1)
-        output, _ = self.o_proj(attn_output)
+        # pass output_tensor only when given: LoRA-wrapped layers do not take it
+        kwargs = {} if output_tensor is None else {"output_tensor": output_tensor}
+        output, _ = self.o_proj(attn_output, **kwargs)
 
         return output
 
@@ -984,9 +988,13 @@ class Gemma4TextModel(PreTrainedModel):
         self.post_init()
 
     # Block-FP8 linears that take the fused site's pre-quantized (fp8, scales)
-    # input (see compressed_tensors_w8a8_fp8.apply_weights).
+    # input (see compressed_tensors_w8a8_fp8.apply_weights). The FlashInfer hybrid
+    # qualifies because it hands a pre-quantized (input_scale != None) call back to
+    # DeepGEMM, so on H20 -- where ``auto`` resolves to it -- enabling this fusion
+    # still works instead of being dropped.
     _AR_FUSION_LINEARS = (
         "deepgemm_w8a8_block_fp8_linear_with_fallback",
+        "flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback",
         "triton_w8a8_block_fp8_linear",
     )
 
@@ -999,14 +1007,21 @@ class Gemma4TextModel(PreTrainedModel):
                 ("qkv_proj", layer.self_attn.qkv_proj),
                 ("gate_up_proj", layer.mlp.gate_up_proj),
             ):
-                linear = getattr(
-                    getattr(proj, "scheme", None), "w8a8_block_fp8_linear", None
-                )
+                scheme = getattr(proj, "scheme", None)
+                linear = getattr(scheme, "w8a8_block_fp8_linear", None)
                 linear_name = getattr(getattr(linear, "func", linear), "__name__", "")
                 if linear_name not in cls._AR_FUSION_LINEARS:
                     return (
                         f"layer {i} {name}: block-FP8 linear "
                         f"{linear_name or 'missing'} takes no pre-quantized input"
+                    )
+                # The fused site emits per-token-group scales, one per K/128
+                # columns; a [*, 32] weight layout would read them as K/32.
+                block = getattr(scheme, "weight_block_size", None)
+                if block is not None and list(block)[1] != 128:
+                    return (
+                        f"layer {i} {name}: weight scales are K/{list(block)[1]}, "
+                        f"the fused site produces K/128"
                     )
         return None
 
@@ -1046,7 +1061,7 @@ class Gemma4TextModel(PreTrainedModel):
     ) -> bool:
         mode = forward_batch.forward_mode
         return (
-            (mode == ForwardMode.EXTEND or mode.is_mixed())
+            (mode in (ForwardMode.DECODE, ForwardMode.EXTEND) or mode.is_mixed())
             and self._ar_fusion.applies(num_tokens)
             and per_layer_inputs is None
             and pp_proxy_tensors is None
@@ -1060,25 +1075,35 @@ class Gemma4TextModel(PreTrainedModel):
         """The layer stack with every TP all-reduce + epilogue as one fused site.
 
         This rank keeps only its own rows of the residual stream; each site
-        returns the next GEMM's FP8 input for all rows. Same math as
+        returns the next GEMM's FP8 input for all rows. o_proj and down_proj
+        write their partial sums straight into the site's symmetric buffer. Same math as
         Gemma4DecoderLayer.forward: the attention site rounds the
         post-attention norm to bf16 before the add, the MLP site adds in fp32
         and scales.
         """
         fusion = self._ar_fusion
-        if not fusion.used:
-            fusion.used = True
+        kind = "decode" if forward_batch.forward_mode.is_decode() else "extend"
+        if kind not in fusion.used:
+            fusion.used.add(kind)
             logger.info(
-                "gemma4 all-reduce fusion: first fused forward (%d tokens)",
+                "gemma4 all-reduce fusion: first fused %s forward (%d tokens)",
+                kind,
                 input_embeds.shape[0],
             )
-        row0, rows = fusion.rows(input_embeds.shape[0])
+        num_tokens = input_embeds.shape[0]
+        row0, rows = fusion.rows(num_tokens)
+        # Safe to overwrite between sites: a site returns only after every rank
+        # has read this buffer (the kernel's closing barrier).
+        partial_out = fusion.partial_out(num_tokens)
         residual = input_embeds[row0 : row0 + rows].clone()
         x = self.layers[self.start_layer].input_layernorm(input_embeds)
         for idx in range(self.start_layer, self.end_layer):
             layer = self.layers[idx]
             h = layer.self_attn(
-                positions=positions, hidden_states=x, forward_batch=forward_batch
+                positions=positions,
+                hidden_states=x,
+                forward_batch=forward_batch,
+                output_tensor=partial_out,
             )
             x = fusion.site(
                 h,
@@ -1088,7 +1113,7 @@ class Gemma4TextModel(PreTrainedModel):
                 None,
                 round_a=True,
             )
-            h = layer.mlp(x)
+            h = layer.mlp(x, output_tensor=partial_out)
             if idx + 1 < self.end_layer:
                 x = fusion.site(
                     h,
@@ -1302,11 +1327,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
             "up_proj",
         ],
     }
-
-    # Gemma does not apply LoRA to the embedding layer.
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = False
 
     def __init__(
         self,
@@ -1625,9 +1645,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
             return weight
         shard_size = (weight.shape[0] + tp_size - 1) // tp_size
         return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
-
-    def get_embed(self):
-        return self._shard_weight(self.model.embed_tokens.weight)
 
     def get_embed_and_head(self, *, draft_embedding=None):
         if self.pp_group.world_size > 1:

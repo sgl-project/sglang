@@ -614,6 +614,7 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
             scale_fmt="ue8m0",
             is_neox_style=False,
             fused_indexer_hadamard=False,
+            skip_rope=False,
             k_norm=SimpleNamespace(
                 weight=torch.randn((128,), device=device, generator=generator),
                 bias=torch.randn((128,), device=device, generator=generator),
@@ -699,6 +700,7 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.token_to_kv_pool = pool
     backend.req_to_token = req_to_token
     backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+    backend.max_kv_len = req_to_token.shape[1]
     backend._kv_shard_pool = get_kv_shard_pool(pool)
     backend.dsa_index_kpool = 1
     backend.dsa_index_topk = 2048
@@ -724,6 +726,8 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.flashmla_kv_num_q_heads_prefill = 64
     backend.flashmla_kv_format = "V32"
     backend.hisparse_coordinator = None
+    backend.flashmla_prefill_token_packing = False
+    backend._trtllm_fused_q = False
     backend.device_sm_major = (
         torch.cuda.get_device_capability()[0]
         if torch.device(device).type == "cuda"
@@ -942,14 +946,21 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
 
     indexer = SimpleNamespace(
         index_topk=2048,
+        fp4_index_k=False,
         num_init_tokens=0,
         num_local_tokens=0,
         logits_with_pp_recv=False,
         use_prefill_lite_topk=False,
+        tp_split_min_rows=None,
         sm_count=torch.cuda.get_device_properties(check.device).multi_processor_count,
         _pad_heads_for_deep_gemm=dsa_indexer.Indexer._pad_heads_for_deep_gemm,
     )
-    for name in ("_with_real_sm_count", "_mask_init_and_local_tokens", "_mqa_logits"):
+    for name in (
+        "_with_real_sm_count",
+        "_mask_init_and_local_tokens",
+        "_mqa_logits",
+        "_indexer_tp_split",
+    ):
         setattr(indexer, name, MethodType(getattr(dsa_indexer.Indexer, name), indexer))
 
     class RecordingMetadata:
@@ -972,7 +983,7 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
         ):
             results.append(
                 dsa_indexer.Indexer._get_topk_ragged(
-                    indexer, False, batch, layer_id, query, weights, metadata
+                    indexer, batch, layer_id, query, weights, metadata
                 )
             )
         starts, ends = metadata.get_indexer_kvcache_range()

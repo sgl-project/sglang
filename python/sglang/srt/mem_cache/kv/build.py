@@ -14,18 +14,31 @@ import torch
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.decl import (
+    KV_PART,
+    IndexKeyGeometry,
     KVLayerDecl,
+    MLAGeometry,
     RequestLifetime,
     StateLifetime,
     WindowLifetime,
 )
+from sglang.srt.mem_cache.kv.layout.composite import (
+    CompositeSubPoolSpec,
+    UnitPartGeometry,
+)
+from sglang.srt.mem_cache.kv.layout.index_key import IndexKeyView
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
-from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
+from sglang.srt.mem_cache.kv.layout.mla import (
+    LayerMajorMLAView,
+    MLASubPoolSpec,
+    MLAView,
+)
 from sglang.srt.mem_cache.kv.layout.state import NGramView, ShortConvView, StateView
 from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena, plan_bands
 from sglang.srt.mem_cache.kv.memory.fixed import FixedMemory
 from sglang.srt.mem_cache.kv.plan import (
     KVStoragePlan,
+    PlannedPart,
     PlannedSubPool,
     plan_kv_storage,
 )
@@ -64,8 +77,6 @@ class UnifiedBuildContext(msgspec.Struct, frozen=True, kw_only=True):
     head_dim: Optional[int] = None
     # The request table (every plan) and the state storage (a plan with state).
     max_num_reqs: int = 0
-    model_context_len: int = 0
-    extra_max_context_len: int = 0
     state_cache_params: Optional[Any] = None
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
@@ -95,7 +106,7 @@ def _build_request_table(
         size=sized.max_running_requests,
         reserved_rows=sized.request_rows,
         pre_alloc_size=ctx.decode_pre_alloc_size,
-        max_context_len=ctx.model_context_len + ctx.extra_max_context_len,
+        row_width=sized.req_to_token_row_width,
         state_sub_pool=None if state is None else state.name,
         tracking=(
             None
@@ -175,7 +186,11 @@ def _build_token_view(
     plan: KVStoragePlan,
     ctx: UnifiedBuildContext,
 ):
-    """A token sub-pool's view in its layout."""
+    """A token sub-pool's view in its layout; a composite's other parts are
+    bound by `_bind_unit_parts`."""
+    if isinstance(sub_pool.spec, CompositeSubPoolSpec):
+        kv = sub_pool.part(KV_PART)
+        return _unit_view(kv, sub_pool, arena, plan)
     if isinstance(sub_pool.spec, MLASubPoolSpec):
         # Addressed by the 0..N-1 index of its layers, so start_layer stays 0.
         return MLAView(
@@ -193,6 +208,51 @@ def _build_token_view(
         start_layer=0,
         end_layer=len(sub_pool.layer_ids) - 1,
     )
+
+
+def _unit_view(
+    part: PlannedPart, sub_pool: PlannedSubPool, arena: KVArena, plan: KVStoragePlan
+):
+    """The view a composite sub-pool's part is read through."""
+    geometry = part.geometry
+    if isinstance(geometry, UnitPartGeometry):
+        return geometry.unit_view(
+            arena=arena, spec=sub_pool.spec, part=part, page_size=plan.page_size
+        )
+    if isinstance(geometry, MLAGeometry) and geometry.layer_major:
+        return LayerMajorMLAView(
+            arena=arena,
+            spec=sub_pool.spec,
+            geometry=geometry,
+            page_size=plan.page_size,
+            model_layer_ids=part.layer_ids,
+        )
+    if isinstance(geometry, IndexKeyGeometry):
+        return IndexKeyView(
+            arena=arena,
+            spec=sub_pool.spec,
+            geometry=geometry,
+            page_size=plan.page_size,
+            model_layer_ids=part.layer_ids,
+        )
+    raise NotImplementedError(
+        f"sub-pool {sub_pool.name!r}: no view reads {type(geometry).__name__} "
+        "from a composite unit"
+    )
+
+
+def _bind_unit_parts(router, plan: KVStoragePlan, arena: KVArena) -> None:
+    """Routes each composite sub-pool's non-KV parts by part name."""
+    for sub_pool in plan.sub_pools:
+        for part in sub_pool.parts:
+            if part.name == KV_PART:
+                continue
+            router.bind_part(
+                sub_pool=sub_pool.name,
+                part=part.name,
+                view=_unit_view(part, sub_pool, arena, plan),
+                indices={layer_id: i for i, layer_id in enumerate(part.layer_ids)},
+            )
 
 
 def build_kv_storage(
@@ -277,6 +337,7 @@ def build_kv_storage(
             if isinstance(s.lifetime, WindowLifetime)
         },
     )
+    _bind_unit_parts(token_to_kv_pool.layer_router, plan, arena)
     req_to_token_pool = _build_request_table(plan, ctx, sized)
     state_storage = None
     if state is not None:
@@ -397,7 +458,6 @@ def build_unified_pools(
             lazy=ctx.enable_mamba_extra_buffer_lazy,
         ),
         pre_alloc_rows=ctx.decode_pre_alloc_size,
-        extra_context_len=ctx.extra_max_context_len,
     )
     sized = size_plan(plan, sizing)
     return build_kv_storage(plan, sized, ctx)

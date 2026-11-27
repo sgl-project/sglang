@@ -104,8 +104,14 @@ mis-mapped layout stays numerically correct and silently loses the performance
 
 ## The Ulysses transport
 
-The all-to-alls normally run over NCCL. On exactly 2 GPUs with peer-to-peer
-access, a CUDA-IPC transport replaces them by default: each rank writes its
+On CUDA, the plain Ulysses all-to-all normally uses NCCL. On a single host
+with peer access and compute capability 10.x, it tries the copy engine when
+each rank sends at least 48 MiB in a three-rank group or 128 MiB in a
+four-rank group. The threshold applies to each exchange, not to the model
+or the whole request. The pipelined attention exchange below is selected
+separately.
+
+Eligible two-rank exchanges have a separate CUDA-IPC path: each rank writes its
 half directly into the peer's mapped staging buffer, with GPU-side sequence
 counters instead of a NCCL rendezvous. An all-to-all is a permutation, never a
 reduction, so the transport cannot change results — outputs are bitwise
@@ -113,8 +119,9 @@ identical to the NCCL path.
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
-| `SGLANG_DIFFUSION_IPC_A2A` | `1` | set `0` to force NCCL |
-| `SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS` | `10000` | deadlock backstop for the peer wait; on expiry the transport retires on every rank and the request fails rather than returning incomplete data |
+| `SGLANG_DIFFUSION_IPC_A2A` | `1` | set `0` to disable the dedicated two-rank IPC path |
+| `SGLANG_DIFFUSION_IPC_A2A_MULTI` | unset (automatic) | for the plain exchange only: `0` uses the collective; `1` tries the copy engine regardless of payload size, falling back when unavailable |
+| `SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS` | `10000` | deadlock backstop for the peer waits, not a per-step budget. On expiry in the copy-engine all-to-all or the pipelined exchange, the request fails after its denoising stage rather than returning incomplete data, and `/health` reports the server unhealthy until it is restarted; on the two-rank IPC path the transport retires on both ranks and the next request fails |
 | `SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS` | `16` | staging pairs kept alive; raise for many-resolution serving |
 | `SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS` | `-1` | head groups for the pipelined exchange below; `0` keeps the sequential exchange, `N >= 2` forces `N` groups |
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -16,6 +17,10 @@ import torch
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+    AscendFAMetadata,
+    AscendFAMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
     CubeSparseAttentionMetadata,
@@ -451,8 +456,32 @@ def _precompute_refined_prompt_embeds(
             refiner_cu = refiner_params["cu_seqlens_q"]
         else:
             refiner_cu = refiner_params.cu_seqlens_q
+        from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+            MiniMaxH3DiTModel,
+        )
+
         with torch.inference_mode():
-            refined = refine(prompt_embeds, refiner_cu, device=device)
+            bounds = (
+                refiner_params.get("cu_seqlens_q_host")
+                if isinstance(refiner_params, dict)
+                else getattr(refiner_params, "cu_seqlens_q_host", None)
+            )
+            if (
+                isinstance(model, MiniMaxH3DiTModel)
+                and bounds is not None
+                and tuple(bounds)
+                in (
+                    (0, prompt_embeds.shape[0]),
+                    (0, prompt_embeds.shape[0], prompt_embeds.shape[0]),
+                )
+            ):
+                if len(bounds) == 2:
+                    refiner_cu = torch.cat((refiner_cu, refiner_cu[-1:]))
+                refined = refine(
+                    prompt_embeds, refiner_cu, device=device, text_len=bounds[1]
+                )
+            else:
+                refined = refine(prompt_embeds, refiner_cu, device=device)
     if not torch.is_tensor(refined):
         raise TypeError("MiniMax H3 refine_prompt_embeds must return a torch.Tensor")
     if int(refined.shape[0]) != int(prompt_embeds.shape[0]):
@@ -498,12 +527,19 @@ def _high_quality_steps_computation_mask(num_inference_steps: int) -> list[int]:
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
     def __init__(
-        self, transformer, pipeline=None, stochastic_sampling: bool = False
+        self,
+        transformer,
+        pipeline=None,
+        stochastic_sampling: bool = False,
+        transformer_2=None,
     ) -> None:
+        # transformer_2: the Ref2VA DiT of a fl2va+ref2va server, which
+        # denoises the ref2va requests
         super().__init__(
             transformer=transformer,
             scheduler=None,
             pipeline=pipeline,
+            transformer_2=transformer_2,
         )
         # the release's few-step re-noising update (release metadata)
         self.stochastic_sampling = stochastic_sampling
@@ -518,7 +554,27 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             # Image releases have no residency plan: a plain DiT use, with no
             # phase, prefetch or keep-ready-after-request policy.
             return [ComponentUse(self._component_stage_name(stage_name), "transformer")]
-        return super().component_uses(server_args, stage_name)
+        uses = super().component_uses(server_args, stage_name)
+        if self.transformer_2 is None:
+            return uses
+        # fl2va+ref2va: only the request says which DiT it runs, so the manager
+        # must not prefetch the first one declared. Under the automatic policy
+        # the DiT that ran last stays on the GPU; _begin_dit_use releases it
+        # when a request runs the other one.
+        keep_ready = server_args.performance_mode == "auto"
+        return [
+            (
+                replace(
+                    use,
+                    allow_prefetch=False,
+                    keep_ready_after_request=keep_ready
+                    and server_args.explicit_residency_mode(use.component_name) is None,
+                )
+                if use.component_name in ("transformer", "transformer_2")
+                else use
+            )
+            for use in uses
+        ]
 
     def _owns_compile_warmup_lifecycle(self) -> bool:
         return True
@@ -810,13 +866,22 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             num_steps=len(sigmas_video) - 1,
             device=device,
         )
+        transformer_backend = (server_args.component_attention_backends or {}).get(
+            "transformer", server_args.attention_backend
+        )
+        if current_platform.is_npu() and (
+            transformer_backend is None or transformer_backend.lower() == "fa"
+        ):
+            attn_metadata = AscendFAMetadataBuilder().build(
+                attention_backend_config=server_args.attention_backend_config,
+                ring_degree=server_args.ring_degree,
+            )
 
+        transformer = self._begin_dit_use(ctx.is_ref2va, batch)
         placement_managed = self._component_residency_manager is not None
-        if placement_managed:
-            self._manage_dit_use_site(self.transformer, "transformer", batch)
         try:
             model = _resolve_denoise_model(
-                self.transformer,
+                transformer,
                 device,
                 placement_managed=placement_managed,
             )
@@ -928,9 +993,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     model=model,
                     model_forward=partial(
                         self._forward_dit,
+                        packed_branches={},
                         batch=batch,
                         attn_metadata=attn_metadata,
                         build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
+                        num_steps=len(sigmas_video) - 1,
                     ),
                     positive=positive,
                     initial_video_rows=initial_video,
@@ -964,6 +1031,33 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             video_rows=video_rows,
             audio_rows=audio_rows,
         )
+
+    def _begin_dit_use(self, is_ref2va: bool, batch: Req) -> Any:
+        """The DiT this request runs, placed by the residency manager when there
+        is one: a fl2va+ref2va server runs ref2va requests (the ones with
+        reference rows) on transformer_2."""
+        name = (
+            "transformer_2"
+            if is_ref2va and self.transformer_2 is not None
+            else "transformer"
+        )
+        transformer = getattr(self, name)
+        manager = self._component_residency_manager
+        if manager is None:
+            return transformer
+        if self.transformer_2 is None:
+            self._manage_dit_use_site(transformer, name, batch)
+            return transformer
+        # The DiT that ran last may still be on the GPU. Release the one this
+        # request does not run before placing the other: both may not fit.
+        idle = "transformer" if name == "transformer_2" else "transformer_2"
+        self.finish_unused_declared_component(
+            component_name=idle, module=getattr(self, idle)
+        )
+        manager.begin_use(
+            self._declared_component_use(component_name=name), module=transformer
+        )
+        return transformer
 
     def _run_image_loop(self, batch: Req, plan: Any, server_args: ServerArgs) -> None:
         """Run the image loop over the published latent and reference rows."""
@@ -1035,8 +1129,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     model=transformer,
                     model_forward=partial(
                         self._forward_dit,
+                        packed_branches={},
+                        capture_device_varlen=server_args.num_gpus == 1,
                         batch=batch,
                         attn_metadata=positive.attn_metadata,
+                        num_steps=len(batch.sigmas) - 1,
                     ),
                     positive=positive,
                     initial_video_rows=initial_rows,
@@ -1084,8 +1181,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         step_index: int,
         *,
         batch: Req,
-        attn_metadata: CubeSparseAttentionMetadata | None = None,
+        packed_branches=None,
+        capture_device_varlen: bool = False,
+        capture_bcg: bool = False,
+        attn_metadata: AscendFAMetadata | CubeSparseAttentionMetadata | None = None,
         build_vsa_h3_step_metadata: Callable[[int], Any] | None = None,
+        num_steps: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route the custom full loop through the native denoising runner."""
 
@@ -1093,6 +1194,27 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             set_forward_context,
         )
 
+        # H3 resolves transformer component overrides lazily, so its actual
+        # model backend may differ from the stage's default metadata backend.
+        backend_enum = getattr(model, "_resolved_attention_backend", None)
+        if not isinstance(backend_enum, AttentionBackendEnum):
+            backend = getattr(self, "attn_backend", None)
+            backend_enum = backend.get_enum() if backend is not None else None
+        if backend_enum == AttentionBackendEnum.ASCEND_SPARSE_ATTN:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_sparse_attn import (
+                AscendSparseAttentionMetadataBuilder,
+            )
+
+            packed_params = call_kwargs["packed_seq_params"]
+            metadata_kwargs = dict(self.server_args.attention_backend_config or {})
+            metadata_kwargs.update(
+                current_timestep=step_index,
+                num_steps=num_steps,
+                video_spans=packed_params.get("video_spans"),
+            )
+            attn_metadata = AscendSparseAttentionMetadataBuilder().build(
+                **metadata_kwargs
+            )
         with set_forward_context(
             current_timestep=step_index,
             attn_metadata=(
@@ -1105,7 +1227,40 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             runner = self._maybe_get_bcg_runner(model)
             if runner is None:
                 return model(**call_kwargs)
-            return self._bcg_run(runner, call_kwargs, model)
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+                H3PackedPrompt,
+                live_packed_prompt,
+                supports_live_packed_bounds,
+            )
+
+            if packed_branches is None:
+                packed_branches = {}
+            psp = call_kwargs["packed_seq_params"]
+            key = id(psp)
+            if key not in packed_branches:
+                if not supports_live_packed_bounds(call_kwargs):
+                    return model(**call_kwargs)
+                text_len = call_kwargs["prompt_embeds"].shape[0]
+                packed_branches[key] = H3PackedPrompt(
+                    tuple(psp["cu_seqlens_q_host"]),
+                    text_len,
+                    capture_varlen=capture_device_varlen
+                    and model.supports_graph_device_varlen(),
+                    source_psp=psp,
+                )
+            # timestep bits are eager memo keys, not graph specialization inputs
+            call_kwargs.pop("adaln_timestep_bits", None)
+            token = live_packed_prompt.set(packed_branches[key])
+            try:
+                if capture_bcg and not self._bcg_is_warmup():
+                    padded = self._bcg_pad_prompt_kwargs(
+                        call_kwargs, current_model=model
+                    )
+                    runner.capture(**padded)
+                    return runner(**padded)
+                return self._bcg_run(runner, call_kwargs, model)
+            finally:
+                live_packed_prompt.reset(token)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         # The base checks minus batch.generator: H3 seeds its own noise from
@@ -1372,7 +1527,7 @@ def _build_packed_layout(
     emb: Mapping[str, Any],
     *,
     include_video_pos: bool = False,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, Any]:
     """Build the per-task packed layout for the positive branch."""
 
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (

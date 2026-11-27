@@ -20,10 +20,12 @@ from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.flint import FlintConfig
+from sglang.srt.configs.gigachat4 import GigaChat4Config
 from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.configs.hy_v4 import HYV4Config
+from sglang.srt.configs.hy_v4_flash import HYV4FlashConfig, HYV4FlashTextConfig
 from sglang.srt.configs.inkling import (
     InklingAudioConfig,
     InklingMMConfig,
@@ -155,9 +157,12 @@ __all__ = [
     "Dots3Config",
     "FalconH1Config",
     "FalconMambaConfig",
+    "GigaChat4Config",
     "GigaChat35Config",
     "GraniteMoeHybridConfig",
     "HYV4Config",
+    "HYV4FlashConfig",
+    "HYV4FlashTextConfig",
     "MambaConfig",
     "Mamba2Config",
     "Lfm2Config",

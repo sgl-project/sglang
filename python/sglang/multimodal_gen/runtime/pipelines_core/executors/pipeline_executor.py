@@ -17,7 +17,13 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
     conditioning_cache_group,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed import get_world_rank
+from sglang.multimodal_gen.runtime.distributed import (
+    get_replica_group,
+    get_world_rank,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+    IPC_A2A_MULTI,
+)
 from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     get_progress_reporter,
 )
@@ -28,6 +34,10 @@ from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.device_errors import (
+    is_out_of_memory_error,
+    is_unrecoverable_device_error,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.profiler import (
@@ -40,6 +50,33 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 
 logger = init_logger(__name__)
+
+
+def _forward_error_ends_the_replica(error: Exception) -> bool:
+    """Errors the worker turns into an exit instead of a request error.
+
+    An error output would let this rank take the next request while the other
+    ranks are still inside the failed forward's collectives, or keep serving
+    from a device that can no longer be trusted.
+    """
+    if is_out_of_memory_error(error):
+        return get_replica_group().world_size > 1
+    # Only RuntimeError messages are matched: a request error may quote the
+    # caller's text (e.g. a Cosmos3 domain name) that contains a marker.
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        message = str(error)
+        if "out of memory" not in message.lower() and (
+            isinstance(error, torch.AcceleratorError)
+            or (
+                isinstance(error, RuntimeError)
+                and is_unrecoverable_device_error(message)
+            )
+        ):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
 
 
 class PipelineExecutor(ABC):
@@ -146,6 +183,15 @@ class PipelineExecutor(ABC):
         return payload
 
     @staticmethod
+    def _check_peer_waits(stage: "PipelineStage") -> None:
+        """Fail the request if a Ulysses peer wait expired in a denoising stage,
+        before anything decodes or saves its incomplete output. A group
+        collective: call it where every rank arrives, whichever ranks ran the
+        stage."""
+        if stage.role_affinity == RoleType.DENOISER:
+            IPC_A2A_MULTI.check_timeout()
+
+    @staticmethod
     def _step_stage_profiler() -> None:
         profiler = SGLDiffusionProfiler.get_instance()
         if profiler:
@@ -157,8 +203,7 @@ class PipelineExecutor(ABC):
         batch: Req,
         server_args: ServerArgs,
     ) -> OutputBatch:
-
-        with self.profile_execution(batch, dump_rank=0):
+        with self.profile_execution(batch, dump_rank=None):
             with current_platform.inference_mode():
                 batch = self.execute(stages, batch, server_args)
 
@@ -296,6 +341,8 @@ class PipelineExecutor(ABC):
                         error=str(e), cancelled=True, metrics=batch.metrics
                     )
                 except Exception as e:
+                    if _forward_error_ends_the_replica(e):
+                        raise
                     logger.error(
                         "Sequential DiT/VAE inference failed for request %s: %s",
                         batch.request_id,
@@ -335,5 +382,8 @@ class PipelineExecutor(ABC):
         )
         try:
             yield
-        finally:
+        except BaseException:
+            profiler.stop_on_error(dump_rank=dump_rank)
+            raise
+        else:
             profiler.stop(dump_rank=dump_rank)
