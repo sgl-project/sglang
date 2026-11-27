@@ -432,6 +432,11 @@ class PipelineConfig:
     def slice_noise_pred(self, noise, latents):
         return noise
 
+    def batch_cfg_branch_kwargs(self, cond_kwargs, uncond_kwargs):
+        """DiT kwargs that run the [cond, uncond] CFG branches as one batch-2
+        forward, or None when the model cannot batch them."""
+        return None
+
     def adjust_num_frames(self, num_frames, *, log_adjustment: bool = True):
         return num_frames
 
