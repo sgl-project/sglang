@@ -784,17 +784,17 @@ class AiterAttnBackend(AttentionBackend):
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
-        # DSpark block-verification has no custom_mask. Cache this so the
-        # CUDA-graph verify path uses None at both capture and replay (see below).
+        # DSpark verify never has a custom_mask (block verification on or off).
+        # Cache this so the CUDA-graph verify path uses None at both capture and
+        # replay (see below).
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         _spec = get_spec()
-        self._dspark_block_verify = bool(
+        self._dspark_verify = bool(
             _spec is not None
             and SpeculativeAlgorithm.from_string(
                 _spec.speculative_algorithm
             ).is_dspark()
-            and getattr(_spec, "speculative_use_block_verification", False)
         )
         self.topk = topk
         self.num_head = (
@@ -4390,10 +4390,10 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 else:
                     # Key the mask on config, not the per-call tensor: the capture
-                    # dummy is non-None but the real DSpark block-verify mask is
+                    # dummy is non-None but the real DSpark verify mask is
                     # None, so keying off the tensor would bake USE_CUSTOM_MASK=True
                     # at capture and read a stale buffer at replay. Both None here.
-                    if self._dspark_block_verify or spec_info.custom_mask is None:
+                    if self._dspark_verify or spec_info.custom_mask is None:
                         custom_mask = None
                     else:
                         custom_mask = self.cuda_graph_custom_mask
