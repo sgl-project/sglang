@@ -395,7 +395,7 @@ async fn dispatch<T: Transport>(
 /// request with no bootstrap fields is then plain to prefill, which samples
 /// its one token, finishes it and caches the prompt.
 fn prefill_answers_alone(ctx: &AppContext, request: &PreparedRequest, prefill: &Worker) -> bool {
-    ctx.config.proxy.prefill_only_for_one_token
+    ctx.config.proxy.one_token_on_prefill_only
         && prefill.mode() == WorkerMode::Prefill
         && prefill.prefill_answers_alone()
         && request.wants_at_most_one_token()
@@ -1224,7 +1224,7 @@ mod tests {
         let capable = worker(WorkerMode::Prefill, true);
         assert!(!prefill_answers_alone(&ctx, &request, &capable));
 
-        ctx.config.proxy.prefill_only_for_one_token = true;
+        ctx.config.proxy.one_token_on_prefill_only = true;
         assert!(prefill_answers_alone(&ctx, &request, &capable));
         assert!(!prefill_answers_alone(
             &ctx,

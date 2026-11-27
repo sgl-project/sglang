@@ -403,7 +403,7 @@ async fn pd_mode_disconnect_aborts_decode_but_not_prefill() {
 
 mod reliability;
 
-// --- --pd-prefill-only-for-one-token -------------------------------------------
+// --- --pd-one-token-on-prefill-only -------------------------------------------
 
 /// A PD router with the flag on; `prefill_answers_alone` is what the prefill
 /// engine's `/server_info` reports.
@@ -413,7 +413,7 @@ fn build_single_token_ctx(
     prefill_answers_alone: bool,
 ) -> Arc<AppContext> {
     let mut cfg = config();
-    cfg.proxy.prefill_only_for_one_token = true;
+    cfg.proxy.one_token_on_prefill_only = true;
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     let profile = sgl_router::workers::worker::EngineProfile {

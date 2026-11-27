@@ -187,7 +187,7 @@ pub struct ServerArgs {
     /// decode and no KV transfer. A prefill whose /server_info does not report
     /// `prefill_answers_alone` keeps the normal prefill and decode path.
     #[arg(long)]
-    pub pd_prefill_only_for_one_token: bool,
+    pub pd_one_token_on_prefill_only: bool,
 
     /// PD: at most N requests per prefill DP rank go to decode before their
     /// first token; the rest wait and get their decode DP rank when sent.
@@ -741,7 +741,7 @@ impl Cli {
                 max_backoff_ms: self.server.retry_max_backoff_ms,
                 decode_dispatch_limit: self.server.decode_dispatch_limit,
                 stream_after_prefill: self.server.pd_stream_after_prefill,
-                prefill_only_for_one_token: self.server.pd_prefill_only_for_one_token,
+                one_token_on_prefill_only: self.server.pd_one_token_on_prefill_only,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,

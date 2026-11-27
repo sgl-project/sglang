@@ -37,7 +37,7 @@ sgl-router --model-id qwen3 --service-discovery \
 
 A PD prefill engine samples the first output token itself, so a request whose
 whole output is that token (prompt scoring, classification, a yes/no judge)
-does not need decode. With `--pd-prefill-only-for-one-token`, the router sends
+does not need decode. With `--pd-one-token-on-prefill-only`, the router sends
 a chat, completions or `/generate` request for at most one token, one sample and
 one prompt to the chosen prefill worker alone, with no bootstrap fields. Decode
 reserves no KV for it and no KV is transferred; the prompt still enters that

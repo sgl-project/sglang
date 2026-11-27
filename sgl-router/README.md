@@ -399,7 +399,7 @@ unset fields inherit the CLI flags. See
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
   decode only within the same engine version; see
   [PD version groups](REFERENCE.md#pd-version-groups).
-- **Single-token requests on prefill**: `--pd-prefill-only-for-one-token`
+- **Single-token requests on prefill**: `--pd-one-token-on-prefill-only`
   answers a request for at most one token on the prefill engine alone, with no
   decode and no KV transfer; see
   [single-token requests](REFERENCE.md#single-token-requests-on-prefill).
