@@ -236,7 +236,7 @@ def _decode_backend(prompts, page_state, coord_state, bt, *, graph: bool):
     b.buf_width = 4
     b.num_layers = 0
     b.image_bucket_constraint = True
-    b.max_context_len = WIDTH * BS
+    b.model_config = SimpleNamespace(context_len=WIDTH * BS)
     b.max_block_static = WIDTH
     b.model_dtype = torch.float32
     b.page_state, b.coord_state = page_state, coord_state
