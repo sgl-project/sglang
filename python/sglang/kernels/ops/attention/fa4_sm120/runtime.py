@@ -622,6 +622,7 @@ class Sm120ForwardPolicy:
         window_size_right: Optional[int],
         pack_gqa: bool,
         paged_kv: bool,
+        is_plain_packed_self_attention: bool = False,
     ) -> Sm120ForwardConfig:
         if has_bias:
             if max(head_dim, head_dim_v) > 128:
@@ -636,6 +637,7 @@ class Sm120ForwardPolicy:
             tile_m, tile_n = FlashAttentionForwardSm120.get_fwd_tile_size(
                 head_dim,
                 head_dim_v,
+                is_plain_packed_self_attention=is_plain_packed_self_attention,
                 total_q_rows=total_q_rows,
                 num_sms=num_sms,
                 num_batch=num_batch,
@@ -1060,6 +1062,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         return (
             "basic-varlen",
             arch,
+            cu_seqlens_q is cu_seqlens_k,
             tuple(_tensor_signature(t) for t in (q, k, v, cu_seqlens_q, cu_seqlens_k)),
             sink_signature,
             max_seqlen_q,

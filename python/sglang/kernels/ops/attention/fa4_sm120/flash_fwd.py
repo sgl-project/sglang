@@ -414,6 +414,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         window_size_right: int | None = None,
         pack_gqa: bool = False,
         paged_kv: bool = False,
+        is_plain_packed_self_attention: bool = False,
     ) -> tuple[int, int]:
         """Select an SM120 tile that fits the architecture's 99 KB SMEM."""
         smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
@@ -492,6 +493,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 )
         elif (
             shape == (128, 128)
+            and is_plain_packed_self_attention
             and num_sms == 188
             and num_head_kv == 56
             and qhead_per_kvhead == 1

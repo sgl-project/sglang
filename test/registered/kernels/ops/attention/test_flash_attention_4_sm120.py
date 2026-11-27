@@ -35,16 +35,19 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 1
 
 
 @pytest.mark.parametrize(
-    ("length", "padding", "num_sms", "expected_m"),
+    ("length", "padding", "num_sms", "shared_offsets", "expected_m"),
     [
-        (6177, 31, 188, 128),
-        (6205, 19, 188, 128),
-        (3329, 31, 188, 64),  # Eight long CTAs in the final wide-tile wave.
-        (6177, 128, 188, 64),
-        (6177, 31, 110, 64),
+        (6177, 31, 188, True, 128),
+        (6205, 19, 188, True, 128),
+        (3329, 31, 188, True, 64),  # Eight long CTAs in the final wide-tile wave.
+        (6177, 128, 188, True, 64),
+        (6177, 31, 110, True, 64),
+        (6177, 31, 188, False, 64),
     ],
 )
-def test_sm120_packed_global_mha_query_tile(length, padding, num_sms, expected_m):
+def test_sm120_packed_global_mha_query_tile(
+    length, padding, num_sms, shared_offsets, expected_m
+):
     from sglang.kernels.ops.attention.fa4_sm120.flash_fwd import (
         FlashAttentionForwardSm120,
     )
@@ -57,6 +60,7 @@ def test_sm120_packed_global_mha_query_tile(length, padding, num_sms, expected_m
         qhead_per_kvhead=1,
         seqlen_q=length,
         seqlen_k=length,
+        is_plain_packed_self_attention=shared_offsets,
         total_q_rows=(length + padding) * 56,
         num_sms=num_sms,
     ) == (expected_m, 64)
@@ -1742,20 +1746,28 @@ def test_sm120_forward_only_varlen_cache_is_pack_order_independent(monkeypatch):
             for start, end in zip(alternate_offsets[:-1], alternate_offsets[1:])
         ]
     )
-    alternate_output = flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q=alternate_cu_seqlens,
-        cu_seqlens_k=alternate_cu_seqlens,
-        max_seqlen_q=max(alternate_lengths),
-        max_seqlen_k=max(alternate_lengths),
-        softmax_scale=head_dim**-0.5,
-        causal=True,
-        pack_gqa=False,
-    )
-    assert cache_hits[-1]
-    _assert_attention_close(alternate_output, alternate_reference)
+    # Equal shapes can represent self-attention or differently packed Q and K.
+    separate_offsets = alternate_cu_seqlens.clone()
+    for cu_k, expected_hit in (
+        (alternate_cu_seqlens, True),
+        (separate_offsets, False),
+        (separate_offsets, True),
+        (alternate_cu_seqlens, True),
+    ):
+        alternate_output = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=alternate_cu_seqlens,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max(alternate_lengths),
+            max_seqlen_k=max(alternate_lengths),
+            softmax_scale=head_dim**-0.5,
+            causal=True,
+            pack_gqa=False,
+        )
+        assert cache_hits[-1] == expected_hit
+        _assert_attention_close(alternate_output, alternate_reference)
 
 
 def test_sm120_varlen_padding_ctas_are_inert_across_tile_specializations():
