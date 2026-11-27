@@ -44,25 +44,25 @@ Use a Linux host with the Ascend driver and a compatible CANN / TorchNPU environ
 <Tab title="A3">
 
 ```bash Command
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-glm5.3-flash
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
 ```
 
-Run the following setup before copying the generated command (CANN 9.1.0). CPU tuning requires host privileges.
+Run the following setup before copying the generated command (CANN 9.2.0). CPU tuning requires host privileges.
 
 ```bash Command
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/cann-9.2.0/opp/vendors/customize/bin/set_env.bash
 ```
 
 </Tab>
 <Tab title="950PR/DT series">
 
-Use a CANN 9.1.0 SGLang image with the custom operators and MemFabric runtime required by the tutorial; PD mode also requires DP-attention support. The tutorial does not specify a 950PR/DT series image tag.
+Use a CANN 9.2.0 SGLang image with the custom operators and MemFabric runtime required by the tutorial; PD mode also requires DP-attention support.
 
 ```bash Command
-NPU_IMAGE="<your-compatible-950pr-dt-series-image>"
+NPU_IMAGE="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B051"
 docker pull "$NPU_IMAGE"
 ```
 

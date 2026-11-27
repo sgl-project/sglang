@@ -372,7 +372,6 @@ class IndexerKPool(MultiPlatformOp):
         slot_k,
         slot_score,
         write_locs,
-        forward_batch,
         layer_id,
         write_mask=None,
         return_compressed: bool = False,
@@ -413,7 +412,7 @@ class IndexerKPool(MultiPlatformOp):
 
     @staticmethod
     def _write_returned_compressed_pooled_index_cache(
-        forward_batch, layer_id, write_locs, k_fp8, k_scale
+        layer_id, write_locs, k_fp8, k_scale
     ):
         if k_fp8.shape[0] == 0:
             return
@@ -634,7 +633,6 @@ class IndexerKPool(MultiPlatformOp):
                     slot_k,
                     slot_score,
                     write_locs,
-                    forward_batch,
                     layer_id,
                     return_compressed=use_returned_compressed,
                     write_cache=write_cache,
@@ -1412,7 +1410,6 @@ class IndexerKPool(MultiPlatformOp):
                     )
                     with torch.cuda.stream(self.alt_stream):
                         self._write_returned_compressed_pooled_index_cache(
-                            forward_batch,
                             layer_id,
                             write_locs,
                             write_k_fp8,
@@ -1539,7 +1536,6 @@ class IndexerKPool(MultiPlatformOp):
             if pool_seq_len > 0 and deferred_cache_write is not None:
                 write_locs, curr_k_fp8, curr_k_scale = deferred_cache_write
                 self._write_returned_compressed_pooled_index_cache(
-                    forward_batch,
                     layer_id,
                     write_locs,
                     curr_k_fp8,
@@ -1573,14 +1569,6 @@ class IndexerKPool(MultiPlatformOp):
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
-        if metadata.attn_metadata.kpool_extend_plan is not None:
-            return self._get_topk_ragged_kpool_plan(
-                forward_batch,
-                layer_id,
-                q_fp8,
-                weights,
-                metadata,
-            )
         return self._get_topk_ragged_kpool(
             forward_batch,
             layer_id,
@@ -1596,7 +1584,6 @@ class IndexerKPool(MultiPlatformOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
-        act_quant,
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
@@ -1634,7 +1621,6 @@ class IndexerKPool(MultiPlatformOp):
             positions,
             forward_batch,
             layer_id,
-            act_quant=None,
             metadata=metadata,
             return_indices=False,
         )
@@ -1876,7 +1862,6 @@ class IndexerKPool(MultiPlatformOp):
                 positions,
                 forward_batch,
                 layer_id,
-                act_quant,
                 metadata,
                 return_indices,
             )
