@@ -609,10 +609,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return total
 
     def __init__(
-        self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
+        self, storage_config: HiCacheStorageConfig, mem_pool: HostKVCache = None
     ):
         MooncakeBaseStore.__init__(self)
-        self.dcp_size = storage_config.dcp_size if storage_config is not None else 1
+        self.dcp_size = storage_config.dcp_size
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
@@ -625,11 +625,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
             self.config = self._load_config(storage_config)
             self._validate_egm_store_pool(store_cls=MooncakeDistributedStore)
-            extra_config = (
-                getattr(storage_config, "extra_config", None)
-                if storage_config
-                else None
-            )
+            extra_config = storage_config.extra_config
             self.enable_group_semantics = bool(
                 extra_config.get("enable_group_semantics", False)
                 if extra_config
@@ -646,11 +642,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     "Mooncake package does not support ReplicateConfig.group_ids. "
                     "Falling back to the existing batch_put_from path."
                 )
-            rank_scale_factor = (
-                1
-                if storage_config is None
-                else (storage_config.tp_size * storage_config.pp_size)
-            )
+            rank_scale_factor = storage_config.tp_size * storage_config.pp_size
 
             per_rank_global_segment_size = (
                 self.config.global_segment_size // rank_scale_factor
@@ -662,7 +654,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             config_prefix_parts = []
             if extra_config and extra_config.get("extra_backend_tag") is not None:
                 config_prefix_parts.append(str(extra_config["extra_backend_tag"]))
-            if storage_config is not None and storage_config.model_name:
+            if storage_config.model_name:
                 model_name = "-".join(storage_config.model_name.split("/"))
                 config_prefix_parts.append(model_name)
             if self.dcp_size > 1:
@@ -685,14 +677,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if device_name and device_name.strip().startswith("{"):
                 try:
                     device_config = json.loads(device_name)
-                    if storage_config and hasattr(storage_config, "tp_rank"):
-                        tp_rank = storage_config.tp_rank
-                        # Try both integer and string keys since JSON parsing may convert keys
-                        device_name = device_config.get(tp_rank, "")
-                        if not device_name:
-                            device_name = device_config.get(str(tp_rank), "")
-                    else:
-                        device_name = ""
+                    tp_rank = storage_config.tp_rank
+                    # Try both integer and string keys since JSON parsing may convert keys
+                    device_name = device_config.get(tp_rank, "")
+                    if not device_name:
+                        device_name = device_config.get(str(tp_rank), "")
                 except (json.JSONDecodeError, AttributeError):
                     logger.warning(
                         f"Failed to parse device_name as JSON: {device_name}"
@@ -764,14 +753,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     # scan after a restart, and bucket files are opened with
                     # O_CREAT|O_TRUNC, so a filename collision truncates
                     # another rank's bucket. Give every rank a private subdir.
-                    ssd_offload_path = self.config.ssd_offload_path
-                    if storage_config is not None:
-                        ssd_offload_path = os.path.join(
-                            ssd_offload_path,
-                            f"rank_{storage_config.dp_rank}"
-                            f"_{storage_config.tp_rank}_{storage_config.pp_rank}"
-                            f"_{storage_config.attn_cp_rank}",
-                        )
+                    ssd_offload_path = os.path.join(
+                        self.config.ssd_offload_path,
+                        f"rank_{storage_config.dp_rank}"
+                        f"_{storage_config.tp_rank}_{storage_config.pp_rank}"
+                        f"_{storage_config.attn_cp_rank}",
+                    )
                     os.makedirs(ssd_offload_path, exist_ok=True)
                     setup_kwargs["ssd_offload_path"] = ssd_offload_path
                 if self.config.tenant_id != DEFAULT_TENANT_ID:
@@ -826,27 +813,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             logger.info("Mooncake store setup successfully.")
 
-            self.local_rank = (
-                storage_config.tp_rank if storage_config is not None else 0
-            )
+            self.local_rank = storage_config.tp_rank
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
-            self.enable_storage_metrics = False
-            if storage_config is not None:
-                self.is_mla_backend = storage_config.is_mla_model
-                self.pp_rank = storage_config.pp_rank
-                self.pp_size = storage_config.pp_size
-                self.attn_cp_rank = storage_config.attn_cp_rank
-                self.attn_cp_size = storage_config.attn_cp_size
-                self.enable_storage_metrics = storage_config.enable_storage_metrics
-            else:
-                self.is_mla_backend = False
-                self.local_rank = 0
-                self.pp_rank = 0
-                self.pp_size = 1
-                self.attn_cp_rank = 0
-                self.attn_cp_size = 1
+            self.is_mla_backend = storage_config.is_mla_model
+            self.pp_rank = storage_config.pp_rank
+            self.pp_size = storage_config.pp_size
+            self.attn_cp_rank = storage_config.attn_cp_rank
+            self.attn_cp_size = storage_config.attn_cp_size
+            self.enable_storage_metrics = storage_config.enable_storage_metrics
 
             self.enable_pp = self.pp_size > 1
             if self.enable_pp:
