@@ -1297,6 +1297,25 @@ def draft_kv_ring_row_pairs(
     return [a for a, _ in pairs], [b for _, b in pairs]
 
 
+def is_tp_head_owner(
+    *,
+    src_attn_tp_size: int,
+    dst_attn_tp_size: int,
+    local_tp_rank_in_group: int,
+    dst_tp_rank_in_group: int,
+) -> bool:
+    """Whether ``local_tp_rank_in_group`` owns any contiguous TP head slice for
+    ``dst_tp_rank_in_group`` (Mamba/KDA state or head-sliced draft KV)."""
+    if src_attn_tp_size == dst_attn_tp_size:
+        return local_tp_rank_in_group == dst_tp_rank_in_group
+    if src_attn_tp_size < dst_attn_tp_size:
+        return local_tp_rank_in_group == dst_tp_rank_in_group // (
+            dst_attn_tp_size // src_attn_tp_size
+        )
+    writers_per_decode = src_attn_tp_size // dst_attn_tp_size
+    return local_tp_rank_in_group // writers_per_decode == dst_tp_rank_in_group
+
+
 def compute_mamba_state_slice_blocks(
     src_dim: int,
     dst_dim: int,
@@ -1323,6 +1342,14 @@ def compute_mamba_state_slice_blocks(
     block per sub-block for conv_state; temporal_state and non-GDN states (when
     ``conv_shard_groups`` is None) keep the single contiguous slice.
     """
+    if not is_tp_head_owner(
+        src_attn_tp_size=src_attn_tp_size,
+        dst_attn_tp_size=dst_attn_tp_size,
+        local_tp_rank_in_group=local_tp_rank_in_group,
+        dst_tp_rank_in_group=dst_tp_rank_in_group,
+    ):
+        return []
+
     use_subdims = (
         conv_shard_groups is not None
         and sum(conv_shard_groups) == src_dim * src_attn_tp_size
@@ -1400,6 +1427,13 @@ def compute_mamba_state_slice_byte_blocks(
                 "Replicated Mamba state item lengths differ between prefill and "
                 f"decode: {src_item_len} != {dst_item_len}"
             )
+        if not is_tp_head_owner(
+            src_attn_tp_size=src_attn_tp_size,
+            dst_attn_tp_size=dst_attn_tp_size,
+            local_tp_rank_in_group=local_tp_rank_in_group,
+            dst_tp_rank_in_group=dst_tp_rank_in_group,
+        ):
+            return []
         if not should_send_replicated_state(
             src_attn_tp_size=src_attn_tp_size,
             dst_attn_tp_size=dst_attn_tp_size,

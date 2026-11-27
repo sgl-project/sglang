@@ -78,6 +78,7 @@ from sglang.srt.disaggregation.utils import (
     draft_kv_ring_row_pairs,
     filter_kv_indices_for_shard_rank,
     is_elided_entry,
+    is_tp_head_owner,
     resolve_dcp_dst_entry_indices,
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,
@@ -1918,17 +1919,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
             draft_rows_collapsed=draft_rows_collapsed,
+            src_dcp_size=self.dcp_size,
+            src_dcp_rank=self.dcp_rank,
+            src_draft_rows_collapsed=self.kv_args.draft_rows_dcp_collapsed,
         )
         if plan.empty():
             return 0
 
-        entry_copies = self._dcp_target_copies(
-            plan=plan,
-            pack_buffer=pack_buffer,
-            src_ptrs=src_kv_ptrs[:num_target],
-            token_bytes=dcp_token_item_lens[:num_target],
-            src_keys=src_keys[:num_target],
-            dst_keys=dst_keys[:num_target],
+        entry_copies = (
+            self._dcp_target_copies(
+                plan=plan,
+                pack_buffer=pack_buffer,
+                src_ptrs=src_kv_ptrs[:num_target],
+                token_bytes=dcp_token_item_lens[:num_target],
+                src_keys=src_keys[:num_target],
+                dst_keys=dst_keys[:num_target],
+            )
+            if plan.target_src_token_indices.size
+            else []
         )
         if dsa_index_k is not None and plan.target_src_token_indices.size:
             entry_copies += self._dsa_index_k_dcp_copies(
@@ -1951,6 +1959,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 token_bytes=dcp_token_item_lens,
                 dst_kv_item_lens=dst_kv_item_lens,
                 dst_dcp_size=dst_dcp_size,
+                dst_dcp_rank=dst_dcp_rank,
                 dst_tp_rank=dst_tp_rank,
                 dst_attn_tp_size=dst_attn_tp_size,
                 draft_rows_collapsed=draft_rows_collapsed,
@@ -1978,6 +1987,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     draft_slices = [
                         s for s in draft_slices if s.src_token_bytes < s.dst_token_bytes
                     ]
+
+        if not entry_copies and not draft_slices:
+            return 0
 
         def send_draft_slices(slices: List[_DcpDraftSlice]) -> int:
             batch_size = self.max_transfer_batch_indices
@@ -2083,6 +2095,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         token_bytes: Sequence[int],
         dst_kv_item_lens: Optional[List[int]],
         dst_dcp_size: int,
+        dst_dcp_rank: int = 0,
         dst_tp_rank: int,
         dst_attn_tp_size: Optional[int],
         draft_rows_collapsed: bool,
@@ -2104,6 +2117,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 plan.draft_src_token_indices, plan.draft_dst_token_indices
             )
         )
+        src_draft_collapsed = self.kv_args.draft_rows_dcp_collapsed
+        send_replicated = (
+            draft_rows_collapsed
+            or src_draft_collapsed
+            or self._should_send_replicated_dcp_draft(dst_dcp_size, dst_dcp_rank)
+        )
         copies, slices = [], []
         for entry in draft_entries:
             src_width = token_bytes[entry]
@@ -2116,6 +2135,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if remainder or dst_width <= 0:
                     raise ValueError("Invalid PD DCP draft destination token width")
             if src_width == dst_width:
+                if not send_replicated:
+                    continue
                 if pack_collapsed:
                     slices.append(
                         _DcpDraftSlice(
@@ -2151,11 +2172,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 raise ValueError(
                     "PD DCP draft head slicing requires destination TP size"
                 )
+            local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+            dst_tp_in_group = dst_tp_rank % dst_attn_tp_size
+            if not is_tp_head_owner(
+                src_attn_tp_size=self.attn_tp_size,
+                dst_attn_tp_size=dst_attn_tp_size,
+                local_tp_rank_in_group=local_tp_rank,
+                dst_tp_rank_in_group=dst_tp_in_group,
+            ):
+                continue
             src_span = src_width * self.attn_tp_size
             dst_span = dst_width * dst_attn_tp_size
-            src_rank = (self.kv_args.engine_rank % self.attn_tp_size) // max(
-                1, src_span // dst_span
-            )
+            src_rank = local_tp_rank // max(1, src_span // dst_span)
             dst_rank = dst_tp_rank // max(1, dst_span // src_span)
             slices.append(
                 _DcpDraftSlice(
@@ -2682,14 +2710,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if not self.is_hybrid_mla_backend:
             return skip_kv, skip_state
 
-        if info is not None and self.attn_tp_size > info.dst_attn_tp_size:
-            sub_rank = (self.kv_args.engine_rank % self.attn_tp_size) % (
-                self.attn_tp_size // info.dst_attn_tp_size
-            )
-            if sub_rank != 0:
-                skip_kv = True
-                # Hybrid-MLA KV is replicated across these source ranks, but
-                # TP-sharded state needs every rank for the aggregation path.
+        if info is not None and self._should_skip_duplicate_hybrid_mla_kv(
+            info.dst_attn_tp_size
+        ):
+            skip_kv = True
 
         return skip_kv, skip_state
 
@@ -2844,6 +2868,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         or rc
                     )
                 else:
+                    if (
+                        target_rank_registration_info is not None
+                        and not is_tp_head_owner(
+                            src_attn_tp_size=self.state_tp_size,
+                            dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                            local_tp_rank_in_group=(
+                                self.kv_args.engine_rank % self.state_tp_size
+                            ),
+                            dst_tp_rank_in_group=(
+                                target_rank_registration_info.dst_tp_rank
+                                % target_rank_registration_info.dst_attn_tp_size
+                            ),
+                        )
+                    ):
+                        continue
                     rc = (
                         self._send_mamba_state(
                             req,
@@ -3277,6 +3316,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 local_tp_rank_in_group=local_tp_rank_in_group,
                 conv_shard_groups=conv_shard_groups,
             )
+            if not blocks:
+                continue
             copies.append(
                 Copy(
                     src=src_keys[i],
@@ -3288,6 +3329,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
             )
 
+        if not copies:
+            return 0
         return self._transfer_copies(req.mooncake_session_id, copies)
 
     def _send_swa_state_slice(

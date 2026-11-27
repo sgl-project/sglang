@@ -1763,16 +1763,6 @@ class TestLoadBalanceMethod(unittest.TestCase):
             resolution_result(server_args, "load_balance_method"), "round_robin"
         )
 
-    def test_pd_prefill_dcp_warns_about_performance(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="prefill",
-            dcp_size=4,
-        )
-        with self.assertLogs(pd_disaggregation_hook.logger, level="WARNING") as logs:
-            handle_pd_disaggregation(server_args)
-        self.assertIn("without improving prefill performance", "\n".join(logs.output))
-
     def test_pd_decode_dcp_disables_radix_cache(self):
         server_args = self._load_balance_args(
             disaggregation_mode="decode",

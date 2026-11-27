@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     is_elided_entry,
+    is_tp_head_owner,
     resolve_dcp_dst_entry_indices,
     slice_dsa_tail_dst_ptrs_for_pp,
 )
@@ -1909,40 +1910,52 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_xfer_handle is None:
                             if is_dcp_transfer:
-                                pack_buffer = (
-                                    self._dcp_pack_buffers[worker_index]
-                                    if self._dcp_pack_buffers
-                                    else None
-                                )
-                                if kv_chunk.num_kv_tokens is None:
-                                    raise ValueError(
-                                        "PD DCP transfer requires num_kv_tokens"
+                                if not self._should_skip_duplicate_hybrid_mla_kv(
+                                    decode_tp_size
+                                ):
+                                    pack_buffer = (
+                                        self._dcp_pack_buffers[worker_index]
+                                        if self._dcp_pack_buffers
+                                        else None
                                     )
-                                plan = build_dcp_token_transfer_plan(
-                                    src_prefill_kv_indices,
-                                    chunked_dst_kv_indice,
-                                    physical_page_size=self.kv_args.page_size,
-                                    dcp_size=dst_info.dst_dcp_size,
-                                    dcp_rank=dst_info.dst_dcp_rank,
-                                    src_page_offset=(kv_chunk.index_slice.start or 0),
-                                    decode_prefix_len=req.decode_prefix_len or 0,
-                                    num_kv_tokens=kv_chunk.num_kv_tokens,
-                                    draft_rows_collapsed=dst_info.dst_draft_rows_dcp_collapsed,
-                                )
-                                packed_src = self._pack_dcp_rank_once(
-                                    pack_buffer,
-                                    dst_info,
-                                    plan.target_src_token_indices,
-                                    packed_source_by_dcp_rank,
-                                )
-                                handles.extend(
-                                    self.send_kvcache_dcp(
-                                        req.agent_name,
+                                    if kv_chunk.num_kv_tokens is None:
+                                        raise ValueError(
+                                            "PD DCP transfer requires num_kv_tokens"
+                                        )
+                                    plan = build_dcp_token_transfer_plan(
+                                        src_prefill_kv_indices,
+                                        chunked_dst_kv_indice,
+                                        physical_page_size=self.kv_args.page_size,
+                                        dcp_size=dst_info.dst_dcp_size,
+                                        dcp_rank=dst_info.dst_dcp_rank,
+                                        src_page_offset=(
+                                            kv_chunk.index_slice.start or 0
+                                        ),
+                                        decode_prefix_len=req.decode_prefix_len or 0,
+                                        num_kv_tokens=kv_chunk.num_kv_tokens,
+                                        draft_rows_collapsed=dst_info.dst_draft_rows_dcp_collapsed,
+                                        src_dcp_size=self.dcp_size,
+                                        src_dcp_rank=self.dcp_rank,
+                                        src_draft_rows_collapsed=self.kv_args.draft_rows_dcp_collapsed,
+                                        send_replicated_draft=self._should_send_replicated_dcp_draft(
+                                            dst_info.dst_dcp_size,
+                                            dst_info.dst_dcp_rank,
+                                        ),
+                                    )
+                                    packed_src = self._pack_dcp_rank_once(
+                                        pack_buffer,
                                         dst_info,
-                                        plan,
-                                        packed_src,
+                                        plan.target_src_token_indices,
+                                        packed_source_by_dcp_rank,
                                     )
-                                )
+                                    handles.extend(
+                                        self.send_kvcache_dcp(
+                                            req.agent_name,
+                                            dst_info,
+                                            plan,
+                                            packed_src,
+                                        )
+                                    )
                             elif (
                                 self.is_mla_backend
                                 or self.is_hybrid_mla_backend
@@ -3228,6 +3241,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 src_addrs.append((src_addr, bytes_to_send, self.kv_args.gpu_id))
                 dst_addrs.append((dst_addr, bytes_to_send, dst_gpu_id))
 
+        if not src_addrs:
+            return None
+
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
 
@@ -3405,6 +3421,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         dst_layer_ids=dst_lids,
                     )
                 else:
+                    if not is_tp_head_owner(
+                        src_attn_tp_size=self.state_tp_size,
+                        dst_attn_tp_size=decode_tp_size,
+                        local_tp_rank_in_group=(
+                            self.kv_args.engine_rank % self.state_tp_size
+                        ),
+                        dst_tp_rank_in_group=decode_tp_rank % decode_tp_size,
+                    ):
+                        continue
                     h = self._send_mamba_state(
                         peer_name,
                         src_indices,

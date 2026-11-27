@@ -1203,8 +1203,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             max_prefix_len=max_prefix_len,
         )
         req.lock = self.tree_cache.lock(result.last_device_node)
+        prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
+        prefix_align = (
+            self.kv_manager.kv_args.page_size * prefill_info.dcp_size
+            if prefill_info is not None
+            and prefill_info.dcp_size > self.kv_manager.dcp_size
+            else 1
+        )
         return self._build_decode_prefix_match(
-            req, result, max_prefix_len=max_prefix_len
+            req, result, max_prefix_len=max_prefix_len, prefix_align=prefix_align
         )
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:

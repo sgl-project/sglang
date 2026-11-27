@@ -408,6 +408,7 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                         kv_layer_ids=[47, 93, 93],
                         kv_data_ptrs=[10000, 100000, 200000],
                         num_draft_entries=2,
+                        draft_rows_dcp_collapsed=False,
                         engine_rank=src_rank + 2 * src_tp,
                     ),
                     attn_tp_size=src_tp,
@@ -523,6 +524,7 @@ class TestDcpCollapsedDraftPack(CustomTestCase):
                 kv_layer_ids=[],
                 kv_data_ptrs=[10000, 20000],
                 num_draft_entries=1,
+                draft_rows_dcp_collapsed=False,
                 engine_rank=0,
             ),
             attn_tp_size=1,
@@ -627,6 +629,7 @@ class TestDcpDsaIndexKTransfer(unittest.TestCase):
                         kv_layer_ids=[],
                         kv_data_ptrs=[10000],
                         num_draft_entries=0,
+                        draft_rows_dcp_collapsed=False,
                         engine_rank=0,
                         dsa_index_k_token_bytes=(value_bytes, scale_bytes),
                         state_types=[StateType.DSA],
@@ -687,7 +690,11 @@ class TestDcpPackLifetime(CustomTestCase):
             enable_custom_mem_pool=True
         )
         manager.kv_args = SimpleNamespace(
-            page_size=1, kv_layer_ids=[], kv_data_ptrs=[1000, 2000], num_draft_entries=0
+            page_size=1,
+            kv_layer_ids=[],
+            kv_data_ptrs=[1000, 2000],
+            num_draft_entries=0,
+            draft_rows_dcp_collapsed=False,
         )
         source = np.array([11], dtype=np.uint8)
         observed = []

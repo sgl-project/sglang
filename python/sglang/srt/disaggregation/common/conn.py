@@ -203,6 +203,7 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    dcp_size: int = 1
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     spec_kv_layout: Optional[dict] = None
@@ -226,9 +227,11 @@ class PrefillServerInfo:
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
     target_tp_ranks: Optional[List[int]] = None
+    real_tp_ranks: Optional[List[int]] = None
     target_cp_ranks: Optional[List[int]] = None
     target_pp_ranks: Optional[List[int]] = None
     required_dst_info_num: Optional[int] = None
+    required_dst_info_num_by_tp: Optional[Dict[int, int]] = None
     required_prefill_response_num: Optional[int] = None
 
     def __post_init__(self):
@@ -236,6 +239,7 @@ class PrefillServerInfo:
         self.attn_cp_size = int(self.attn_cp_size)
         self.dp_size = int(self.dp_size)
         self.pp_size = int(self.pp_size)
+        self.dcp_size = int(self.dcp_size)
         self.page_size = int(self.page_size) if self.page_size is not None else None
         self.kv_cache_dtype = (
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
@@ -408,6 +412,8 @@ class CommonKVManager(BaseKVManager):
     # shard group. Each rank owns a subset of logical KV pages.
     kv_shard_rank: int = 0
     kv_shard_size: int = 1
+    dcp_size: int = 1
+    dcp_rank: int = 0
     # QSA prefill KV sharding under CP-TP group sharing: decode pulls KV pages from
     # every CP rank, but GDN/QSA/PLE state and aux only from its rank-matched
     # one (see _is_request_peer).
@@ -703,22 +709,41 @@ class CommonKVManager(BaseKVManager):
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self.dcp_size == dst_dcp_size:
             if self.dcp_rank != dst_dcp_rank:
+                # A hybrid-MLA state-only peer gets no KV rows from the plan.
+                if self.is_hybrid_mla_backend and self.dcp_size > 1:
+                    return True
                 raise RuntimeError(
                     "PD peers must connect matching DCP ranks, got "
                     f"prefill={self.dcp_rank}, decode={dst_dcp_rank}"
                 )
             return False
 
-        if (
-            self.dcp_size == 1
-            and dst_dcp_size > 1
-            and (self.is_mla_backend or self.is_hybrid_mla_backend)
+        if (self.is_mla_backend or self.is_hybrid_mla_backend) and (
+            dst_dcp_size % self.dcp_size == 0 or self.dcp_size % dst_dcp_size == 0
         ):
             return True
 
         raise RuntimeError(
             f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
         )
+
+    def _should_send_replicated_dcp_draft(
+        self, dst_dcp_size: int, dst_dcp_rank: int
+    ) -> bool:
+        """Elect a single prefill DCP rank to write replicated draft KV."""
+        if self.dcp_size <= dst_dcp_size:
+            return dst_dcp_rank % self.dcp_size == self.dcp_rank
+        return self.dcp_rank == dst_dcp_rank
+
+    def _should_skip_duplicate_hybrid_mla_kv(self, dst_attn_tp_size: int) -> bool:
+        """Under hybrid-MLA aggregation, skip duplicate KV replicas while keeping
+        every distinct prefill DCP shard."""
+        if not self.is_hybrid_mla_backend or self.attn_tp_size <= dst_attn_tp_size:
+            return False
+        sub_rank = (self.kv_args.engine_rank % self.attn_tp_size) % (
+            self.attn_tp_size // dst_attn_tp_size
+        )
+        return sub_rank // self.dcp_size != 0
 
     def prepare_dcp_token_item_lens(
         self,
@@ -735,8 +760,18 @@ class CommonKVManager(BaseKVManager):
                 f"prefill entry: src={num_entries} (draft={num_draft}), "
                 f"dst={len(dst_page_item_lens)}"
             )
+        src_draft_collapsed = self.kv_args.draft_rows_dcp_collapsed
         src_token_lens = [
-            item_len // page_size for item_len in self.kv_args.kv_item_lens
+            item_len
+            // (
+                page_size
+                * (
+                    self.dcp_size
+                    if i >= num_entries - num_draft and not src_draft_collapsed
+                    else 1
+                )
+            )
+            for i, item_len in enumerate(self.kv_args.kv_item_lens)
         ]
         for i, dst_item_len in enumerate(dst_page_item_lens):
             if dst_item_len is None:
@@ -769,7 +804,7 @@ class CommonKVManager(BaseKVManager):
         from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
 
         max_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
-        max_tokens = ceil_align(max_tokens, self.kv_args.page_size)
+        max_tokens = ceil_align(max_tokens, self.kv_args.page_size * self.dcp_size)
         self._dcp_pack_buffers = init_dcp_pack_buffers(
             self._register_staging_memory,
             self.kv_args,
@@ -1724,20 +1759,24 @@ class CommonKVManager(BaseKVManager):
                     f"state types {[st.value for st in block_scale_states]}."
                 )
 
-        if self.dcp_size > 1:
+        if self.dcp_size > 1 or info.dcp_size > 1:
             if not (self.is_mla_backend or self.is_hybrid_mla_backend):
+                raise RuntimeError("PD DCP requires an MLA or hybrid-MLA KV pool.")
+            if info.dcp_size != self.dcp_size and (
+                self.dcp_size % info.dcp_size != 0
+                and info.dcp_size % self.dcp_size != 0
+            ):
                 raise RuntimeError(
-                    "PD decode DCP requires an MLA or hybrid-MLA KV pool."
+                    f"Unsupported PD DCP topology: {info.dcp_size} -> {self.dcp_size}"
                 )
             if info.attn_cp_size != 1:
                 raise RuntimeError(
-                    "PD decode DCP currently requires prefill attention CP=1, "
+                    "PD DCP currently requires prefill attention CP=1, "
                     f"got {info.attn_cp_size}."
                 )
             if info.enable_kv_cache_sharding:
                 raise RuntimeError(
-                    "PD decode DCP does not support a prefill with "
-                    "--enable-kv-cache-sharding."
+                    "PD DCP does not support a prefill with --enable-kv-cache-sharding."
                 )
 
         self._resolve_rank_mapping(info)
@@ -1745,9 +1784,81 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
 
+    @staticmethod
+    def _resolve_dcp_tp_rank_mapping(
+        *,
+        src_attn_tp: int,
+        src_dcp: int,
+        dst_attn_tp: int,
+        dst_dcp: int,
+        dst_tp_rank: int,
+        is_hybrid_mla: bool,
+    ) -> Tuple[List[int], List[int], Dict[int, int], int]:
+        """Build the bipartite TP rank mapping when prefill shards KV over DCP.
+
+        KV ownership pairs by DCP parity (modulo ``src_dcp`` for fan-out, stride
+        ``dst_dcp`` for fan-in). Hybrid-MLA also pairs each decode rank with the
+        contiguous attention-TP owner of its linear-attention state.
+        """
+        if max(src_attn_tp, dst_attn_tp) % min(src_attn_tp, dst_attn_tp) != 0:
+            raise RuntimeError(
+                "PD DCP requires divisible prefill/decode attention TP sizes, got "
+                f"prefill={src_attn_tp}, decode={dst_attn_tp}"
+            )
+        real_by_dst: Dict[int, List[int]] = {}
+        used_src: Set[int] = set()
+        for d in range(dst_attn_tp):
+            r_d = d % dst_dcp
+            if dst_attn_tp >= src_attn_tp:
+                state_ranks = [d // (dst_attn_tp // src_attn_tp)]
+                src_dcp_group = state_ranks[0] // src_dcp
+            else:
+                ratio = src_attn_tp // dst_attn_tp
+                state_ranks = list(range(d * ratio, (d + 1) * ratio))
+                src_dcp_group = state_ranks[0] // src_dcp
+
+            if src_dcp <= dst_dcp:
+                kv_ranks = [src_dcp_group * src_dcp + (r_d % src_dcp)]
+            else:
+                kv_ranks = [
+                    src_dcp_group * src_dcp + r_s
+                    for r_s in range(r_d, src_dcp, dst_dcp)
+                ]
+
+            real = sorted(
+                set(kv_ranks) | (set(state_ranks) if is_hybrid_mla else set())
+            )
+            real_by_dst[d] = real
+            used_src.update(real)
+
+        dummy_by_dst: Dict[int, List[int]] = {d: [] for d in range(dst_attn_tp)}
+        for p in range(src_attn_tp):
+            if p not in used_src:
+                owner_d = (p * dst_attn_tp) // src_attn_tp
+                dummy_by_dst[owner_d].append(p)
+
+        required_dst_by_tp: Dict[int, int] = {p: 0 for p in range(src_attn_tp)}
+        for d in range(dst_attn_tp):
+            for p in real_by_dst[d]:
+                required_dst_by_tp[p] += 1
+            for p in dummy_by_dst[d]:
+                required_dst_by_tp[p] += 1
+
+        real_ranks = real_by_dst[dst_tp_rank]
+        target_tp_ranks = sorted(set(real_ranks) | set(dummy_by_dst[dst_tp_rank]))
+        return (
+            target_tp_ranks,
+            real_ranks,
+            {p: required_dst_by_tp[p] for p in target_tp_ranks},
+            len(real_ranks),
+        )
+
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
+        real_tp_ranks: Optional[List[int]] = None
+        required_dst_info_num_by_tp: Optional[Dict[int, int]] = None
+
         # TP rank mapping
         if info.attn_cp_size == 1 and info.enable_kv_cache_sharding:
             # KV pages striped over the registered TP ranks (MLA attn-TP, or CP-TP
@@ -1760,6 +1871,22 @@ class CommonKVManager(BaseKVManager):
             target_tp_ranks = list(range(info.attn_tp_size))
             required_dst_info_num = self.attn_tp_size
             required_prefill_response_num = info.attn_tp_size
+        elif info.dcp_size > 1 and (self.is_mla_backend or self.is_hybrid_mla_backend):
+            (
+                target_tp_ranks,
+                real_tp_ranks,
+                required_dst_info_num_by_tp,
+                required_prefill_response_num,
+            ) = self._resolve_dcp_tp_rank_mapping(
+                src_attn_tp=info.attn_tp_size,
+                src_dcp=info.dcp_size,
+                dst_attn_tp=self.attn_tp_size,
+                dst_dcp=self.dcp_size,
+                dst_tp_rank=self.kv_args.engine_rank % self.attn_tp_size,
+                is_hybrid_mla=self.is_hybrid_mla_backend,
+            )
+            target_tp_rank = real_tp_ranks[0] if len(real_tp_ranks) == 1 else None
+            required_dst_info_num = required_dst_info_num_by_tp[target_tp_ranks[0]]
         elif self.attn_tp_size == info.attn_tp_size:
             target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
             required_dst_info_num = 1
@@ -1835,9 +1962,11 @@ class CommonKVManager(BaseKVManager):
 
         info.target_tp_rank = target_tp_rank
         info.target_tp_ranks = target_tp_ranks
+        info.real_tp_ranks = real_tp_ranks
         info.target_cp_ranks = target_cp_ranks
         info.target_pp_ranks = target_pp_ranks
         info.required_dst_info_num = required_dst_info_num
+        info.required_dst_info_num_by_tp = required_dst_info_num_by_tp
         info.required_prefill_response_num = required_prefill_response_num
 
     def _sync_bootstrap_port_across_nodes(self, local_port: int) -> int:
@@ -1899,6 +2028,7 @@ class CommonKVManager(BaseKVManager):
             "attn_cp_rank": attn_cp[1],
             "attn_dp_size": self.attn_dp_size,
             "attn_dp_rank": self.attn_dp_rank,
+            "dcp_size": self.dcp_size,
             "pp_size": self.pp_size,
             "pp_rank": self.pp_rank,
             "system_dp_size": self.system_dp_size,
@@ -2824,6 +2954,7 @@ class CommonKVSender(BaseKVSender):
 
 
 class CommonKVReceiver(BaseKVReceiver):
+    prefill_info: Optional[PrefillServerInfo] = None
     _prefill_wait_start: Optional[float] = None
     _owns_bootstrap_room: bool = True
     _lifecycle_lock = nullcontext()
@@ -2989,7 +3120,15 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
-                            if self.kv_mgr.is_mla_backend:
+                            prefill_info = self.prefill_info
+                            if (
+                                prefill_info is not None
+                                and prefill_info.real_tp_ranks is not None
+                            ):
+                                bootstrap_info["is_dummy"] = (
+                                    target_tp_rank not in prefill_info.real_tp_ranks
+                                )
+                            elif self.kv_mgr.is_mla_backend:
                                 # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
                                 bootstrap_info["is_dummy"] = not bool(
                                     target_tp_rank == self.target_tp_rank
@@ -2998,6 +3137,15 @@ class CommonKVReceiver(BaseKVReceiver):
                             else:
                                 # For non-MLA: all target_tp_ranks are selected real ranks
                                 bootstrap_info["is_dummy"] = False
+                            if (
+                                prefill_info is not None
+                                and prefill_info.required_dst_info_num_by_tp is not None
+                            ):
+                                bootstrap_info["required_dst_info_num"] = (
+                                    prefill_info.required_dst_info_num_by_tp[
+                                        target_tp_rank
+                                    ]
+                                )
                             logger.debug(
                                 f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"
                             )
@@ -3224,7 +3372,9 @@ class CommonKVReceiver(BaseKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             message = self.kv_mgr.build_receiver_metadata_message(
                 bootstrap_room=self.bootstrap_room,
-                required_dst_info_num=self.required_dst_info_num,
+                required_dst_info_num=bootstrap_info.get(
+                    "required_dst_info_num", self.required_dst_info_num
+                ),
                 kv_indices=kv_indices,
                 aux_index=aux_index,
                 state_indices=state_indices,
@@ -3385,6 +3535,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.attn_tp_size = None
         self.attn_cp_size = None
         self.dp_size = None
+        self.dcp_size: Optional[int] = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.kv_layout: Optional[str] = None
@@ -3529,6 +3680,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.dp_size is None:
             self.dp_size = attn_dp_size if system_dp_size == 1 else system_dp_size
 
+        if self.dcp_size is None:
+            self.dcp_size = int(data.get("dcp_size", 1))
+
         if self.pp_size is None:
             self.pp_size = pp_size
 
@@ -3619,6 +3773,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 attn_cp_size=self.attn_cp_size,
                 dp_size=self.dp_size,
                 pp_size=self.pp_size,
+                dcp_size=self.dcp_size if self.dcp_size is not None else 1,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
                 kv_layout=self.kv_layout,
