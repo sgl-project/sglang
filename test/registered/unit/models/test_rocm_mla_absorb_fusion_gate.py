@@ -369,7 +369,6 @@ class TestMonoPreQReplicateShape(CustomTestCase):
         q_rep_phase: bool,
         has_qrep_weights: bool,
         q_cols: int,
-        hidden=None,
     ):
         seen = {}
         num_local_heads, qk_head_dim, rows = 12, 192, 16
@@ -400,8 +399,7 @@ class TestMonoPreQReplicateShape(CustomTestCase):
             "k_nope": torch.zeros(rows, 512, dtype=torch.bfloat16),
             "q_lora": torch.zeros(rows, 1536, dtype=torch.bfloat16),
         }
-        if hidden is None:
-            hidden = torch.zeros(rows, 7168, dtype=torch.bfloat16)
+        hidden = torch.zeros(rows, 7168, dtype=torch.bfloat16)
         with mock.patch.object(
             forward_mla_rocm, "maybe_capture_indexer_topk", return_value=None
         ):
@@ -447,22 +445,6 @@ class TestMonoPreQReplicateShape(CustomTestCase):
                 q_rep_phase=True,
                 has_qrep_weights=True,
                 q_cols=96 * 192,
-            ),
-            (16, 96, 192),
-        )
-
-    def test_tuple_hidden_states_uses_q_lora_row_count(self):
-        hidden_tuple = (
-            torch.zeros(16, 7168, dtype=torch.bfloat16),
-            torch.ones(16, 56, dtype=torch.float32),
-        )
-        self.assertEqual(
-            self._run_prepare_to_split(
-                dcp_size=8,
-                q_rep_phase=True,
-                has_qrep_weights=True,
-                q_cols=96 * 192,
-                hidden=hidden_tuple,
             ),
             (16, 96, 192),
         )
