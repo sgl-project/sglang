@@ -1795,6 +1795,11 @@ class Envs:
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
+    # 4 PCIe GPUs on two switches (pcie_pair_ar.py). Max bytes: 24 rows of hidden
+    # 5120 bf16, the largest decode message where fp32 pair sums beat NCCL on A100.
+    SGLANG_ENABLE_PCIE_PAIR_ALLREDUCE = EnvBool(False)
+    SGLANG_PCIE_PAIR_AR_MAX_BYTES = EnvInt(24 * 5120 * 2)
+    SGLANG_PCIE_PAIR_AR_FP32 = EnvBool(True)
 
     # ===================================================================
     # RoPE cache

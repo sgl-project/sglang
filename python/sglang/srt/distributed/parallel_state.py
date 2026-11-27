@@ -530,6 +530,19 @@ class GroupCoordinator:
                 )
             except Exception as e:
                 logger.warning(f"Setup FlashInfer PCIe-IPC allreduce failed with {e}.")
+
+        self.pcie_pair_comm: Optional[Any] = None
+        from sglang.srt.distributed.device_communicators import pcie_pair_ar
+
+        if pcie_pair_ar.eligible_group(
+            group_name=group_name, world_size=self.world_size
+        ):
+            try:
+                self.pcie_pair_comm = pcie_pair_ar.PciePairCommunicator(
+                    group=self.cpu_group, device=self.device
+                )
+            except Exception as e:
+                logger.warning(f"Setup PCIe pair allreduce failed with {e}.")
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -1010,6 +1023,15 @@ class GroupCoordinator:
             and self.ca_comm.should_custom_ar(input_)
         ):
             return "ca"
+        # After ``ca`` (it needs NVLink here): 4 GPUs on two PCIe switches. Fixed
+        # summation order for any size, so it also serves deterministic inference.
+        if (
+            self.pcie_pair_comm is not None
+            and not self.pcie_pair_comm.disabled
+            and not should_use_pymscclpp_allreduce
+            and self.pcie_pair_comm.should_pcie_pair_ar(input_)
+        ):
+            return "pcie_pair"
         # After ``ca``: the PCIe-IPC kernels are for hosts where no fabric-specific
         # backend applies. They do not probe for NVLink, so on a host that has it
         # this ordering is what keeps the faster backend in front of them.
@@ -1106,6 +1128,8 @@ class GroupCoordinator:
             out = pymscclpp_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pcie_ipc":
             return self.pcie_ipc_comm.pcie_ipc_all_reduce(input_)
+        elif outplace_all_reduce_method == "pcie_pair":
+            return self.pcie_pair_comm.pcie_pair_all_reduce(input_)
         elif outplace_all_reduce_method == "pynccl":
             with pynccl_comm.change_state(enable=True):
                 out = pynccl_comm.outplace_all_reduce(input_)
@@ -2104,6 +2128,9 @@ class GroupCoordinator:
         if self.pcie_ipc_comm is not None:
             self.pcie_ipc_comm.destroy()
             self.pcie_ipc_comm = None
+        if self.pcie_pair_comm is not None:
+            self.pcie_pair_comm.destroy()
+            self.pcie_pair_comm = None
         # Also before destroy_process_group(): the symmetric workspace is released
         # collectively on cpu_group, after the custom all-reduce drops its views.
         self.ca_comm = None
