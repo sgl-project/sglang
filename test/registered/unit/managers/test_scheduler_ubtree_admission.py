@@ -12,6 +12,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -42,7 +43,9 @@ class TestSchedulerUBTreeAdmission(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_session_radix_cache = False
         scheduler.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.model_config = SimpleNamespace(hf_eos_token_id={0}, vocab_size=128)
+        scheduler.model_config = SimpleNamespace(
+            hf_eos_token_id={0}, vocab_size=128, token_id_vocab_size=120
+        )
         scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
         scheduler.kv_events_publisher = SimpleNamespace(enable_kv_cache_events=False)
         scheduler.tokenizer = None
@@ -66,6 +69,8 @@ class TestSchedulerUBTreeAdmission(CustomTestCase):
         scheduler.beam_coordinator = Mock()
         scheduler.hisparse_coordinator = None
         scheduler.uocr_runtime = None
+        scheduler._embedding_preserve_last_token_id = False
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         scheduler._add_request_to_queue = Mock()
 

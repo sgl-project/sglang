@@ -53,7 +53,8 @@ class TestUBTreeKernelCompatibility(CustomTestCase):
                 "cu_seqlens is_kda lower_bound disable_state_update "
                 "intermediate_states_buffer intermediate_state_indices cache_steps "
                 "retrieve_parent_token cache_ring replayssm_rawv replayssm_rawk "
-                "replayssm_g replayssm_beta ring_indices match_cutedsl_decode",
+                "replayssm_g replayssm_beta ring_indices match_cutedsl_decode "
+                "round_beta_to_input_dtype",
                 {"tree_depths": object(), "force_factorized_tree": True},
             ),
         )

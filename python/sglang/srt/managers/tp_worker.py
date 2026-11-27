@@ -574,13 +574,16 @@ class TpModelWorker(BaseTpWorker):
         max_req_input_len = max_req_len - 5
         spec = get_spec()
         if spec.speculative_algorithm == "UBTREE":
-            # V2 keeps two verify allocations in flight. The request-to-token
-            # row already includes one tree width; reserve the other at admission.
+            # Row width already reserves both in-flight verify allocations past
+            # context_len, so only cap the physical KV side by one verify width.
             headroom = max(
                 spec.speculative_num_steps,
                 spec.speculative_num_draft_tokens,
             )
-            max_req_len = max(1, max_req_len - headroom)
+            max_req_len = min(
+                self.model_config.context_len - 1,
+                max(1, kv_capacity - 1 - headroom),
+            )
             max_req_input_len = max(1, min(max_req_input_len, max_req_len - 5))
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size

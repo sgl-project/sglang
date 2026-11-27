@@ -85,6 +85,11 @@ class CustomSpecAlgo:
     def is_ubtree(self) -> bool:
         return False
 
+    def create_cuda_graph_verify_input(
+        self, *, custom_mask, num_tokens_per_req: int, is_draft_worker: bool
+    ):
+        return None
+
     def is_uno(self) -> bool:
         return False
 

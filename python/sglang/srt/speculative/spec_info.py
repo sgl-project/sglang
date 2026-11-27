@@ -164,7 +164,7 @@ class SpeculativeAlgorithm(Enum):
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
         graphs in the decode cuda graph runner."""
-        return self.is_dflash_family()
+        return self.is_dflash_family() and not self.is_ubtree()
 
     def supports_grammar_overlap(self) -> bool:
         # Whether the worker advances the grammar FSM inside verify() (via the
@@ -531,15 +531,13 @@ def create_dummy_verify_input(
     """
     from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 
-    custom_builder = getattr(spec_algorithm, "create_cuda_graph_verify_input", None)
-    if custom_builder is not None:
-        spec_info = custom_builder(
-            custom_mask=custom_mask,
-            num_tokens_per_req=num_tokens_per_req,
-            is_draft_worker=is_draft_worker,
-        )
-        if spec_info is not None:
-            return spec_info
+    spec_info = spec_algorithm.create_cuda_graph_verify_input(
+        custom_mask=custom_mask,
+        num_tokens_per_req=num_tokens_per_req,
+        is_draft_worker=is_draft_worker,
+    )
+    if spec_info is not None:
+        return spec_info
 
     spec = get_spec_config()
 

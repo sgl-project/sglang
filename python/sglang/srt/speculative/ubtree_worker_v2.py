@@ -399,13 +399,9 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         sampling_info = batch.sampling_info
         if sampling_info is None:
             return False
-        if sampling_info.acc_additive_penalties is not None:
-            return False
-        if sampling_info.acc_scaling_penalties is not None:
-            return False
-        if sampling_info.logit_bias is not None:
-            return False
-        if sampling_info.has_custom_logit_processor:
+        from sglang.srt.sampling.sampling_batch_info import adjusts_logits
+
+        if adjusts_logits(sampling_info, has_grammar=batch.has_grammar):
             return False
         if not sampling_info.is_all_greedy and (
             sampling_info.sampling_seed is not None

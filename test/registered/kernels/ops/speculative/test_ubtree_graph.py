@@ -53,7 +53,8 @@ def _make_fa3_verify_backend(width, algorithm, *, max_bs=1):
     from sglang.srt.runtime_context import get_context, get_parallel
 
     pool = SimpleNamespace(
-        req_to_token=torch.arange(3 * 512, device="cuda").reshape(3, 512)
+        req_to_token=torch.arange(3 * 512, device="cuda").reshape(3, 512),
+        row_width=512,
     )
     kv_pool = SimpleNamespace(
         layer_router=SimpleNamespace(routes_to=lambda kind: False),
@@ -623,10 +624,10 @@ def test_worker_commits_once_and_keeps_scheduler_outputs_alive(
         has_grammar=False,
         sampling_info=SimpleNamespace(
             is_all_greedy=True,
-            acc_additive_penalties=None,
-            acc_scaling_penalties=None,
+            step_penalties=None,
             logit_bias=None,
             has_custom_logit_processor=False,
+            watermark=None,
         ),
         spec_info=DFlashDraftInputV2.create_idle_input(device="cuda"),
         seq_lens=torch.tensor([3], dtype=torch.int32, device="cuda"),
@@ -699,11 +700,13 @@ def test_worker_rejects_penalties_before_prefill():
         forward_mode=ForwardMode.EXTEND,
         is_extend_in_batch=False,
         return_logprob=False,
+        has_grammar=False,
         sampling_info=SimpleNamespace(
             is_all_greedy=True,
-            acc_additive_penalties=None,
-            acc_scaling_penalties=None,
+            step_penalties=None,
             logit_bias={1: 1},
+            has_custom_logit_processor=False,
+            watermark=None,
         ),
     )
     with pytest.raises(ValueError, match="without penalties"):
