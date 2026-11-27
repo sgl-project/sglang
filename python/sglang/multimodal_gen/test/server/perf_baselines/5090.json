@@ -65,6 +65,11 @@
             "estimated_full_test_time_s": 94.0
         },
         "wan2_1_t2v_1.3b": {
+            "min_free_vram_mb": {
+                "load": 4096.0,
+                "warmup": 4096.0,
+                "serving": 4096.0
+            },
             "expected_load_ms": 46026.44,
             "stages_ms": {
                 "DecodingStage": 846.85,
@@ -92,6 +97,11 @@
             "estimated_full_test_time_s": 160.9
         },
         "turbo_wan2_1_t2v_1.3b": {
+            "min_free_vram_mb": {
+                "load": 4096.0,
+                "warmup": 4096.0,
+                "serving": 4096.0
+            },
             "expected_load_ms": 43084.93,
             "stages_ms": {
                 "InputValidationStage": 0.11,
