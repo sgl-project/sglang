@@ -1252,8 +1252,11 @@ class ChatCompletionRequest(PDRoutingFields):
     @model_validator(mode="before")
     @classmethod
     def set_json_schema(cls, values):
+        if not isinstance(values, dict):
+            return values
+
         response_format = values.get("response_format")
-        if not response_format:
+        if not isinstance(response_format, dict):
             return values
 
         if response_format.get("type") != "json_schema":
@@ -1265,12 +1268,20 @@ class ChatCompletionRequest(PDRoutingFields):
         if json_schema:
             return values
 
-        if schema:
+        if schema is not None:
+            if not isinstance(schema, dict):
+                raise ValueError("response_format.schema must be an object")
+
             name_ = schema.get("title", "Schema")
+            if not isinstance(name_, str):
+                name_ = "Schema"
             strict_ = None
-            if "properties" in schema and "strict" in schema["properties"]:
-                item = schema["properties"].pop("strict", None)
-                strict_ = bool(item and item.get("default", False))
+            properties = schema.get("properties")
+            if isinstance(properties, dict) and "strict" in properties:
+                item = properties.get("strict")
+                if isinstance(item, dict):
+                    properties.pop("strict", None)
+                    strict_ = bool(item.get("default", False))
 
             response_format["json_schema"] = {
                 "name": name_,
