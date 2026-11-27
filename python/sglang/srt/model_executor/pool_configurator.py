@@ -1533,16 +1533,20 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"sparse-attention operator, got {self._npu_c128_page_size}"
             )
 
-    def _npu_swa_pool_bytes(self, swa_tokens: int) -> int:
+    def _npu_swa_pool_bytes(self, swa_tokens: int, *, padding_only: bool = False) -> int:
         # Same reserved-page rule as NPUDeepSeekV4SingleKVPool.create_buffer.
         swa_pages = (swa_tokens + self.page_size + 1) // self.page_size
         swa_rows = swa_pages * self.page_size
+        if padding_only:
+            swa_rows -= swa_tokens
         kv_bytes = swa_rows * self.kv_bytes * self.num_swa_layers
         if not self.num_layers(4):
             return kv_bytes
         ring = self.ring_sizes[4]
         state_size = swa_tokens // self.page_size * ring
         state_rows = ceil_align(state_size + ring + 1, lcm(4, ring))
+        if padding_only:
+            state_rows -= state_size
         state_row_bytes = 4 * (self.attn_head_dim + self.indexer_head_dim)
         return (
             kv_bytes
@@ -1745,6 +1749,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             if self.swa_cap_tokens is None
             else self.swa_cap_tokens * self.bytes_per_swa_token
         )
+        if _is_npu and self.swa_cap_tokens is not None:
+            # The paged cap estimate omits the reserved SWA page and extra C4
+            # state rows on both GPU and NPU. Their byte costs depend on each
+            # backend's allocation and alignment rules. Correct the NPU budget here.
+            # The logical-slot price already includes the speculative reserve.
+            padding_bytes = self._npu_swa_pool_bytes(
+                self.swa_cap_tokens, padding_only=True
+            )
+            paged_bytes += padding_bytes * self._spec_infl
         return self.request_window_bytes + paged_bytes
 
     def _get_swa_tokens(self, full_token: int, page_size: int) -> int:
@@ -1966,7 +1979,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
         full_token = full_token // page_size * page_size
-        if self._npu_kv_row_bytes is not None:
+        if _is_npu:
             # The linear estimate seeds the search. Actual PA_ND buffers grow in
             # physical pages, so a candidate can land on either side of it.
             if self._npu_variable_pool_bytes(full_token) > available_bytes_for_tokens:
