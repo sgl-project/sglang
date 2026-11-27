@@ -47,6 +47,10 @@ class EngramConfig:
     # tables, and a directory all of them see, empty for each deployment.
     group_size: int = 0
     group_store: str = ""
+    # placement cpu only: back the tables with this file or dev-dax char device
+    # (a DAX/CXL region) instead of anonymous host memory. The whole TP group
+    # maps one file, each table at its own aligned offset.
+    table_path: str = ""
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "EngramConfig":
@@ -66,6 +70,11 @@ class EngramConfig:
                 f"--engram-config: invalid {', '.join(invalid)}; choices: {choices}"
             )
         config = cls(**raw)
+        if config.table_path and config.replication == EngramReplication.GROUP_SHARDS:
+            raise ValueError(
+                "--engram-config: 'table_path' is not supported with replication "
+                "'group_shards', whose slices are shared through 'group_store'."
+            )
         if config.replication == EngramReplication.GROUP_SHARDS:
             if config.lookup not in (EngramLookup.AUTO, EngramLookup.PEER_READ):
                 raise ValueError(
@@ -84,6 +93,11 @@ class EngramConfig:
             raise ValueError(
                 "--engram-config: 'group_size' and 'group_store' apply to "
                 "replication 'group_shards' only."
+            )
+        if config.table_path and config.placement != EngramPlacement.CPU:
+            raise ValueError(
+                "--engram-config: 'table_path' backs the host tables; it needs "
+                "placement 'cpu'."
             )
         if (
             config.lookup == EngramLookup.PEER_READ
