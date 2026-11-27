@@ -14,6 +14,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+    MLA_KV_HEAD_NUM,
     BudgetPlan,
     fit_sparse_running_requests,
     get_sparse_kv_cache_tokens,
@@ -233,7 +234,7 @@ def build_sparse_kv_budget_options(
         top_k=get_sparsity_driven_kv_offload_sparse_context_len(
             model_config=model_config
         ),
-        kv_bytes_per_token=model_config.get_total_num_kv_heads(compressed_mla=True)
+        kv_bytes_per_token=MLA_KV_HEAD_NUM
         * (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
         * torch._utils._element_size(kv_dtype),
         num_layers=num_layers,

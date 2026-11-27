@@ -1926,13 +1926,8 @@ class ModelConfig:
         return max(1, total_num_attention_heads // tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
-    def get_total_num_kv_heads(self, *, compressed_mla: bool = False) -> int:
-        """Return the configured KV head count or the shared head for compressed MLA."""
-        if compressed_mla:
-            if self.attention_arch != AttentionArch.MLA:
-                raise ValueError("Compressed MLA KV heads require an MLA model.")
-            return 1
-
+    def get_total_num_kv_heads(self) -> int:
+        """Returns the total number of KV heads."""
         # For GPTBigCode & Falcon:
         # NOTE: for falcon, when new_decoder_architecture is True, the
         # multi_query flag is ignored and we use n_head_kv for the number of
