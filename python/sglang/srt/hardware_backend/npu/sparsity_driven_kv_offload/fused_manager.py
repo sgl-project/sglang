@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Union, cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
-
 from sglang.kernels.ops.attention.npu_copy_sfa import (
     fused_scatter_copy_sparse_flash_attention,
     load_copy_sfa_operator,
@@ -33,6 +32,7 @@ if TYPE_CHECKING:
 
 class FusedSparseKVCacheManager:
     host_pool: HostKVPool
+    packed_c8 = False
 
     def __init__(
         self,
@@ -61,20 +61,30 @@ class FusedSparseKVCacheManager:
         self.size = self.budget.request_rows
         self.max_context_len = self.budget.context_len
         self.host_token_capacity = self.budget.host_token_capacity
-        self._copy_sfa_operator = load_copy_sfa_operator()
+        self._copy_sfa_operator = self._load_copy_sfa_operator()
 
         self.resident_pool = ResidentKVPool(self.budget, self.device)
         try:
             for name, spec in self.budget.manager_buffers.items():
                 setattr(self, name, spec.allocate(self.device))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - preserve the allocation context
             self._raise_buffer_allocation_error(name, e)
 
-        # Shared host components use [physical_pages, page_size, head_num, width].
-        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        self._init_host_pool()
+        self.lim_adapter = self._make_decode_adapter()
 
-        # Radix prefixes use physical token IDs from the Indexer K pool.
-        # Host KV shares that address space. C residency is tracked per request.
+        if self.resident_pool.request_to_resident is None:
+            self._install_req_alloc_hook(req_to_token_pool)
+        else:
+            decode_pool = cast("DecodeReqToTokenPool", req_to_token_pool)
+            decode_pool.resident_row_lifecycle = self.resident_pool
+
+    @staticmethod
+    def _load_copy_sfa_operator():
+        return load_copy_sfa_operator()
+
+    def _init_host_pool(self) -> None:
+        """Allocate the default split CKV/KPE Host payload pool."""
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
             HostKVPool,
         )
@@ -94,22 +104,17 @@ class FusedSparseKVCacheManager:
         )
         self.host_k_buffer, self.host_v_buffer = self.host_pool.buffers
 
+    def _make_decode_adapter(self):
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
             LIMDecodeAdapter,
         )
 
-        self.lim_adapter = LIMDecodeAdapter(
+        return LIMDecodeAdapter(
             self.budget,
             device=self.device,
             last_prefix=self.resident_pool.last_prefix,
             request_to_resident=self.resident_pool.request_to_resident,
         )
-
-        if self.resident_pool.request_to_resident is None:
-            self._install_req_alloc_hook(req_to_token_pool)
-        else:
-            decode_pool = cast("DecodeReqToTokenPool", req_to_token_pool)
-            decode_pool.resident_row_lifecycle = self.resident_pool
 
     def _raise_buffer_allocation_error(
         self,
@@ -229,7 +234,6 @@ class FusedSparseKVCacheManager:
         from sgl_kernel_npu.operators.mem_cache.prepare_sparse_kv_offload_rows import (
             prepare_sparse_kv_offload_rows,
         )
-
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
             sparse_query_width,
         )
@@ -263,9 +267,8 @@ class FusedSparseKVCacheManager:
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         *,
-        offload_rows: Optional[
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = None,
+        offload_rows: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
     ):
         """Publish this layer's KV and return its current rows for attention."""
         layer_idx = layer.layer_id - self.start_layer
@@ -316,7 +319,7 @@ class FusedSparseKVCacheManager:
 
     def get_forward_kv(
         self,
-        layer: Union[RadixAttention, int],
+        layer: RadixAttention | int,
         forward_batch: ForwardBatch,
         plan=None,
         current=None,

@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch_npu
-
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.model_executor.forward_mode import ForwardMode
 
@@ -19,9 +16,9 @@ def forward_fused_sparse_kv_offload(
     layer,
     forward_batch,
     save_kv_cache: bool = True,
-    q_rope: Optional[torch.Tensor] = None,
-    k_rope: Optional[torch.Tensor] = None,
-    topk_indices: Optional[torch.Tensor] = None,
+    q_rope: torch.Tensor | None = None,
+    k_rope: torch.Tensor | None = None,
+    topk_indices: torch.Tensor | None = None,
 ):
     """Publish current KV before fused attention."""
     del v
@@ -57,6 +54,14 @@ def forward_fused_sparse_kv_offload(
             return torch.nn.functional.pad(result, (0, 0, 0, q.shape[0] - rows))
         return result
 
+    if manager.packed_c8:
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_prefill import (
+            forward_packed_prefill,
+        )
+
+        return forward_packed_prefill(
+            backend, q, q_rope, layer, forward_batch, topk_indices
+        )
     actual_q = backend.forward_metadata.actual_seq_lengths_q
     if actual_q is None:
         actual_q = torch.cumsum(forward_batch.extend_seq_lens, dim=0)

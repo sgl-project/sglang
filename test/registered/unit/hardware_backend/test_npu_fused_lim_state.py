@@ -7,7 +7,6 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
     resolve_sparse_kv_budget,
@@ -15,6 +14,9 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget imp
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
     LIMDecodeAdapter,
     sparse_query_width,
+)
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.resident_pool import (
+    ResidentKVPool,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
@@ -677,13 +679,13 @@ class TestLIMState(CustomTestCase):
                 (kwargs["request_state"][0].item(), kwargs["seq_lens"][0].item())
             )
 
-        args = dict(
-            query=torch.zeros((1, 1)),
-            weights=torch.zeros((1, 1)),
-            key=None,
-            block_table=None,
-            forward_batch=batch,
-        )
+        args = {
+            "query": torch.zeros((1, 1)),
+            "weights": torch.zeros((1, 1)),
+            "key": None,
+            "block_table": None,
+            "forward_batch": batch,
+        }
         module = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim"
         with patch(module + ".fused_lightning_indexer_manage", side_effect=native):
             for old, length in ((-1, 12), (12, 13), (13, 9)):
@@ -717,6 +719,39 @@ class TestLIMState(CustomTestCase):
                 out_cache_loc=torch.tensor(list(range(width)) + [-1] * (count - width)),
             )
             self.assertEqual(sparse_query_width(batch), width)
+
+    def test_resident_pool_invalidates_identity_and_bound_rows(self):
+        identity = object.__new__(ResidentKVPool)
+        identity.device = "cpu"
+        identity.request_rows = identity.resident_rows = 3
+        identity.request_to_resident = None
+        identity.short_resident_end = torch.full((2, 3), 7, dtype=torch.int32)
+        identity.device_slot_map = [torch.full((3, 4), 8, dtype=torch.int32)]
+        identity.last_prefix = torch.full((3,), 9, dtype=torch.int32)
+        identity.invalidate_request(-1)
+        identity.invalidate_request(0)
+        self.assertTrue(identity.device_slot_map[0].eq(8).all())
+        identity.invalidate_request(1)
+        self.assertTrue(identity.short_resident_end[:, 1].eq(-1).all())
+        self.assertTrue(identity.device_slot_map[0][1].eq(-1).all())
+        self.assertEqual(identity.last_prefix[1].item(), -1)
+
+        compact = object.__new__(ResidentKVPool)
+        compact.device = "cpu"
+        compact.request_rows, compact.resident_rows = 4, 3
+        compact.request_to_resident = torch.tensor([0, 0, 2, 0], dtype=torch.int32)
+        compact._request_to_resident_cpu = [0, 0, 2, 0]
+        compact.short_resident_end = torch.full((1, 4), 7, dtype=torch.int32)
+        compact.device_slot_map = [torch.full((3, 4), 8, dtype=torch.int32)]
+        compact.last_prefix = torch.full((3,), 9, dtype=torch.int32)
+        compact.invalidate_request(-1)
+        compact.invalidate_request(0)
+        compact.invalidate_request(1)
+        self.assertTrue(compact.device_slot_map[0].eq(8).all())
+        compact.invalidate_request(2)
+        self.assertTrue(compact.short_resident_end[:, 2].eq(-1).all())
+        self.assertTrue(compact.device_slot_map[0][2].eq(-1).all())
+        self.assertEqual(compact.last_prefix[2].item(), -1)
 
 
 if __name__ == "__main__":

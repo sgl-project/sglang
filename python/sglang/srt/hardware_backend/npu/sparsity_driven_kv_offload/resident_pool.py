@@ -82,6 +82,20 @@ class ResidentKVPool:
             self._request_to_resident_cpu[req_id] = 0
             self._free_resident_rows.append(resident_id)
 
+    def invalidate_request(self, req_id: int) -> None:
+        """Invalidate one request's C row after an external payload restore."""
+        if not 0 < req_id < self.request_rows:
+            return
+        if self.request_to_resident is None:
+            resident_id = req_id
+            if resident_id >= self.resident_rows:
+                return
+        else:
+            resident_id = self._request_to_resident_cpu[req_id]
+            if not resident_id:
+                return
+        self.reset_rows([req_id], [resident_id])
+
     def admit(self, req_ids: list[int]) -> None:
         """Reset and bind new C rows on the forward consumer stream."""
         device_mapping = self.request_to_resident

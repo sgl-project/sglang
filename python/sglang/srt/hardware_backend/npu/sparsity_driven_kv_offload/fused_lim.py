@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.attention.npu_lim import (
     fused_lightning_indexer_manage,
     load_fused_lim_operator,
@@ -58,7 +57,7 @@ class LIMDecodeAdapter:
         self.max_query_width = budget.max_query_width
         self.last_prefix = last_prefix
         self.request_to_resident = request_to_resident
-        self.operator = load_fused_lim_operator()
+        self.operator = self._load_operator()
         self._fused_prepare_lim_metadata = fused_prepare_lim_metadata
         self._prepared_batch = None
         for name, spec in budget.adapter_buffers.items():
@@ -74,6 +73,10 @@ class LIMDecodeAdapter:
             else:
                 value = spec.allocate(device)
             setattr(self, name, value)
+
+    @staticmethod
+    def _load_operator():
+        return load_fused_lim_operator()
 
     def _prepare_forward(self, block_table, forward_batch, width):
         batch = forward_batch.batch_size
@@ -110,6 +113,7 @@ class LIMDecodeAdapter:
         forward_batch,
         slot_pool: torch.Tensor,
         reuse_metadata=False,
+        **operator_kwargs,
     ):
         batch = forward_batch.batch_size
         width = sparse_query_width(forward_batch)
@@ -118,28 +122,16 @@ class LIMDecodeAdapter:
         # different batch has used it since this batch's preceding owner.
         if not reuse_metadata or self._prepared_batch is not forward_batch:
             self._prepare_forward(block_table, forward_batch, width)
-        sources = self.source_ids[:rows]
-        fused_lightning_indexer_manage(
-            weights=weights[:rows].contiguous(),
-            query=query[:rows].contiguous(),
+        self._run_operator(
+            batch,
+            width,
+            query=query,
+            weights=weights,
             key=key,
-            block_table=self.block_table[:batch],
-            query_ends=self.query_ends[width - 1, :batch],
-            seq_lens=self._pre_lengths[:batch],
-            prefix_lens=self._pre_lengths[:batch],
-            cache_sizes=self._pre_cache_sizes[:batch],
-            request_state=self._pre_states[:batch],
-            request_slots=self.resident_safe_slots[:batch],
             slot_pool=slot_pool,
-            source_ids=sources,
-            device_slots=self.device_slots[:rows],
-            topk_misses=self.topk_misses[:rows],
-            miss_sources=self.miss_sources[:batch],
-            miss_slots=self.miss_slots[:batch],
-            miss_counts=self.miss_counts[:batch],
-            operator=self.operator,
-            full_visible=True,
+            **operator_kwargs,
         )
+        sources = self.source_ids[:rows]
         return LIMSelection(
             sources,
             self.device_slots[:rows],
@@ -152,6 +144,30 @@ class LIMDecodeAdapter:
             self.request_safe_slots[:batch],
             self.resident_safe_slots[:batch],
             width,
+        )
+
+    def _run_operator(self, batch, width, *, query, weights, key, slot_pool):
+        rows = batch * width
+        fused_lightning_indexer_manage(
+            weights=weights[:rows].contiguous(),
+            query=query[:rows].contiguous(),
+            key=key,
+            block_table=self.block_table[:batch],
+            query_ends=self.query_ends[width - 1, :batch],
+            seq_lens=self._pre_lengths[:batch],
+            prefix_lens=self._pre_lengths[:batch],
+            cache_sizes=self._pre_cache_sizes[:batch],
+            request_state=self._pre_states[:batch],
+            request_slots=self.resident_safe_slots[:batch],
+            slot_pool=slot_pool,
+            source_ids=self.source_ids[:rows],
+            device_slots=self.device_slots[:rows],
+            topk_misses=self.topk_misses[:rows],
+            miss_sources=self.miss_sources[:batch],
+            miss_slots=self.miss_slots[:batch],
+            miss_counts=self.miss_counts[:batch],
+            operator=self.operator,
+            full_visible=True,
         )
 
     def commit_forward(self, batch: int) -> None:
