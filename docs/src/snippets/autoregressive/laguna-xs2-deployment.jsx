@@ -154,7 +154,7 @@ export const LagunaXS2Deployment = () => {
       if (quantization !== 'bf16') return '# Error: No validated Xeon recipe for this checkpoint format.';
       lines[lines.length - 1] += ' \\';
       lines.push('  --disable-overlap-schedule \\');
-      lines.push('  --device cpu')
+      lines.push('  --device cpu');
     }
 
     lines[lines.length - 1] += ' \\';
