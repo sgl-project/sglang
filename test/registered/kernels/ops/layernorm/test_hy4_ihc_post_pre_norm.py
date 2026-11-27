@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -201,6 +202,15 @@ def test_decoder_layer_ihc_pre_fusion_matches_deferred():
     # The layer's own weights are random: only the two code paths are compared.
     with patch.object(hunyuan_v4, "ReplicatedLinear", TupleLinear):
         next_layer = hunyuan_v4.HYV4HCLayer(config, "next").cuda()
+    # HYV4HCLayer leaves hc_scale / hc_base as torch.empty until the checkpoint
+    # is loaded; fill them so the comparison never reads uninitialized memory
+    # (a NaN there fails torch.equal even when both code paths agree).
+    with torch.no_grad():
+        next_layer.hc_pre.hc_scale.copy_(torch.tensor([0.5, 0.25], device="cuda"))
+        next_layer.hc_pre.hc_base.copy_(
+            torch.linspace(-0.1, 0.1, 2 * hc_mult, device="cuda")
+        )
+
     norm = hunyuan_v4.RMSNorm(hidden_size, eps=1e-5, force_native=True).cuda()
     out_norm = hunyuan_v4.RMSNorm(hidden_size, eps=1e-5, force_native=True).cuda()
     with torch.no_grad():
@@ -235,3 +245,7 @@ def test_decoder_layer_ihc_pre_fusion_matches_deferred():
 
         for fused_out, deferred_out in zip(fused, deferred):
             assert torch.equal(fused_out, deferred_out)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
