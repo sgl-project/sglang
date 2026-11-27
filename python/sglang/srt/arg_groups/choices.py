@@ -282,6 +282,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "cutedsl",
     "flashinfer",
     "flashkda",
+    "flydsl",
     "nvidia_kda",
     "ptx_kda",
     "helion",

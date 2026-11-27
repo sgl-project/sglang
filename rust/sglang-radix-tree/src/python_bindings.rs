@@ -2089,6 +2089,10 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().set_is_write_back(is_write_back));
             }
 
+            fn set_mamba_path_cap_counts_host(&self, py: Python<'_>, enabled: bool) {
+                py.detach(|| self.core().set_mamba_path_cap_counts_host(enabled));
+            }
+
             /// The current write-back (vs write-through) policy.
             fn is_write_back(&self, py: Python<'_>) -> bool {
                 self.core_attached(py).is_write_back()
@@ -3458,6 +3462,14 @@ macro_rules! tree_core_binding {
             /// The current write-back (vs write-through) policy.
             fn is_write_back(&self, py: Python<'_>) -> PyResult<bool> {
                 catch_native_panic(|| Ok(self.inner.is_write_back(py)))
+            }
+
+            /// Make the per-path Mamba cap count and free host copies; decided at HiCache init.
+            fn set_mamba_path_cap_counts_host(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_mamba_path_cap_counts_host(py, enabled);
+                    Ok(())
+                })
             }
 
             /// Set the write-through backup hit threshold; decided at HiCache init.
