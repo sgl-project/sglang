@@ -231,11 +231,27 @@ def encode_reasoning_state(text: str) -> str:
     return _REASONING_STATE_PREFIX + packed.decode("ascii")
 
 
-def decode_reasoning_state(blob: Any) -> Optional[str]:
+_MAX_REASONING_STATE_BYTES = 4 * 1024 * 1024  # 4 MiB decompressed cap
+_MAX_REASONING_STATE_B64_CHARS = 8 * 1024 * 1024  # base64 input cap
+
+
+def decode_reasoning_state(
+    blob: Any, max_bytes: int = _MAX_REASONING_STATE_BYTES
+) -> Optional[str]:
     if not isinstance(blob, str) or not blob.startswith(_REASONING_STATE_PREFIX):
         return None
+    encoded = blob[len(_REASONING_STATE_PREFIX) :]
+    if len(encoded) > _MAX_REASONING_STATE_B64_CHARS:
+        return None
     try:
-        raw = base64.urlsafe_b64decode(blob[len(_REASONING_STATE_PREFIX) :])
-        return zlib.decompress(raw).decode("utf-8")
+        raw = base64.urlsafe_b64decode(encoded)
+        decompressor = zlib.decompressobj()
+        out = decompressor.decompress(raw, max_bytes + 1)
+        if len(out) > max_bytes or decompressor.unconsumed_tail:
+            return None
+        tail = decompressor.flush()
+        if not decompressor.eof or len(out) + len(tail) > max_bytes:
+            return None
+        return (out + tail).decode("utf-8")
     except (ValueError, zlib.error, UnicodeDecodeError):
         return None
