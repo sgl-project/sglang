@@ -13,6 +13,8 @@ A hybrid model's linear-attention layers carry a recurrent state instead of per-
 
 The per-path cap is a pruning target, not a strict state-slot bound. Tail, fork, locked, and device-leaf states can be preserved, so a path may retain multiple checkpoints. Size the state pool for running requests and retained checkpoints, and verify actual occupancy.
 
+With HiCache in its default `cache` host memory mode, the cap also counts host copies: a checkpoint the cap prunes loses its host copy as well, unless that copy is locked or a backup or load-back of it is in flight. This keeps the host Mamba pool for the checkpoints each path still uses.
+
 ## What level 2 changes
 
 - **Request-end checkpoints support continued conversations.** Level 2 preserves the checkpointing path used when the next turn extends the previous request's full context. Actual reuse still depends on checkpoint placement, KV and state capacity, eviction, and usable host backups; equal hit rates across levels are not guaranteed.
