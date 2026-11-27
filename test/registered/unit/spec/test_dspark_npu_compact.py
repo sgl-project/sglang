@@ -546,13 +546,11 @@ class TestNpuCompactExecution(CustomTestCase):
         op = Mock(return_value=(torch.zeros(4, 1, 4), None, None))
         method = _backend_method(
             "forward_sparse",
-            torch_npu=SimpleNamespace(npu_sparse_flash_attention=op),
             _expand_dsa_sparse_indices=lambda x: x.unsqueeze(-2),
             get_dsa_token_shard_plan=lambda _: None,
             NPUDecodeContextParallelMetadata=type(
                 "NPUDecodeContextParallelMetadata", (), {}
             ),
-            next_power_of_2=next_power_of_2,
         )
         metadata = SimpleNamespace(
             actual_seq_lengths_q=torch.tensor([1, 4], dtype=torch.int32),
@@ -568,6 +566,15 @@ class TestNpuCompactExecution(CustomTestCase):
                 get_kv_buffer=lambda _: (torch.zeros(4, 4), torch.zeros(4, 2)),
             ),
             _pad_topk_indices=lambda x, _: x,
+        )
+        backend._forward_unquantized_sparse = MethodType(
+            _backend_method(
+                "_forward_unquantized_sparse",
+                torch_npu=SimpleNamespace(npu_sparse_flash_attention=op),
+                is_npu_arch35=lambda: False,
+                next_power_of_2=next_power_of_2,
+            ),
+            backend,
         )
         method(
             backend,
