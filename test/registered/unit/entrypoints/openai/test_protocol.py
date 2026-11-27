@@ -494,12 +494,23 @@ class TestChatCompletionRequest(CustomTestCase):
 
     def test_legacy_schema_must_be_an_object(self):
         """A non-object legacy `schema` is a validation error (400), not a 500."""
-        for schema in (True, 1, "{}", [{"type": "object"}]):
+        for schema in (True, 1, "{}", [{"type": "object"}], False, 0, "", []):
             with self.subTest(schema=schema):
                 with self.assertRaises(ValidationError):
                     self._chat_request(
                         response_format={"type": "json_schema", "schema": schema}
                     )
+
+    def test_legacy_empty_schema_is_converted(self):
+        """An empty legacy `schema` is a schema, not a missing one."""
+        request = self._chat_request(
+            response_format={"type": "json_schema", "schema": {}}
+        )
+        self.assertEqual(request.response_format.json_schema.schema_, {})
+        sampling_params = request.to_sampling_params(
+            stop=[], model_generation_config={}
+        )
+        self.assertEqual(json.loads(sampling_params["json_schema"]), {})
 
     def test_legacy_schema_keeps_non_model_strict_property(self):
         """Only a model-field `strict` subschema is taken as the strict switch.

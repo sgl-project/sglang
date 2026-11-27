@@ -1259,7 +1259,7 @@ class ChatCompletionRequest(PDRoutingFields):
         if json_schema:
             return values
 
-        if schema:
+        if schema is not None:
             if not isinstance(schema, dict):
                 raise ValueError("response_format.schema must be a JSON object")
             name_ = schema.get("title", "Schema")
