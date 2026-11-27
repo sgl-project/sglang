@@ -944,9 +944,12 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             // Intel XPU: The GPU is reached through the render-node device plus
             // the host's video group GID, per docs/docs/hardware-platforms/xpu.mdx.
             "docker run --privileged",
+            "  --user root",
             "  --group-add $(getent group video | cut -d: -f3)",
             "  --device /dev/dri",
             "  -v /dev/dri/by-path:/dev/dri/by-path",
+            "  -v /dev/shm:/dev/shm",
+            "  --shm-size 32g",
           ]
         : [
             "docker run --gpus all",
