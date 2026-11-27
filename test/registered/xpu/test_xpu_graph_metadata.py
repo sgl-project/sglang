@@ -692,24 +692,45 @@ class TestXPUGraphMetadata(CustomTestCase):
         self.assertIsNone(_allocate_output_buffer((torch.ones(1, 2), None)))
 
     def test_xpu_mem_get_info(self):
-        """Verify that get_available_gpu_memory queries torch.xpu.mem_get_info."""
+        """Verify XPU free-memory query, allocator upper-bound clamp, and fallback."""
         from sglang.srt.utils.device import get_available_gpu_memory
 
-        fake_total = 16 * 1024**3
-        fake_free = 10 * 1024**3
+        gib = 1024**3
+        fake_total = 16 * gib
 
         with (
             patch("torch.xpu.device_count", return_value=1),
             patch("torch.xpu.current_device", return_value=0),
             patch("sglang.srt.utils.device.empty_device_cache") as mock_empty_cache,
-            patch(
-                "torch.xpu.mem_get_info", return_value=(fake_free, fake_total)
-            ) as mock_mem_info,
+            patch("torch.xpu.memory_reserved", return_value=4 * gib),
         ):
-            avail_gb = get_available_gpu_memory("xpu", 0)
-            mock_empty_cache.assert_called_once()
-            mock_mem_info.assert_called_once_with(0)
-            self.assertAlmostEqual(avail_gb, 10.0, places=2)
+            # 1. Normal driver report (10 GiB <= 16 - 4 = 12 GiB): uses driver free.
+            with patch(
+                "torch.xpu.mem_get_info", return_value=(10 * gib, fake_total)
+            ) as mock_mem_info:
+                self.assertAlmostEqual(
+                    get_available_gpu_memory("xpu", 0), 10.0, places=2
+                )
+                mock_empty_cache.assert_called_once()
+                mock_mem_info.assert_called_once_with(0)
+
+            # 2. Frozen Sysman report (free == total): clamped by total - reserved.
+            with patch("torch.xpu.mem_get_info", return_value=(fake_total, fake_total)):
+                self.assertAlmostEqual(
+                    get_available_gpu_memory("xpu", 0), 12.0, places=2
+                )
+
+            # 3. Unsupported Sysman (RuntimeError): falls back to total_memory - reserved.
+            with (
+                patch("torch.xpu.mem_get_info", side_effect=RuntimeError("no sysman")),
+                patch(
+                    "torch.xpu.get_device_properties",
+                    return_value=SimpleNamespace(total_memory=fake_total),
+                ),
+            ):
+                self.assertAlmostEqual(
+                    get_available_gpu_memory("xpu", 0), 12.0, places=2
+                )
 
     def test_full_xpu_graph_backend_retains_capture_inputs_and_cleans_up(self):
         from contextlib import nullcontext
