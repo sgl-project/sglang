@@ -16,7 +16,12 @@ import numpy.typing as npt
 import zmq
 from mori.io import EngineDesc, MemoryDesc
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferDestination,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     ABORT_TAG,
     AbortNotification,
@@ -2103,6 +2108,7 @@ class MoriKVManager(CommonKVManager):
         decode_prefix_len: Optional[int],
         is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ) -> List[bytes]:
         if is_dummy:
             kv_indices_bytes = aux_bytes = state_bytes = b""
