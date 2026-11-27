@@ -36,11 +36,11 @@ class MooncakeEngramStorage(HiCacheEngramStorage):
             or row_bytes < 1
         ):
             raise ValueError(
-                "deepep_rdma requires Qwen head boundaries and byte-row specs"
+                "deepep_rdma requires Engram head boundaries and byte-row specs"
             )
         from mooncake.engram import EngramStore
 
-        from sglang.srt.mem_cache.engram.remote import make_remote_config
+        from sglang.srt.mem_cache.engram.remote_utils import make_remote_config
 
         heads = len(head_bounds) - 1
         config = make_remote_config(remote, heads)
@@ -104,7 +104,7 @@ class MooncakeEngramStorage(HiCacheEngramStorage):
         if rows.shape[0] != self.row_end - self.row_start:
             raise ValueError("Loaded rows must match this node's storage heads")
         if row_bytes != self._row_bytes:
-            # Qwen can discover FP8 storage from checkpoint shards while loading.
+            # Checkpoint loading can reveal an FP8 row width after construction.
             # Placement is unchanged; no bytes or bootstrap records were published.
             from mooncake.engram import EngramStore
 

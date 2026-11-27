@@ -1,4 +1,4 @@
-"""Qwen Engram runtime metadata for Mooncake; no model collectives here."""
+"""Runtime identity, lookup capacity, and NCCL setup for remote Engram storage."""
 
 import hashlib
 import json
@@ -20,8 +20,12 @@ def select_rdma_device(device, local_rank):
     return device.format(local_rank=local_rank).strip()
 
 
-def configure_nccl(config, local_rank):
-    """Apply the remote Engram NIC before NCCL caches process-wide devices."""
+def configure_remote_nccl(config, local_rank):
+    """Validate cuMem and apply an explicit NIC before NCCL initialization.
+
+    NIC selection is process-wide: it also restricts model communicators in
+    this worker. Without rdma_device, preserve NCCL's existing NIC selection.
+    """
     from sglang.srt.mem_cache.engram import _parse_config
 
     options = _parse_config(config)
@@ -40,7 +44,9 @@ def configure_nccl(config, local_rank):
     device = select_rdma_device(options["rdma_device"], local_rank)
     os.environ["NCCL_IB_HCA"] = "=" + device
     logger.info(
-        "Engram local rank %s: NCCL_IB_HCA=%s", local_rank, os.environ["NCCL_IB_HCA"]
+        "Engram local rank %s: NCCL_IB_HCA=%s applies to model and Engram NCCL",
+        local_rank,
+        os.environ["NCCL_IB_HCA"],
     )
 
 
@@ -96,7 +102,7 @@ def make_remote_config(options, heads):
     )
     if schedule.enable_mixed_chunk:
         tokens = max(tokens, prefill + decode_tokens)
-    # Global-TP Qwen gathers attention-DP token IDs before embedding lookup.
+    # Global-TP Engram lookup gathers attention-DP token IDs before lookup.
     capacity = tokens * max(parallel.attn_dp_size, 1) * heads
     configured = options.get("max_lookup_rows", capacity)
     if configured < capacity:

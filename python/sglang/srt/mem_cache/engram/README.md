@@ -93,8 +93,9 @@ Use the matching Mooncake Engram Config branch and its rebuilt Master/Python
 extension. `--enable-hi-engram` remains a boolean flag; select the backend in
 JSON. Reuse the existing `MOONCAKE_MASTER=host:port` or Mooncake configuration.
 Enable `NCCL_CUMEM_ENABLE=1` before launch, as required by NCCL GIN windows.
-An Engram-only bootstrap hook selects an explicitly configured NIC before the
-first NCCL process group; Engine and ModelRunner are unchanged.
+An Engram-gated bootstrap hook validates cuMem and applies an explicitly
+configured NIC before the first NCCL process group. NIC selection affects all
+NCCL communicators in that worker; Engine and ModelRunner are unchanged.
 
 ```bash
 export MOONCAKE_MASTER=master-host:50051
