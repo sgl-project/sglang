@@ -663,6 +663,8 @@ def fused_sigmoid_gating_delta_rule_update(
             "match_cutedsl_decode reproduces an NVIDIA-only kernel and is not "
             "available on ROCm."
         )
+    if torch.compiler.is_compiling():
+        q, k, v, a, b = (t.contiguous() for t in (q, k, v, a, b))
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
     stride_k = k.stride()[1]

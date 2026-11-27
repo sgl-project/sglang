@@ -418,6 +418,31 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+def _token_major_conv_operands(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Contiguous ``(tokens, dim)`` input and output buffers for a channel-last ``x``.
+
+    A compiled graph may copy a view operand into a contiguous buffer while the kernel
+    keeps the strides read at trace time; contiguous operands keep the two in agreement.
+    """
+    x_tokens = x.t().contiguous()
+    return x_tokens, torch.empty_like(x_tokens)
+
+
+def _conv_state_storage(conv_state: torch.Tensor) -> torch.Tensor:
+    """The tensor to launch a kernel on, given ``conv_state``'s strides.
+
+    The KDA pool stores conv states as ``(slots, state_len, dim)`` and passes their
+    ``(slots, dim, state_len)`` transpose. A compiled graph may copy that view into a
+    contiguous buffer its strides do not describe; the pool's own storage is what
+    they describe.
+    """
+    if torch.compiler.is_compiling() and not conv_state.is_contiguous():
+        storage = conv_state.transpose(-1, -2)
+        if storage.is_contiguous():
+            return storage
+    return conv_state
+
+
 def _causal_conv1d_fn_triton(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -484,18 +509,27 @@ def _causal_conv1d_fn_triton(
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
+    o_ptr = None
+    if x.stride(0) == 1 and torch.compiler.is_compiling():
+        x_ptr, o_ptr = _token_major_conv_operands(x)
+        x = x_ptr.t()
+    else:
+        x_ptr = x
+
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
     if output_split_size:
         if output_split_size < 0 or dim % output_split_size:
             raise ValueError("output_split_size must be positive and divide dim")
-        out = torch.empty(
+        out = o_ptr = torch.empty(
             (dim // output_split_size, cu_seqlen, output_split_size),
             dtype=x.dtype,
             device=x.device,
         )
+    elif o_ptr is not None:
+        out = o_ptr.t()
     else:
-        out = torch.empty_like(x)
+        out = o_ptr = torch.empty_like(x)
     _, width = weight.shape
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
@@ -574,14 +608,14 @@ def _causal_conv1d_fn_triton(
 
     _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
-        x,
+        x_ptr,
         weight,
         bias,
-        conv_states,
+        None if conv_states is None else _conv_state_storage(conv_states),
         cache_indices,
         has_initial_state,
         query_start_loc,
-        out,
+        o_ptr,
         block_table,
         # Matrix dimensions
         dim,
@@ -1216,6 +1250,8 @@ def causal_conv1d_update(
     if unsqueeze:
         # make it (batch, dim, seqlen) with seqlen == 1
         x = x.unsqueeze(-1)
+    if torch.compiler.is_compiling():
+        x = x.contiguous()
     batch, dim, seqlen = x.shape
     _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
@@ -1327,7 +1363,7 @@ def causal_conv1d_update(
         x,
         weight,
         bias,
-        conv_state,
+        _conv_state_storage(conv_state),
         cache_seqlens,
         conv_state_indices,
         num_accept_tokens,
