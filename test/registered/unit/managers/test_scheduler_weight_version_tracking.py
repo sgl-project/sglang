@@ -9,7 +9,7 @@ from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -27,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.weight_versions import compute_weight_version_spans
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -63,6 +64,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     ) -> SimpleNamespace:
         return SimpleNamespace(
             collect_inflight_reqs=lambda: set(inflight),
+            _num_queued_outputs=lambda: {},
             waiting_queue=list(waiting),
             chunked_req=chunked,
             hisparse_coordinator=(
@@ -91,6 +93,151 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         self.assertEqual(
             set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
         )
+
+
+class _OverlappedReq:
+    def __init__(self, output_ids, *, middle_chunks=0):
+        self.output_ids = list(output_ids)
+        self.weight_version_events = []
+        self.inflight_middle_chunks = middle_chunks
+        self.is_retracted = False
+        self.beam_group = None
+
+    def finished(self):
+        return False
+
+
+class TestVersionChangeWithAnOverlappedResultQueued(CustomTestCase):
+    """The real overlap loop: a control request is handled at the top of an iteration, while the previous
+    forward's result still waits in result_queue for process_batch_result."""
+
+    _serving = TestSchedulerRecordWeightVersionChange._serving
+
+    def _run(self, req, *, forwards, tokens_per_result=1):
+        """Change the version at the top of the second iteration; return the tokens with the version each forward
+        ran on, and the spans reported for the request."""
+        serving = self._serving("0")
+        batch = SimpleNamespace(
+            reqs=[req],
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            forward_mode=ForwardMode.DECODE,
+        )
+        batch.copy = lambda: batch
+        scheduler = SimpleNamespace(
+            gracefully_exit=False,
+            enable_overlap_mlx=False,
+            _engine_paused=False,
+            running_batch=batch,
+            last_batch=None,
+            is_generation=False,
+            waiting_queue=[],
+            chunked_req=None,
+            hisparse_coordinator=None,
+            collect_inflight_reqs=lambda: {req},
+            is_disable_overlap_for_batch=lambda *args, **kwargs: False,
+            _apply_war_barrier=lambda: None,
+            on_idle=lambda: None,
+        )
+        scheduler._num_queued_outputs = lambda: Scheduler._num_queued_outputs(scheduler)
+        iteration, launched = 0, []
+
+        def ingest():
+            nonlocal iteration
+            iteration += 1
+            if iteration == 2:
+                self.assertEqual(len(scheduler.result_queue), 1)
+                Scheduler.record_weight_version_change(scheduler, "1")
+            scheduler.gracefully_exit = iteration > forwards + 1
+
+        def run_batch(_):
+            launched.append(serving.weight_version)
+            return [100 + iteration] * tokens_per_result
+
+        scheduler.ingest_requests = ingest
+        scheduler.get_next_batch_to_run = lambda **kwargs: SimpleNamespace(
+            running_batch=batch, batch_to_run=batch if iteration <= forwards else None
+        )
+        scheduler.run_batch = run_batch
+        scheduler.process_batch_result = lambda _, result: req.output_ids.extend(result)
+        Scheduler.event_loop_overlap(scheduler)
+        spans = compute_weight_version_spans(
+            req.weight_version_events, serving.weight_version, len(req.output_ids)
+        )
+        return launched, [(span.version, span.start, span.end) for span in spans]
+
+    def test_a_queued_decode_token_belongs_to_the_version_its_forward_ran_on(self):
+        launched, spans = self._run(_OverlappedReq([101, 102]), forwards=2)
+        self.assertEqual(launched, ["0", "1"])
+        self.assertEqual(spans, [("0", 0, 3), ("1", 3, 4)])
+
+    def test_a_queued_first_and_last_token_belongs_to_the_old_version(self):
+        launched, spans = self._run(_OverlappedReq([]), forwards=1)
+        self.assertEqual(launched, ["0"])
+        self.assertEqual(spans, [("0", 0, 1)])
+
+    def test_a_queued_middle_chunk_commits_no_token(self):
+        req = _OverlappedReq([], middle_chunks=1)
+        # the queued result is a prefill chunk: the request's first token comes from a forward after the change
+        self._run(req, forwards=1, tokens_per_result=0)
+        self.assertEqual(req.weight_version_events, [])
+
+    def test_a_request_retracted_after_the_change_keeps_no_count_of_its_dropped_output(
+        self,
+    ):
+        """The change counted the queued token; the retraction in the same iteration drops that token, and the
+        request's next one comes from the new version."""
+        req = _OverlappedReq([101, 102])
+        req.retraction_count, req.input_embeds, req.send_token_offset = 0, None, 0
+        req.kv = SimpleNamespace(holds_kv=False)
+        self._serving("0")
+        batch = SimpleNamespace(
+            reqs=[req],
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            forward_mode=ForwardMode.DECODE,
+        )
+        scheduler = SimpleNamespace(
+            enable_overlap_mlx=False,
+            result_queue=[(batch, None)],
+            collect_inflight_reqs=lambda: {req},
+            waiting_queue=[],
+            chunked_req=None,
+            hisparse_coordinator=None,
+        )
+        scheduler._num_queued_outputs = lambda: Scheduler._num_queued_outputs(scheduler)
+        Scheduler.record_weight_version_change(scheduler, "1")
+        self.assertEqual(req.weight_version_events[0].num_output_tokens, 3)
+
+        Req.reset_for_retract(req)
+        req.output_ids += [201, 202]  # prefilled again and decoded on the new version
+
+        spans = compute_weight_version_spans(
+            req.weight_version_events, "1", len(req.output_ids)
+        )
+        self.assertEqual(
+            [(span.version, span.start, span.end) for span in spans],
+            [("0", 0, 2), ("1", 2, 4)],
+        )
+
+    def test_a_queued_prebuilt_batch_commits_no_token(self):
+        req = _OverlappedReq([900])
+        batch = SimpleNamespace(
+            reqs=[req],
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            forward_mode=ForwardMode.PREBUILT,
+        )
+        scheduler = SimpleNamespace(
+            enable_overlap_mlx=False, result_queue=[(batch, None)]
+        )
+        self.assertEqual(Scheduler._num_queued_outputs(scheduler), {})
+
+    def test_the_mlx_loop_queues_jobs_that_are_not_counted(self):
+        scheduler = SimpleNamespace(enable_overlap_mlx=True, result_queue=[object()])
+        self.assertEqual(Scheduler._num_queued_outputs(scheduler), {})
+
+    def test_a_queued_output_that_is_dropped_leaves_the_span_at_what_was_kept(self):
+        req = _OverlappedReq([101, 102])
+        _, spans = self._run(req, forwards=1, tokens_per_result=0)
+        self.assertEqual(spans, [("0", 0, 2)])
 
 
 class TestSchedulerBatchWeightVersion(CustomTestCase):
@@ -302,6 +449,8 @@ def _runner(result=(True, "ok")):
     runner.weight_updater.receive_weights_from_distributed.return_value = [
         ("weight", torch.tensor([1.0]))
     ]
+    # peers write these runners' live weights
+    runner.weight_updater.has_weight_staging.return_value = False
     return runner
 
 
@@ -520,7 +669,9 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
 
         target.weight_updater.begin_weight_update.assert_not_called()
         target.weight_updater.end_weight_update.assert_not_called()
-        draft.weight_updater.begin_weight_update.assert_called_once_with()
+        draft.weight_updater.begin_weight_update.assert_called_once_with(
+            use_staging=False
+        )
         draft.weight_updater.end_weight_update.assert_called_once()
 
     def test_begin_rejects_reentry(self):

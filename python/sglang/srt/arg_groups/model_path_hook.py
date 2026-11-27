@@ -12,6 +12,7 @@ from typing import Any, Optional
 from sglang.srt.arg_groups.overrides import (
     _gguf_quantization,
     declare_resolution,
+    remote_instance_transfer_engine_of,
     resolving_view,
     run_post_process_pass,
 )
@@ -267,6 +268,9 @@ def handle_load_format(server_args: Any):
     if cfg.remote_instance_weight_loader_start_seed_via_mori:
         _assert_mori_seed_usable(cfg)
 
+    if cfg.weight_update_staging:
+        _assert_weight_update_staging_usable(cfg)
+
     # "ipc_cache" is an internal-only load format: ModelRunner sets it
     # automatically when the weight cache is enabled, and it is not a public
     # --load-format choice. Setting it directly is always wrong (no daemon is
@@ -335,6 +339,37 @@ def _assert_mori_seed_usable(cfg: Any) -> None:
         raise ValueError(
             f"{flag} cannot run with --enable-memory-saver: it releases the registered weights"
         )
+
+
+def _assert_weight_update_staging_usable(cfg: Any) -> None:
+    flag = "--weight-update-staging"
+    if (
+        remote_instance_transfer_engine_of(cfg)
+        or cfg.remote_instance_weight_loader_start_seed_via_nixl
+    ):
+        raise ValueError(
+            f"{flag}: only the MoRI seed publishes the staging region; the transfer engine and the NIXL seed "
+            "publish the live weights, which peers would then write while the engine generates"
+        )
+    # shortcut: catches only --quantization, not a checkpoint that is quantized by its own config; a quant method
+    # that packs weights in place needs the unpacked layout in the staging region, upgrade when one is needed.
+    if cfg.quantization:
+        raise ValueError(
+            f"{flag} does not support --quantization {cfg.quantization}: the staging region mirrors the live "
+            "weights byte for byte, and a quantized runner repacks them after loading"
+        )
+    # shortcut: these three are refused because nobody ran them, not because they are known to fail; lift each one
+    # once it has a test. A draft runner has its own slot for the embed and head it shares with the target, so its
+    # commit could bring old bytes back. Local control broadcast hands each DP group the end of the session on its
+    # own, and the commit needs every rank on the same step. Each tokenizer worker has its own session state, so
+    # the worker that ends the session may wait for its requests as in a plain session.
+    untested = {
+        "--speculative-algorithm": cfg.speculative_algorithm is not None,
+        "--enable-dp-attention-local-control-broadcast": cfg.enable_dp_attention_local_control_broadcast,
+        "--tokenizer-worker-num above 1": cfg.tokenizer_worker_num > 1,
+    }
+    if refused := [option for option, is_set in untested.items() if is_set]:
+        raise ValueError(f"{flag} is not supported together with {', '.join(refused)}")
 
 
 def _assert_nixl_seed_usable(cfg: Any) -> None:

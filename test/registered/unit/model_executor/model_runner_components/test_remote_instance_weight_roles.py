@@ -43,9 +43,18 @@ def _start_bootstrap_server():
     raise TimeoutError(f"the bootstrap server on {url} did not start")
 
 
-def _publish(role, session_id, port, nixl_agent=None, mori_engine=None):
+def _publish(
+    role,
+    session_id,
+    port,
+    nixl_agent=None,
+    mori_engine=None,
+    weight_update_staging=False,
+):
     model_config = SimpleNamespace(
-        remote_instance_weight_loader_backend=None, engine_info_bootstrap_port=port
+        remote_instance_weight_loader_backend=None,
+        engine_info_bootstrap_port=port,
+        weight_update_staging=weight_update_staging,
     )
     with (
         patch.object(
@@ -259,8 +268,54 @@ class TestPublicationRoles(CustomTestCase):
                     [8192, 4096, "YmxvY2stYg=="],
                 ],
                 "weights_info_dict": {"target.weight": [1, 4, 2]},
+                "weight_update_staging": False,
             },
         )
+
+    def test_a_mori_runner_with_a_staging_region_publishes_its_slots_not_the_live_weights(
+        self,
+    ):
+        """What a peer writes while the engine generates must not be the weights it generates with."""
+        server, url = _start_bootstrap_server()
+        self.addCleanup(server.close)
+        desc = SimpleNamespace(pack=lambda: b"block")
+        staging = SimpleNamespace(slot_info={"target.weight": (4096, 4, 2)})
+        registered = []
+
+        def register_weight_staging_mori(staging, mori_engine, gpu_id):
+            registered.append((staging, gpu_id))
+            return [(4096, 64, desc)]
+
+        with (
+            patch.object(
+                transporter_mod.WeightStaging, "allocate", lambda model: staging
+            ),
+            patch.object(
+                transporter_mod,
+                "register_weight_staging_mori",
+                register_weight_staging_mori,
+            ),
+            patch.object(
+                transporter_mod,
+                "register_memory_region_mori",
+                lambda *args: self.fail("the live weights were registered for writes"),
+            ),
+        ):
+            _publish(
+                "target",
+                None,
+                server.port,
+                mori_engine=SimpleNamespace(get_engine_desc=lambda: desc),
+                weight_update_staging=True,
+            )
+
+        info = requests.get(
+            f"{url}/get_transfer_engine_info", params={"rank": 0}
+        ).json()["remote_instance_transfer_engine_info"]
+        self.assertEqual(registered, [(staging, 3)])
+        self.assertEqual(info["memory_blocks"], [[4096, 64, "YmxvY2s="]])
+        self.assertEqual(info["weights_info_dict"], {"target.weight": [4096, 4, 2]})
+        self.assertIs(info["weight_update_staging"], True)
 
     def test_drafts_publish_once_their_pools_bind_the_targets_embed_and_head(self):
         """EAGLE binds the target's embed and head into its draft while allocating the draft's pools; a table

@@ -300,6 +300,7 @@ class _ContextStub:
 class _SchedulerStub:
     _collect_inflight_batches = Scheduler._collect_inflight_batches
     collect_inflight_reqs = Scheduler.collect_inflight_reqs
+    _num_queued_outputs = Scheduler._num_queued_outputs
 
     def __init__(
         self,
@@ -312,6 +313,7 @@ class _SchedulerStub:
     ):
         self.serving = _ServingStub(version)
         self.enable_continuous_input_polling = False
+        self.enable_overlap_mlx = False
         self.result_queue = deque()
         self.running_batch = SimpleNamespace(reqs=running)
         self.last_batch = last_batch

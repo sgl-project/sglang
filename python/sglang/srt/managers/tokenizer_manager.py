@@ -858,6 +858,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A staged session (adapter-only, deferred publications pending) runs
         # under the reader lock, concurrent with generation.
         self._weight_update_staged_session = False
+        # A use_staging session (base weights written to the staging region) does the same.
+        self._weight_update_uses_staging = False
         self._weight_update_pending_version: Optional[str] = None
 
     def init_lora(self):

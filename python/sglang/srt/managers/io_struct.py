@@ -2286,6 +2286,10 @@ class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
     # sync), so the quant unpack/repack round-trip is skipped and a base-named
     # tensor arriving in-session is an error.
     sync_base: bool = True
+    # Peers write this session's base weights into the staging region (--weight-update-staging)
+    # instead of the live weights, so the engine is not paused and keeps generating with the old
+    # weights; end_weight_update installs them between two forward steps.
+    use_staging: bool = False
 
 
 class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2302,7 +2306,11 @@ class EndWeightUpdateReqInput(BaseReq, kw_only=True):
     # (set equality + per-tensor checksum) before it is applied.
     expected_lora_checksums: Optional[Dict[str, Dict[str, str]]] = None
     # discard the streamed LoRA stash and deferred publications; in-place base writes are not rolled back
+    # (a use_staging session never wrote the live weights, so its abort leaves them intact)
     abort: bool = False
+    # use_staging sessions: the version the installed weights carry, recorded with the install so that
+    # no token is attributed to a version it was not generated under
+    weight_version: Optional[str] = None
 
 
 class EndWeightUpdateReqOutput(BaseReq, kw_only=True):

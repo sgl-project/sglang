@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import sys
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping
 
 import msgspec
 
@@ -37,14 +37,22 @@ class WeightVersionEvent:
 # ======================================================================
 # Scheduler process
 # ======================================================================
-def record_weight_version_events(reqs: Iterable[Req], old_version: str) -> int:
+def record_weight_version_events(
+    reqs: Iterable[Req],
+    old_version: str,
+    num_queued_outputs: Mapping[Req, int] | None = None,
+) -> int:
+    """`num_queued_outputs`: per request, the tokens a forward on the old version has computed and the scheduler
+    has not appended to `output_ids` yet."""
+    num_queued_outputs = num_queued_outputs or {}
     num_recorded = 0
     for req in reqs:
-        if req.output_ids:
+        num_output_tokens = len(req.output_ids) + num_queued_outputs.get(req, 0)
+        if num_output_tokens:
             req.weight_version_events.append(
                 WeightVersionEvent(
                     old_version=old_version,
-                    num_output_tokens=len(req.output_ids),
+                    num_output_tokens=num_output_tokens,
                 )
             )
             num_recorded += 1

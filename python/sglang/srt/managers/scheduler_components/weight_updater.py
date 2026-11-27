@@ -109,12 +109,20 @@ def _parse_runner_selector(selector: str) -> Set[str]:
     )
 
 
+# the engine keeps generating during a use_staging session, and a broadcast load goes into the live weights
+_LIVE_LOAD_IN_STAGING_SESSION = (
+    "base tensors arrived over update_weights_from_distributed in a use_staging weight-update session; "
+    "send them with update_weights_from_tensor or write them to the published staging addresses"
+)
+
+
 class _WeightUpdateSession(msgspec.Struct, frozen=True):
     # recorded at begin so end finalizes the same runners
     selector: str
     loaded_weights: bool = False
     sync_base: bool = True
     pending_version: Optional[str] = None
+    use_staging: bool = False
 
 
 @dataclass(kw_only=True, slots=True)
@@ -178,6 +186,10 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if error := self._staging_session_error("update_weights_from_disk"):
+            return UpdateWeightFromDiskReqOutput(
+                success=False, message=error, num_paused_requests=0
+            )
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -290,6 +302,7 @@ class SchedulerWeightUpdaterManager:
                     assert self._session.sync_base, (
                         "base tensors arrived in a sync_base=False weight-update session"
                     )
+                    assert not self._session.use_staging, _LIVE_LOAD_IN_STAGING_SESSION
                 self._stash_lora_tensors(lora_tensors)
             except Exception as e:
                 success, message = False, f"Failed to receive weights: {e}"
@@ -351,10 +364,19 @@ class SchedulerWeightUpdaterManager:
                 assert self._session.sync_base, (
                     "base tensors arrived in a sync_base=False weight-update session"
                 )
+                # begin checked the staging regions of the session's runners, not of any others
+                assert (
+                    not self._session.use_staging
+                    or recv_req.selector == self._session.selector
+                ), (
+                    f"a use_staging session over the {self._session.selector!r} runners got a load for "
+                    f"{recv_req.selector!r}"
+                )
                 for _, runner in self._select_runners(recv_req.selector):
                     success, message = runner.weight_updater.update_weights_from_tensor(
                         named_tensors=named_tensors,
                         load_format=load_format,
+                        use_staging=self._session.use_staging,
                     )
                     if not success:
                         break
@@ -374,6 +396,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        if error := self._staging_session_error("update_weights_from_ipc"):
+            return UpdateWeightsFromIPCReqOutput(success=False, message=error)
         with self._observe_weight_load("ipc"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -425,17 +449,31 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
+        if recv_req.use_staging and (error := self._weight_staging_error(recv_req)):
+            return BeginWeightUpdateReqOutput(success=False, message=error)
         self._lora_stash = {}
+        start = time.perf_counter()
         if recv_req.sync_base:
             for _, runner in self._select_runners(recv_req.selector):
-                runner.weight_updater.begin_weight_update()
+                runner.weight_updater.begin_weight_update(
+                    use_staging=recv_req.use_staging
+                )
         # peers write the weights over RDMA, outside the engine's streams; an in_place pause leaves the last
         # overlapped forward running
         torch.get_device_module().synchronize()
         self._session = _WeightUpdateSession(
-            selector=recv_req.selector, sync_base=recv_req.sync_base
+            selector=recv_req.selector,
+            sync_base=recv_req.sync_base,
+            use_staging=recv_req.use_staging,
         )
         torch.distributed.barrier(group=self.tp_cpu_group)
+        if recv_req.use_staging:
+            # the engine is generating: this is time it did not, like the install at the end; the barrier is
+            # in it, so every rank reports the slowest one
+            logger.info(
+                "Staged weight update begins: generation held for %.1f ms",
+                (time.perf_counter() - start) * 1e3,
+            )
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
     def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
@@ -445,7 +483,10 @@ class SchedulerWeightUpdaterManager:
                 success=False,
                 message="no weight-update session is open; call begin_weight_update() first",
             )
-        if self._session.sync_base:
+        start, use_staging = time.perf_counter(), self._session.use_staging
+        if use_staging:
+            self._install_staged_weights(abort=recv_req.abort)
+        elif self._session.sync_base:
             run_post_load = not self._session.loaded_weights
             for _, runner in self._select_runners(self._session.selector):
                 runner.weight_updater.end_weight_update(run_post_load=run_post_load)
@@ -454,12 +495,88 @@ class SchedulerWeightUpdaterManager:
             success, message = True, "Aborted: streamed adapters discarded"
         else:
             success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
-        pending_version = self._session.pending_version
+        if success and not recv_req.abort and self._peers_wrote_unused_staging():
+            success, message = (
+                False,
+                (
+                    "no weights were loaded in this session, and this engine publishes its staging region to "
+                    "peers (--weight-update-staging): what they wrote is installed only by a session opened with "
+                    "use_staging=True"
+                ),
+            )
+        pending_version = recv_req.weight_version or self._session.pending_version
         self._session = None
         if success and not recv_req.abort:
             self.record_weight_version_after_update(pending_version)
         torch.distributed.barrier(group=self.tp_cpu_group)
+        if use_staging:
+            logger.info(
+                "Staged weight update ends: generation held for %.1f ms",
+                (time.perf_counter() - start) * 1e3,
+            )
         return EndWeightUpdateReqOutput(success=success, message=message)
+
+    def _peers_wrote_unused_staging(self) -> bool:
+        """A base session that loaded nothing got its weights from peers, by address; if those addresses are
+        staging slots and the session does not install them, the update silently did nothing."""
+        return (
+            self._session.sync_base
+            and not self._session.use_staging
+            and not self._session.loaded_weights
+            and any(
+                runner.weight_updater.has_weight_staging()
+                for _, runner in self._select_runners(self._session.selector)
+            )
+        )
+
+    def _staging_session_error(self, op: str) -> Optional[str]:
+        """An in-place load during a use_staging session would be overwritten by the install at its end."""
+        if self._session is not None and self._session.use_staging:
+            return f"{op} loads the live weights in place, which the open use_staging session will overwrite"
+        return None
+
+    def _weight_staging_error(
+        self, recv_req: BeginWeightUpdateReqInput
+    ) -> Optional[str]:
+        if not recv_req.sync_base:
+            return "use_staging stages base weights; it needs sync_base=True"
+        missing = [
+            role
+            for role, runner in self._select_runners(recv_req.selector)
+            if not runner.weight_updater.has_weight_staging()
+        ]
+        if missing:
+            return (
+                f"the {missing} runners have no staging region; start the engine with "
+                "--weight-update-staging"
+            )
+        return None
+
+    def _install_staged_weights(self, *, abort: bool) -> None:
+        """Copy the staging region over the live weights. This runs in the scheduler loop, between two forward
+        steps and at the same one on every TP rank, so it needs no pause: only the last overlapped forward may
+        still be running, and it must finish on the old weights."""
+        device_module = torch.get_device_module()
+        start = time.perf_counter()
+        device_module.synchronize()
+        waited = time.perf_counter()
+        for _, runner in self._select_runners(self._session.selector):
+            runner.weight_updater.end_weight_update(
+                run_post_load=True, use_staging=True, abort=abort
+            )
+        device_module.synchronize()
+        done = time.perf_counter()
+        if abort:
+            return
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_weight_load(done - start, "staged_commit")
+        logger.info(
+            "Staged weight commit: generation held for %.1f ms "
+            "(%.1f ms for the forward in flight, %.1f ms to install)",
+            (done - start) * 1e3,
+            (waited - start) * 1e3,
+            (done - waited) * 1e3,
+        )
 
     def forget_lora_adapter(self, lora_name: str) -> None:
         """Drop the partial-stream guard entry: a re-registered or unloaded name

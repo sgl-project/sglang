@@ -22,7 +22,7 @@ import signal
 import sys
 import time
 from array import array
-from collections import deque
+from collections import Counter, deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
@@ -5674,9 +5674,36 @@ class Scheduler(
             live_reqs.update(
                 act.req for act in self.hisparse_coordinator.ack_staging_queue
             )
-        num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
+        num_queued_outputs = self._num_queued_outputs()
+        live_reqs.update(num_queued_outputs)
+        num_recorded = record_weight_version_events(
+            live_reqs, old_version=old_version, num_queued_outputs=num_queued_outputs
+        )
         logger.info(
             f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
+        )
+
+    def _num_queued_outputs(self) -> Counter:
+        """Per request, the output tokens its queued results will commit. Their forwards were launched before
+        the weights changed (an overlapped forward under an in-place pause or a staged commit), and
+        process_batch_result appends them to output_ids only later; the conditions mirror the ones there."""
+        # shortcut: a speculative batch commits a verified run whose length is not known yet, so it is counted
+        # as none (the version boundary is then early by that run); upgrade by stamping the version on the
+        # batch when it is launched. The MLX loop queues jobs of its own kind and keeps the earlier behavior.
+        if self.enable_overlap_mlx:
+            return Counter()
+        return Counter(
+            req
+            for batch, _ in self.result_queue
+            # a prebuilt batch (PD decode) commits no token
+            if batch.spec_algorithm.is_none() and not batch.forward_mode.is_prebuilt()
+            for req in batch.reqs
+            if not (
+                req.finished()
+                or req.is_retracted
+                or req.beam_group is not None
+                or req.inflight_middle_chunks > 0
+            )
         )
 
     def collect_inflight_reqs(self) -> Set[Req]:

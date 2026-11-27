@@ -2271,6 +2271,8 @@ class ModelRunner:
         *,
         role: str,
     ):
+        if action == "reset_tensors":
+            self.weight_updater.live_weights_change()
         return self._weight_checker.handle(
             action=action,
             allow_quant_error=allow_quant_error,

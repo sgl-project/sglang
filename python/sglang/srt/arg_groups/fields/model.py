@@ -345,6 +345,10 @@ class Model(msgspec.Struct):
         bool,
         "Start seed server via MoRI-IO for remote instance weight loader: each runner publishes a MoRI engine and its registered weight memory, which peers write its weights into over RDMA (AMD GPUs).",
     ] = False
+    weight_update_staging: A[
+        bool,
+        "Keep a second copy of each runner's weights (the staging region). A begin_weight_update(use_staging=True) session fills it while generation continues with the live weights, by update_weights_from_tensor or by peers writing its addresses (published in place of the live weights' with --remote-instance-weight-loader-start-seed-via-mori), and end_weight_update installs it with an on-device copy between two forward steps. Costs one more copy of the weights in device memory.",
+    ] = False
     enable_engine_info_bootstrap: A[
         bool,
         "Start the EngineInfoBootstrapServer and register per-rank parallelism config, without the mooncake/verbs P2P transfer-engine seeding.",

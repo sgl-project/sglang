@@ -35,7 +35,7 @@ def _published(model):
 def _weight_updater(model, published_weight_info):
     model_runner = SimpleNamespace(
         remote_instance_weight_transporter=SimpleNamespace(
-            weight_info=published_weight_info
+            weight_info=published_weight_info, staging=None
         )
     )
     return WeightUpdater(

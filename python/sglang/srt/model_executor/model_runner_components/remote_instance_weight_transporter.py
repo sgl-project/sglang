@@ -10,11 +10,15 @@ import torch
 
 from sglang.srt.distributed.parallel_state import RankParallelismConfig
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.model_runner_components.weight_staging import (
+    WeightStaging,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     register_memory_region,
     register_memory_region_mori,
     register_memory_region_nixl,
+    register_weight_staging_mori,
 )
 from sglang.srt.runtime_context import (
     get_model,
@@ -38,7 +42,9 @@ class RemoteInstanceWeightTransporter:
     session_id: str = ""
     nixl_agent: Optional[Any] = None
     mori_engine: Optional[Any] = None
+    # what peers write to: the live weights, or the staging region's slots when there is one
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
+    staging: Optional[WeightStaging] = None
     parallelism_config: Optional[RankParallelismConfig] = None
     _nixl_registration: Optional[Any] = None
 
@@ -113,6 +119,8 @@ class RemoteInstanceWeightTransporter:
     def maybe_register_and_publish_weight_info(self, role: str) -> None:
         """Registers this runner's weights with its transfer engine and publishes them, with its parallelism
         config, under `role`: ``target``, or the draft role `weight_update_runners()` names."""
+        if get_model().weight_update_staging and self.staging is None:
+            self.staging = WeightStaging.allocate(self.model)
         if (
             (
                 remote_instance_transfer_engine_enabled()
@@ -147,9 +155,15 @@ class RemoteInstanceWeightTransporter:
     def _register_weights_for_peer_writes(self) -> dict:
         """Registers the weights with this runner's transport; returns what a peer needs to write them."""
         if self.mori_engine is not None:
-            self.weight_info, blocks = register_memory_region_mori(
-                self.model, self.mori_engine, self.gpu_id
-            )
+            if self.staging is not None:
+                blocks = register_weight_staging_mori(
+                    self.staging, self.mori_engine, self.gpu_id
+                )
+                self.weight_info = self.staging.slot_info
+            else:
+                self.weight_info, blocks = register_memory_region_mori(
+                    self.model, self.mori_engine, self.gpu_id
+                )
             pack = lambda desc: base64.b64encode(desc.pack()).decode("ascii")  # noqa: E731
             return {
                 "transport": "mori",
@@ -158,6 +172,8 @@ class RemoteInstanceWeightTransporter:
                     [addr, size, pack(desc)] for addr, size, desc in blocks
                 ],
                 "weights_info_dict": self.weight_info,
+                # a writer that skips pausing the engine must see this: the addresses are not the live weights
+                "weight_update_staging": self.staging is not None,
             }
         if self.nixl_agent is not None:
             self.weight_info, self._nixl_registration = register_memory_region_nixl(

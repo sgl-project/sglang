@@ -11,11 +11,18 @@ import torch
 
 import sglang.srt.model_loader.loader as loader_mod
 import sglang.srt.model_loader.remote_instance_weight_loader_utils as utils_mod
-from sglang.srt.arg_groups.model_path_hook import _assert_mori_seed_usable
+from sglang.srt.arg_groups.model_path_hook import (
+    _assert_mori_seed_usable,
+    _assert_weight_update_staging_usable,
+)
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.model_executor.model_runner_components.weight_staging import (
+    WeightStaging,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     register_memory_region_mori,
+    register_weight_staging_mori,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -200,6 +207,82 @@ class TestMoriSeed(CustomTestCase):
                 with self.assertRaisesRegex(RuntimeError, "expandable_segments"):
                     self._register({name: "expandable_segments:True"}, registered)
                 self.assertEqual(registered, [])
+
+    def test_the_staging_region_is_registered_as_one_gpu_block_in_place_of_the_weights(
+        self,
+    ):
+        registered = []
+        engine = SimpleNamespace(
+            register_memory=lambda *args: registered.append(args) or "desc"
+        )
+        mori_io = ModuleType("mori.io")
+        mori_io.MemoryLocationType = SimpleNamespace(GPU="GPU")
+        model = torch.nn.Linear(3, 2)
+        staging = WeightStaging.allocate(model)
+        with (
+            patch.dict(sys.modules, {"mori": ModuleType("mori"), "mori.io": mori_io}),
+            patch.dict(os.environ, {}, clear=True),
+        ):
+            blocks = register_weight_staging_mori(staging, engine, 5)
+
+        address, size = staging.buffer.data_ptr(), staging.buffer.nbytes
+        self.assertEqual(registered, [(address, size, 5, "GPU")])
+        self.assertEqual(blocks, [(address, size, "desc")])
+        live = {param.data_ptr() for param in model.parameters()}
+        for slot_address, numel, element_size in staging.slot_info.values():
+            self.assertNotIn(slot_address, live)
+            self.assertTrue(
+                address <= slot_address
+                and slot_address + numel * element_size <= address + size
+            )
+
+    def test_the_staging_flag_is_refused_where_live_weights_would_be_written_or_repacked(
+        self,
+    ):
+        cfg = lambda **overrides: SimpleNamespace(  # noqa: E731
+            **{
+                "remote_instance_weight_loader_start_seed_via_transfer_engine": False,
+                "remote_instance_weight_loader_start_seed_via_nixl": False,
+                "load_format": "auto",
+                "remote_instance_weight_loader_backend": "transfer_engine",
+                "quantization": None,
+                "speculative_algorithm": None,
+                "enable_dp_attention_local_control_broadcast": False,
+                "tokenizer_worker_num": 1,
+                **overrides,
+            }
+        )
+        _assert_weight_update_staging_usable(cfg())
+        for seed in ("transfer_engine", "nixl"):
+            with (
+                self.subTest(seed),
+                self.assertRaisesRegex(ValueError, "only the MoRI seed"),
+            ):
+                _assert_weight_update_staging_usable(
+                    cfg(
+                        **{f"remote_instance_weight_loader_start_seed_via_{seed}": True}
+                    )
+                )
+        # loading from a remote instance over the transfer engine publishes the live weights too
+        with self.assertRaisesRegex(ValueError, "only the MoRI seed"):
+            _assert_weight_update_staging_usable(cfg(load_format="remote_instance"))
+        with self.assertRaisesRegex(ValueError, "--quantization fp8"):
+            _assert_weight_update_staging_usable(cfg(quantization="fp8"))
+        for override, option in (
+            ({"speculative_algorithm": "EAGLE"}, "--speculative-algorithm"),
+            (
+                {"enable_dp_attention_local_control_broadcast": True},
+                "--enable-dp-attention-local-control-broadcast",
+            ),
+            ({"tokenizer_worker_num": 2}, "--tokenizer-worker-num above 1"),
+        ):
+            with (
+                self.subTest(option),
+                self.assertRaisesRegex(
+                    ValueError, f"not supported together with {option}"
+                ),
+            ):
+                _assert_weight_update_staging_usable(cfg(**override))
 
 
 if __name__ == "__main__":
