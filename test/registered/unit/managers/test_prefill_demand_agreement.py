@@ -346,7 +346,7 @@ class TestWindowRetirement(CustomTestCase):
                 )
 
     def test_a_decode_step_allocates_ahead_of_its_processed_length(self):
-        """Decode allocates ahead of retirement by the decode reserve, which
+        """Decode allocates ahead of retirement by the decode-ahead, which
         covers the overlap lag too."""
         for no_overlap in (False, True):
             schedule = SimpleNamespace(
@@ -356,7 +356,7 @@ class TestWindowRetirement(CustomTestCase):
                 self.subTest(no_overlap=no_overlap),
                 patch("sglang.srt.runtime_context.get_schedule", return_value=schedule),
                 patch(
-                    "sglang.srt.mem_cache.allocation_sizing.get_decode_reserve",
+                    "sglang.srt.mem_cache.allocation_sizing.get_decode_ahead",
                     return_value=10,
                 ),
             ):
