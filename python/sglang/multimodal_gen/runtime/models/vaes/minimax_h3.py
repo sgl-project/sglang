@@ -111,6 +111,7 @@ class MiniMaxH3ImageVAE(MiniMaxH3VideoVAE):
         encode = super().tiled_encode
         if x.ndim != 5 or x.shape[2] != 1:
             return encode(x)
+        # Returning early on one tile rank would skip its all-gather.
         if self.parallel_tiling and get_tile_parallel_state()[1] > 1:
             return encode(x)
         # The request generator samples this posterior after tile assembly.
