@@ -1814,9 +1814,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             state_last_dim = 3 * self.attn_head_dim
         else:
             state_pool_size = num_req_slots * ring_size
-            # NPU exposes state in ring-sized banks; GPU uses flat storage.
-            pad_to = lcm(128, ring_size) if _is_npu else 128
-            state_rows = ceil_align(state_pool_size + ring_size + 1, pad_to)
+            state_rows = state_pool_size + ring_size + 1
+            if _is_npu:
+                state_rows = ceil_align(state_rows, lcm(128, ring_size))
+            else:
+                state_rows = ceil_div(state_rows, 128) * 128
             state_last_dim = 2 * self.attn_head_dim
 
         return state_rows * state_last_dim * c128_state_dtype_size * num_layers
@@ -1830,8 +1832,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_size = self.ring_sizes[2]
-        pad_to = lcm(2, ring_size) if _is_npu else 2
-        state_rows = ceil_align(num_req_slots * ring_size + ring_size + 1, pad_to)
+        # CompressStatePool allocates `size + ring_size + 1` rows, padded to the ratio.
+        state_rows = num_req_slots * ring_size + ring_size + 1
+        if _is_npu:
+            state_rows = ceil_align(state_rows, lcm(2, ring_size))
+        else:
+            state_rows = ceil_div(state_rows, 2) * 2
         state_last_dim = 2 * self.attn_head_dim
         return state_rows * state_last_dim * torch.float32.itemsize * num_layers
 
