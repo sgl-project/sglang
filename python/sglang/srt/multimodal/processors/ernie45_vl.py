@@ -19,7 +19,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.qwen_vl import (
+from sglang.srt.multimodal.qwen_vl_media_processing import (
     ceil_by_factor,
     floor_by_factor,
     round_by_factor,
@@ -207,17 +207,9 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        self.hf_config = hf_config
-        self.model_type = hf_config.model_type
         self.image_start_token_id = hf_config.image_start_token_id
         self.image_end_token_id = hf_config.image_end_token_id
-        self.video_start_token_id = hf_config.video_start_token_id
-        self.video_end_token_id = hf_config.video_end_token_id
 
-        self.IMAGE_FACTOR = 28
-        self.MIN_PIXELS = 4 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
-        self.MAX_RATIO = 200
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|IMAGE_START|><|image@placeholder|><|IMAGE_END|>",
             video_token="<|VIDEO_START|><|video@placeholder|><|VIDEO_END|>",
@@ -225,7 +217,6 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             video_token_id=hf_config.im_patch_id,  # image and video use the same token_id
         ).build(_processor)
 
-        self.tokenizer = self._processor.tokenizer
         self.image_processor = self._processor.image_processor
 
     def _pixel_values_norm(
@@ -338,7 +329,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
                     if result["pixel_values_videos"].numel() == 0:
                         del result["pixel_values_videos"]
 
-        if not self.use_cuda_ipc:
+        if not self._feature_transport.use_cuda_ipc:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if feature_name in result and isinstance(

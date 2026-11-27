@@ -48,6 +48,7 @@ fn resolve_media_work_with_budget(
         prefetched,
         mm_hashes: _,
         admission: _,
+        cancellation: _,
     } = mm;
     let mut prefetched = prefetched.into_iter();
     let budget = ByteBudget::new(max_request_bytes);

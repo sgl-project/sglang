@@ -195,14 +195,15 @@ class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
 
 def _import_manager_module():
     # The manager imports the Ascend kernel package at module level.
-    vendor = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload")
+    module_name = "sgl_kernel_npu.operators.mem_cache"
+    vendor = ModuleType(module_name)
     for name in ("create_shm_tensor", "slot_map_lookup", "unidex_copy_inplace"):
         setattr(vendor, name, Mock(side_effect=AssertionError(f"Unexpected {name}")))
     with patch.dict(
         "sys.modules",
         {
             "sgl_kernel_npu": ModuleType("sgl_kernel_npu"),
-            "sgl_kernel_npu.sparsity_driven_kv_offload": vendor,
+            module_name: vendor,
         },
     ):
         return importlib.import_module(
@@ -216,7 +217,7 @@ class TestSparseKVRequestAllocHook(unittest.TestCase):
         slot map of each fresh row and keep the map of a request that keeps its row."""
         manager_module = _import_manager_module()
         pool = ReqToTokenPool(
-            size=3, max_context_len=8, device="cpu", enable_memory_saver=False
+            size=3, row_width=8, device="cpu", enable_memory_saver=False
         )
         manager = manager_module.SparseKVCacheManager.__new__(
             manager_module.SparseKVCacheManager

@@ -53,13 +53,16 @@ def backend():
     obj.needs_cpu_seq_lens = False
     obj.device = "cpu"
     obj.page_size, obj.speculative_num_draft_tokens = 128, 7
-    obj.max_context_len = 512
     obj.graph_mode = obj.enable_torch_compile = False
     obj.enable_sparsity_driven_kv_offload = False
     obj.is_hybrid_swa = obj.use_sliding_window_kv_pool = False
     obj.q_head_num_padding = None
     obj.req_to_token = torch.arange(1024, dtype=torch.int32).reshape(2, 512)
-    obj.req_to_token_pool = SimpleNamespace(req_to_token=obj.req_to_token)
+    obj.req_to_token_pool = SimpleNamespace(
+        req_to_token=obj.req_to_token, row_width=512
+    )
+    obj.max_kv_len = 512
+    obj.max_num_pages = 4
     obj.graph_metadata = {"block_tables": torch.zeros(2, 4, dtype=torch.int32)}
     obj.token_to_kv_pool = SimpleNamespace(
         get_key_buffer=Mock(return_value=torch.zeros(8, 128, 32)),
@@ -238,7 +241,6 @@ def test_draft_preserves_cpu_lengths_unless_backend_opts_out(
             "envs": SimpleNamespace(
                 SGLANG_DSPARK_EMBED_IN_GRAPH=SimpleNamespace(get=lambda: False)
             ),
-            "_make_num_token_non_padded": lambda *args: None,
             "DraftForwardResult": SimpleNamespace,
         },
     )
@@ -270,6 +272,7 @@ def test_draft_preserves_cpu_lengths_unless_backend_opts_out(
         _draft_block_spec_info=object(),
         _fill_dp_moe_sync_metadata=Mock(),
         deferred_draft_kv=None,
+        _num_token_non_padded=None,
     )
     proposer.draft_block_ids_view = lambda **kwargs: draft_block_ids_view(
         proposer, **kwargs
@@ -291,7 +294,6 @@ def test_draft_preserves_cpu_lengths_unless_backend_opts_out(
         draft_input=draft,
         verify_window=window,
         bs=1,
-        device="cpu",
         embed_module=lambda x: torch.zeros(1, 7, 16),
     )
     if needs_cpu and mirror is None:
@@ -348,7 +350,6 @@ def test_target_verify_preserves_cpu_path_unless_backend_opts_out(needs_cpu, mir
             verify_cache_loc=torch.arange(8),
             iteration_ids=object(),
         ),
-        sampling_info=None,
     )
     method(executor, **kwargs)
     assert fb.seq_lens.tolist() == [127]

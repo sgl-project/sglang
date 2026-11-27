@@ -60,17 +60,8 @@ class ToleranceConfig:
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
         """Load a specific tolerance profile from a dictionary of profiles."""
-        # Support both flat structure (backward compatibility) and profiled structure
-        if "e2e" in all_tolerances and not isinstance(all_tolerances["e2e"], dict):
-            tol_data = all_tolerances
-            actual_profile = "legacy/flat"
-        else:
-            tol_data = all_tolerances.get(
-                profile_name, all_tolerances.get("pr_test", {})
-            )
-            actual_profile = (
-                profile_name if profile_name in all_tolerances else "pr_test"
-            )
+        tol_data = all_tolerances.get(profile_name, all_tolerances.get("pr_test", {}))
+        actual_profile = profile_name if profile_name in all_tolerances else "pr_test"
 
         if not tol_data:
             raise ValueError(
@@ -143,6 +134,8 @@ class ScenarioConfig:
     # rather than by the code under test. VRAM guards keep the profile
     # tolerance -- they are what such a case actually protects.
     timing_tolerance: float | None = None
+    # auto-placement can trade resident weights for faster requests on this GPU
+    min_free_vram_mb: dict[str, float] | None = None
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any]) -> ScenarioConfig:
@@ -150,6 +143,9 @@ class ScenarioConfig:
             value = cfg.get(name)
             return float(value) if value is not None else None
 
+        floors = cfg.get("min_free_vram_mb")
+        if isinstance(floors, (int, float)):
+            floors = dict.fromkeys(("load", "warmup", "serving"), float(floors))
         return cls(
             stages_ms=cfg["stages_ms"],
             denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
@@ -167,6 +163,7 @@ class ScenarioConfig:
             runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
             host_anon_tolerance=optional_float("host_anon_tolerance"),
             timing_tolerance=optional_float("timing_tolerance"),
+            min_free_vram_mb=floors,
         )
 
 
@@ -177,7 +174,6 @@ class BaselineConfig:
     scenarios: dict[str, ScenarioConfig]
     step_fractions: Sequence[float]
     tolerances: ToleranceConfig
-    improvement_threshold: float
 
     @classmethod
     def load(cls, path: Path) -> BaselineConfig:
@@ -209,15 +205,13 @@ class BaselineConfig:
         scenarios = {
             name: ScenarioConfig.from_dict(cfg)
             for name, cfg in data["scenarios"].items()
+            if set(cfg) != {"estimated_full_test_time_s"}
         }
 
         return cls(
             scenarios=scenarios,
             step_fractions=tuple(data["sampling"]["step_fractions"]),
             tolerances=tolerances,
-            improvement_threshold=data.get("improvement_reporting", {}).get(
-                "threshold", 0.2
-            ),
         )
 
     def update(self, path: Path):
@@ -229,6 +223,7 @@ class BaselineConfig:
             {
                 name: ScenarioConfig.from_dict(cfg)
                 for name, cfg in data["scenarios"].items()
+                if set(cfg) != {"estimated_full_test_time_s"}
             }
         )
         return self
@@ -308,7 +303,7 @@ class DiffusionSamplingParams:
 
     # inputs and conditioning
     prompt: str | None = None  # text prompt for generation
-    image_path: Path | str | None = None  # input image/video for editing (Path or URL)
+    image_path: Path | str | list[Path | str] | None = None  # local paths or URLs
 
     # duration
     seconds: int = 1  # for video: duration in seconds
@@ -336,6 +331,7 @@ class DiffusionSamplingParams:
     # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
     # merged directly into the OpenAI extra_body dict.
     extras: dict = field(default_factory=dict)
+    expect_rgba_layers: bool = False
 
 
 @dataclass(frozen=True)
@@ -639,6 +635,14 @@ class PerformanceSummary:
     avg_frame_time_ms: float | None = None
     denoising_stages: set[str] = field(default_factory=set)
     load_time_ms: float | None = None
+    min_free_vram_by_gpu_mb: dict[str, list[float]] = field(default_factory=dict)
+
+    @property
+    def min_free_vram_mb(self) -> dict[str, float]:
+        return {
+            phase: min(samples)
+            for phase, samples in self.min_free_vram_by_gpu_mb.items()
+        }
 
     @staticmethod
     def from_req_perf_record(
@@ -853,6 +857,7 @@ MULTI_FRAME_I2I_sampling_params = DiffusionSamplingParams(
     num_frames=4,
     direct_url_test=True,
     output_format="png",
+    expect_rgba_layers=True,
 )
 
 T2V_PROMPT = "A curious raccoon"
@@ -982,15 +987,6 @@ LONGLIVE2_I2V_CI_sampling_params = replace(
     realtime_perf_thresholds={},
     realtime_perf_ignore_initial_chunks=0,
     extras=dict(_REALTIME_MODEL_COMMON_EXTRAS),
-)
-
-TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
-    prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
-    image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
-    direct_url_test=True,
-    output_size="960x960",
-    num_frames=4,
-    fps=4,
 )
 
 # Wan-Animate-2 inputs; they ship in the same ci-data-diffusion commit as the GT,
@@ -1149,6 +1145,7 @@ PERF_BASELINE_FILE_BY_PLATFORM = {
     "b200": "b200.json",
     "5090": "5090.json",
     "xpu_b60": "xpu_b60.json",
+    "xpu_b70": "xpu_b70.json",
 }
 PERF_BASELINE_PLATFORM_ALIASES = {
     "sm90": "h100",
@@ -1162,6 +1159,10 @@ PERF_BASELINE_PLATFORM_ALIASES = {
     "5090": "5090",
     "xpu": "xpu_b60",
     "bmg": "xpu_b60",
+    "b60": "xpu_b60",
+    "xpub60": "xpu_b60",
+    "b70": "xpu_b70",
+    "xpub70": "xpu_b70",
 }
 
 
@@ -1177,12 +1178,24 @@ def _normalize_perf_baseline_platform(platform: str) -> str:
     return PERF_BASELINE_PLATFORM_ALIASES[normalized]
 
 
+def _xpu_perf_baseline_platform(device_name: str, total_bytes: int) -> str:
+    # CI pools mix Arc Pro B60 (24 GiB) and B70 (32 GiB) under one runner label;
+    # memory is the fallback when the driver reports a generic device name.
+    name = device_name.upper()
+    if "B70" in name or ("B60" not in name and total_bytes > 28 * 1024**3):
+        return "xpu_b70"
+    return "xpu_b60"
+
+
 def get_perf_baseline_platform() -> str:
     override = os.getenv(PERF_BASELINE_PLATFORM_ENV)
     if override:
         return _normalize_perf_baseline_platform(override)
     if current_platform.is_xpu():
-        return "xpu_b60"
+        return _xpu_perf_baseline_platform(
+            current_platform.get_device_name(),
+            current_platform.get_device_total_memory(),
+        )
     if current_platform.is_sm120():
         return "5090"
     if current_platform.is_blackwell():

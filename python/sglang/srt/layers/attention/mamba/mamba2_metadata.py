@@ -18,11 +18,14 @@
 
 import math
 from dataclasses import dataclass
-from typing import NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.kernels.state_pool_io import PoolStaging
 
 
 class ForwardStateSlots(NamedTuple):
@@ -31,11 +34,16 @@ class ForwardStateSlots(NamedTuple):
 
     working: torch.Tensor  # one slot per request
     track: Optional[torch.Tensor] = None  # prefix-cache checkpoint slots
+    # A request-scoped ReplaySSM ring's row per request: the request row, or its
+    # request sub-pool unit under unified memory.
+    ring: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
 class ForwardMetadata:
     query_start_loc: torch.Tensor
+    # int64 copy of query_start_loc for extend kernels that need it; None otherwise.
+    query_start_loc_i64: Optional[torch.Tensor] = None
     mamba_cache_indices: torch.Tensor
     conv_block_table: Optional[torch.Tensor] = None
     logical_num_tokens: Optional[int] = None
@@ -90,6 +98,9 @@ class ForwardMetadata:
     # a cuda-graph capture then holds one build instead of one per layer.
     fused_accept_state_indices: Optional[torch.Tensor] = None
     fused_accept_num_accepted: Optional[torch.Tensor] = None
+    # GDN prefill on packed copies of a strided state pool: built by the first
+    # layer that stages and shared by the rest of the forward.
+    prefill_state_staging: Optional["PoolStaging"] = None
 
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
