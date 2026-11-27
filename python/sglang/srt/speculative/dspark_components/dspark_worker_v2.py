@@ -1330,6 +1330,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.commit_spec_accept_lens(
+                batch, accept.commit_lens
+            )
         verify.commit(
             batch,
             logits_output=logits_output,

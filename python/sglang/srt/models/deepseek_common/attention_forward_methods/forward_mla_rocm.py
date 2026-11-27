@@ -963,7 +963,7 @@ class DeepseekMLARocmForwardMixin:
         llama_4_scaling,
         q_nope_unabsorbed=None,
     ):
-        save_kv_cache = True
+        save_kv_cache = self.save_kv_cache
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
@@ -1055,6 +1055,7 @@ class DeepseekMLARocmForwardMixin:
                         forward_batch,
                         q_rope=q_pe,
                         k_rope=k_pe,
+                        save_kv_cache=save_kv_cache,
                         **extra_args,
                         **(
                             dict(topk_indices=topk_indices)
@@ -1070,6 +1071,7 @@ class DeepseekMLARocmForwardMixin:
                         forward_batch,
                         q_rope=q_pe,
                         k_rope=k_pe,
+                        save_kv_cache=save_kv_cache,
                         **extra_args,
                         **(
                             dict(topk_indices=topk_indices)

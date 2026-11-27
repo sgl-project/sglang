@@ -379,6 +379,25 @@ class TestChatCompletionRequest(CustomTestCase):
                     model="test-model", messages=messages, **request_kwargs
                 )
 
+    def test_chat_completion_rejects_thinking_parts_outside_assistant(self):
+        """Bug regression: adding the thinking part to the SHARED content-part
+        union silently widened acceptance to every role (user/system/tool) and
+        every model family, where downstream templates cannot render it —
+        replacing the previous clean 422 with template-dependent behavior."""
+        from pydantic import ValidationError
+
+        for role in ("user", "system", "tool"):
+            with self.subTest(role=role), self.assertRaises(ValidationError):
+                ChatCompletionRequest(
+                    model="test-model",
+                    messages=[
+                        {
+                            "role": role,
+                            "content": [{"type": "thinking", "thinking": "x"}],
+                        }
+                    ],
+                )
+
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""
         transcript = "Good morning! It's 7:00 AM, and I'm just waking up. Today is going to be a busy day, "

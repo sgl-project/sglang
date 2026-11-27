@@ -251,6 +251,12 @@ try:
         model_type = "kimi_k2"
 
     _CONFIG_REGISTRY["kimi_k2"] = _KimiK2ConfigAlias
+
+    # Built from a native params.json by mistral_utils.adapt_config_dict.
+    class _MistralLarge4ConfigAlias(_HFDeepseekV3Config):
+        model_type = "mistral_large_4"
+
+    _CONFIG_REGISTRY["mistral_large_4"] = _MistralLarge4ConfigAlias
 except ImportError:
     pass
 

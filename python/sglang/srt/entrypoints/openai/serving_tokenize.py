@@ -52,7 +52,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 max_model_len = self.tokenizer_manager.model_config.context_len
 
             if request.messages is not None:
-                token_ids = self._tokenize_chat_request(request)
+                token_ids = await self._tokenize_chat_request(request)
                 tokens = token_ids
                 count = len(token_ids)
             elif isinstance(request.prompt, str):
@@ -89,7 +89,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
-    def _tokenize_chat_request(self, request: TokenizeRequest) -> List[int]:
+    async def _tokenize_chat_request(self, request: TokenizeRequest) -> List[int]:
         if self.chat_serving is None:
             raise ValueError("Chat template tokenization requires a template manager.")
 
@@ -120,6 +120,15 @@ class OpenAIServingTokenize(OpenAIServingBase):
         )
 
         prompt_ids = processed_messages.prompt_ids
+        uses_image_placeholders = self.chat_serving._uses_mistral_image_placeholders(
+            image_data=processed_messages.image_data,
+            video_data=processed_messages.video_data,
+            audio_data=processed_messages.audio_data,
+        )
+        if uses_image_placeholders and isinstance(prompt_ids, list):
+            return await self._expand_image_placeholders(
+                prompt_ids, processed_messages.image_data
+            )
         if isinstance(prompt_ids, list) and (
             prompt_ids or not processed_messages.prompt
         ):
@@ -134,6 +143,21 @@ class OpenAIServingTokenize(OpenAIServingBase):
             )
 
         raise ValueError("Failed to render chat messages into token ids.")
+
+    async def _expand_image_placeholders(
+        self, prompt_ids: List[int], image_data
+    ) -> List[int]:
+        mm_processor = self.tokenizer_manager.mm_processor
+        if mm_processor is None:
+            raise ValueError(
+                "Image chat tokenization requires the multimodal processor."
+            )
+        mm_inputs = await mm_processor.process_mm_data_async(
+            image_data=image_data,
+            input_text=prompt_ids,
+            request_obj=None,
+        )
+        return mm_inputs.input_ids
 
 
 class OpenAIServingDetokenize(OpenAIServingBase):
