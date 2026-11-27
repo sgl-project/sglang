@@ -17,6 +17,7 @@ Usage:
 import ast
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -28,6 +29,25 @@ CASE_LIST_TO_SUITE = {
     "ONE_GPU_B200_CASES": "1-gpu-b200",
     "TWO_GPU_CASES": "2-gpu",
 }
+
+# Only these H100 cases can be deferred. Every other case and standalone file
+# runs on the usual cadence, including the Klein Base regression on the 5090.
+H100_MODEL_CASES = {
+    "qwen": {"qwen_image_edit_ti2i"},
+    "wan": {"wan2_1_t2v_14b_2gpu", "wan2_1_i2v_14b_480P_2gpu"},
+    "flux": {"flux_2_klein_base_image_t2i"},
+}
+
+# Recognize model-specific modules only. Shared encoders, VAEs, kernels,
+# loaders, registry, sampling logic and unknown modules require the full suite.
+MODEL_MODULE = re.compile(
+    r"python/sglang/multimodal_gen/"
+    r"(?:configs/(?:models/dits|pipeline_configs|sample)|runtime/(?:models/dits|pipelines))/"
+    r"(?P<family>qwen_?image|wan|flux|ltx|sana|zimage|kandinsky|minimax|hunyuan|"
+    r"ideogram|cosmos|ming_image|llada_image|joy_image|longcat_image)"
+    r"[a-z0-9_]*\.py"
+)
+
 
 # Default estimated time for cases without baseline (5 minutes)
 DEFAULT_EST_TIME_SECONDS = 300.0
@@ -74,6 +94,19 @@ class DiffusionSuiteInfo:
     missing_standalone_estimates: List[
         str
     ]  # standalone files without configured estimate
+
+
+def pr_model_families(paths: list[str]) -> set[str]:
+    families = set()
+    for path in paths:
+        if path.startswith("docs/") and path.endswith((".md", ".mdx")):
+            continue
+        match = MODEL_MODULE.fullmatch(path)
+        if not match:
+            return set()
+        family = match["family"]
+        families.add("qwen" if family.startswith("qwen") else family)
+    return families
 
 
 class DiffusionTestCaseVisitor(ast.NodeVisitor):
@@ -450,6 +483,8 @@ def validate_standalone_est_times(
 def collect_diffusion_suites(
     case_config_path: Path,
     baseline_path: Path,
+    *,
+    pr_families: tuple[str, ...] = (),
 ) -> Dict[str, DiffusionSuiteInfo]:
     """
     Collect all diffusion test suite information using AST parsing.
@@ -473,6 +508,12 @@ def collect_diffusion_suites(
     # Load baselines for time estimation
     baselines = load_baselines(baseline_path)
 
+    deferred = {
+        case_id
+        for family, ids in H100_MODEL_CASES.items()
+        if pr_families and family not in pr_families
+        for case_id in ids
+    }
     # Build suite info
     suites = {}
     for list_name, suite in CASE_LIST_TO_SUITE.items():
@@ -484,6 +525,7 @@ def collect_diffusion_suites(
                 est_time=get_case_est_time(cid, baselines),
             )
             for cid in case_ids
+            if suite not in ("1-gpu", "2-gpu") or cid not in deferred
         ]
 
         if suite not in suites:
