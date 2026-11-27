@@ -25,12 +25,14 @@ def _client() -> TestClient:
     return TestClient(app)
 
 
-def test_invalid_sampling_parameter_answers_400():
+def test_invalid_sampling_parameter_answers_400(tmp_path):
     with (
         patch.object(
             mesh_api,
             "get_global_server_args",
-            return_value=SimpleNamespace(model_path="dummy", input_save_path=None),
+            return_value=SimpleNamespace(
+                model_path="dummy", input_save_path=None, output_path=str(tmp_path)
+            ),
         ),
         patch.object(mesh_api, "save_image_to_path", _fake_save_image_to_path),
         patch.object(

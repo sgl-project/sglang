@@ -4,9 +4,9 @@
 export const config = {
   modelName: "Nemotron 3.5 Super VL",
 
-  supportedHardware: ["b200", "h200", "rtx-pro-6000", "dgx-spark"],
+  supportedHardware: ["b200", "h200", "rtxpro6000", "dgx-spark"],
   hardware: [
-    { id: "rtx-pro-6000", label: "RTX PRO 6000", vram: "96GB", vendor: "nvidia" },
+    { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "nvidia" },
   ],
 
   variants: [{ id: "default", label: "Default" }],
@@ -71,7 +71,7 @@ export const config = {
   dockerImages: {
     b200: "lmsysorg/sglang:nemotron3-5-super",
     h200: "lmsysorg/sglang:nemotron3-5-super",
-    "rtx-pro-6000": "lmsysorg/sglang:nemotron3-5-super",
+    "rtxpro6000": "lmsysorg/sglang:nemotron3-5-super",
     "dgx-spark": "lmsysorg/sglang:nemotron3-5-super",
   },
 
@@ -218,7 +218,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "rtx-pro-6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verificationStatus: "verified",
       env: [],
       flags: [
@@ -244,7 +244,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "rtx-pro-6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verificationStatus: "verified",
       env: [],
       flags: [

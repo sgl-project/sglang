@@ -13,7 +13,8 @@ Control-video clips are committed the same way, as clean vision frames sharing
 the target frames' positions.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextvars import ContextVar
 from typing import Any, NamedTuple
 
 import msgspec
@@ -48,6 +49,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 
 KVPair = tuple[torch.Tensor, torch.Tensor]
 logger = init_logger(__name__)
@@ -246,7 +250,7 @@ def _pack_kernel_applies(
 
 def _write_chunk_kv(
     attention: Cosmos3CrossAttention,
-    hidden: torch.Tensor,
+    qkv: torch.Tensor,
     *,
     kv_slot: CosmosDreamsKVSlot,
     cos_sin_cache: torch.Tensor,
@@ -255,10 +259,9 @@ def _write_chunk_kv(
 ) -> torch.Tensor:
     """``kv_slot`` gets what history must store: post-norm, post-RoPE K and V
     with null-action slots zeroed."""
-    batch_size, seq_len = hidden.shape[:2]
+    batch_size, seq_len = qkv.shape[:2]
     num_q_heads = attention.local_num_attention_heads
     num_kv_heads = attention.local_num_key_value_heads
-    qkv, _ = attention.to_qkv(hidden)
     qkv = qkv.view(
         batch_size, seq_len, num_q_heads + 2 * num_kv_heads, attention.head_dim
     )
@@ -302,15 +305,23 @@ def _write_chunk_kv(
 
 
 def _joint_attention(
+    attention: Cosmos3CrossAttention, hidden: torch.Tensor, **attention_kwargs: Any
+) -> torch.Tensor:
+    qkv, _ = attention.to_qkv(hidden)
+    out, _ = attention.to_out(_attend_qkv(attention, qkv, **attention_kwargs))
+    return out
+
+
+def _attend_qkv(
     attention: Cosmos3CrossAttention,
-    hidden: torch.Tensor,
+    qkv: torch.Tensor,
     *,
     kv_slot: CosmosDreamsKVSlot,
     clean_frame_ranges: tuple[tuple[int, int, int], ...] | None = None,
     **write_kwargs: Any,
 ) -> torch.Tensor:
-    batch_size, seq_len = hidden.shape[:2]
-    q = _write_chunk_kv(attention, hidden, kv_slot=kv_slot, **write_kwargs)
+    batch_size, seq_len = qkv.shape[:2]
+    q = _write_chunk_kv(attention, qkv, kv_slot=kv_slot, **write_kwargs)
     keys, values = kv_slot.keys, kv_slot.values
     if clean_frame_ranges is None:
         out = attention.attn(q, keys, values)
@@ -335,8 +346,7 @@ def _joint_attention(
                 )
             )
         out = torch.cat(outputs, dim=1)
-    out, _ = attention.to_out(out.reshape(batch_size, seq_len, -1))
-    return out
+    return out.reshape(batch_size, seq_len, -1)
 
 
 class CosmosDreamsCrossAttention(Cosmos3CrossAttention):
@@ -361,17 +371,40 @@ def default_joint_attention_backend() -> AttentionBackendEnum | None:
     return None
 
 
+# Graph breaks read the KV history of the request currently replaying.
+_denoise_attention: ContextVar[
+    Callable[["CosmosDreamsGenDecoderLayer", torch.Tensor], torch.Tensor]
+] = ContextVar("cosmos_denoise_attention")
+
+
 class CosmosDreamsGenDecoderLayer(Cosmos3GenDecoderLayer):
-    def forward(self, hidden: torch.Tensor, **attention_kwargs: Any) -> torch.Tensor:
-        hidden = hidden + _joint_attention(
-            self.cross_attention, self.input_layernorm(hidden), **attention_kwargs
+    @eager_on_graph(
+        output_factory=lambda self, qkv: qkv.new_empty(
+            (
+                *qkv.shape[:2],
+                self.cross_attention.local_num_attention_heads
+                * self.cross_attention.head_dim,
+            )
         )
+    )
+    def live_attention(self, qkv: torch.Tensor) -> torch.Tensor:
+        return _denoise_attention.get()(self, qkv)
+
+    def after_attention(
+        self, hidden: torch.Tensor, attention_output: torch.Tensor
+    ) -> torch.Tensor:
+        hidden = hidden + attention_output
         return hidden + self.mlp(self.post_attention_layernorm(hidden))
 
-    def write_kv(self, hidden: torch.Tensor, **write_kwargs: Any) -> None:
-        _write_chunk_kv(
-            self.cross_attention, self.input_layernorm(hidden), **write_kwargs
+    def forward(self, hidden: torch.Tensor, **attention_kwargs: Any) -> torch.Tensor:
+        attention_output = _joint_attention(
+            self.cross_attention, self.input_layernorm(hidden), **attention_kwargs
         )
+        return self.after_attention(hidden, attention_output)
+
+    def write_kv(self, hidden: torch.Tensor, **write_kwargs: Any) -> None:
+        qkv, _ = self.cross_attention.to_qkv(self.input_layernorm(hidden))
+        _write_chunk_kv(self.cross_attention, qkv, **write_kwargs)
 
 
 def project_actions(
@@ -428,6 +461,16 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         self._validate_causal_arch(hf_config)
         self.action_tokens_per_frame = self.manifest.action_tokens_per_frame
         self.text_cache_max_len = self.manifest.text_cache_max_len
+        self.denoise_runner = None
+        self.can_capture_denoise = (
+            quant_config is None
+            and self.manifest.conditioning_mode == ACTION_CONDITIONING_MODE
+        )
+
+    def release_cuda_graphs(self, reason: str = "weights released") -> None:
+        if self.denoise_runner is not None:
+            self.denoise_runner.reset(disabled_reason=reason)
+            self.denoise_runner = None
 
     def _validate_causal_arch(self, hf_config: dict[str, Any]) -> None:
         expected_flags = {
@@ -518,6 +561,14 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         text_kv = self.language_model(text_ids, text_mask, position_ids.unsqueeze(1))
         return text_kv, real_len
 
+    def denoise_blocks(self, hidden: torch.Tensor) -> torch.Tensor:
+        for layer in self.gen_layers:
+            attention = layer.cross_attention
+            qkv, _ = attention.to_qkv(layer.input_layernorm(hidden))
+            out, _ = attention.to_out(layer.live_attention(qkv))
+            hidden = layer.after_attention(hidden, out)
+        return hidden
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -529,6 +580,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         fps: float,
         action_latents: torch.Tensor | None = None,
         action_domain_ids: torch.Tensor | None = None,
+        denoise_runner=None,
         null_action_frame_indexes: Sequence[int] = (),
     ) -> CosmosDreamsForwardOutput:
         """Denoise one current chunk.
@@ -554,8 +606,24 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
             action_domain_ids=action_domain_ids,
             null_action_frame_indexes=null_action_frame_indexes,
         )
-        for layer, kv_slot in zip(self.gen_layers, kv_slots, strict=True):
-            hidden = layer(hidden, kv_slot=kv_slot, **layer_kwargs)
+        if denoise_runner is None:
+            for layer, kv_slot in zip(self.gen_layers, kv_slots, strict=True):
+                hidden = layer(hidden, kv_slot=kv_slot, **layer_kwargs)
+        else:
+
+            def attend(layer, qkv):
+                return _attend_qkv(
+                    layer.cross_attention,
+                    qkv,
+                    kv_slot=kv_slots[layer.layer_idx],
+                    **layer_kwargs,
+                )
+
+            token = _denoise_attention.set(attend)
+            try:
+                hidden = denoise_runner(hidden=hidden)
+            finally:
+                _denoise_attention.reset(token)
 
         _, _, num_frames, latent_h, latent_w = hidden_states.shape
         hidden = self.norm_moe_gen(hidden)

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -10,7 +10,6 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPU_W4A4DynamicLinearMethod,
 )
-from sglang.srt.layers.parameter import PerTensorScaleParameter
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
 from sglang.srt.layers.utils.common import set_weight_attrs
 
@@ -25,25 +24,6 @@ class ModelSlimW4A4Int4(ModelSlimLinearScheme):
         self.is_dynamic = self.quant_config[prefix + ".weight"] == "W4A4_DYNAMIC"
         self.kernel = NPU_W4A4DynamicLinearMethod()
 
-    @staticmethod
-    def get_weight(
-        input_size: int, output_size: int, params_dtype: torch.dtype
-    ) -> Dict[str, Any]:
-        if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
-            output_size = output_size // 2
-        params_dict = {"weight": torch.empty(output_size, input_size, dtype=torch.int8)}
-        return params_dict
-
-    @staticmethod
-    def get_perchannel_param(
-        output_size: int,
-        params_dtype: torch.dtype,
-    ) -> Dict[str, Any]:
-        params_dict = {}
-        params_dict["weight_scale"] = torch.empty(output_size, 1, dtype=params_dtype)
-        params_dict["weight_offset"] = torch.empty(output_size, 1, dtype=params_dtype)
-        return params_dict
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -55,7 +35,6 @@ class ModelSlimW4A4Int4(ModelSlimLinearScheme):
         **extra_weight_attrs,
     ) -> None:
         output_size_per_partition = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader")
         if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
             weight_output_size_per_partition = output_size_per_partition // 2
         else:
@@ -77,15 +56,6 @@ class ModelSlimW4A4Int4(ModelSlimLinearScheme):
                 set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
             layer.register_parameter(weight_name, param)
             set_weight_attrs(param, extra_weight_attrs)
-
-        pertensor_dict = {}
-        for pertensor_name, pertensor_param in pertensor_dict.items():
-            param = PerTensorScaleParameter(
-                data=pertensor_param, weight_loader=weight_loader
-            )
-            # disable warning
-            param.ignore_warning = True
-            layer.register_parameter(pertensor_name, param)
 
         perchannel_dict = {}
         perchannel_dict["weight_scale"] = torch.empty(

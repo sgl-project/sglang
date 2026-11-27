@@ -153,6 +153,14 @@ unified contracts require normalized 59-dimensional rows and default to
 These pipelines predict video from actions, not actions from video; use the policy
 checkpoints above for action prediction.
 
+For single-GPU lossless Bimanual serving with unquantized weights, keep the
+transformer resident and enable `--enable-breakable-cuda-graph`. For an 832×480
+reference image and a 33-frame warmup, pass `--warmup-mode server`,
+`--warmup-resolutions 832x480`, `--warmup-num-frames 33`, and
+`--warmup-sampling-params '{"image_path":["/path/to/reference.png"],"quality":"lossless","num_inference_steps":4}'`.
+Denoise chunks reuse the captured spatial and temporal token shape across
+prompts and actions. Uncaptured chunk shapes run eagerly.
+
 For realtime Bimanual sessions, add
 `--pipeline-class-name CosmosDreamsRealtimePipeline` and use
 [`/v1/realtime_video`](/docs/sglang-diffusion/realtime_models).
