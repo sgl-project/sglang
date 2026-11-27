@@ -450,6 +450,19 @@ for _name, _backend in (
         )
     )
 del _name, _backend
+for _name in (
+    "nvfp4_expert_matmul_lowm_scaled",
+    "mxfp8_expert_matmul_lowm",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.inkling2_{_name}_sm120",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.gemm.inkling2_moe_gemm_lowm_sm120:{_name}",
+            capabilities=_SM12X,
+        )
+    )
+del _name
 register_kernel(
     KernelSpec(
         op="gemm.fp8_blockwise_scaled_mm",
