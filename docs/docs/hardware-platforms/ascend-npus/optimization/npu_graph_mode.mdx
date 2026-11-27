@@ -82,7 +82,7 @@ sglang serve \
 </table>
 
 <Info>
-`--disable-cuda-graph` and `--cuda-graph-bs` are **deprecated**. Prefer `--cuda-graph-backend-{decode,prefill}=disabled` and `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill`.
+`--disable-cuda-graph` was **removed** in SGLang 1.0 (listed in `REMOVED_FLAGS`); passing it aborts launch and tells you to use `--disable-decode-cuda-graph` / `--disable-prefill-cuda-graph` (or `--cuda-graph-backend-{decode,prefill}=disabled`). `--cuda-graph-bs` no longer exists — use `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill`.
 </Info>
 
 ### Choosing capture batch sizes
@@ -92,7 +92,7 @@ sglang serve \
 3. Keep the list **small** (often ≤10 distinct sizes) to reduce capture time, memory, and graph-update stream pressure.
 4. If latency spikes appear only at certain concurrency levels, add those batch sizes rather than capturing a dense range.
 
-Example for a 7B dense model on one card:
+Example for an 8B dense model on one card:
 
 ```bash Command
 sglang serve \
@@ -178,7 +178,7 @@ Use normal serving settings and collect traces with `bench_serving --profile`:
 ```bash Command
 export SGLANG_TORCH_PROFILER_DIR=./sglang_profile
 
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --base-url http://127.0.0.1:30000 \
   --model /path/to/model \
