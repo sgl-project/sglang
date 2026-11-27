@@ -314,7 +314,7 @@ def _cuda_sconv(
     """_sconv_kernel in CUDA; False when an operand layout or dtype is unsupported.
     FP32 x only in the routed epilogue, and with top-k rows only under round_bf16
     (the CUDA gather rounds the sum to bf16)."""
-    if _is_hip:
+    if _is_hip or not is_arch_support_pdl():
         return False
     rows, d = (attention if attention is not None else x).shape
     ints = (

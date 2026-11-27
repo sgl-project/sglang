@@ -2,6 +2,27 @@ import msgspec
 import torch
 from torch import nn
 
+# The CUTE block-attention-residual kernel needs Hopper or newer; SM80 uses the
+# Triton kernel. Resolved once because this runs several times per decode step.
+_USE_TRITON_ATTN_RES = None
+
+
+def _attn_res_impl():
+    global _USE_TRITON_ATTN_RES
+    if _USE_TRITON_ATTN_RES is None:
+        from sglang.srt.models.inkling_common.inkling2_arch import (
+            prefer_triton_fallbacks,
+        )
+
+        _USE_TRITON_ATTN_RES = prefer_triton_fallbacks()
+    if _USE_TRITON_ATTN_RES:
+        from sglang.kernels.ops.attention.inkling2_attn_res_triton import attn_res_fused
+
+        return attn_res_fused
+    from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
+
+    return attn_res
+
 
 def block_attn_res(
     blocks: list[torch.Tensor],
@@ -28,9 +49,7 @@ def block_attn_res(
         if scaled_queries is not None
         else queries.float() * (hidden_size**-0.5)
     )
-    from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
-
-    return attn_res(
+    return _attn_res_impl()(
         [x.contiguous() for x in sources],
         partial_addend.contiguous() if partial_addend is not None else None,
         effective_queries.contiguous(),

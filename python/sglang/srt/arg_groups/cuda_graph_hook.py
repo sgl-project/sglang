@@ -6,6 +6,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+import torch
+
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     model_config_of,
@@ -412,7 +414,12 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     before _handle_cuda_graph_config: the generic breakable default is
     auto-disabled for this multimodal arch, and declarative model overrides
     materialize too late to steer cuda-graph resolution. Honors an explicit
-    --cuda-graph-backend-prefill / --disable-prefill-cuda-graph."""
+    --cuda-graph-backend-prefill / --disable-prefill-cuda-graph.
+
+    Full-graph prefill capture is FA4/CUTE-only, and the breakable fallback's
+    capture peak does not fit beside the BF16 experts of these large models on
+    pre-sm90 devices either, so those disable the prefill graph (prefill runs
+    eagerly) instead of failing an EXTEND replay or an OOM mid-capture."""
 
     cfg = resolving_view(server_args)
     if (
@@ -432,7 +439,11 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
         declare_resolution(
             server_args,
             "_apply_inkling_prefill_cuda_graph_default",
-            cuda_graph_backend_prefill=Backend.FULL,
+            cuda_graph_backend_prefill=(
+                Backend.FULL
+                if torch.cuda.get_device_capability()[0] >= 9
+                else Backend.DISABLED
+            ),
         )
 
 

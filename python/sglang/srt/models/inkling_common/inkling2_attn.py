@@ -11,6 +11,9 @@ from sglang.kernels.ops.attention.inkling2_attn import (
     pad_head_groups,
 )
 from sglang.kernels.ops.attention.inkling2_attn_prologue import attention_prologue
+from sglang.kernels.ops.attention.score_mod import (
+    relative_bias_score_mod as triton_relative_bias_score_mod,
+)
 from sglang.kernels.ops.communication.inkling2_comm import (
     all_reduce,
     oneshot_all_reduce,
@@ -30,6 +33,10 @@ from sglang.srt.models.inkling_common.attn import (
     RelLogitsProj,
     get_inkling_relative_attention_score_mod,
     serving_attention_backend,
+)
+from sglang.srt.models.inkling_common.inkling2_arch import (
+    prefer_triton_fallbacks,
+    supports_fa4,
 )
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
 from sglang.srt.models.inkling_common.sconv import SconvType
@@ -90,6 +97,8 @@ class QKL2Clip(nn.Module):
             set_weight_attrs(self.scale, {"weight_loader": self.weight_loader})
         else:
             self.register_parameter("scale", None)
+        # The CUTE clip kernel compiles for Hopper and newer; SM80 uses Triton.
+        self._use_triton = prefer_triton_fallbacks()
 
     def weight_loader(self, param, loaded_weight):
         if loaded_weight.shape != param.shape:
@@ -100,11 +109,16 @@ class QKL2Clip(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x, *, output_scale=None):
-        from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip import (
-            qk_l2_clip_fwd_cutedsl,
-        )
+        if self._use_triton:
+            from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip_triton import (
+                qk_l2_clip_fwd_triton as _clip,
+            )
+        else:
+            from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip import (
+                qk_l2_clip_fwd_cutedsl as _clip,
+            )
 
-        output = qk_l2_clip_fwd_cutedsl(
+        output = _clip(
             x, self.threshold, self.eps, scale=self.scale, output_scale=output_scale
         )
         return output.view(x.shape)
@@ -248,6 +262,10 @@ class Inkling2Attention(nn.Module):
             for cache_layer_id in cache_layer_ids
         ]
         self.attn = attention[0] if len(attention) == 1 else nn.ModuleList(attention)
+        # FA4-only fast paths (compact decode, padded GQA decode and the fused
+        # prologue) need Hopper or newer; pre-Hopper devices take the Triton
+        # backend with an explicit score mod instead.
+        self._fa4 = supports_fa4()
         # FA4 packs GQA heads only for group sizes dividing 128, so decode pads
         # each KV group with zero query heads up to the next power of two.
         group = self.num_tp_heads // self.num_tp_kv_heads
@@ -255,7 +273,8 @@ class Inkling2Attention(nn.Module):
         kv_heads = self.num_tp_kv_heads
         pad_rows = kv_heads * (self.padded_group - group)
         self.fused_decode_prologue = (
-            self.head_dim == 128
+            self._fa4
+            and self.head_dim == 128
             and self.d_rel == 16
             and self.rel_extent % 128 == 0
             and kv_heads & (kv_heads - 1) == 0
@@ -287,7 +306,7 @@ class Inkling2Attention(nn.Module):
                 )
                 for cache_layer_id in cache_layer_ids
             )
-            if group > 1 and 128 % group
+            if self._fa4 and group > 1 and 128 % group
             else None
         )
         self.verify_wave_splits = not get_platform().is_sm90
@@ -458,11 +477,15 @@ class Inkling2Attention(nn.Module):
             )
 
     def _forward(self, hidden_states, positions, forward_batch, *, attn, attn_padded):
-        assert serving_attention_backend(forward_batch) == "fa4", (
-            "Inkling2 requires FA4 attention"
+        backend = serving_attention_backend(forward_batch)
+        assert backend in ("fa4", "triton"), (
+            f"Inkling2 requires the fa4 or triton attention backend, got {backend!r}"
         )
         mxfp8 = get_model().kv_cache_dtype == "mxfp8"
         fa4_mxfp8 = mxfp8 and not get_platform().is_sm120
+        assert not (mxfp8 and backend != "fa4"), (
+            "MXFP8 KV cache requires the FA4 attention backend"
+        )
         sources = (
             AttentionSources(hidden_states, hidden_states, hidden_states)
             if isinstance(hidden_states, torch.Tensor)
@@ -547,7 +570,14 @@ class Inkling2Attention(nn.Module):
                 q_descale=quantized_q.scale.view(torch.float8_e8m0fnu),
             )
         else:
-            attention_kwargs = dict(rel_bias=rel_bias, **bias_kwargs)
+            attention_kwargs = (
+                dict(rel_bias=rel_bias, **bias_kwargs)
+                if self._fa4
+                else dict(
+                    score_mod=triton_relative_bias_score_mod,
+                    aux_tensors=[rel_bias],
+                )
+            )
         if compact:
             output = attn(
                 q,

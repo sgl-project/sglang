@@ -269,7 +269,7 @@ def _gate_sink_module(heads, head_dim, group, padded_group):
 
 def _cuda_gate_sink(output, gate, lse, sinks, result, group, padded_group):
     """_gate_sink_kernel in CUDA; False when an operand layout is unsupported."""
-    if _is_hip:
+    if _is_hip or not is_arch_support_pdl():
         return False
     heads = sinks.shape[-1]
     head_dim = result.shape[1] // heads

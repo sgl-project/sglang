@@ -79,15 +79,13 @@ class Inkling2VisionAttention(nn.Module):
             for projection in (self.q_proj, self.k_proj, self.v_proj)
         )
         q, k = _rotary(q, k, positions)
-        if hidden.is_cuda:
+        # The CUTE varlen kernel only exists for SM90+; SM80 falls back to the
+        # per-image SDPA path below (same math, no varlen packing).
+        if hidden.is_cuda and torch.cuda.get_device_capability(hidden.device)[0] >= 9:
             from sglang.kernels.ops.attention.flash_attn.cute import (
                 flash_attn_varlen_func,
             )
 
-            if torch.cuda.get_device_capability(hidden.device)[0] not in (9, 10, 12):
-                raise ValueError(
-                    "Inkling2 vision attention requires Hopper or Blackwell"
-                )
             max_length = max(257, sum(lengths) - len(lengths) + 1)
             output, _ = flash_attn_varlen_func(
                 q,
