@@ -15,7 +15,6 @@ from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
     resolving_view,
-    use_mla_backend,
 )
 from sglang.srt.arg_groups.overrides import (
     _speculative_moe_runner_default,
@@ -1504,23 +1503,13 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             with_phase,
         )
 
-        graph_config = with_phase(
-            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-        )
-        overrides = {}
-        # Target-verification graphs are supported for full-attention MHA/GQA.
-        # Keep the existing eager path for MLA until its graph path is validated.
-        if use_mla_backend(server_args):
-            graph_config = with_phase(
-                graph_config, Phase.DECODE, backend=Backend.DISABLED
-            )
-            overrides["disable_cuda_graph"] = True
         declare_resolution(
             server_args,
             "_handle_ngram",
-            cuda_graph_config=graph_config,
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
             disable_overlap_schedule=True,
-            **overrides,
         )
         logger.warning("NGRAM on NPU uses synchronous scheduling.")
 

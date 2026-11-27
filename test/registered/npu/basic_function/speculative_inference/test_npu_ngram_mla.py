@@ -19,7 +19,7 @@ class TestNpuMlaNgram(ngram_checks.TestNpuNgram):
         "Continue the sequence: 101, 102, 103, 104, 105,"
     ]
 
-    @unittest.skip("NGRAM target-verification graphs are currently MHA/GQA-only.")
+    @unittest.skip("MLA NGRAM graph replay has known eager-parity differences.")
     def test_graph_matches_eager_with_long_prefix(self):
         pass
 

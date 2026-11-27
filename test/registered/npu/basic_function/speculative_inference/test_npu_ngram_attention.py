@@ -1,11 +1,14 @@
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 import torch_npu  # noqa: F401
 from sgl_kernel_npu.operators.attention import build_ngram_attention_mask
+from transformers import DeepseekV2Config, Qwen3Config
 
 from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
@@ -23,7 +26,6 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpecInputType
-from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=15, suite="nightly-test-1-npu-a3", nightly=True)
@@ -239,10 +241,11 @@ class TestNgramAttention(unittest.TestCase):
                         )
 
     def test_resolved_npu_configuration(self):
+        model_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        mha_path = model_dir / "mha"
+        Qwen3Config(architectures=["Qwen3ForCausalLM"]).save_pretrained(mha_path)
         options = dict(
-            model_path=os.environ.get(
-                "SGLANG_TEST_NGRAM_MODEL", QWEN3_0_6B_WEIGHTS_PATH
-            ),
+            model_path=str(mha_path),
             device="npu",
             attention_backend="ascend",
             speculative_algorithm="NGRAM",
@@ -263,15 +266,16 @@ class TestNgramAttention(unittest.TestCase):
         self.assertEqual(
             resolved_view(disabled).cuda_graph_config.decode.backend, Backend.DISABLED
         )
-        with patch(
-            "sglang.srt.arg_groups.speculative_hook.use_mla_backend", return_value=True
-        ):
-            mla = ServerArgs(**options)
-            mla.resolve_once()
-        self.assertTrue(resolved_view(mla).disable_cuda_graph)
-        self.assertEqual(
-            resolved_view(mla).cuda_graph_config.decode.backend, Backend.DISABLED
+        mla_path = model_dir / "mla"
+        DeepseekV2Config(architectures=["DeepseekV2ForCausalLM"]).save_pretrained(
+            mla_path
         )
+        mla = ServerArgs(**dict(options, model_path=str(mla_path)))
+        mla.resolve_once()
+        mla = resolved_view(mla)
+        self.assertFalse(mla.disable_cuda_graph)
+        self.assertEqual(mla.cuda_graph_config.decode.backend, Backend.FULL)
+        self.assertEqual(mla.cuda_graph_config.prefill.backend, Backend.DISABLED)
         for invalid in (
             dict(speculative_ngram_external_corpus_path="corpus.jsonl"),
             dict(
