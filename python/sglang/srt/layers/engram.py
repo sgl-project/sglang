@@ -16,6 +16,7 @@ import logging
 import mmap
 import os
 import re
+import stat
 import time
 from typing import Optional
 
@@ -66,6 +67,11 @@ from sglang.srt.layers.dp_attention import (
     is_dp_gatherv_active,
     world_dp_gather_enabled,
 )
+from sglang.srt.layers.engram_region import (
+    STORE_ALIGN,
+    engram_table_offsets,
+    max_shard_rows,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
@@ -86,6 +92,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_serving,
+    process_model_config,
 )
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_npu
 
@@ -735,21 +742,120 @@ def _registered_device_ptr(host_ptr: int) -> int:
     return device_ptr.value
 
 
+@functools.cache
+def _store_layer_shard_rows() -> dict[int, int]:
+    """Rows to reserve for each Engram table, keyed by layer id.
+
+    The whole table when every rank maps all of it (``replication`` ``per_node``),
+    otherwise the largest rank's shard. Sizing by the largest shard rather than by
+    the local one keeps the offsets identical on every rank even when the TP group
+    does not divide the table evenly; sizing on the local count would let the
+    regions drift apart and overlap.
+
+    Cached: it depends only on the model config, and drawing the layout's primes is
+    not free, while every layer asks for it while the store is laid out.
+    """
+    try:
+        hf = process_model_config().hf_text_config
+        layer_ids = tuple(hf.engram_layer_ids)
+        num_embeddings = tuple(hf.engram_num_embeddings)
+    except (ValueError, AttributeError) as e:
+        raise RuntimeError(
+            "engram host table: cannot read the Engram table sizes needed to place "
+            f"them in the store ({e})"
+        ) from e
+    config = get_exec().offload.engram_config
+    per_node = config is not None and config.replication == EngramReplication.PER_NODE
+    if per_node:
+        return {lid: int(rows) for lid, rows in zip(layer_ids, num_embeddings)}
+    layout = EngramLayout.from_config(hf)
+    tp_size = get_parallel().tp_size
+    return {
+        lid: max_shard_rows(
+            int(num_embeddings[i]),
+            layout.column_bounds(i),
+            tp_size,
+            shard_range,
+        )
+        for i, lid in enumerate(layer_ids)
+    }
+
+
+@functools.cache
+def _store_offsets(dim: int, block_size: int, mxfp4: bool) -> dict[int, int]:
+    """This rank's offset for every Engram table in the shared store, by layer id.
+
+    The tables are laid out in ascending layer id order, each aligned, so every rank
+    derives the same layout without communicating: the layer ids and the reserved
+    sizes are the same everywhere.
+
+    With ``replication`` ``none`` every rank owns only its own shard, so each
+    ``(table, rank)`` pair needs its own region; without that, the ranks would all
+    map the same bytes and overwrite each other's shards. ``per_node`` maps the whole
+    table on every rank, so one region per table is shared.
+    """
+    rows = _store_layer_shard_rows()
+    layer_ids = tuple(sorted(rows))
+    parallel = get_parallel()
+    config = get_exec().offload.engram_config
+    replicated = config is not None and config.replication == EngramReplication.PER_NODE
+    offsets = engram_table_offsets(
+        [rows[lid] for lid in layer_ids],
+        dim,
+        block_size,
+        parallel.tp_rank,
+        parallel.tp_size,
+        STORE_ALIGN,
+        mxfp4=mxfp4,
+        replicated=replicated,
+    )
+    return dict(zip(layer_ids, offsets))
+
+
 class _HostTable:
     """Host-memory backing for one engram table: one shard per rank, or with
     replication per_node one whole table shared by the TP group.
+
+    With ``store_path`` this rank's slice lives in a file-backed mapping instead
+    of anonymous memory: a regular file (tmpfs for testing, or a DAX filesystem)
+    or a dev-dax char device, i.e. a slice of CXL pooled memory. The mapping, the
+    pin and the offsets are the only difference; the kernels read the same bytes
+    through the same pointers, so the lookup path is unchanged.
 
     Lives for the whole process: the mapping, the memfd and the cudaHostRegister
     pin are never released because the table is read by every forward.
     """
 
-    def __init__(self, replication: str, nbytes: int, name: str, group):
+    def __init__(
+        self,
+        replication: str,
+        nbytes: int,
+        name: str,
+        group,
+        *,
+        store_path: Optional[str] = None,
+        store_offset: int = 0,
+    ):
         self.replication = replication
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
+        # None for anonymous memory; set when the slice is file-backed.
+        self.store_path = store_path
+        self.store_offset = store_offset
         per_node = replication == EngramReplication.PER_NODE
-        if per_node:
+        if store_path is not None:
+            # Every rank opens the same path at the same offset, so no fd has to
+            # be broadcast as it does for the per_node memfd.
+            self.fd = self._open_store(store_path, store_offset, nbytes)
+            self.mm = mmap.mmap(
+                self.fd,
+                nbytes,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                offset=store_offset,
+            )
+        elif per_node:
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
                 self.fd,
@@ -768,7 +874,14 @@ class _HostTable:
         # Advisory before the first touch: pages are allocated huge at fault time.
         self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
-        if not per_node:
+        if store_path is not None:
+            if not self._is_char_device(store_path):
+                # A regular file allocates on write, so pre-fault it: the pages then
+                # come from one contiguous pass and can be collapsed into huge pages,
+                # where faults spread over the load would fall back to base pages.
+                _drop_page_cache_once("before pre-faulting the file-backed table")
+                np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+        elif not per_node:
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.
             _drop_page_cache_once("before pre-faulting the per-rank shard")
@@ -779,8 +892,49 @@ class _HostTable:
             group.barrier()
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
-            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+            hint = ""
+            if store_path is not None and not self._is_char_device(store_path):
+                hint = (
+                    f"; a regular file must be on tmpfs or a DAX filesystem, since "
+                    f"CUDA cannot pin disk-backed pages ({store_path})"
+                )
+            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}{hint}")
         self.device_ptr = _registered_device_ptr(self.bytes.data_ptr())
+
+    @staticmethod
+    def _is_char_device(path: str) -> bool:
+        """True for a dev-dax char device, which is sized by the kernel and takes
+        no ftruncate."""
+        try:
+            return stat.S_ISCHR(os.stat(path).st_mode)
+        except OSError:
+            return False
+
+    def _open_store(self, path: str, offset: int, nbytes: int) -> int:
+        """Open the shared backing file and make sure this rank's slice fits.
+
+        A regular file is grown to ``offset + nbytes``; a dev-dax device has a
+        fixed size and rejects ftruncate, so an OSError there is expected and the
+        mapping simply speaks for itself at mmap time.
+        """
+        if offset % mmap.PAGESIZE:
+            raise ValueError(
+                f"engram host table: store offset {offset} in {path} is not page "
+                f"aligned"
+            )
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        if self._is_char_device(path):
+            return fd
+        try:
+            if offset + nbytes > os.fstat(fd).st_size:
+                os.ftruncate(fd, offset + nbytes)
+        except OSError as e:
+            os.close(fd)
+            raise RuntimeError(
+                f"engram host table: cannot grow {path} to {offset + nbytes} bytes "
+                f"for offset {offset} ({e}); is the store big enough?"
+            ) from e
+        return fd
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -826,10 +980,14 @@ class _HostTable:
             return
         self.dirty = False
         per_node = self.replication == EngramReplication.PER_NODE
+        # Anonymous memory is the only layout that can be collapsed here: MADV_COLLAPSE
+        # refuses shmem unless shmem huge pages are enabled, and a dev-dax mapping is
+        # already backed by huge pages, so it would report 0 either way.
+        collapsible = self.store_path is None and not per_node
         if per_node:
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if not per_node and huge_kb < mapped_kb * 0.98:
+        if collapsible and huge_kb < mapped_kb * 0.98:
             # The loader's own reads refilled the page cache; empty it again so the
             # collapse can find contiguous memory.
             drop_checkpoint_page_cache()
@@ -837,11 +995,20 @@ class _HostTable:
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
         msg = (
-            f"engram host table {label}: replication={self.replication}, "
-            f"{mapped_kb / 2**10:.0f} MiB resident, {huge_kb / 2**10:.0f} MiB in huge pages "
-            f"({pct:.0f}%)"
+            f"engram host table {label}: replication={self.replication}"
+            + (
+                f", store={self.store_path} offset={self.store_offset}"
+                if self.store_path is not None
+                else ""
+            )
+            + f", {mapped_kb / 2**10:.0f} MiB resident, "
+            f"{huge_kb / 2**10:.0f} MiB in huge pages ({pct:.0f}%)"
         )
-        if huge_kb == 0:
+        if self.store_path is not None and self._is_char_device(self.store_path):
+            # dev-dax is inherently huge-page backed and does not report through the
+            # same smaps fields, so its coverage is not the knob to warn about.
+            logger.info(msg)
+        elif huge_kb == 0:
             knob = "shmem_enabled" if per_node else "enabled"
             logger.warning(
                 "%s. No huge pages: expect ~10x slower lookups (one TLB miss per row); "
@@ -1375,7 +1542,14 @@ class EngramEmbedding(nn.Module):
             self.weight = nn.Parameter(weight, requires_grad=False)
             self.scale = nn.Parameter(scale, requires_grad=False)
         elif config.placement == EngramPlacement.CPU:
-            self._init_host_table(num_embeddings, dim, layer_id, config.replication)
+            self._init_host_table(
+                num_embeddings,
+                dim,
+                layer_id,
+                config.replication,
+                column_bounds,
+                config.table_path,
+            )
         else:
             self.weight = nn.Parameter(
                 torch.empty(
@@ -1398,17 +1572,30 @@ class EngramEmbedding(nn.Module):
         self.scale.weight_loader = self._load_rows
 
     def _init_host_table(
-        self, num_embeddings: int, dim: int, layer_id: int, replication: str
+        self,
+        num_embeddings: int,
+        dim: int,
+        layer_id: int,
+        replication: str,
+        column_bounds: tuple[int, ...],
+        table_path: str = "",
     ):
         per_node = replication == EngramReplication.PER_NODE
         n = num_embeddings if per_node else self.rows
         w_bytes = n * self.row_bytes
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
+        store_offset = 0
+        if table_path:
+            # The offsets are a pure function of the model config, so every rank
+            # derives the same layout for this layer without communicating.
+            store_offset = _store_offsets(dim, FP8_BLOCK_SIZE, self.mxfp4)[layer_id]
         self.host_table = _HostTable(
             replication,
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
             f"sglang_engram_{layer_id}",
             get_parallel().tp_group,
+            store_path=table_path or None,
+            store_offset=store_offset,
         )
         weight, scale = _table_views(self.host_table.bytes, n, dim, self.mxfp4)
         self.weight = nn.Parameter(weight, requires_grad=False)
