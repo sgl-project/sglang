@@ -33,9 +33,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.base_graph_backend import (
-    BaseGraphBackend,
-)
+from sglang.srt.model_executor.runner_backend.base_graph_backend import BaseGraphBackend
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import empty_context, get_bool_env_var, get_compiler_backend
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -501,8 +499,48 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                 )
             hf_config = runner.model_runner.model_config.hf_config
             attn_backend = getattr(runner, "attn_backend", None)
+            from sglang.srt.layers.attention.hybrid_attn_backend import (
+                HybridAttnBackend,
+            )
+
+            if isinstance(attn_backend, HybridAttnBackend):
+                attn_backend = attn_backend._select_backend(
+                    static_forward_batch.forward_mode
+                )
             full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
             needs_cpu_seq_lens = getattr(attn_backend, "needs_cpu_seq_lens", True)
+            if getattr(full_attn_backend, "use_encoder_decoder_paged", False):
+                metadata = full_attn_backend.forward_metadata.encoder_decoder
+                lengths_by_table = {
+                    metadata.self_block_tables.data_ptr(): metadata.self_lengths,
+                    metadata.cross_block_tables.data_ptr(): metadata.cross_lengths,
+                }
+                update_inputs = []
+                matched_tables = set()
+                graph = self._graphs[shape_key]
+                for record in graph.graph_dispatch_mode.graph_dispatch_records:
+                    table = record.kwargs.get("block_table")
+                    if (
+                        isinstance(table, torch.Tensor)
+                        and table.data_ptr() in lengths_by_table
+                    ):
+                        pointer = table.data_ptr()
+                        matched_tables.add(pointer)
+                        update_inputs.append(
+                            {"actual_seq_lengths_kv": lengths_by_table[pointer]}
+                        )
+                    else:
+                        update_inputs.append({})
+                if matched_tables != set(lengths_by_table):
+                    raise RuntimeError(
+                        "Encoder-decoder graph did not capture both paged KV views."
+                    )
+                return self.replay_with_input_update(
+                    shape_key,
+                    seq_lens=None,
+                    cpu_update_input=update_inputs,
+                    update_before_replay=True,
+                )
             # QFA needs no FIA host rebinding even when GDN needs CPU lengths.
             if getattr(full_attn_backend, "use_quant_flash_attn", False):
                 needs_cpu_seq_lens = False
@@ -572,6 +610,7 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         attr_name: str = None,
         attr_type: Any = None,
         cpu_update_input: list = None,
+        update_before_replay: bool = False,
     ) -> Any:
         """Rebind seq_lens on the recorded NPU graph, then replay.
 
@@ -594,11 +633,19 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         if self._rebind_fence is not None:
             self._rebind_fence.synchronize()
 
-        update_future = self._update_executor.submit(
-            graph.update, cpu_update_input=cpu_update_input
-        )
-        graph.replay()
-        update_future.result()
+        if update_before_replay:
+            # Encoder threads can submit blocking D2H copies concurrently.
+            # Publish every update/event before launching a graph that waits
+            # for those events: otherwise a blocking copy can prevent the
+            # pending update from reaching the device submission queue.
+            graph.update(cpu_update_input=cpu_update_input)
+            graph.replay()
+        else:
+            update_future = self._update_executor.submit(
+                graph.update, cpu_update_input=cpu_update_input
+            )
+            graph.replay()
+            update_future.result()
 
         fence = self._device_module.Event()
         fence.record()

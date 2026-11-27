@@ -30,7 +30,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_ascend_ops_config
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
-from sglang.srt.runtime_context import get_flags, get_forward
+from sglang.srt.runtime_context import get_forward
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -54,12 +54,8 @@ class BreakableNPUGraphBackend(BreakableCudaGraphBackend):
             enable_memory_saver=enable_memory_saver,
             debug_eager=debug_eager,
         )
-        # torch.compile cannot contain the eager break points this backend
-        # depends on (NPU decode still compiles through NPUGraphRunner).
-        assert not get_flags().capture.enable_torch_compile, (
-            "breakable NPU prefill graph does not support torch.compile; "
-            "disable --enable-torch-compile or prefill graph"
-        )
+        # Prefill passes an uncompiled forward to this backend. The global
+        # compile flag may independently enable the full decode graph backend.
         # AllToAllV sizes its buffers from live per-expert counts read on the
         # host, which a captured segment cannot do.  Reject at construction so
         # the failure lands at startup, before any capture.

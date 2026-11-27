@@ -115,13 +115,16 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         enable_kv_cache_copy: bool = False,
         modelslim_cache_layout=None,
         is_draft_worker: bool = False,
+        use_fia: Optional[bool] = None,
         **kwargs,
     ):
         self.is_modelslim_mxfp8 = (
             modelslim_cache_layout is not None
             and modelslim_cache_layout.layout == "gqa_mxfp8"
         )
-        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_fia = (
+            get_bool_env_var("ASCEND_USE_FIA", "False") if use_fia is None else use_fia
+        )
         if self.is_modelslim_mxfp8:
             head_num = modelslim_cache_layout.local_kv_heads
             head_dim = modelslim_cache_layout.key_head_dim
@@ -272,9 +275,11 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 layout=KVBufferLayout.PAGED_NHD,
             ),
             page_size=self.page_size,
-            head_num=self.row_dim // self.head_dim
-            if self.head_dim == self.v_head_dim
-            else self.head_num,
+            head_num=(
+                self.row_dim // self.head_dim
+                if self.head_dim == self.v_head_dim
+                else self.head_num
+            ),
             head_dim=self.head_dim,
             v_head_dim=self.v_head_dim,
             dtype=self.store_dtype,

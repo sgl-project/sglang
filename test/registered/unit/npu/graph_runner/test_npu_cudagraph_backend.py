@@ -14,6 +14,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=10, suite="extra-a-test-npu")
 
@@ -90,7 +91,55 @@ def _make_decode_runner(raw_bs=2, bs=2):
     return runner
 
 
-class TestNPUCudaGraphBackend(unittest.TestCase):
+class TestNPUCudaGraphBackend(CustomTestCase):
+    def test_encoder_decoder_rebinds_by_table_not_record_order(self):
+        """Cross lengths must not receive the decoder's host length payload."""
+        runner = _make_decode_runner()
+        metadata = SimpleNamespace(
+            self_block_tables=torch.zeros(2, 16, dtype=torch.int32),
+            cross_block_tables=torch.zeros(2, 16, dtype=torch.int32),
+            self_lengths=[97, 131],
+            cross_lengths=[1500, 129],
+        )
+        runner.attn_backend = SimpleNamespace(
+            use_encoder_decoder_paged=True,
+            forward_metadata=SimpleNamespace(encoder_decoder=metadata),
+        )
+        backend, _ = _make_backend(runner)
+        self.addCleanup(backend.cleanup)
+        graph = mock.Mock()
+        shape_key = ShapeKey(size=2)
+        backend._graphs[shape_key] = graph
+        backend._outputs[shape_key] = "result"
+        graph.graph_dispatch_mode.graph_dispatch_records = [
+            SimpleNamespace(kwargs={"block_table": metadata.cross_block_tables}),
+            SimpleNamespace(kwargs={}),
+            SimpleNamespace(kwargs={"block_table": metadata.self_block_tables}),
+            SimpleNamespace(kwargs={"block_table": metadata.cross_block_tables}),
+        ]
+        for self_lengths, cross_lengths in (
+            ([97, 131], [1500, 129]),
+            ([132, 141], [1500, 129]),
+        ):
+            metadata.self_lengths = self_lengths
+            metadata.cross_lengths = cross_lengths
+            self.assertEqual(backend.replay(shape_key, SimpleNamespace()), "result")
+            self.assertEqual(
+                graph.update.call_args.kwargs["cpu_update_input"],
+                [
+                    {"actual_seq_lengths_kv": cross_lengths},
+                    {},
+                    {"actual_seq_lengths_kv": self_lengths},
+                    {"actual_seq_lengths_kv": cross_lengths},
+                ],
+            )
+        graph.reset_mock()
+        graph.update.side_effect = RuntimeError("failed to publish attention update")
+        with self.assertRaisesRegex(RuntimeError, "failed to publish"):
+            backend.replay(shape_key, SimpleNamespace())
+        # An unupdated graph waits on external events that will never be recorded.
+        graph.replay.assert_not_called()
+
     def test_replay_update_converts_legacy_sequence_lengths_to_int32_tensor(self):
         backend, runner = _make_backend()
         graph = mock.Mock()

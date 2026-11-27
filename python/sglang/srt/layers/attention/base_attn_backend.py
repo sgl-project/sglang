@@ -13,9 +13,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
-        BaseIndexerMetadata,
-    )
+    from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -114,6 +112,8 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # False when this configuration needs host-driven attention fallback.
+    supports_decode_cuda_graph: bool = True
     # Bind-time cap on the window sub-pools one runner's layers attend through.
     max_window_sub_pools: int = 1
 
@@ -382,7 +382,6 @@ class AttentionBackend(ABC):
         (e.g. dirty metadata buffers, raw->full upgrades) before capture
         freezes the kernel pointers.
         """
-        pass
 
     @property
     def verify_mask(self) -> Optional[VerifyMask]:

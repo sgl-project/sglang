@@ -791,6 +791,13 @@ def capture_decode_graph(
     if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
         return no_capture
 
+    if not getattr(model_runner.attn_backend, "supports_decode_cuda_graph", True):
+        logger.warning(
+            "Decode graph disabled: this attention configuration requires "
+            "ordinary execution. Prefill graph configuration is unchanged."
+        )
+        return no_capture
+
     if getattr(model_runner, "device", None) == "cpu":
         if not get_flags().capture.enable_torch_compile:
             return no_capture

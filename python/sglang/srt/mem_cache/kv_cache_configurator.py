@@ -2543,6 +2543,8 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             modelslim_cache_layout=self.modelslim_cache_layout,
+            # Keep per-layer views available during encoder-decoder graph capture.
+            use_fia=True if self.model_config.is_encoder_decoder else None,
         )
         return token_to_kv_pool
 
