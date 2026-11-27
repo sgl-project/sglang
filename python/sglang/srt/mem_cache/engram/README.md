@@ -93,9 +93,9 @@ Use the matching Mooncake Engram Config branch and its rebuilt Master/Python
 extension. `--enable-hi-engram` remains a boolean flag; select the backend in
 JSON. Reuse the existing `MOONCAKE_MASTER=host:port` or Mooncake configuration.
 Enable `NCCL_CUMEM_ENABLE=1` before launch, as required by NCCL GIN windows.
-An Engram-gated bootstrap hook validates cuMem and applies an explicitly
-configured NIC before the first NCCL process group. NIC selection affects all
-NCCL communicators in that worker; Engine and ModelRunner are unchanged.
+NIC selection reuses NCCL configuration, including `NCCL_IB_HCA` when set.
+Engram does not override it; Engine, ModelRunner and distributed bootstrap
+are unchanged.
 
 ```bash
 export MOONCAKE_MASTER=master-host:50051
@@ -114,16 +114,13 @@ SGLang automatically supplies the node/model identity, dense `caller_id`,
 `num_callers`, and a conservative `max_lookup_rows` bound including graph
 padding and speculative/attention-DP expansion. User JSON rejects caller,
 identity, Master-address and session fields. Optional user overrides are
-`rdma_device` (a string accepting `{local_rank}`, or a list indexed by the
-CUDA-visible device ordinal), `timeout` and a sufficiently large
-`max_lookup_rows`. Remote JSON does not use `local_dir` or `persistent`.
+`timeout` and a sufficiently large `max_lookup_rows`. Remote JSON does not use
+`local_dir` or `persistent`.
 
-For example, `"rdma_device": ["mlx5_0", "mlx5_0", "mlx5_1", "mlx5_1"]`
-maps four visible GPUs onto two NICs. The selected NIC becomes the worker's
-`NCCL_IB_HCA` before model communication initializes and is also passed to
-Mooncake. This explicitly restricts both model and Engram NCCL communication
-in that worker; when omitted, NCCL keeps its existing device selection.
-The list uses CUDA-visible ordinals, not physical GPU numbers or TP ranks.
+To restrict NIC selection, set `NCCL_IB_HCA` before launch, for example
+`export NCCL_IB_HCA='=mlx5_0'`. This is the worker's NCCL configuration for both
+model and Engram communication. Otherwise NCCL selects devices using its
+existing configuration and topology discovery.
 
 The Engram adapter constructs `EngramStoreConfig` and `EngramStore`, obtains
 placement before allocating the local weight buffer, then translates Qwen head

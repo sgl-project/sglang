@@ -26,7 +26,6 @@ def _parse_config(config: str | None) -> dict:
             "group_size",
             "group_id",
             "shard_id",
-            "rdma_device",
             "timeout",
             "max_lookup_rows",
         }
@@ -65,13 +64,6 @@ def _parse_config(config: str | None) -> dict:
         or options["timeout"] <= 0
     ):
         raise ValueError("timeout must be finite and positive")
-    if "rdma_device" in options:
-        devices = options["rdma_device"]
-        devices = devices if isinstance(devices, list) else [devices]
-        if not devices or any(
-            not isinstance(device, str) or not device.strip() for device in devices
-        ):
-            raise ValueError("rdma_device must be a nonempty string or device list")
     return options
 
 

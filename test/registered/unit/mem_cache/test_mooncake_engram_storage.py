@@ -12,11 +12,7 @@ import torch
 
 from sglang.srt import runtime_context
 from sglang.srt.mem_cache.engram import _parse_config, create_storage
-from sglang.srt.mem_cache.engram.remote_utils import (
-    configure_remote_nccl,
-    make_remote_config,
-    select_rdma_device,
-)
+from sglang.srt.mem_cache.engram.remote_utils import make_remote_config
 from sglang.srt.mem_cache.storage.mooncake_engram import MooncakeEngramStorage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -199,6 +195,7 @@ class TestEngramRemoteConfig(CustomTestCase):
             ("master_addr", "host:50051"),
             ("session_id", "old"),
             ("local_dir", "/tmp"),
+            ("rdma_device", "mlx5_0"),
         ):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, "Unknown"):
                 _parse_config(json.dumps(dict(self.options, **{name: value})))
@@ -212,104 +209,6 @@ class TestEngramRemoteConfig(CustomTestCase):
         self.assertEqual(_parse_config(json.dumps(manual)), manual)
         with self.assertRaises(ValueError):
             _parse_config(json.dumps(dict(manual, shard_id=2)))
-
-    def test_rdma_device_mapping_and_validation(self):
-        devices = ["mlx5_7", "mlx5_7", "mlx5_5", "mlx5_5"]
-        self.assertEqual(select_rdma_device("mlx5_{local_rank}", 2), "mlx5_2")
-        self.assertEqual(select_rdma_device("mlx5_7", 2), "mlx5_7")
-        self.assertEqual(select_rdma_device(devices, 2), "mlx5_5")
-        self.assertEqual(
-            _parse_config(json.dumps(dict(self.options, rdma_device=devices)))[
-                "rdma_device"
-            ],
-            devices,
-        )
-        for device in ([], ["mlx5_0", ""], ["mlx5_0", 1], " ", 1, None):
-            with self.subTest(device=device), self.assertRaises(ValueError):
-                _parse_config(json.dumps(dict(self.options, rdma_device=device)))
-        for rank in (-1, 4):
-            with self.subTest(rank=rank), self.assertRaisesRegex(ValueError, "rank"):
-                select_rdma_device(devices, rank)
-
-    def test_nccl_preparation_preserves_default_and_local_settings(self):
-        with mock.patch.dict(
-            os.environ, {"NCCL_IB_HCA": "=existing", "NCCL_CUMEM_ENABLE": "1"}
-        ):
-            configure_remote_nccl(None, 0)
-            configure_remote_nccl(json.dumps(self.options), 0)
-            self.assertEqual(os.environ["NCCL_IB_HCA"], "=existing")
-
-    def test_nccl_preparation_does_not_override_disabled_cumem(self):
-        with mock.patch.dict(os.environ, {"NCCL_CUMEM_ENABLE": "0"}):
-            with self.assertRaisesRegex(ValueError, "CUMEM"):
-                configure_remote_nccl(json.dumps(self.options), 0)
-            self.assertEqual(os.environ["NCCL_CUMEM_ENABLE"], "0")
-
-    def test_nccl_preparation_rejects_late_device_selection(self):
-        options = dict(self.options, rdma_device="mlx5_0")
-        with (
-            mock.patch.dict(os.environ, {"NCCL_CUMEM_ENABLE": "1"}),
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            self.assertRaisesRegex(RuntimeError, "before NCCL"),
-        ):
-            configure_remote_nccl(json.dumps(options), 0)
-
-    def test_bootstrap_selects_device_before_first_process_group(self):
-        from sglang.srt.distributed import bootstrap
-
-        options = dict(self.options, rdma_device=["mlx5_7", "mlx5_7", "mlx5_5"])
-        parallel = SimpleNamespace(
-            tp_size=4,
-            pp_size=1,
-            tp_rank=2,
-            pp_rank=0,
-            dist_timeout=None,
-            max_ep_size=None,
-        )
-        execution = SimpleNamespace(
-            moe=SimpleNamespace(
-                is_ep_joiner=False, is_ep_scale_joiner=False, moe_a2a_backend=None
-            ),
-            comm=SimpleNamespace(enable_symm_mem=False),
-        )
-        args = SimpleNamespace(
-            enable_hi_engram=True, hi_engram_config=json.dumps(options)
-        )
-
-        def init_group(**kwargs):
-            self.assertEqual(kwargs["local_rank"], 2)
-            self.assertEqual(os.environ["NCCL_IB_HCA"], "=mlx5_5")
-
-        with (
-            mock.patch.dict(
-                os.environ, {"NCCL_CUMEM_ENABLE": "1", "NCCL_IB_HCA": "=existing"}
-            ),
-            mock.patch("torch.distributed.is_initialized", return_value=False),
-            mock.patch.object(bootstrap, "get_parallel", return_value=parallel),
-            mock.patch.object(bootstrap, "get_exec", return_value=execution),
-            mock.patch.object(
-                bootstrap, "init_distributed_environment", side_effect=init_group
-            ) as initialize,
-            mock.patch.object(bootstrap, "initialize_model_parallel"),
-            mock.patch.object(bootstrap, "_tag_groups_for_flashinfer_allreduce_only"),
-            mock.patch.object(bootstrap, "initialize_dp_attention"),
-            mock.patch.object(bootstrap, "is_npu", return_value=False),
-        ):
-            bootstrap._init_parallel_groups(
-                backend="nccl", dist_init_method="env://", server_args=args, gpu_id=2
-            )
-            initialize.assert_called_once()
-            args.enable_hi_engram = False
-            with mock.patch(
-                "sglang.srt.mem_cache.engram.remote_utils.configure_remote_nccl"
-            ) as prepare:
-                bootstrap._init_parallel_groups(
-                    backend="nccl",
-                    dist_init_method="env://",
-                    server_args=args,
-                    gpu_id=2,
-                )
-                prepare.assert_not_called()
 
     def test_callers_identity_and_capacity_are_derived_from_runtime(self):
         module = ModuleType("mooncake.engram")
@@ -358,12 +257,16 @@ class TestEngramRemoteConfig(CustomTestCase):
             second = make_remote_config(options, 24)
             self.assertEqual(second.caller_id, 2)
             self.assertEqual(first.node_id, second.node_id)
-            with mock.patch("torch.cuda.current_device", return_value=2):
-                selected = make_remote_config(
-                    dict(options, rdma_device=["mlx5_7", "mlx5_7", "mlx5_5", "mlx5_5"]),
-                    24,
-                )
-            self.assertEqual(selected.rdma_device, "mlx5_5")
+            with mock.patch.dict(
+                os.environ, {"NCCL_CUMEM_ENABLE": "0", "NCCL_IB_HCA": "=existing"}
+            ):
+                with self.assertRaisesRegex(ValueError, "CUMEM"):
+                    make_remote_config(options, 24)
+                self.assertEqual(os.environ["NCCL_CUMEM_ENABLE"], "0")
+                self.assertEqual(os.environ["NCCL_IB_HCA"], "=existing")
+            with mock.patch.dict(os.environ, {"NCCL_IB_HCA": "=existing"}):
+                make_remote_config(options, 24)
+                self.assertEqual(os.environ["NCCL_IB_HCA"], "=existing")
             with self.assertRaisesRegex(ValueError, "cover"):
                 make_remote_config(dict(options, max_lookup_rows=1), 24)
             patches["get_schedule"].chunked_prefill_size = -1

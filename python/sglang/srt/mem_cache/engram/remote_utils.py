@@ -1,53 +1,9 @@
-"""Runtime identity, lookup capacity, and NCCL setup for remote Engram storage."""
+"""Runtime identity and lookup capacity for remote Engram storage."""
 
 import hashlib
 import json
-import logging
 import os
 import socket
-
-logger = logging.getLogger(__name__)
-
-
-def select_rdma_device(device, local_rank):
-    """Index by CUDA-visible device ordinal, also used by bootstrap's gpu_id."""
-    if isinstance(device, list):
-        if not 0 <= local_rank < len(device):
-            raise ValueError(
-                f"rdma_device has {len(device)} entries but local rank is {local_rank}"
-            )
-        device = device[local_rank]
-    return device.format(local_rank=local_rank).strip()
-
-
-def configure_remote_nccl(config, local_rank):
-    """Validate cuMem and apply an explicit NIC before NCCL initialization.
-
-    NIC selection is process-wide: it also restricts model communicators in
-    this worker. Without rdma_device, preserve NCCL's existing NIC selection.
-    """
-    from sglang.srt.mem_cache.engram import _parse_config
-
-    options = _parse_config(config)
-    if options.get("backend", "local") != "deepep_rdma":
-        return
-    if os.environ.get("NCCL_CUMEM_ENABLE") != "1":
-        raise ValueError(
-            "deepep_rdma requires NCCL_CUMEM_ENABLE=1 before SGLang launch"
-        )
-    if "rdma_device" not in options:
-        return
-    import torch
-
-    if torch.distributed.is_initialized():
-        raise RuntimeError("Configure Engram rdma_device before NCCL initialization")
-    device = select_rdma_device(options["rdma_device"], local_rank)
-    os.environ["NCCL_IB_HCA"] = "=" + device
-    logger.info(
-        "Engram local rank %s: NCCL_IB_HCA=%s applies to model and Engram NCCL",
-        local_rank,
-        os.environ["NCCL_IB_HCA"],
-    )
 
 
 def make_remote_config(options, heads):
@@ -111,13 +67,6 @@ def make_remote_config(options, heads):
         )
     settings = dict(options)
     settings["max_lookup_rows"] = configured
-    if settings.get("rdma_device"):
-        import torch
-
-        settings["rdma_device"] = select_rdma_device(
-            settings["rdma_device"], torch.cuda.current_device()
-        )
-    # The bootstrap hook checks this before the first communicator as well.
     if os.environ.get("NCCL_CUMEM_ENABLE") != "1":
         raise ValueError(
             "deepep_rdma requires NCCL_CUMEM_ENABLE=1 before SGLang launch"
