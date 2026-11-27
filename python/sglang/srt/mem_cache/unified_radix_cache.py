@@ -483,9 +483,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
         if cache_linker.load_mode == "prefetch":
-            memory = get_memory()
             self.prefetch_stop_policy = cache_linker.prefetch_policy
-            config = memory.unified_cache_external_linker_config
             (
                 _,
                 _,
@@ -493,9 +491,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 timeout_per_ki_token,
                 _,
             ) = HybridCacheController.parse_storage_backend_extra_config(
-                json.dumps(config)
-                if config is not None
-                else memory.hicache_storage_backend_extra_config
+                json.dumps(get_memory().unified_cache_external_linker_config)
             )
             self.prefetch_timeout_per_page = (
                 self.page_size / 1024 * timeout_per_ki_token
@@ -660,6 +656,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        self._init_mamba_path_cap_counts_host()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -4613,6 +4610,20 @@ class UnifiedRadixCache(BasePrefixCache):
         if comp is None:
             return False
         return comp._mamba_host_only_checkpoint()
+
+    def _init_mamba_path_cap_counts_host(self) -> None:
+        """Let the per-path Mamba state cap count and free host copies; a no-op
+        without a cap (checkpoints level 3) or a Mamba host pool in cache mode."""
+        comp = self.components.get(ComponentType.MAMBA)
+        cap = comp.mamba_max_states_per_path if comp is not None else -1
+        if (
+            cap < 0
+            or comp._mamba_pool_host is None
+            or self.host_memory_mode == "buffer_only"
+        ):
+            return
+        self.tree_core.set_mamba_path_cap_counts_host(True)
+        logger.info("Mamba path cap counts host copies (cap %d)", cap)
 
     # ---- HiCache: Scheduler Entry Points ----
 
