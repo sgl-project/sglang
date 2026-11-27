@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -130,8 +131,16 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         self.limit = limit
         self.swiglu_limit = swiglu_limit
         self._use_oai = alpha is not None and limit is not None
+        self._fused_clipped_quant = None
         if swiglu_limit is not None:
             assert need_quant and not self._use_oai
+            if not is_npu_arch35():
+                from sgl_kernel_npu.operators.utils.cann import detect_cann_version
+
+                if detect_cann_version().startswith("9.2."):
+                    from sgl_kernel_npu.operators.activation import swiglu_quant
+
+                    self._fused_clipped_quant = swiglu_quant
             return
         if self._use_oai:
             from sgl_kernel_npu.operators.activation import swiglu_oai_quant
@@ -149,6 +158,22 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         group_list_type: int,
     ):
         if self.swiglu_limit is not None:
+            if (
+                self._fused_clipped_quant is not None
+                and hidden_states.device.type == "npu"
+                and hidden_states.ndim == 2
+                and hidden_states.is_contiguous()
+                and group_list.is_contiguous()
+            ):
+                # Both grouped matmuls use this same metadata to delimit the
+                # packed valid prefix. GMM2 skips the unwritten capacity rows.
+                return self._fused_clipped_quant(
+                    hidden_states,
+                    group_list,
+                    group_list_type,
+                    limit=self.swiglu_limit,
+                    clamp_before_silu=True,
+                )
             return _clipped_swiglu_quant(
                 hidden_states, self.swiglu_limit, group_list, group_list_type
             )
