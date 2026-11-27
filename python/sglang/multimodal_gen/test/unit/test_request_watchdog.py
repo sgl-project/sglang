@@ -246,10 +246,8 @@ def test_trip_turns_health_unhealthy_and_dumps_worker_stacks(monkeypatch) -> Non
         http_server.health(SimpleNamespace(app=SimpleNamespace(state=state)))
     )
     assert response.status_code == 503
-    assert json.loads(response.body) == {
-        "status": "unhealthy",
-        "error": "request r7 exceeded 2 s",
-    }
+    assert client.failure_reason == "request r7 exceeded 2 s"
+    assert json.loads(response.body) == {"status": "unhealthy"}
 
 
 def test_watchdog_trips_from_reported_executions(tmp_path, monkeypatch) -> None:

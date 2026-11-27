@@ -3,6 +3,9 @@ import os
 from contextlib import suppress
 from typing import Optional
 
+from sglang.multimodal_gen.runtime.entrypoints.openai.media_privacy import (
+    PRIVATE_CACHE_CONTROL,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -66,7 +69,10 @@ class CloudStorage:
                 local_path,
                 self.bucket_name,
                 destination_key,
-                ExtraArgs={"ContentType": content_type},
+                ExtraArgs={
+                    "ContentType": content_type,
+                    "CacheControl": PRIVATE_CACHE_CONTROL,
+                },
             )
 
         try:
@@ -82,7 +88,7 @@ class CloudStorage:
             raise
         except Exception as e:
             # If upload fails, log the error and return None for fallback
-            logger.error(f"Upload failed for {destination_key}: {e}")
+            logger.error("Media upload failed (%s)", type(e).__name__)
             return None
 
         # Simplified URL generation with a default region
@@ -94,7 +100,7 @@ class CloudStorage:
             region = self.region_name or "us-east-1"
             url = f"https://{self.bucket_name}.s3.{region}.amazonaws.com/{destination_key}"
 
-        logger.info(f"Uploaded {local_path} to {url}")
+        logger.info("Media uploaded to cloud storage")
         return url
 
     async def upload_and_cleanup(self, file_path: str) -> Optional[str]:
@@ -110,7 +116,9 @@ class CloudStorage:
                 # pass if removal fails
                 os.remove(file_path)
             except OSError as e:
-                logger.warning(f"Failed to remove temporary file {file_path}: {e}")
+                logger.warning(
+                    "Failed to remove uploaded temporary media (errno=%s)", e.errno
+                )
         return url
 
     async def upload_all_and_cleanup(self, paths: list[str]) -> list[Optional[str]]:

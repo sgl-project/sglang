@@ -1979,6 +1979,29 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_qlen,
                 actual_seq_lengths_kv,
             )
+        return self._forward_unquantized_sparse(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            topk_indices=topk_indices,
+            scaling=layer.scaling,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+        )
+
+    def _forward_unquantized_sparse(
+        self,
+        *,
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        topk_indices,
+        scaling,
+        actual_seq_qlen,
+        actual_seq_lengths_kv,
+    ):
         # Before arch35, sparse attention requires a power-of-two head group.
         # Arch35 supports K3.1's 96 query heads without padding.
         num_q_heads = q_nope.shape[1]
@@ -1995,7 +2018,7 @@ class AscendAttnBackend(AttentionBackend):
             query_rope=q_pe,
             key_rope=k_pe,
             sparse_indices=topk_indices,
-            scale_value=layer.scaling,
+            scale_value=scaling,
             actual_seq_lengths_query=actual_seq_qlen.to(
                 device=q_nope.device, dtype=torch.int32
             ),
@@ -2010,7 +2033,7 @@ class AscendAttnBackend(AttentionBackend):
             attention_mode=2,
             return_softmax_lse=False,
         )
-        return attn_out[:, :num_q_heads]
+        return attn_out[:, :num_q_heads] if head_padding else attn_out
 
     def _forward_fp8_sparse(
         self,
@@ -2294,52 +2317,16 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv,
                 )
             else:
-                # Arch35 accepts 96 query heads directly; older architectures
-                # need a power-of-two head count for this shared-KV MLA path.
-                num_q_heads = q_nope.shape[1]
-                pad_heads = (
-                    num_q_heads if is_npu_arch35() else next_power_of_2(num_q_heads)
+                attn_out = self._forward_unquantized_sparse(
+                    q_nope=q_nope,
+                    q_pe=q_pe,
+                    k_nope=k_nope,
+                    k_pe=k_pe,
+                    topk_indices=topk_indices,
+                    scaling=layer.scaling,
+                    actual_seq_qlen=actual_seq_qlen,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
                 )
-                if pad_heads != num_q_heads:
-                    extra = pad_heads - num_q_heads
-                    q_nope = torch.cat(
-                        (
-                            q_nope,
-                            q_nope[:, -1:, :].expand(-1, extra, -1),
-                        ),
-                        dim=1,
-                    ).contiguous()
-                    q_pe = torch.cat(
-                        (
-                            q_pe,
-                            q_pe[:, -1:, :].expand(-1, extra, -1),
-                        ),
-                        dim=1,
-                    ).contiguous()
-                attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
-                    query=q_nope,
-                    key=k_nope,
-                    value=k_nope,
-                    query_rope=q_pe,
-                    key_rope=k_pe,
-                    sparse_indices=topk_indices,
-                    scale_value=layer.scaling,
-                    actual_seq_lengths_query=actual_seq_qlen.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    block_table=self.forward_metadata.block_tables,
-                    sparse_block_size=1,
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                    attention_mode=2,
-                    return_softmax_lse=False,
-                )
-                if pad_heads != num_q_heads:
-                    attn_out = attn_out[:, :num_q_heads]
 
         return attn_out
 
