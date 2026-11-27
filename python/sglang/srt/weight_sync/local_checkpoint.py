@@ -41,10 +41,24 @@ import zstandard
 
 logger = logging.getLogger(__name__)
 
+_CPU_MAX_PATH = "/sys/fs/cgroup/cpu.max"
+
+
+def _get_available_cpus() -> int:
+    """CPUs this process may use: the cgroup v2 quota if set, else the affinity mask."""
+    quota, period = "max", "1"
+    if os.path.exists(_CPU_MAX_PATH):  # cgroup v2 only
+        with open(_CPU_MAX_PATH) as f:
+            quota, period = f.read().split()
+    if quota != "max":
+        return max(1, int(quota) // int(period))
+    return len(os.sched_getaffinity(0))
+
+
 # The delta-apply phases (decompress, XOR/scatter, checksum) are memory-bandwidth
 # bound and release the GIL, so a thread pool over tensors recovers the
 # bandwidth one thread leaves idle.
-NUM_WORKERS = min(32, (os.cpu_count() or 8))
+NUM_WORKERS = min(32, _get_available_cpus())
 
 # Per-checkpoint dir holding the applied-version marker and the pull lock.
 SYNC_DIR = ".weight_sync"
