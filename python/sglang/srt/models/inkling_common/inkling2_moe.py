@@ -94,6 +94,10 @@ def _capped_swiglu(gate_up, gammas, gate_cap, up_cap, offsets=None):
     return out.to(gate_up.dtype)
 
 
+def _has_forward_hooks(*modules):
+    return any(m._forward_hooks or m._forward_pre_hooks for m in modules)
+
+
 class RoutedOutput(NamedTuple):
     """Expert rows in routing order, all-reduced; combined by the consumer.
     top_k 0: rows are already combined per token (src2dst None)."""
@@ -124,11 +128,14 @@ class Inkling2Gate(nn.Module):
             "_one", torch.ones((), dtype=torch.float32), persistent=False
         )
 
-    def forward(self, x):
+    def partials(self, x):
+        """FP32 router split-K partials, [groups, tokens, experts]."""
         if uses_k_groups(x, self.weight):
-            partials = linear_k_group_partials(x.contiguous(), self.weight)
-        else:
-            partials = linear(x, self.weight, out_dtype=torch.float32)[None]
+            return linear_k_group_partials(x.contiguous(), self.weight)
+        return linear(x, self.weight, out_dtype=torch.float32)[None]
+
+    def forward(self, x):
+        partials = self.partials(x)
         if self.topk == 8:
             _, ids, weights = route_topk(
                 partials, self.bias, self.topk, self.route_scale, self._one
@@ -1264,14 +1271,12 @@ class Inkling2MoE(nn.Module):
                 self.experts.output_sizes["w13"] // 2,
                 x.device,
             )
+            # The fused route calls neither module: keep their --forward-hooks.
+            and not _has_forward_hooks(self.gate, self.experts)
         ):
-            if uses_k_groups(x, self.gate.weight):
-                partials = linear_k_group_partials(x.contiguous(), self.gate.weight)
-            else:
-                partials = linear(x, self.gate.weight, out_dtype=torch.float32)[None]
             _, _, src2dst, dst2src, gammas, offsets = (
                 moe_lowm_sm120.route_topk_meta_lowm(
-                    partials,
+                    self.gate.partials(x),
                     self.gate.bias,
                     self.gate.route_scale,
                     self.gate._one,
