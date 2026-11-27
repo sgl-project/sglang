@@ -78,7 +78,7 @@ export const config = {
 
   // Daily build for Atlas 800I A3.
   dockerImages: {
-    a3: "quay.io/ascend/sglang:main-cann9.1.0-a3",
+    a3: "quay.io/ascend/sglang:main-cann9.2.0-a3",
   },
 
   // This page renders the deployment matrix only; the GPU Playground is not wired up here.
