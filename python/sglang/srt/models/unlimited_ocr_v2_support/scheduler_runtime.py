@@ -258,17 +258,21 @@ class UocrSchedulerRuntime:
     def create_request_receiver(
         self, *, parallel, attn_dp_enabled: bool, mm_feature_transport: str, **kwargs
     ) -> UocrRequestReceiver:
-        materializer = create_async_shm_materializer(
-            max_recv_per_poll=kwargs["max_recv_per_poll"],
-            tp_size=parallel.tp_size,
-            pp_size=parallel.pp_size,
-            dp_size=parallel.num_dp_ranks,
-            attn_cp_size=parallel.attn_cp_size if attn_dp_enabled else 1,
-            nnodes=parallel.nnodes,
-            mm_feature_transport=mm_feature_transport,
-            scripted_runtime=kwargs["scripted_scheduler_hook"] is not None,
-            rust_server=kwargs["rust_server_mode"],
-            is_unlimited_ocr=True,
+        materializer = (
+            None
+            if kwargs.get("input_blocker") is not None
+            else create_async_shm_materializer(
+                max_recv_per_poll=kwargs["max_recv_per_poll"],
+                tp_size=parallel.tp_size,
+                pp_size=parallel.pp_size,
+                dp_size=parallel.num_dp_ranks,
+                attn_cp_size=parallel.attn_cp_size if attn_dp_enabled else 1,
+                nnodes=parallel.nnodes,
+                mm_feature_transport=mm_feature_transport,
+                scripted_runtime=kwargs["scripted_scheduler_hook"] is not None,
+                rust_server=kwargs["rust_server_mode"],
+                is_unlimited_ocr=True,
+            )
         )
         return UocrRequestReceiver(
             **kwargs,
