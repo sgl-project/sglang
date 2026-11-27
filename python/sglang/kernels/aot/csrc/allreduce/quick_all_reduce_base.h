@@ -32,19 +32,6 @@ using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
 
 static constexpr int kNegOne = 0xBC00BC00;  // {-1, -1}, fp16x2_t
 
-// Range guard for the bf16 -> fp16 fast path (AllReduceTwoshot<..., true>): fp16 saturates at
-// 65504. Divide by a power of two on load and multiply it back on store; the shift is exact, so
-// sum(x_i / S) * S == sum(x_i). Per codec, because only CodecFP needs it: it carries no block
-// scale, so S is its only range guard, and is free there. The quantized codecs already normalize
-// each 32 values by their own block scale, and MODE.FP16_OVFL (armed in CodecBase) keeps an
-// over-ceiling element from becoming an inf that poisons its block through the block max. S buys
-// them nothing and costs the low end: encoding_scale = rcp(decoding_scale) saturates at 65504,
-// past which encode and decode stop being reciprocals and the block is attenuated wholesale.
-// That cliff sits at blockmax = S * L / 65504 (L = 8 / 32 / 128 for Q4 / Q6 / Q8), so raising S
-// walks it into real data -- 1 -> 2 measures 62% perplexity on GLM-5.2. Leave it at 1.
-static constexpr int kQRFp16CastScaleLog2Fp = 4;     // S = 16, CodecFP
-static constexpr int kQRFp16CastScaleLog2Quant = 0;  // S = 1, CodecQ4 / CodecQ6 / CodecQ8
-
 // Number of atoms (4xf16x2_t) processed by a single thread
 static constexpr int kAtoms = 8;
 
@@ -129,6 +116,33 @@ union bf162_int_union {
   int i;
   nv_bfloat162 bf2;
 };
+
+// bf16 is the upper half of an f32, so widening each lane is a shift or a mask.
+template <int kNumAtoms>
+__quickreduce_device_inline__ void accumulate_bf16_in_f32(float (&acc)[kNumAtoms][8], int32x4_t const* data) {
+#pragma unroll
+  for (int i = 0; i < kNumAtoms; i++) {
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      uint32_t const w = static_cast<uint32_t>(data[i][j]);
+      acc[i][2 * j] += __uint_as_float(w << 16);
+      acc[i][2 * j + 1] += __uint_as_float(w & 0xffff0000u);
+    }
+  }
+}
+
+template <int kNumAtoms>
+__quickreduce_device_inline__ void round_f32_to_bf16(int32x4_t* data, float const (&acc)[kNumAtoms][8]) {
+#pragma unroll
+  for (int i = 0; i < kNumAtoms; i++) {
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      bf162_int_union r;
+      r.bf2 = __float22bfloat162_rn(make_float2(acc[i][2 * j], acc[i][2 * j + 1]));
+      data[i][j] = r.i;
+    }
+  }
+}
 
 template <typename T>
 __quickreduce_device_inline__ void packed_assign_add(int32x4_t* A, int32x4_t* B);

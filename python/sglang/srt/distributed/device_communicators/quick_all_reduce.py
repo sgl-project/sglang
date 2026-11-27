@@ -58,8 +58,8 @@ class QuickAllReduce:
         (torch.float16, 2): [1 * MB, 2 * MB, 2 * MB, 1 * MB],
         (torch.float16, 4): [1 * MB, 16 * MB, 4 * MB, 2 * MB],
         (torch.float16, 8): [16 * MB, 4 * MB, 4 * MB, 2 * MB],
-        (torch.bfloat16, 2): [2 * MB, 8 * MB, 8 * MB, 8 * MB],
-        (torch.bfloat16, 4): [8 * MB, 64 * MB, 64 * MB, 16 * MB],
+        (torch.bfloat16, 2): [1 * MB, 8 * MB, 8 * MB, 8 * MB],
+        (torch.bfloat16, 4): [1 * MB, 64 * MB, 64 * MB, 16 * MB],
         (torch.bfloat16, 8): [16 * MB, 2048 * MB, 2048 * MB, 2048 * MB],
     }
 
@@ -166,9 +166,9 @@ class QuickAllReduce:
         self.init_quick_all_reduce()
 
     def init_quick_all_reduce(self):
-        # On RocM, bfloat16 kernels are slower than fp16
-        # due to slower match operations
-        # If environment variable is set to 1, we convert input to fp16
+        # When set, the quantized codecs reduce bf16 input in fp16, because their bf16 math is
+        # slower on ROCm. The FP codec ignores it: the cast saves it no traffic, and summing bf16
+        # in f32 keeps the full bf16 range and rounds once, so it is more accurate.
         self.use_fp16_kernels = int(
             os.environ.get("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)
         )
@@ -234,7 +234,8 @@ class QuickAllReduce:
         if not is_weak_contiguous(inp):
             return False
         dtype = inp.dtype
-        if self.use_fp16_kernels:
+        # Only the quantized codecs reduce bf16 in fp16; the FP codec ignores the cast flag.
+        if self.use_fp16_kernels and self.qr_quant_level != QuickReduceRegime.FP:
             dtype = torch.float16
         return (
             inp_size <= self.qr_max_size
