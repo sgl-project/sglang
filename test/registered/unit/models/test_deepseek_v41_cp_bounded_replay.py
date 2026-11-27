@@ -13,6 +13,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from sglang.srt.arg_groups import deepseek_v4_hook
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention import deepseek_v4_backend as backend_module
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
@@ -29,8 +30,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     PhaseConfig,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner import eager_runner, prefill_cuda_graph_runner
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    use_breakable_capture_recorder,
+)
 from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_prefill_graph_scope,
@@ -1345,6 +1350,155 @@ class TestCPTailKVStore(CustomTestCase):
                 torch.testing.assert_close(cache, expected)
 
 
+class TestTailGraphCaptureState(CustomTestCase):
+    def test_cp_capture_clears_source_layer_without_running_eager_breaks(self):
+        """Recording the CP bridge must not poison later decode/verify captures."""
+
+        class CaptureOnlyRecorder:
+            def __init__(self):
+                self.calls = []
+
+            def end_current_segment(self):
+                pass
+
+            def begin_next_segment(self):
+                pass
+
+            def retain_for_replay(self, value):
+                return value
+
+            def register_eager_call(self, call):
+                # Real capture records the body; its finally does not execute.
+                self.calls.append(call)
+
+        backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
+        backend.tail_source_kv_layer_id = None
+        recorder = CaptureOnlyRecorder()
+        with (
+            forward_context(ForwardContext(attn_backend=backend)),
+            use_breakable_capture_recorder(recorder),
+        ):
+            deepseek_v4.bcg_deepseek_v4_write_tail_source_kv(
+                SimpleNamespace(layer_id=20), object(), object()
+            )
+            self.assertEqual(backend.tail_source_kv_layer_id, 20)
+            deepseek_v4_replay_tail.bcg_cp_tail_layers_in_prefill_graph(
+                None, None, True, 20, (True, False), None, [], object()
+            )
+        self.assertEqual(len(recorder.calls), 2)
+        self.assertIsNone(backend.tail_source_kv_layer_id)
+
+    def test_tail_startup_restores_source_layer_on_success_and_error(self):
+        """Startup scopes must restore the compressor selector with metadata."""
+        for raises in (False, True):
+            with self.subTest(raises=raises):
+                backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
+                original = (object(), object(), object(), 7)
+                (
+                    backend.forward_metadata,
+                    backend.tail_forward_metadata,
+                    backend.prefill_graph_replay_batch,
+                    backend.tail_source_kv_layer_id,
+                ) = original
+                expected_error = (
+                    self.assertRaisesRegex(RuntimeError, "capture failed")
+                    if raises
+                    else contextlib.nullcontext()
+                )
+                with expected_error:
+                    with backend.preserve_tail_graph_state():
+                        backend.forward_metadata = object()
+                        backend.tail_forward_metadata = object()
+                        backend.prefill_graph_replay_batch = object()
+                        backend.tail_source_kv_layer_id = 20
+                        if raises:
+                            raise RuntimeError("capture failed")
+                self.assertEqual(
+                    (
+                        backend.forward_metadata,
+                        backend.tail_forward_metadata,
+                        backend.prefill_graph_replay_batch,
+                        backend.tail_source_kv_layer_id,
+                    ),
+                    original,
+                )
+
+    def test_decode_and_verify_in_graph_drop_prefill_tail_state(self):
+        """A full metadata object must not retain the prefill compressor skip."""
+        for mode in (ForwardMode.DECODE, ForwardMode.IDLE, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
+                backend.forward_metadata = object()
+                backend._early_verify_metadata_ids = set()
+                backend.tail_forward_metadata = object()
+                backend.tail_source_kv_layer_id = 20
+                backend.init_forward_metadata_in_graph(
+                    SimpleNamespace(forward_mode=mode)
+                )
+                self.assertIsNone(backend.tail_source_kv_layer_id)
+                self.assertIsNone(backend.tail_forward_metadata)
+
+    def test_early_verify_clears_tail_state_before_metadata_replan(self):
+        """The early-verify return must not bypass host-state cleanup."""
+        backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
+        backend.forward_metadata = object()
+        backend._early_verify_metadata_ids = {id(backend.forward_metadata)}
+        backend.tail_forward_metadata = object()
+        backend.tail_source_kv_layer_id = 20
+        observed = []
+        with mock.patch.object(
+            backend_module,
+            "_replan_topk_in_graph",
+            side_effect=lambda metadata: observed.append(
+                (backend.tail_source_kv_layer_id, backend.tail_forward_metadata)
+            ),
+        ):
+            backend.init_forward_metadata_in_graph(
+                SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+            )
+        self.assertEqual(observed, [(None, None)])
+
+    def test_decode_and_verify_out_graph_clear_state_before_build(self):
+        """Out-of-graph setup must clear the skip before constructing metadata."""
+        for mode in (ForwardMode.DECODE, ForwardMode.IDLE, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
+                backend.tail_forward_metadata = object()
+                backend.tail_source_kv_layer_id = 20
+                backend.needs_cpu_seq_lens = False
+                backend.MAX_SEQ_LEN_FOR_CAPTURE = 128
+                backend.cuda_int32_kwargs = {"device": "cpu", "dtype": torch.int32}
+                backend.online_c128_mtp = SimpleNamespace(
+                    prepare_forward=lambda *a: None
+                )
+                backend.is_dspark_draft = True
+                backend.speculative_num_draft_tokens = 2
+                backend.cuda_graph_metadata_of_bucket_and_bs = {
+                    bucket: {} for bucket in backend_module._GraphBucket
+                }
+                observed = []
+
+                def build(**kwargs):
+                    observed.append(
+                        (backend.tail_source_kv_layer_id, backend.tail_forward_metadata)
+                    )
+                    return object()
+
+                backend.init_forward_metadata_decode = build
+                backend.init_forward_metadata_dspark_draft_block = build
+                backend.replay_cuda_graph_metadata_from = lambda **kwargs: None
+                batch = SimpleNamespace(
+                    forward_mode=mode,
+                    batch_size=1,
+                    req_pool_indices=torch.tensor([0]),
+                    seq_lens=torch.tensor([1]),
+                    positions=torch.tensor([0]),
+                    out_cache_loc=torch.tensor([0]),
+                )
+                backend.init_forward_metadata_out_graph(batch, in_capture=True)
+                self.assertEqual(observed, [(None, None)])
+
+
 class TestTailGraphStartup(CustomTestCase):
     """Serving must replay startup graphs without recording new CUDA work."""
 
@@ -1383,6 +1537,7 @@ class TestTailGraphStartup(CustomTestCase):
             forward_metadata=object(),
             tail_forward_metadata=object(),
             prefill_graph_replay_batch=None,
+            tail_source_kv_layer_id=None,
         )
         backend.preserve_tail_graph_state = (
             DeepseekV4AttnBackend.preserve_tail_graph_state.__get__(backend)

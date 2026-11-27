@@ -1063,6 +1063,12 @@ def _cp_tail_layers_in_prefill_graph(
         backend.exit_late_layer_tail(saved, forward_batch)
 
 
-bcg_cp_tail_layers_in_prefill_graph = eager_on_graph(True)(
-    _cp_tail_layers_in_prefill_graph
+def _cp_tail_layers_on_capture(*args, **kwargs) -> None:
+    # Capture records the bridge without running its exit/finally cleanup.
+    # Later decode and verify captures must not inherit the compressor skip.
+    get_attn_backend().tail_source_kv_layer_id = None
+
+
+bcg_cp_tail_layers_in_prefill_graph = eager_on_graph(
+    _cp_tail_layers_in_prefill_graph, on_capture=_cp_tail_layers_on_capture
 )
