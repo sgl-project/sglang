@@ -24,6 +24,13 @@ _UNRECOVERABLE_DEVICE_ERROR_MARKERS = (
 )
 
 
+def is_out_of_memory_error(error: BaseException) -> bool:
+    return isinstance(error, torch.OutOfMemoryError) or (
+        isinstance(error, torch.AcceleratorError)
+        and "out of memory" in str(error).lower()
+    )
+
+
 def is_unrecoverable_device_error(error: BaseException | str) -> bool:
     """Recognize context/allocator failures, including wrapped RPC errors.
 
