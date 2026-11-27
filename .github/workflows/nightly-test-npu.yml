@@ -2,6 +2,12 @@ name: Nightly Test (NPU)
 on:
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
+  # TEMP (validation only): allow this PR to trigger the A5 4P job. Drop before merging.
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/nightly-test-npu.yml"
   workflow_dispatch:
     inputs:
       ref:
@@ -90,6 +96,10 @@ jobs:
             echo "ref=${{ inputs.ref }}" >> $GITHUB_OUTPUT
           fi
           JOB_FILTER="$(echo "${JOB_FILTER}" | tr -d '[:space:]')"
+          # TEMP (validation only): PR runs only the A5 4P suite.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            JOB_FILTER="nightly-acc-test-4-npu-a5"
+          fi
           echo "job_filter=${JOB_FILTER:-all}" | tee -a $GITHUB_OUTPUT
           if [ -z "${{ inputs.image_a3 }}" ]; then
             echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.2.0-a3" >> $GITHUB_OUTPUT
@@ -97,7 +107,12 @@ jobs:
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.image_a5 }}" ]; then
-            echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.2.0-950" >> $GITHUB_OUTPUT
+            # TEMP (validation only): PR runs use the B050 A5 image.
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B050" >> $GITHUB_OUTPUT
+            else
+              echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.2.0-950" >> $GITHUB_OUTPUT
+            fi
           else
             echo "image_a5=${{ inputs.image_a5 }}" >> $GITHUB_OUTPUT
           fi
@@ -566,7 +581,8 @@ jobs:
       accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
 
   check-all-jobs:
-    if: ${{ !cancelled() }}
+    # TEMP (validation only): no aggregate gate on PR validation runs.
+    if: ${{ github.event_name != 'pull_request' && !cancelled() }}
     needs:
       - nightly-test-1-npu-a3
       - nightly-test-2-npu-a3
