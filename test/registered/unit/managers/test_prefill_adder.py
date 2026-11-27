@@ -163,6 +163,7 @@ class TestPrefillAdder(CustomTestCase):
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
         req.kv = ReqKvInfo()
+        req.session = None
         req.rid = str(rid)
         req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = priority
