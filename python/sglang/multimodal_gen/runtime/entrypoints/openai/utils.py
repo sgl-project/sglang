@@ -5,7 +5,6 @@ import inspect
 import json
 import os
 import re
-import shutil
 import tempfile
 import time
 from contextlib import contextmanager, suppress
@@ -18,17 +17,7 @@ from pydantic import BaseModel
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
-from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
-    ListLorasReq,
-    MergeLoraWeightsReq,
-    SetLoraReq,
-    ShutdownReq,
-    UnmergeLoraWeightsReq,
-)
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    format_lora_message,
-    save_outputs,
-)
+from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
     RequestCancelledError,
 )
@@ -40,6 +29,7 @@ from sglang.multimodal_gen.runtime.utils.image_io import (
     ensure_path_within_root,
     save_base64_image_to_path,
     save_image_bytes_to_path,
+    temporary_media_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -47,16 +37,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_generation_timer,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
-
-# re-export LoRA protocol types for backward compatibility
-__all__ = [
-    "SetLoraReq",
-    "MergeLoraWeightsReq",
-    "UnmergeLoraWeightsReq",
-    "ListLorasReq",
-    "ShutdownReq",
-    "format_lora_message",
-]
 
 logger = init_logger(__name__)
 
@@ -239,11 +219,8 @@ def temp_dir_if_disabled(
         os.makedirs(configured_path, exist_ok=True)
         yield configured_path
     else:
-        tmp = tempfile.mkdtemp(prefix="sglang_")
-        try:
+        with temporary_media_directory() as tmp:
             yield tmp
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def choose_output_image_ext(

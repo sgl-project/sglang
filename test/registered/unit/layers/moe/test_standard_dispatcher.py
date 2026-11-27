@@ -6,9 +6,14 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.layers.moe.topk as topk_module
+from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher.base import (
+    BaseDispatcher,
+    prebuild_dispatchers,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
@@ -26,6 +31,104 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _ep_dispatcher(*, moe_ep_rank: int, num_shared: int = 0):
+    dispatcher = object.__new__(StandardDispatcher)
+    dispatcher.moe_ep_size = 2
+    dispatcher.moe_ep_rank = moe_ep_rank
+    dispatcher.num_experts = 8 + num_shared
+    dispatcher.num_local_shared_experts = num_shared
+    dispatcher.num_local_routed_experts = 4
+    dispatcher.num_local_experts = 4 + num_shared
+    dispatcher.skip_local_expert_mapping = False
+    dispatcher.use_aiter_moe_runner = False
+    dispatcher.local_expert_mapping = None
+    dispatcher.expert_mask_gpu = None
+    return dispatcher
+
+
+class _LazyDispatcher(BaseDispatcher):
+    # No ``prebuild`` override: builds its state at the first dispatch.
+
+    prebuild_pending = True
+
+    def dispatch(self, hidden_states, topk_output):
+        raise NotImplementedError
+
+    def combine(self, combine_input):
+        raise NotImplementedError
+
+
+class TestStandardDispatcherPrebuild(CustomTestCase):
+    def setUp(self):
+        standard = "sglang.srt.layers.moe.token_dispatcher.standard."
+        self.enterContext(patch(standard + "get_device", return_value="cpu"))
+        self.enterContext(
+            patch(
+                standard + "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            )
+        )
+
+    def test_prebuilt_mapping_matches_the_first_dispatch(self):
+        """EP2 output was garbage when a capture recorded the expert-mapping fill;
+        the prebuilt mapping must equal the lazy one, or stay unbuilt like it."""
+        topk_ids = torch.tensor([[0, 5], [8, 3]], dtype=torch.int32)
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.ones_like(topk_ids, dtype=torch.float32),
+            topk_ids=topk_ids,
+            router_logits=None,
+        )
+        for rank in (0, 1):
+            with self.subTest(moe_ep_rank=rank):
+                lazy = _ep_dispatcher(moe_ep_rank=rank, num_shared=1)
+                lazy.dispatch(torch.ones((2, 4)), topk_output)
+                eager = _ep_dispatcher(moe_ep_rank=rank, num_shared=1)
+                self.assertTrue(eager.prebuild_pending)
+                eager.prebuild()
+                self.assertFalse(eager.prebuild_pending)
+                mapping = eager.local_expert_mapping
+                self.assertTrue(torch.equal(mapping, lazy.local_expert_mapping))
+                out = eager.dispatch(torch.ones((2, 4)), topk_output)
+                self.assertIs(eager.local_expert_mapping, mapping)
+                self.assertTrue(
+                    torch.equal(out.topk_output.topk_ids, mapping[topk_ids.long()])
+                )
+        for field, value in (
+            ("moe_ep_size", 1),
+            ("skip_local_expert_mapping", True),
+            ("use_aiter_moe_runner", True),
+        ):
+            with self.subTest(unbuilt_layout=field):
+                dispatcher = _ep_dispatcher(moe_ep_rank=0)
+                setattr(dispatcher, field, value)
+                self.assertFalse(dispatcher.prebuild_pending)
+                dispatcher.prebuild()
+                self.assertIsNone(dispatcher.local_expert_mapping)
+
+    def test_model_walk_prebuilds_every_dispatcher(self):
+        """Each dispatcher a module holds is prebuilt once, whatever its attribute name,
+        two-batch-overlap inners included; one without ``prebuild`` stays lazy."""
+        plain = _ep_dispatcher(moe_ep_rank=0)
+        inners = [_ep_dispatcher(moe_ep_rank=1), _ep_dispatcher(moe_ep_rank=1)]
+        wrapper = object.__new__(MaybeTboDeepEPDispatcher)
+        wrapper._inners = inners
+        model = torch.nn.Module()
+        for name, dispatcher in (
+            ("moe", plain),
+            ("custom", wrapper),
+            ("lora", plain),  # a LoRA wrapper shares its base layer's dispatcher
+            ("lazy", _LazyDispatcher()),
+        ):
+            setattr(model, name, torch.nn.Module())
+            setattr(getattr(model, name), f"{name}_dispatcher", dispatcher)
+
+        self.assertFalse(model.lazy.lazy_dispatcher.implements_prebuild)
+        self.assertEqual(prebuild_dispatchers(model), 2)
+        for dispatcher in [plain, *inners]:
+            self.assertIsNotNone(dispatcher.local_expert_mapping)
+        self.assertEqual(prebuild_dispatchers(model), 0)
 
 
 class TestLayerRunnerDispatch(CustomTestCase):
@@ -221,11 +324,7 @@ class TestLayerRunnerDispatch(CustomTestCase):
         """Folding a routed factor does not require selected-weight normalization."""
         hidden = torch.ones((1, 4))
         logits = torch.tensor([[3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0]])
-        for name in (
-            "grouped_topk_gpu",
-            "kimi_k2_biased_topk_impl",
-            "biased_topk_impl",
-        ):
+        for name in ("grouped_topk_gpu", "biased_topk_impl"):
             router = getattr(topk_module, name)._torchdynamo_orig_callable
             for renormalize in (True, False):
                 for fold in (True, False):
@@ -251,15 +350,14 @@ class TestLayerRunnerDispatch(CustomTestCase):
                         if fold:
                             expected *= 2.5
                         torch.testing.assert_close(weights, expected)
-                        if name != "kimi_k2_biased_topk_impl":
-                            kwargs.update(topk=3, num_fused_shared_experts=1)
-                            shared_weights, shared_ids = router(**kwargs)
-                            torch.testing.assert_close(shared_weights[:, :2], expected)
-                            self.assertEqual(int(shared_ids[0, -1]), logits.shape[-1])
-                            torch.testing.assert_close(
-                                shared_weights[:, -1],
-                                torch.tensor([1.0 if fold else 1.0 / 2.5]),
-                            )
+                        kwargs.update(topk=3, num_fused_shared_experts=1)
+                        shared_weights, shared_ids = router(**kwargs)
+                        torch.testing.assert_close(shared_weights[:, :2], expected)
+                        self.assertEqual(int(shared_ids[0, -1]), logits.shape[-1])
+                        torch.testing.assert_close(
+                            shared_weights[:, -1],
+                            torch.tensor([1.0 if fold else 1.0 / 2.5]),
+                        )
 
     def test_fp8_fallback_uses_local_ids_and_materialized_routes(self):
         """FP8 experts under an FP4 runner request must not receive global IDs."""

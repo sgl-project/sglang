@@ -51,11 +51,11 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
     is_gfx115_supported,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -79,7 +79,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx115 = _is_hip and is_gfx115_supported()
 # AITER picks the GEMM kernel, tile and split-K by the number of tokens, so
@@ -109,6 +109,10 @@ if _use_aiter:
         a16w16_into,
         prefer_hipblaslt,
     )
+
+_use_tlx_gemm = _is_gfx95 and envs.SGLANG_USE_TLX_GEMM.get()
+if _use_tlx_gemm:
+    from sglang.kernels.ops.gemm import tlx as tlx_gemm
 
 if _rowmajor_ok:
     from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
@@ -224,6 +228,9 @@ _hopper_bf16_gemv = None
 _use_hopper_bf16_gemv = None
 _hopper_bf16_tiny_gemv = None
 _use_hopper_bf16_tiny_gemv = None
+_sm12x_bf16_gemv = None
+_use_sm12x_bf16_gemv = None
+_b12x_bf16_gemv = None
 _splitk_tactic = None
 _run_splitk_dense = None
 _direct_default_tactic = None
@@ -481,6 +488,7 @@ def initialize_bf16_gemm_config() -> None:
     global _active_warp_splitk_tactics
     global _mm_bf16, _flashinfer_autotuner
     global _skip_aiter_unquant
+    global _sm12x_bf16_gemv, _use_sm12x_bf16_gemv, _b12x_bf16_gemv
 
     _skip_aiter_unquant = (
         _is_gfx95 and get_exec().deterministic.enable_deterministic_inference
@@ -576,6 +584,22 @@ def initialize_bf16_gemm_config() -> None:
 
             _mm_bf16 = mm_bf16
             _flashinfer_autotuner = AutoTuner.get()
+
+    _sm12x_bf16_gemv = _use_sm12x_bf16_gemv = _b12x_bf16_gemv = None
+    if (
+        backend.is_auto()
+        and get_platform().is_sm120
+        and not get_exec().deterministic.enable_deterministic_inference
+    ):
+        from sglang.kernels.ops.gemm.sm12x_bf16_gemv import (
+            b12x_bf16_gemv,
+            sm12x_bf16_gemv,
+            use_sm12x_bf16_gemv,
+        )
+
+        _sm12x_bf16_gemv = sm12x_bf16_gemv
+        _use_sm12x_bf16_gemv = use_sm12x_bf16_gemv
+        _b12x_bf16_gemv = b12x_bf16_gemv
 
     _BF16_GEMM_BACKEND = backend
 
@@ -810,6 +834,62 @@ def _can_accumulate_into_addend(
     )
 
 
+def _sm12x_bf16_gemv_eligible(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
+) -> bool:
+    return (
+        _sm12x_bf16_gemv is not None
+        and not torch.compiler.is_compiling()
+        and not is_batch_invariant_mode_enabled()
+        and not (x.requires_grad or weight.requires_grad)
+        and (bias is None or not bias.requires_grad)
+        and _use_sm12x_bf16_gemv(x, weight, bias)
+    )
+
+
+def _sm12x_bf16_gemv_writes(
+    out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, dtype: torch.dtype
+) -> bool:
+    # The GEMV stores row m at out + m * out.stride(0); rows must not overlap.
+    return (
+        out.dtype == dtype
+        and out.device == x.device
+        and out.stride(-1) == 1
+        and (out.shape[0] <= 1 or out.stride(0) >= weight.shape[0])
+    )
+
+
+def sm12x_fp32_lm_head_applies(
+    x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor]
+) -> bool:
+    return _sm12x_bf16_gemv_eligible(x, weight) and (
+        out is None or _sm12x_bf16_gemv_writes(out, x, weight, torch.float32)
+    )
+
+
+def sm12x_fp32_lm_head(
+    x: torch.Tensor, weight: torch.Tensor, out: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """FP32 logits of a BF16 LM head for sm12x_fp32_lm_head_applies operands."""
+    if x.numel() != x.shape[-1]:
+        return _sm12x_bf16_gemv(x, weight, out_dtype=torch.float32, out=out)
+    # One row: b12x's SIMT GEMV errs 4.1e-7 vs 7.4e-7 for cuBLAS and 1.2e-5 for
+    # the Triton GEMV (2304 -> 201024, FP64 reference), at the same 608 us on RTX
+    # PRO 6000; at 2-16 rows the Triton GEMV's error equals cuBLAS's.
+    if out is None:
+        out = x.new_empty((1, weight.shape[0]), dtype=torch.float32)
+    _b12x_bf16_gemv(x=x.reshape(1, -1), weight=weight, out=out)
+    return out.view(*x.shape[:-1], weight.shape[0])
+
+
+def sm12x_bf16_lm_head_applies(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return _sm12x_bf16_gemv_eligible(x, weight)
+
+
+def sm12x_bf16_lm_head(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return _sm12x_bf16_gemv(x, weight)
+
+
 def bf16_gemm_needs_autotune() -> bool:
     return _mm_bf16 is not None
 
@@ -1016,6 +1096,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # _skip_aiter_unquant marks deterministic mode; the TLX plan also varies with M.
+        if (
+            _use_tlx_gemm
+            and bias is None
+            and not _skip_aiter_unquant
+            and type(layer.weight.data) is torch.Tensor
+            and tlx_gemm.mm_supported(x, layer.weight)
+        ):
+            return tlx_gemm.linear(x, layer.weight)
         if (
             getattr(layer, "small_m_rowmajor", False)
             and bias is None
@@ -1041,8 +1130,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif (
             _use_aiter
+            and x.is_cuda
             and not _skip_aiter_unquant
             and type(layer.weight.data) is torch.Tensor
+            # AITER GEMMs only take GPU tensors; CPU inputs use F.linear below.
+            and x.is_cuda
         ):
             if x.dim() == 2 and prefer_hipblaslt(x.shape[0], *layer.weight.shape):
                 return F.linear(x, layer.weight, bias)
@@ -1081,6 +1173,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
+        # SM12x auto path; hopper_bf16_gemv is the opt-in gemv backend's 1-row kernel.
+        if _sm12x_bf16_gemv_eligible(x, layer.weight, bias):
+            return _sm12x_bf16_gemv(x, layer.weight, bias)
         if bias is not None:
             # RowParallelLinear holds its bias on TP rank 0 only, and FlashInfer
             # syncs each tuning call across TP ranks.
@@ -1169,7 +1264,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
             )
         if _use_aiter and bias is None and a16w16_into(x, layer.weight, output):
             return output
-        torch.mm(x, layer.weight.t(), out=output)
+        if _sm12x_bf16_gemv_eligible(x, layer.weight) and _sm12x_bf16_gemv_writes(
+            output, x, layer.weight, torch.bfloat16
+        ):
+            _sm12x_bf16_gemv(x, layer.weight, out=output)
+        else:
+            torch.mm(x, layer.weight.t(), out=output)
         if bias is not None:
             output.add_(bias)
         return output
@@ -1394,6 +1494,26 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
 
         self._maybe_apply_flashinfer_trtllm_bf16_block_layout(layer)
+        if self.use_flashinfer_trtllm_moe:
+            config = layer.moe_runner_config
+            swiglu_limit = config.swiglu_limit
+            if (
+                swiglu_limit is not None
+                and config.activation == "silu"
+                and config.is_gated
+                and not hasattr(layer, "_flashinfer_trtllm_gemm1_clamp_limit")
+            ):
+                clamp_limit = layer.w13_weight.new_full(
+                    (layer.num_local_experts,), swiglu_limit, dtype=torch.float32
+                )
+                # Keep the configured limit when resetting weights for validation.
+                clamp_limit._skip_weight_check = True
+                # Memory saver restores buffers in place for CUDA graph replay.
+                layer.register_buffer(
+                    "_flashinfer_trtllm_gemm1_clamp_limit",
+                    clamp_limit,
+                    persistent=False,
+                )
 
         if _is_npu:
             # The kernels set the dispatcher output dtype themselves -- they are
@@ -1630,6 +1750,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self._restore_trtllm_bf16_canonical_layout(layer, param, param_name)
 
     def _aiter_ck_moe_unsupported_reason(self, layer) -> Optional[str]:
+        # aiter's only gfx1250 MoE kernel takes MXFP4 weights with gate/up interleaved.
+        if is_gfx1250_supported():
+            return "aiter has no bf16 fused-MoE kernel on gfx1250"
+
         # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
         # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
         if layer.intermediate_size_per_partition % 128 != 0:
@@ -1790,6 +1914,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 gemm2_weights=layer.w2_weight,
                 global_num_experts=layer.num_experts,
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                gemm1_clamp_limit=getattr(
+                    layer, "_flashinfer_trtllm_gemm1_clamp_limit", None
+                ),
             )
             return self.runner.run(dispatch_output, quant_info)
         else:

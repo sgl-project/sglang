@@ -35,10 +35,6 @@ class VMOBAAttentionBackend(AttentionBackend):
         return VMOBAAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["VideoMobaAttentionMetadata"]:
-        return VideoMobaAttentionMetadata
-
-    @staticmethod
     def get_builder_cls() -> type["VideoMobaAttentionMetadataBuilder"]:
         return VideoMobaAttentionMetadataBuilder
 

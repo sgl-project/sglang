@@ -380,6 +380,8 @@ __global__ void Marlin(
   static constexpr auto s_type = host::ScalarType::from_id(s_type_id);
   if constexpr (w_type == host::kFE2M1f) {
     static_assert(s_type == host::kFE4M3fn && group_blocks == 1 || s_type == host::kFE8M0fnu && group_blocks == 2);
+  } else if constexpr (w_type == host::kFE4M3fn && s_type == host::kFE8M0fnu) {
+    static_assert(group_blocks == 2);
   } else if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
     static_assert(s_type == host::kBFloat16);
   } else if constexpr (std::is_same<scalar_t, half>::value) {
@@ -390,8 +392,9 @@ __global__ void Marlin(
   constexpr bool is_int_type =
       w_type == host::kU4 || w_type == host::kU8 || w_type == host::kU4B8 || w_type == host::kU8B128;
   constexpr bool is_8bit_scale = s_type.size_bits() == 8;
-  // see comments of dequant.h for more details
-  constexpr bool dequant_skip_flop = w_type == host::kFE4M3fn || w_type == host::kFE2M1f && s_type == host::kFE4M3fn ||
+  // MXFP8 E8M0 scales do not absorb the FP8 exponent bias; keep the dequant flop.
+  constexpr bool dequant_skip_flop = (w_type == host::kFE4M3fn && s_type != host::kFE8M0fnu) ||
+                                     w_type == host::kFE2M1f && s_type == host::kFE4M3fn ||
                                      has_zp && !is_zp_float && !std::is_same<scalar_t, nv_bfloat16>::value ||
                                      has_zp && !is_zp_float && !(w_type == host::kU8);
 
