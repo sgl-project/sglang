@@ -430,10 +430,17 @@ def _build_action_model_sampling_params(
         "output_format": output_format,
         "return_timing": _runtime_bool(runtime.get("return_timing"), True),
         "enable_prefix_cache": _runtime_bool(prefix_cache, True),
-        "enable_cuda_graph": _runtime_bool(cuda_graph, True),
+        "enable_cuda_graph": _runtime_bool(
+            cuda_graph, getattr(sampling_params_cls, "enable_cuda_graph", True)
+        ),
     }
     # Optional per-request overrides; absent keys keep the model defaults.
-    for name in ("seed", "guidance_scale", "guidance_scale_action"):
+    for name in (
+        "seed",
+        "guidance_scale",
+        "guidance_scale_action",
+        "return_native_outputs",
+    ):
         value = parameters.get(name, observation.get(name))
         if value is not None:
             sampling_kwargs[name] = value

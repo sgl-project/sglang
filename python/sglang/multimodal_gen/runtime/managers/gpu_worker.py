@@ -363,6 +363,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if released:
             if _device_initialized():
                 _device_module().empty_cache()
+        config = getattr(getattr(self, "server_args", None), "pipeline_config", None)
+        if getattr(config, "action_websocket_sessions", False) is True:
+            released = self.pipeline.release_action_session(session_id) or released
         return OutputBatch(output={"released": released, "session_id": session_id})
 
     def _configure_persistent_torch_compile_cache(self) -> None:
