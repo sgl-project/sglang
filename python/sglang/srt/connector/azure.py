@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 from typing import Generator, Optional, Tuple
+from urllib.parse import urlsplit
 
 import torch
 
@@ -82,8 +83,9 @@ class AzureBlobConnector(BaseFileConnector):
         if not files:
             return
 
+        base_path = urlsplit(base_dir).path
         for file in files:
-            relative = file[len(base_dir) :].lstrip("/")
+            relative = urlsplit(file).path[len(base_path) :].lstrip("/")
             destination_file = os.path.join(self.local_dir, relative)
             os.makedirs(Path(destination_file).parent, exist_ok=True)
             self.bf.copy(file, destination_file, overwrite=True)
