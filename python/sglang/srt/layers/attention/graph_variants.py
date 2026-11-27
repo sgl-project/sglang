@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 DSA_DENSE = "dense"
 DSA_SPARSE = "sparse"
+KPOOL_SHORT_DECODE = "kpool_short_decode"
+KPOOL_SCORED_DECODE = "kpool_scored_decode"
 
 
 class AttentionGraphVariants(Protocol):
