@@ -763,6 +763,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # An eager forward never runs on a graph bucket's tables.
         self.prefill_graph_metadata = None
         super().init_forward_metadata(forward_batch)
+        if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            # The per-layer state commit filters padded rows (slot -1) through
+            # this. Eager metadata resolves slots through the request-table
+            # gather, whose mapping is zero-initialized: padded rows land on
+            # the reserved padding slot 0, so no row is ever -1 here and every
+            # row is valid. (-1 padding only exists in graph-bucket tables,
+            # which refresh forward_metadata separately and leave this None,
+            # falling back to the per-layer nonzero.) Computing it as a plain
+            # arange keeps this whole step free of nonzero() stream-syncs,
+            # which would otherwise stall the host for the kernel drain once
+            # per KDA layer.
+            num_sequences = self.forward_metadata.query_start_loc.numel() - 1
+            self.forward_metadata.extend_valid_positions = torch.arange(
+                num_sequences, device=self.device
+            )
         if (
             self.kernel_dispatcher.extend_kernel.wants_int64_query_start_loc
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -1222,6 +1237,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            # Valid state-commit rows, shared by every KDA layer of this step.
+            valid_positions=self.forward_metadata.extend_valid_positions,
             query_start_loc_i64=self.forward_metadata.query_start_loc_i64,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,

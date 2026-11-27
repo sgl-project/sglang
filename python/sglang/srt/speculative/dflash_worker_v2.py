@@ -1521,11 +1521,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         req_pool_indices: torch.Tensor,
         start: torch.Tensor | None,
         lengths: torch.Tensor,
+        max_len: Optional[int] = None,
     ) -> torch.Tensor:
         lengths = lengths.to(torch.int64)
         if lengths.numel() == 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
-        max_len = int(lengths.max().item())
+        if max_len is None:
+            max_len = int(lengths.max().item())
+        else:
+            max_len = int(max_len)
         if max_len <= 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
 
@@ -1655,11 +1659,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                 full_to_swa=full_to_swa,
             )
         else:
+            # Sync-free upper bound on the compact segment lengths: the exact
+            # per-row length stays in [window, window+page) past the window
+            # (see _compute_compact_draft_seq_lens_host), so the envelope is a
+            # constant. Spares the lengths.max().item() D2H on the eager
+            # (non-triton) rebuild path; the mask trims the extra columns.
+            compact_max_len = int(self.draft_window_size) + (
+                self._draft_compact_page_size - 1
+                if self._draft_compact_page_size > 1
+                else 0
+            )
             suffix_cache_loc = self._gather_req_to_token_segments(
                 req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                 req_pool_indices=req_pool_indices,
                 start=suffix_start,
                 lengths=draft_prefix_lens,
+                max_len=compact_max_len,
             )
             if full_to_swa is not None:
                 suffix_cache_loc = full_to_swa[suffix_cache_loc]

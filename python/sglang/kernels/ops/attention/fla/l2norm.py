@@ -57,15 +57,32 @@ def l2norm_fwd_kernel(
     y,
     eps,
     T,
+    stride_xt,
+    stride_xh,
+    H: tl.constexpr,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
+    IS_CONTIG: tl.constexpr,
 ):
     i_t = tl.program_id(0).to(tl.int64)
     o_t = i_t * BT + tl.arange(0, BT)
     o_d = tl.arange(0, BD)
     m_x = (o_t[:, None] < T) & (o_d[None, :] < D)
-    p_x = x + o_t[:, None] * D + o_d[None, :]
+    if IS_CONTIG:
+        p_x = x + o_t[:, None] * D + o_d[None, :]
+    else:
+        # (t, h) rows with h fastest: consecutive rows inside one token are
+        # D-element adjacent in memory, so tile loads stay coalesced even
+        # though tokens are far apart in the parent tensor.
+        o_tg = o_t // H
+        o_th = o_t % H
+        p_x = (
+            x
+            + o_tg[:, None] * stride_xt
+            + o_th[:, None] * stride_xh
+            + o_d[None, :]
+        )
     p_y = y + o_t[:, None] * D + o_d[None, :]
     b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=1)
@@ -77,6 +94,45 @@ def l2norm_fwd(
     x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
 ):
     x_shape_og = x.shape
+    D = x.shape[-1]
+    # Strided head-structured input (e.g. q/k head-slices of the fused qkv
+    # projection on the KDA extend path): normalize in place over D without
+    # materializing a contiguous copy. Requires the (..., H, D) tail layout
+    # with a D-contiguous last dim; batch dim (if present) must be 1.
+    if (
+        not x.is_contiguous()
+        and x.ndim in (3, 4)
+        and x.stride(-1) == 1
+        and x.stride(-2) == D
+        and (x.ndim == 3 or x.shape[0] == 1)
+    ):
+        H = x.shape[-2]
+        if x.ndim == 3:
+            T = x.shape[0]
+            stride_xt, stride_xh = x.stride(0), x.stride(1)
+        else:
+            T = x.shape[1]
+            stride_xt, stride_xh = x.stride(1), x.stride(2)
+        y = torch.empty(
+            x_shape_og, dtype=output_dtype or x.dtype, device=x.device
+        )
+        grid = (triton.cdiv(T * H, 16),)
+        l2norm_fwd_kernel[grid](
+            x,
+            y,
+            eps,
+            stride_xt=stride_xt,
+            stride_xh=stride_xh,
+            H=H,
+            T=T * H,
+            D=D,
+            BD=triton.next_power_of_2(D),
+            BT=16,
+            IS_CONTIG=False,
+            num_warps=8,
+            num_stages=3,
+        )
+        return y
     x = x.view(-1, x.shape[-1])
     # allocate output
     if output_dtype is None:
@@ -101,10 +157,14 @@ def l2norm_fwd(
             x,
             y,
             eps,
+            stride_xt=0,
+            stride_xh=0,
+            H=1,
             T=T,
             D=D,
             BD=BD,
             BT=16,
+            IS_CONTIG=True,
             num_warps=8,
             num_stages=3,
         )

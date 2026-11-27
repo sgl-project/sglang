@@ -681,7 +681,8 @@ class AscendAttnBackend(AttentionBackend):
             and not dense_mla_dcp_partial
             and not self.use_quant_flash_attn
         ):
-            seq_lens_max = forward_batch.seq_lens.max()
+            # seq_lens_max is assigned in every branch below; derive it from the
+            # host-side mirror so the block-table slice never syncs the device.
             if forward_batch.forward_mode.is_target_verify():
                 if (
                     forward_batch.spec_algorithm is not None
@@ -707,7 +708,12 @@ class AscendAttnBackend(AttentionBackend):
                 seq_lens_max = forward_batch.seq_lens.max()
                 seq_lens_max += self.speculative_step_id + 1
             else:
-                seq_lens_max = forward_batch.seq_lens.max()
+                # Extend path: the device max() would force the req_to_token
+                # slice below to call Tensor::item() on a 0-dim device tensor,
+                # draining the whole device queue (up to ~9-15ms under load).
+                # The CPU mirror is authoritative for the block-table width
+                # here, so use it and keep the host unsynchronized.
+                seq_lens_max = forward_batch.seq_lens_cpu.max().item()
             self.forward_metadata.block_tables = (
                 self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, :seq_lens_max

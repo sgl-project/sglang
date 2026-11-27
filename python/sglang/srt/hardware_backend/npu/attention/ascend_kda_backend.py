@@ -38,11 +38,12 @@ class _AscendKDAExtendKernel:
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         return_intermediate_states: bool = False,
+        valid_positions: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         chunk_size = 64
-        q = l2norm_fwd(q.contiguous())
-        k = l2norm_fwd(k.contiguous())
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
         v = v.contiguous()
         g = g.contiguous()
         beta = beta.contiguous()
@@ -51,7 +52,13 @@ class _AscendKDAExtendKernel:
         # canonical contiguous [N, H, V, K] layout and scatter final_state back.
         num_sequences = query_start_loc.shape[0] - 1
         source_indices = cache_indices[:num_sequences].to(torch.long)
-        valid_state_mask = source_indices >= 0
+        if valid_positions is None:
+            # Fallback for paths without eager metadata (e.g. graph replay):
+            # this nonzero() stream-syncs behind chunk_kda_fwd and stalls the
+            # host for the whole kernel drain.
+            valid_positions = (source_indices >= 0).nonzero(
+                as_tuple=False
+            ).flatten()
         # Forward metadata may use -1 for a padded request.  index_select would
         # otherwise read the last cache slot and index_copy_ would overwrite it.
         # Slot 0 is a gather placeholder for that padded row; its computed result
@@ -83,7 +90,6 @@ class _AscendKDAExtendKernel:
             output_h=return_intermediate_states,
         )
         out, final_state, chunk_states = outputs[0], outputs[1], outputs[10]
-        valid_positions = valid_state_mask.nonzero(as_tuple=False).flatten()
         ssm_states.index_copy_(
             0,
             source_indices.index_select(0, valid_positions),
