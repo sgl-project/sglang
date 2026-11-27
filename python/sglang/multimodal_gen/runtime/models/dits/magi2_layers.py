@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.utils.weak import WeakTensorKeyDictionary
 
-from sglang.multimodal_gen.runtime.layers.moe_multihead import (
+from sglang.multimodal_gen.runtime.models.dits.magi2_moe import (
     SWIGLU7_ALPHA,
     SWIGLU7_LIMIT,
 )
