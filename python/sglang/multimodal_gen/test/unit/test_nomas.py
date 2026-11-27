@@ -276,6 +276,41 @@ def condition(device="cpu", dtype=torch.float32, padded=True):
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires CUDA graph capture",
+)
+@torch.inference_mode()
+def test_offline_graph_replays_with_current_action_mask():
+    from functools import partial
+
+    from msgspec.structs import replace
+
+    model = tiny_model("cuda", "flex").bfloat16()
+    runner = model.offline_graph(warmup=True)
+    results = []
+    shape = (2, 2, 2)
+    for index, padded in enumerate((True, False, True)):
+        event = condition("cuda", torch.bfloat16, padded)
+        event = replace(event, camera_embedding=None, camera_has_mask=None)
+
+        def generate(graph_predict=None):
+            session = NomasLatentSession(model, cache_capacity=0, seed=11, steps=2)
+            return session.generate_segment(
+                shape, event, cache_segment=False, graph_predict=graph_predict
+            )
+
+        expected = generate()
+        result = generate(partial(runner.predict, warmup=index == 0))
+        assert len(runner.entries) == 1
+        assert torch.equal(result, expected)
+        results.append(result)
+    assert torch.equal(results[0], results[2])
+    assert not torch.equal(results[0], results[1])
+    model.release_cuda_graphs()
+    assert not runner.entries and model.offline_graph(warmup=False) is None
+
+
 def tiny_decoder():
     torch.manual_seed(5)
     arch = NomasVAEArchConfig(
@@ -1483,6 +1518,28 @@ def test_activation_scale_is_shared_across_token_blocks(block_m, tail):
         torch.testing.assert_close(q[-1, 0].float(), torch.tensor(448.0))
     else:
         torch.testing.assert_close(scales[:, 0], torch.full((tokens,), 0.5))
+
+
+@pytest.mark.skipif(
+    not is_nvidia_cuda or torch.cuda.get_device_capability() != (10, 3),
+    reason="requires the SM103 block activation quantizer",
+)
+def test_block_fp8_activation_matches_torch_on_partial_strided_blocks():
+    values = torch.linspace(-2, 2, 256 * 129, device="cuda").bfloat16().view(256, 129).T
+    values[0, 0] = (
+        2.03125  # Multiplying by 1/448 and dividing by 448 round differently.
+    )
+    values[:128, 128:] = 0
+    values[-1, 0] = float("nan")
+    values[-1, 128] = float("inf")
+    quant, scales = _quantize_block_fp8_activation(values)
+    # FP32 inputs use the torch path with the same values and scale arithmetic.
+    ref_quant, ref_scales = _quantize_block_fp8_activation(values.float())
+    assert torch.equal(quant[:128].view(torch.uint8), ref_quant[:128].view(torch.uint8))
+    torch.testing.assert_close(
+        quant[-1].float(), ref_quant[-1].float(), rtol=0, atol=0, equal_nan=True
+    )
+    torch.testing.assert_close(scales, ref_scales, rtol=0, atol=0, equal_nan=True)
 
 
 @pytest.fixture

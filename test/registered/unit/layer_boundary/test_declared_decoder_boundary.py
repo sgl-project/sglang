@@ -59,7 +59,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_forward
+from sglang.srt.runtime_context import ForwardFlags, get_forward
 from sglang.test.boundary_fixtures import (
     Norm,
     finish_exit,
@@ -1547,24 +1547,6 @@ class Group:
         return output
 
 
-class Flags:
-    """The per-forward flags an FFN exit publishes, one set per rank."""
-
-    def __init__(self):
-        self.mlp_reduce_scatter = False
-        self.defer_moe_finalize = False
-        self.sp_active = False
-
-    @contextmanager
-    def scoped(self, **flags):
-        saved = {k: getattr(self, k) for k in flags}
-        self.__dict__.update(flags)
-        try:
-            yield
-        finally:
-            self.__dict__.update(saved)
-
-
 def fake_dp_gather(
     global_tokens, local_tokens, forward_batch, cp_shard_counts=None, *, is_partial
 ):
@@ -1765,7 +1747,7 @@ class TestTwoLayers(CustomTestCase):
                         tp_group=tp_group,
                         attn_tp_group=attn_tp_groups[d],
                     ),
-                    flags=Flags(),
+                    flags=ForwardFlags(),
                     calls=[],
                     dp=d,
                     rows=rows[d],
@@ -1979,7 +1961,7 @@ class TestCompleteOutputsOnInputScatteredBatches(CustomTestCase):
                     attn_tp_group=group,
                     enable_attn_tp_input_scattered=True,
                 ),
-                flags=Flags(),
+                flags=ForwardFlags(),
                 calls=[],
                 ops=[],
                 attn_inputs=[],

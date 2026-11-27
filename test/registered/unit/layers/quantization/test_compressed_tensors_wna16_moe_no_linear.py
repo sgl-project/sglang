@@ -9,6 +9,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW4AFP8MoE,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
 )
@@ -73,6 +74,64 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
     def test_per_layer_fqn_expert_targets_int4(self):
         config = _make_wna16_moe_config(PER_LAYER_EXPERT_TARGETS, num_bits=4)
         self._assert_wna16_moe(config, expected_bits=4)
+
+    def test_w4afp8_uses_the_matched_expert_group(self):
+        config = _make_wna16_moe_config(["re:.*mlp.experts.*"], num_bits=4)
+        config["config_groups"]["group_0"]["input_activations"] = {
+            "num_bits": 8,
+            "type": "float",
+            "symmetric": True,
+            "strategy": "token",
+            "dynamic": True,
+        }
+        for has_linear in (False, True):
+            with self.subTest(has_linear=has_linear):
+                if has_linear:
+                    config["config_groups"]["linear"] = _make_wna16_moe_config(
+                        ["Linear"], num_bits=8, group_size=64
+                    )["config_groups"]["group_0"]
+                quant_config = CompressedTensorsConfig.from_config(config)
+                layer = torch.nn.Module()
+                scheme = quant_config.get_moe_scheme(layer, layer_name=EXPERTS_LAYER)
+
+                self.assertIsInstance(scheme, CompressedTensorsW4AFP8MoE)
+                scheme.create_weights(layer, 1, 4096, 256, torch.float16)
+                self.assertEqual(layer.w13_weight_packed.shape[-1], 512)
+                self.assertEqual(layer.w13_weight_scale.shape[-1], 32)
+                self.assertEqual(layer.w2_weight_scale.shape[-1], 2)
+
+    def test_w4afp8_rejects_group64_expert_override(self):
+        config = _make_wna16_moe_config(["Linear"], num_bits=4)
+        expert_group = _make_wna16_moe_config(
+            PER_LAYER_EXPERT_TARGETS, num_bits=4, group_size=64
+        )["config_groups"]["group_0"]
+        expert_group["input_activations"] = {
+            "num_bits": 8,
+            "type": "float",
+            "symmetric": True,
+            "strategy": "token",
+            "dynamic": True,
+        }
+        config["config_groups"]["experts"] = expert_group
+        quant_config = CompressedTensorsConfig.from_config(config)
+        with self.assertRaisesRegex(ValueError, "requires group_size=128, got 64"):
+            quant_config.get_moe_scheme(torch.nn.Module(), layer_name=EXPERTS_LAYER)
+
+    def test_unsupported_bits_error_is_one_message(self):
+        """The unsupported-bits error reads as a sentence, not a tuple repr."""
+        quant_config = CompressedTensorsConfig.from_config(
+            _make_wna16_moe_config(["re:.*mlp.experts.*"], num_bits=2)
+        )
+        with (
+            mock.patch.object(
+                compressed_tensors,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.MARLIN,
+            ),
+            self.assertRaises(ValueError) as ctx,
+        ):
+            quant_config.get_moe_scheme(torch.nn.Module(), layer_name=EXPERTS_LAYER)
+        self.assertEqual(len(ctx.exception.args), 1, ctx.exception.args)
 
     def test_blackwell_int4_auto_uses_triton(self):
         for group_size in (32, 128):
@@ -214,6 +273,43 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
         self.assertEqual(layer.w2_weight_zero_point.shape, (2, 2, 32))
         self.assertTrue(layer.w2_weight_scale.load_full_w2)
         self.assertTrue(layer.w2_weight_zero_point.load_full_w2)
+
+    def test_weight_actorder_shards_w2_scales_like_static(self):
+        """actorder "weight" is compressed-tensors' alias of "static" and must load like it.
+
+        compressed-tensors keeps the string as written, so a raw comparison with
+        "static" treated "weight" as dynamic: at moe_tp_size > 1 it loaded the full
+        unsharded w2 scale with no g_idx, and Marlin derived a smaller group from it.
+        """
+
+        def w2_scale_layout(actorder):
+            quant_config = CompressedTensorsConfig.from_config(
+                _make_wna16_moe_config(
+                    ["re:.*mlp.experts.*"], num_bits=4, actorder=actorder
+                )
+            )
+            with mock.patch.object(
+                compressed_tensors,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.MARLIN,
+            ):
+                scheme = quant_config.get_moe_scheme(
+                    torch.nn.Module(), layer_name=EXPERTS_LAYER
+                )
+            layer = torch.nn.Module()
+            layer.moe_tp_size = 4
+            scheme.create_weights(
+                layer=layer,
+                num_experts=2,
+                hidden_size=256,
+                intermediate_size_per_partition=256,
+                params_dtype=torch.float16,
+            )
+            scale = layer.w2_weight_scale
+            return tuple(scale.shape), scale.load_full_w2
+
+        self.assertEqual(w2_scale_layout("static"), ((2, 2, 256), False))
+        self.assertEqual(w2_scale_layout("weight"), w2_scale_layout("static"))
 
 
 if __name__ == "__main__":
