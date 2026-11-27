@@ -3122,6 +3122,10 @@ class AiterAttnBackend(AttentionBackend):
                         page_size=self.page_size,
                     )
                     triton_mla_seqused_k = forward_batch.seq_lens[:bs].to(torch.int32)
+                elif self.gfx1250_mla_asm_decode:
+                    self._build_asm_mla_page_table(
+                        forward_batch.req_pool_indices, forward_batch.seq_lens, bs
+                    )
                 elif self._use_mla_decode_persist_metadata():
                     metadata_fast_mode, metadata_intra_batch_mode = (
                         self._mla_decode_metadata_modes()
@@ -4129,6 +4133,8 @@ class AiterAttnBackend(AttentionBackend):
                     triton_mla_tables[:, : tables.shape[1]].copy_(tables)
                     triton_mla_seqused_k = self.cuda_graph_triton_mla_seqused_k[:bs]
                     triton_mla_seqused_k.copy_(seq_lens[:bs])
+                elif self.gfx1250_mla_asm_decode:
+                    self._build_asm_mla_page_table(req_pool_indices, seq_lens, bs)
                 elif self._use_mla_decode_persist_metadata():
                     metadata_fast_mode, metadata_intra_batch_mode = (
                         self._mla_decode_metadata_modes()
@@ -5888,13 +5894,25 @@ class AiterAttnBackend(AttentionBackend):
             s: torch.arange(0, (max_reqs + 1) * s, s, dtype=torch.int32, device=dev)
             for s in range(1, 17)
         }
-        self.asm_mla_first_layer_id = None
         logger.info(
             "aiter MLA decode: gfx1250 non-persistent asm, %d heads, %d CUs",
             self.num_head,
             self.asm_mla_cu_num,
         )
         return True
+
+    def _build_asm_mla_page_table(
+        self, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor, bs: int
+    ) -> None:
+        self._asm_mla_build_page_table(
+            self.req_to_token,
+            req_pool_indices[:bs],
+            seq_lens[:bs],
+            self.page_size,
+            self.asm_mla_kv_indptr,
+            self.asm_mla_kv_indices,
+            self.asm_mla_last_page_len,
+        )
 
     def _asm_mla_num_kv_splits(self, bs: int) -> int:
         if self.asm_mla_fixed_splits > 0:
@@ -5929,20 +5947,6 @@ class AiterAttnBackend(AttentionBackend):
             )
         bs = forward_batch.batch_size
         num_heads = layer.tp_q_head_num
-        # Page table is per forward: build it at the first MLA layer from the
-        # graph-static batch tensors so CUDA graph replay refreshes it.
-        if self.asm_mla_first_layer_id is None:
-            self.asm_mla_first_layer_id = layer.layer_id
-        if layer.layer_id == self.asm_mla_first_layer_id:
-            self._asm_mla_build_page_table(
-                self.req_to_token,
-                forward_batch.req_pool_indices[:bs],
-                forward_batch.seq_lens[:bs],
-                self.page_size,
-                self.asm_mla_kv_indptr,
-                self.asm_mla_kv_indices,
-                self.asm_mla_last_page_len,
-            )
         if q.dtype == fp8_dtype:
             # Already rotated, cast and padded by the fused rope kernel.
             q_fp8, q_scale = q, self.asm_mla_q_scale
