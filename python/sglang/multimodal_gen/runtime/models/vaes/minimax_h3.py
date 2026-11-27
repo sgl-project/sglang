@@ -8,6 +8,7 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEConfig,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_call
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -105,6 +106,16 @@ class MiniMaxH3ImageVAE(MiniMaxH3VideoVAE):
         # and this tiled image decode switch together.
         self.decode_fast_path_gate = self._sgl_gate
         register_vae_fast_path_gate(self, self.decode_fast_path_gate)
+
+    def tiled_encode(self, x):
+        encode = super().tiled_encode
+        if self.parallel_tiling or x.ndim != 5 or x.shape[2] != 1:
+            return encode(x)
+        # The request generator samples this posterior after tile assembly.
+        # On a miss, unchanged tiles can still hit their own cache entries.
+        return cached_vae_call(
+            self, "tiled_image_moments", (x,), lambda: encode(x), nested=True
+        )
 
     def _run_tile_tasks(
         self, tiles, tile_indices, forward_fn, cls_agg=None, *, tile_batch: int = 1

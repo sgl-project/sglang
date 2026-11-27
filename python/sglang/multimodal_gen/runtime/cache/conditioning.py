@@ -853,7 +853,7 @@ def _vae_numeric_settings(vae):
     }
 
 
-def cached_vae_call(vae, method, args, compute, *, group=None):
+def cached_vae_call(vae, method, args, compute, *, group=None, nested=False):
     """Cache a deterministic result derived from ``vae`` across requests.
 
     When ``compute`` issues collectives, ``group`` must hold every rank that
@@ -863,7 +863,7 @@ def cached_vae_call(vae, method, args, compute, *, group=None):
     if cache is None:
         return compute()
     return cache.run(
-        vae, method, (args, _vae_numeric_settings(vae)), {}, compute, group
+        vae, method, (args, _vae_numeric_settings(vae)), {}, compute, group, nested=nested
     )
 
 
