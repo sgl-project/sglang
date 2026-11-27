@@ -122,8 +122,7 @@ class HeadManager:
         self.is_generation = False
         self.allow_auto_truncate = False
         self.num_reserved_tokens = 0
-        # min(context_len - 1, kv_capacity - 1) - 5 for context_len 4096, as
-        # the scheduler reports it.
+        # The scheduler's limit for context_len 4096.
         self.max_req_input_len = 4090
         self.mm_processor = PatchCounter()
         self.request_logger = SimpleNamespace(log_requests=False)

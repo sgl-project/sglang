@@ -358,11 +358,8 @@ def get_request_length_limits(
 
 
 def get_context_max_new_tokens(max_req_len: int, input_len: int) -> int:
-    """The most tokens a request with input_len prompt tokens may generate.
-
-    The +1 is the last output token, which is sampled but never forwarded:
-    the -1 in get_request_length_limits.
-    """
+    """The +1 is the last output token, sampled but never forwarded: the -1 in
+    get_request_length_limits."""
     return max_req_len - input_len + 1
 
 

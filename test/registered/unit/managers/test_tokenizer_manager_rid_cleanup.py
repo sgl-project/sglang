@@ -116,8 +116,7 @@ class TestSamplingParamsTruncation(CustomTestCase):
                     self.assertEqual(shared, {"max_new_tokens": 20})
 
     def test_truncated_prompt_keeps_its_reserved_tokens(self):
-        """After truncation the reserved tokens still count as input, so the
-        completion budget leaves room for them."""
+        """Reserved tokens still count as input after truncation."""
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
