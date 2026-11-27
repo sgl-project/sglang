@@ -489,5 +489,65 @@ def test_performance(
     assert jit_time >= 0 and sgl_time >= 0
 
 
+def test_rotary_embedding_empty_batch():
+    """Verify rotary embedding handles empty batch (num_tokens=0) without SIGFPE."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for rotary embedding tests")
+
+    device = "cuda"
+    head_size = 64
+    rotary_dim = 64
+    cos_sin_cache = create_cos_sin_cache(
+        rotary_dim=rotary_dim,
+        max_position_embeddings=128,
+        base=10000,
+        dtype=torch.float16,
+        device=device,
+    )
+
+    # 1D positions: num_tokens = 0
+    pos_1d = torch.empty(0, dtype=torch.int64, device=device)
+    q_1d = torch.empty((0, head_size), dtype=torch.float16, device=device)
+    k_1d = torch.empty((0, head_size), dtype=torch.float16, device=device)
+
+    out_q, out_k = rotary_embedding(
+        positions=pos_1d,
+        query=q_1d,
+        key=k_1d,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=True,
+    )
+    assert out_q.shape == (0, head_size)
+    assert out_k.shape == (0, head_size)
+
+    # Key is None
+    out_q_nokey, _ = rotary_embedding(
+        positions=pos_1d,
+        query=q_1d,
+        key=None,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=False,
+    )
+    assert out_q_nokey.shape == (0, head_size)
+
+    # 2D positions: [batch_size=0, seq_len=4]
+    pos_2d = torch.empty((0, 4), dtype=torch.int64, device=device)
+    q_2d = torch.empty((0, 4, head_size), dtype=torch.float16, device=device)
+    k_2d = torch.empty((0, 4, head_size), dtype=torch.float16, device=device)
+
+    out_q2, out_k2 = rotary_embedding(
+        positions=pos_2d,
+        query=q_2d,
+        key=k_2d,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=True,
+    )
+    assert out_q2.shape == (0, 4, head_size)
+    assert out_k2.shape == (0, 4, head_size)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
