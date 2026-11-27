@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
@@ -56,6 +57,7 @@ class TestCFGGating(unittest.TestCase):
 
     def test_reuses_unconditional_residual_after_gate_step(self):
         stage = DenoisingStage.__new__(DenoisingStage)
+        stage.attn_backend = SDPABackend
         batch = self._make_batch()
         server_args = self._make_server_args()
         policy = CFGPolicy().build(batch, {}, {}, {})
@@ -114,6 +116,7 @@ class TestCFGGating(unittest.TestCase):
 
     def test_model_switch_invalidates_cached_delta(self):
         stage = DenoisingStage.__new__(DenoisingStage)
+        stage.attn_backend = SDPABackend
         batch = self._make_batch()
         batch.sampling_params.quality = "exact"
         server_args = self._make_server_args()

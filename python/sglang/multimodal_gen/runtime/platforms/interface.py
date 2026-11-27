@@ -44,6 +44,7 @@ class AttentionBackendEnum(enum.Enum):
     AITER = enum.auto()
     AITER_SAGE = enum.auto()
     AITER_QUANT = enum.auto()
+    AITER_SOL = enum.auto()
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
     LASER_ATTN = enum.auto()
@@ -77,6 +78,7 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.RAIN_FUSION_ATTN,
             AttentionBackendEnum.ASCEND_SPARSE_ATTN,
             AttentionBackendEnum.SOL_ATTN,
+            AttentionBackendEnum.AITER_SOL,
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
             AttentionBackendEnum.CUBE_SPARSE_ATTN,
         }

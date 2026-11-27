@@ -3,10 +3,13 @@
 
 import unittest
 
+import torch
+
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     trailing_padding_used_len,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
+    minimax_h3_curve_order_target_video,
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
 )
@@ -225,3 +228,73 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
         )
         target_t0 = built["img_position_ids"][built["img_pos"][frozen_rows], 0]
         self.assertEqual(float(target_t0), target_origin)
+
+
+def _curve_order_layout(include_video_pos: bool = False) -> dict:
+    # 2 frames of a 4 x 6 token grid. Even sides keep every curve step to one
+    # cell; a side of odd length makes the curve take a few diagonal steps.
+    return minimax_h3_packed_sequence(
+        text_len=5,
+        latent_t=2,
+        latent_h=8,
+        latent_w=12,
+        audio_t=3,
+        include_keyframe_cond=False,
+        include_video_pos=include_video_pos,
+    )
+
+
+def _grid_cells(positions: torch.Tensor) -> torch.Tensor:
+    """(n, 3) integer (t, h, w) cell coordinates of float position rows."""
+    return torch.stack(
+        [torch.unique(positions[:, a], return_inverse=True)[1] for a in range(3)],
+        dim=-1,
+    )
+
+
+class TestMiniMaxH3CurveOrderTargetVideo(unittest.TestCase):
+    def test_target_video_tokens_take_their_rows_along_the_curve(self):
+        """Only the target video rows move, each token's row data moves with
+        it, and consecutive target rows are neighbouring video grid cells."""
+        packed = _curve_order_layout()
+        reordered = minimax_h3_curve_order_target_video(packed)
+
+        old_rows = packed["img_pos"][packed["update_mask"]]
+        new_rows = reordered["img_pos"][reordered["update_mask"]]
+        self.assertFalse(torch.equal(new_rows, old_rows))
+        self.assertTrue(torch.equal(new_rows.sort().values, old_rows.sort().values))
+
+        fixed = torch.ones(int(packed["seq_len"]), dtype=torch.bool)
+        fixed[old_rows] = False
+        for field in ("img_position_ids", "token_tags"):
+            with self.subTest(field=field):
+                self.assertTrue(
+                    torch.equal(reordered[field][fixed], packed[field][fixed])
+                )
+                self.assertTrue(
+                    torch.equal(reordered[field][new_rows], packed[field][old_rows])
+                )
+
+        in_row_order = reordered["img_position_ids"][old_rows.sort().values]
+        steps = _grid_cells(in_row_order).diff(dim=0).abs().sum(dim=-1)
+        self.assertTrue(torch.all(steps == 1))
+
+    def test_video_pos_follows_its_tokens(self):
+        packed = _curve_order_layout(include_video_pos=True)
+        reordered = minimax_h3_curve_order_target_video(packed)
+
+        self.assertTrue(
+            torch.equal(
+                reordered["img_position_ids"][reordered["video_pos"]],
+                packed["img_position_ids"][packed["video_pos"]],
+            )
+        )
+
+    def test_target_rows_that_do_not_fill_a_grid_keep_the_packed_order(self):
+        packed = _curve_order_layout()
+        target_rows = packed["img_pos"][packed["update_mask"]]
+        packed["img_position_ids"][target_rows[-1]] = packed["img_position_ids"][
+            target_rows[0]
+        ]
+
+        self.assertIs(minimax_h3_curve_order_target_video(packed), packed)

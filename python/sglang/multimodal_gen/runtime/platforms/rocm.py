@@ -156,6 +156,21 @@ class RocmPlatform(Platform):
             logger.info("Using aiter_quant attention backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_quant.AITERQuantBackend"
 
+        elif selected_backend == AttentionBackendEnum.AITER_SOL:
+            # Arch family only; whether the selected recipe has a Sol-Attn
+            # manifest row on this device is checked when the impl is built.
+            if not is_gfx95_supported():
+                raise ValueError(
+                    "aiter_sol requires a gfx950-class arch, got "
+                    f"{cls.get_device_name()}."
+                )
+            # The operand dtype is not known here: this runs at backend
+            # selection, where dtype is the default compute dtype and not what
+            # the attention layer receives. The Sol-Attn impl checks the real
+            # Q/K/V on every call and rejects anything but BF16.
+            logger.info("Using aiter_sol attention backend on ROCm.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol.AITERSolBackend"
+
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,

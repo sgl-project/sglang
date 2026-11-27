@@ -619,7 +619,70 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     return packed
 
 
+def minimax_h3_curve_order_target_video(packed: dict[str, Any]) -> dict[str, Any]:
+    """Place the generated video tokens along a Gilbert curve over their (t, h, w) grid.
+
+    The target video tokens take the same set of packed rows, in curve order
+    instead of raster order; text, audio, condition and pad rows keep their
+    rows. Every op in an H3 block but attention is per row, so this only
+    changes which tokens share an attention block: a block of consecutive
+    rows then holds a compact video patch instead of a few frame rows, which
+    a backend that pools and routes whole KV blocks needs.
+
+    Tokens stay in raster order in ``img_pos``; only the row each one is
+    placed on changes, and the per-row fields move with it. Returns ``packed``
+    unchanged when the target rows do not fill a whole grid.
+    """
+    from sglang.multimodal_gen.runtime.utils.gilbert_curve import (
+        gilbert_curve_step_of_cell,
+    )
+
+    img_pos = packed["img_pos"].view(-1).to(torch.long)
+    update_mask = packed["update_mask"].view(-1).to(torch.bool)
+    position_ids = packed["img_position_ids"]
+    target_rows = img_pos[update_mask]
+    target_positions = position_ids.index_select(0, target_rows)
+
+    grid, coordinates = [], []
+    for axis in range(target_positions.shape[-1]):
+        values, coordinate = torch.unique(
+            target_positions[:, axis], return_inverse=True
+        )
+        grid.append(int(values.numel()))
+        coordinates.append(coordinate)
+    frames, height, width = grid
+    cells = (coordinates[0] * height + coordinates[1]) * width + coordinates[2]
+    if frames * height * width != target_rows.numel() or (
+        torch.unique(cells).numel() != cells.numel()
+    ):
+        return packed
+
+    curve_step = gilbert_curve_step_of_cell(frames, height, width)
+    curve_rows = target_rows.sort().values.index_select(
+        0, curve_step.index_select(0, cells)
+    )
+    seq_len = int(packed["seq_len"])
+    # row_order[new_row] = old_row: gathering a per-row field with it moves
+    # each target token's row data to its curve row.
+    row_order = torch.arange(seq_len, dtype=torch.long)
+    row_order[curve_rows] = target_rows
+    new_row_of_old = torch.argsort(row_order)
+
+    reordered = dict(packed)
+    reordered_img_pos = img_pos.clone()
+    reordered_img_pos[update_mask] = curve_rows
+    reordered["img_pos"] = reordered_img_pos
+    reordered["img_position_ids"] = position_ids.index_select(0, row_order)
+    reordered["token_tags"] = packed["token_tags"].index_select(0, row_order)
+    if "video_pos" in packed:
+        reordered["video_pos"] = new_row_of_old.index_select(
+            0, packed["video_pos"].view(-1).to(torch.long)
+        )
+    return reordered
+
+
 __all__ = [
+    "minimax_h3_curve_order_target_video",
     "minimax_h3_packed_sequence",
     "minimax_h3_packed_sequence_ref2va_blocks",
 ]

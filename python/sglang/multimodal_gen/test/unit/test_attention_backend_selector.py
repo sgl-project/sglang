@@ -86,6 +86,22 @@ class _FakeSparseBackend:
     def unsupported_requirements(cls, _requirements) -> tuple[str, ...]:
         return ()
 
+    @classmethod
+    def dense_fallback_backend(cls) -> AttentionBackendEnum | None:
+        return None
+
+
+class _FakeSolBackend(_FakeSparseBackend):
+    """A sparse backend that names its own dense fallback."""
+
+    @classmethod
+    def get_enum(cls) -> AttentionBackendEnum:
+        return AttentionBackendEnum.AITER_SOL
+
+    @classmethod
+    def dense_fallback_backend(cls) -> AttentionBackendEnum:
+        return AttentionBackendEnum.AITER
+
 
 class _FakePlatform:
     device_name = "test"
@@ -98,6 +114,8 @@ class _FakePlatform:
             return "fake.AITERBackend"
         if selected_backend == AttentionBackendEnum.LASER_ATTN:
             return "fake.SparseBackend"
+        if selected_backend == AttentionBackendEnum.AITER_SOL:
+            return "fake.SolBackend"
         if selected_backend in (None, AttentionBackendEnum.FA):
             return "fake.FABackend"
         return "fake.SDPABackend"
@@ -107,6 +125,7 @@ _FAKE_BACKENDS = {
     "fake.AITERBackend": _FakeAITERBackend,
     "fake.FABackend": _FakeFABackend,
     "fake.SparseBackend": _FakeSparseBackend,
+    "fake.SolBackend": _FakeSolBackend,
     "fake.SDPABackend": _FakeSDPABackend,
 }
 
@@ -337,6 +356,26 @@ class TestAttentionBackendFallback(unittest.TestCase):
 
         self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
+
+    def test_cross_attention_takes_the_sparse_backends_named_fallback(self):
+        """The fallback a sparse backend names wins over the platform default
+        for cross attention; self attention keeps the sparse backend."""
+        backend = self._resolve(
+            AttentionBackendEnum.AITER_SOL,
+            explicit=True,
+            is_cross_attention=True,
+            supported=set(),
+        )
+        self.assertIs(backend, _FakeAITERBackend)
+        self.assertEqual(_FakePlatform.selected_backend, AttentionBackendEnum.AITER)
+
+        backend = self._resolve(
+            AttentionBackendEnum.AITER_SOL,
+            explicit=True,
+            is_cross_attention=False,
+            supported=set(),
+        )
+        self.assertIs(backend, _FakeSolBackend)
 
     def test_explicit_sparse_backend_is_admitted_for_self_attention(self):
         backend = self._resolve(

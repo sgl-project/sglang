@@ -94,8 +94,13 @@ def _worker(mode):
                     actual, _ = stage._postprocess_sp_latents(batch, actual, None)
                     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
             else:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+                    SDPABackend,
+                )
+
                 pipeline = MOSSImagePipelineConfig(dit_config=config)
                 stage = object.__new__(MOSSImageDenoisingStage)
+                stage.attn_backend = SDPABackend
                 stage._predict_noise = lambda **kw: candidate(
                     kw["latent_model_input"],
                     kw["timestep"],

@@ -29,6 +29,7 @@ class ForwardContext:
         tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ] = field(default_factory=dict)
     quality: str = field(default="exact", kw_only=True)
+    sol_beta: torch.Tensor | None = field(default=None, kw_only=True)
 
     @torch.compiler.disable
     def get_trtllm_gen_sequence_metadata(
@@ -92,6 +93,7 @@ def set_forward_context(
     forward_batch: Optional["Req"] = None,
     *,
     quality: str = "exact",
+    sol_beta: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -104,6 +106,9 @@ def set_forward_context(
         attn_metadata=attn_metadata,
         forward_batch=forward_batch,
         quality=quality,
+        sol_beta=sol_beta
+        if sol_beta is not None
+        else (None if prev_context is None else prev_context.sol_beta),
     )
 
     try:

@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol import (
+    AITERSolMetadata,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
     AscendFAMetadata,
     AscendFAMetadataBuilder,
@@ -389,6 +392,17 @@ def _resolve_denoise_model(
             model.eval()
         return model
     return model.to(device).eval()
+
+
+def _sol_attention_metadata(call_kwargs: dict[str, Any]) -> AITERSolMetadata:
+    """Sol-Attn metadata for one DiT forward: its text and audio keys are
+    computed exactly. Built per call because CFG branches pack text of
+    different lengths."""
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        minimax_h3_text_audio_key_mask,
+    )
+
+    return AITERSolMetadata(exact_kv_tokens=minimax_h3_text_audio_key_mask(call_kwargs))
 
 
 def _build_cube_attn_metadata(
@@ -812,6 +826,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             emb,
             include_video_pos=subblock_enabled,
         )
+        if self._transformer_uses_sol_attention():
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
+                minimax_h3_curve_order_target_video,
+            )
+
+            # Sol-Attn pools and routes KV blocks of consecutive rows, which
+            # need spatially compact video tokens.
+            packed = minimax_h3_curve_order_target_video(packed)
         tags = packed["token_tags"]
         tags[packed["text_pos"].view(-1)] = (
             emb["text_token_tags"].view(-1).to(torch.long)
@@ -1185,13 +1207,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             attn_metadata = AscendSparseAttentionMetadataBuilder().build(
                 **metadata_kwargs
             )
+        if build_vsa_h3_step_metadata is not None:
+            attn_metadata = build_vsa_h3_step_metadata(step_index)
+        elif attn_metadata is None and self._transformer_uses_sol_attention():
+            attn_metadata = _sol_attention_metadata(call_kwargs)
         with set_forward_context(
             current_timestep=step_index,
-            attn_metadata=(
-                build_vsa_h3_step_metadata(step_index)
-                if build_vsa_h3_step_metadata is not None
-                else attn_metadata
-            ),
+            attn_metadata=attn_metadata,
             forward_batch=batch,
         ):
             runner = self._maybe_get_bcg_runner(model)
@@ -1200,6 +1222,16 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             # timestep bits are eager memo keys, not graph specialization inputs
             call_kwargs.pop("adaln_timestep_bits", None)
             return self._bcg_run(runner, call_kwargs, model)
+
+    def _transformer_uses_sol_attention(self) -> bool:
+        """Whether the DiT runs Sol-Attn. The DiT resolves its backend on its
+        first forward, so the stage asks the pipeline config instead."""
+        backend = (
+            self.server_args.pipeline_config.resolve_transformer_attention_backend(
+                self.server_args
+            )
+        )
+        return backend is AttentionBackendEnum.AITER_SOL
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         # The base checks minus batch.generator: H3 seeds its own noise from

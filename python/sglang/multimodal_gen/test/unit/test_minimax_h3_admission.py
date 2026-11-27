@@ -1004,6 +1004,41 @@ def test_validate_server_args_requires_packed_varlen_backend():
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
 
 
+@pytest.mark.parametrize(
+    "global_backend,component_backends,resolved",
+    [
+        ("aiter_sol", {}, (None, None)),
+        (
+            "aiter",
+            {"transformer": "aiter_sol"},
+            (AttentionBackendEnum.AITER_SOL, "transformer"),
+        ),
+    ],
+)
+def test_validate_server_args_selects_sol_for_the_transformer(
+    global_backend, component_backends, resolved
+):
+    """A global aiter_sol is accepted like the component selection: the
+    components Sol-Attn cannot serve, such as the causal, head_dim-72 text
+    encoder, run on its dense fallback."""
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends=component_backends,
+        attention_backend=global_backend,
+        ring_degree=1,
+        performance_mode="speed",
+        resolve_component_attention_backend=lambda *_names: resolved,
+    )
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
+    ) as get_attn_backend:
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+    assert (
+        get_attn_backend.call_args.kwargs["selected_attention_backend"]
+        is AttentionBackendEnum.AITER_SOL
+    )
+
+
 @pytest.mark.parametrize("backend", ["fa", "aiter"])
 def test_validate_server_args_accepts_ring_on_lse_backends(backend):
     config = MiniMaxH3PipelineConfig()

@@ -159,6 +159,9 @@ class DmdDenoisingStage(DenoisingStage):
                             current_timestep=i,
                             attn_metadata=attn_metadata,
                             forward_batch=batch,
+                            sol_beta=self._prepare_sol_beta(
+                                batch, i, latent_model_input.device, server_args
+                            ),
                         ):
                             # Run transformer
                             pred_noise = current_model(
