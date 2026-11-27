@@ -2398,19 +2398,18 @@ class TestDSV4LowRatioBudget(CustomTestCase):
         ):
             for owners in ({}, {4: [0], 128: [1]}):
                 planner.stage_owner_layers = owners
-                self.assertEqual(planner._get_low_ratio_kv_padding_bytes(256), 0)
+                self.assertEqual(planner._get_variable_pool_byte_adjustment(256), 0)
 
     def test_other_backends_keep_existing_byte_contract(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         # Exercise sizing guards only; this does not assert these backends can
         # serve a low-ratio model or use the FlashMLA layouts.
-        for unified, npu, backend, kv_bytes in (
-            (True, False, "flashmla", 1024),
-            (False, True, "flashmla", 584),
-            (False, False, "trtllm", 512),
+        for unified, backend, kv_bytes in (
+            (True, "flashmla", 1024),
+            (False, "trtllm", 512),
         ):
-            with self.subTest(unified=unified, npu=npu, backend=backend):
+            with self.subTest(unified=unified, backend=backend):
                 _publish_config(self, dsv4_attn_backend=backend)
                 planner = object.__new__(DSV4PoolConfigurator)
                 planner._unified = unified
@@ -2418,7 +2417,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
                 planner.low_ratio_index_bytes = 68
                 planner.stage_owner_layers = {1: [0], 2: [1]}
                 with (
-                    patch("sglang.srt.model_executor.pool_configurator._is_npu", npu),
+                    patch("sglang.srt.model_executor.pool_configurator._is_npu", False),
                     patch(
                         "sglang.srt.mem_cache.deepseek_v4_memory_pool.select_dsv4_kv_layout",
                         side_effect=AssertionError(
@@ -2431,7 +2430,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
                             planner._compressed_bytes_per_full_token(ratio),
                             (kv_bytes + 68) / ratio,
                         )
-                    self.assertEqual(planner._get_low_ratio_kv_padding_bytes(256), 0)
+                    self.assertEqual(planner._get_variable_pool_byte_adjustment(256), 0)
 
 
 if __name__ == "__main__":

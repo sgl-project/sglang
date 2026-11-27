@@ -1700,9 +1700,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         assert ratio == 128, f"unsupported compression ratio: {ratio}"
         return 1 / 128 * self._get_paged_kv_bytes_per_token(128)
 
-    def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
-        """Reserved main/indexer pages beyond the token-scaled low-ratio bytes."""
-        if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
+    def _get_variable_pool_byte_adjustment(self, full_tokens: int) -> float:
+        """Adjust the linear estimate for physical pool sizes."""
+        if _is_npu:
+            # SWA ratio sizing rounds down, so this adjustment can be negative.
+            return (
+                self._npu_variable_pool_bytes(full_tokens)
+                - full_tokens * self.bytes_per_full_token
+            )
+        if self._unified or get_exec().kernel.dsv4_attn_backend == "trtllm":
             return 0
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DSV41_INDEX_PAGE_SIZE,
@@ -1979,30 +1985,23 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
         full_token = full_token // page_size * page_size
+
+        while full_token > 0 and (
+            full_token * self.bytes_per_full_token
+            + self._get_variable_pool_byte_adjustment(full_token)
+            > available_bytes_for_tokens
+        ):
+            full_token -= page_size
         if _is_npu:
-            # The linear estimate seeds the search. Actual PA_ND buffers grow in
-            # physical pages, so a candidate can land on either side of it.
-            if self._npu_variable_pool_bytes(full_token) > available_bytes_for_tokens:
-                while (
-                    full_token > 0
-                    and self._npu_variable_pool_bytes(full_token)
-                    > available_bytes_for_tokens
-                ):
-                    full_token -= page_size
-            else:
-                while (
-                    self._npu_variable_pool_bytes(full_token + page_size)
-                    <= available_bytes_for_tokens
-                ):
-                    full_token += page_size
-        else:
-            # Account for reserved low-ratio KV and indexer pages.
-            while full_token > 0 and (
-                full_token * self.bytes_per_full_token
-                + self._get_low_ratio_kv_padding_bytes(full_token)
-                > available_bytes_for_tokens
+            # The linear estimate can also leave room for another full page.
+            next_token = full_token + page_size
+            while (
+                next_token * self.bytes_per_full_token
+                + self._get_variable_pool_byte_adjustment(next_token)
+                <= available_bytes_for_tokens
             ):
-                full_token -= page_size
+                full_token = next_token
+                next_token += page_size
         if full_token <= 0 and self.swa_cap_tokens is not None:
             raise RuntimeError(
                 f"The DSV4 SWA pool cap ({self.swa_cap_tokens} tokens, "
