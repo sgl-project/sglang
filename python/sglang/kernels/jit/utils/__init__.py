@@ -17,7 +17,6 @@ from sglang.kernels.jit.utils.common import (
 )
 from sglang.kernels.jit.utils.compile import (
     KERNEL_PATH,
-    cuda_stubs_dir,
     load_jit,
     make_cpp_args,
     parallel_compile,
@@ -36,7 +35,6 @@ __all__ = [
     "make_cpp_args",
     "load_jit",
     "parallel_compile",
-    "cuda_stubs_dir",
     "get_activation_cuda_cflags",
     "is_arch_support_pdl",
     "KERNEL_PATH",

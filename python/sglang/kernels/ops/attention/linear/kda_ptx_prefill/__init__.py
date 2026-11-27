@@ -34,8 +34,6 @@ def load_ext():
     """JIT-load the CUDA extension (cached after first call)."""
     global _ext
     if _ext is None:
-        from torch.utils import cpp_extension
-
         from sglang.srt.utils.cpp_extension_loader import (
             load_extension_with_recovery,
         )
@@ -43,12 +41,6 @@ def load_ext():
         src = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
             "../../../../jit/csrc/attention/kda_prefill.cu",
-        )
-        # -lcuda: cuTensorMapEncodeTiled (driver API). The stubs dir covers
-        # boxes whose real libcuda.so lives off the default linker path;
-        # ld.so still binds the driver's libcuda.so.1 at import time.
-        stubs = os.path.join(
-            cpp_extension.CUDA_HOME or "/usr/local/cuda", "lib64", "stubs"
         )
         capability = torch.cuda.get_device_capability()
         if capability not in SM_ARCHS:
@@ -70,7 +62,6 @@ def load_ext():
                 f"arch=compute_{arch},code=sm_{arch}",
             ],
             extra_cflags=["-O3"],
-            extra_ldflags=[f"-L{stubs}", "-lcuda"],
         )
     return _ext
 

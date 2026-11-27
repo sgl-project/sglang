@@ -13,6 +13,7 @@ and ``tvm_ffi.load_module`` for loading the result.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import pathlib
@@ -39,9 +40,19 @@ _SAIL_GPU_ARCHS = (
 )
 
 
+_DEFAULT_CUDA_HOME = "/usr/local/cuda"
+
+
 @cache_once
 def cuda_home() -> str:
-    """CUDA install root, resolved the way tvm-ffi resolves it.
+    """CUDA install root: a system toolkit first, then the pip CUDA wheels.
+
+    The system part is resolved the way tvm-ffi resolves it (`CUDA_HOME` /
+    `CUDA_PATH`, nvcc on PATH, `/usr/local/cuda`). Without one, the toolkit is
+    the ``nvidia/cu<major>`` root that sglang's own dependencies install
+    (`cuda-toolkit[nvcc]`, version-locked to torch's runtime). With neither,
+    the default root is still returned so modules without device code keep
+    building on CPU hosts.
 
     `arch._jit_cuda_version` probes this nvcc to pick the compile target.
     """
@@ -51,19 +62,37 @@ def cuda_home() -> str:
     nvcc_path = shutil.which("nvcc")
     if nvcc_path is not None:
         return os.path.dirname(os.path.dirname(nvcc_path))
-    return "/usr/local/cuda"
+    if os.path.isfile(os.path.join(_DEFAULT_CUDA_HOME, "bin", "nvcc")):
+        return _DEFAULT_CUDA_HOME
+    pip_root = _pip_cuda_home()
+    if pip_root is not None:
+        logger.info(
+            "No system CUDA toolkit; JIT builds use the pip one at %s", pip_root
+        )
+        return pip_root
+    return _DEFAULT_CUDA_HOME
+
+
+def _pip_cuda_home() -> str | None:
+    """The CUDA root the pip wheels form, for torch's CUDA major (CUDA 13+ layout)."""
+    if torch.version.cuda is None:
+        return None
+    spec = importlib.util.find_spec("nvidia")
+    if spec is None:
+        return None
+    major = torch.version.cuda.split(".")[0]
+    for location in spec.submodule_search_locations or ():
+        root = os.path.join(location, f"cu{major}")
+        if os.path.isfile(os.path.join(root, "bin", "nvcc")):
+            return root
+    return None
 
 
 @cache_once
-def cuda_stubs_dir() -> str:
-    """Directory holding the driver stub libraries (`libcuda.so`).
-
-    A module that calls the driver API links `-lcuda` against this stub; the
-    real `libcuda.so.1` is supplied by the installed driver at load time. Only
-    the stub ships with the toolkit, so this path -- not a plain `-lcuda` -- is
-    what makes the link resolve.
-    """
-    return os.path.join(cuda_home(), "lib64", "stubs")
+def cuda_lib_dir() -> str:
+    """``lib64/`` in a CUDA toolkit; ``lib/`` in the pip wheels and conda, which have no ``lib64/``."""
+    lib64, lib = (os.path.join(cuda_home(), name) for name in ("lib64", "lib"))
+    return lib if os.path.isdir(lib) and not os.path.isdir(lib64) else lib64
 
 
 @cache_once
@@ -239,7 +268,17 @@ def base_link_flags(*, with_device: bool) -> List[str]:
         ]
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
-    return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
+    return flags + [f"-L{cuda_lib_dir()}", _cudart_link_flag()]
+
+
+def _cudart_link_flag() -> str:
+    # The pip wheels ship only the soname (libcudart.so.13), with no unversioned
+    # development link for a plain -lcudart to find.
+    lib_dir = pathlib.Path(cuda_lib_dir())
+    if (lib_dir / "libcudart.so").exists():
+        return "-lcudart"
+    sonames = [path.name for path in lib_dir.glob("libcudart.so.*")]
+    return f"-l:{min(sonames, key=len)}" if sonames else "-lcudart"
 
 
 def compilers() -> Tuple[str, str]:
