@@ -229,8 +229,6 @@ def _adjust_after_watermark(
     *,
     logprob_logits: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Decode's stages after the watermark, in place: the custom logit
-    processor, then non-finite sanitizing."""
     _custom_logit_processor_stage(logits, sampling_info, logprob_logits=logprob_logits)
     sanitize_nan_logits(logits, "sampler: next_token_logits")
     if logprob_logits is not None:
@@ -276,7 +274,6 @@ class VerifyRoute(msgspec.Struct, frozen=True):
         """`has_grammar` and `has_watermark` come from the caller: verify builds
         its grammar mask over the draft tree, and the provider's sampling view
         carries neither stage's state."""
-        # Without sampling info, only a grammar edits the logits.
         if info is None:
             return cls(adjusts_logits=has_grammar, need_truncated_sampling=False)
         return cls(
@@ -386,8 +383,6 @@ class VerifyStep(msgspec.Struct):
     def commit(
         self, accept: VerifyAccept, *, logits_output: LogitsProcessorOutput
     ) -> None:
-        """Commit `accept` to each stage's per-request state, then compute the
-        logprobs of its tokens when the batch returns them."""
         batch = self.batch
         info = batch.sampling_info
         if info.step_penalties is not None:

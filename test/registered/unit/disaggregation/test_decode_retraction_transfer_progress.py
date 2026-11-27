@@ -110,7 +110,7 @@ class _DecodeNode:
         self.next_room = 1000
         self.req_to_token_pool = DecodeReqToTokenPool(
             size=ROWS,
-            max_context_len=pool_size,
+            row_width=pool_size,
             device="cpu",
             enable_memory_saver=False,
             pre_alloc_size=ROWS,

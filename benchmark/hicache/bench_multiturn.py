@@ -23,6 +23,16 @@ from sglang.test.kits.cache_hit_kit import (
 )
 
 
+def parse_json_object(value):
+    try:
+        obj = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {exc.msg}") from exc
+    if not isinstance(obj, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    return obj
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Script to benchmark concurrent requests to a server."
@@ -87,6 +97,21 @@ def parse_args():
         type=str,
         default="meta-llama/Llama-3.1-8B-Instruct",
         help="model path compatible with Hugging Face Transformers",
+    )
+    parser.add_argument(
+        "--model",
+        help="Model ID for OpenAI chat requests (defaults to --model-path)",
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=parse_json_object,
+        help="JSON object of chat template parameters for OpenAI chat requests",
+    )
+    parser.add_argument(
+        "--extra-request-body",
+        type=parse_json_object,
+        help="JSON object of extra request fields for --api-format openai. "
+        "--chat-template-kwargs takes precedence if both set chat_template_kwargs.",
     )
     parser.add_argument(
         "--dataset-path",
@@ -166,7 +191,26 @@ def parse_args():
         help="API format to use: 'sglang' for native /generate endpoint, "
         "'openai' for OpenAI-compatible /v1/chat/completions endpoint.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.extra_request_body is not None:
+        if args.api_format != "openai":
+            parser.error("--extra-request-body requires --api-format openai")
+        managed_fields = {
+            "model",
+            "messages",
+            "max_tokens",
+            "max_completion_tokens",
+            "n",
+            "stream",
+            "stream_options",
+        }
+        conflicts = managed_fields.intersection(args.extra_request_body)
+        if conflicts:
+            parser.error(
+                "--extra-request-body cannot override benchmark-managed fields: "
+                + ", ".join(sorted(conflicts))
+            )
+    return args
 
 
 def log_to_jsonl_file(data, file_path="performance_metrics.jsonl", tag=""):
@@ -212,7 +256,9 @@ class ReadyQueue:
 class WorkloadGenerator:
     def __init__(self, args):
         self.api_format = args.api_format
-        self.model_path = args.model_path
+        self.model = args.model or args.model_path
+        self.chat_template_kwargs = args.chat_template_kwargs
+        self.extra_request_body = args.extra_request_body
 
         # Construct the base URL and select request/payload functions
         if self.api_format == "openai":
@@ -320,7 +366,9 @@ class WorkloadGenerator:
                     gen_payload_openai(
                         initial_messages[i],
                         first_round_output_lens[i],
-                        self.model_path,
+                        self.model,
+                        chat_template_kwargs=self.chat_template_kwargs,
+                        extra_request_body=self.extra_request_body,
                     ),
                 )
                 for i in range(args.num_clients)
@@ -499,7 +547,9 @@ class WorkloadGenerator:
                             gen_payload_openai(
                                 self.client_records[client_id]["history"],
                                 sub_q.output_len,
-                                self.model_path,
+                                self.model,
+                                chat_template_kwargs=self.chat_template_kwargs,
+                                extra_request_body=self.extra_request_body,
                             ),
                         )
                     else:
