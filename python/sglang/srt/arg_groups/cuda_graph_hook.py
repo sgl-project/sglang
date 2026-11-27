@@ -223,7 +223,13 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
             "unvalidated a2a backend",
             lambda: (
                 resolved_view(server_args).moe_a2a_backend
-                not in ("none", "deepep", "megamoe", "flashinfer_nvlink_one_sided")
+                not in (
+                    "none",
+                    "deepep",
+                    "megamoe",
+                    "flashinfer_nvlink_one_sided",
+                    "flashinfer_megamoe",
+                )
             ),
         ),
         # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
@@ -415,11 +421,13 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
         or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
     ):
         return
+    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
+
     arch = model_config_of(server_args).hf_config.architectures[0]
     if arch in (
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
-        "Inkling2ForConditionalGeneration",
+        *INKLING2_ARCHS,
     ):
         declare_resolution(
             server_args,

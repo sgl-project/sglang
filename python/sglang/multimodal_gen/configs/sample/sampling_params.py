@@ -3,17 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import dataclasses
-import hashlib
 import json
 import math
 import os
 import os.path
 import re
-import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from sglang.multimodal_gen import envs
@@ -28,27 +25,6 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
-
-
-def _json_safe(obj: Any):
-    """
-    Recursively convert objects to JSON-serializable forms.
-    - Enums -> their name
-    - Callables -> stable module-qualified name
-    - Sets/Tuples -> lists
-    - Dicts/Lists -> recursively processed
-    """
-    if isinstance(obj, Enum):
-        return obj.name
-    if callable(obj):
-        module = getattr(obj, "__module__", None)
-        qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", repr(obj)))
-        return f"{module}.{qualname}" if module else qualname
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_json_safe(v) for v in obj]
-    return obj
 
 
 def generate_request_id() -> str:
@@ -373,6 +349,9 @@ class SamplingParams:
     # A prompt-free pipeline (e.g. a text-free SR / video-to-video DiT) sets this to
     # ``True`` so the multipart video-generation route does not require ``prompt``.
     prompt_optional: ClassVar[bool] = False
+    # False when a smaller frame count or resolution fails this type's validation,
+    # so warmup probes keep their shape instead of being halved.
+    supports_warmup_lightening: ClassVar[bool] = True
 
     height: int | None = None
     width: int | None = None
@@ -487,36 +466,9 @@ class SamplingParams:
             )
 
     def _set_output_file_name(self):
-        # settle output_file_name
-        if (
-            self.output_file_name is None
-            and self.prompt
-            and isinstance(self.prompt, str)
-        ):
-            # generate a random filename
-            # get a hash of current params
-            params_dict = dataclasses.asdict(self)
-            # Avoid recursion
-            params_dict["output_file_name"] = ""
-
-            # Convert to a stable JSON string
-            params_str = json.dumps(_json_safe(params_dict), sort_keys=True)
-            # Create a hash
-            hasher = hashlib.sha256()
-            hasher.update(params_str.encode("utf-8"))
-            param_hash = hasher.hexdigest()[:8]
-
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            base = f"{self.prompt[:100]}_{timestamp}_{param_hash}"
-            self.output_file_name = base
-
         if self.output_file_name is None:
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            self.output_file_name = f"output_{timestamp}"
-
+            self.output_file_name = f"output_{uuid.uuid4().hex}"
         self.output_file_name = _sanitize_filename(self.output_file_name)
-
-        # Ensure a proper extension is present
         self._set_output_file_ext()
 
     def __post_init__(self) -> None:
@@ -649,6 +601,11 @@ class SamplingParams:
     ) -> None:
         """Resolve model-specific facts for one synthetic warmup request."""
         del req, server_args
+
+    def request_task(self) -> str | None:
+        """Task name that ``--request-time-limit TASK=SECONDS`` matches, or None
+        for models without named tasks."""
+        return None
 
     def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
         """Return model-resolved fields to publish with the queued video job."""
@@ -1144,6 +1101,22 @@ class SamplingParams:
         if diffusers_kwargs is not None:
             sampling_params.diffusers_kwargs = diffusers_kwargs
         sampling_params._adjust(server_args)
+        # __post_init__ maps the default output_quality before _adjust knows the
+        # data type, so an image got the video default and its PNG the slow
+        # compressed encode instead of the stored one. Only image requests are
+        # touched: action sampling params carry no output quality at all.
+        if (
+            sampling_params.data_type == DataType.IMAGE
+            and user_kwargs.get("output_compression") is None
+            and sampling_params.output_quality is not None
+            and sampling_params.output_compression
+            == sampling_params._adjust_output_quality(
+                sampling_params.output_quality, DataType.VIDEO
+            )
+        ):
+            sampling_params.output_compression = sampling_params._adjust_output_quality(
+                sampling_params.output_quality, DataType.IMAGE
+            )
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
 

@@ -132,6 +132,7 @@ def _load_batch_runner(backend):
     )
     runner.enable_cp_bcg_capture = False
     runner._is_full_backend = False
+    runner._is_breakable_backend = isinstance(backend, BreakableCudaGraphBackend)
     runner.backend = backend
     runner.has_mha_companion_layers = False
     runner._prefill_static_buffers = None
@@ -336,6 +337,45 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         self.assertIs(output.customized_info, customized_info)
 
+    def test_trim_logits_output_preserves_input_logprobs(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+        )
+        runner.raw_bs = 1
+        runner._is_full_backend = True
+        # Per request, not per padded token: the scheduler reads each of them
+        # off the replayed output.
+        untrimmed = LogitsProcessorOutput(
+            next_token_logits=torch.zeros((4, 8)),
+            input_token_logprobs=object(),
+            input_top_logprobs_val=object(),
+            input_top_logprobs_idx=object(),
+            input_top_logprobs_weights=object(),
+            input_token_ids_logprobs_val=object(),
+            input_token_ids_logprobs_idx=object(),
+            input_logprobs_copy_done=object(),
+        )
+        output = runner._trim_logits_output(untrimmed)
+
+        self.assertIs(output.input_token_logprobs, untrimmed.input_token_logprobs)
+        self.assertIs(output.input_top_logprobs_val, untrimmed.input_top_logprobs_val)
+        self.assertIs(output.input_top_logprobs_idx, untrimmed.input_top_logprobs_idx)
+        self.assertIs(
+            output.input_top_logprobs_weights, untrimmed.input_top_logprobs_weights
+        )
+        self.assertIs(
+            output.input_token_ids_logprobs_val,
+            untrimmed.input_token_ids_logprobs_val,
+        )
+        self.assertIs(
+            output.input_token_ids_logprobs_idx,
+            untrimmed.input_token_ids_logprobs_idx,
+        )
+        self.assertIs(
+            output.input_logprobs_copy_done, untrimmed.input_logprobs_copy_done
+        )
+
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()
         prefill_runner = object()
@@ -396,6 +436,46 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             )
 
         self.assertIs(capture.runner, prefill_runner)
+
+    def test_no_fitting_capture_size_falls_back_to_eager(self):
+        """When every prefill bucket exceeds what a capture batch can hold, the
+        caller must get an eager capture record, not a startup AttributeError."""
+        eager_runner = object()
+        override = get_context().override_server_args(
+            enable_lora=False,
+            enable_prefill_cp=False,
+            pp_size=1,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(bs=[4096], backend=Backend.BREAKABLE)
+            ),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        model_runner = SimpleNamespace(
+            device="cuda",
+            is_draft_worker=False,
+            lora_manager=None,
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
+            server_args=SimpleNamespace(),
+            model=SimpleNamespace(),
+            # One request of 512 tokens is the largest capture batch.
+            model_config=SimpleNamespace(context_len=512),
+            req_to_token_pool=SimpleNamespace(size=1),
+        )
+
+        with (
+            patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                graph_setup, "resolve_language_model", return_value=SimpleNamespace()
+            ),
+        ):
+            capture = capture_prefill_graph(
+                model_runner=model_runner,
+                eager_runner=eager_runner,
+            )
+
+        self.assertIs(capture.runner, eager_runner)
+        self.assertEqual(capture.memory_usage, {"prefill": 0})
 
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()
@@ -516,9 +596,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             server_args=SimpleNamespace(),
             # Wider than the token table, so the table is the binding limit.
             model_config=SimpleNamespace(context_len=4096),
-            req_to_token_pool=SimpleNamespace(
-                req_to_token=torch.empty((1, 32), dtype=torch.int32)
-            ),
+            req_to_token_pool=SimpleNamespace(row_width=32),
         )
 
         self.assertEqual(

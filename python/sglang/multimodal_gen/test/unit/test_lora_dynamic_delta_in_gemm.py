@@ -10,13 +10,15 @@ that add it themselves.
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
     ColumnParallelLinearWithLoRA,
@@ -130,6 +132,94 @@ def test_lossless_tier_is_admitted_against_the_fp64_math(stacked, adapter_dtype)
     )
 
 
+@pytest.mark.parametrize("quality", ["exact", "lossless"])
+@pytest.mark.parametrize("stacked", [False, True])
+def test_fp16_adapter_keeps_activations_beyond_the_fp16_range(quality, stacked):
+    # fp16 is the default save precision of Kohya-style trainers. Computed in
+    # fp16, bf16 activations beyond 65504 overflow and the image turns black;
+    # the adapter now computes in the activations' dtype, like its bf16 copy.
+    a, b = _adapter(stacked, torch.float16)
+    fp16_layer = _layer(a, b, alpha=RANK, strength=1.0)
+    bf16_layer = _layer(a.bfloat16(), b.bfloat16(), alpha=RANK, strength=1.0)
+    x = (_activations(TOKENS, IN_DIM, seed=4) * 1e4).to(torch.bfloat16)
+    assert x.abs().max() > torch.finfo(torch.float16).max
+    with torch.inference_mode(), set_forward_context(0, None, _batch(quality)):
+        out = fp16_layer.base_layer(x)
+        actual = fp16_layer._add_lora_delta(out.clone(), x, 1.0)
+        bf16_copy = bf16_layer._add_lora_delta(out.clone(), x, 1.0)
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual, bf16_copy)
+
+
+@pytest.mark.parametrize("stacked", [False, True])
+def test_fp32_adapter_computes_as_its_bf16_copy_only_at_high(stacked):
+    # Lightning LoRAs ship fp32 and bf16 files of the same weights. At "high"
+    # the fp32 file computes in the activations' dtype, i.e. exactly as the
+    # bf16 file; "exact" and "lossless" keep the fp32 operands.
+    a, b = _adapter(stacked, torch.float32)
+    fp32_layer = _layer(a, b, alpha=RANK, strength=1.0)
+    bf16_layer = _layer(a.bfloat16(), b.bfloat16(), alpha=RANK, strength=1.0)
+    x = _activations(TOKENS, IN_DIM, seed=6).to(torch.bfloat16)
+    results = {}
+    for quality in ("exact", "lossless", "high"):
+        with torch.inference_mode(), set_forward_context(0, None, _batch(quality)):
+            out = fp32_layer.base_layer(x)
+            results[quality] = (
+                fp32_layer._add_lora_delta(out.clone(), x, 1.0),
+                bf16_layer._add_lora_delta(out.clone(), x, 1.0),
+                out,
+            )
+    actual, bf16_copy, _ = results["high"]
+    assert torch.equal(actual, bf16_copy)
+    for quality in ("exact", "lossless"):
+        kept, bf16_copy, out = results[quality]
+        assert not torch.equal(kept, bf16_copy)
+        expected = out.float() + _compute_lora_delta(x.float(), a.float(), b.float())
+        torch.testing.assert_close(kept.float(), expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("adapter_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("stacked", [False, True])
+def test_lossless_delta_under_bf16_autocast_with_a_non_bf16_adapter(
+    adapter_dtype, stacked
+):
+    # Wan runs its blocks under bf16 autocast: the shrink GEMM comes out bf16,
+    # and the in-place addmm_ used to fail on the fp16/fp32 expand weight.
+    a, b = _adapter(stacked, adapter_dtype)
+    layer = _layer(a, b, alpha=RANK, strength=1.0)
+    x = _activations(TOKENS, IN_DIM, seed=5).to(torch.bfloat16)
+    with (
+        torch.inference_mode(),
+        set_forward_context(0, None, _batch("lossless")),
+        torch.autocast("cpu", dtype=torch.bfloat16),
+    ):
+        out = layer.base_layer(x)
+        actual = layer._add_lora_delta(out.clone(), x, 1.0)
+    expected = out.float() + _compute_lora_delta(x.float(), a.float(), b.float())
+    scale = expected.abs().max().item()
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2 * scale)
+
+
+@pytest.mark.parametrize("quality", ["exact", "lossless"])
+@pytest.mark.parametrize("stacked", [False, True])
+def test_fp16_adapter_under_bf16_autocast_matches_its_bf16_copy(quality, stacked):
+    # Autocast already runs the matmuls in bf16, so an fp16 adapter takes the
+    # path of a bf16 adapter instead of paying for an fp32 detour.
+    a, b = _adapter(stacked, torch.float16)
+    fp16_layer = _layer(a, b, alpha=RANK, strength=1.0)
+    bf16_layer = _layer(a.bfloat16(), b.bfloat16(), alpha=RANK, strength=1.0)
+    x = _activations(TOKENS, IN_DIM, seed=6).to(torch.bfloat16)
+    with (
+        torch.inference_mode(),
+        set_forward_context(0, None, _batch(quality)),
+        torch.autocast("cpu", dtype=torch.bfloat16),
+    ):
+        out = fp16_layer.base_layer(x)
+        actual = fp16_layer._add_lora_delta(out.clone(), x, 1.0)
+        expected = bf16_layer._add_lora_delta(out.clone(), x, 1.0)
+    assert torch.equal(actual, expected)
+
+
 def test_only_a_request_that_allows_it_takes_the_lossless_path():
     # LTX-2's denoising, among others, sets the context without forward_batch
     assert not request_allows_lossless()  # no forward context
@@ -196,32 +286,30 @@ def test_row_parallel_bias_moves_into_the_gemm_only_above_exact():
     )
 
 
-class _ColumnLinear(nn.Module):
+class _ColumnLinear(MergedColumnParallelLinear):
     """The ColumnParallelLinear surface the LoRA wrapper reads, at TP 1."""
 
     def __init__(self, output_sizes: list[int]):
-        super().__init__()
+        tp_group = MagicMock(spec=dist.ProcessGroup)
+        tp_group.rank.return_value = 0
+        tp_group.size.return_value = 1
+        super().__init__(IN_DIM, output_sizes, bias=False, tp_group=tp_group)
         g = torch.Generator().manual_seed(6)
         self.weight = nn.Parameter(
             torch.randn(sum(output_sizes), IN_DIM, generator=g) * 0.05
         )
-        self.bias = None
-        self.output_sizes = output_sizes
-        self.output_partition_sizes = output_sizes
-        self.skip_bias_add = False
-        self.gather_output = False
-        self.quant_method = SimpleNamespace(
-            apply=lambda layer, x, bias=None: F.linear(x, layer.weight, bias)
-        )
-
-    def forward(self, x):
-        return F.linear(x, self.weight), None
 
 
 def _column_layer(
-    *, stacked=False, alpha=RANK, strength=1.0, output_offset=None, multi=False
+    *,
+    stacked=False,
+    alpha=RANK,
+    strength=1.0,
+    output_offset=None,
+    multi=False,
+    dtype=torch.float32,
 ):
-    a, b = _adapter(stacked, torch.float32)
+    a, b = _adapter(stacked, dtype)
     if stacked:
         layer = MergedColumnParallelLinearWithLoRA(
             _ColumnLinear([OUT_DIM // 3] * 3), lora_rank=RANK, lora_alpha=alpha
@@ -234,7 +322,7 @@ def _column_layer(
         a, b, strength=strength, merge_weights=False, output_offset=output_offset
     )
     if multi:
-        a, b = _adapter(stacked, torch.float32, seed=21)
+        a, b = _adapter(stacked, dtype, seed=21)
         layer.lora_alpha = RANK // 2
         layer.set_lora_weights(
             a, b, strength=-0.4, merge_weights=False, output_offset=output_offset
@@ -267,6 +355,22 @@ def test_fused_delta_matches_the_forward_delta(stacked, multi):
     delta = _fused_delta(layer, x)
     assert delta.shape == (TOKENS, OUT_DIM)
     _assert_fused_delta(delta, _forward_delta(layer, x))
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_fused_delta_of_an_fp16_adapter_keeps_activations_beyond_the_fp16_range(multi):
+    layer = _column_layer(dtype=torch.float16, multi=multi)
+    x = (_activations(TOKENS, IN_DIM, seed=9) * 1e4).to(torch.bfloat16)
+    adapters = layer.lora_weights_list
+    assert len(adapters) == (2 if multi else 1)
+    expected = sum(
+        _compute_lora_delta(x.float(), a.float(), b.float()) * strength * (alpha / rank)
+        for a, b, _, strength, rank, alpha, _ in adapters
+    )
+    delta = _fused_delta(layer, x)
+    assert torch.isfinite(delta).all()
+    scale = expected.abs().max().item()
+    torch.testing.assert_close(delta.float(), expected, rtol=1e-2, atol=1e-2 * scale)
 
 
 def test_fused_delta_follows_the_runtime_scale_and_output_offset():

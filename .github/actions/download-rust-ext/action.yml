@@ -14,6 +14,14 @@ inputs:
     description: 'Must match what _pr-test-rust-ext-build.yml saves under. ARM64 runners always restore rust-ext-aarch64-cp312.'
     required: false
     default: rust-ext-x86_64-cp312
+  from_source:
+    description: >
+      'true' takes neither the artifact nor the cache and leaves the build to
+      source, for a job that holds a secret besides GITHUB_TOKEN: a
+      pull_request_target run (PR code) can write into the default branch's
+      cache, and a same-run artifact may have come from that cache.
+    required: false
+    default: 'false'
 
 outputs:
   hit:
@@ -27,7 +35,7 @@ runs:
     # to the cache below.
     - name: Download prebuilt Rust extensions
       id: artifact
-      if: inputs.artifact_name != ''
+      if: inputs.artifact_name != '' && inputs.from_source != 'true'
       continue-on-error: true
       uses: actions/download-artifact@v4
       with:
@@ -38,7 +46,7 @@ runs:
     # arrived never reads the cache, so it should not pay an apt-get for it. The
     # self-hosted images ship without zstd, and the entries were saved with it.
     - name: Ensure zstd so the cache entry is readable
-      if: steps.artifact.outcome != 'success'
+      if: steps.artifact.outcome != 'success' && inputs.from_source != 'true'
       shell: bash
       run: bash scripts/ci/utils/ensure_zstd.sh
 
@@ -47,7 +55,7 @@ runs:
     # seed-rust-ext-cache.yml and the branch's own rust-ext-build both land here.
     - name: Restore prebuilt Rust extensions from cache
       id: cache
-      if: steps.artifact.outcome != 'success'
+      if: steps.artifact.outcome != 'success' && inputs.from_source != 'true'
       uses: actions/cache/restore@v4
       with:
         path: |
