@@ -412,6 +412,84 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
 
+class GigaChat4Detector(BaseReasoningFormatDetector):
+    """Split the template-prefilled think block according to the request's mode."""
+
+    _end_markers = ("</s>", "<|message_sep|>")
+    _trailing_markers = re.compile(r"(?:</s>|<\|message_sep\|>)+\s*$")
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="reasoning",
+            force_nonempty_content=force_nonempty_content,
+        )
+        self._terminal_buffer = ""
+        self._finishing = False
+
+    def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
+        text = self._trailing_markers.sub("", text)
+        if not self._in_reasoning:
+            return StreamingParseResult(normal_text=text)
+        text = text.removeprefix(self.think_start_token)
+        reasoning_text, _, normal_text = text.partition(self.think_end_token)
+        return StreamingParseResult(
+            reasoning_text=reasoning_text, normal_text=normal_text
+        )
+
+    def _strip_leading_think_start(self, text: str) -> str:
+        return text
+
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        new_text = self._terminal_buffer + new_text
+        self._terminal_buffer = ""
+        if not self._finishing:
+            holdback = max(
+                self._ends_with_partial_token(new_text, marker)
+                for marker in self._end_markers
+            )
+            end = len(new_text) - holdback
+            trailing = self._trailing_markers.search(new_text[:end])
+            if trailing is not None:
+                end = trailing.start()
+            self._terminal_buffer = new_text[end:]
+            new_text = new_text[:end]
+
+        # The template prefills the think block; answer text cannot reopen it.
+        if not self._in_reasoning:
+            return StreamingParseResult(normal_text=new_text)
+        pending = self._buffer + new_text
+        if not (
+            pending.startswith(self.think_start_token)
+            or self.think_start_token.startswith(pending)
+        ):
+            self.stripped_think_start = True
+        return super()._parse_streaming_increment_impl(new_text)
+
+    def finish(self) -> StreamingParseResult:
+        self._finishing = True
+        self._terminal_buffer = self._trailing_markers.sub("", self._terminal_buffer)
+        result = self.parse_streaming_increment("")
+        end = super().finish()
+        return StreamingParseResult(
+            reasoning_text=result.reasoning_text + end.reasoning_text,
+            normal_text=result.normal_text + end.normal_text,
+        )
+
+
 class IQuestQ1ReasoningDetector(BaseReasoningFormatDetector):
     @staticmethod
     def thinking_enabled(chat_kwargs):
@@ -1692,7 +1770,6 @@ class Apertus2509Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
             force_nonempty_content=force_nonempty_content,
         )
-        self._force_reasoning = force_reasoning
         self._tool_start_token = "<|tools_prefix|>["
         self._tool_end_token = "<|tools_suffix|>"
         self._reasoning_acc: str = ""
@@ -2390,6 +2467,7 @@ class ReasoningParser:
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
         "gigachat35": DeepSeekR1Detector,
+        "gigachat4": GigaChat4Detector,
         "inkling": InklingDetector,
         "iquest_q1": IQuestQ1ReasoningDetector,
         "flint": _FlintDetector,

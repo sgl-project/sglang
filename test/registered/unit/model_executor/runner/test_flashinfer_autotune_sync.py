@@ -132,7 +132,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                     patch.multiple(
                         autotune,
                         flashinfer_autotune_cache_path=lambda _: cache_path,
-                        get_flashinfer_autotune_skip_ops=lambda _: skip_ops,
+                        get_flashinfer_autotune_skip_ops=lambda: skip_ops,
                         get_exec=lambda: SimpleNamespace(
                             moe=SimpleNamespace(moe_runner_backend="flashinfer_megamoe")
                         ),
@@ -183,7 +183,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                 patch.multiple(
                     autotune,
                     flashinfer_autotune_cache_path=lambda _: cache_path,
-                    get_flashinfer_autotune_skip_ops=lambda _: set(),
+                    get_flashinfer_autotune_skip_ops=lambda: set(),
                     get_exec=lambda: SimpleNamespace(
                         moe=SimpleNamespace(moe_runner_backend="triton")
                     ),
@@ -352,6 +352,16 @@ class TestModelPrefillAutotune(CustomTestCase):
                 self.hook.assert_not_called()
                 self.flashinfer_autotune_context.assert_not_called()
 
+    def test_hook_covers_verify_rows_above_prefill_chunk(self):
+        self.max_prefill_buffer_tokens.return_value = 1024
+        autotune.maybe_flashinfer_autotune_extend(self.runner, decode_num_tokens=1152)
+        self.hook.assert_called_once_with(1152, dtype=torch.bfloat16)
+
+        self.hook.reset_mock()
+        self.max_prefill_buffer_tokens.return_value = 4096
+        autotune.maybe_flashinfer_autotune_extend(self.runner, decode_num_tokens=768)
+        self.hook.assert_called_once_with(4096, dtype=torch.bfloat16)
+
 
 class TestExtendAutotuneDummy(CustomTestCase):
     """SGLANG_FLASHINFER_AUTOTUNE_EXTEND must tune exactly the per-rank prefill
@@ -427,6 +437,12 @@ class TestAutotuneCachePhases(CustomTestCase):
                     )
                 )
             with (
+                # The per-rank JSON cache, which multi-rank and MegaMoE keep.
+                patch.object(
+                    autotune,
+                    "uses_flashinfer_managed_autotune_cache",
+                    return_value=False,
+                ),
                 patch.object(
                     autotune,
                     "flashinfer_autotune_cache_path",

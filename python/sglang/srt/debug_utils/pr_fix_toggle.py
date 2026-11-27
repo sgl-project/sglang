@@ -67,9 +67,11 @@ patches:
   - target: sglang.srt.layers.attention.flashinfer_backend.FlashInferMultiStepDraftBackend.init_cuda_graph_state
     edits:
       - match: |
-          (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
+          kv_indices_width = draft_kv_indices_buffer_width(
+              max_bs, self.topk, self.max_kv_len
+          )
         replacement: |
-          (self.speculative_num_steps, max_bs * self.max_context_len),
+          kv_indices_width = max_bs * self.max_kv_len
 """
 
 
@@ -85,12 +87,12 @@ patches:
 
 _PR_REVERT_YAML_26972 = """
 patches:
-  - target: sglang.srt.mem_cache.allocation_sizing.get_req_to_token_extra_context_len
+  - target: sglang.srt.mem_cache.allocation_sizing.get_req_to_token_headroom
     edits:
       - match: |
-          extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
+          return get_spec_decode_reach(get_alloc_page_size())
         replacement: |
-          pass
+          return 4 + (max_speculative_num_draft_tokens() or 0)
 """
 
 
@@ -99,9 +101,11 @@ patches:
   - target: sglang.srt.layers.attention.flashinfer_mla_backend.FlashInferMLAMultiStepDraftBackend.init_cuda_graph_state
     edits:
       - match: |
-          (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
+          kv_indices_width = draft_kv_indices_buffer_width(
+              max_bs, self.topk, self.max_kv_len
+          )
         replacement: |
-          (self.speculative_num_steps, max_bs * self.max_context_len),
+          kv_indices_width = max_bs * self.max_kv_len
 """
 
 
