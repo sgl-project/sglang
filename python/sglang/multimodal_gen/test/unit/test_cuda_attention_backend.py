@@ -42,6 +42,10 @@ class FakeCudaPlatform(CudaPlatformBase):
     device_capability = DeviceCapability(8, 0)
 
     @classmethod
+    def get_device_name(cls, device_id: int = 0) -> str:
+        return "Fake CUDA device"
+
+    @classmethod
     def is_sm120(cls):
         return cls.is_sm120_device
 
