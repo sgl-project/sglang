@@ -783,7 +783,10 @@ def capture_decode_graph(
     if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
         return no_capture
 
-    if getattr(model_runner, "device", None) == "cpu":
+    graph_runner_cls = current_platform.get_graph_runner_cls()
+    # A platform can keep scheduler tensors on the CPU and run its graphs on
+    # an accelerator. The AMX requirements apply to the built-in CPU runner.
+    if getattr(model_runner, "device", None) == "cpu" and graph_runner_cls is None:
         if not get_flags().capture.enable_torch_compile:
             return no_capture
         if (
@@ -834,8 +837,7 @@ def capture_decode_graph(
         f"avail mem={before_mem:.2f} GB"
     )
 
-    GraphRunnerCls = current_platform.get_graph_runner_cls()
-    if GraphRunnerCls is None:
+    if graph_runner_cls is None:
         require_out_of_tree_impl(
             current_platform,
             hook="get_graph_runner_cls()",
@@ -847,8 +849,8 @@ def capture_decode_graph(
                 "xpu": XPUGraphRunner,
             },
         )
-        GraphRunnerCls = graph_runners[model_runner.device]
-    runner = GraphRunnerCls(model_runner)
+        graph_runner_cls = graph_runners[model_runner.device]
+    runner = graph_runner_cls(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     memory_usage_gb = before_mem - after_mem

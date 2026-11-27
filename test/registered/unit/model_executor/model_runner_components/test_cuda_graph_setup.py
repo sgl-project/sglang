@@ -159,6 +159,60 @@ def test_shared_kv_layers_keep_distinct_graph_entries():
         index_attention_layers_by_global_id([owner, duplicate], [None, None])
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_platform_decode_runner_with_cpu_bookkeeping(monkeypatch, enabled):
+    class PlatformGraphRunner:
+        capture_bs = [16]
+
+        def __init__(self, model_runner):
+            self.model_runner = model_runner
+
+    def reject_cpu_backend_check():
+        pytest.fail("the platform runner should bypass the in-tree CPU backend check")
+
+    model_runner = SimpleNamespace(
+        device="cpu",
+        gpu_id=0,
+        is_generation=True,
+        is_draft_worker=False,
+        spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+        decode_num_tokens_per_req=lambda: 1,
+        _uses_cpu_graph_attention_backend=reject_cpu_backend_check,
+    )
+    monkeypatch.setattr(
+        cuda_graph_setup.current_platform,
+        "get_graph_runner_cls",
+        lambda: PlatformGraphRunner,
+    )
+    monkeypatch.setattr(
+        cuda_graph_setup, "check_cuda_graph_backend", lambda *_: not enabled
+    )
+    monkeypatch.setattr(cuda_graph_setup, "get_available_gpu_memory", lambda *_: 0.0)
+    monkeypatch.setattr(
+        cuda_graph_setup, "get_model", lambda: SimpleNamespace(model_impl="auto")
+    )
+    monkeypatch.setattr(
+        cuda_graph_setup,
+        "get_exec",
+        lambda: SimpleNamespace(
+            moe=SimpleNamespace(enable_paged_experts=False),
+            graph=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(backend="full")
+                )
+            ),
+        ),
+    )
+
+    capture = capture_decode_graph(model_runner=model_runner)
+
+    if enabled:
+        assert isinstance(capture.runner, PlatformGraphRunner)
+        assert capture.runner.model_runner is model_runner
+    else:
+        assert capture.runner is None
+
+
 def test_draft_startup_preserves_runner_local_capture_sizes(monkeypatch, caplog):
     """Startup must not reject local draft buckets using global TP alignment."""
     from sglang.srt.layers import dp_attention
