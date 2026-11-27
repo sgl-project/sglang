@@ -623,16 +623,16 @@ def _check_bundled_draft_revision(server_args: ServerArgs) -> None:
     repo ID to one local snapshot, and a bundled draft loads from it. An
     unset --revision is master, the default revision of modelscope-hub."""
     cfg = resolving_view(server_args)
-    # The raw input, not the resolving view: the resolved path is already the
-    # local snapshot, so only the raw one tells a repo ID from a local checkpoint.
-    model_path = (getattr(server_args, "_raw_input", None) or {}).get(
-        "model_path", cfg.model_path
+    # The raw input, not the resolving view: handle_modelscope_paths keeps a
+    # local path as it is, so a changed path means that it resolved a repo ID.
+    raw_model_path = (getattr(server_args, "_raw_input", None) or {}).get(
+        "model_path", server_args.model_path
     )
     revision = cfg.speculative_draft_model_revision
     target_revision = cfg.revision or "master"
     if (
         envs.SGLANG_USE_MODELSCOPE.get()
-        and not os.path.exists(model_path)
+        and raw_model_path != cfg.model_path
         and revision not in (None, target_revision)
     ):
         raise ValueError(

@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
     _resolve_dspark_lm_head_dtype,
@@ -130,12 +130,33 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
                 )
                 server_args.revision = revision
                 server_args.speculative_draft_model_revision = draft_revision
+                declare_resolution(
+                    server_args, "_handle_modelscope_paths", model_path="/ms/snapshot"
+                )
                 with envs.SGLANG_USE_MODELSCOPE.override(True):
                     if raises:
                         with self.assertRaisesRegex(ValueError, "ModelScope"):
                             _handle_dspark(server_args)
                     else:
                         _handle_dspark(server_args)
+
+    def test_modelscope_check_reads_the_resolution_not_the_disk(self):
+        # A cold download can create the raw path after ModelScope resolved it.
+        with tempfile.TemporaryDirectory() as raw_path:
+            server_args = _make_dspark_server_args(
+                model_path=raw_path, hf_config=_bundled_hf_config()
+            )
+            server_args.revision = "target"
+            server_args.speculative_draft_model_revision = "draft"
+            server_args._raw_input = {"model_path": raw_path}
+            declare_resolution(
+                server_args, "_handle_modelscope_paths", model_path="/ms/snapshot"
+            )
+            with (
+                envs.SGLANG_USE_MODELSCOPE.override(True),
+                self.assertRaisesRegex(ValueError, "ModelScope"),
+            ):
+                _handle_dspark(server_args)
 
     def test_modelscope_accepts_another_revision_for_a_local_checkpoint(self):
         for hf_config in (_bundled_hf_config(), _plain_hf_config()):

@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.arg_groups.speculative_hook import _handle_eagle_family
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
@@ -47,6 +47,9 @@ class TestEagleBundledDraftPathDefaulting(CustomTestCase):
 
     def test_modelscope_rejects_another_revision_for_a_bundled_draft(self):
         server_args = _make_nextn_server_args(draft_revision="draft")
+        declare_resolution(
+            server_args, "_handle_modelscope_paths", model_path="/ms/snapshot"
+        )
         with (
             envs.SGLANG_USE_MODELSCOPE.override(True),
             self.assertRaisesRegex(ValueError, "ModelScope"),
