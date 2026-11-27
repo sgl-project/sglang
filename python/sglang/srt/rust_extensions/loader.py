@@ -331,10 +331,8 @@ def query_rust_toolchain(
 ) -> dict[str, str]:
     """The cargo and rustc versions that key cached builds of ``workspace``.
 
-    A rustup toolchain file can make the first query install the pinned
-    toolchain, and concurrent installs fail or stall. Processes sharing a cache
-    (the ranks of one server) therefore query one at a time, so they all see the
-    same toolchain instead of some failing while another installs it.
+    Queried under a cache lock: rustup may install the pinned toolchain on first
+    use, and concurrent installs fail.
     """
     lock_path = _cache_root(cache_dir) / "locks" / "rust-toolchain.lock"
     with _filesystem_lock(lock_path):

@@ -112,13 +112,9 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
             return "the requested Rust TreeCore source build has no sources"
         return "this installation contains neither the Rust TreeCore extension nor its sources"
     # Even a cached source build needs these version queries for its fingerprint.
-    # The loader's own query serializes the ranks of a server, so a toolchain
-    # that rustup installs on first use is installed once and every rank agrees.
     try:
         query_rust_toolchain(workspace)
     except (OSError, RuntimeError) as exc:
-        # OSError: the extension cache that holds the lock is not writable, so
-        # the loader could not build or cache the extension either.
         return f"the Rust TreeCore toolchain is unavailable: {exc}"
     return None
 

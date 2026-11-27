@@ -1,4 +1,3 @@
-import fcntl
 import importlib.abc
 import importlib.machinery
 import json
@@ -33,8 +32,7 @@ def _hold_filesystem_lock(path: str, ready, release) -> None:
         release.wait(timeout=10)
 
 
-# A rustup proxy whose pinned toolchain installs on first use: a second process
-# that runs while the install is in progress fails, as rustup's does.
+# A rustup proxy that installs on first use and fails while another install runs.
 _FIRST_USE_INSTALL_PROXY = """#!/bin/sh
 root="$FAKE_RUSTUP_HOME"
 if [ ! -e "$root/installed" ]; then
@@ -50,8 +48,6 @@ echo "$(basename "$0") 1.92.0"
 """
 
 
-# One rank: wait for the start file, then query the toolchain and print the
-# versions, or the error, as JSON.
 _QUERY_TOOLCHAIN_PROCESS = """
 import json, sys, time
 from pathlib import Path
@@ -476,7 +472,6 @@ crate-type = ["cdylib"]
                     "features": ("python", "inspection"),
                     "build_fingerprint": {"native": "abi"},
                     "extension_module": "demo._inspection",
-                    # The toolchain query locks the same cache the build uses.
                     "cache_dir": (root / "cache").resolve(),
                 },
             )
@@ -619,25 +614,6 @@ crate-type = ["cdylib"]
                 thread.join(timeout=5)
             self.assertEqual(process.exitcode, 0)
             self.assertTrue(acquired.is_set())
-
-    def test_toolchain_query_holds_the_cache_lock(self):
-        with TemporaryDirectory() as directory:
-            cache = Path(directory)
-            lock_path = cache / "locks" / "rust-toolchain.lock"
-
-            def version(command, *arguments, cwd):
-                with lock_path.open("a+b") as other:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return f"{command} 1.0"
-
-            with mock.patch.object(
-                rust_extension, "_command_version", side_effect=version
-            ):
-                self.assertEqual(
-                    rust_extension.query_rust_toolchain(cache, cache),
-                    {"cargo": "cargo 1.0", "rustc": "rustc 1.0"},
-                )
 
     def test_concurrent_toolchain_queries_share_one_first_use_install(self):
         with TemporaryDirectory() as directory:

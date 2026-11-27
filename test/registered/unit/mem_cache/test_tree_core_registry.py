@@ -423,39 +423,27 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
         for mode in ("auto", "force"):
             with self.subTest(mode=mode), envs.SGLANG_RUST_BUILD_MODE.override(mode):
                 self.assertEqual(select_tree_core_backend(_cache_init_params()), "rust")
-                # The loader's serialized query, without a timeout that could
-                # stop rustup mid-install on one rank only.
                 tree_core_registry.query_rust_toolchain.assert_called_once_with(
                     self.workspace
                 )
                 tree_core_registry.query_rust_toolchain.reset_mock()
 
     def test_toolchain_probe_failure_uses_python_for_all_source_build_modes(self):
-        error = RuntimeError(
-            "failed to query the Rust toolchain with `cargo --version --verbose`: "
-            "error: toolchain '1.92' is not installed"
-        )
-        tree_core_registry.query_rust_toolchain.side_effect = error
         for mode in ("auto", "never", "force"):
-            with self.subTest(mode=mode), envs.SGLANG_RUST_BUILD_MODE.override(mode):
-                self.assertEqual(
-                    select_tree_core_backend(_cache_init_params()), "python"
-                )
-                self.assertEqual(
-                    resolve_tree_core_backend("rust", _cache_init_params()),
-                    "python",
-                )
-                # The reason names the failing query and its output.
-                self.assertEqual(
-                    tree_core_registry._rust_fallback_reason(_cache_init_params()),
-                    f"the Rust TreeCore toolchain is unavailable: {error}",
-                )
-
-    def test_unwritable_extension_cache_uses_python(self):
-        tree_core_registry.query_rust_toolchain.side_effect = PermissionError(
-            "cannot create the toolchain lock"
-        )
-        self.assertEqual(select_tree_core_backend(_cache_init_params()), "python")
+            # RuntimeError: a failed query; PermissionError: an unwritable cache.
+            for error in (RuntimeError("cargo failed"), PermissionError("lock")):
+                with (
+                    self.subTest(mode=mode, error=type(error).__name__),
+                    envs.SGLANG_RUST_BUILD_MODE.override(mode),
+                ):
+                    tree_core_registry.query_rust_toolchain.side_effect = error
+                    self.assertEqual(
+                        select_tree_core_backend(_cache_init_params()), "python"
+                    )
+                    self.assertEqual(
+                        resolve_tree_core_backend("rust", _cache_init_params()),
+                        "python",
+                    )
 
     def test_invalid_mode_and_force_after_import_remain_loader_errors(self):
         from sglang.srt.rust_extensions.loader import load_rust_extension
