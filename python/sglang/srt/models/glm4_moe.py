@@ -90,6 +90,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
+    is_cpu,
     is_cuda,
     is_hip,
     is_npu,
@@ -100,6 +101,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
