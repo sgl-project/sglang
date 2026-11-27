@@ -34,7 +34,7 @@ def shell_serving(monkeypatch):
     tokenizer.decode.return_value = "<|start|>assistant"
     requests, rendered = [], []
 
-    def render(request, tools, is_multimodal):
+    def render(request, tools, is_multimodal, **kwargs):
         requests.append(request)
         rendered.append(tools)
         return MessageProcessingResult(

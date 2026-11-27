@@ -13,6 +13,7 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 import asyncio
 import copy
 import gc
+import itertools
 import json
 import unittest
 import uuid
@@ -346,6 +347,235 @@ class TestChatTemplateCache(CustomTestCase):
         )
         self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 2)
         self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
+    def test_cache_entry_without_text_gets_it_for_a_later_reader(self):
+        self.assertEqual(self._render(decode_prompt=False), ([11, 12], None))
+        self.assertEqual(self._render(decode_prompt=False), ([11, 12], None))
+        self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
+        self.assertEqual(self._render(), ([11, 12], "decoded"))
+        self.assertEqual(self._render(), ([11, 12], "decoded"))
+        # Text already in the entry is returned even when not asked for.
+        self.assertEqual(self._render(decode_prompt=False), ([11, 12], "decoded"))
+        self.tokenizer_manager.tokenizer.apply_chat_template.assert_called_once()
+        self.tokenizer_manager.tokenizer.decode.assert_called_once_with([11, 12])
+
+    def test_cache_hit_without_text_returns_an_owned_id_list(self):
+        first, _ = self._render(decode_prompt=False)
+        first.append(99)
+
+        self.assertEqual(self._render(decode_prompt=False), ([11, 12], None))
+
+
+_TEXT_ONLY_PROMPT_IDS = [11, 12]
+_IMAGE_PART = {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+
+
+class TestTextOnlyPromptDecode(CustomTestCase):
+    """A multimodal model renders a chat to ids and decodes them back to text,
+    because a request with media hands that text to the multimodal processor.
+    A request without media whose ids go to the engine never reads the text, so
+    it must not pay for decoding the whole prompt."""
+
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", default_chat_template_kwargs=None),
+            role="tokenizer",
+        )
+        self.tm = _MockTokenizerManager()
+        self.tm.model_config.is_multimodal = True
+        self.tm.model_config.hf_config.architectures = [
+            "Qwen2_5_VLForConditionalGeneration"
+        ]
+        tokenizer = self.tm.tokenizer
+        # No specials on an empty encode, and the text and id renders agree.
+        tokenizer.encode.side_effect = lambda text, **_: (
+            list(_TEXT_ONLY_PROMPT_IDS) if text else []
+        )
+        tokenizer.apply_chat_template.side_effect = (
+            lambda messages, tokenize=False, **_: (
+                list(_TEXT_ONLY_PROMPT_IDS) if tokenize else "rendered"
+            )
+        )
+        tokenizer.decode.return_value = "decoded"
+        self.template_manager = _MockTemplateManager()
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.assertFalse(self.chat._tokenizer_auto_adds_specials)
+        self.assertFalse(self.chat._prompt_text_round_trip_is_lossy)
+        self.assertIsNone(self.chat.chat_encoding_spec)
+        self.tokenizer = tokenizer
+        tokenizer.reset_mock()
+
+    @staticmethod
+    def _request(content="Hi?", **kwargs):
+        return ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": content}], **kwargs
+        )
+
+    def _image_request(self):
+        # A template that takes content parts keeps the image in the request.
+        self.template_manager.jinja_template_content_format = "openai"
+        return self._request([{"type": "text", "text": "What is this?"}, _IMAGE_PART])
+
+    def _use_lossy_round_trip(self):
+        self.chat._prompt_text_round_trip_is_lossy = True
+
+    def _use_moss_vl(self):
+        self.tm.model_config.hf_config.architectures = [
+            "MossVLForConditionalGeneration"
+        ]
+
+    def _use_tokenizer_that_adds_specials(self):
+        self.chat._tokenizer_auto_adds_specials = True
+
+    def assertSentAsIdsWithoutDecode(self, adapted, ids=_TEXT_ONLY_PROMPT_IDS):
+        self.assertEqual(adapted.input_ids, ids)
+        self.assertIsNone(adapted.text)
+        self.tokenizer.decode.assert_not_called()
+
+    def assertSentAsDecodedText(self, adapted):
+        self.assertEqual(adapted.text, "decoded")
+        self.assertIsNone(adapted.input_ids)
+        self.tokenizer.decode.assert_called_once_with(_TEXT_ONLY_PROMPT_IDS)
+
+    def test_text_only_request_sends_ids_and_skips_the_decode(self):
+        adapted, _ = self.chat._convert_to_internal_request(self._request())
+
+        self.assertSentAsIdsWithoutDecode(adapted)
+        result = self.chat._process_messages(
+            self._request(), True, reuse_prompt_ids=True
+        )
+        self.assertEqual(result.prompt, "")
+        self.assertEqual(result.prompt_ids, _TEXT_ONLY_PROMPT_IDS)
+        self.tokenizer.decode.assert_not_called()
+
+    def test_request_with_an_image_still_sends_the_decoded_text(self):
+        for configure in (lambda: None, self._use_lossy_round_trip):
+            with self.subTest(configure=configure):
+                self.setUp()
+                configure()
+
+                adapted, _ = self.chat._convert_to_internal_request(
+                    self._image_request()
+                )
+
+                self.assertSentAsDecodedText(adapted)
+                self.assertEqual(len(adapted.image_data), 1)
+
+    def test_tokenizer_that_adds_specials_keeps_the_text_path(self):
+        self._use_tokenizer_that_adds_specials()
+
+        adapted, _ = self.chat._convert_to_internal_request(self._request())
+
+        self.assertSentAsDecodedText(adapted)
+
+    def test_lossy_round_trip_text_only_sends_ids_and_skips_the_decode(self):
+        self._use_lossy_round_trip()
+
+        adapted, _ = self.chat._convert_to_internal_request(self._request())
+
+        self.assertSentAsIdsWithoutDecode(adapted)
+        self.tokenizer.encode.assert_not_called()
+
+    def test_continued_final_message_text_only_skips_the_decode(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Hi?"},
+                {"role": "assistant", "content": "Hello"},
+            ],
+            continue_final_message=True,
+        )
+        for configure in (lambda: None, self._use_lossy_round_trip):
+            with self.subTest(configure=configure):
+                self.setUp()
+                configure()
+
+                adapted, _ = self.chat._convert_to_internal_request(
+                    request.model_copy(deep=True)
+                )
+
+                self.assertIsNotNone(adapted.input_ids)
+                self.assertIsNone(adapted.text)
+                self.tokenizer.decode.assert_not_called()
+
+    def test_empty_prompt_ids_keep_their_text(self):
+        self.tokenizer.encode.side_effect = lambda text, **_: []
+
+        adapted, _ = self.chat._convert_to_internal_request(self._request())
+
+        self.assertEqual(adapted.text, "decoded")
+        self.tokenizer.decode.assert_called_once_with([])
+
+    def test_cached_render_is_decoded_once_for_the_first_reader(self):
+        # The same conversation: sent to the engine, then read as text twice.
+        self.chat._convert_to_internal_request(self._request())
+        self.tokenizer.decode.assert_not_called()
+
+        first = self.chat._process_messages(self._request(), True)
+        second = self.chat._process_messages(self._request(), True)
+        adapted, _ = self.chat._convert_to_internal_request(self._request())
+
+        self.assertEqual(first.prompt, "decoded")
+        self.assertEqual(second.prompt, "decoded")
+        self.assertEqual(adapted.input_ids, _TEXT_ONLY_PROMPT_IDS)
+        self.tokenizer.apply_chat_template.assert_called_once()
+        self.tokenizer.decode.assert_called_once_with(_TEXT_ONLY_PROMPT_IDS)
+
+    def test_moss_vl_keeps_the_text_path(self):
+        self._use_moss_vl()
+
+        adapted, _ = self.chat._convert_to_internal_request(self._request())
+
+        self.assertSentAsDecodedText(adapted)
+
+    def test_other_callers_keep_the_prompt_text(self):
+        # serving_tokenize, serving_responses and the Anthropic adapter call
+        # _process_messages without reuse_prompt_ids and may read the text.
+        for configure in (lambda: None, self._use_lossy_round_trip):
+            with self.subTest(configure=configure):
+                self.setUp()
+                configure()
+
+                result = self.chat._process_messages(self._request(), True)
+
+                self.assertEqual(result.prompt, "decoded")
+                self.assertEqual(result.prompt_ids, _TEXT_ONLY_PROMPT_IDS)
+                self.tokenizer.decode.assert_called_once_with(_TEXT_ONLY_PROMPT_IDS)
+
+    def test_decode_is_skipped_exactly_when_the_engine_takes_ids(self):
+        settings = {
+            "lossy": self._use_lossy_round_trip,
+            "moss_vl": self._use_moss_vl,
+            "adds_specials": self._use_tokenizer_that_adds_specials,
+        }
+        for multimodal in (True, False):
+            for chosen in itertools.product((False, True), repeat=len(settings)):
+                for with_image in (False, True):
+                    if with_image and not multimodal:
+                        continue
+                    names = [n for n, on in zip(settings, chosen) if on]
+                    with self.subTest(
+                        multimodal=multimodal, settings=names, image=with_image
+                    ):
+                        self.setUp()
+                        self.tm.model_config.is_multimodal = multimodal
+                        for name in names:
+                            settings[name]()
+                        request = (
+                            self._image_request() if with_image else self._request()
+                        )
+
+                        adapted, _ = self.chat._convert_to_internal_request(request)
+
+                        self.assertEqual(
+                            self.tokenizer.decode.called, adapted.text is not None
+                        )
 
 
 class TestPythonChatTemplateSegments(CustomTestCase):
