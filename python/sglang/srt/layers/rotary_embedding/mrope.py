@@ -22,21 +22,16 @@ from sglang.srt.layers.rotary_embedding.yarn import (
 from sglang.srt.runtime_context import attention_backends
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    is_cuda,
     is_hip,
     is_npu,
     is_xpu,
     support_triton,
 )
 
-_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
-
-if _is_cuda:
-    from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
 
 if _is_npu:
     import torch_npu
@@ -628,17 +623,6 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
                 head_size=self.head_size,
                 rotary_dim=self.rotary_dim,
                 is_neox_style=self.is_neox_style,
-            )
-            return query, key
-
-        if _is_cuda and (apply_rope_with_cos_sin_cache_inplace is not None):
-            apply_rope_with_cos_sin_cache_inplace(
-                positions=positions,
-                query=query,
-                key=key,
-                head_size=self.head_size,
-                cos_sin_cache=self.cos_sin_cache,
-                is_neox=self.is_neox_style,
             )
             return query, key
 
