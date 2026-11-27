@@ -35,7 +35,7 @@ from manual.ep.test_nixl_ep import (
     TestNixlEPTP as _TestNixlEPTP,
 )
 
-register_cuda_ci(est_time=1050, stage="base-c", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=1050, stage="base-c", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
