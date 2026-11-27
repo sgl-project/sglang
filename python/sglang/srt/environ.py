@@ -734,6 +734,16 @@ class Envs:
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
     # UniBoost: estimated prefill cost per uncached prompt token, in microseconds.
     SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
+    # NO_TOKEN admission lookahead: after the queue head is rejected with
+    # NO_TOKEN, scan up to this many further requests in the same pass while
+    # the head's matched prefix stays pinned. 0 disables.
+    SGLANG_PREFILL_NO_TOKEN_LOOKAHEAD = EnvInt(0)
+    # Consecutive NO_TOKEN passes of one head after which lookahead is withheld
+    # until that head is admitted or replaced.
+    SGLANG_PREFILL_LOOKAHEAD_AGING_PASSES = EnvInt(20)
+    # KV tokens (free + evictable) the head-prefix pin must leave for requests
+    # already in flight. 0 reserves max_prefill_tokens; negative is rejected.
+    SGLANG_PREFILL_HEADLOCK_RESERVE_TOKENS = EnvInt(0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
