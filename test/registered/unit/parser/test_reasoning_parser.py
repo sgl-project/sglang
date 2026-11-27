@@ -357,6 +357,84 @@ class TestInklingDetector(CustomTestCase):
         # finish() flushes the buffered trace instead of dropping it.
         self.assertEqual(detector.finish().reasoning_text, "truncated thinking")
 
+    def test_finish_flushes_held_back_partial_control_prefix(self):
+        """A trailing prefix of a control token held back in streaming must be
+        flushed by finish() into the active block, matching detect_and_parse."""
+        cases = (
+            (
+                "content",
+                "<|message_model|><|content_text|>x <",
+                True,
+                "",
+                "x <",
+            ),
+            (
+                "content_two_char_prefix",
+                "<|message_model|><|content_text|>a <|",
+                True,
+                "",
+                "a <|",
+            ),
+            (
+                "reasoning_stream_true",
+                "<|message_model|><|content_thinking|>a <",
+                True,
+                "a <",
+                "",
+            ),
+            (
+                "reasoning_stream_false",
+                "<|message_model|><|content_thinking|>a <",
+                False,
+                "a <",
+                "",
+            ),
+            (
+                "unframed_text",
+                "x <",
+                True,
+                "",
+                "x <",
+            ),
+            (
+                "tool_block",
+                '<|message_model|>fn<|content_invoke_tool_json|>{"a":"<',
+                True,
+                "",
+                '<|message_model|>fn<|content_invoke_tool_json|>{"a":"<',
+            ),
+            (
+                "header_does_not_leak",
+                "<|message_model|>fn<",
+                True,
+                "",
+                "",
+            ),
+        )
+        for label, source, stream_reasoning, expected_r, expected_c in cases:
+            with self.subTest(case=label):
+                ns = InklingDetector(
+                    stream_reasoning=stream_reasoning
+                ).detect_and_parse(source)
+                self.assertEqual(
+                    (ns.reasoning_text, ns.normal_text), (expected_r, expected_c)
+                )
+
+                detector = InklingDetector(stream_reasoning=stream_reasoning)
+                reasoning = ""
+                content = ""
+                for char in source:
+                    step = detector.parse_streaming_increment(char)
+                    reasoning += step.reasoning_text
+                    content += step.normal_text
+                end = detector.finish()
+                reasoning += end.reasoning_text
+                content += end.normal_text
+                self.assertEqual((reasoning, content), (expected_r, expected_c))
+
+                again = detector.finish()
+                self.assertEqual((again.reasoning_text, again.normal_text), ("", ""))
+
 
 class TestKimiDetector(CustomTestCase):
     def setUp(self):
