@@ -8,6 +8,12 @@ import torch
 import sglang.srt.layers.moe.topk as topk_module
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.ep_remap import (
+    build_ep_remap_kwargs,
+    can_fuse_ep_local_expert_remap,
+    resolve_ep_remap_policy,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -18,7 +24,13 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
 )
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    StandardTopKOutputLocalMapped,
+    TopK,
+    TopKConfig,
+    TopKOutputFormat,
+)
 from sglang.srt.layers.moe.utils import (
     MoeA2ABackend,
     MoeRunnerBackend,
@@ -26,11 +38,17 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.runtime_context import get_context, get_flags, get_model, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_flags,
+    get_model,
+    get_parallel,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _ep_dispatcher(*, moe_ep_rank: int, num_shared: int = 0):
@@ -939,6 +957,532 @@ class TestLayerRunnerDispatch(CustomTestCase):
         topk = TopK(top_k=2, layer_id=0, output_format=TopKOutputFormat.STANDARD)
         topk.bind_runner_backend(MoeRunnerBackend.FLASHINFER_TRTLLM)
         self.assertEqual(topk.topk_config.output_format, TopKOutputFormat.STANDARD)
+
+
+class TestEpStandardDispatcherRemapFusion(CustomTestCase):
+    def setUp(self):
+        self.enterContext(
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.standard.get_device",
+                return_value="cpu",
+            )
+        )
+        self.enterContext(
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.standard."
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            )
+        )
+        self.enterContext(
+            patch(
+                "sglang.srt.layers.moe.utils."
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            )
+        )
+        self.enterContext(
+            patch(
+                "sglang.srt.layers.moe.ep_remap."
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            )
+        )
+        self.enterContext(
+            get_context().override_server_args(model_path="dummy", device="cpu")
+        )
+        self.enterContext(
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.TRITON,
+                a2a_backend=MoeA2ABackend.NONE,
+            )
+        )
+        self.enterContext(
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                tp_group=None,
+                attn_dp_size=1,
+                attn_dp_rank=0,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_ep_size=2,
+                moe_ep_rank=1,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                dwdp_size=1,
+            )
+        )
+        self.enterContext(envs.SGLANG_DISABLE_FUSED_EP_REMAP.override(False))
+        self.enterContext(envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.override(False))
+
+    @staticmethod
+    def _resolve_policy(topk_config: TopKConfig):
+        return resolve_ep_remap_policy(
+            topk_config=topk_config,
+            is_cuda=True,
+            use_aiter=False,
+            is_xpu=False,
+            is_expert_remapping_enabled_fn=lambda: False,
+        )
+
+    def test_ep_remap_kwargs_and_policy_caching(self):
+        base_cfg = TopKConfig(
+            top_k=8, runner_backend=MoeRunnerBackend.TRITON, layer_id=0
+        )
+        with patch(
+            "sglang.srt.layers.moe.ep_remap.get_global_experts_capturer",
+            return_value=None,
+        ):
+            policy = self._resolve_policy(base_cfg)
+            self.assertTrue(
+                can_fuse_ep_local_expert_remap(
+                    policy=policy,
+                    allow_routed_experts_capture=base_cfg.allow_routed_experts_capture,
+                    num_routed_experts=128,
+                    expert_location_dispatch_info=None,
+                    routing_overridden=False,
+                )
+            )
+            self.assertEqual(
+                build_ep_remap_kwargs(policy=policy, num_routed_experts=128),
+                {"ep_start": 64, "ep_end": 128},
+            )
+            with envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.override(True):
+                interleaved_policy = self._resolve_policy(base_cfg)
+                self.assertEqual(
+                    build_ep_remap_kwargs(
+                        policy=interleaved_policy, num_routed_experts=128
+                    ),
+                    {"ep_interleaved_size": 2, "ep_rank": 1},
+                )
+            with envs.SGLANG_DISABLE_FUSED_EP_REMAP.override(True):
+                disabled_policy = self._resolve_policy(base_cfg)
+                self.assertFalse(
+                    can_fuse_ep_local_expert_remap(
+                        policy=disabled_policy,
+                        allow_routed_experts_capture=base_cfg.allow_routed_experts_capture,
+                        num_routed_experts=128,
+                        expert_location_dispatch_info=None,
+                        routing_overridden=False,
+                    )
+                )
+            with patch.object(topk_module, "_is_cuda", True), patch.object(
+                topk_module, "_use_aiter", False
+            ), patch.object(topk_module, "_is_xpu", False), patch.object(
+                topk_module, "is_expert_remapping_enabled", return_value=False
+            ):
+                topk = TopK(top_k=8, layer_id=0, allow_routed_experts_capture=False)
+                topk.bind_runner_backend(MoeRunnerBackend.TRITON)
+                self.assertIsNotNone(topk.topk_config.ep_remap_policy)
+                self.assertTrue(topk.topk_config.ep_remap_policy.can_fuse_static)
+
+    def test_ep_remap_eligibility_negative_guards(self):
+        base_cfg = TopKConfig(
+            top_k=8, runner_backend=MoeRunnerBackend.TRITON, layer_id=0
+        )
+        with patch(
+            "sglang.srt.layers.moe.ep_remap.get_global_experts_capturer",
+            return_value=None,
+        ):
+            policy = self._resolve_policy(base_cfg)
+            self.assertFalse(
+                can_fuse_ep_local_expert_remap(
+                    policy=policy,
+                    allow_routed_experts_capture=base_cfg.allow_routed_experts_capture,
+                    num_routed_experts=129,
+                    expert_location_dispatch_info=None,
+                    routing_overridden=False,
+                )
+            )
+            with get_parallel().override(dwdp_size=2):
+                self.assertFalse(
+                    can_fuse_ep_local_expert_remap(
+                        policy=self._resolve_policy(base_cfg),
+                        allow_routed_experts_capture=base_cfg.allow_routed_experts_capture,
+                        num_routed_experts=128,
+                        expert_location_dispatch_info=None,
+                        routing_overridden=False,
+                    )
+                )
+            wf_cfg = TopKConfig(
+                top_k=8,
+                runner_backend=MoeRunnerBackend.TRITON,
+                shared_experts=SharedExpertsConfig(use_waterfill=True),
+                layer_id=0,
+            )
+            self.assertFalse(
+                can_fuse_ep_local_expert_remap(
+                    policy=self._resolve_policy(wf_cfg),
+                    allow_routed_experts_capture=wf_cfg.allow_routed_experts_capture,
+                    num_routed_experts=128,
+                    expert_location_dispatch_info=None,
+                    routing_overridden=False,
+                )
+            )
+            with get_exec().moe.override(ep_join_mode="scale"):
+                self.assertFalse(
+                    can_fuse_ep_local_expert_remap(
+                        policy=self._resolve_policy(base_cfg),
+                        allow_routed_experts_capture=base_cfg.allow_routed_experts_capture,
+                        num_routed_experts=128,
+                        expert_location_dispatch_info=None,
+                        routing_overridden=False,
+                    )
+                )
+            custom_cfg = TopKConfig(
+                top_k=8,
+                runner_backend=MoeRunnerBackend.TRITON,
+                use_custom_local_expert_mapping=True,
+                layer_id=0,
+            )
+            self.assertFalse(self._resolve_policy(custom_cfg).can_fuse_static)
+            self.assertFalse(
+                can_fuse_ep_local_expert_remap(
+                    policy=policy,
+                    allow_routed_experts_capture=base_cfg.allow_routed_experts_capture,
+                    num_routed_experts=128,
+                    expert_location_dispatch_info=None,
+                    routing_overridden=False,
+                    use_custom_local_expert_mapping=True,
+                )
+            )
+            for global_backend in (
+                MoeRunnerBackend.FLASHINFER_TRTLLM,
+                MoeRunnerBackend.FLASHINFER_CUTLASS,
+            ):
+                bad_cfg = TopKConfig(top_k=8, runner_backend=global_backend, layer_id=0)
+                self.assertFalse(
+                    can_fuse_ep_local_expert_remap(
+                        policy=self._resolve_policy(bad_cfg),
+                        allow_routed_experts_capture=bad_cfg.allow_routed_experts_capture,
+                        num_routed_experts=128,
+                        expert_location_dispatch_info=None,
+                        routing_overridden=False,
+                    )
+                )
+
+    def test_ep_local_mapped_no_double_remap_on_default_mapping(self):
+        cfg = MoeRunnerConfig(
+            num_experts=128,
+            num_local_experts=64,
+            top_k=8,
+            num_fused_shared_experts=0,
+            runner_backend=MoeRunnerBackend.TRITON,
+        )
+        dispatcher = StandardDispatcher(cfg)
+
+        # Warm lazy default mapping on an un-fused StandardTopKOutput (e.g. M=0).
+        dispatcher.dispatch(
+            torch.empty((0, 16)),
+            StandardTopKOutput(
+                torch.empty((0, 8), dtype=torch.float32),
+                torch.full((0, 8), -1, dtype=torch.int32),
+                torch.empty((0, 128)),
+            ),
+        )
+        self.assertIsNotNone(dispatcher.local_expert_mapping)
+        self.assertIs(
+            dispatcher.local_expert_mapping, dispatcher._default_local_expert_mapping
+        )
+
+        # Rank 1 local IDs [0..63] must not be double-remapped through [64..127]->[0..63].
+        local_ids = torch.tensor(
+            [[0, 1, -1, -1, 63, -1, -1, 2], [5, -1, 10, 20, -1, 30, -1, 63]],
+            dtype=torch.int32,
+        )
+        out = dispatcher.dispatch(
+            torch.ones((2, 16)),
+            StandardTopKOutputLocalMapped(
+                torch.ones((2, 8), dtype=torch.float32) / 8.0,
+                local_ids.clone(),
+                torch.ones((2, 128)),
+            ),
+        )
+        self.assertTrue(torch.equal(out.topk_output.topk_ids, local_ids))
+
+    def test_ep_custom_local_expert_mapping_preserves_global_ids_and_rejects_local_mapped(
+        self,
+    ):
+        cfg = MoeRunnerConfig(
+            num_experts=128,
+            num_local_experts=64,
+            top_k=8,
+            num_fused_shared_experts=0,
+            runner_backend=MoeRunnerBackend.TRITON,
+        )
+        warmed = StandardDispatcher(cfg)
+        warmed.dispatch(
+            torch.empty((0, 16)),
+            StandardTopKOutput(
+                torch.empty((0, 8), dtype=torch.float32),
+                torch.full((0, 8), -1, dtype=torch.int32),
+                torch.empty((0, 128)),
+            ),
+        )
+
+        # Custom global-indexed table: [0..63] -> [63..0], [64..127] -> -1.
+        custom_map = torch.full((128,), -1, dtype=torch.int32)
+        custom_map[:64] = torch.arange(63, -1, -1, dtype=torch.int32)
+        global_ids = torch.tensor(
+            [[0, 1, 63, 64, 65, 127, -1, 2], [64, 0, -1, 127, 63, 1, 10, -1]],
+            dtype=torch.int32,
+        )
+        expected = torch.where(
+            global_ids < 0, -1, custom_map[global_ids.clamp_min(0)]
+        )
+        self.assertEqual(int(expected[0, 0].item()), 63)
+        self.assertEqual(int(expected[0, 3].item()), -1)
+
+        for disp in (StandardDispatcher(cfg), warmed):
+            disp.local_expert_mapping = custom_map
+            with self.assertRaisesRegex(ValueError, "custom local_expert_mapping"):
+                disp.dispatch(
+                    torch.ones((2, 16)),
+                    StandardTopKOutputLocalMapped(
+                        torch.ones((2, 8), dtype=torch.float32) / 8.0,
+                        torch.zeros_like(global_ids),
+                        torch.ones((2, 128)),
+                    ),
+                )
+            out = disp.dispatch(
+                torch.ones((2, 16)),
+                StandardTopKOutput(
+                    torch.ones((2, 8), dtype=torch.float32) / 8.0,
+                    global_ids.clone(),
+                    torch.ones((2, 128)),
+                ),
+            )
+            self.assertTrue(torch.equal(out.topk_output.topk_ids, expected))
+
+    def test_ep_local_mapped_populates_mapping_and_dwdp_reset(self):
+        cfg = MoeRunnerConfig(
+            num_experts=129,
+            num_local_experts=65,
+            top_k=9,
+            num_fused_shared_experts=1,
+            runner_backend=MoeRunnerBackend.MARLIN,
+        )
+        dispatcher = StandardDispatcher(cfg)
+        local_ids = torch.tensor([[0, 1, -1, -1, 63, -1, -1, 2, 64]], dtype=torch.int32)
+        out = dispatcher.dispatch(
+            torch.ones((1, 16)),
+            StandardTopKOutputLocalMapped(
+                torch.ones((1, 9), dtype=torch.float32) / 8.0,
+                local_ids.clone(),
+                torch.ones((1, 129)),
+            ),
+        )
+        self.assertTrue(torch.equal(out.topk_output.topk_ids, local_ids))
+        self.assertIsNotNone(dispatcher.local_expert_mapping)
+        self.assertTrue(
+            torch.equal(
+                dispatcher.local_expert_mapping[:64],
+                torch.full((64,), -1, dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                dispatcher.local_expert_mapping[64:128],
+                torch.arange(64, dtype=torch.int32),
+            )
+        )
+        self.assertEqual(int(dispatcher.local_expert_mapping[128].item()), 64)
+
+        fake_layer = SimpleNamespace(
+            moe_ep_size=2,
+            moe_ep_rank=1,
+            _num_global_routed=128,
+            _num_local_routed=64,
+            num_local_experts=65,
+            num_experts=129,
+            moe_runner_config=cfg,
+            dispatcher=dispatcher,
+            replace_expert_tensor=lambda *a, **kw: None,
+            _dwdp_bound=False,
+        )
+        FusedMoE.bind_full_expert_weights(fake_layer, {})
+        self.assertIsNone(dispatcher.local_expert_mapping)
+        out_after_dwdp = dispatcher.dispatch(
+            torch.ones((1, 16)),
+            StandardTopKOutput(
+                torch.ones((1, 9), dtype=torch.float32) / 8.0,
+                local_ids.clone(),
+                torch.ones((1, 129)),
+            ),
+        )
+        self.assertIsNone(dispatcher.local_expert_mapping)
+        self.assertTrue(torch.equal(out_after_dwdp.topk_output.topk_ids, local_ids))
+
+    def test_interleaved_ep_weight_loader_mapping(self):
+        fake_moe = SimpleNamespace(
+            moe_ep_size=2,
+            _expert_storage_rank=1,
+            _interleaved_experts=True,
+            _num_global_routed=8,
+            _num_local_routed=4,
+            num_experts=9,
+            num_local_experts=5,
+            _has_fused_shared=True,
+            scheme=None,
+            quant_method=SimpleNamespace(apply=None),
+            quant_config=None,
+            use_flashinfer_trtllm_moe=False,
+        )
+        self.assertEqual(
+            FusedMoE._map_global_expert_id_to_local_expert_id(fake_moe, 0), -1
+        )
+        self.assertEqual(
+            FusedMoE._map_global_expert_id_to_local_expert_id(fake_moe, 1), 0
+        )
+        self.assertEqual(
+            FusedMoE._map_global_expert_id_to_local_expert_id(fake_moe, 7), 3
+        )
+        self.assertEqual(
+            FusedMoE._map_global_expert_id_to_local_expert_id(fake_moe, 8), 4
+        )
+        self.assertEqual(
+            FusedMoE._local_routed_expert_ids(fake_moe, list(range(9))),
+            [1, 3, 5, 7],
+        )
+        full_w = (
+            torch.arange(9, dtype=torch.float32)[:, None, None]
+            .expand(9, 4, 4)
+            .clone()
+        )
+        param = torch.nn.Parameter(torch.zeros((5, 4, 4)), requires_grad=False)
+        fake_moe._load_model_weight_or_group_weight_scale = (
+            lambda shard_id, shard_dim, loaded_weight, expert_data, is_bias: (
+                expert_data.copy_(loaded_weight)
+            )
+        )
+        FusedMoE.weight_loader_fused(fake_moe, param, full_w, "w13_weight", "w13")
+        self.assertTrue(
+            torch.equal(param[:, 0, 0], torch.tensor([1.0, 3.0, 5.0, 7.0, 8.0]))
+        )
+
+        # FusedMoE.__init__ caches SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS at construction.
+        with envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.override(True):
+            method = UnquantizedFusedMoEMethod()
+            with patch.object(method, "create_weights"):
+                layer = FusedMoE(
+                    num_experts=4,
+                    top_k=2,
+                    hidden_size=4,
+                    intermediate_size=96,
+                    layer_id=0,
+                    quant_method=method,
+                )
+            self.assertTrue(layer._interleaved_experts)
+
+    def test_interleaved_ep_gated_to_standard_dispatcher(self):
+        with envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.override(True):
+            method = UnquantizedFusedMoEMethod()
+            with patch.object(method, "create_weights"):
+                with (
+                    get_flags().moe.override(
+                        runner_backend=MoeRunnerBackend.FLASHINFER_CUTLASS,
+                        a2a_backend=MoeA2ABackend.NONE,
+                    ),
+                    patch.object(
+                        method,
+                        "get_moe_runner_backend",
+                        return_value=MoeRunnerBackend.FLASHINFER_CUTLASS,
+                    ),
+                ):
+                    global_id_layer = FusedMoE(
+                        num_experts=4,
+                        top_k=2,
+                        hidden_size=4,
+                        intermediate_size=96,
+                        layer_id=0,
+                        quant_method=method,
+                    )
+                    self.assertTrue(global_id_layer.dispatcher.skip_local_expert_mapping)
+                    self.assertFalse(global_id_layer._interleaved_experts)
+                    self.assertFalse(global_id_layer.dispatcher._interleaved_experts)
+
+                with get_exec().moe.override(ep_join_mode="scale"), get_parallel().override(
+                    elastic_ep_initial_size=2,
+                    ep_join_rank_offset=0,
+                ):
+                    scale_layer = FusedMoE(
+                        num_experts=4,
+                        top_k=2,
+                        hidden_size=4,
+                        intermediate_size=96,
+                        layer_id=0,
+                        quant_method=method,
+                    )
+                    self.assertFalse(scale_layer._interleaved_experts)
+                    self.assertFalse(scale_layer.dispatcher._interleaved_experts)
+
+                with (
+                    get_flags().moe.override(
+                        runner_backend=MoeRunnerBackend.TRITON,
+                        a2a_backend=MoeA2ABackend.DEEPEP,
+                    ),
+                    patch(
+                        "sglang.srt.layers.moe.fused_moe_triton.layer."
+                        "MaybeTboDeepEPDispatcher",
+                        return_value=SimpleNamespace(skip_local_expert_mapping=False),
+                    ),
+                    patch(
+                        "sglang.srt.layers.moe.fused_moe_triton.layer."
+                        "_get_deepep_comm_group",
+                        return_value=None,
+                    ),
+                    patch(
+                        "sglang.srt.layers.moe.fused_moe_triton.layer.get_deepep_mode",
+                        return_value=None,
+                    ),
+                ):
+                    deepep_layer = FusedMoE(
+                        num_experts=4,
+                        top_k=2,
+                        hidden_size=4,
+                        intermediate_size=96,
+                        layer_id=0,
+                        quant_method=method,
+                    )
+                    self.assertFalse(deepep_layer._interleaved_experts)
+
+    def test_map_topk_ids_skips_triton_when_not_nvidia_cuda(self):
+        from sglang.srt.layers.moe.token_dispatcher import standard as standard_mod
+
+        class _FakeCudaTensor(torch.Tensor):
+            @property
+            def is_cuda(self):
+                return True
+
+        fake_ids = torch.tensor([[0, 2, -1]], dtype=torch.int32).as_subclass(
+            _FakeCudaTensor
+        )
+        mapping = torch.tensor([-1, -1, 0], dtype=torch.int32)
+        expected = torch.tensor([[-1, 0, -1]], dtype=torch.int32)
+
+        with patch.object(
+            standard_mod, "map_topk_ids_to_local_experts", return_value=expected
+        ) as mock_triton:
+            with patch.object(standard_mod, "_is_cuda", False):
+                out_eager = standard_mod._map_topk_ids_to_local_experts(
+                    topk_ids=fake_ids, local_expert_mapping=mapping
+                )
+            mock_triton.assert_not_called()
+            self.assertTrue(
+                torch.equal(out_eager.as_subclass(torch.Tensor), expected)
+            )
+
+            with patch.object(standard_mod, "_is_cuda", True):
+                out_triton = standard_mod._map_topk_ids_to_local_experts(
+                    topk_ids=fake_ids, local_expert_mapping=mapping
+                )
+            mock_triton.assert_called_once_with(
+                topk_ids=fake_ids, local_expert_mapping=mapping
+            )
+            self.assertTrue(torch.equal(out_triton, expected))
 
 
 if __name__ == "__main__":

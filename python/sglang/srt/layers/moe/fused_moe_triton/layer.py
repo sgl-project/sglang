@@ -379,6 +379,7 @@ class FusedMoE(torch.nn.Module):
     scheme = None
 
     _skip_aiter_moe_shuffle: bool = False
+    _interleaved_experts: bool = False
 
     def __init__(
         self,
@@ -658,6 +659,13 @@ class FusedMoE(torch.nn.Module):
 
         self.dispatcher = create_moe_dispatcher(
             self.moe_runner_config, quant_method=self.quant_method
+        )
+        self._interleaved_experts = (
+            envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.get()
+            and get_moe_a2a_backend().is_none()
+            and isinstance(self.dispatcher, StandardDispatcher)
+            and not self.dispatcher.skip_local_expert_mapping
+            and get_exec().moe.ep_join_mode != "scale"
         )
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.
@@ -1213,6 +1221,14 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        if self._interleaved_experts and self.moe_ep_size > 1:
+            if 0 <= expert_id < self._num_global_routed:
+                if expert_id % self.moe_ep_size == self._expert_storage_rank:
+                    return expert_id // self.moe_ep_size
+                return -1
+            elif self._has_fused_shared and expert_id >= self._num_global_routed:
+                return expert_id - self._num_global_routed + self._num_local_routed
+            return -1
         start_idx = self._expert_storage_rank * self._num_local_routed
         end_idx = start_idx + self._num_local_routed
         if start_idx <= expert_id < end_idx:
@@ -1223,6 +1239,13 @@ class FusedMoE(torch.nn.Module):
             return -1
 
     def _local_routed_expert_ids(self, physical_expert_ids: List[int]) -> List[int]:
+        if self._interleaved_experts and self.moe_ep_size > 1:
+            return [
+                i
+                for i in physical_expert_ids
+                if 0 <= i < self._num_global_routed
+                and i % self.moe_ep_size == self._expert_storage_rank
+            ]
         start_idx = self._expert_storage_rank * self._num_local_routed
         end_idx = start_idx + self._num_local_routed
         return [i for i in physical_expert_ids if start_idx <= i < end_idx]
@@ -1678,6 +1701,21 @@ class FusedMoE(torch.nn.Module):
 
         expert_data = param.data
         is_bias = expert_data.dim() == 2
+        if (
+            self._interleaved_experts
+            and self.moe_ep_size > 1
+            and loaded_weight.dim() >= 1
+            and loaded_weight.shape[0] == self.num_experts
+            and self.num_experts > self.num_local_experts
+        ):
+            routed = loaded_weight[
+                self._expert_storage_rank : self._num_global_routed : self.moe_ep_size
+            ]
+            if self._has_fused_shared:
+                shared = loaded_weight[self._num_global_routed :]
+                loaded_weight = torch.cat([routed, shared], dim=0)
+            else:
+                loaded_weight = routed
 
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors

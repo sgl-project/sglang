@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.moe.map_local_experts import map_topk_ids_to_local_experts
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -15,6 +16,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_max_padding,
     mask_dp_pad_moe_topk_ids,
 )
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -23,13 +25,20 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    StandardTopKOutputLocalMapped,
+    TopKOutput,
+    TopKOutputChecker,
+)
 from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.runtime_context import get_lora, get_parallel
-from sglang.srt.utils.device import get_device
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
+from sglang.srt.utils.device import get_device, is_cuda
+
+_is_cuda = is_cuda()
 
 _MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
 
@@ -83,9 +92,28 @@ assert isinstance(StandardCombineInput, CombineInput)
 
 
 def _map_topk_ids_to_local_experts(
-    topk_ids: torch.Tensor, local_expert_mapping: torch.Tensor
+    topk_ids: torch.Tensor,
+    local_expert_mapping: torch.Tensor,
+    *,
+    use_triton: Optional[bool] = None,
 ) -> torch.Tensor:
     """Map global expert ids while preserving the ``-1`` drop sentinel."""
+    allow_triton = (
+        not _envs.SGLANG_DISABLE_FUSED_EP_REMAP.get()
+        if use_triton is None
+        else use_triton
+    )
+    if (
+        _is_cuda
+        and topk_ids.is_cuda
+        and topk_ids.is_contiguous()
+        and local_expert_mapping.is_contiguous()
+        and allow_triton
+    ):
+        return map_topk_ids_to_local_experts(
+            topk_ids=topk_ids,
+            local_expert_mapping=local_expert_mapping,
+        )
     return torch.where(
         topk_ids < 0,
         -1,
@@ -106,6 +134,10 @@ def _keeps_global_expert_ids(backend: Optional[MoeRunnerBackendLike]) -> bool:
 
 
 class StandardDispatcher(BaseDispatcher):
+    _disable_fused_ep_remap: bool = False
+    _interleaved_experts: bool = False
+    _default_local_expert_mapping: Optional[torch.Tensor] = None
+
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.moe_ep_size = get_parallel().moe_ep_size
@@ -135,7 +167,15 @@ class StandardDispatcher(BaseDispatcher):
             self.num_local_experts - self.num_local_shared_experts
         )
         self.moe_ep_rank = get_parallel().moe_ep_rank
+        self._disable_fused_ep_remap = _envs.SGLANG_DISABLE_FUSED_EP_REMAP.get()
+        self._interleaved_experts = (
+            _envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.get()
+            and get_moe_a2a_backend().is_none()
+            and not self.skip_local_expert_mapping
+            and get_exec().moe.ep_join_mode != "scale"
+        )
         self.local_expert_mapping = None
+        self._default_local_expert_mapping: Optional[torch.Tensor] = None
         self.expert_mask_gpu = None
 
     @property
@@ -151,7 +191,7 @@ class StandardDispatcher(BaseDispatcher):
 
     def prebuild(self) -> None:
         if self.prebuild_pending:
-            self.local_expert_mapping = self._build_local_expert_mapping()
+            self._ensure_local_expert_mapping()
 
     def _build_local_expert_mapping(self) -> torch.Tensor:
         # Global expert id -> local slot, -1 for experts held elsewhere;
@@ -159,17 +199,35 @@ class StandardDispatcher(BaseDispatcher):
         device = get_device()
         routed = self.num_local_routed_experts
         mapping = torch.full((self.num_experts,), -1, dtype=torch.int32, device=device)
-        mapping[self.moe_ep_rank * routed : (self.moe_ep_rank + 1) * routed] = (
-            torch.arange(0, routed, dtype=torch.int32, device=device)
-        )
+        if self._interleaved_experts:
+            mapping[self.moe_ep_rank : routed * self.moe_ep_size : self.moe_ep_size] = (
+                torch.arange(0, routed, dtype=torch.int32, device=device)
+            )
+        else:
+            mapping[self.moe_ep_rank * routed : (self.moe_ep_rank + 1) * routed] = (
+                torch.arange(0, routed, dtype=torch.int32, device=device)
+            )
         if self.num_local_shared_experts > 0:
             mapping[-self.num_local_shared_experts :] = torch.arange(
                 routed,
                 routed + self.num_local_shared_experts,
                 dtype=torch.int32,
-                device="cpu",
+                device=device,
             )
         return mapping
+
+    def _ensure_local_expert_mapping(self) -> None:
+        if self.local_expert_mapping is None:
+            self._default_local_expert_mapping = None
+        if (
+            self.moe_ep_size <= 1
+            or self.skip_local_expert_mapping
+            or self.local_expert_mapping is not None
+        ):
+            return
+        mapping = self._build_local_expert_mapping()
+        self._default_local_expert_mapping = mapping
+        self.local_expert_mapping = mapping
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -239,13 +297,29 @@ class StandardDispatcher(BaseDispatcher):
         else:
             hidden_states_scale = None
 
-        if (
-            self.moe_ep_size > 1
-            and not self.skip_local_expert_mapping
-            and TopKOutputChecker.format_is_standard(topk_output)
-            and self.local_expert_mapping is None
-        ):
-            self.local_expert_mapping = self._build_local_expert_mapping()
+        if TopKOutputChecker.format_is_standard(topk_output):
+            self._ensure_local_expert_mapping()
+
+        has_custom_mapping = (
+            self.local_expert_mapping is not None
+            and self.local_expert_mapping is not self._default_local_expert_mapping
+        )
+        if isinstance(topk_output, StandardTopKOutputLocalMapped):
+            if has_custom_mapping:
+                raise ValueError(
+                    "StandardDispatcher received StandardTopKOutputLocalMapped with a "
+                    "custom local_expert_mapping; set "
+                    "TopKConfig.use_custom_local_expert_mapping=True so the router "
+                    "preserves global expert IDs."
+                )
+            if not self.skip_local_expert_mapping and not self.use_aiter_moe_runner:
+                if _MASK_DP_PAD_MOE and is_dp_max_padding():
+                    mask_dp_pad_moe_topk_ids(topk_output.topk_ids)
+                return StandardDispatchOutput(
+                    hidden_states=hidden_states,
+                    hidden_states_scale=hidden_states_scale,
+                    topk_output=topk_output,
+                )
 
         if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
             if self.use_aiter_moe_runner and self.expert_mask_gpu is None:
@@ -260,7 +334,9 @@ class StandardDispatcher(BaseDispatcher):
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
                     topk_ids_local = _map_topk_ids_to_local_experts(
-                        topk_output.topk_ids, self.local_expert_mapping
+                        topk_ids=topk_output.topk_ids,
+                        local_expert_mapping=self.local_expert_mapping,
+                        use_triton=not self._disable_fused_ep_remap,
                     )
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and

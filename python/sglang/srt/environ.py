@@ -1706,6 +1706,12 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+    # Disable fused StandardDispatcher EP expert-ID remap and padded-row masking
+    # in moe_fused_gate, falling back to eager PyTorch ops in dispatch.
+    SGLANG_DISABLE_FUSED_EP_REMAP = EnvBool(False)
+    # Shard routed experts across EP ranks by (expert_id % ep_size == ep_rank)
+    # instead of contiguous rank blocks under StandardDispatcher.
+    SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS = EnvBool(False)
 
     # ===================================================================
     # DeepGEMM Mega MoE

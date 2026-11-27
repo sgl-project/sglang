@@ -1,28 +1,42 @@
+import contextlib
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import sglang.kernels.ops.moe.fill_padded_rows as fill_mod
+import sglang.kernels.ops.moe.moe_fused_gate as moe_fused_gate_mod
 import sglang.srt.layers.moe.topk as topk_mod
 from sglang.kernels.ops.moe.fill_padded_rows import (
     _can_fuse_padded_region,
     _fill_padded_rows,
 )
+from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
+from sglang.srt.environ import envs
+from sglang.srt.layers import dp_attention as dp_attn_mod
+from sglang.srt.layers.moe import ep_remap as ep_remap_mod
+from sglang.srt.layers.moe import utils as moe_utils_mod
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher import standard as standard_mod
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
 from sglang.srt.layers.moe.topk import (
+    StandardTopKOutputLocalMapped,
     TopKConfig,
     _mask_topk_ids_padded_region,
     _post_process_topk_ids,
     _zero_topk_weights_padded_region,
+    select_experts,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=60, stage="base-b", runner_config="1-gpu-small-amd")
 
 _IS_HIP = is_hip()
@@ -422,6 +436,331 @@ class TestSelectExpertsPerRankSharedSlotPadMask(CustomTestCase):
                 self.assertTrue(torch.all(out.topk_ids[n_valid:] == -1))
                 self.assertTrue(torch.all(out.topk_ids[:n_valid] >= 0))
                 self.assertTrue(torch.all(out.topk_ids[:n_valid, -1] == home_shared_id))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "EP remap fusion needs a GPU")
+@unittest.skipIf(_IS_HIP, "CUDA EP remap fusion is disabled under AITER/HIP")
+class TestEpRemapFusionRuntime(CustomTestCase):
+    DEVICE = "cuda"
+
+    def setUp(self):
+        self.enterContext(
+            get_context().override_server_args(model_path="dummy", device="cuda")
+        )
+        self.enterContext(envs.SGLANG_DISABLE_FUSED_EP_REMAP.override(False))
+        self.enterContext(envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.override(False))
+        self.enterContext(
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.TRITON,
+                a2a_backend=MoeA2ABackend.NONE,
+            )
+        )
+        self.enterContext(
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_ep_size=2,
+                moe_ep_rank=1,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                dwdp_size=1,
+                tp_group=None,
+            )
+        )
+        self.enterContext(get_exec().moe.override(ep_join_mode=None))
+        self.enterContext(
+            patch.object(
+                standard_mod,
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            )
+        )
+        self.enterContext(
+            patch.object(
+                moe_utils_mod,
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            )
+        )
+        self.enterContext(
+            patch.object(
+                ep_remap_mod,
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            )
+        )
+        self.enterContext(
+            patch.object(dp_attn_mod, "is_dp_max_padding", return_value=False)
+        )
+        self.enterContext(
+            patch.object(ep_remap_mod, "is_dp_max_padding", return_value=False)
+        )
+        self.enterContext(
+            patch.object(
+                topk_mod, "is_expert_remapping_enabled", return_value=False
+            )
+        )
+        self.enterContext(
+            patch.object(
+                ep_remap_mod, "get_global_experts_capturer", return_value=None
+            )
+        )
+        self.enterContext(
+            patch.object(
+                ep_remap_mod,
+                "get_global_expert_distribution_recorder",
+                return_value=SimpleNamespace(
+                    recording=False,
+                    get_current_pass_count_buffer=lambda: None,
+                    on_select_experts=lambda **kw: None,
+                ),
+            )
+        )
+        self.enterContext(
+            patch.object(
+                topk_mod,
+                "get_global_expert_distribution_recorder",
+                return_value=SimpleNamespace(
+                    recording=False,
+                    get_current_pass_count_buffer=lambda: None,
+                    on_select_experts=lambda **kw: None,
+                ),
+            )
+        )
+        self.enterContext(
+            patch.object(
+                standard_mod,
+                "use_symmetric_memory",
+                lambda *a, **kw: contextlib.nullcontext(),
+            )
+        )
+        self.enterContext(
+            patch.object(
+                topk_mod,
+                "use_symmetric_memory",
+                lambda *a, **kw: contextlib.nullcontext(),
+            )
+        )
+
+    def test_select_experts_ep_remap_equivalence(self):
+        with patch.object(
+            moe_fused_gate_mod.moe_route_warp, "covered", return_value=False
+        ):
+            for scoring, shared in (
+                ("softmax", 0),
+                ("softmax", 1),
+                ("sigmoid", 0),
+                ("sqrtsoftplus", 1),
+            ):
+                with self.subTest(scoring=scoring, shared=shared):
+                    num_experts, m_rows = 128, 8
+                    total_topk = 8 + shared
+                    hidden = torch.randn(
+                        (m_rows, 64), dtype=torch.bfloat16, device=self.DEVICE
+                    )
+                    logits = torch.randn(
+                        (m_rows, num_experts), dtype=torch.bfloat16, device=self.DEVICE
+                    )
+                    bias = (
+                        None
+                        if scoring == "softmax"
+                        else torch.randn(
+                            (num_experts,), dtype=torch.bfloat16, device=self.DEVICE
+                        )
+                        * 0.1
+                    )
+                    non_pad = torch.tensor([5], dtype=torch.int32, device=self.DEVICE)
+                    cfg = TopKConfig(
+                        top_k=total_topk,
+                        renormalize=True,
+                        scoring_func=scoring,
+                        correction_bias=bias,
+                        shared_experts=SharedExpertsConfig(
+                            num_fused_shared_experts=shared
+                        ),
+                        runner_backend=MoeRunnerBackend.TRITON,
+                        layer_id=0,
+                    )
+                    runner_cfg = MoeRunnerConfig(
+                        num_experts=num_experts + shared,
+                        num_local_experts=(num_experts // 2) + shared,
+                        top_k=total_topk,
+                        num_fused_shared_experts=shared,
+                        runner_backend=MoeRunnerBackend.TRITON,
+                    )
+                    with envs.SGLANG_DISABLE_FUSED_EP_REMAP.override(True):
+                        ref_topk = select_experts(
+                            hidden, logits, cfg, num_token_non_padded=non_pad
+                        )
+                        ref_disp = StandardDispatcher(runner_cfg).dispatch(
+                            hidden, ref_topk
+                        )
+                    treat_topk = select_experts(
+                        hidden, logits, cfg, num_token_non_padded=non_pad
+                    )
+                    self.assertIsInstance(treat_topk, StandardTopKOutputLocalMapped)
+                    d_treat = StandardDispatcher(runner_cfg)
+                    treat_disp = d_treat.dispatch(hidden, treat_topk)
+                    treat_disp2 = d_treat.dispatch(hidden, treat_topk)
+                    self.assertTrue(
+                        torch.equal(
+                            treat_disp.topk_output.topk_ids[:5],
+                            ref_disp.topk_output.topk_ids[:5],
+                        )
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            treat_disp2.topk_output.topk_ids[:5],
+                            ref_disp.topk_output.topk_ids[:5],
+                        )
+                    )
+                    torch.testing.assert_close(
+                        treat_disp.topk_output.topk_weights[:5],
+                        ref_disp.topk_output.topk_weights[:5],
+                        atol=1e-6,
+                        rtol=1e-5,
+                    )
+                    self.assertTrue(torch.all(treat_disp.topk_output.topk_ids[5:] == -1))
+                    self.assertTrue(
+                        torch.all(treat_disp.topk_output.topk_weights[5:] == 0.0)
+                    )
+
+    def test_select_experts_ep_remap_cuda_graph_replay(self):
+        m_rows, num_experts, topk = 64, 128, 8
+        hidden = torch.randn((m_rows, 32), dtype=torch.bfloat16, device=self.DEVICE)
+        logits = torch.randn(
+            (m_rows, num_experts), dtype=torch.bfloat16, device=self.DEVICE
+        )
+        non_pad = torch.tensor([32], dtype=torch.int32, device=self.DEVICE)
+        cfg = TopKConfig(
+            top_k=topk,
+            renormalize=True,
+            scoring_func="softmax",
+            runner_backend=MoeRunnerBackend.TRITON,
+            layer_id=0,
+        )
+        runner_cfg = MoeRunnerConfig(
+            num_experts=num_experts,
+            num_local_experts=num_experts // 2,
+            top_k=topk,
+            num_fused_shared_experts=0,
+            runner_backend=MoeRunnerBackend.TRITON,
+        )
+        disp = StandardDispatcher(runner_cfg)
+        out_ids = torch.empty((m_rows, topk), dtype=torch.int32, device=self.DEVICE)
+        out_w = torch.empty((m_rows, topk), dtype=torch.float32, device=self.DEVICE)
+
+        def step():
+            tk = select_experts(hidden, logits, cfg, num_token_non_padded=non_pad)
+            d = disp.dispatch(hidden, tk)
+            out_ids.copy_(d.topk_output.topk_ids)
+            out_w.copy_(d.topk_output.topk_weights)
+
+        s = torch.cuda.Stream(device=self.DEVICE)
+        s.wait_stream(torch.cuda.current_stream(self.DEVICE))
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                step()
+        torch.cuda.current_stream(self.DEVICE).wait_stream(s)
+        torch.cuda.synchronize(self.DEVICE)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            step()
+        torch.cuda.synchronize(self.DEVICE)
+
+        for v in (48, 1, 64, 0):
+            non_pad.fill_(v)
+            g.replay()
+            torch.cuda.synchronize(self.DEVICE)
+            with envs.SGLANG_DISABLE_FUSED_EP_REMAP.override(True):
+                tk_ref = select_experts(
+                    hidden, logits, cfg, num_token_non_padded=non_pad
+                )
+                d_ref = StandardDispatcher(runner_cfg).dispatch(hidden, tk_ref)
+            self.assertTrue(torch.equal(out_ids, d_ref.topk_output.topk_ids))
+            torch.testing.assert_close(
+                out_w[:v], d_ref.topk_output.topk_weights[:v], atol=1e-6, rtol=1e-5
+            )
+            self.assertTrue(torch.all(out_ids[v:] == -1))
+            self.assertTrue(torch.all(out_w[v:] == 0.0))
+
+    def test_custom_local_expert_mapping_matches_unfused_from_global_logits(self):
+        num_experts, m_rows, topk = 128, 4, 8
+        hidden = torch.randn((m_rows, 32), dtype=torch.bfloat16, device=self.DEVICE)
+        logits = torch.full(
+            (m_rows, num_experts), -20.0, dtype=torch.bfloat16, device=self.DEVICE
+        )
+        # Rows [0, 1] select global [0..7]; rows [2, 3] select global [64..71].
+        logits[:2, :topk] = 10.0
+        logits[2:, 64 : 64 + topk] = 10.0
+
+        # Global-indexed custom map: [0..63] -> [63..0], [64..127] -> -1.
+        custom_map = torch.full((num_experts,), -1, dtype=torch.int32, device=self.DEVICE)
+        custom_map[:64] = torch.arange(63, -1, -1, dtype=torch.int32, device=self.DEVICE)
+
+        runner_cfg = MoeRunnerConfig(
+            num_experts=num_experts,
+            num_local_experts=64,
+            top_k=topk,
+            num_fused_shared_experts=0,
+            runner_backend=MoeRunnerBackend.TRITON,
+        )
+        cfg_custom = TopKConfig(
+            top_k=topk,
+            renormalize=True,
+            scoring_func="softmax",
+            runner_backend=MoeRunnerBackend.TRITON,
+            use_custom_local_expert_mapping=True,
+            layer_id=0,
+        )
+        with envs.SGLANG_DISABLE_FUSED_EP_REMAP.override(True):
+            d_ctrl = StandardDispatcher(runner_cfg)
+            d_ctrl.local_expert_mapping = custom_map
+            tk_ctrl = select_experts(hidden, logits, cfg_custom)
+            self.assertNotIsInstance(tk_ctrl, StandardTopKOutputLocalMapped)
+            ctrl_disp = d_ctrl.dispatch(hidden, tk_ctrl)
+
+        d_treat = StandardDispatcher(runner_cfg)
+        d_treat.local_expert_mapping = custom_map
+        self.assertTrue(d_ctrl._disable_fused_ep_remap)
+        self.assertFalse(d_treat._disable_fused_ep_remap)
+
+        tk_treat = select_experts(hidden, logits, cfg_custom)
+        self.assertNotIsInstance(tk_treat, StandardTopKOutputLocalMapped)
+        treat_disp = d_treat.dispatch(hidden, tk_treat)
+
+        self.assertTrue(
+            torch.equal(treat_disp.topk_output.topk_ids, ctrl_disp.topk_output.topk_ids)
+        )
+        torch.testing.assert_close(
+            treat_disp.topk_output.topk_weights,
+            ctrl_disp.topk_output.topk_weights,
+            atol=1e-6,
+            rtol=1e-5,
+        )
+        # Global [0..7] -> custom_map[0..7] == [63..56]; global [64..71] -> -1 (dropped).
+        expected_live = torch.arange(63, 63 - topk, -1, dtype=torch.int32, device=self.DEVICE)
+        for row in (0, 1):
+            self.assertEqual(
+                set(treat_disp.topk_output.topk_ids[row].tolist()),
+                set(expected_live.tolist()),
+            )
+        self.assertTrue(torch.all(treat_disp.topk_output.topk_ids[2:] == -1))
+
+        cfg_default = TopKConfig(
+            top_k=topk,
+            renormalize=True,
+            scoring_func="softmax",
+            runner_backend=MoeRunnerBackend.TRITON,
+            layer_id=0,
+        )
+        tk_local = select_experts(hidden, logits, cfg_default)
+        self.assertIsInstance(tk_local, StandardTopKOutputLocalMapped)
+        with self.assertRaisesRegex(ValueError, "custom local_expert_mapping"):
+            d_treat.dispatch(hidden, tk_local)
 
 
 if __name__ == "__main__":
