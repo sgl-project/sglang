@@ -6,6 +6,22 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_contract import (
     validate_minimax_h3_vae_latent_stats,
 )
 
+# Defaults for the released 3D video decoder. An image VAE's config.json sets
+# ``vit_decoder_2d: true`` and its own ``vit_decoder_kwargs``.
+VIDEO_VIT_DECODER_KWARGS = {
+    "dim_head": 64,
+    "ffn_activation_fn": "silu",
+    "ffn_use_gated": True,
+    "heads": 32,
+    "norm_affine": True,
+    "norm_type": "rms_norm",
+    "num_layers": 36,
+    "qk_norm_affine": False,
+    "qk_norm_type": "rms_norm",
+    "rope_dim_ratio": 0.75,
+    "rope_theta": 100.0,
+}
+
 
 @dataclass
 class MiniMaxH3VideoVAEArchConfig(VAEArchConfig):
@@ -17,11 +33,14 @@ class MiniMaxH3VideoVAEArchConfig(VAEArchConfig):
     vae_clip_length: int = 17
     vae_token_drop: int = 3
     vae_encoder_tiling: int = 1
-    vae_decoder_tiling: int = 1
     vae_parallel_tiling: int = 1
     vae_tile_size: int = 256
     vae_tile_overlap_min: int = 64
     vae_chunk_dim: int = -1
+    vit_decoder_2d: bool = False
+    vit_decoder_kwargs: dict = field(
+        default_factory=lambda: dict(VIDEO_VIT_DECODER_KWARGS)
+    )
 
 
 @dataclass

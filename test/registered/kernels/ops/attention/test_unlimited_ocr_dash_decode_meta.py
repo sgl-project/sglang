@@ -40,7 +40,7 @@ from sglang.test.kernels.unlimited_ocr_dash import (
     torch_decode_page_meta,
 )
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 BS, IMG, PAGE, MM_PAD = 128, 99, 7, 1_000_000
 NUM_BLOCKS, WIDTH = 64, 12
@@ -236,7 +236,7 @@ def _decode_backend(prompts, page_state, coord_state, bt, *, graph: bool):
     b.buf_width = 4
     b.num_layers = 0
     b.image_bucket_constraint = True
-    b.max_context_len = WIDTH * BS
+    b.model_config = SimpleNamespace(context_len=WIDTH * BS)
     b.max_block_static = WIDTH
     b.model_dtype = torch.float32
     b.page_state, b.coord_state = page_state, coord_state

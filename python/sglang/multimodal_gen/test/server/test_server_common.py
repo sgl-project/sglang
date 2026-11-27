@@ -77,6 +77,7 @@ from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     gt_exists,
     image_bytes_to_numpy,
+    is_in_ci,
     load_action_consistency_gt,
     load_audio_consistency_gt,
     load_consistency_gt,
@@ -85,6 +86,7 @@ from sglang.multimodal_gen.test.test_utils import (
     save_missing_consistency_gt_artifact,
     wait_for_req_perf_record,
 )
+from sglang.test.test_utils import admin_post
 
 logger = init_logger(__name__)
 
@@ -139,7 +141,9 @@ def _key_frame_distances(
 
 
 @pytest.fixture
-def diffusion_server(case: DiffusionTestCase) -> ServerContext:
+def diffusion_server(
+    case: DiffusionTestCase, request: pytest.FixtureRequest
+) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
     _fixture_start_time = time.perf_counter()
     server_args = case.server_args
@@ -159,8 +163,12 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
-    extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-    extra_args = f"--model-type diffusion {extra_args}".strip()
+    extra_args = "--model-type diffusion"
+    if is_in_ci():
+        # Capture the seed for reproducibility without emitting prompt text.
+        extra_args += " --log-requests --log-requests-level 1"
+    if overrides := os.environ.get("SGLANG_TEST_SERVE_ARGS"):
+        extra_args += f" {overrides}"
 
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
@@ -221,6 +229,19 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         server_args.num_gpus,
     )
 
+    scenario = BASELINE_CONFIG.scenarios.get(case.id)
+    sampler = None
+    if (
+        current_platform.is_cuda()
+        and scenario
+        and scenario.min_free_vram_mb is not None
+    ):
+        from sglang.multimodal_gen.test.server.common.gpu_headroom import (
+            GpuHeadroomSampler,
+        )
+
+        sampler = GpuHeadroomSampler(extra_args, env_vars)
+        request.addfinalizer(sampler.close)
     manager = ServerManager(
         model=server_args.model_path,
         port=port,
@@ -230,6 +251,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     )
     try:
         ctx = manager.start()
+        ctx.headroom_sampler = sampler
     except (RuntimeError, TimeoutError) as exc:
         # Auto-skip when the installed diffusers version lacks the required
         # pipeline class.  This avoids hard failures when a model needs a
@@ -454,6 +476,12 @@ class DiffusionServerBase:
 
         summary = validator.collect_metrics(perf_record)
         summary.load_time_ms = ctx.load_time_ms
+        if (
+            scenario
+            and scenario.min_free_vram_mb is not None
+            and current_platform.is_cuda()
+        ):
+            summary.min_free_vram_by_gpu_mb = ctx.minimum_free_vram()
         self._record_performance_result(case, summary, request_index)
         self._print_performance_log(case, summary, scenario)
 
@@ -553,6 +581,12 @@ class DiffusionServerBase:
             summary.e2e_ms = e2e_ms
 
         summary.load_time_ms = ctx.load_time_ms
+        if (
+            scenario
+            and scenario.min_free_vram_mb is not None
+            and current_platform.is_cuda()
+        ):
+            summary.min_free_vram_by_gpu_mb = ctx.minimum_free_vram()
         self._record_performance_result(case, summary, request_index)
         self._print_performance_log(case, summary, scenario)
         if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
@@ -630,7 +664,8 @@ class DiffusionServerBase:
             "modality": case.server_args.modality,
             "e2e_ms": summary.e2e_ms,
             "load_time_ms": summary.load_time_ms,
-            "load_inclusive_e2e_ms": summary.load_time_ms + summary.e2e_ms,
+            "min_free_vram_mb": summary.min_free_vram_mb,
+            "min_free_vram_by_gpu_mb": summary.min_free_vram_by_gpu_mb,
             "avg_denoise_ms": summary.avg_denoise_ms,
             "median_denoise_ms": summary.median_denoise_ms,
             "load_peak_vram_mb": summary.load_peak_vram_mb,
@@ -666,7 +701,6 @@ class DiffusionServerBase:
             (
                 f"  e2e={summary.e2e_ms:.2f}ms, "
                 f"load={summary.load_time_ms:.2f}ms, "
-                f"load_inclusive_e2e={summary.load_time_ms + summary.e2e_ms:.2f}ms, "
                 f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
                 f"median_denoise={summary.median_denoise_ms:.2f}ms, "
                 f"load_peak_vram={summary.load_peak_vram_mb:.0f}MiB, "
@@ -692,6 +726,11 @@ class DiffusionServerBase:
                 f"load={scenario.load_peak_vram_mb:.0f}MiB, "
                 f"runtime={scenario.runtime_peak_vram_mb:.0f}MiB"
             )
+        if summary.min_free_vram_mb:
+            lines.append(
+                f"  minimum free memory per GPU (MiB): {summary.min_free_vram_by_gpu_mb}"
+            )
+            lines.append(f"  minimum free GPU memory (MiB): {summary.min_free_vram_mb}")
         if summary.stage_metrics:
             stages = ", ".join(
                 f"{name}={duration:.2f}ms"
@@ -779,6 +818,8 @@ class DiffusionServerBase:
         existing = BASELINE_CONFIG.scenarios.get(case.id)
         if existing is not None and existing.timing_tolerance is not None:
             baseline["timing_tolerance"] = existing.timing_tolerance
+        if existing is not None and existing.min_free_vram_mb is not None:
+            baseline["min_free_vram_mb"] = existing.min_free_vram_mb
 
         # Video-specific metrics
         if case.server_args.modality == "video":
@@ -1223,7 +1264,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 1: unmerge_lora_weights - API should succeed and generation should work
         logger.info("[LoRA E2E] Testing unmerge_lora_weights for %s", case.id)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/unmerge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
         )
         assert resp.status_code == 200, f"unmerge_lora_weights failed: {resp.text}"
@@ -1237,7 +1278,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 2: merge_lora_weights - API should succeed and generation should work
         logger.info("[LoRA E2E] Testing merge_lora_weights for %s", case.id)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/merge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
         )
         assert resp.status_code == 200, f"merge_lora_weights failed: {resp.text}"
@@ -1252,7 +1293,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 3: set_lora (re-set the same adapter) - API should succeed and generation should work
         logger.info("[LoRA E2E] Testing set_lora for %s", case.id)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1318,7 +1359,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         logger.info(
             "[LoRA Switch E2E] Switching to second LoRA adapter for %s", case.id
         )
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "lora2", "lora_path": second_lora_path},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1338,7 +1379,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 3: Switch back to original LoRA and generate
         logger.info("[LoRA Switch E2E] Switching back to original LoRA for %s", case.id)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1383,7 +1424,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             "[Dynamic LoRA] Loading LoRA dynamically via set_lora API for %s", case.id
         )
         logger.info("[Dynamic LoRA] LoRA path: %s", dynamic_lora_path)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default", "lora_path": dynamic_lora_path},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1407,7 +1448,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         client = self._client(ctx)
 
         # Test 1: Basic multi-LoRA with list format
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={
                 "lora_nickname": ["default", "lora2"],
@@ -1426,7 +1467,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert rid is not None
 
         # Test 2: Different strengths
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={
                 "lora_nickname": ["default", "lora2"],
@@ -1444,18 +1485,18 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         )
         assert rid is not None
 
-        # Test 3: Different targets
-        requests.post(
+        # Test 3: Select the Z-Image transformer for both cached adapters
+        admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={
                 "lora_nickname": ["default", "lora2"],
-                "lora_path": [first_lora_path, second_lora_path],
-                "target": ["transformer", "transformer_2"],
+                "lora_path": [None, None],
+                "target": ["transformer", "transformer"],
                 "strength": [0.6, 0.35],
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1469,7 +1510,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert rid is not None
 
         # Test 4: Switch back to single LoRA
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1540,14 +1581,14 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         if case.run_lora_effect_check:
             base_url = f"http://localhost:{ctx.port}/v1"
             # unmerge turns the adapter off in every merge mode; merge restores it
-            resp = requests.post(
+            resp = admin_post(
                 f"{base_url}/unmerge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
             )
             assert resp.status_code == 200, f"unmerge_lora_weights failed: {resp.text}"
             try:
                 without_lora = self._generate_key_frames(ctx, case)
             finally:
-                resp = requests.post(
+                resp = admin_post(
                     f"{base_url}/merge_lora_weights",
                     timeout=_CONTROL_API_TIMEOUT_SECS,
                 )
@@ -1569,7 +1610,6 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
     ) -> None:
         """
         Test /v1/models endpoint returns OpenAI-compatible response.
-        This endpoint is required for sgl-model-gateway router compatibility.
         """
         base_url = f"http://localhost:{ctx.port}"
 

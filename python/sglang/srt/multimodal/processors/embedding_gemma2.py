@@ -23,10 +23,10 @@ import torch
 from transformers.video_utils import VideoMetadata
 
 from sglang.srt.models.embedding_gemma2 import EmbeddingGemma2Model
+from sglang.srt.multimodal.media_io import load_audio
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.gemma4 import Gemma4SGLangProcessor
-from sglang.srt.utils.common import load_audio
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
@@ -106,10 +106,6 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
         self.IMAGE_TOKEN_ID = getattr(hf_config, "image_token_id", 258880)
         self.AUDIO_TOKEN_ID = getattr(hf_config, "audio_token_id", 258881)
         self.VIDEO_TOKEN_ID = getattr(hf_config, "video_token_id", 258884)
-        self.AUDIO_START_TOKEN_ID = getattr(hf_config, "boa_token_id", 256000)
-        self.AUDIO_END_TOKEN_ID = getattr(
-            hf_config, "eoa_token_id", getattr(hf_config, "eoa_token_index", 258883)
-        )
 
     @classmethod
     def _load_single_item(

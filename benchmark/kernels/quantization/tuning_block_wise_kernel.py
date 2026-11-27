@@ -28,14 +28,10 @@ from tqdm import tqdm
 mp.set_start_method("spawn", force=True)
 
 from sglang.benchmark.deepseek_utils import get_weight_shapes
-from sglang.kernels.ops.gemm.fp8_kernel import (
-    _w8a8_block_fp8_matmul,
-    _w8a8_block_fp8_matmul_unrolledx4,
-)
+from sglang.kernels.ops.gemm.fp8_kernel import _w8a8_block_fp8_matmul
 from sglang.kernels.ops.gemm.int8_kernel import _w8a8_block_int8_matmul
 from sglang.srt.utils import (
     get_device,
-    get_device_core_count,
     get_device_count,
     get_device_name,
     is_hip,
@@ -99,24 +95,15 @@ def w8a8_block_matmul(
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
-    # Use manually unrolledx4 kernel on AMD GPU when the grid size is small.
-    # Empirical testing shows the sweet spot lies when it's less than the # of
-    # compute units available on the device.
-    num_workgroups = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
-        N, config["BLOCK_SIZE_N"]
-    )
-
     extra_kernel_args = {}
     if A.dtype == torch.float8_e4m3fnuz or A.dtype == torch.float8_e4m3fn:
-        kernel = (
-            _w8a8_block_fp8_matmul_unrolledx4
-            if (_is_hip == True and num_workgroups <= get_device_core_count())
-            else _w8a8_block_fp8_matmul
-        )
+        kernel = _w8a8_block_fp8_matmul
         # set masking flag required by kernel arguments
         extra_kernel_args["needs_masking"] = needs_masking
     else:
         kernel = _w8a8_block_int8_matmul
+    # Same size check as the serving launchers, so large tuning shapes do not wrap
+    extra_kernel_args["USE_INT64_OFFSETS"] = max(A.numel(), C.numel()) >= 2**31
 
     kernel[grid](
         A,

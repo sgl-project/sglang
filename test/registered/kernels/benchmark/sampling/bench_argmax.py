@@ -9,7 +9,7 @@ from sglang.kernels.ops.speculative.row_argmax import _medium_row_argmax
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 
@@ -76,7 +76,7 @@ FN_MAP = {"jit": jit_argmax, "triton": triton_argmax, "torch": torch_argmax}
 # before `Sampler.forward` reaches its greedy branch.
 @marker.parametrize("vocab_size", [32000, 129280, 151936, 256000], [129280])
 @marker.parametrize("batch_size", [2**n for n in range(0, 12)], [1, 64, 1024])
-@marker.benchmark("impl", ["jit", "triton", "torch"])
+@marker.benchmark("impl", ["jit", "triton", "torch"], gate=["jit"])
 def benchmark(vocab_size: int, batch_size: int, impl: str):
     logits = create_random(batch_size, vocab_size, dtype=torch.float32)
     return marker.do_bench(FN_MAP[impl], input_args=(logits,))

@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.hf_transformers.common import get_rope_config
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -40,13 +41,13 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import Ernie4_5_VLRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4_5_VLMoeMLP
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
-from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +89,6 @@ class Ernie4_5_VLMoeAttention(nn.Module):
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
         )
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
-        self.rotary_dim = int(partial_rotary_factor * self.head_dim)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -396,7 +395,6 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         rope_theta, rope_scaling = get_rope_config(config)
         rope_is_neox_style = getattr(config, "rope_is_neox_style", False)
         freq_allocation = getattr(config, "freq_allocation", 20)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 131072)
         # Self attention.
         self.self_attn = Ernie4_5_VLMoeAttention(
             config=config,

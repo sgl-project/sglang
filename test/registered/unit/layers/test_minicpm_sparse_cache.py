@@ -70,7 +70,7 @@ def make_pool_and_req(capacity: int = 64):
     allocator = RecordingAllocator(capacity)
     pool = ReqToTokenPool(
         size=2,
-        max_context_len=64,
+        row_width=64,
         device="cpu",
         enable_memory_saver=False,
     )
@@ -158,7 +158,7 @@ def test_reserve_leaves_only_dense_capacity_visible():
     allocator = RecordingAllocator(capacity=69)
     pool = ReqToTokenPool(
         size=2,
-        max_context_len=64,
+        row_width=64,
         device="cpu",
         enable_memory_saver=False,
     )
@@ -214,7 +214,6 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
         token_to_kv_pool_allocator=allocator,
         req_to_token_pool=pool,
         pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
-        get_last_batch=lambda: None,
         scheduler_stage_metrics=None,
     )
 
@@ -288,7 +287,6 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
         pool_stats_observer=SimpleNamespace(
             session_held_mamba_slots=lambda: 0,
         ),
-        get_last_batch=lambda: None,
         scheduler_stage_metrics=None,
     )
 
@@ -342,7 +340,7 @@ def test_attach_compressed_cache_is_idempotent():
     allocator = RecordingAllocator(capacity=64)
     pool = ReqToTokenPool(
         size=2,
-        max_context_len=64,
+        row_width=64,
         device="cpu",
         enable_memory_saver=False,
     )

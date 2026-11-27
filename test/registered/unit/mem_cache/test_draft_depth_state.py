@@ -12,7 +12,8 @@ import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.kv_cache_configurator import runner_state
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MHATokenToKVPool
 from sglang.test.test_utils import CustomTestCase
@@ -49,7 +50,7 @@ class TestDraftDepthState(CustomTestCase):
             size=4,
             mamba_size=8,
             mamba_spec_state_size=4,
-            max_context_len=32,
+            row_width=32,
             device="cpu",
             enable_memory_saver=False,
             cache_params=_params(_STATE_LAYERS),

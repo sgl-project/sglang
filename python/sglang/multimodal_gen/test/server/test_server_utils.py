@@ -17,7 +17,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
@@ -59,6 +59,10 @@ from sglang.multimodal_gen.test.test_utils import (
     validate_openai_video,
     validate_video_file,
 )
+from sglang.test.test_utils import ADMIN_LAUNCH_ARGS_FOR_TEST
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.test.server.common.gpu_headroom import GpuHeadroomSampler
 
 logger = init_logger(__name__)
 
@@ -190,6 +194,14 @@ class ServerContext:
     _stdout_fh: Any = field(repr=False)
     _log_thread: threading.Thread | None = field(default=None, repr=False)
     load_time_ms: float | None = None
+    load_finished_ns: int | None = None
+    server_ready_ns: int | None = None
+    headroom_sampler: GpuHeadroomSampler | None = None
+
+    def minimum_free_vram(self) -> dict[str, list[float]]:
+        assert self.headroom_sampler is not None, "GPU headroom sampler missing"
+        assert self.load_finished_ns is not None and self.server_ready_ns is not None
+        return self.headroom_sampler.minima(self.load_finished_ns, self.server_ready_ns)
 
     def log_tail(self, lines: int = 200) -> str:
         """Return recent server output for failure diagnostics."""
@@ -406,6 +418,8 @@ class ServerManager:
             "--port",
             str(self.port),
             "--log-level=debug",
+            # The admin routes (weights, LoRA, profiling) refuse a server without one.
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ]
         if self.extra_args.strip():
             command.extend(shlex.split(self.extra_args))
@@ -488,9 +502,11 @@ class ServerManager:
         )
         try:
             self._wait_for_ready(process, stdout_path)
+            context.server_ready_ns = time.monotonic_ns()
             # health includes warmup; the worker marker's clock excludes it
             load_ready.wait(timeout=5)
             if load_finished_ns is not None:
+                context.load_finished_ns = load_finished_ns
                 context.load_time_ms = (load_finished_ns - load_started_ns) / 1e6
         except BaseException:
             context.cleanup()
@@ -614,14 +630,30 @@ class PerformanceValidator:
     ) -> None:
         assert summary.load_peak_vram_mb > 0, "Load peak VRAM metric missing"
         assert summary.runtime_peak_vram_mb > 0, "Runtime peak VRAM metric missing"
-        self._assert_peak_vram(
-            "Load Peak VRAM",
-            reserved=summary.load_peak_vram_mb,
-            allocated=summary.load_peak_allocated_mb,
-            expected_reserved=expected_load_peak_vram_mb,
-            expected_allocated=expected_load_peak_allocated_mb,
-            tolerance=self.tolerances.load_peak_vram,
-        )
+        floors = self.scenario.min_free_vram_mb
+        if floors is None:
+            self._assert_peak_vram(
+                "Load Peak VRAM",
+                reserved=summary.load_peak_vram_mb,
+                allocated=summary.load_peak_allocated_mb,
+                expected_reserved=expected_load_peak_vram_mb,
+                expected_allocated=expected_load_peak_allocated_mb,
+                tolerance=self.tolerances.load_peak_vram,
+            )
+        else:
+            # auto placement may keep more weights resident to reduce request time
+            assert {"load", "serving"} <= floors.keys(), (
+                "Missing load or serving GPU headroom floor"
+            )
+            minima = summary.min_free_vram_mb
+            for phase, floor in floors.items():
+                assert math.isfinite(floor) and floor > 0, (
+                    f"Invalid {phase} GPU headroom floor"
+                )
+                assert phase in minima, f"Missing {phase} GPU headroom measurement"
+                assert minima[phase] >= floor, (
+                    f"{phase} minimum free VRAM: {minima[phase]:.0f} MiB, need {floor:.0f} MiB"
+                )
         self._assert_peak_vram(
             "Runtime Peak VRAM",
             reserved=summary.runtime_peak_vram_mb,
@@ -704,12 +736,15 @@ class PerformanceValidator:
                 "skipping the host budget check"
             )
             return
+        tolerance = self.scenario.host_anon_tolerance
+        if tolerance is None:
+            tolerance = self.tolerances.host_anon
         if expected_load_mb is not None:
             self._assert_le(
                 "Load Peak Host Anon",
                 summary.load_peak_host_anon_mb,
                 expected_load_mb,
-                self.tolerances.host_anon,
+                tolerance,
                 min_abs_tolerance=256.0,
                 unit=" MiB",
             )
@@ -718,7 +753,7 @@ class PerformanceValidator:
                 "Runtime Peak Host Anon",
                 summary.runtime_peak_host_anon_mb,
                 expected_runtime_mb,
-                self.tolerances.host_anon,
+                tolerance,
                 min_abs_tolerance=256.0,
                 unit=" MiB",
             )
@@ -865,6 +900,16 @@ class PerformanceValidator:
                 tolerance,
                 min_abs_tolerance=min_abs_tolerance,
             )
+
+
+class ActionPerformanceValidator(PerformanceValidator):
+    """Action policies run no denoising loop, so only the denoise checks are skipped."""
+
+    def _validate_denoise_agg(self, summary: PerformanceSummary) -> None:
+        return None
+
+    def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
+        return None
 
 
 class VideoPerformanceValidator(PerformanceValidator):
@@ -1058,7 +1103,7 @@ VALIDATOR_REGISTRY = {
     "default": PerformanceValidator,
     "video": VideoPerformanceValidator,
     "mesh": MeshValidator,
-    "action": PerformanceValidator,
+    "action": ActionPerformanceValidator,
 }
 
 
@@ -1754,6 +1799,7 @@ def get_generate_fn(
                 ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
             )
         )
+        observation_rows = int(extra.get("observation_rows", 0))
 
         def tensor_payload(array):
             return {
@@ -1773,7 +1819,18 @@ def get_generate_fn(
                 ),
                 axis=-1,
             )
-            return tensor_payload(image.astype(np.uint8))
+            image = image.astype(np.uint8)
+            if observation_rows:
+                # Frame stack [T, H, W, 3], oldest first (Praxis).
+                image = np.tile(image, (observation_rows, 1, 1, 1))
+            return tensor_payload(image)
+
+        def state_payload():
+            if "state_row" in extra:
+                # One valid pose row per frame, so the quaternion stays normalized.
+                row = np.asarray(extra["state_row"], dtype=np.float32)
+                return tensor_payload(np.tile(row, (max(observation_rows, 1), 1)))
+            return tensor_payload(np.linspace(-0.5, 0.5, state_dim, dtype=np.float32))
 
         rng = np.random.default_rng(int(extra.get("seed", 0)))
         request_id = f"{case_id}-{int(time.time() * 1000)}"
@@ -1788,9 +1845,7 @@ def get_generate_fn(
                         for index, camera in enumerate(camera_order)
                     },
                     "camera_order": list(camera_order),
-                    "state": tensor_payload(
-                        np.linspace(-0.5, 0.5, state_dim, dtype=np.float32)
-                    ),
+                    "state": state_payload(),
                     "noise": tensor_payload(
                         rng.standard_normal((action_horizon, action_dim)).astype(
                             np.float32

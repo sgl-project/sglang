@@ -8,6 +8,10 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import ListKind
+from sglang.srt.managers.scheduler_components.state_check import (
+    FailureReporter,
+    StateCheckError,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,8 +20,10 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 _PAGE_SIZE = 256
 
 
-def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=None):
-    rtt = torch.zeros((num_reqs, row_width), dtype=torch.int32)
+def _make_checker(
+    page_size=_PAGE_SIZE, req_to_token_row_width=4096, num_reqs=8, free_pages=None
+):
+    rtt = torch.zeros((num_reqs, req_to_token_row_width), dtype=torch.int32)
     rtp = SimpleNamespace(req_to_token=rtt)
     if free_pages is None:
         free_pages = torch.arange(num_reqs * 4, dtype=torch.int64)
@@ -35,9 +41,8 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         req_to_token_pool = _rtp
         token_to_kv_pool_allocator = _alloc
         tree_cache = _tc
-        get_last_batch = lambda self: None
         get_request_lists = lambda self: {}
-        count_memory_leak_warnings = 0
+        reporter = FailureReporter()
 
         from sglang.srt.managers.scheduler_components.invariant_checker import (
             SchedulerInvariantChecker as _RIC,
@@ -66,14 +71,13 @@ class TestKVPageInvariants(CustomTestCase):
         chk.get_request_lists = lambda: {
             ListKind.DECODING: [_FakeOwner(0, 145, 144, rid="a")]
         }
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(StateCheckError):
             chk._check_kv_page_invariants()
 
     def test_slot_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
-        chk.get_last_batch = lambda: None
         tc.session_records()["s1"] = _FakeOwner(0, 145, 144).kv
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(StateCheckError):
             chk._check_kv_page_invariants()
 
     def test_owner_references_free_page_raises(self):
@@ -85,7 +89,7 @@ class TestKVPageInvariants(CustomTestCase):
         chk.get_request_lists = lambda: {
             ListKind.DECODING: [_FakeOwner(0, 3, 3, rid="a")]
         }
-        with self.assertRaises(ValueError):
+        with self.assertRaises(StateCheckError):
             chk._check_kv_page_invariants()
 
     def test_requests_in_any_list_are_checked(self):
@@ -98,11 +102,11 @@ class TestKVPageInvariants(CustomTestCase):
                 )
                 owner = _FakeOwner(0, 3, 3, rid="a")
                 chk.get_request_lists = lambda: {where: [owner]}
-                with self.assertRaises(ValueError):
+                with self.assertRaises(StateCheckError):
                     chk._check_kv_page_invariants()
 
     def test_classed_allocator_without_flat_free_list_is_checked(self):
-        chk, rtt, _tc, alloc = _make_checker(page_size=4, row_width=8)
+        chk, rtt, _tc, alloc = _make_checker(page_size=4, req_to_token_row_width=8)
         alloc.free_pages = None
         alloc.get_all_free_pages = MagicMock(
             return_value=torch.tensor([5, 6], dtype=torch.int64)
@@ -116,7 +120,7 @@ class TestKVPageInvariants(CustomTestCase):
             "sglang.srt.managers.scheduler_components.invariant_checker.page_interleave_shard_size",
             return_value=2,
         ):
-            with self.assertRaisesRegex(ValueError, "use-after-free"):
+            with self.assertRaisesRegex(StateCheckError, "use-after-free"):
                 chk._check_kv_page_invariants()
 
         alloc.get_all_free_pages.assert_called()
@@ -127,7 +131,7 @@ class TestKVPageInvariants(CustomTestCase):
         chk.get_request_lists = lambda: {
             ListKind.DECODING: [_FakeOwner(0, 1, 1, rid="a")]
         }
-        with self.assertRaises(ValueError):
+        with self.assertRaises(StateCheckError):
             chk._check_kv_page_invariants()
 
 

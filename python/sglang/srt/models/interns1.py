@@ -1,3 +1,4 @@
+import logging
 from array import array
 from typing import Iterable, List, Optional, Tuple
 
@@ -20,7 +21,8 @@ from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.srt.multimodal.modality import Modality
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 
 class InternS1ForConditionalGeneration(nn.Module):
@@ -28,7 +30,6 @@ class InternS1ForConditionalGeneration(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        use_flash_attn=True,
     ) -> None:
         super().__init__()
         self.config = config
@@ -48,11 +49,6 @@ class InternS1ForConditionalGeneration(nn.Module):
             (image_size // patch_size) ** 2 * (config.downsample_ratio**2)
         )
         self.downsample_ratio = config.downsample_ratio
-
-        config.vision_config.use_flash_attn = True if use_flash_attn else False
-        config.text_config._attn_implementation = (
-            "flash_attention_2" if use_flash_attn else "eager"
-        )
 
         logger.info(f"num_image_token: {self.num_image_token}")
 

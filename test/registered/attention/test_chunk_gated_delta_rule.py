@@ -1,8 +1,14 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.kernels.ops.attention.fla import chunk_o
+from sglang.kernels.ops.attention.fla.chunk import (
+    CHUNK_SIZE,
+    chunk_gated_delta_rule,
+    chunk_gated_delta_rule_fwd_h,
+)
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
@@ -13,9 +19,9 @@ from sglang.test.ci.ci_register import (
     register_xpu_ci,
 )
 
-register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=11, stage="stage-b", runner_config="1-gpu-large-amd")
-register_xpu_ci(est_time=900, suite="stage-b-test-1-gpu-xpu")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=14, stage="base-b", runner_config="1-gpu-large-amd")
+register_xpu_ci(est_time=930, suite="extra-test-1-gpu-xpu")
 
 
 @unittest.skipIf(
@@ -73,6 +79,42 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
             use_qk_l2norm_in_kernel=True,
         )
         return o, pool
+
+    @patch.object(chunk_o, "is_batch_invariant_mode_enabled", lambda: True)
+    def test_short_sequence_output_independent_of_batchmates(self):
+        """In batch-invariant mode a short sequence must give bitwise the same output
+        alone and packed with other sequences: the output kernel's tile must not shrink
+        with the batch's total length (it did, which made deterministic inference
+        batch-variant)."""
+        device = get_device()
+        Hk, Hv, K, V = 16, 48, 128, 128
+        for L in range(10, 17):
+            for seed in range(6):
+                torch.manual_seed(seed * 1000 + L)
+                q = torch.randn(1, L, Hk, K, dtype=torch.bfloat16, device=device)
+                k = torch.randn(1, L, Hk, K, dtype=torch.bfloat16, device=device)
+                v = torch.randn(1, L, Hv, V, dtype=torch.bfloat16, device=device)
+                g = -torch.rand(1, L, Hv, dtype=torch.float32, device=device) * 0.5
+                beta = torch.rand(1, L, Hv, dtype=torch.bfloat16, device=device)
+                outs = []
+                for n in (1, 2):
+                    cu_seqlens = torch.arange(
+                        0, (n + 1) * L, L, dtype=torch.long, device=device
+                    )
+                    o = chunk_gated_delta_rule(
+                        *(torch.cat([t] * n, dim=1) for t in (q, k, v, g, beta)),
+                        initial_state=torch.zeros(
+                            n, Hv, V, K, dtype=torch.float32, device=device
+                        ),
+                        initial_state_indices=torch.arange(
+                            n, dtype=torch.int32, device=device
+                        ),
+                        cu_seqlens=cu_seqlens,
+                        head_first=False,
+                        use_qk_l2norm_in_kernel=True,
+                    )[0]
+                    outs.append(o[:, :L])
+                self.assertTrue(torch.equal(outs[0], outs[1]), f"L={L} seed={seed}")
 
     def _check_shape(
         self, B, T_per_seq, H, K, V, pool_size, sequential_indices=False, seed=42
@@ -423,6 +465,98 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                     torch.equal(pool[untouched], pool_init[untouched]),
                     f"{label}: padded rows wrote into the state pool",
                 )
+
+    # ------------------------------------------------------------------
+    # Long packed prefills (chunk-state offsets beyond the int32 range)
+    # ------------------------------------------------------------------
+
+    def test_chunk_state_slot_beyond_int32_offset(self):
+        """A sequence whose chunk-state offset exceeds int32 must fill its own slots.
+
+        Chunk states are addressed by chunk_offsets[i] * H * V * K elements.
+        Computed in int32, that product wraps once it passes 2**31: between
+        2**31 and 2**32 the sequence writes before the buffer, and at 2**32 it
+        lands on slot 0, over the first sequence's chunk states. The test sits
+        exactly at 2**32 so the bug shows up as a failed comparison rather
+        than an illegal memory access.
+
+        Two sequences with identical inputs and identical initial states must
+        produce identical chunk states, whatever offset they sit at.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        Hg = H = 32
+        K = V = 128
+        T_per_seq = 2 * CHUNK_SIZE
+        nt_seq = T_per_seq // CHUNK_SIZE
+        # First chunk slot whose element offset lands on a multiple of 2**32.
+        overflow_slot = 2**32 // (H * V * K)
+        num_chunks = overflow_slot + nt_seq
+        torch.manual_seed(0)
+
+        k_seq = torch.randn(1, T_per_seq, Hg, K, dtype=dtype, device=device)
+        w_seq = 0.1 * torch.randn(1, T_per_seq, H, K, dtype=dtype, device=device)
+        u_seq = torch.randn(1, T_per_seq, H, V, dtype=dtype, device=device)
+        # g enters this kernel already cumulatively summed within each chunk.
+        g_seq = (
+            torch.nn.functional.logsigmoid(
+                torch.randn(1, T_per_seq, H, dtype=torch.float32, device=device) + 4.0
+            )
+            .view(1, nt_seq, CHUNK_SIZE, H)
+            .cumsum(dim=2)
+            .view(1, T_per_seq, H)
+        )
+        k = torch.cat([k_seq, k_seq], dim=1)
+        w = torch.cat([w_seq, w_seq], dim=1)
+        u = torch.cat([u_seq, u_seq], dim=1)
+        g = torch.cat([g_seq, g_seq], dim=1)
+
+        state = torch.randn(1, H, V, K, dtype=torch.float32, device=device) * 0.1
+        pool = state.repeat(2, 1, 1, 1)
+        state_indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        cu_seqlens = torch.tensor(
+            [0, T_per_seq, 2 * T_per_seq], dtype=torch.long, device=device
+        )
+        # The second sequence sits behind the chunks of earlier, already
+        # scheduled sequences; only their slots are reserved here, not their
+        # tokens, which keeps the test to one chunk-state buffer.
+        chunk_offsets = cu_seqlens.new_tensor([0, overflow_slot])
+        # chunk_indices never reaches the kernel; its length sizes that buffer.
+        chunk_indices = cu_seqlens.new_zeros(num_chunks, 2)
+
+        buffer_bytes = num_chunks * H * V * K * dtype.itemsize
+        free_bytes, _ = getattr(torch, device).mem_get_info()
+        if free_bytes < buffer_bytes + 2**30:
+            self.skipTest(
+                f"needs {buffer_bytes / 2**30 + 1:.1f} GiB of free device memory"
+            )
+
+        # Poison the block the buffer is about to be carved out of, so an
+        # unwritten slot cannot pass for a correctly written one. This relies
+        # on the caching allocator handing the same-sized block back.
+        poison = torch.empty(num_chunks * H * V * K, dtype=dtype, device=device)
+        poison.fill_(float("nan"))
+        del poison
+        h, _ = chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=pool,
+            initial_state_indices=state_indices,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+        )
+        same = torch.equal(h[0, overflow_slot : overflow_slot + nt_seq], h[0, :nt_seq])
+        del h
+        getattr(torch, device).empty_cache()
+
+        self.assertTrue(
+            same,
+            "chunk states of the sequence past the int32 offset were written "
+            "somewhere other than its own slots",
+        )
 
 
 if __name__ == "__main__":

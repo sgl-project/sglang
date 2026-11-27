@@ -27,6 +27,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -34,7 +36,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
 
 logger = logging.getLogger(__name__)
 
@@ -324,9 +325,6 @@ class NanbeigeModel(nn.Module):
         # For EAGLE3 / DFLASH: capture *before* unrolled layer id (ids already +1'd).
         self.layers_to_capture = []
 
-    def get_input_embedding(self, input_ids):
-        return self.embed_tokens(input_ids)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -438,9 +436,6 @@ class NanbeigeForCausalLM(nn.Module):
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
-
-    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embedding(input_ids)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -591,8 +586,6 @@ class NanbeigeForSequenceClassification(nn.Module):
         )
         self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
-
-        self.eos_token_id = config.eos_token_id
 
     @torch.no_grad()
     def forward(

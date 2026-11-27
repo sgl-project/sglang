@@ -18,17 +18,14 @@ It supporst page size = 1.
 
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
-import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-
-if _is_cuda or _is_hip:
-    CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 
 @triton.jit
@@ -177,7 +174,8 @@ def context_attention_fwd(
     out: [b * s, head, head_dim]
     sm_scale: softmax scale, defaults to 1/sqrt(head_dim)
     """
-    if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
+    # props.major is the gfx major on ROCm, so gfx9+ takes the larger block too.
+    if (_is_cuda or _is_hip) and current_arch().props.major > 8:
         BLOCK = 128
     else:
         BLOCK = 64

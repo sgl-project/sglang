@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-import warnings
 from functools import lru_cache, partial
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -12,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang._lazy_import import LazyImport
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm as can_use_jit_qk_norm,
 )
@@ -40,7 +40,6 @@ from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
     with_multi_stream,
 )
-from sglang.utils import LazyImport
 
 _is_cpu = is_cpu()
 _is_cuda = is_cuda()
@@ -98,13 +97,9 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb_native_eager
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-ROTARY_EMBED_CLASSES = {
-    "normal": apply_rotary_pos_emb,
-}
 
 # === Vision Encoder === #
 FLASHINFER_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
@@ -545,14 +540,13 @@ class VisionTritonAttention(nn.Module):
             seq_lens = forward_metadata.seq_lens
             max_seqlen = forward_metadata.max_seqlen
             output = torch.empty_like(q)
-        elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            if "output_ws" not in kwargs:
+        elif isinstance(cu_seqlens, list):
+            # ViT CUDA graph runners pass [cu_seqlens, seq_lens, max_seqlen]; models
+            # without a runner keep passing tensors even when the graph env var is set.
+            output = kwargs.get("output_ws")
+            if output is None:
                 raise RuntimeError("output_ws should be prepared for cuda-graph mode")
 
-            if not isinstance(cu_seqlens, list):
-                raise RuntimeError("cuda-graph mode cu_seqlens should be a list")
-
-            output = kwargs["output_ws"]
             cu_seqlens_gpu = cu_seqlens[0]
             seq_lens = cu_seqlens[1]
             max_seqlen = cu_seqlens[2]
@@ -616,9 +610,9 @@ class VisionFlash3Attention(nn.Module):
         if forward_metadata is not None:
             cu_seqlens_gpu = forward_metadata.cu_seqlens
             max_seqlen = forward_metadata.max_seqlen
-        elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            if not isinstance(cu_seqlens, list):
-                raise RuntimeError("cuda-graph mode cu_seqlens should be a list")
+        elif isinstance(cu_seqlens, list):
+            # ViT CUDA graph runners pass [cu_seqlens, max_seqlen]; models without
+            # a runner keep passing tensors even when the graph env var is set.
             cu_seqlens_gpu = cu_seqlens[0]
             max_seqlen = cu_seqlens[1]
         else:
@@ -736,17 +730,17 @@ class VisionFlashInferAttention(nn.Module):
             packed_cu_seqlens = forward_metadata.packed_indptrs
             max_seqlen = forward_metadata.flashinfer_max_seqlen
         else:
-            if "sequence_lengths" not in kwargs:
+            sequence_lengths = kwargs.get("sequence_lengths")
+            if sequence_lengths is None:
                 raise RuntimeError(
                     "sequence_lengths should be prepared for vision flashinfer_cudnn attention backend"
                 )
-            if "max_seqlen" not in kwargs:
+            max_seqlen = kwargs.get("max_seqlen")
+            if max_seqlen is None:
                 raise RuntimeError(
                     "max_seqlen should be prepared for vision flashinfer_cudnn attention backend"
                 )
-            sequence_lengths = kwargs["sequence_lengths"]
             packed_cu_seqlens = cu_seqlens
-            max_seqlen = kwargs["max_seqlen"]
 
         # max_seqlen must be python int
         if isinstance(max_seqlen, torch.Tensor):
@@ -1032,6 +1026,7 @@ class VisionAMXAttention(nn.Module):
         cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
+        softmax_scale: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -1062,6 +1057,7 @@ class VisionAMXAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             causal=False,
+            sm_scale=softmax_scale,
         )
 
         return output
@@ -1180,13 +1176,6 @@ class VisionAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        if head_dim is None and "head_size" in kwargs:
-            head_dim = kwargs.pop("head_size")
-            warnings.warn(
-                "VisionAttention(head_size=...) is deprecated; use head_dim=...",
-                DeprecationWarning,
-                stacklevel=2,
-            )
         self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
         self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.dropout = dropout
@@ -1580,8 +1569,8 @@ class VisionAttention(nn.Module):
 
         # internvl
         if self.qk_normalization and not self.qk_normalization_by_head_size:
-            # jit kernel
-            if can_use_jit_qk_norm(self.head_size, q.dtype):
+            # The norm spans every head, so under TP it needs _apply_qk_norm's all-gather.
+            if self.tp_size == 1 and can_use_jit_qk_norm(self.head_size, q.dtype):
                 # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
                 head_dim_for_norm = head * self.head_size
 
