@@ -70,7 +70,7 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
 )
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_memory, get_model, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -545,6 +545,14 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             # Cannot be refused: its idle gate is the check at the top.
             self.flush_cache()
+            if scheduler is not None and get_memory().release_hicache:
+                # The HiCache host pool is off the device: free it too, so the
+                # host side of an offloaded engine is not held by KV pages.
+                release_hicache = getattr(
+                    scheduler.tree_cache, "release_memory_occupation", None
+                )
+                if release_hicache is not None:
+                    release_hicache()
             self.offload_tags.add(GPU_MEMORY_TYPE_KV_CACHE)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
@@ -594,6 +602,13 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
             scheduler = self.scheduler
             if scheduler is not None:
+                if get_memory().release_hicache:
+                    # Rebuild the host pool before any transfer can address it.
+                    resume_hicache = getattr(
+                        scheduler.tree_cache, "resume_memory_occupation", None
+                    )
+                    if resume_hicache is not None:
+                        resume_hicache()
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                     queue = getattr(scheduler, "disagg_decode_prealloc_queue", None)
                     if queue is not None:

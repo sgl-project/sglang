@@ -103,10 +103,15 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
 
         self.kv_buffer = self.init_kv_buffer()
         self.fd = getattr(self.allocator, "fd", None)
+        self.lock = threading.RLock()
+        self._host_memory_released = False
+        self.clear()
+        self._post_init_host_buffers()
+
+    def _post_init_host_buffers(self) -> None:
+        # Flags and the page-row transfer tables depend on the host buffers.
         self.can_use_jit = False
         self.can_use_write_back_jit = False
-        self.lock = threading.RLock()
-        self.clear()
         self._init_page_row_transfer()
 
     # ----- layout ------------------------------------------------------------
@@ -521,8 +526,7 @@ class MiniMaxM3Nvfp4MainKVPoolHost(MiniMaxM3Nvfp4IndexKPoolHost):
             allocator_type=allocator_type,
             pool_label=pool_label,
         )
-        self.can_use_jit = False
-        self._init_page_row_transfer()
+        self._post_init_host_buffers()
 
     def get_ksize_per_token(self):
         return self.get_size_per_token() // 2

@@ -398,6 +398,14 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
     return synced_size
 
 
+def _iter_tensors(value):
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_tensors(item)
+
+
 def synchronized(func):
     @wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -483,7 +491,37 @@ class HostKVCache(abc.ABC):
         if not is_dummy:
             self._allocate_host_buffer()
         self.lock = threading.RLock()
+        # Offloaded state: the host buffers exist but hold no KV and no capacity.
+        self._host_memory_released = False
         self.clear()
+
+    @property
+    def _budget_device(self):
+        """Device the host-memory budget of this pool is accounted against."""
+        # Mamba pools budget on the state buffers, the rest on the KV pool device.
+        return getattr(self, "_transfer_device", None) or self._buffer_device
+
+    def _allocation_preflight(self) -> tuple[int, int]:
+        """(requested, available) host bytes for this pool's whole mapping."""
+        return host_memory_preflight(
+            self.get_mapping_lengths(), self.allocator, self._budget_device
+        )
+
+    def _requested_host_memory_bytes(self) -> int:
+        """Host bytes this pool releases when it is offloaded (log/accounting)."""
+        return sum(self.get_mapping_lengths())
+
+    def _check_host_memory_available(self) -> int:
+        """Raise unless the host can hold this pool; return the requested bytes."""
+        allocation_bytes, available_bytes = self._allocation_preflight()
+        if allocation_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory available. Requesting "
+                f"{allocation_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                f"size of the hierarchical cache."
+            )
+        return allocation_bytes
 
     def _allocate_host_buffer(self) -> None:
         if self.size <= self.device_capacity_tokens:
@@ -496,42 +534,127 @@ class HostKVCache(abc.ABC):
                 self.device_capacity_tokens,
             )
 
-        # Verify there is enough available host memory.
-        budget_device = self._transfer_device
-        allocation_bytes, available_bytes = host_memory_preflight(
-            self.get_mapping_lengths(), self.allocator, budget_device
-        )
-        if allocation_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{allocation_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
+        allocation_bytes = self._check_host_memory_available()
+        draft_layer_num = self.layer_num - self.target_layer_num
+        if draft_layer_num > 0:
+            logger.info(
+                "Allocating %s hierarchical KV host pool: %d tokens, "
+                "%.2f GB host memory, packed MTP KV layers: "
+                "target_layers=%d, draft_layers=%d, total_layers=%d.",
+                self.pool_label,
+                self.size,
+                allocation_bytes / 1e9,
+                self.target_layer_num,
+                draft_layer_num,
+                self.layer_num,
             )
         else:
-            draft_layer_num = self.layer_num - self.target_layer_num
-            if draft_layer_num > 0:
-                logger.info(
-                    "Allocating %s hierarchical KV host pool: %d tokens, "
-                    "%.2f GB host memory, packed MTP KV layers: "
-                    "target_layers=%d, draft_layers=%d, total_layers=%d.",
-                    self.pool_label,
-                    self.size,
-                    allocation_bytes / 1e9,
-                    self.target_layer_num,
-                    draft_layer_num,
-                    self.layer_num,
-                )
-            else:
-                logger.info(
-                    "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
-                    self.pool_label,
-                    self.size,
-                    allocation_bytes / 1e9,
-                )
+            logger.info(
+                "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
+                self.pool_label,
+                self.size,
+                allocation_bytes / 1e9,
+            )
 
+        self._init_host_buffers()
+
+    def _init_host_buffers(self) -> None:
+        """Allocate the pool's host buffers (also used to rebuild them on resume)."""
         self.kv_buffer = self.init_kv_buffer()
         self.fd = getattr(self.allocator, "fd", None)
+
+    def _rebuild_host_buffers(self) -> None:
+        """Re-allocate host buffers and the views built on top of them."""
+        self._init_host_buffers()
+        self._post_init_host_buffers()
+
+    def _post_init_host_buffers(self) -> None:
+        """Rebuild per-layer views/pointer tables derived from the host buffers.
+
+        Subclasses that cache views into their host buffer override this; it is
+        called after every (re)allocation of those buffers.
+        """
+
+    # Payload buffers to drop when the pool is offloaded. Subclasses with more
+    # than the fused kv_buffer list all of them.
+    def _host_buffer_attr_names(self) -> tuple[str, ...]:
+        return ("kv_buffer",)
+
+    # Views/pointer tables that must not outlive the buffers they point into.
+    def _host_derived_attr_names(self) -> tuple[str, ...]:
+        return (
+            "host_kv_data_refs",
+            "k_data_refs",
+            "v_data_refs",
+            "k_data_ptrs",
+            "v_data_ptrs",
+            "data_refs",
+            "data_ptrs",
+            "index_k_data_refs",
+            "index_k_data_ptrs",
+            "index_k_device_ptrs",
+        )
+
+    def _release_host_buffers(self) -> None:
+        """Drop every host buffer and view; unregister pinned CUDA/ROCm memory."""
+        seen_ptrs = set()
+        for attr in self._host_derived_attr_names():
+            if getattr(self, attr, None) is not None:
+                setattr(self, attr, None)
+        for attr in self._host_buffer_attr_names():
+            value = getattr(self, attr, None)
+            if value is not None and self.pin_memory and (_is_cuda or _is_hip):
+                for tensor in _iter_tensors(value):
+                    ptr = tensor.data_ptr()
+                    if ptr and ptr not in seen_ptrs:
+                        seen_ptrs.add(ptr)
+                        _cuda_host_unregister(tensor)
+            setattr(self, attr, None)
+        self.kv_buffer = None
+
+    @property
+    def _host_pool_label(self) -> str:
+        """Pool name for logs; not every host pool sets ``pool_label``."""
+        return getattr(self, "pool_label", type(self).__name__)
+
+    @synchronized
+    def release_memory_occupation(self) -> None:
+        """Free the host KV pool (capacity included) until resume_memory_occupation().
+
+        Idempotent. The KV content is dropped, not kept: a resume allocates a
+        fresh, empty pool of the same geometry.
+        """
+        if getattr(self, "_destroyed", False) or self._host_memory_released:
+            return
+        self._release_host_buffers()
+        # Keep the pool unusable and "empty" while offloaded: no free slots, so
+        # an unguarded alloc() cannot hand out slots into a freed buffer.
+        self.mem_state = torch.empty((0,), dtype=torch.uint8, device=self.device)
+        self.free_slots = torch.empty((0,), dtype=torch.int64)
+        self.release_slots = []
+        self.num_release_slots = 0
+        self.slot_used = torch.empty((0,), dtype=torch.bool)
+        self._host_memory_released = True
+        logger.info(
+            "Released %.2f GB of HiCache host buffers for pool %s.",
+            self._requested_host_memory_bytes() / 1e9,
+            self._host_pool_label,
+        )
+
+    @synchronized
+    def resume_memory_occupation(self) -> None:
+        """Re-allocate the host pool released by release_memory_occupation()."""
+        if not self._host_memory_released:
+            return
+        self._check_host_memory_available()
+        self._rebuild_host_buffers()
+        self._host_memory_released = False
+        self.clear()
+        logger.info(
+            "Restored %.2f GB host memory of HiCache pool %s.",
+            self._requested_host_memory_bytes() / 1e9,
+            self._host_pool_label,
+        )
 
     def get_mapping_lengths(self) -> list[int]:
         """Return the requested byte length of each host mapping.
