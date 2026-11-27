@@ -39,6 +39,7 @@ import sglang.multimodal_gen.runtime.models.dits.ernie_image as ernie_image
 import sglang.multimodal_gen.runtime.models.dits.flux as flux
 import sglang.multimodal_gen.runtime.models.dits.flux_2 as flux2
 import sglang.multimodal_gen.runtime.models.dits.glm_image as glm_image
+import sglang.multimodal_gen.runtime.models.dits.llada_image as llada_image
 import sglang.multimodal_gen.runtime.models.dits.longcat_image as longcat_image
 import sglang.multimodal_gen.runtime.models.dits.ltx_2 as ltx2_module
 import sglang.multimodal_gen.runtime.models.dits.qwen_image as qwen_image
@@ -77,6 +78,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     RMSNormNoWeight,
     apply_qk_norm,
+    apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
@@ -995,6 +997,113 @@ def test_longcat_qknorm_rope_is_bit_exact():
     assert torch.equal(k_out, k_ref)
     assert longcat_image._LONGCAT_QKNORM_ROPE.verified
     assert not longcat_image._LONGCAT_QKNORM_ROPE.disabled
+
+
+# -------------------------------------------------------------------------
+# LLaDA-Image -- strided QK RMSNorm+RoPE straight off the packed projection
+# -------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_llada_image_qk_rope_reads_the_packed_stride_bit_exactly():
+    """The fused branch must read the packed ``qkv.split`` views and reproduce
+    the contiguous reference bit for bit, leaving the projection untouched."""
+    heads, head_dim, seq = 30, 128, 512
+    torch.manual_seed(7)
+    packed = torch.randn(
+        1, seq, 3 * heads * head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    query, key, _ = (
+        view.unflatten(-1, (heads, head_dim))
+        for view in packed.split([heads * head_dim] * 3, dim=-1)
+    )
+    assert query.stride() == (
+        seq * 3 * heads * head_dim,
+        3 * heads * head_dim,
+        head_dim,
+        1,
+    )
+
+    q_norm = llada_image.LLaDAImageRMSNorm(head_dim, eps=1e-5).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    k_norm = llada_image.LLaDAImageRMSNorm(head_dim, eps=1e-5).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    # Production checkpoints are affine-free (unit weight); random weights make
+    # the comparison stricter than the shapes the model actually runs.
+    q_norm.weight.copy_(torch.randn_like(q_norm.weight))
+    k_norm.weight.copy_(torch.randn_like(k_norm.weight))
+
+    angles = torch.randn(seq, head_dim // 2, device="cuda")
+    cache = torch.cat((angles.cos(), angles.sin()), dim=-1).reshape(-1, head_dim)
+    cache = cache.contiguous()
+    positions = torch.arange(seq, device="cuda", dtype=torch.int64)
+
+    pristine = packed.clone()
+    reference = apply_qk_norm_with_optional_rope(
+        q=query.contiguous(),
+        k=key.contiguous(),
+        q_norm=q_norm,
+        k_norm=k_norm,
+        head_dim=head_dim,
+        cos_sin_cache=cache,
+        positions=positions,
+        is_neox=False,
+        allow_inplace=True,
+    )
+    fused = llada_image._llada_image_qk_rope(
+        query, key, q_norm, k_norm, head_dim, cache, positions
+    )
+
+    gate = llada_image._LLADA_IMAGE_QK_ROPE
+    sig = (query.device, tuple(query.shape), tuple(query.stride()), 1e-5)
+    assert not gate.disabled
+    assert sig in gate.verified_sigs, "the fused branch did not run for this layout"
+    for actual, expected in zip(fused, reference, strict=True):
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    assert torch.equal(packed, pristine)
+
+
+@torch.no_grad()
+def test_llada_image_qk_rope_keeps_a_contiguous_input_on_the_reference():
+    """A contiguous q already has the layout the in-place kernel wants; the
+    packed-stride branch must decline instead of launching a copy."""
+    heads, head_dim, seq = 30, 128, 64
+    torch.manual_seed(11)
+    query = torch.randn(1, seq, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    q_norm = llada_image.LLaDAImageRMSNorm(head_dim, eps=1e-5).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    k_norm = llada_image.LLaDAImageRMSNorm(head_dim, eps=1e-5).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    angles = torch.randn(seq, head_dim // 2, device="cuda")
+    cache = torch.cat((angles.cos(), angles.sin()), dim=-1).reshape(-1, head_dim)
+    cache = cache.contiguous()
+    positions = torch.arange(seq, device="cuda", dtype=torch.int64)
+
+    # The in-place fused kernel writes into a contiguous input, so the
+    # expectation has to be produced before the call under test runs.
+    expected = apply_qk_norm_with_optional_rope(
+        q=query.clone(),
+        k=key.clone(),
+        q_norm=q_norm,
+        k_norm=k_norm,
+        head_dim=head_dim,
+        cos_sin_cache=cache,
+        positions=positions,
+        is_neox=False,
+        allow_inplace=True,
+    )
+    got = llada_image._llada_image_qk_rope(
+        query, key, q_norm, k_norm, head_dim, cache, positions
+    )
+    sig = (query.device, tuple(query.shape), tuple(query.stride()), 1e-5)
+    assert sig not in llada_image._LLADA_IMAGE_QK_ROPE.verified_sigs
+    for actual, wanted in zip(got, expected, strict=True):
+        assert torch.equal(actual, wanted)
 
 
 # -------------------------------------------------------------------------
