@@ -418,7 +418,7 @@ def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
     runner = SimpleNamespace(
         device="cpu",
         token_to_kv_pool=routed(pool),
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token, row_width=64),
         model_config=SimpleNamespace(
             context_len=64,
             hf_config=SimpleNamespace(indexer_compress_ratio=COMPRESS_RATIO),
@@ -563,6 +563,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
         )
         indexer = SimpleNamespace(
             layer_id=0,
+            index_n_heads=1,
             project_qk=lambda hidden, rope_positions, **kwargs: (
                 hidden.reshape(-1, 1, 2),
                 hidden.reshape(-1, 1, 2),
@@ -753,7 +754,7 @@ def _make_qsa_runner_and_pool(num_reqs=4):
     runner = SimpleNamespace(
         device="cpu",
         token_to_kv_pool=routed(pool),
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token, row_width=64),
         model_config=SimpleNamespace(
             context_len=64,
             hf_config=SimpleNamespace(indexer_compress_ratio=COMPRESS_RATIO),
@@ -834,6 +835,7 @@ def test_qsa_extend_rope_matrix_uses_mrope_coordinates():
         seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int32),
         forward_mode=ForwardMode.EXTEND,
         extend_seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        extend_seq_lens_cpu=[num_tokens],
         extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
         positions=flat,
         mrope_positions=mrope,
@@ -1141,6 +1143,7 @@ def test_qsa_extend_metadata_carries_host_sequence_lengths():
         seq_lens_cpu=torch.tensor([8, 6], dtype=torch.int32),
         forward_mode=ForwardMode.EXTEND,
         extend_seq_lens=torch.tensor([4, 6], dtype=torch.int32),
+        extend_seq_lens_cpu=[4, 6],
         extend_prefix_lens=torch.tensor([4, 0], dtype=torch.int32),
         positions=torch.tensor([4, 5, 6, 7, 0, 1, 2, 3, 4, 5]),
         mrope_positions=None,
@@ -1151,6 +1154,70 @@ def test_qsa_extend_metadata_carries_host_sequence_lengths():
     backend.init_forward_metadata(forward_batch)
     indexer = backend.forward_metadata.indexer_metadata
     assert indexer.prefill_sequence_lengths_cpu == (8, 6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_qsa_extend_rows_take_the_host_lens_without_a_sync():
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        _extend_token_to_batch_idx,
+    )
+
+    lens = [4, 0, 7, 1]
+    device_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    want = _extend_token_to_batch_idx(device_lens, None, len(lens), "cuda")
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        got = _extend_token_to_batch_idx(device_lens, lens, len(lens), "cuda")
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert torch.equal(got, want)
+    assert got.tolist() == [0] * 4 + [2] * 7 + [3]
+    # Host lens that do not line up with the device tensor keep the device read.
+    short = _extend_token_to_batch_idx(device_lens, lens[:2], len(lens), "cuda")
+    assert torch.equal(short, want)
+
+
+def test_qsa_mtp_extend_capture_seeds_last_rows_without_a_sync():
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QSAMTPSharedSparseIndices,
+        QwenSparseAttnBackend,
+        _extend_token_to_batch_idx,
+    )
+
+    lens, pool_ids, layer_id = [4, 0, 7, 1], [5, 2, 9, 3], 3
+    rows = sum(lens)
+    topk = torch.arange(rows * 6, dtype=torch.int32, device="cuda").view(rows, 6)
+    seqlens = torch.arange(100, 100 + rows, dtype=torch.int32, device="cuda")
+    row_map = _extend_token_to_batch_idx(
+        torch.tensor(lens, device="cuda"), lens, len(lens), "cuda"
+    )
+    metadata = SimpleNamespace(
+        is_cuda_graph=False,
+        req_pool_indices=torch.tensor(pool_ids, device="cuda"),
+        get_token_to_batch_idx=lambda: row_map,
+        get_seqlens_expanded=lambda: seqlens,
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_draft_extend_v2=lambda: False)
+    )
+    state = QSAMTPSharedSparseIndices(
+        layer_ids=[layer_id], num_requests=16, token_topk=6, tail_width=2, device="cuda"
+    )
+    backend = SimpleNamespace(_mtp_shared_sparse_indices=state)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        QwenSparseAttnBackend.capture_mtp_sparse_indices(
+            backend, topk, forward_batch, layer_id, metadata=metadata
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    # Each request with rows is seeded from its last row; the empty one is untouched.
+    for pool_id, last in ((5, 3), (9, 10), (3, 11)):
+        assert torch.equal(state.indices[0, pool_id, :6], topk[last])
+        assert state.captured_len[0, pool_id].item() == 100 + last
+    assert state.indices[0, 2].eq(0).all() and state.captured_len[0, 2].item() == 1
 
 
 def test_qsa_row_ranges_do_not_cross_sequences():
