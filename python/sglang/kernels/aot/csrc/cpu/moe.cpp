@@ -1083,7 +1083,6 @@ at::Tensor fused_experts_cpu(
           A_tmp,
           Aq_tmp,
           As_tmp,
-          nullptr,
           C_tmp,
           dqB_tmp,
           hidden_states.data_ptr<scalar_t>(),

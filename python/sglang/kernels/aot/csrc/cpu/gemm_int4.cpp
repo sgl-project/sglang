@@ -6,185 +6,93 @@
 namespace {
 
 constexpr int64_t BLOCK_M = block_size_m();
-#define BLOCK_N block_size_n()
-
-template <bool sym_quant_act>
-struct ActDtype;
-template <>
-struct ActDtype<true> {
-  using type = int8_t;
-};
-template <>
-struct ActDtype<false> {
-  using type = uint8_t;
-};
+constexpr int64_t BLOCK_N = block_size_n();
+// Symmetrically quantized int8 activations are shifted by +128 into uint8 for u8s8 VNNI/AMX.
+constexpr int32_t kActZp = 128;
 
 #if defined(CPU_CAPABILITY_AVX512)
-struct alignas(32) m256i_wrapper {
-  __m256i data;
+struct m256i_pair {
+  __m256i low;
+  __m256i high;
 };
 
-inline std::array<m256i_wrapper, 2> load_zps_4vnni(const int8_t* __restrict__ zps) {
-  // broadcast 01234567 to
-  // 01234567012345670123456701234567
+inline m256i_pair load_zps_4vnni(const int8_t* __restrict__ zps) {
   __m256i vzps_low = _mm256_set1_epi64x(*reinterpret_cast<const long*>(zps));
   __m256i vzps_high = _mm256_set1_epi64x(*reinterpret_cast<const long*>(zps + 8));
-  // shuffle from
-  // 01234567012345670123456701234567
-  // to
-  // 00001111222233334444555566667777
+  // Broadcast each byte 4x for VNNI4: [0..7]x4 -> [0,0,0,0, ..., 7,7,7,7]
   __m256i shuffle_mask =
       _mm256_set_epi8(7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
-  vzps_low = _mm256_shuffle_epi8(vzps_low, shuffle_mask);
-  vzps_high = _mm256_shuffle_epi8(vzps_high, shuffle_mask);
-  m256i_wrapper vzps_low_wp, vzps_high_wp;
-  vzps_low_wp.data = vzps_low;
-  vzps_high_wp.data = vzps_high;
-  return {vzps_low_wp, vzps_high_wp};
+  return {_mm256_shuffle_epi8(vzps_low, shuffle_mask), _mm256_shuffle_epi8(vzps_high, shuffle_mask)};
 }
 
-inline std::array<m256i_wrapper, 2> load_uint4_as_int8(const uint8_t* __restrict__ qB) {
+inline m256i_pair load_uint4_as_int8(const uint8_t* __restrict__ qB) {
   __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qB));
   const __m256i low_mask = _mm256_set1_epi8(0x0f);
-  __m256i high = _mm256_srli_epi16(packed, 4);
-  high = _mm256_and_si256(high, low_mask);
   __m256i low = _mm256_and_si256(packed, low_mask);
-  m256i_wrapper low_wp, high_wp;
-  low_wp.data = low;
-  high_wp.data = high;
-  return {low_wp, high_wp};
+  __m256i high = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask);
+  return {low, high};
+}
+
+inline __m512i combine_m256i(m256i_pair pair) {
+  return _mm512_inserti64x4(_mm512_castsi256_si512(pair.low), pair.high, 1);
 }
 
 template <int64_t N, int64_t ldb>
 void _dequant_weight_zp_only(const uint8_t* __restrict__ B, int8_t* dqB, const int8_t* __restrict__ qzeros, int64_t K) {
-  // unpack weight int8 -> two int4
-  // subtract zero point
-  // B shape = [K, ldb] = [K, N / 2], actual shape = [K / 4, N / 2, 4]
-  // dqB shape = [K, N], actual shape = [K / 4, N, 4]
+  // B layout: [K / 4, N / 2, 4] (2 int4 lanes per byte), dqB layout: [K / 4, N, 4]
 #pragma GCC unroll 2
   for (int n = 0; n < N; n += 16) {
-    auto [zps_low_wp, zps_high_wp] = load_zps_4vnni(&qzeros[n]);
-    auto zps_low = zps_low_wp.data;
-    auto zps_high = zps_high_wp.data;
+    auto zps = load_zps_4vnni(&qzeros[n]);
     for (int k = 0; k < K; k += 4) {
-      auto [vb_low_wp, vb_high_wp] = load_uint4_as_int8(B + ldb * k + n / 2 * 4);
-      auto vb_low = vb_low_wp.data;
-      auto vb_high = vb_high_wp.data;
-      vb_high = _mm256_sub_epi8(vb_high, zps_high);
-      vb_low = _mm256_sub_epi8(vb_low, zps_low);
-      // store vb to B
-      _mm256_storeu_si256(reinterpret_cast<__m256i_u*>(dqB + N * k + n * 4), vb_low);
-      _mm256_storeu_si256(reinterpret_cast<__m256i_u*>(dqB + N * k + (n + 8) * 4), vb_high);
+      auto vb = load_uint4_as_int8(B + ldb * k + n / 2 * 4);
+      _mm256_storeu_si256(reinterpret_cast<__m256i_u*>(dqB + N * k + n * 4), _mm256_sub_epi8(vb.low, zps.low));
+      _mm256_storeu_si256(reinterpret_cast<__m256i_u*>(dqB + N * k + (n + 8) * 4), _mm256_sub_epi8(vb.high, zps.high));
     }
   }
 }
 
-template <bool accum, int64_t N, bool sym_quant_act>
-void _dequant_and_store(
+template <int64_t N>
+void _dequant_and_accum(
     float* __restrict__ output,
     const int32_t* __restrict__ input,
     const float* __restrict__ scale_a,
-    const int32_t* __restrict__ zp_a,
     const float* __restrict__ scale_b,
     const int32_t* __restrict__ comp_b,
     int M,
     int ldi,
-    int ldo,
-    int ldsa = 1) {
+    int ldo) {
+  static_assert(N % 16 == 0, "_dequant_and_accum requires N to be a multiple of 16");
+  const __m512i va_zp = _mm512_set1_epi32(kActZp);
   for (int m = 0; m < M; ++m) {
-    float a_scale = *(scale_a + m * ldsa);
-    __m512 va_scale = _mm512_set1_ps(a_scale);
-    int32_t a_zp;
-    __m512i va_zp;
-    if constexpr (!sym_quant_act) {
-      a_zp = *(zp_a + m * ldsa);
-      va_zp = _mm512_set1_epi32(a_zp);
-    }
-    int n = 0;
+    __m512 va_scale = _mm512_set1_ps(scale_a[m]);
 #pragma GCC unroll 2
-    for (; n < N; n += 16) {
+    for (int n = 0; n < N; n += 16) {
       __m512i vc = _mm512_loadu_si512(input + m * ldi + n);
-      if constexpr (!sym_quant_act) {
-        __m512i vb_comp = _mm512_loadu_si512(comp_b + n);
-        vc = _mm512_sub_epi32(vc, _mm512_mullo_epi32(vb_comp, va_zp));
-      }
-      __m512 vc_f = _mm512_cvtepi32_ps(vc);
-      __m512 vc_f_mul = _mm512_mul_ps(vc_f, va_scale);
-      __m512 vb_s = _mm512_loadu_ps(scale_b + n);
-      vc_f_mul = _mm512_mul_ps(vc_f_mul, vb_s);
-      if constexpr (accum) {
-        __m512 vo = _mm512_loadu_ps(output + m * ldo + n);
-        _mm512_storeu_ps(output + m * ldo + n, _mm512_add_ps(vo, vc_f_mul));
-      } else {
-        _mm512_storeu_ps(output + m * ldo + n, vc_f_mul);
-      }
-    }
-    for (; n < N; ++n) {
-      float dq_val;
-      if constexpr (sym_quant_act) {
-        dq_val = (float)input[m * ldi + n] * a_scale * scale_b[n];
-      } else {
-        dq_val = (float)(input[m * ldi + n] - a_zp * comp_b[n]) * a_scale * scale_b[n];
-      }
-      if constexpr (accum) {
-        output[m * ldo + n] += dq_val;
-      } else {
-        output[m * ldo + n] = dq_val;
-      }
+      __m512i vb_comp = _mm512_loadu_si512(comp_b + n);
+      vc = _mm512_sub_epi32(vc, _mm512_mullo_epi32(vb_comp, va_zp));
+      __m512 vc_f = _mm512_mul_ps(_mm512_cvtepi32_ps(vc), va_scale);
+      vc_f = _mm512_mul_ps(vc_f, _mm512_loadu_ps(scale_b + n));
+      __m512 vo = _mm512_loadu_ps(output + m * ldo + n);
+      _mm512_storeu_ps(output + m * ldo + n, _mm512_add_ps(vo, vc_f));
     }
   }
 }
 
-#else
-template <int64_t N, int64_t ldb>
-void _dequant_weight_zp_only(const uint8_t* B, int8_t* dqB, const int8_t* qzeros, int64_t K) {
-  // B shape = [K, N / 2]
-  // dqB shape = [K, N]
-  for (int k = 0; k < K; ++k) {
-    for (int n = 0; n < N / 2; ++n) {
-      int32_t b = (int32_t)B[k * ldb + n];
-      dqB[k * N + n * 2] = (b & 0xf) - qzeros[n];
-      dqB[k * N + n * 2 + 1] = (b >> 4) - qzeros[n];
-    }
-  }
-}
-#endif
-
-#if defined(CPU_CAPABILITY_AVX512)
-inline __m512i combine_m256i(__m256i a, __m256i b) {
-  __m512i c = _mm512_castsi256_si512(a);
-  return _mm512_inserti64x4(c, b, 1);
-}
-
-inline __m512i combine_m256i(std::array<m256i_wrapper, 2> two_256) {
-  return combine_m256i(two_256[0].data, two_256[1].data);
-}
-
-// negate elements in a according to b's sign
-static inline __m512i _mm512_sign_epi8(__m512i a, __m512i b) {
-  __m512i zero = _mm512_setzero_si512();
-  __mmask64 blt0 = _mm512_movepi8_mask(b);
-  return _mm512_mask_sub_epi8(a, blt0, zero, a);
-}
-
-template <int64_t M, int64_t N, int64_t ldb, bool sym_quant_act>
+template <int64_t M, int64_t N, int64_t ldb>
 void _dequant_gemm_accum_small_M(
     float* __restrict__ C,
     const uint8_t* A,
     const float* scales_a,
-    const int32_t* qzeros_a,
     const uint8_t* B,
     const float* scales_b,
     const int8_t* qzeros_b,
     int64_t K,
     int64_t lda,
     int64_t ldc) {
-  // if sym_quant_act is true, A pointer type is passed in as uint8_t* but actually int8_t*.
-
   constexpr int COLS = N / 16;
-  // Computing compensation is faster than loading it for small M
-  // because it's memory bound.
-  __m512i ones = _mm512_set1_epi8(1);  // used for computing compensation
+  // Computing compensation on the fly is faster than loading it for small M (memory-bound).
+  __m512i ones = _mm512_set1_epi8(1);
+  __m512i va_zp = _mm512_set1_epi32(kActZp);
   __m512i va;
   __m512i vb[COLS];
   __m512i vc[M * COLS];
@@ -192,44 +100,30 @@ void _dequant_gemm_accum_small_M(
   __m512i vzps[COLS];
   __m512i vcompensate[COLS];
 
-  // Load scales and zps
   Unroll<COLS>{}([&](auto i) {
     vscales[i] = _mm512_loadu_ps(scales_b + i * 16);
     vzps[i] = combine_m256i(load_zps_4vnni(qzeros_b + i * 16));
-    if constexpr (!sym_quant_act) {
-      vcompensate[i] = _mm512_setzero_epi32();
-    }
+    vcompensate[i] = _mm512_setzero_epi32();
   });
   Unroll<M * COLS>{}([&](auto i) { vc[i] = _mm512_setzero_epi32(); });
 
   auto compute = [&](auto i, int k) {
-    constexpr const int row = i / COLS;
-    constexpr const int col = i % COLS;
+    constexpr int row = i / COLS;
+    constexpr int col = i % COLS;
 
     if constexpr (col == 0) {
-      va = _mm512_set1_epi32(*(int32_t*)(A + row * lda + k));
+      va = _mm512_set1_epi32(*(const int32_t*)(A + row * lda + k));
     }
-
     if constexpr (row == 0) {
       int B_offset = k * ldb + col * 16 * 2;
-      vb[col] = combine_m256i(load_uint4_as_int8(B + B_offset));
-      vb[col] = _mm512_sub_epi8(vb[col], vzps[col]);
-      if constexpr (!sym_quant_act) {
-        vcompensate[col] = _mm512_dpbusd_epi32(vcompensate[col], ones, vb[col]);
-      }
+      vb[col] = _mm512_sub_epi8(combine_m256i(load_uint4_as_int8(B + B_offset)), vzps[col]);
+      vcompensate[col] = _mm512_dpbusd_epi32(vcompensate[col], ones, vb[col]);
       _mm_prefetch(B + B_offset + 128 * ldb, _MM_HINT_T0);
     }
-    if constexpr (sym_quant_act) {
-      auto vsb = _mm512_sign_epi8(vb[col], va);
-      auto vabsa = _mm512_sign_epi8(va, va);
-      vc[i] = _mm512_dpbusds_epi32(vc[i], vabsa, vsb);
-    } else {
-      vc[i] = _mm512_dpbusd_epi32(vc[i], va, vb[col]);
-    }
+    vc[i] = _mm512_dpbusd_epi32(vc[i], va, vb[col]);
   };
 
-  // Accumulate along k
-  constexpr const int unroll = 4;
+  constexpr int unroll = 4;
   int k = 0;
   for (; k < K / 4 / unroll; k++) {
     Unroll<unroll>{}([&](auto i) { Unroll<M * COLS>{}(compute, 4 * (k * unroll + i)); });
@@ -239,36 +133,26 @@ void _dequant_gemm_accum_small_M(
     Unroll<M * COLS>{}(compute, k);
   }
 
-  // Store to C
-  auto store = [&](auto i) {
-    constexpr const int row = i / COLS;
-    constexpr const int col = i % COLS;
-    // compute (qC - compensate * zp_a) * scale_a * scale_b
-    __m512 vc_float;
-    if constexpr (!sym_quant_act) {
-      vc[i] = _mm512_sub_epi32(vc[i], _mm512_mullo_epi32(vcompensate[col], _mm512_set1_epi32(*(qzeros_a + row))));
-    }
-    vc_float = _mm512_cvtepi32_ps(vc[i]);
-    vc_float = _mm512_mul_ps(vc_float, _mm512_set1_ps(*(scales_a + row)));
-
+  Unroll<M * COLS>{}([&](auto i) {
+    constexpr int row = i / COLS;
+    constexpr int col = i % COLS;
+    vc[i] = _mm512_sub_epi32(vc[i], _mm512_mullo_epi32(vcompensate[col], va_zp));
+    __m512 vc_float = _mm512_mul_ps(_mm512_cvtepi32_ps(vc[i]), _mm512_set1_ps(scales_a[row]));
     vc_float = _mm512_mul_ps(vc_float, vscales[col]);
-    auto vc_old = _mm512_loadu_ps(C + row * ldc + col * 16);
-    vc_float = _mm512_add_ps(vc_float, vc_old);
+    vc_float = _mm512_add_ps(vc_float, _mm512_loadu_ps(C + row * ldc + col * 16));
     _mm512_storeu_ps(C + row * ldc + col * 16, vc_float);
-  };
-  Unroll<M * COLS>{}(store);
+  });
 }
 
 #define CALL_DEQUANT_GEMM_ACCUM_SMALL_M(M) \
-  _dequant_gemm_accum_small_M<M, N, ldb, sym_quant_act>(C, A, scales_a, qzeros_a, B, scales_b, qzeros_b, K, lda, ldc);
+  _dequant_gemm_accum_small_M<M, N, ldb>(C, A, scales_a, B, scales_b, qzeros_b, K, lda, ldc);
 #endif
 
-template <int64_t N, int64_t ldb, bool sym_quant_act>
+template <int64_t N, int64_t ldb>
 void _dequant_gemm_accum(
     float* C,
     const uint8_t* A,
     const float* scales_a,
-    const int32_t* qzeros_a,
     const uint8_t* B,
     const float* scales_b,
     const int8_t* qzeros_b,
@@ -280,8 +164,6 @@ void _dequant_gemm_accum(
     int64_t ldc,
     bool use_brgemm,
     bool do_dequant) {
-  // Compute GEMM int8 * int8 -> int32
-  // dequant result to float by applying scales/qzeros
 #if defined(CPU_CAPABILITY_AVX512)
   if (!use_brgemm) {
     switch (M) {
@@ -306,120 +188,50 @@ void _dequant_gemm_accum(
   if (do_dequant) {
     _dequant_weight_zp_only<N, ldb>(B, dqB, qzeros_b, K);
   }
-  using Tin = typename ActDtype<sym_quant_act>::type;
-  Tin* A_ptr = (Tin*)A;
-  if (use_brgemm) {
-    int32_t C_i32[M * N];
-    at::native::cpublas::brgemm(
-        M, N, K, lda, N /*ldb*/, N /*ldc*/, false /* add_C */, A_ptr, dqB, C_i32, true /* is_vnni */);
-    _mm_prefetch(B + N * K / 2, _MM_HINT_T0);
-    _mm_prefetch(A + K, _MM_HINT_T0);
-    _dequant_and_store<true, N, sym_quant_act>(
-        C, C_i32, scales_a, qzeros_a, scales_b, compensation, M, N /*ldi*/, ldc, 1 /*ldsa*/);
-  } else
+  int32_t C_i32[M * N];
+  at::native::cpublas::brgemm(
+      M, N, K, lda, N /*ldb*/, N /*ldc*/, false /* add_C */, const_cast<uint8_t*>(A), dqB, C_i32, true /* is_vnni */);
+  _mm_prefetch(B + N * K / 2, _MM_HINT_T0);
+  _mm_prefetch(A + K, _MM_HINT_T0);
+  _dequant_and_accum<N>(C, C_i32, scales_a, scales_b, compensation, M, N /*ldi*/, ldc);
+#else
+  TORCH_CHECK(false, "tinygemm_kernel: scalar path not implemented!");
 #endif
-  {
-    TORCH_CHECK(false, "tinygemm_kernel: scalar path not implemented!");
-  }
 }
 
 template <int64_t N>
 inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
-  if (bias_ptr) {
-    for (int i = 0; i < m; ++i) {
-      int j = 0;
-#if defined(CPU_CAPABILITY_AVX512)
+  using Vec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = Vec::size();
+  static_assert(N % kVecSize == 0, "copy_bias requires N to be a multiple of Vectorized<float>::size()");
+  const bool has_bias = bias_ptr != nullptr;
+  const Vec zero_vec(0.f);
+  for (int64_t i = 0; i < m; ++i) {
 #pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 bias_vec = _mm512_loadu_ps(bias_ptr + j);
-        _mm512_storeu_ps(y_buf + i * N + j, bias_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        y_buf[i * N + j] = bias_ptr[j];
-      }
-    }
-  } else {  // initialize to zero
-    for (int i = 0; i < m; ++i) {
-      int j = 0;
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 zero_vec = _mm512_setzero_ps();
-        _mm512_storeu_ps(y_buf + i * N + j, zero_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        y_buf[i * N + j] = 0;
-      }
+    for (int64_t j = 0; j < N; j += kVecSize) {
+      Vec vec = has_bias ? Vec::loadu(bias_ptr + j) : zero_vec;
+      vec.store(y_buf + i * N + j);
     }
   }
 }
 
-template <typename out_dtype, int64_t N>
-inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_t n, */ int64_t lda) {
-  for (int i = 0; i < m; ++i) {
-    int j = 0;
-    if constexpr (std::is_same<out_dtype, float>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
-        _mm512_storeu_ps(c_ptr + i * lda + j, y_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        c_ptr[i * lda + j] = y_buf[i * N + j];
-      }
-    } else if constexpr (std::is_same<out_dtype, at::BFloat16>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
-        __m256i y_bf16_vec = at::vec::cvtfp32_bf16(y_vec);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c_ptr + i * lda + j), y_bf16_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        c_ptr[i * lda + j] = at::BFloat16(y_buf[i * N + j]);
-      }
-    } else if constexpr (std::is_same<out_dtype, at::Half>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
-        __m256i y_fp16_vec = at::vec::cvtfp32_fp16(y_vec);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c_ptr + i * lda + j), y_fp16_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        c_ptr[i * lda + j] = at::Half(y_buf[i * N + j]);
-      }
-    } else {
-      TORCH_CHECK(false, "Unsupported output dtype");
-    }
-  }
-}
-
-void fill_val_stub(int32_t* __restrict__ output, int32_t value, int64_t size) {
-  using iVec = at::vec::Vectorized<int32_t>;
-  constexpr int VecSize = iVec::size();
-  const iVec fill_val_vec = iVec(value);
-  int64_t d;
+template <typename scalar_t>
+inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
+  using Vec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
 #pragma GCC unroll 4
-  for (d = 0; d <= size - VecSize; d += VecSize) {
-    fill_val_vec.store(output + d);
-  }
-  for (; d < size; ++d) {
-    output[d] = value;
+  for (int64_t d = 0; d < size; d += Vec::size()) {
+    fVec x0 = fVec::loadu(input + d);
+    fVec x1 = fVec::loadu(input + d + fVec::size());
+    Vec res = convert_from_float_ext<scalar_t>(x0, x1);
+    res.store(out + d);
   }
 }
 
-template <typename act_dtype, typename out_dtype, bool sym_quant_act>
+template <typename out_dtype>
 void _da8w4_linear_impl(
-    act_dtype* __restrict__ input,
+    const uint8_t* __restrict__ input,
     const float* __restrict__ input_scales,
-    const int32_t* __restrict__ input_qzeros,
     const uint8_t* __restrict__ weight,
     const float* __restrict__ weight_scales,
     const int8_t* __restrict__ weight_qzeros,
@@ -431,7 +243,7 @@ void _da8w4_linear_impl(
     int64_t N,
     int64_t K,
     int64_t num_groups) {
-  // weight + compensation shape = [Nc, Kc, BLOCK_N * _block_k / 2 + BLOCK_N*sizeof(int32_t)]
+  // weight + compensation shape = [Nc, Kc, BLOCK_N * _block_k / 2 + BLOCK_N * sizeof(int32_t)]
   // scales/qzeros shape = [Nc, G, BLOCK_N]
   const bool use_brgemm = can_use_brgemm<int8_t>(M);
   const int64_t MB = div_up(M, BLOCK_M);
@@ -440,6 +252,7 @@ void _da8w4_linear_impl(
   const int64_t _block_k = get_4bit_block_k_size(group_size);
   const int64_t Kc = K / _block_k;
   const int64_t block_per_group = group_size / _block_k;
+  const int64_t block_stride = BLOCK_N * (_block_k / 2 + sizeof(int32_t));
   const bool cache_dqB = use_brgemm && (MB > 1);
   const int64_t cache_blocks_nb = get_cache_blocks<int8_t>(BLOCK_N * K);
   const int64_t dqB_size_per_thread = cache_dqB ? cache_blocks_nb * BLOCK_N * K : _block_k * BLOCK_N;
@@ -452,23 +265,18 @@ void _da8w4_linear_impl(
     loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t m_start = mb * BLOCK_M;
       int64_t m_size = std::min(M - m_start, BLOCK_M);
-      // copy bias to y_buf if bias is not None
-      auto bias_data = bias ? bias + nb * BLOCK_N : nullptr;
-      copy_bias<BLOCK_N>(bias_data, C_tmp, m_size);
+      copy_bias<BLOCK_N>(bias ? bias + nb * BLOCK_N : nullptr, C_tmp, m_size);
       const bool do_dequant = !cache_dqB || (mb == mb0);
       int8_t* dqB_nb = cache_dqB ? (dqB_thread + nb_offset * BLOCK_N * K) : dqB_thread;
       for (int kci = 0; kci < Kc; ++kci) {
-        int32_t* compensation_ptr =
-            sym_quant_act ? nullptr
-                          : (int32_t*)(void*)(weight + (nb * Kc + kci) * (BLOCK_N * (_block_k / 2 + sizeof(int32_t))) +
-                                              _block_k * BLOCK_N / 2) /*Bcomp*/;
+        const uint8_t* B_ptr = weight + (nb * Kc + kci) * block_stride;
+        const int32_t* compensation_ptr = reinterpret_cast<const int32_t*>(B_ptr + _block_k * BLOCK_N / 2);
         int8_t* dqB_tmp = cache_dqB ? (dqB_nb + kci * _block_k * BLOCK_N) : dqB_nb;
-        _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2, sym_quant_act>(
+        _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2>(
             /*C*/ C_tmp,
-            /*A*/ (uint8_t*)input + m_start * K + kci * _block_k,
+            /*A*/ input + m_start * K + kci * _block_k,
             /*scales_a*/ input_scales + m_start,
-            /*qzeros_a*/ input_qzeros + m_start,
-            /*B*/ weight + (nb * Kc + kci) * (BLOCK_N * (_block_k / 2 + sizeof(int32_t))),
+            /*B*/ B_ptr,
             /*scales_b*/ weight_scales + nb * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N,
             /*qzeros_b*/ weight_qzeros + nb * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N,
             /*Bcomp*/ compensation_ptr,
@@ -480,8 +288,9 @@ void _da8w4_linear_impl(
             /*use_brgemm*/ use_brgemm,
             /*do_dequant*/ do_dequant);
       }
-      // store y_buf to output with dtype conversion
-      store_out<out_dtype, BLOCK_N>(C_tmp, output + m_start * N + nb * BLOCK_N, m_size, N /*lda*/);
+      for (int64_t m = 0; m < m_size; ++m) {
+        copy_stub<out_dtype>(output + (m_start + m) * N + nb * BLOCK_N, C_tmp + m * BLOCK_N, BLOCK_N);
+      }
     });
 
     if (use_brgemm) {
@@ -583,97 +392,31 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_int4_weight_packed_with_c
   return std::make_tuple(std::move(blocked_weight), std::move(blocked_scales), std::move(blocked_qzeros));
 }
 
-std::tuple<at::Tensor, at::Tensor> unpack_4bit_to_32bit_signed(const at::Tensor& qweight, const at::Tensor& qzeros) {
+std::tuple<at::Tensor, at::Tensor> int4pack(at::Tensor qweight, at::Tensor qzeros, int64_t quant_method_4bit) {
   TORCH_CHECK(qweight.scalar_type() == at::kInt, "qweight must be int32");
   TORCH_CHECK(qzeros.scalar_type() == at::kInt, "qzeros must be int32");
-  const auto W0 = qweight.size(0);
-  const auto W1 = qweight.size(1);
-  const auto Z0 = qzeros.size(0);
-  const auto Z1 = qzeros.size(1);
-
-  // unpacked_weights: (W0 * 8, W1), int8
-  auto unpacked_weights = at::zeros({W0 * 8, W1}, at::TensorOptions().dtype(at::kChar));
-  // unpacked_zeros: (Z0, Z1 * 8), int8
-  auto unpacked_zeros = at::zeros({Z0, Z1 * 8}, at::TensorOptions().dtype(at::kChar));
-
-  const int32_t* qw_ptr = qweight.data_ptr<int32_t>();
-  const int32_t* qz_ptr = qzeros.data_ptr<int32_t>();
-  int8_t* uw_ptr = unpacked_weights.data_ptr<int8_t>();
-  int8_t* uz_ptr = unpacked_zeros.data_ptr<int8_t>();
-
-  // ---- unpack qweight ----
-  for (int64_t row = 0; row < W0 * 8; ++row) {
-    const int i = row & 7;         // row % 8
-    const int src_row = row >> 3;  // row // 8
-    const int shift = 4 * i;
-    for (int64_t col = 0; col < W1; ++col) {
-      int32_t v = qw_ptr[src_row * W1 + col];
-      uw_ptr[row * W1 + col] = static_cast<int8_t>((v >> shift) & 0xF);
-    }
-  }
-  // ---- unpack qzeros ----
-  for (int64_t col = 0; col < Z1 * 8; ++col) {
-    const int i = col & 7;
-    const int src_col = col >> 3;
-    const int shift = 4 * i;
-
-    for (int64_t row = 0; row < Z0; ++row) {
-      int32_t v = qz_ptr[row * Z1 + src_col];
-      uz_ptr[row * (Z1 * 8) + col] = static_cast<int8_t>((v >> shift) & 0xF);
-    }
-  }
-
-  return std::make_tuple(unpacked_weights, unpacked_zeros + 1);
-}
-
-std::tuple<at::Tensor, at::Tensor>
-autogptq_to_int4pack(const at::Tensor& qweight_tensor, const at::Tensor& qzeros_tensor) {
-  TORCH_CHECK(qweight_tensor.scalar_type() == at::kInt, "qweight_tensor must be int32");
-  TORCH_CHECK(qzeros_tensor.scalar_type() == at::kInt, "qzeros_tensor must be int32");
-  TORCH_CHECK(qweight_tensor.is_cpu(), "CPU only implementation");
-  if (qweight_tensor.dim() == 3) {
-    const int64_t B = qweight_tensor.size(0);
-    std::vector<at::Tensor> qweight_list;
-    std::vector<at::Tensor> qzeros_list;
-    qweight_list.reserve(B);
-    qzeros_list.reserve(B);
-    for (int64_t i = 0; i < B; ++i) {
-      auto outputs = unpack_4bit_to_32bit_signed(qweight_tensor[i], qzeros_tensor[i]);
-      at::Tensor unpacked_qweight = std::get<0>(outputs);
-      at::Tensor unpacked_qzeros = std::get<1>(outputs);
-      qweight_list.push_back(unpacked_qweight.transpose(0, 1).contiguous().to(at::kByte));
-      qzeros_list.push_back(unpacked_qzeros.contiguous().to(at::kByte));
-    }
-    return std::make_tuple(at::stack(qweight_list).detach(), at::stack(qzeros_list).detach());
-  }
-  auto outputs = unpack_4bit_to_32bit_signed(qweight_tensor, qzeros_tensor);
-  at::Tensor unpacked_qweight = std::get<0>(outputs);
-  at::Tensor unpacked_qzeros = std::get<1>(outputs);
-  at::Tensor return_qweight = unpacked_qweight.transpose(0, 1).contiguous().to(at::kByte);
-  at::Tensor return_qzeros = unpacked_qzeros.contiguous().to(at::kByte);
-  return std::make_tuple(return_qweight, return_qzeros);
-}
-
-std::tuple<at::Tensor, at::Tensor> int4pack(at::Tensor qweight, at::Tensor qzeros, int64_t quant_method_4bit) {
+  qweight = qweight.contiguous();
+  qzeros = qzeros.contiguous();
   if (quant_method_4bit == CPUQuantAlgo::AWQ) {
-    // autoawq unpacking
-    qweight = qweight.contiguous();
-    qzeros = qzeros.contiguous();
-    // bitshifts: [0, 4, 1, 5, 2, 6, 3, 7] * 4
     auto bitshifts = at::tensor({0, 4, 1, 5, 2, 6, 3, 7}, at::kInt) * 4;
-    auto qweight_unsq = qweight.unsqueeze(-1);  // [..., K, N/8, 1]
-    auto unpacked = (at::bitwise_right_shift(qweight_unsq, bitshifts) & 0xF).contiguous();
-    auto qweight_final = unpacked.flatten(-2).transpose(-1, -2).to(at::kByte).clone();
-    auto qzeros_unsq = qzeros.unsqueeze(-1);
-    auto qzeros_unpacked = (at::bitwise_right_shift(qzeros_unsq, bitshifts) & 0xF).contiguous();
-    auto qzeros_final = qzeros_unpacked.flatten(-2).to(at::kByte).clone();
+    auto qweight_final = (at::bitwise_right_shift(qweight.unsqueeze(-1), bitshifts) & 0xF)
+                             .flatten(-2)
+                             .transpose(-1, -2)
+                             .contiguous()
+                             .to(at::kByte);
+    auto qzeros_final =
+        (at::bitwise_right_shift(qzeros.unsqueeze(-1), bitshifts) & 0xF).flatten(-2).contiguous().to(at::kByte);
     return std::make_tuple(qweight_final, qzeros_final);
   } else if (quant_method_4bit == CPUQuantAlgo::GPTQ) {
-    // autogptq unpacking
-    auto outputs = autogptq_to_int4pack(qweight, qzeros);
-    at::Tensor unpacked_qweight = std::get<0>(outputs);
-    at::Tensor unpacked_qzeros = std::get<1>(outputs);
-    return std::make_tuple(unpacked_qweight, unpacked_qzeros);
+    auto bitshifts = at::arange(0, 32, 4, at::kInt);
+    auto qweight_final = (at::bitwise_right_shift(qweight.unsqueeze(-2), bitshifts.view({8, 1})) & 0xF)
+                             .flatten(-3, -2)
+                             .transpose(-1, -2)
+                             .contiguous()
+                             .to(at::kByte);
+    auto qzeros_final =
+        ((at::bitwise_right_shift(qzeros.unsqueeze(-1), bitshifts) & 0xF) + 1).flatten(-2).contiguous().to(at::kByte);
+    return std::make_tuple(qweight_final, qzeros_final);
   } else {
     TORCH_CHECK(false, "CPU int4 pack only support AWQ or GPTQ...");
   }
@@ -741,29 +484,20 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
   TORCH_CHECK(
       st == at::kBFloat16 || st == at::kHalf, "int4_scaled_mm_cpu_with_quant: expect A to be bfloat16 or half.");
 
-  constexpr bool sym_quant_act = false;  // TODO: add sym quant path
-  using Tin = typename ActDtype<sym_quant_act>::type;
-  int64_t act_buffer_size = /* act quant */ M_a * K_a +
-                            /* act scale */ M_a * sizeof(float) +
-                            /* act zp */ M_a * sizeof(int32_t);
+  int64_t act_buffer_size = /* act quant */ M_a * K_a + /* act scale */ M_a * sizeof(float);
   auto act_buffer = at::empty({act_buffer_size}, input.options().dtype(at::kByte));
-  // asym path, activation quants into uint8_t
   auto Aq_data = act_buffer.data_ptr<uint8_t>();
   auto As_data = reinterpret_cast<float*>(Aq_data + M_a * K_a);
-  auto Azp_data = reinterpret_cast<int32_t*>(As_data + M_a);
-  fill_val_stub(Azp_data, 128, M_a);  // sym_a s8s8 is unified to u8s8 with compensation (128)
 
   auto out_sizes = input.sizes().vec();
   int64_t N = weight_scales.size(0) * weight_scales.size(-1);
   out_sizes.back() = N;
   auto output = at::empty(out_sizes, input.options());
-  // weight + compensation shape = [Nc, Kc, BLOCK_N * _block_k / 2 + BLOCK_N*sizeof(int32_t)]
-  // scales/qzeros shape = [Nc, G, BLOCK_N]
+
   int64_t Nc = weight.size(0);
   int64_t Kc = weight.size(1);
   int64_t _block_k = K_a / Kc;
   TORCH_CHECK(N == Nc * BLOCK_N, "DA8W4: weight and input shapes mismatch");
-  // scales/qzeros shape = [Nc, G, BLOCK_N]
   int64_t num_groups = weight_scales.size(1);
 
   const uint8_t* b_ptr = weight.data_ptr<uint8_t>();
@@ -777,54 +511,36 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
   const int64_t dqB_size_per_thread =
       cache_dqB ? int64_t(get_cache_blocks<int8_t>(BLOCK_N * K_a)) * BLOCK_N * K_a : _block_k * BLOCK_N;
   int64_t temp_buffer_size = /* output temp */ num_threads * BLOCK_M * BLOCK_N * sizeof(float) +
-                             /*  weight dequant temp */ num_threads * dqB_size_per_thread;
+                             /* weight dequant temp */ num_threads * dqB_size_per_thread;
   auto c_temp_buffer = at::empty({temp_buffer_size}, input.options().dtype(at::kChar));
-  float* c_temp_ptr = (float*)((void*)(c_temp_buffer.data_ptr<int8_t>()));
-  int8_t* dqB_temp_ptr = (int8_t*)((void*)(c_temp_ptr + num_threads * BLOCK_M * BLOCK_N));
+  float* c_temp_ptr = reinterpret_cast<float*>(c_temp_buffer.data_ptr<int8_t>());
+  int8_t* dqB_temp_ptr = reinterpret_cast<int8_t*>(c_temp_ptr + num_threads * BLOCK_M * BLOCK_N);
 
-#define LAUNCH_DA8W4_LINEAR_WITH_QUANT_IMPL(sym_quant_act)                                                 \
-  AT_DISPATCH_FLOATING_TYPES_AND2(                                                                         \
-      at::ScalarType::BFloat16, at::ScalarType::Half, output_dtype, "int4_scaled_mm_cpu_with_quant", [&] { \
-        const scalar_t* __restrict__ A_data = input.data_ptr<scalar_t>();                                  \
-        scalar_t* __restrict__ c_ptr = output.data_ptr<scalar_t>();                                        \
-        at::parallel_for(0, M_a, 0, [&](int64_t begin, int64_t end) {                                      \
-          for (int64_t m = begin; m < end; ++m) {                                                          \
-            quantize_row_int8<scalar_t>(Aq_data + m * K_a, As_data[m], A_data + m * lda, K_a);             \
-          }                                                                                                \
-        });                                                                                                \
-        _da8w4_linear_impl<Tin, scalar_t, sym_quant_act>(                                                  \
-            Aq_data,                                                                                       \
-            As_data,                                                                                       \
-            Azp_data,                                                                                      \
-            b_ptr,                                                                                         \
-            b_scales_ptr,                                                                                  \
-            b_qzeros_ptr,                                                                                  \
-            bias_ptr,                                                                                      \
-            c_ptr,                                                                                         \
-            c_temp_ptr,                                                                                    \
-            dqB_temp_ptr,                                                                                  \
-            M_a,                                                                                           \
-            N,                                                                                             \
-            K_a,                                                                                           \
-            num_groups);                                                                                   \
-      });
-
-  LAUNCH_DA8W4_LINEAR_WITH_QUANT_IMPL(sym_quant_act);
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(output_dtype, "int4_scaled_mm_cpu_with_quant", [&] {
+    const scalar_t* __restrict__ A_data = input.data_ptr<scalar_t>();
+    scalar_t* __restrict__ c_ptr = output.data_ptr<scalar_t>();
+    at::parallel_for(0, M_a, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t m = begin; m < end; ++m) {
+        quantize_row_int8<scalar_t>(Aq_data + m * K_a, As_data[m], A_data + m * lda, K_a);
+      }
+    });
+    _da8w4_linear_impl<scalar_t>(
+        Aq_data,
+        As_data,
+        b_ptr,
+        b_scales_ptr,
+        b_qzeros_ptr,
+        bias_ptr,
+        c_ptr,
+        c_temp_ptr,
+        dqB_temp_ptr,
+        M_a,
+        N,
+        K_a,
+        num_groups);
+  });
 
   return output;
-}
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-// no remainder
-#pragma GCC unroll 4
-  for (int64_t d = 0; d < size; d += Vec::size()) {
-    fVec x0 = fVec::loadu(input + d);
-    fVec x1 = fVec::loadu(input + d + fVec::size());
-    Vec res = convert_from_float_ext<scalar_t>(x0, x1);
-    res.store(out + d);
-  }
 }
 
 template <typename scalar_t>
@@ -833,7 +549,6 @@ void tinygemm_kernel(
     float* C_temp,
     const uint8_t* A,
     const float* scales_a,
-    const int32_t* qzeros_a,
     const uint8_t* B,
     const float* scales_b,
     const int8_t* qzeros_b,
@@ -847,25 +562,9 @@ void tinygemm_kernel(
     bool store_out,
     bool use_brgemm,
     bool do_dequant) {
-  // TODO: add sym quant act, now only asym
-  _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2, false>(
-      C_temp,
-      A,
-      scales_a,
-      qzeros_a,
-      B,
-      scales_b,
-      qzeros_b,
-      compensation,
-      dqB_tmp,
-      M,
-      K,
-      lda,
-      ldc_f,
-      use_brgemm,
-      do_dequant);
+  _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2>(
+      C_temp, A, scales_a, B, scales_b, qzeros_b, compensation, dqB_tmp, M, K, lda, ldc_f, use_brgemm, do_dequant);
   if (store_out) {
-    // copy from Ctmp to C
     for (int64_t m = 0; m < M; ++m) {
       copy_stub<scalar_t>(C + m * ldc_s, C_temp + m * ldc_f, BLOCK_N);
     }
@@ -878,7 +577,6 @@ void tinygemm_kernel(
       float* C_temp,                        \
       const uint8_t* A,                     \
       const float* scales_a,                \
-      const int32_t* qzeros_a,              \
       const uint8_t* B,                     \
       const float* scales_b,                \
       const int8_t* qzeros_b,               \
