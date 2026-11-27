@@ -649,14 +649,29 @@ class DSANPUIndexerMixin:
                 manager = backend.sparse_kv_manager
                 metadata = backend.forward_metadata
                 layer_index = layer_id - manager.start_layer
+                scales = {}
+                if manager.budget.packed_c8:
+                    query, query_scale = _quantize_npu_indexer_activation(
+                        query,
+                        pool.indexer_hadamard_128,
+                        pool.index_k_store_dtype,
+                        pool.index_k_scale_dtype,
+                    )
+                    scales = {
+                        "query_scale": query_scale,
+                        "key_scale": pool.get_index_k_scale_buffer(layer_id),
+                    }
+                else:
+                    query = q.view(-1, self.n_heads, self.head_dim)
                 plan = manager.lim_adapter.select(
-                    query=q.view(-1, self.n_heads, self.head_dim),
+                    query=query,
                     weights=weights,
                     key=past_key_states,
                     block_table=block_table,
                     forward_batch=forward_batch,
                     slot_pool=manager.resident_pool.device_slot_map[layer_index],
                     reuse_metadata=metadata.sparse_kv_lim_plan is not None,
+                    **scales,
                 )
                 manager.prepare_copy_sfa_plan(plan)
                 metadata.sparse_kv_lim_plan = plan

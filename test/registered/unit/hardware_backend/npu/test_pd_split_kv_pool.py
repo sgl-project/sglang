@@ -3,7 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -211,6 +211,49 @@ class TestPDSplitKVPool(CustomTestCase):
         self.assertEqual(page_bytes, [131072] * 2 + [16384] * 2 + [512] * 2)
         self.assertEqual(prefill.get_kv_layer_ids(), [4, 5] * 3)
         self.assertEqual(decode.get_kv_layer_ids(), prefill.get_kv_layer_ids())
+
+    def test_packed_move_and_retract_preserve_payload_and_local_scales(self):
+        pool = _make_pool()
+        pool.dsa_kv_cache_store_c8 = True
+        pool.size = 4
+        pool.indexer_layer_ids = (5,)
+        pool.indexer_layer_id_to_slot = {5: 0}
+        key = torch.arange(8, dtype=torch.uint8).reshape(1, 1, 4, 1, 2)
+        scale = torch.arange(4, dtype=torch.float32).reshape(1, 1, 4, 1)
+        pool.index_k_buffer = key.view(torch.float8_e4m3fn)
+        pool.index_k_scale_buffer = scale
+        payloads = [
+            torch.arange(4 * 656, dtype=torch.int8).reshape(1, 4, 1, 656) + layer
+            for layer in range(2)
+        ]
+
+        def copy_rows(sources, destinations, src, dst, valid):
+            (source,), (destination,) = sources, destinations
+            destination.reshape(-1, 656)[dst[valid]] = source.reshape(-1, 656)[
+                src[valid]
+            ]
+
+        pool.pd_host_pool = SimpleNamespace(
+            rank=0, buffers=(payloads,), copy_rows=copy_rows, publish=Mock()
+        )
+        pool.invalidate_packed_request = Mock()
+        source, target = torch.tensor([0, 1, 2]), torch.tensor([1, 2, 3])
+        state = [p.view(4, -1) for p in (*payloads, key, scale)]
+        original = [s.clone() for s in state]
+        with patch.object(
+            torch, "npu", SimpleNamespace(synchronize=Mock()), create=True
+        ):
+            saved = pool.get_cpu_copy(source)
+            self.assertEqual([len(chunks[0]) for chunks in saved], [1, 3])
+            pool.move_kv_cache(target, source)
+            for actual, before in zip(state, original, strict=True):
+                torch.testing.assert_close(actual[target], before[source])
+                actual.zero_()
+            pool.load_cpu_copy(saved, source, req_pool_index=7)
+            for actual, before in zip(state, original, strict=True):
+                torch.testing.assert_close(actual[source], before[source])
+        pool.invalidate_packed_request.assert_called_once_with(7)
+        self.assertEqual(pool.pd_host_pool.publish.call_count, 2)
 
     def test_host_group_partitions_by_shared_memory(self):
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (

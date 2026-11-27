@@ -1166,10 +1166,23 @@ class ModelRunner:
                 FusedSparseKVCacheManager,
             )
 
-            self.fused_sparse_kv_manager = FusedSparseKVCacheManager(
-                self.req_to_token_pool, sparse_topk, index_k_pool=self.token_to_kv_pool
+            pool = self.token_to_kv_pool
+            manager_type = FusedSparseKVCacheManager
+            if pool.sparse_kv_budget_plan.packed_c8:
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_manager import (
+                    C8SparseKVCacheManager,
+                )
+
+                manager_type = C8SparseKVCacheManager
+            manager = manager_type(
+                self.req_to_token_pool, sparse_topk, index_k_pool=pool
             )
-            self.token_to_kv_pool.pd_host_pool = self.fused_sparse_kv_manager.host_pool
+            pool.pd_host_pool = manager.host_pool
+            if pool.sparse_kv_budget_plan.packed_c8:
+                pool.invalidate_packed_request = (
+                    manager.resident_pool.invalidate_request
+                )
+            self.fused_sparse_kv_manager = manager
         return self.fused_sparse_kv_manager
 
     def init_attention_backends(self):
