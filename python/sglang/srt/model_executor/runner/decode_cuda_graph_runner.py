@@ -98,12 +98,13 @@ from sglang.srt.model_executor.runner.early_verify_metadata import (
     VerifyInputSources,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    flashinfer_tactics_cache_for_persistence,
     maybe_flashinfer_autotune_speculative_draft,
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
-    BreakableCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
+    BaseBreakableGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.capture_profile import (
     CaptureProfileOptions,
@@ -134,6 +135,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import UOCRDecod
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
 from sglang.srt.utils import empty_context, get_available_gpu_memory
 from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -352,7 +354,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
-        self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
         # True if the DSA or MLA prefill-CP flavor is active. These flavors
@@ -890,8 +891,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return not draft_uses_compressed_kv_attention()
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
-        # [Compact] 图与 padding。请求槽容量独立于每轮真实请求数和有效 token 数。
-        # 例 num_tokens=12、max_bs=8 时返回 8 个槽，raw_bs=3 时有 5 个虚拟槽。
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return num_tokens // self.captured_req_width
         return min(num_tokens, self.max_bs)
@@ -923,9 +922,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return layout
 
     def _stage_ragged_verify_layout(self, ragged_layout, graph_size_key: int) -> None:
-        # [Compact] 图与 padding。每次回放把真实请求边界写入图捕获时绑定的缓冲区。
-        # 例图容量 12、8 个槽。verify_lens=[3, 4, 5] 补为 [3, 4, 5, 0, 0, 0, 0, 0]，
-        # qo_indptr 从 [0, 3, 7, 12] 补为 [0, 3, 7, 12, 12, 12, 12, 12, 12]。
         # Without this refresh every replay reuses the capture-time synthetic
         # verify_lens / qo_indptr and mis-slices the packed q rows.
         cap_layout = self._captured_ragged_layouts.get(graph_size_key)
@@ -1234,6 +1230,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_hidden_mode,
             spec_info,
         )
+        self._capture_custom_mask = (
+            spec_info.custom_mask if spec_info is not None else None
+        )
 
         if self.model_runner.lora_manager is not None:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
@@ -1310,7 +1309,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
-        with self.model_context():
+        # Foundry: SAVE archives the graphs this loop captures, LOAD restores them.
+        with (
+            self.model_context(),
+            get_foundry_adapter().capture_scope(
+                phase="decode",
+                model=self.model_runner.model,
+                # Read only when active: a test may drive capture() on a stand-in.
+                kind=self._foundry_graph_kind()
+                if get_foundry_adapter().enabled
+                else None,
+                flashinfer_tactics=flashinfer_tactics_cache_for_persistence(
+                    self.model_runner
+                ),
+            ),
+        ):
             self._capture()
 
     def _capture_profile_options(self) -> CaptureProfileOptions:
@@ -1322,6 +1335,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             per_shape=per_shape,
             get_trace_tag=lambda: getattr(self, "_profile_trace_tag", None),
         )
+
+    def _foundry_graph_kind(self) -> str:
+        # Names this runner's graph set in Foundry's archive, EAGLE subclasses included:
+        # target_decode, target_verify, draft_decode, draft_extend, draft_verify.
+        role = "draft" if self.model_runner.is_draft_worker else "target"
+        mode = self.capture_forward_mode
+        if mode.is_target_verify():
+            return f"{role}_verify"
+        if mode.is_draft_extend_v2():
+            return f"{role}_extend"
+        return f"{role}_{mode.name.lower()}"
 
     def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
@@ -1448,7 +1472,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if get_exec().graph.debug_cuda_graph:
-            assert isinstance(self.backend, BreakableCudaGraphBackend), (
+            assert isinstance(self.backend, BaseBreakableGraphBackend), (
                 "Breakable CUDA graph is required for --debug-cuda-graph"
             )
 
@@ -1585,13 +1609,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if buf is not None and _dp_tp_moe_masks_pad_rows():
             buf.fill_(raw_num_token)
 
-    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
-        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
-            raise RuntimeError(
-                "The runtime hidden-state mode exceeds the fixed CUDA graph "
-                f"capture mode ({self.capture_hidden_mode.name})."
-            )
-
     def load_batch(
         self,
         forward_batch: ForwardBatch,
@@ -1689,10 +1706,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # capture_num_tokens (same source), and verify_layout_grid's
             # [total] escape branches only fire with ragged_verify_mode off,
             # where this branch is unreachable.
-            # [Compact] 图与 padding。更小的 graph_num_tokens 才会缩小定长 forward。
-            # ACLGraph 是昇腾 NPU 的图捕获和回放机制。每轮装载新数据后复用已捕获的算子任务。
-            # 例 raw_bs=3、verify_lens=[3, 4, 5]。选 12 行图时 input_ids [12]；
-            # 若选 24 行图则 input_ids [24]，其中 12 行是真实输入。
             raw_num_token = graph_size_key = ragged_layout.graph_num_tokens
             bs = self._ragged_capture_slots(graph_size_key)
             assert bs >= raw_bs, (
@@ -1761,7 +1774,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and forward_batch.forward_mode.is_idle()
             and forward_batch.spec_info is not None
         ):
-            forward_batch.spec_info.custom_mask = buffers.custom_mask
+            # Idle replay uses the same mask mode as capture.
+            forward_batch.spec_info.custom_mask = self._capture_custom_mask
 
         self._init_replay_attn_metadata(
             forward_batch,

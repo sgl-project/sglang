@@ -655,7 +655,7 @@ def capture_prefill_graph(
             context_length,
             model_runner.req_to_token_pool.size,
         )
-        return eager_runner
+        return result(eager_runner)
 
     # Collect attention layers and moe layers from the model. Keep a VLM
     # wrapper that exposes ``language_model`` unchanged: assigning it to
@@ -707,12 +707,20 @@ def capture_prefill_graph(
             end_layer=model_runner.layer_info.end_layer,
         )
     )
+    # A decoder may own fewer attention layers than the runner's layer range,
+    # e.g. looped passes that share KV cache layers but keep per-visit states.
+    attention_start_layer = getattr(
+        layer_model, "start_layer", model_runner.layer_info.start_layer
+    )
+    attention_end_layer = getattr(
+        layer_model, "end_layer", model_runner.layer_info.end_layer
+    )
     if not supports_hybrid_graph and not has_standard_gqa_for_all_local_layers(
         attention_layer_count=sum(
             layer is not None for layer in model_runner.attention_layers
         ),
-        start_layer=model_runner.layer_info.start_layer,
-        end_layer=model_runner.layer_info.end_layer,
+        start_layer=attention_start_layer,
+        end_layer=attention_end_layer,
     ):
         # TODO(yuwei): support Non-Standard GQA
         log_info_on_rank0(
@@ -747,6 +755,12 @@ def capture_decode_graph(
     *, model_runner: ModelRunner, prefill_runner: Optional[BaseRunner] = None
 ) -> GraphCapture:
     """Capture device graphs."""
+    if get_exec().moe.enable_paged_experts and not model_runner.is_draft_worker:
+        from sglang.srt.layers.moe.paged_experts.precopy import install
+
+        # The paged executors are final (sizing ran with the memory pool): link the
+        # pre-copies before any decode capture.
+        install(model_runner.model)
     if model_runner.is_draft_worker:
         memory_phase = "draft_decode"
     elif model_runner.spec_algorithm.is_speculative():
@@ -810,7 +824,6 @@ def capture_decode_graph(
         {
             "cuda": "CUDA graph",
             "musa": "CUDA graph",
-            "cpu": "CPU graph",
             "npu": "NPU graph",
             "xpu": "XPU graph",
         },
@@ -839,7 +852,6 @@ def capture_decode_graph(
         graph_runners = defaultdict(
             model_runner._decode_cuda_graph_runner_cls,
             {
-                "cpu": CPUGraphRunner,
                 "xpu": XPUGraphRunner,
             },
         )

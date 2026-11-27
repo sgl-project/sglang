@@ -21,7 +21,6 @@ from sglang.srt.layers.quantization.utils import (
     resolve_dynamic_fused_shards,
 )
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
     GPTQAscendLinearScheme,
@@ -245,6 +244,7 @@ class GPTQConfig(_GPTQCheckpointMixin, QuantizationConfig):
         true_sequential: bool = False,
         static_groups: bool = False,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        is_sym: bool = False,
     ) -> None:
         # GPTQModel use `dynamic` config property to allow per module
         # quantization config so each module can be individually optimized.
@@ -285,6 +285,7 @@ class GPTQConfig(_GPTQCheckpointMixin, QuantizationConfig):
         self.checkpoint_format = checkpoint_format
         self.true_sequential = true_sequential
         self.static_groups = static_groups
+        self.is_sym = is_sym
         if self.weight_bits not in [2, 3, 4, 8]:
             raise ValueError(
                 "Currently, only 2/3/4/8-bit weight quantization is "
@@ -354,6 +355,7 @@ class GPTQConfig(_GPTQCheckpointMixin, QuantizationConfig):
             true_sequential,
             static_groups,
             packed_modules_mapping=packed_modules_mapping,
+            is_sym=cls.get_from_keys_or(config, ["sym"], default=False),
         )
 
     def _get_scheme_linear_quant_method(
@@ -892,12 +894,3 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         return layer.scheme.apply_weights(layer, dispatch_output)
-
-
-# Register fake implementations for torch.compile support. The decorator is a
-# no-op when the custom op is unavailable on the current platform.
-@register_fake_if_exists("sgl_kernel::gptq_marlin_repack")
-def _(b_q_weight, perm, size_k, size_n, num_bits):
-    return b_q_weight.new_empty(
-        (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
-    )

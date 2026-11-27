@@ -37,10 +37,11 @@ from sglang.srt.layers.attention.flashattention_backend import (
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-amd")
 
 _DEV = "cuda"
 _NUM_DRAFT = 4
@@ -128,9 +129,9 @@ def _backend(runner_ids, req_to_token, page_size):
     b = FlashAttentionBackend.__new__(FlashAttentionBackend)
     b.runner_ids = runner_ids
     b.req_to_token = req_to_token
-    b.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+    b.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, row_width=_MAX_CTX)
+    b.max_kv_len = _MAX_CTX
     b.page_size = page_size
-    b.max_context_len = _MAX_CTX
     b.max_num_pages = -(-_MAX_CTX // page_size)
     b.topk = 1
     b.speculative_num_draft_tokens = _NUM_DRAFT

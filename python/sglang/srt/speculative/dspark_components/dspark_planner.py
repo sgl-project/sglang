@@ -25,7 +25,6 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -253,7 +252,6 @@ class DSparkVerifyPlanner:
         return self._budget_planner.take_last_decision()
 
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
-        # [Compact] 例 mode=compact 且 layout.verify_lens=[3, 4, 5] 时返回 True。
         return (
             self._ragged_verify_mode is RaggedVerifyMode.COMPACT and layout is not None
         )
@@ -281,8 +279,6 @@ class DSparkVerifyPlanner:
                 batch.batch_size() * self.verify_num_draft_tokens
             )
             return
-        # [Compact] 调度开销。重叠调度在这里读取已有的 confidence 并计算预算。
-        # 例 confidence [3, 5] 得到额外预算 9，加上 3 个 anchor，计划验证 12 行。
         resolved = future_map.resolve_confidence_cpu(batch)
         draft_input.verify_token_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
@@ -310,8 +306,6 @@ class DSparkVerifyPlanner:
         gathered = torch.empty(
             (torch.distributed.get_world_size(group=cpu_group),), dtype=torch.int64
         )
-        # [Compact] 调度开销。DP 选档先在 CPU 交换预算，再取各 rank 的最大值。
-        # 例本 rank 输入 [12]，DP8 可得到 [12, 11, 10, 9, 12, 10, 11, 8]，最大为 12。
         all_gather_single(gathered, local_tensor, group=cpu_group)
         batch.global_spec_verify_tier_num_tokens = gathered.tolist()
 
@@ -400,8 +394,6 @@ class DSparkVerifyPlanner:
     ) -> Optional[int]:
         """Per-step verify-token budget: under overlap it was precomputed into
         the draft input by prepare_verify_budget; otherwise compute it now."""
-        # [Compact] 示例的返回值是整数 9。它控制 3 个请求的额外草稿验证行，
-        # 每请求保留的 anchor 在计算 verify_lens 时另加。无预算时返回 None。
         if not self.schedules_verify_budget or confidence is None:
             return None
         if not get_schedule().disable_overlap_schedule:
@@ -456,9 +448,6 @@ class DSparkVerifyPlanner:
         global_num_reqs: Optional[int] = None,
         dp_tier_num_tokens: Optional[int] = None,
     ) -> Optional[RaggedVerifyLayout]:
-        # [Compact] Static 在外层入口返回。动态长度在下方按预算计算。
-        # Static 的 layout=None。Compact 示例返回 verify_lens=[3, 4, 5]，
-        # extend_start_loc=[0, 3, 7]、qo_indptr_device=[0, 3, 7, 12]。
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
         num_reqs = int(req_pool_indices.shape[0])
@@ -514,8 +503,6 @@ class DSparkVerifyPlanner:
                 )
             return None
         bs = int(verify_lens.shape[0])
-        # [Compact] 例 bs=3、budget=9、DP 最大计划行数=12。
-        # tier 返回 graph_num_tokens=12，并记录该档位是否超出抓图范围。
         tier = self._resolve_verify_tier(
             num_reqs=bs,
             global_num_reqs=global_num_reqs,
@@ -526,8 +513,6 @@ class DSparkVerifyPlanner:
             return None
         graph_num_tokens_floor = tier.graph_num_tokens_floor
         if tier.graph_num_tokens is not None:
-            # [Compact] 输入设备 verify_lens [3] 和图容量 12，输出 layout 的 Q 偏移 [4]。
-            # 此构造路径的 verify_lens_cpu 和 total_verify_tokens 都是 None。
             return RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=verify_lens, graph_num_tokens=tier.graph_num_tokens
             )
@@ -619,9 +604,6 @@ class DSparkVerifyPlanner:
             tier_tokens_hint=tier_num_tokens,
         )
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
-        # [Compact] 图与 padding。预算向上取档，选中的档位决定回放的 token 行数。
-        # 例 DP 最大计划行数 12，档位 [6, 12, 24, 48]，得到 graph_num_tokens=12。
-        # 若 DP 最大值为 13，同样的本地 12 行需补齐到 24 行图。
         graph_num_tokens = (
             round_up_grid(graph_num_tokens_floor, capture_num_tokens)
             if not exceeds_captured_grid
@@ -648,9 +630,6 @@ class DSparkVerifyPlanner:
     ) -> Optional[torch.Tensor]:
         if self._budget_planner is None or confidence is None or budget is None:
             return None
-        # [Compact] 调度开销。Top-K 将额外预算分给各请求，返回含 anchor 的验证长度。
-        # 例 confidence [3, 5] 和预算 9 可分成 [2, 3, 4] 个额外行，
-        # 加上每请求 1 行 anchor，输出 [3, 4, 5]，张量形状为 [3]。
         verify_lens = ScheduleVerifyLensTopk.execute(
             confidence=confidence,
             budget=budget,
@@ -930,29 +909,11 @@ def alloc_verify_window(
     if positions_2d is None:
         positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
     verify_cache_loc = plan.write_virtual
-    # [Decode] 例 prefix_lens=[100, 200, 300]、bs=3、verify_w=6。
-    # positions_2d [3, 6] 的三行分别从 100、200、300 开始。虚拟 KV 槽为 [18]，
-    # 二维视图为 [3, 6]。IterationIds 持有请求槽、前缀、写入窗口和池址映射。
     return VerifyWindow(
         positions_2d=positions_2d,
         verify_cache_loc=verify_cache_loc,
         verify_cache_loc_2d=verify_cache_loc.view(bs, verify_w),
         iteration_ids=plan,
-    )
-
-
-def apply_logits_adjustments_strided(
-    *,
-    next_token_logits: torch.Tensor,
-    sampling_info,
-    verify_num_draft_tokens: int,
-) -> None:
-    if sampling_info is None:
-        return
-    apply_dflash_verify_logits_adjustments(
-        next_token_logits=next_token_logits,
-        sampling_info=sampling_info,
-        draft_token_num=verify_num_draft_tokens,
     )
 
 
@@ -990,8 +951,6 @@ def compute_verify_token_budget(
     sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
     cfg: DSparkScheduleConfig,
 ) -> VerifyBudgetDecision:
-    # [Compact] 输入历史前缀接受概率 [3, 5] 和 SPS 表。例最优点的 budget=9，
-    # 返回的决策还可带预测的 step 秒数和输出速度。本轮 confidence 另用于分配这 9 行。
     num_requests = history_survival_probs.shape[0]
     max_len = cfg.resolved_max_verify_len()
 

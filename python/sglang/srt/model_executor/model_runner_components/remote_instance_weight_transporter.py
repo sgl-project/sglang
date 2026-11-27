@@ -30,7 +30,6 @@ class RemoteInstanceWeightTransporter:
     engine: Optional[Any] = None
     session_id: str = ""
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
-    _nixl_manager: Optional[Any] = None
 
     @property
     def model(self) -> torch.nn.Module:

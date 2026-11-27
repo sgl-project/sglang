@@ -135,6 +135,76 @@ def _ds41_ops():
     )
 
 
+@functools.cache
+def _dsv41_a3_ops():
+    """Use the paired BF16 A3 operators bundled by sgl-kernel-npu."""
+    from sgl_kernel_npu.operators.attention import (
+        sparse_flash_mla,
+        sparse_flash_mla_metadata,
+    )
+    from sgl_kernel_npu.operators.indexer import (
+        lightning_indexer_v2,
+        sparse_lightning_indexer,
+    )
+
+    return SimpleNamespace(
+        attention=sparse_flash_mla,
+        metadata=sparse_flash_mla_metadata,
+        indexer=lightning_indexer_v2,
+        sparse_indexer=sparse_lightning_indexer,
+    )
+
+
+@functools.cache
+def _dsv41_a3_compressor_kernel():
+    from sgl_kernel_npu.operators.attention import compressor_v2
+
+    return compressor_v2
+
+
+@torch.library.custom_op("sglang::dsv41_a3_compressor", mutates_args=("state_cache",))
+def _dsv41_a3_compressor(
+    x: torch.Tensor,
+    wkv: torch.Tensor,
+    wgate: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_block_table: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seqused: torch.Tensor,
+    start_pos: torch.Tensor,
+    cmp_ratio: int,
+) -> torch.Tensor:
+    # Keep the cycle-bank mutation visible to graph tracing while using the
+    # public sgl-kernel-npu entry point (including its input validation).
+    return _dsv41_a3_compressor_kernel()(
+        x,
+        wkv,
+        wgate,
+        state_cache,
+        cmp_ratio,
+        state_block_table=state_block_table,
+        cu_seqlens=cu_seqlens,
+        seqused=seqused,
+        start_pos=start_pos,
+    )
+
+
+@_dsv41_a3_compressor.register_fake
+def _dsv41_a3_compressor_fake(
+    x,
+    wkv,
+    wgate,
+    state_cache,
+    state_block_table,
+    cu_seqlens,
+    seqused,
+    start_pos,
+    cmp_ratio,
+):
+    rows = min(x.shape[0], x.shape[0] // cmp_ratio + cu_seqlens.shape[0] - 1)
+    return x.new_empty((rows, wkv.shape[0]))
+
+
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     # n**-0.5 norm is baked in via the sqrt(2) division per doubling; _apply_hadamard is a plain matmul
     cache = _walsh_hadamard_matrix._cache
@@ -204,15 +274,10 @@ def _build_explicit_state_block_table(
 
 
 def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tensor:
-    """Build the Ascend 950 cache_mode=2 request-bank table.
-
-    Ascend 950 interprets this input as one bank id per request and computes the
-    in-bank ring offset itself.  It must never receive the arch22 explicit
-    per-token location table.
-    """
+    """C2 takes one cycle-bank ID per request, not an explicit per-token table."""
     if req_pool_indices.ndim != 1:
         raise ValueError(
-            "Ascend 950 compressor requires a 1-D request-bank table, got "
+            "C2 compressor requires a 1-D request-bank table, got "
             f"shape={tuple(req_pool_indices.shape)}"
         )
     return req_pool_indices.to(dtype=torch.int32).contiguous()
@@ -289,7 +354,7 @@ class CompressorAscendBackendMixin:
         fm = self.forward_metadata
         fm.dsv4_cycle_state_block_table = (
             _build_cycle_state_block_table(forward_batch.req_pool_indices)
-            if is_npu_arch35()
+            if 2 in self._dsv4_compress_ratios
             else None
         )
         forward_mode = forward_batch.forward_mode
@@ -298,7 +363,7 @@ class CompressorAscendBackendMixin:
         fm.dsv4_explicit_state_block_tables = {}
         fm.dsv4_max_input_capacity = 1 if is_decode else None
 
-        if self._dsv4_has_c4 or self._dsv4_has_c128: # dsv4的路径
+        if self._dsv4_has_c4 or self._dsv4_has_c128:
             # V4 c4/c128 metadata; V4.1 runs the else branch.
             _verify_compress = is_verify and bool(self._dsv4_compress_ratios)
             _seq_lens = forward_batch.seq_lens.to(torch.int32)
@@ -320,9 +385,8 @@ class CompressorAscendBackendMixin:
                 req_to_token_pool=self.req_to_token_pool,
                 out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
             )
+
             # [Compact] V4 的字典按压缩比返回字段，验证长度可能改变页表列数。
-            # 例 3 个请求的末尾长度为 [103, 204, 305]。若同时启用 C4/C128，
-            # verify 时下方仍遍历两个页表字段，各字段内的 tensor 按需要定列宽。
             for k, v in result.items():
                 setattr(fm, k, v)
             if is_decode:
@@ -341,10 +405,8 @@ class CompressorAscendBackendMixin:
 
             if _verify_compress:
                 self._build_npu_compress_metadata_verify(forward_batch)
-
         else: #dsv4.1的路径
-            # [Compact] V4.1 eager 走 ratio 1/2。ACLGraph 回放走 _refresh_graph_verify_rows。
-            # 例 3 个请求的 start_pos=[100, 200, 300]，seqused=[3, 4, 5]。
+            #  [Compact] V4.1 eager 走 ratio 1/2。ACLGraph 回放走 _refresh_graph_verify_rows。
             # V4.1: no allocator bundle and no c4/c128 tables; only the shared
             # seq scalars the fused low-ratio compressor consumes.
             if is_decode:
@@ -1263,6 +1325,13 @@ class LowRatioCompressAscendBackendMixin:
         if layer.layer_id == self.tail_source_kv_layer_id:
             run_compressor = False
 
+        query_tokens = self._dsv41_a3_query_tokens(forward_batch)
+        if query_tokens is not None:
+            # TP-only padding is not an extra query in the last request. Keep
+            # compressor, indexer Q and candidate rows on the same TND geometry.
+            x = x[:query_tokens]
+            q_lora = None if q_lora is None else q_lora[:query_tokens]
+            positions = positions[:query_tokens]
         pos = positions
         latent = None
         if run_compressor and layer.compressor is not None:
@@ -1284,23 +1353,21 @@ class LowRatioCompressAscendBackendMixin:
             # No gate and no pairing for ratio 1.
             kv, _ = compressor.project(x)
         else:
-            assert is_npu_arch35(), (
-                "the fused DeepSeek-V4.1 compressor needs arch35 "
-                "(kv_compress_epilog_v2 packing); arch22 is not supported."
-            )
             # NPU needs the two separate projections below; fail here rather
             # than with an AttributeError deep inside the forward.
             assert not compressor.use_fused_gate, (
                 "DeepSeek-V4.1 ratio-2 compression on NPU needs the unfused "
                 "compressor (separate wkv/wgate), but the module has wkv_gate."
             )
-            ds41 = _ds41_ops()
             pool = self.token_to_kv_pool
             # arch35 cache_mode=2 (CYCLE): one request bank per row, the in-bank
             # offset comes from start_pos. Second arg False: the attention
             # state pool, never the nested c4-indexer one.
             state_pool = pool._get_state_pool(layer.layer_id, False)
-            kv = ds41.compressor(
+            compress = (
+                _ds41_ops().compressor if is_npu_arch35() else _dsv41_a3_compressor
+            )
+            kv = compress(
                 x=x.view(-1, x.shape[-1]),
                 wkv=compressor.wkv.weight,
                 wgate=compressor.wgate.weight,
@@ -1424,6 +1491,19 @@ class LowRatioCompressAscendBackendMixin:
             allow_build=False,
             cache_dtype=torch.float32,
         )
+        if not is_npu_arch35():
+            # This checkpoint does not require FP4 rounding. Store ordinary
+            # BF16 index keys, using the same pre-RoPE compressed latent.
+            index_k = indexer.k_norm(indexer.wk(latent)).to(torch.bfloat16)
+            Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                index_k.view(-1, 1, indexer.index_head_dim),
+                None,
+                cos.view(-1, 1, 1, cos.shape[-1]),
+                sin.view(-1, 1, 1, sin.shape[-1]),
+                qk_nope_dim=indexer.index_head_dim - indexer.rope_head_dim,
+            )
+            pool.set_compress_buffer(layer.layer_id, cache_index, index_k, None, True)
+            return
         ds41 = _ds41_ops()
         # Keep the NZ cast inside the traced region: hoisting it into a cached
         # attribute makes aclgraph clone an NZ graph input back to ND.
@@ -1489,6 +1569,8 @@ class LowRatioCompressAscendBackendMixin:
             sin,
             qk_nope_dim=indexer.index_head_dim - indexer.rope_head_dim,
         )
+        if not is_npu_arch35():
+            return q, None, indexer.head_weights(x).view(-1, indexer.n_heads).float()
         q_packed, q_scale = torch_npu.npu_dynamic_mx_quant(
             q, dst_type=torch_npu.float4_e2m1fn_x2
         )
@@ -1515,6 +1597,25 @@ class LowRatioCompressAscendBackendMixin:
         q_packed, descale_q, w = self._dsv41_index_q(layer, x, q_lora, pos)
 
         k = pool.get_index_k(layer.layer_id)
+        if not is_npu_arch35():
+            kwargs = self._dsv41_a3_index_kwargs(forward_batch, ratio)
+            if candidate:
+                indices, _, blocks, lengths = _dsv41_a3_ops().indexer(
+                    q_packed,
+                    k,
+                    w,
+                    self._dsv4_index_topk,
+                    candidate_topk_blocks=indexer.candidate_topk_blocks,
+                    candidate_block_size=indexer.candidate_block_size,
+                    **kwargs,
+                )
+                # A3 V3 reserves candidate lengths (empty tensor); consumers
+                # use -1 padded block IDs, not the A5 length array.
+                return indices.view(t, -1), (blocks, lengths)
+            indices, _ = _dsv41_a3_ops().indexer(
+                q_packed, k, w, self._dsv4_index_topk, **kwargs
+            )
+            return indices.view(t, -1), None
         k_scale = pool.get_index_scale(layer.layer_id)
         # PA_ND rows are [pages, page_rows, 1, dim]; both views are pure
         # reshapes of the buffers the prologue wrote.
@@ -1579,6 +1680,21 @@ class LowRatioCompressAscendBackendMixin:
             return scored, None
         return scored, (candidate_indices, candidate_lengths)
 
+    def _dsv41_a3_index_kwargs(self, forward_batch, ratio):
+        seq_lens = self._dsv41_a3_kv_lengths(forward_batch)
+        return dict(
+            cu_seqlens_q=self.forward_metadata.actual_seq_lengths_q_pa,
+            seqused_k=seq_lens // ratio,
+            cmp_residual_k=seq_lens % ratio if ratio > 1 else None,
+            block_table=getattr(self.forward_metadata, f"c{ratio}_index_page_table").to(
+                torch.int32
+            ),
+            layout_q="TND",
+            layout_k="PA_BBND",
+            mask_mode=3,
+            cmp_ratio=ratio,
+        )
+
     def _dsv41_qsli_cache(self, layer) -> torch.Tensor:
         """The combined index-K record QSLI reads: ``[pages, page_size/8, 1, 544]``.
 
@@ -1639,6 +1755,17 @@ class LowRatioCompressAscendBackendMixin:
                 f"{candidate_indices.shape[0]} rows published, {t} needed."
             )
         q_packed, descale_q, w = self._dsv41_index_q(layer, x, q_lora, pos)
+        if not is_npu_arch35():
+            indices, _ = _dsv41_a3_ops().sparse_indexer(
+                q_packed,
+                self.token_to_kv_pool.get_index_k(layer.layer_id),
+                w,
+                self._dsv4_index_topk,
+                candidate_indices,
+                candidate_block_size=indexer.candidate_block_size,
+                **self._dsv41_a3_index_kwargs(forward_batch, ratio),
+            )
+            return indices.view(t, -1)
         page_table = getattr(fm, f"c{ratio}_index_page_table", None)
         if page_table is None:
             raise RuntimeError(
@@ -1716,6 +1843,9 @@ class LowRatioCompressAscendBackendMixin:
         lengths so it does not depend on the compress-metadata pass running
         first.
         """
+        if not is_npu_arch35():
+            # arch22 LI V2/V3 and SLI do not consume a metadata tensor.
+            return {}
         fm = self.forward_metadata
         kv_lens = self._dsv41_qli_kv_lens(forward_batch)
         cu_seqlens_q = fm.actual_seq_lengths_q_pa
@@ -1913,7 +2043,7 @@ class LowRatioCompressAscendBackendMixin:
         if precomputed is not None and int(precomputed.numel()) == t:
             return precomputed
         return self._dsv41_live_row_mask(
-            forward_batch, t, getattr(fm, "seq_lens_cpu_int", None) #给每个 token 标记：这一行是真请求的，还是为了凑 graph 大小补进去的假行。
+            forward_batch, t, getattr(fm, "seq_lens_cpu_int", None)
         )
 
     def _dsv41_window_indices(self, forward_batch: ForwardBatch):
@@ -1971,6 +2101,26 @@ class LowRatioCompressAscendBackendMixin:
     def _dsv41_attention_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         """MQSMLA dispatch tables: ``win`` (ratio 0) plus ``c{r}a`` (ratio 1/2)."""
         fm = self.forward_metadata
+        if not is_npu_arch35():
+            out = {}
+            for ratio in (0, *self._dsv41_low_ratios()):
+                key = "win_metadata" if ratio == 0 else f"c{ratio}a_metadata"
+                metadata = _dsv41_a3_ops().metadata(
+                    self._dsv4_q_head_num,
+                    1,
+                    self._dsv4_head_dim,
+                    batch_size=forward_batch.batch_size,
+                    has_ori_kv=True,
+                    has_cmp_kv=ratio > 0,
+                    cmp_topk=self._dsv4_index_topk if ratio else 0,
+                    **self._dsv41_a3_attention_kwargs(forward_batch, ratio),
+                )
+                buf = fm.kernel_metadata.get(key)
+                if buf is not None:
+                    buf.copy_(metadata)
+                    metadata = buf
+                out[key] = metadata
+            return out
         _, win_lengths = self._dsv41_window_indices(forward_batch)
         ds41 = _ds41_ops()
         cu_seqlens_q = fm.actual_seq_lengths_q_pa
@@ -2007,6 +2157,54 @@ class LowRatioCompressAscendBackendMixin:
             out[key] = metadata
         return out
 
+    def _dsv41_a3_query_tokens(self, forward_batch) -> int | None:
+        mode = getattr(forward_batch, "forward_mode", None)
+        if is_npu_arch35() or mode is None:
+            return None
+        if mode.is_target_verify():
+            layout = forward_batch.ragged_verify_layout
+            if layout is not None:
+                if layout.total_verify_tokens is not None:
+                    return layout.total_verify_tokens
+                return int(self.forward_metadata.actual_seq_lengths_q_pa_cpu[-1])
+            # Fixed-width verify may be graph-captured: use host geometry.
+            width = int(forward_batch.spec_info.draft_token_num)
+            return int(forward_batch.batch_size) * width
+        if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            # Eager prefill: packed TND rows must end at cu_q[-1], even when
+            # MLP sync padded the token axis for attention TP.
+            return int(self.forward_metadata.actual_seq_lengths_q_pa_cpu[-1])
+        return None
+
+    def _dsv41_a3_kv_lengths(self, forward_batch, *, metadata=None):
+        fm = self.forward_metadata if metadata is None else metadata
+        mode = getattr(forward_batch, "forward_mode", None)
+        # DSpark keeps committed lengths on the device batch during verification.
+        # The backend normalizes actual_seq_lengths_kv to include all query rows;
+        # causal masking then hides the later draft tokens from earlier queries.
+        if mode is not None and mode.is_target_verify():
+            return fm.actual_seq_lengths_kv.to(torch.int32)
+        return forward_batch.seq_lens.to(torch.int32)
+
+    def _dsv41_a3_attention_kwargs(self, forward_batch, ratio, *, metadata=None):
+        # Unlike MQSMLA, the BF16 A3 kernel derives causal windows and the
+        # compressed prefix from lengths, masks and the unfinished C2 pair.
+        seq_lens = self._dsv41_a3_kv_lengths(forward_batch, metadata=metadata)
+        fm = self.forward_metadata if metadata is None else metadata
+        return dict(
+            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
+            seqused_ori_kv=seq_lens,
+            seqused_cmp_kv=seq_lens // ratio if ratio else None,
+            cmp_residual_kv=seq_lens % ratio if ratio > 1 else None,
+            cmp_ratio=ratio or 1,
+            ori_mask_mode=4,
+            cmp_mask_mode=3 if ratio else 0,
+            ori_win_left=self._dsv4_sliding_window_size - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+        )
+
     def _dsv41_attention_sinks(self, attn_sink, device, head_num: int):
         """MQSMLA always needs a float32 ``(N1,)`` sink."""
         if attn_sink is None:
@@ -2030,10 +2228,6 @@ class LowRatioCompressAscendBackendMixin:
         """
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
-        # The metadata pass (eager init / capture seeding / replay refresh)
-        # owns the window geometry; read the buffers, never recompute here.
-        win_indices = fm.dsv41_win_sparse_indices
-        win_lengths = fm.dsv41_win_topk_length
         metadata = fm.kernel_metadata.get(
             "win_metadata" if compress_ratio == 0 else f"c{compress_ratio}a_metadata"
         )
@@ -2043,6 +2237,43 @@ class LowRatioCompressAscendBackendMixin:
                 f"layer_id={layer.layer_id} compress_ratio={compress_ratio}; "
                 f"available: {list(fm.kernel_metadata.keys())}."
             )
+        if not is_npu_arch35():
+            query_tokens = self._dsv41_a3_query_tokens(forward_batch)
+            attention_q = q if query_tokens is None else q[:query_tokens]
+            kwargs = self._dsv41_a3_attention_kwargs(forward_batch, compress_ratio)
+            if compress_ratio:
+                topk = getattr(fm, f"c{compress_ratio}_topk_indices")
+                kwargs.update(
+                    cmp_kv=pool.get_compress_buffer(layer.layer_id, False),
+                    cmp_sparse_indices=topk.view(-1, 1, self._dsv4_index_topk),
+                    cmp_block_table=getattr(fm, f"c{compress_ratio}_page_table").to(
+                        torch.int32
+                    ),
+                )
+            attn_out, _ = _dsv41_a3_ops().attention(
+                attention_q,
+                ori_kv=pool.get_swa_buffer(layer.layer_id),
+                ori_block_table=fm.swa_page_table.to(torch.int32),
+                sinks=None if attn_sink is None else attn_sink.reshape(-1).float(),
+                metadata=metadata,
+                softmax_scale=layer.scaling,
+                **kwargs,
+            )
+            # Padded graph rows have no real cache slot, even if an operator
+            # leaves the result of a zero-length request unspecified.
+            live = (
+                forward_batch.out_cache_loc.reshape(-1)[: attention_q.shape[0]]
+                >= self.page_size
+            )
+            attn_out = attn_out.masked_fill(~live[:, None, None], 0)
+            if attn_out.shape[0] < q.shape[0]:
+                attn_out = F.pad(
+                    attn_out, (0, 0, 0, 0, 0, q.shape[0] - attn_out.shape[0])
+                )
+            return attn_out
+        # The metadata pass owns A5's explicit window geometry.
+        win_indices = fm.dsv41_win_sparse_indices
+        win_lengths = fm.dsv41_win_topk_length
         attn_kwargs = dict(
             ori_kv=pool.get_swa_buffer(layer.layer_id).view(torch.uint8),
             ori_sparse_indices=win_indices,
@@ -2092,8 +2323,6 @@ class LowRatioCompressAscendBackendMixin:
         # (unused, empty) softmax-lse tensors explicitly.
         attn_out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
         lse = torch.empty((0,), dtype=torch.float32, device=q.device)
-        # [Compact] Target 计算。MQSMLA 用 Q 偏移和 top-k 长度区分有效行与补齐行。
-        # 例 12 行图的 q 和 attn_out 首维均为 12，Q 偏移的尾部重复 12 表示空请求槽。
         _ds41_ops().mixed_quant_sparse_flash_mla_dsl(
             q, out=attn_out, lse=lse, **attn_kwargs
         )
@@ -2182,9 +2411,28 @@ class LowRatioCompressAscendBackendMixin:
         device = forward_batch.positions.device
         positions = forward_batch.positions.reshape(-1).to(torch.int64)
         out_loc = forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
+        query_tokens = self._dsv41_a3_query_tokens(forward_batch)
+        is_a3_verify = (
+            query_tokens is not None and forward_batch.forward_mode.is_target_verify()
+        )
+        if is_a3_verify and out_loc.numel() < positions.numel():
+            # Fixed-width A3 verify needs one slot per query row. Fill missing
+            # slots with the dummy page and keep the shared full-slot mapping.
+            out_loc = F.pad(out_loc, (0, positions.numel() - out_loc.numel()))
         n = min(int(positions.numel()), int(out_loc.numel()))
+        if query_tokens is not None:
+            n = min(n, query_tokens)
         positions, out_loc = positions[:n], out_loc[:n]
         bs = int(forward_batch.batch_size)
+        if is_a3_verify:
+            # A3 verification uses fixed-width blocks. Keep ghost request rows
+            # out of both compressed pools without a device-side indptr search.
+            width = int(forward_batch.spec_info.draft_token_num)
+            rows = torch.arange(n, device=device)
+            req = rows // width
+            safe_req = req.clamp(max=bs - 1)
+            valid = (req < bs) & (rows % width < fm.seqused[safe_req])
+            out_loc = torch.where(valid, out_loc, torch.zeros_like(out_loc))
         keep, pos_values, slot_values = self._dsv41_ratio_row_values(
             positions, out_loc, ratio, int(self.page_size)
         )
@@ -2207,8 +2455,9 @@ class LowRatioCompressAscendBackendMixin:
             )
         setattr(fm, f"positions_cmp_padding_c{ratio}", pos_row)
         setattr(fm, f"c{ratio}_loc", slot_row)
-        # Compressed page j is full page j: the full page table doubles as the
-        # compressed page table.
+        # Compressed pages carry the full pool's page ids (compressed page j is
+        # full page j), so the full page table doubles as the compressed page
+        # table read with page_size // ratio.
         block_tables = getattr(fm, "block_tables", None)
         setattr(fm, f"c{ratio}_page_table", block_tables)
         # Indexer-K pool pages at DSV41_INDEX_PAGE_SIZE slots: expand the full
@@ -2233,7 +2482,7 @@ class LowRatioCompressAscendBackendMixin:
         setattr(fm, f"c{ratio}_index_page_table", index_page_table)
 
     def _init_dsv41_graph_metadata(self, metadata, bs: int, tokens_per_req: int, device,
-                                   num_tokens: Optional[int] = None, ) -> None:
+                                   num_tokens: Optional[int] = None, forward_batch=None) -> None:
         """Allocate the aclgraph-persistent low-ratio buffers for one bs bucket."""
         # t = bs * tokens_per_req
         # static：默认 t = bs * tokens_per_req。
@@ -2294,6 +2543,39 @@ class LowRatioCompressAscendBackendMixin:
         )
         if not hasattr(metadata, "kernel_metadata") or metadata.kernel_metadata is None:
             metadata.kernel_metadata = {}
+        if not is_npu_arch35():
+            # BF16 SMLA and its AICPU metadata have a fixed, shared ABI. Do not
+            # probe MQSMLA/QLI or allocate packed-index metadata on A3.
+            probe_batch = (
+                forward_batch
+                if forward_batch is not None
+                else SimpleNamespace(seq_lens=metadata.actual_seq_lengths_kv)
+            )
+            for ratio in (0, *self._dsv41_low_ratios()):
+                attention_type = "win" if ratio == 0 else f"c{ratio}a"
+                key = f"kernel_metadata_{attention_type}"
+                buf = self.graph_metadata.get(key)
+                if buf is None or buf.numel() != 2048:
+                    buf = torch.zeros(2048, dtype=torch.int32, device=device)
+                    self.graph_metadata[key] = buf
+                # Warmup/capture uses this table before the first replay
+                # refresh; an all-zero allocation is not a valid schedule.
+                buf.copy_(
+                    _dsv41_a3_ops().metadata(
+                        self._dsv4_q_head_num,
+                        1,
+                        self._dsv4_head_dim,
+                        batch_size=bs,
+                        has_ori_kv=True,
+                        has_cmp_kv=ratio > 0,
+                        cmp_topk=self._dsv4_index_topk if ratio else 0,
+                        **self._dsv41_a3_attention_kwargs(
+                            probe_batch, ratio, metadata=metadata
+                        ),
+                    )
+                )
+                metadata.kernel_metadata[f"{attention_type}_metadata"] = buf
+            return
         # Variable-size dispatch tables: probe one tensor per attention type.
         ds41 = _ds41_ops()
 
@@ -2303,8 +2585,9 @@ class LowRatioCompressAscendBackendMixin:
         # 实际图若补齐请求槽位，使用的也是上层准备好的对应分段。
         cu_seqlens_q = getattr(metadata, "actual_seq_lengths_q_pa", None)
         if cu_seqlens_q is None:
-            cu_seqlens_q = (torch.arange(bs + 1, dtype=torch.int32, device=device) * tokens_per_req)
-
+            cu_seqlens_q = (
+                torch.arange(bs + 1, dtype=torch.int32, device=device) * tokens_per_req
+            )
         probe_cmp_lengths = torch.zeros((t, 1), dtype=torch.int32, device=device)
         for ratio in (0, *self._dsv41_low_ratios()):
             attention_type = "win" if ratio == 0 else f"c{ratio}a"
@@ -2327,7 +2610,6 @@ class LowRatioCompressAscendBackendMixin:
                 buf = torch.zeros_like(probe)
                 self.graph_metadata[key] = buf
             metadata.kernel_metadata[f"{attention_type}_metadata"] = buf
-
         for ratio in self._dsv41_low_ratios():
             probe = ds41.quant_lightning_indexer_metadata_dsl(
                 cu_seqlens_q=cu_seqlens_q,
@@ -2361,7 +2643,6 @@ class LowRatioCompressAscendBackendMixin:
         candidate_ratio = self._dsv41_candidate_ratio()
         if candidate_ratio is None:
             return
-
         block = int(self._dsv41_candidate_block_size)
         if block <= 0 or self._dsv41_candidate_topk_blocks <= 0:
             raise RuntimeError(
@@ -2466,8 +2747,6 @@ class LowRatioCompressAscendBackendMixin:
                     slot_dst, slot_values, keep, fill=self._DSV41_SLOT_SKIP
                 )
 
-
-
     def _refresh_graph_dsv41_index_page_tables(self, fm) -> None:
         """Re-derive the indexer-K page-table expansion into the captured buffers.
 
@@ -2506,80 +2785,52 @@ class LowRatioCompressAscendBackendMixin:
         window through the shared row formulas, matching the eager verify path
         element for element.
         """
-
-        # 例 raw_bs=3，verify_lens=[3, 4, 5]，前缀长度=[100, 200, 300]。
         fm = ctx.fm
         layout = ctx.ragged_layout
         w = int(ctx.tokens_per_bs)
-        live = ctx.live_seq_lens[: ctx.bs].to(torch.int64) # 8 槽图的前缀长度为 [100, 200, 300, 0, 0, 0, 0, 0]。
+        n = int(layout.graph_num_tokens) if layout is not None else int(ctx.bs) * w
 
-        # positions 是本轮 token 的绝对位置。Static 每请求 6 行，真实位置共 18 行。
-        # Compact 位置为 [100, 101, 102, 200, 201, 202, 203, 300, 301, 302, 303, 304]，
-        # 命中 12 行图时 positions 形状为 [12]。
-        positions = ctx.forward_batch.positions.reshape(-1).to(torch.int64) # 展平本轮 token 的绝对位置
-
-        # [Compact] Target 计算。按图 token 容量规划压缩行，只保留有效组的写入槽。
-        # 例 12 个有效 position 中，C2 组在 101、201、203、301、303 结束。
-        # positions_cmp_padding_c2 [12] 含组起点 [100, 200, 202, 300, 302] 和 7 个 0，
-        # c2_loc [12] 含 5 个压缩 KV 写入槽和 7 个 -1。
-        # Static uses a request-major rectangle; ragged uses a token-tier capacity.
-        n = (int(layout.graph_num_tokens)if layout is not None else int(ctx.bs) * w)  #图容量
-
+        positions = ctx.forward_batch.positions.reshape(-1).to(torch.int64)
+        if not is_npu_arch35():
+            # Attention TP pads only the flat token axis, not request/cu geometry.
+            positions = positions[:n]
         if positions.numel() != n:
             raise RuntimeError(
                 "V4.1 verify replay rows do not match the bucket width: "
                 f"positions={positions.numel()} vs bs*tokens_per_req={n}."
             )
-
-        # Ragged verify: request boundaries come from the packed Q indptr.
-        if layout is not None:
-            if int(ctx.bs) == 0: # 防御性处理：当前没有请求槽位，不能执行索引读取
-                self._clear_graph_dsv41_verify_metadata(ctx) #清理可能残留的 V4.1 验证元数据
-                return
-
-            # Ragged: use Q indptr to map each packed token to its request.
-            request_rows = ragged_verify_token_rows(layout, n) # 例 [0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2]。
-            valid_request = request_rows < int(ctx.raw_bs) # ctx.raw_bs:原始请求数量/ ctx.bs:补齐后，图执行使用的请求槽位数量 /仅保留实际请求，屏蔽图补齐产生的虚拟请求
-            safe_request_rows = request_rows.clamp(max=int(ctx.bs) - 1)  #将越界编号限制到合法范围，保证读取安全
-            row_live = live[safe_request_rows] # 展开为 3 个 100、4 个 200 和 5 个 300。
-            row_live = torch.where(valid_request, row_live, torch.zeros_like(row_live),) # 真实请求保留前缀长度，虚拟请求或未归属行置 0，shape: (n,)
-
-        else: # static 分支：每个请求都有相同数量的验证行
-            # Static: every request owns the same number of token rows.
-            # 每个请求槽的前缀长度重复 6 次。若回放 4 槽图，形状为 [24]。
-            # 这里保留整数长度；辅助函数内部通过 row_live > 0 判断有效性
-            row_live = live.repeat_interleave(w)
-
-        # Compact 的 out_cache_loc 已补到图容量，存的是 KV 物理槽。
-        # 例 12 行图可用 [1124, 1125, 1126, 2248, 2249, 2250, 2251,
-        # 3372, 3373, 3374, 3375, 3376]，24 行图还会在尾部补 12 个 0。
+        # The replay view's out_cache_loc is UNPADDED: scatter it into the
+        # padded window; padding rows keep 0 and the slot filter drops them.
         raw_out_loc = ctx.forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
-        if layout is not None and raw_out_loc.numel() != n:  #    # compact 正常输入应已经补齐到 token 图容量
-            raise RuntimeError(
-                "V4.1 ragged verify cache locations exceed the token tier: "
-                f"out_cache_loc={raw_out_loc.numel()} vs graph_num_tokens={n}."
-            )
+        out_loc = torch.zeros(n, dtype=torch.int64, device=ctx.device)
+        if raw_out_loc.numel() > 0:
+            m = min(int(raw_out_loc.numel()), n)
+            out_loc[:m] = raw_out_loc[:m]
+        # A3 uses the query mask to exclude TP-padded request rows. Preserve
+        # the upstream A5 live-prefix convention.
 
-        if raw_out_loc.numel() == n:
-            out_loc = raw_out_loc  # 已补齐，直接复用        # out_loc = torch.zeros(n, dtype=torch.int64, device=ctx.device)
+        if layout is not None:
+            row_live = fm.dsv41_live_mask_buf
         else:
-            # Static 输入若短于图容量，用 0 填满剩余位置。
-            out_loc = torch.zeros(n, dtype=torch.int64, device=ctx.device)
-            if raw_out_loc.numel() > 0:
-                m = min(int(raw_out_loc.numel()), n)
-                out_loc[:m] = raw_out_loc[:m]
-        # start_pos/seqused are written by _refresh_graph_verify_rows.
+            row_live = (
+                ctx.live_seq_lens[: ctx.bs].to(torch.int64)
+                if is_npu_arch35()
+                else fm.seqused
+            ).repeat_interleave(w)
         for ratio in self._dsv41_low_ratios():
-            # 为每个 token 判断是否需要产生一个压缩 KV，并计算对应的组起始位置和压缩缓存槽位，
+            """
+ # 为每个 token 判断是否需要产生一个压缩 KV，并计算对应的组起始位置和压缩缓存槽位，
             # 和_fill_ragged_verify_positions_cmp_padding_one的作用是类似的
 
             # 12 行图的 ratio 1 保留 12 行。ratio 2 只保留 5 个组结束行，
             # 用物理槽整除 2 得到压缩写入槽 [562, 1124, 1125, 1686, 1687]。
+ """
+
             keep, pos_values, slot_values = self._dsv41_ratio_row_values(
                 positions, out_loc, ratio, int(self.page_size), row_live=row_live
             )
-            pos_dst = getattr(fm, f"positions_cmp_padding_c{ratio}")   # 已分配的压缩位置缓冲区，shape: (P,)
-            slot_dst = getattr(fm, f"c{ratio}_loc")                    # 已分配的压缩槽位缓冲区，shape: (P,)，与 pos_dst 逐行对应
+            pos_dst = getattr(fm, f"positions_cmp_padding_c{ratio}") # 已分配的压缩位置缓冲区，shape: (P,) 记录压缩的KV对应原本哪个token
+            slot_dst = getattr(fm, f"c{ratio}_loc")  #已分配的压缩槽位缓冲区，shape: (P,)，与 pos_dst 逐行对应, 记录压缩的KV对应缓存池里哪个物理槽位
             if ratio == 1:
                 # Per-token rows (native projection): identity, not compacted.
                 pos_dst.copy_(
@@ -2593,9 +2844,10 @@ class LowRatioCompressAscendBackendMixin:
                     ).to(slot_dst.dtype)
                 )
             else:
-                # 按原顺序写入 5 个有效组，剩下 7 行的位置填 0，槽位填 -1。
                 self._stable_compact_1d(pos_dst, pos_values, keep, fill=0)
-                self._stable_compact_1d(slot_dst, slot_values, keep, fill=self._DSV41_SLOT_SKIP)
+                self._stable_compact_1d(
+                    slot_dst, slot_values, keep, fill=self._DSV41_SLOT_SKIP
+                )
 
     def _clear_graph_dsv41_verify_metadata(self, ctx) -> None:
         """DP-idle verify replay: neutralize the V4.1 metadata.
@@ -2656,6 +2908,7 @@ class DeepseekV4AscendAttnBackend(
     )
 
     supports_ragged_verify_graph = True
+    _is_dsv41_a3_dspark_draft = False
 
     def __init__(
         self,
@@ -2703,13 +2956,23 @@ class DeepseekV4AscendAttnBackend(
             ratio in (1, 2) for ratio in self._dsv4_compress_ratios
         )
         if self._dsv4_has_low_ratio:
-            # MQSMLA fixes N1 = 64 and does not shard query heads over TP; a
-            # narrower per-rank width would feed the op the wrong head count.
-            assert self._dsv4_q_head_num == 64, (
-                "DeepSeek-V4.1 on NPU needs all 64 query heads on every rank "
-                f"(got {self._dsv4_q_head_num}): check num_attention_heads and "
-                "the attention TP size."
-            )
+            if is_npu_arch35():
+                # MQSMLA fixes N1 = 64 and does not shard query heads over TP.
+                assert self._dsv4_q_head_num == 64, (
+                    "DeepSeek-V4.1 on NPU needs all 64 query heads on every rank "
+                    f"(got {self._dsv4_q_head_num}): check num_attention_heads and "
+                    "the attention TP size."
+                )
+            else:
+                try:
+                    _dsv41_a3_ops()
+                    _dsv41_a3_compressor_kernel()
+                except ImportError as exc:
+                    raise ImportError(
+                        "DeepSeek-V4.1 on Ascend A3 requires sgl-kernel-npu built "
+                        "with the ops_transformer bundle for CANN 9.2.0. "
+                        f"Failed to import an A3 operator: {exc}"
+                    ) from exc
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
@@ -2728,6 +2991,11 @@ class DeepseekV4AscendAttnBackend(
         self._is_dspark_draft_worker = bool(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
+        )
+        self._is_dsv41_a3_dspark_draft = (
+            self._is_dspark_draft_worker
+            and self._dsv4_is_v41_model
+            and not is_npu_arch35()
         )
         self._validate_spec_support(model_runner.spec_algorithm)
         if getattr(model_runner, "is_draft_worker", False):
@@ -2762,6 +3030,9 @@ class DeepseekV4AscendAttnBackend(
         # Draft workers keep the eager prefill metadata path; their graph
         # coverage is handled by the speculative runner.
         if self.is_draft_worker:
+            return False
+        # The captured prefill state has no C1/C2 index or candidate buffers.
+        if self._dsv4_has_low_ratio and not is_npu_arch35():
             return False
         parallel = get_parallel()
         if parallel.attn_cp_size != 1 or parallel.attn_dcp_size != 1:
@@ -2801,7 +3072,7 @@ class DeepseekV4AscendAttnBackend(
                 f"decoding (static mode), got {spec_algorithm!r}."
             )
         ragged_mode = read_ragged_verify_mode()
-        if ragged_mode not in (RaggedVerifyMode.STATIC, RaggedVerifyMode.COMPACT):
+        if ragged_mode is not RaggedVerifyMode.STATIC:
             raise ValueError(
                 "DeepSeek-V4.1 on NPU supports only DSpark speculative "
                 "decoding in static mode (SGLANG_RAGGED_VERIFY_MODE=static), "
@@ -2858,13 +3129,23 @@ class DeepseekV4AscendAttnBackend(
             return
 
         block_size = int(forward_batch.spec_info.draft_token_num)
+        if self._is_dsv41_a3_dspark_draft:
+            # The device batch carries committed prefixes even when there is
+            # no CPU mirror; the full noncausal draft block is already in KV.
+            fm.actual_seq_lengths_kv = (
+                forward_batch.seq_lens.to(torch.int32) + block_size
+            )
+
         ori_sparse_indices, ori_topk_length = self._build_dspark_sparse_metadata(
             seq_lens=forward_batch.seq_lens, block_size=block_size
         )
         # The query is padded to an attn_tp multiple (prepare_mlp_sync_batch),
         # but seq_lens is not, so pad the tail with -1/0 to match.
         num_padded_tokens = forward_batch.out_cache_loc.shape[0]
-        if ori_sparse_indices.shape[0] < num_padded_tokens:
+        if (
+            not self._is_dsv41_a3_dspark_draft
+            and ori_sparse_indices.shape[0] < num_padded_tokens
+        ):
             pad_rows = num_padded_tokens - ori_sparse_indices.shape[0]
             indices_pad = torch.full(
                 (pad_rows, ori_sparse_indices.shape[1]),
@@ -3229,7 +3510,6 @@ class DeepseekV4AscendAttnBackend(
                 dtype=torch.int32,
                 device=device,
             )
-
             # The draft-worker host metadata op consumes this fixed graph
             # geometry without introducing a replay-time D2H synchronization.
             metadata.actual_seq_lengths_q_pa_cpu = torch.arange(
@@ -3251,46 +3531,39 @@ class DeepseekV4AscendAttnBackend(
         metadata.swa_page_table = self.graph_metadata["swa_page_table"][:bs, :]
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.dsv4_max_input_capacity = tokens_per_req
-        if is_npu_arch35():
-            metadata.dsv4_cycle_state_block_table = torch.zeros(
-                bs, dtype=torch.int32, device=device
+        # C2 addresses a bank per request; C4/C128 use explicit token locations.
+        metadata.dsv4_cycle_state_block_table = (
+            torch.zeros(bs, dtype=torch.int32, device=device)
+            if 2 in self._dsv4_compress_ratios
+            else None
+        )
+        metadata.dsv4_explicit_state_block_tables = {
+            ratio: torch.full(
+                (bs, (2 if ratio == 4 else 1) * ratio + tokens_per_req),
+                state_pool.dummy_state_loc,
+                dtype=torch.int32,
+                device=device,
             )
-            # The V4 compressor op consumes the explicit table on every arch,
-            # so seed it for the V4 ratios. The V4.1 ratio-2 pair pool is a
-            # plain CompressStatePool with no ``dummy_state_loc`` sentinel;
-            # its ds41.compressor addresses state through the cycle table
-            # above instead.
-            metadata.dsv4_explicit_state_block_tables = {
-                ratio: torch.full(
-                    (
-                        bs,
-                        (2 if ratio == 4 else 1) * ratio + tokens_per_req,
-                    ),
-                    state_pool.dummy_state_loc,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
-                if ratio in (4, 128)
-            }
-        else:
-            metadata.dsv4_cycle_state_block_table = None
-            metadata.dsv4_explicit_state_block_tables = {
-                ratio: torch.full(
-                    (
-                        bs,
-                        (2 if ratio == 4 else 1) * ratio + tokens_per_req,
-                    ),
-                    state_pool.dummy_state_loc,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
-            }
+            for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
+            if ratio in (4, 128)
+        }
 
         metadata.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
         metadata.seqused = torch.zeros(bs, dtype=torch.int32, device=device)
         metadata.kernel_metadata = {}
+        if (
+            not is_npu_arch35()
+            and self._dsv4_has_low_ratio
+            and forward_mode.is_target_verify()
+        ):
+            capture_prefix = forward_batch.seq_lens.to(torch.int32)
+            metadata.actual_seq_lengths_kv.copy_(
+                torch.where(
+                    capture_prefix > 0,
+                    capture_prefix + tokens_per_req,
+                    torch.zeros_like(capture_prefix),
+                )
+            )
 
         T = n_tok
         if self._dsv4_has_c4:
@@ -3336,10 +3609,12 @@ class DeepseekV4AscendAttnBackend(
             # The live-row mask the captured graphs read; filled per replay by
             # _refresh_graph_seq_metadata (never traced inside the graph).
             metadata.dsv41_live_mask_buf = torch.zeros(
-                n_tok, dtype=torch.bool, device=device
+                bs * tokens_per_req, dtype=torch.bool, device=device
             )
             # V4.1: MQSMLA/QLI dispatch tables plus window/topk-length buffers.
-            self._init_dsv41_graph_metadata(metadata, bs, tokens_per_req, device,num_tokens=n_tok)
+            self._init_dsv41_graph_metadata(
+                metadata, bs, tokens_per_req, device, num_tokens=n_tok, forward_batch=forward_batch
+            )
 
         metadata.ori_sparse_indices = None
         metadata.ori_topk_length = None
@@ -3357,6 +3632,11 @@ class DeepseekV4AscendAttnBackend(
             # kernel adapter selects the released or legacy operator ABI.
             metadata.ori_win_left = self._dsv4_sliding_window_size + tokens_per_req - 1
             metadata.ori_win_right = 0
+
+        if self._is_dsv41_a3_dspark_draft:
+            metadata.kernel_metadata["c1a_metadata"].copy_(
+                self._dsv41_a3_draft_kernel_metadata(bs, metadata=metadata)
+            )
 
         self.graph_metadata[metadata_key] = metadata
 
@@ -3646,7 +3926,6 @@ class DeepseekV4AscendAttnBackend(
                 )
             )
         attn_seq_lens = ctx.live_seq_lens
-
         if ctx.graph_mode.is_target_verify():
             valid_verify_rows = ctx.live_seq_lens > 0
             final_seq_lens = ctx.final_seq_lens_cpu.to(
@@ -3675,55 +3954,43 @@ class DeepseekV4AscendAttnBackend(
         mask_buf = getattr(fm, "dsv41_live_mask_buf", None)
         if mask_buf is not None:
             if ctx.graph_mode.is_target_verify():
-                if ctx.ragged_layout is not None:
-                    # 新增 compact 分支：按真实请求边界展开有效性
-                    layout = ctx.ragged_layout
-                    n = int(layout.graph_num_tokens)  # 图的 token 容量
-                    if mask_buf.numel() != n:
-                        raise RuntimeError(
-                            "V4.1 ragged verify live-mask capacity mismatch: "
-                            f"mask={mask_buf.numel()} vs graph_num_tokens={n}."
-                        )
-                    if int(ctx.bs) == 0:
-                        mask = torch.zeros_like(mask_buf)  # 无请求槽位时全部无效
+                layout = ctx.ragged_layout
+                if layout is not None:
+                    if ctx.is_idle_replay or ctx.raw_bs == 0:
+                        mask = torch.zeros_like(mask_buf)
                     else:
+                        n = int(layout.graph_num_tokens)
                         request_rows = ragged_verify_token_rows(layout, n)
-                        # 例 12 行图对应 [0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2]。
-
                         valid_request = request_rows < int(ctx.raw_bs)
-                        # 排除虚拟请求和未归属的尾部补齐行，shape: (n,)
-
-                        safe_request_rows = request_rows.clamp( max=int(ctx.bs) - 1)
-                        # 保证下面索引前缀长度时不会越界
-
+                        safe_request_rows = request_rows.clamp(max=int(ctx.bs) - 1)
                         per_req = ctx.live_seq_lens[: ctx.bs] > 0
-                        # 8 个请求槽中前 3 个活跃，后 5 个是虚拟请求槽。
 
-                        out_loc = ctx.forward_batch.out_cache_loc.reshape(-1) #DP dummy：所有槽位都是 0  → 全 False
-                        mask = (valid_request& per_req[safe_request_rows]& (out_loc > 0))
-                        # 12 行图的 mask 为 [True] * 12。24 行图还会在尾部补 12 个 False。
+                        raw_out_loc = ctx.forward_batch.out_cache_loc.reshape(-1)
+                        if raw_out_loc.numel() == n:
+                            out_loc = raw_out_loc
+                        else:
+                            out_loc = raw_out_loc.new_zeros(n)
+                            if raw_out_loc.numel() > 0:
+                                m = min(int(raw_out_loc.numel()), n)
+                                out_loc[:m] = raw_out_loc[:m]
 
-                else: #ctx.final_seq_lens_cpu=前缀长度+本轮验证长度
+                        mask = (valid_request & per_req[safe_request_rows] & (out_loc > 0))
+
+                else:
                     per_req = ctx.final_seq_lens_cpu.reshape(-1)[: ctx.bs].to(
                         torch.int64
                     ) > int(ctx.tokens_per_bs)
-                    mask = per_req.repeat_interleave(int(ctx.tokens_per_bs))  # shape: (bs * tokens_per_bs,)
+                    mask = per_req.repeat_interleave(int(ctx.tokens_per_bs))
             else:
-                # 原有普通 decode 分支：每请求一个 query token, shape: (bs,)
                 mask = ctx.live_seq_lens_cpu[: ctx.bs].to(torch.int64) > 0
-
-            # 原地更新 bool 缓冲区，不重新绑定，保留图捕获使用的地址
             mask_buf.copy_(mask.to(mask_buf.dtype))
-
-        # 原地刷新设备端 KV 长度；无效行是否参与计算由上面的 mask 控制
         fm.actual_seq_lengths_kv.copy_(attn_seq_lens.clamp(min=1))
 
     def _refresh_cycle_state_block_table(self, ctx) -> None:
-        """Arch35 cache_mode=2 request-bank table: one bank id per request."""
-        if is_npu_arch35():
-            ctx.fm.dsv4_cycle_state_block_table.copy_(
-                ctx.forward_batch.req_pool_indices[: ctx.bs]
-            )
+        """Cycle request-bank table: one bank id per request."""
+        table = ctx.fm.dsv4_cycle_state_block_table
+        if table is not None:
+            table.copy_(ctx.forward_batch.req_pool_indices[: ctx.bs])
 
     def _refresh_graph_decode_rows(self, ctx) -> None:
         """Decode replay rows: shared seq scalars (start_pos = last live
@@ -3758,8 +4025,16 @@ class DeepseekV4AscendAttnBackend(
                 self._clear_v4_verify_metadata(ctx)
             return
         fm = ctx.fm
-        fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
         valid = ctx.live_seq_lens[: ctx.bs] > 0
+        if self._dsv4_has_low_ratio and not is_npu_arch35():
+            valid &= torch.arange(ctx.bs, device=ctx.device) < ctx.raw_bs
+            fm.start_pos.copy_(
+                torch.where(
+                    valid, ctx.live_seq_lens, torch.zeros_like(ctx.live_seq_lens)
+                )
+            )
+        else:
+            fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
         if ctx.ragged_layout is not None:
             # [Compact] 例 8 槽的 start_pos=[100, 200, 300, 0, 0, 0, 0, 0]，
             # seqused=[3, 4, 5, 0, 0, 0, 0, 0]，压缩算子按这两个 [8] 张量分段。
@@ -4007,7 +4282,6 @@ class DeepseekV4AscendAttnBackend(
             finally:
                 self.forward_metadata = previous
             return
-
         kernel_metadata_new = self._kernel_metadata_from_parts(
             bs=ctx.bs,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
@@ -4209,10 +4483,6 @@ class DeepseekV4AscendAttnBackend(
             fm.actual_seq_lengths_q_pa = None
             fm.actual_seq_lengths_q_pa_cpu = None
 
-        fm.swa_page_table = (
-            fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
-        )
-
         if ragged_layout is not None:
             fm.actual_seq_lengths_kv = (
                 (
@@ -4228,9 +4498,34 @@ class DeepseekV4AscendAttnBackend(
                 fm.actual_seq_lengths_kv = fm.seq_lens_cpu_int.to(
                     device=forward_batch.seq_lens.device, dtype=torch.int32
                 )
+            elif (
+                forward_batch.forward_mode.is_target_verify()
+                and self._dsv4_has_low_ratio
+                and not is_npu_arch35()
+            ):
+                # DSpark supplies the committed device prefix. Request slot 0
+                # is padding and does not own any rows of the verify block.
+                prefix = forward_batch.seq_lens.to(torch.int32)
+                fm.actual_seq_lengths_kv = torch.where(
+                    forward_batch.req_pool_indices != 0, prefix + n_draft, prefix
+                )
+                if self.is_hybrid_swa:
+                    # The base built only full pages. As in graph replay, leave
+                    # one page of slack for the potentially lagging host bound.
+                    hint = forward_batch.max_seq_len_host
+                    max_len = hint + self.page_size if hint else None
+                    full_locs = self.req_to_token[
+                        forward_batch.req_pool_indices, : max_len : self.page_size
+                    ]
+                    fm.block_tables_swa = (
+                        self.full_to_swa_index_mapping[full_locs] // self.page_size
+                    ).to(torch.int32)
             else:
                 fm.actual_seq_lengths_kv = forward_batch.seq_lens.to(torch.int32)
 
+        fm.swa_page_table = (
+            fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
+        )
         self._init_dspark_sparse_metadata(forward_batch)
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
 
@@ -4343,6 +4638,8 @@ class DeepseekV4AscendAttnBackend(
         actual_seq_lengths_kv: torch.Tensor,
     ) -> dict:
         fm = self.forward_metadata
+        if self._is_dsv41_a3_dspark_draft:
+            return {"c1a_metadata": self._dsv41_a3_draft_kernel_metadata(bs)}
         common = {
             **_sparse_attn_kv_quant_kwargs(),
             "cu_seqlens_q": actual_seq_lengths_q_pa,
@@ -4504,6 +4801,40 @@ class DeepseekV4AscendAttnBackend(
             q, layer, forward_batch, attn_sink, compress_ratio
         )
 
+    def _dsv41_a3_draft_attention_kwargs(self, metadata=None):
+        fm = self.forward_metadata if metadata is None else metadata
+        indices = getattr(fm, "ori_sparse_indices", None)
+        kwargs = dict(
+            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
+            seqused_ori_kv=fm.actual_seq_lengths_kv,
+            cmp_ratio=1,
+            ori_mask_mode=0 if indices is not None else 4,
+            cmp_mask_mode=0,
+            ori_win_left=getattr(
+                fm, "ori_win_left", self._dsv4_sliding_window_size - 1
+            ),
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+        )
+        if indices is not None:
+            kwargs["ori_topk_length"] = fm.ori_topk_length
+        return kwargs
+
+    def _dsv41_a3_draft_kernel_metadata(self, bs, metadata=None):
+        fm = self.forward_metadata if metadata is None else metadata
+        indices = getattr(fm, "ori_sparse_indices", None)
+        return _dsv41_a3_ops().metadata(
+            self._dsv4_q_head_num,
+            1,
+            self._dsv4_head_dim,
+            batch_size=bs,
+            has_ori_kv=True,
+            has_cmp_kv=False,
+            ori_topk=0 if indices is None else indices.shape[-1],
+            **self._dsv41_a3_draft_attention_kwargs(metadata=fm),
+        )
+
     def _forward_swa(
         self,
         q: torch.Tensor,
@@ -4514,6 +4845,24 @@ class DeepseekV4AscendAttnBackend(
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
+        if self._is_dsv41_a3_dspark_draft:
+            indices = getattr(fm, "ori_sparse_indices", None)
+            num_rows = q.shape[0] if indices is None else indices.shape[0]
+            # Attention TP may pad the projected Q (e.g. five rows to six for
+            # TP2); do not expose that non-query row as part of a draft block.
+            out, _ = _dsv41_a3_ops().attention(
+                q[:num_rows],
+                ori_kv=ori_kv,
+                ori_sparse_indices=indices,
+                ori_block_table=fm.swa_page_table.to(torch.int32),
+                sinks=attn_sink,
+                metadata=fm.kernel_metadata["c1a_metadata"],
+                softmax_scale=layer.scaling,
+                **self._dsv41_a3_draft_attention_kwargs(),
+            )
+            if out.shape[0] < q.shape[0]:
+                out = F.pad(out, (0, 0, 0, 0, 0, q.shape[0] - out.shape[0]))
+            return out
 
         attn_kwargs = dict(
             **_sparse_attn_kv_quant_kwargs(),

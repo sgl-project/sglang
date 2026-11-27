@@ -285,10 +285,13 @@ def handle_model_specific_adjustments(server_args: Any):
         "Glm5NextForConditionalGeneration",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
+        "HYV4FlashForConditionalGeneration",
         "LongcatFlashForCausalLM",
         "Dots3NoteForCausalLM",
         "Xing4_0ForCausalLM",
         "KimiK31ForConditionalGeneration",
+        "GigaChat4ForCausalLM",
+        "GigaChat4ForCausalLMNextN",
     ]:
         # Set attention backend for DeepSeek
         if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -306,18 +309,12 @@ def handle_model_specific_adjustments(server_args: Any):
                 logger.warning(
                     f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
                 )
-            # The "dsa" attention fill moved to the override registry
-            # (arg_groups/overrides.py: _deepseek_family_overrides).
-
             _validate_dsa_tbo_index_sharing(server_args, hf_config)
 
             if (
                 not get_platform().is_npu and not get_platform().is_xpu
             ):  # CUDA or ROCm GPU
                 if cfg.enable_prefill_cp:
-                    # The DSA CP field declarations moved to the override
-                    # registry (arg_groups/overrides.py:
-                    # _deepseek_family_overrides).
                     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
                     if not (
@@ -345,13 +342,6 @@ def handle_model_specific_adjustments(server_args: Any):
                             f"DSA with TP mode is active, attn_dp_size={cfg.attn_dp_size}, tp_size={cfg.tp_size}, "
                             f"attn_tp_size={attn_tp_size}, attention weights will be sharded across {attn_tp_size} ranks."
                         )
-
-                # The DSA page-size selection moved to the override registry
-                # (arg_groups/overrides.py: _deepseek_family_overrides).
-
-                import torch
-
-                major, _ = torch.cuda.get_device_capability()
 
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
@@ -398,39 +388,36 @@ def handle_model_specific_adjustments(server_args: Any):
                     "--enable-dsa-cache-layer-split requires "
                     "--enable-prefill-cp and --cp-strategy interleave."
                 )
-            # Layer split relies on the mooncake all-CP-rank KV/indexer
-            # transfer path. mori/nixl support is a temporary limitation
-            # and will be added later by the community.
+            # Layer split relies on an all-CP-rank KV/indexer transfer path:
+            # mooncake on GPU, the ascend engine (memfabric_hybrid) on NPU.
+            # mori/nixl support is a temporary limitation and will be added
+            # later by the community.
+            allowed_transfer_backend = "ascend" if get_platform().is_npu else "mooncake"
             if (
                 cfg.enable_dsa_cache_layer_split
-                and cfg.disaggregation_transfer_backend != "mooncake"
+                and cfg.disaggregation_transfer_backend != allowed_transfer_backend
             ):
                 raise ValueError(
                     "--enable-dsa-cache-layer-split currently only supports "
-                    "the mooncake transfer backend (mooncake / mooncake_tcp). "
-                    f"Got --disaggregation-transfer-backend "
+                    "the mooncake transfer backend on GPU, or ascend on NPU. Got "
+                    f"--disaggregation-transfer-backend "
                     f"{cfg.disaggregation_transfer_backend!r}. mori/nixl "
                     "support will be added later by the community."
                 )
             if cfg.enable_dsa_cache_layer_split and cfg.pp_size > 1:
-                raise ValueError(
-                    "--enable-dsa-cache-layer-split is not supported with "
-                    "pipeline parallelism (pp_size > 1) yet. It requires "
-                    "prefill context parallelism, and CP + PP has not been "
-                    "validated for this feature."
-                )
+                if not get_platform().is_npu:
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split is not supported with "
+                        "pipeline parallelism (pp_size > 1) yet. It requires "
+                        "prefill context parallelism, and CP + PP has not been "
+                        "validated for this feature."
+                    )
 
         else:
             # DeepSeek V3/R1/V3.1
             if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
                 logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
 
-            # The sm100 trtllm_mla fill moved to the override registry
-            # (arg_groups/overrides.py: _deepseek_family_overrides).
-
-            # MLA prefill CP auto-config: the field declarations moved to
-            # the override registry (arg_groups/overrides.py:
-            # _deepseek_family_overrides).
             if cfg.enable_prefill_cp and use_mla_backend(server_args):
                 declare_resolution(
                     server_args,
@@ -536,8 +523,6 @@ def handle_model_specific_adjustments(server_args: Any):
         envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
 
     elif model_arch in ["GptOssForCausalLM"]:
-        # Attention backend selection + XPU dtype validation moved to the
-        # override registry (arg_groups/overrides.py: _gpt_oss_overrides).
         # Exempt MLX only: none of these backends exist on MPS, and MLX runs
         # attention inside its own runner, so attention_backend is still
         # unset here.  Plain macOS stays on the list -- torch_native has
@@ -591,28 +576,15 @@ def handle_model_specific_adjustments(server_args: Any):
                     f"attention TP size is {expected_attn_tp_size}."
                 )
 
-        # enable_multi_layer_eagle for EAGLE moved to the override registry
-        # (arg_groups/overrides.py: _mimo_v2_overrides).
-
         # MiMoV2 hierarchical cache runs on the unified radix tree, which
         # is the default tree cache now. MiMoV2 has head_dim != v_head_dim,
         # so the host KV pool uses asymmetric K/V allocation. Both
         # kernel/page_first and direct/page_first_direct have split K/V
         # transfer paths.
     elif (
-        "Step3p5ForCausalLM" in model_arch
-        or "Step3p7ForConditionalGeneration" in model_arch
-    ):
-        # Attention backend selection + EAGLE multi-layer +
-        # hierarchical-cache SWA writes moved to the override registry
-        # (arg_groups/overrides.py: _step3p_overrides).
-        pass
-    elif (
         model_arch in ("Llama4ForConditionalGeneration", "Llama4ForCausalLM")
         and cfg.device != "cpu"
     ):
-        # Attention backend auto-select moved to the override registry
-        # (arg_groups/overrides.py: _llama4_overrides).
         attention_backend = resolved_view(server_args).attention_backend
         assert attention_backend in {
             "fa3",
@@ -624,17 +596,11 @@ def handle_model_specific_adjustments(server_args: Any):
         }, (
             f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {attention_backend}"
         )
-        # The moe_runner_backend selection moved to the override registry
-        # (arg_groups/overrides.py: _llama4_overrides).
-    # Gemma2/Gemma3 (disable_hybrid_swa_memory) moved to the override registry
-    # (arg_groups/overrides.py: _gemma2_gemma3_overrides).
     elif model_arch in (
         "Gemma4ForConditionalGeneration",
         "Gemma4ForCausalLM",
         "Gemma4UnifiedForConditionalGeneration",
     ):
-        # Default attention backend selection moved to the override registry
-        # (arg_groups/overrides.py: _gemma4_overrides).
         prefill_backend, decode_backend = attention_backends_of(
             resolved_view(server_args)
         )
@@ -645,13 +611,6 @@ def handle_model_specific_adjustments(server_args: Any):
             f"Gemma4 only supports attention backends in {accepted_backends}, "
             f"got prefill={prefill_backend}, decode={decode_backend}"
         )
-
-        # The quantization/moe_runner_backend resolution moved to the override
-        # registry (arg_groups/overrides.py: _gemma4_overrides).
-    elif model_arch == "MossVLForConditionalGeneration":
-        # The prefill attention backend default + validation moved to the
-        # override registry (arg_groups/overrides.py: _moss_vl_overrides).
-        pass
     elif model_arch in [
         "Exaone4ForCausalLM",
         "ExaoneMoEForCausalLM",
@@ -679,40 +638,11 @@ def handle_model_specific_adjustments(server_args: Any):
         )
 
         logger.info(f"Using {attention_backend} as attention backend for {model_arch}.")
-    elif model_arch in [
-        "Qwen3MoeForCausalLM",
-        "Qwen3VLMoeForConditionalGeneration",
-        "Qwen3NextForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-        "InternS2PreviewForConditionalGeneration",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen4ExpForConditionalGeneration",
-    ]:
-        # The quantization/moe_runner_backend resolution moved to the
-        # override registry (arg_groups/overrides.py:
-        # _qwen3_moe_family_overrides); the hybrid sub-family's attention
-        # backend + page size defaults to _qwen3_5_hybrid_overrides.
-        pass
-
-    elif model_arch in ["Glm4MoeForCausalLM"]:
-        # The quantization/moe_runner_backend/enable_tf32_matmul resolution
-        # moved to the override registry (arg_groups/overrides.py:
-        # _glm4_moe_overrides).
-        pass
-
     elif model_arch in ["Lfm2ForCausalLM", "Lfm2MoeForCausalLM"]:
-        # Attention backend selection moved to the override registry
-        # (arg_groups/overrides.py: _lfm2_overrides).
         assert resolved_view(server_args).attention_backend != "triton", (
             f"{model_arch} does not support triton attention backend, "
             "as the first layer might not be an attention layer"
         )
-
-    # MiniMaxM2ForCausalLM (enable_tf32_matmul) moved to the override registry
-    # (arg_groups/overrides.py: _minimax_m2_overrides).
-
-    # Qwen3VL aiter unified-attention page_size moved to the override registry
-    # (arg_groups/overrides.py: _qwen3vl_overrides).
 
     # Hybrid-mamba radix cache handling for the per-arch branch call sites
     # dissolved above: the resolution pass self-guards on the arch union

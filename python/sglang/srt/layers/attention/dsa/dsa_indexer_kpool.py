@@ -34,8 +34,6 @@ from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import ceil_align, is_cuda, is_gfx1250_supported, is_hip, is_npu
 
-_is_npu = is_npu()
-
 if is_cuda():
     try:
         import deep_gemm
@@ -246,19 +244,19 @@ class IndexerKPool(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-    @torch.compile(dynamic=True, disable=_is_npu)
+    @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x.float())
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
 
-    @torch.compile(dynamic=True, disable=_is_npu)
+    @torch.compile(dynamic=True)
     def _project_and_scale_head_gates(self, x: torch.Tensor) -> torch.Tensor:
         weights, _ = self.weights_proj(x.float())
         return weights * self.n_heads**-0.5
 
-    @torch.compile(dynamic=True, disable=_is_npu)
+    @torch.compile(dynamic=True)
     def _apply_q_scale_and_softmax_scale(
         self, weights: torch.Tensor, q_scale: torch.Tensor
     ) -> torch.Tensor:
@@ -296,7 +294,6 @@ class IndexerKPool(MultiPlatformOp):
         slot_k,
         slot_score,
         write_locs,
-        forward_batch,
         layer_id,
         write_mask=None,
         return_compressed: bool = False,
@@ -337,7 +334,7 @@ class IndexerKPool(MultiPlatformOp):
 
     @staticmethod
     def _write_returned_compressed_pooled_index_cache(
-        forward_batch, layer_id, write_locs, k_fp8, k_scale
+        layer_id, write_locs, k_fp8, k_scale
     ):
         if k_fp8.shape[0] == 0:
             return
@@ -558,7 +555,6 @@ class IndexerKPool(MultiPlatformOp):
                     slot_k,
                     slot_score,
                     write_locs,
-                    forward_batch,
                     layer_id,
                     return_compressed=use_returned_compressed,
                     write_cache=write_cache,
@@ -1336,7 +1332,6 @@ class IndexerKPool(MultiPlatformOp):
                     )
                     with torch.cuda.stream(self.alt_stream):
                         self._write_returned_compressed_pooled_index_cache(
-                            forward_batch,
                             layer_id,
                             write_locs,
                             write_k_fp8,
@@ -1463,7 +1458,6 @@ class IndexerKPool(MultiPlatformOp):
             if pool_seq_len > 0 and deferred_cache_write is not None:
                 write_locs, curr_k_fp8, curr_k_scale = deferred_cache_write
                 self._write_returned_compressed_pooled_index_cache(
-                    forward_batch,
                     layer_id,
                     write_locs,
                     curr_k_fp8,
@@ -1497,14 +1491,6 @@ class IndexerKPool(MultiPlatformOp):
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
-        if metadata.attn_metadata.kpool_extend_plan is not None:
-            return self._get_topk_ragged_kpool_plan(
-                forward_batch,
-                layer_id,
-                q_fp8,
-                weights,
-                metadata,
-            )
         return self._get_topk_ragged_kpool(
             forward_batch,
             layer_id,
@@ -1520,7 +1506,6 @@ class IndexerKPool(MultiPlatformOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
-        act_quant,
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
@@ -1540,6 +1525,27 @@ class IndexerKPool(MultiPlatformOp):
             return None
 
         return self._full_topk_for_short_sequence(metadata, x.device)
+
+    def forward_k_only(
+        self,
+        *,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> None:
+        """Write the pooled indexer K cache and tails for the batch's tokens."""
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+        if metadata is None:
+            return
+        self._forward_cuda_skip_logits(
+            x,
+            positions,
+            forward_batch,
+            layer_id,
+            metadata=metadata,
+            return_indices=False,
+        )
 
     def _forward_cuda_target_verify(
         self,
@@ -1747,7 +1753,6 @@ class IndexerKPool(MultiPlatformOp):
                 positions,
                 forward_batch,
                 layer_id,
-                act_quant,
                 metadata,
                 return_indices,
             )

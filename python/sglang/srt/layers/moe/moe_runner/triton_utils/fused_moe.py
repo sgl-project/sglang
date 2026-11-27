@@ -28,6 +28,7 @@ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
@@ -38,17 +39,13 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
     is_musa,
-    is_npu,
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-
-_is_npu = is_npu()
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .moe_align_block_size import moe_align_block_size
@@ -60,7 +57,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 
@@ -418,13 +415,13 @@ def fused_experts(
         )
 
 
-@torch.compile(disable=_is_npu)
+@torch.compile
 def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     torch.sum(x, dim=1, out=out)
     out.mul_(routed_scaling_factor)
 
 
-@torch.compile(disable=_is_npu)
+@torch.compile
 def _swiglu_silu_clamp_mul(x, gemm1_limit):
     gate, up = x.chunk(2, dim=-1)
     gate = F.silu(gate)
@@ -433,7 +430,7 @@ def _swiglu_silu_clamp_mul(x, gemm1_limit):
     return gate * up
 
 
-@torch.compile(disable=_is_npu)
+@torch.compile
 def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     # NOTE: This variant uses gemm1_alpha, unlike _swiglu_silu_clamp_mul.
     # At present, only GPT-OSS uses this variant.
@@ -443,7 +440,7 @@ def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
 
-@torch.compile(disable=_is_npu)
+@torch.compile
 def swiglu_no_interleaved_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
     gate, up = x.chunk(2, dim=-1)
     gate = gate.clamp(min=None, max=gemm1_limit)
