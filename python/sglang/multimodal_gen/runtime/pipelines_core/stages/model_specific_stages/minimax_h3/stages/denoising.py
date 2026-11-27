@@ -14,6 +14,9 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+    in_warmup_forward,
+)
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
@@ -1252,7 +1255,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             call_kwargs.pop("adaln_timestep_bits", None)
             token = live_packed_prompt.set(packed_branches[key])
             try:
-                if capture_bcg and not self._bcg_is_warmup():
+                if capture_bcg and not in_warmup_forward():
                     padded = self._bcg_pad_prompt_kwargs(
                         call_kwargs, current_model=model
                     )

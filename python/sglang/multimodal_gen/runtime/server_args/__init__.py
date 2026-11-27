@@ -2,8 +2,7 @@
 
 from sglang.multimodal_gen.runtime.server_args import server_args as _server_args
 from sglang.multimodal_gen.runtime.server_args.server_args import (
-    BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
-    BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
+    BCG_VALIDATED_CHECKPOINTS,
     DEFAULT_BCG_TEXT_BUCKETS,
     LORA_MERGE_MODES,
     LTX2_TWO_STAGE_DEVICE_MODE_CHOICES,
@@ -20,8 +19,7 @@ from sglang.multimodal_gen.runtime.server_args.server_args import (
 
 __all__ = [
     "Backend",
-    "BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS",
-    "BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS",
+    "BCG_VALIDATED_CHECKPOINTS",
     "DEFAULT_BCG_TEXT_BUCKETS",
     "LORA_MERGE_MODES",
     "LTX2_TWO_STAGE_DEVICE_MODE_CHOICES",

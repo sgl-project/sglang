@@ -198,114 +198,53 @@ WARMUP_MODES = ("off", "request", "server")
 # of different lengths share one captured graph.
 DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
-BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
-    {
-        "anima-base-v1.0-diffusers",
-        "black-forest-labs/flux.1-dev",
-        "circlestone-labs/anima-base-v1.0-diffusers",
-        "comfy-org/ideogram-4",
-        "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
-        "efficient-large-model/sana-video_2b_480p_diffusers",
-        "efficient-large-model/sana-video_2.0_5b_720p",
-        "sana1.5_1.6b_1024px_diffusers",
-        "sana-video_2b_480p_diffusers",
-        "sana-video_2.0_5b_720p",
-        "fal/ideogram-v4-fast",
-        "fal/ideogram-v4-instant",
-        "flux.1-dev",
-        "glm-image",
-        "hy-nomas",
-        "tencent/hy-nomas",
-        "ideogram-4",
-        "ideogram-4-fp8",
-        "ideogram-4-nf4",
-        "ideogram-v4-fast",
-        "ideogram-v4-instant",
-        "ideogram-ai/ideogram-4-fp8",
-        "ideogram-ai/ideogram-4-nf4",
-        "jdopensource/joyai-echo",
-        "joyai-echo",
-        "lightricks/ltx-2",
-        "lightricks/ltx-2.3",
-        "lightricks/ltx-2.5-diffusers",
-        "meituan-longcat/longcat-image",
-        "meituan-longcat/longcat-image-edit-turbo",
-        "ltx-2",
-        "ltx-2.3",
-        "ltx-2.5-diffusers",
-        "minimax-h3",
-        "minimax-h3-image",
-        "minimaxai/minimax-h3",
-        "minimaxai/minimax-h3-image",
-        "inclusionai/ming-image-0.1-design",
-        "inclusionai/ming-image-0.1-design-layer",
-        "ming-image-0.1-design",
-        "ming-image-0.1-design-layer",
-        "qwen/qwen-image",
-        "qwen/qwen-image-2512",
-        "qwen/qwen-image-2.1",
-        "qwen-image",
-        "qwen-image-2512",
-        "qwen-image-2.1",
-        "tongyi-mai/z-image",
-        "tongyi-mai/z-image-turbo",
-        "zai-org/glm-image",
-        "z-image",
-        "z-image-turbo",
-        "black-forest-labs/flux.2-klein-4b",
-        "black-forest-labs/flux.2-klein-9b",
-        "flux.2-klein-4b",
-        "flux.2-klein-9b",
-    }
-)
-
-BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
-    {
-        "AnimaPipelineConfig",
-        "Flux3ImagePipelineConfig",
-        "FluxPipelineConfig",
-        "GlmImagePipelineConfig",
-        "Ideogram4PipelineConfig",
-        "JoyEchoPipelineConfig",
-        "LTX2PipelineConfig",
-        "LTX23PipelineConfig",
-        "LongCatImagePipelineConfig",
-        "LongCatImageEditPipelineConfig",
-        "MiniMaxH3PipelineConfig",
-        "MiniMaxH3ImagePipelineConfig",
-        "MingImagePipelineConfig",
-        "MingImageLayerPipelineConfig",
-        "NomasPipelineConfig",
-        "QwenImagePipelineConfig",
-        "QwenImage21PipelineConfig",
-        "SanaPipelineConfig",
-        "SanaVideoPipelineConfig",
-        "SanaVideo2PipelineConfig",
-        "ZImagePipelineConfig",
-        "Flux2KleinPipelineConfig",
-    }
-)
-
-# Pipeline configs identified purely by ``--pipeline-class-name`` (their weights
-# are local paths, not HuggingFace ids), so the model-id whitelist does not
-# apply: selecting the pipeline is already an explicit opt-in.
-BREAKABLE_CUDA_GRAPH_MODEL_ID_EXEMPT_PIPELINE_CONFIGS = frozenset(
-    {"Flux3ImagePipelineConfig"}
+# Setups validated with breakable CUDA graphs: pipeline config -> lowercase repo
+# names of its checkpoints. None validates every checkpoint of the config: its
+# weights are local paths, so selecting the pipeline is the opt-in.
+BCG_VALIDATED_CHECKPOINTS: dict[str, tuple[str, ...] | None] = {
+    "AnimaPipelineConfig": ("anima-base-v1.0-diffusers",),
+    "Flux2KleinPipelineConfig": ("flux.2-klein-4b", "flux.2-klein-9b"),
+    "Flux3ImagePipelineConfig": None,
+    "FluxPipelineConfig": ("flux.1-dev",),
+    "GlmImagePipelineConfig": ("glm-image",),
+    "Ideogram4DistilledPipelineConfig": ("ideogram-v4-fast", "ideogram-v4-instant"),
+    "Ideogram4PipelineConfig": ("ideogram-4", "ideogram-4-fp8", "ideogram-4-nf4"),
+    "JoyEchoPipelineConfig": ("joyai-echo",),
+    "LTX2PipelineConfig": ("ltx-2",),
+    "LTX23PipelineConfig": ("ltx-2.3",),
+    "LTX25PipelineConfig": ("ltx-2.5-diffusers",),
+    "LongCatImageEditPipelineConfig": ("longcat-image-edit-turbo",),
+    "LongCatImagePipelineConfig": ("longcat-image",),
+    "MingImageLayerPipelineConfig": ("ming-image-0.1-design-layer",),
+    "MingImagePipelineConfig": ("ming-image-0.1-design",),
+    "MiniMaxH3ImagePipelineConfig": ("minimax-h3-image",),
+    "MiniMaxH3PipelineConfig": ("minimax-h3",),
+    "NomasPipelineConfig": ("hy-nomas",),
+    "QwenImage21PipelineConfig": ("qwen-image-2.1",),
+    "QwenImagePipelineConfig": ("qwen-image", "qwen-image-2512"),
+    "SanaPipelineConfig": ("sana1.5_1.6b_1024px_diffusers",),
+    "SanaVideo2PipelineConfig": ("sana-video_2.0_5b_720p",),
+    "SanaVideoPipelineConfig": ("sana-video_2b_480p_diffusers",),
+    "ZImagePipelineConfig": ("z-image", "z-image-turbo"),
+}
+# A checkpoint is matched by name alone, under whichever config resolves it.
+_BCG_VALIDATED_CHECKPOINT_NAMES = frozenset(
+    name for names in BCG_VALIDATED_CHECKPOINTS.values() for name in names or ()
 )
 
 
-def _normalized_bcg_model_refs(model_ref: str | None) -> set[str]:
+def _bcg_checkpoint_names(model_ref: str | None) -> set[str]:
     if not model_ref:
         return set()
 
     normalized = str(model_ref).strip().rstrip("/").lower()
-    refs = {normalized, os.path.basename(normalized)}
+    names = {os.path.basename(normalized)}
 
     if "models--" in normalized:
-        hf_cache_name = normalized.split("models--", 1)[1].split("/", 1)[0]
-        refs.add(hf_cache_name.replace("--", "/"))
+        hf_cache_repo = normalized.split("models--", 1)[1].split("/", 1)[0]
+        names.add(hf_cache_repo.rsplit("--", 1)[-1])
 
-    return refs
+    return names
 
 
 @dataclasses.dataclass
@@ -827,21 +766,6 @@ class ServerArgs(DisaggServerArgsMixin):
             )
             self.enable_breakable_cuda_graph = False
             return
-        # BCG graphs are captured per resolution and only replay for that exact
-        # latent shape, so the user must declare the resolutions up front. We
-        # capture every one of them at warmup; serving then never re-captures.
-        if not self.warmup_resolutions:
-            # No explicit resolutions: capture the model's default warmup
-            # resolution (derived by build_warmup_reqs) so
-            # --enable-breakable-cuda-graph works standalone. BCG graphs are
-            # resolution-specific; a request at any other resolution simply
-            # falls back to eager (the runner never re-captures at serving
-            # time). Pass --warmup-resolutions to capture additional shapes.
-            logger.info(
-                "[Diffusion BCG] --warmup-resolutions unset; capturing the "
-                "model default warmup resolution. Requests at other "
-                "resolutions run eager."
-            )
         if self._is_video_gen_task() and self.warmup_num_frames is None:
             default_frames = self._bcg_default_warmup_num_frames()
             logger.info(
@@ -887,31 +811,25 @@ class ServerArgs(DisaggServerArgsMixin):
         if not self.enable_breakable_cuda_graph:
             return
 
-        pipeline_config = getattr(self, "pipeline_config", None)
-        pipeline_config_name = type(pipeline_config).__name__
-        # The lists record validated checkpoints, not what can capture. An
+        # The table records validated checkpoints, not what can capture. An
         # explicit request elsewhere stays on with a warning: warmup reports a
         # denoising stage that captures nothing, and a captured segment that
         # branches on Python-side state replays its capture-time branch.
+        pipeline_config_name = type(self.pipeline_config).__name__
         if not (
-            pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
+            pipeline_config_name in BCG_VALIDATED_CHECKPOINTS
             and (
-                pipeline_config_name
-                in BREAKABLE_CUDA_GRAPH_MODEL_ID_EXEMPT_PIPELINE_CONFIGS
+                BCG_VALIDATED_CHECKPOINTS[pipeline_config_name] is None
                 or self._is_breakable_cuda_graph_supported_model()
             )
         ):
             logger.warning(
                 "[Diffusion BCG] not validated for %s (%s); enabling it as "
                 "requested. Warmup warns if nothing gets captured; compare outputs "
-                "against eager before relying on it. Validated: Anima Base v1.0, "
-                "FLUX.1-dev, FLUX.2-Klein, FLUX.3 Image Klein, "
-                "Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
-                "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
-                "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, SANA-Video 2.0, "
-                "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image.",
+                "against eager before relying on it. Validated checkpoints: %s.",
                 pipeline_config_name,
                 self.model_path,
+                ", ".join(sorted(_BCG_VALIDATED_CHECKPOINT_NAMES)),
             )
         # ComfyUI requests carry the sampler's tensors, which a synthetic warmup
         # cannot build; the ComfyUI step stage captures on its first real step.
@@ -965,9 +883,9 @@ class ServerArgs(DisaggServerArgsMixin):
         return enabled
 
     def _is_breakable_cuda_graph_supported_model(self) -> bool:
-        refs = _normalized_bcg_model_refs(self.model_id)
-        refs.update(_normalized_bcg_model_refs(self.model_path))
-        return bool(refs & BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
+        names = _bcg_checkpoint_names(self.model_id)
+        names.update(_bcg_checkpoint_names(self.model_path))
+        return not names.isdisjoint(_BCG_VALIDATED_CHECKPOINT_NAMES)
 
     def _default_bcg_warmup_resolution(self) -> None:
         """Seed --warmup-resolutions with the model default for BCG.

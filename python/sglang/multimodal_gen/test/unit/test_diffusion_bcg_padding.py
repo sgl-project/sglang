@@ -36,8 +36,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import (
-    BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
-    BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
+    BCG_VALIDATED_CHECKPOINTS,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import _print_warning_once
 
@@ -805,12 +804,8 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(out["encoder_hidden_states"].shape, (1, 300, 2304))
         self.assertEqual(out["encoder_attention_mask"].shape, (1, 300))
         self.assertIn(
-            "efficient-large-model/sana-video_2b_480p_diffusers",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
-        )
-        self.assertIn(
-            "SanaVideoPipelineConfig",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
+            "sana-video_2b_480p_diffusers",
+            BCG_VALIDATED_CHECKPOINTS["SanaVideoPipelineConfig"],
         )
 
     def test_flux_unmasked_conditioning_keeps_one_signature_for_all_buckets(self):
