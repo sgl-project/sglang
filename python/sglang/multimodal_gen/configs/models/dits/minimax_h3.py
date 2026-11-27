@@ -134,6 +134,9 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     has_gate_compress: bool = False
     # VDN-H3: None for the dense model; set from transformer/config.json
     hybrid_attention: VDNHybridAttentionArchConfig | None = None
+    # pi-H3 DWD adapters: the decoder-free pixel head's geometry, from
+    # transformer/config.json; None without a pixel head
+    dwd_head_config: dict | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
