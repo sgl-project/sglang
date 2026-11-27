@@ -114,7 +114,7 @@ def _accept_sampling_core(
     target_logits: torch.Tensor,
     draft_probs: torch.Tensor,
     sampling_info,
-    draft_input: DFlashDraftInputV2,
+    draft_input: Optional[DFlashDraftInputV2],
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
@@ -178,8 +178,10 @@ def _accept_sampling_core(
             sampling_info=sampling_info,
             draft_token_num=verify_num_draft_tokens,
             bs=bs,
-            max_top_k=draft_input.max_top_k,
-            uniform_top_k_value=draft_input.uniform_top_k_value,
+            max_top_k=None if draft_input is None else draft_input.max_top_k,
+            uniform_top_k_value=(
+                None if draft_input is None else draft_input.uniform_top_k_value
+            ),
         )
     (
         retrieve_index,

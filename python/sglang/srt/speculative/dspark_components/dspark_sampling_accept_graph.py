@@ -5,8 +5,7 @@ The static verify graph folds only the greedy accept (DsparkVerifyEpilogue). On 
 all-sampled step the rest ran eagerly after the replay: the draft and target softmax,
 the rejection kernel, the bonus gather, the accept-site TP broadcast, the engram
 history commit, the future relay and the target-hidden KV commit. This module captures
-that region once per verify-graph batch size and replays it right after the verify
-graph.
+that region once per verify graph and replays it right after the verify graph.
 
 The region reads the verify graph's static inputs and outputs (``static_io``) and the
 draft sampler's static buffers, which hold this step's values after both replays, so a
@@ -21,7 +20,7 @@ the region (pynccl inside the graph), so TP ranks agree as in the eager path. Wi
 deferred draft KV store, the verify graph already joined this step's projection, so
 the region stages the stores from it.
 
-The caller routes only all-sampled steps without top-k / top-p, logit adjustments or
+The caller routes only all-sampled steps without top-k / min-p, logit adjustments or
 grammar; everything else keeps the eager accept. Under SGLANG_SIMULATE_ACC_LEN the region
 draws the bonus at the simulated row from the buffers the caller stages with
 begin_sim_bonus.
@@ -39,6 +38,9 @@ import torch
 
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import RejectionNoise
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_capture_stream,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     AcceptOuts,
@@ -54,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 class GraphSamplingInfo(msgspec.Struct, frozen=True):
     """The SamplingBatchInfo fields the sampling accept reads, for an all-sampled
-    batch without top-k / top-p / min-p."""
+    batch without top-k / min-p."""
 
     temperatures: torch.Tensor
     is_all_greedy: bool = False
@@ -62,6 +64,7 @@ class GraphSamplingInfo(msgspec.Struct, frozen=True):
     need_top_k_sampling: bool = False
     need_top_p_sampling: bool = False
     need_min_p_sampling: bool = False
+    top_ps: Optional[torch.Tensor] = None
 
 
 def sampling_accept_commit_lens(
@@ -75,6 +78,7 @@ def sampling_accept_commit_lens(
     tp_sync: SpecTpSync,
     block_verification: bool,
     rejection_noise: Optional[RejectionNoise],
+    top_p: bool = False,
 ) -> Optional[torch.Tensor]:
     """The eager sampling accept and finalize into the epilogue's static buffers;
     returns the gated commit lengths when ``gated``."""
@@ -95,7 +99,11 @@ def sampling_accept_commit_lens(
         target_logits=io.logits,
         draft_block=draft_block,
         # params.temperatures is the batch's, clamped at 1e-5 (resolve_draft_params).
-        sampling_info=GraphSamplingInfo(temperatures=params.temperatures[:bs]),
+        sampling_info=GraphSamplingInfo(
+            temperatures=params.temperatures[:bs].view(-1, 1),
+            need_top_p_sampling=top_p,
+            top_ps=params.top_ps[:bs] if top_p else None,
+        ),
         draft_input=None,
         gamma=stride - 1,
         verify_num_draft_tokens=stride,
@@ -127,11 +135,11 @@ def sampling_accept_commit_lens(
 
 
 class DsparkSamplingAcceptGraph:
-    """Per-batch-size CUDA graphs of the sampling accept region of static verify."""
+    """Per-verify-graph CUDA graphs of the sampling accept region of static verify."""
 
-    # One key per verify-graph batch size is expected; more means addresses move,
-    # and the further keys run eagerly. Arbitrary bound.
-    MAX_GRAPHS = 32
+    # Two keys per verify graph are expected (with and without top-p). More means
+    # addresses move, and the further keys run eagerly. Arbitrary bound.
+    MAX_GRAPHS = 128
 
     def __init__(
         self,
@@ -153,12 +161,20 @@ class DsparkSamplingAcceptGraph:
         self._graphs: dict[Hashable, torch.cuda.CUDAGraph] = {}
         self._warmed_up: set[Hashable] = set()
         self._pool = None
+        self._capture_stream: Optional[torch.cuda.Stream] = None
         self.disabled = False
         self.num_replays = 0
         # Set by run(): whether this step's region committed the engram history.
         self.committed_engram = False
 
-    def run(self, *, bs: int, target_logits: torch.Tensor) -> Optional[AcceptOuts]:
+    def run(
+        self,
+        *,
+        bs: int,
+        target_logits: torch.Tensor,
+        target_hidden: torch.Tensor,
+        top_p: bool = False,
+    ) -> Optional[AcceptOuts]:
         """This step's accept through the region, or None when the step must take the
         eager path. Reads only host state every TP rank holds identically."""
         if self.disabled:
@@ -169,20 +185,22 @@ class DsparkSamplingAcceptGraph:
         ):
             return None
         epilogue = self._epilogue
-        graph_bs = min((b for b in epilogue.static_io if b >= bs), default=None)
+        graph_bs = min((b for b, _ in epilogue.static_io if b >= bs), default=None)
         if graph_bs is None:
             return None
-        io = epilogue.static_io[graph_bs]
+        io = epilogue.static_io.get((graph_bs, target_hidden.data_ptr()))
         # The replayed verify graph must be the one whose buffers were recorded.
-        if target_logits.data_ptr() != io.logits.data_ptr():
+        if io is None or target_logits.data_ptr() != io.logits.data_ptr():
             return None
         key = (
             graph_bs,
             io.logits.data_ptr(),
+            io.hidden.data_ptr(),
             draft_sampler.params.temperatures.data_ptr(),
             0
             if draft_sampler.step_logits is None
             else draft_sampler.step_logits.data_ptr(),
+            top_p,
         )
         region = partial(
             epilogue.run_static,
@@ -194,6 +212,7 @@ class DsparkSamplingAcceptGraph:
                 tp_sync=self._tp_sync,
                 block_verification=self._block_verification,
                 rejection_noise=self._rejection_noise,
+                top_p=top_p,
             ),
             gate=self._gate,
             kv_projected=True,
@@ -208,13 +227,25 @@ class DsparkSamplingAcceptGraph:
             if key not in self._warmed_up:
                 if len(self._warmed_up) < self.MAX_GRAPHS:
                     self._warmed_up.add(key)
-                region()
+                    self._warm_up(region)
+                else:
+                    region()
                 return
             graph = self._capture(key, region)
             if graph is None:
                 return
         graph.replay()
         self.num_replays += 1
+
+    def _warm_up(self, region: Callable[[], object]) -> None:
+        """Run on the capture stream: split sampling keeps scratch per stream."""
+        if self._capture_stream is None:
+            self._capture_stream = get_or_create_global_graph_capture_stream()
+        current = torch.cuda.current_stream()
+        self._capture_stream.wait_stream(current)
+        with torch.cuda.stream(self._capture_stream):
+            region()
+        current.wait_stream(self._capture_stream)
 
     def _capture(
         self, key: Hashable, region: Callable[[], object]
@@ -225,7 +256,7 @@ class DsparkSamplingAcceptGraph:
         try:
             # graph_capture() enables pynccl, which the in-graph accept broadcast needs.
             with (
-                graph_capture() as ctx,
+                graph_capture(stream=self._capture_stream) as ctx,
                 torch.cuda.graph(
                     graph,
                     pool=self._pool,

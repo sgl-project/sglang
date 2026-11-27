@@ -67,6 +67,7 @@ class TestSampleDraftBlock(CustomTestCase):
                 is_all_greedy=False,
                 temperatures=torch.tensor([[0.7], [1.0], [1.0], [1.3]]),
                 top_ks=torch.tensor([1, 50, 1, 50]),
+                top_ps=torch.ones(4),
             )
             offset = torch.zeros(1, dtype=torch.int64)
             block, base, hidden, anchor = _draft(head, sampling_info, offset)
@@ -95,6 +96,7 @@ class TestSampleDraftBlock(CustomTestCase):
             is_all_greedy=False,
             temperatures=torch.tensor([[0.7], [1.0], [1.0], [1.3]]),
             top_ks=torch.tensor([50, 50, 1, 50]),
+            top_ps=torch.ones(4),
         )
         offset = torch.zeros(1, dtype=torch.int64)
         block, base, hidden, anchor = _draft(
@@ -250,9 +252,9 @@ class TestMegakernelDraftSampler(CustomTestCase):
 class TestDraftParamsRestage(CustomTestCase):
     def test_the_draft_params_are_restaged_only_when_their_inputs_change(self):
         """The draft graph's sampling params are copied from the batch's temperature /
-        top-k tensors; a step whose sampler, bs and tensors are the ones last staged
-        skips the copy, and any change (a rebound tensor after filter / merge, a new
-        bs, another sampler) restages."""
+        top-k / top-p tensors; a step whose sampler, bs and tensors are the ones last
+        staged skips the copy, and any change (a rebound tensor after filter / merge, a
+        new bs, another sampler) restages."""
 
         proposer = SimpleNamespace(
             _staged_params_key=None,
@@ -265,7 +267,9 @@ class TestDraftParamsRestage(CustomTestCase):
                 (kw["bs"], kw["sampling_info"])
             )
         )
-        info = SimpleNamespace(temperatures=torch.ones(4), top_ks=torch.ones(4))
+        info = SimpleNamespace(
+            temperatures=torch.ones(4), top_ks=torch.ones(4), top_ps=torch.ones(4)
+        )
 
         def stage(sampler, bs, sampling_info):
             DraftBlockProposer._stage_sampling_params(
@@ -277,13 +281,15 @@ class TestDraftParamsRestage(CustomTestCase):
         info.temperatures = info.temperatures[:3]  # rebound, as filter_batch does
         stage(sampler, 3, info)
         stage(sampler, 2, info)  # another bs
+        info.top_ps = info.top_ps[:2]
+        stage(sampler, 2, info)  # top-p rebound
         other = SimpleNamespace(stage_sampling_params=sampler.stage_sampling_params)
         stage(other, 2, info)  # another sampler
         stage(other, 2, None)
         stage(other, 2, None)  # no sampling info twice: skipped
-        self.assertEqual([bs for bs, _ in staged], [4, 3, 2, 2, 2])
+        self.assertEqual([bs for bs, _ in staged], [4, 3, 2, 2, 2, 2])
         self.assertEqual(proposer.num_staged_params_skips, 2)
-        self.assertEqual(proposer.num_staged_params_calls, 7)
+        self.assertEqual(proposer.num_staged_params_calls, 8)
 
 
 if __name__ == "__main__":

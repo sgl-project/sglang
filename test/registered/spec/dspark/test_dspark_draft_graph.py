@@ -161,6 +161,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
             is_all_greedy=False,
             temperatures=(torch.rand(BS, 1, device=DEVICE) + 0.3),
             top_ks=torch.tensor([1, 40] * (BS // 2), device=DEVICE),
+            top_ps=torch.ones(BS, device=DEVICE),
         )
         sampler.stage_sampling_params(bs=BS, sampling_info=sampling_info)
         sampler(hidden, input_ids)  # warm up outside the capture

@@ -9,6 +9,7 @@ import msgspec
 import pytest
 import torch
 
+from sglang.srt.runtime_context import get_context, reset_context
 from sglang.srt.speculative.dspark_components import dspark_sampling_accept_graph as sag
 from sglang.srt.speculative.dspark_components import (
     dspark_verify,
@@ -75,7 +76,9 @@ def test_routes_only_all_sampled_static_steps():
     assert not _eligible(worker, None)
     assert not _eligible(worker, _sampling_info(is_any_greedy=True))
     assert not _eligible(worker, _sampling_info(need_top_k_sampling=True))
-    assert not _eligible(worker, _sampling_info(need_top_p_sampling=True))
+    assert _eligible(worker, _sampling_info(need_top_p_sampling=True))
+    top_p = _sampling_info(need_top_p_sampling=True)
+    assert not _eligible(worker, top_p, sim_bonus=top_p)
     assert not _eligible(worker, _sampling_info(need_min_p_sampling=True))
     assert not _eligible(worker, _sampling_info(watermark=object()))
     assert not _eligible(worker, _sampling_info(logit_bias=torch.zeros(1)))
@@ -113,18 +116,20 @@ def _gpu_case(*, bs, graph_bs, vocab, seed):
         greedy_draft=False,
         step_logits=step_logits,
         params=SimpleNamespace(
-            temperatures=temps, greedy_mask=torch.zeros(8, dtype=torch.bool, device=dev)
+            temperatures=temps,
+            greedy_mask=torch.zeros(8, dtype=torch.bool, device=dev),
+            top_ps=torch.ones(8, device=dev),
         ),
     )
     epi = dspark_verify.DsparkVerifyEpilogue(
         max_bs=8, verify_num_draft_tokens=STRIDE, device=dev, tp_sync=_tp_sync()
     )
-    epi.static_io[graph_bs] = io
+    epi.static_io[(graph_bs, io.hidden.data_ptr())] = io
     epi.begin_static_step(bs, armed=False)
     return io, sampler, epi
 
 
-def _eager_reference(io, sampler, bs, rejection_noise=None):
+def _eager_reference(io, sampler, bs, rejection_noise=None, top_ps=None):
     """The worker's eager sampling accept on the live rows only."""
     cand = io.candidates[:bs]
     params = sampler.params
@@ -135,7 +140,11 @@ def _eager_reference(io, sampler, bs, rejection_noise=None):
         temperatures=params.temperatures[:bs],
         greedy_draft=False,
     )
-    info = sag.GraphSamplingInfo(temperatures=params.temperatures[:bs].view(bs, 1))
+    info = sag.GraphSamplingInfo(
+        temperatures=params.temperatures[:bs].view(bs, 1),
+        need_top_p_sampling=top_ps is not None,
+        top_ps=None if top_ps is None else top_ps[:bs],
+    )
     correct_len, bonus, trim = dspark_verify.accept_draft_tokens(
         candidates=cand,
         target_logits=io.logits[: bs * STRIDE],
@@ -160,8 +169,8 @@ def _eager_reference(io, sampler, bs, rejection_noise=None):
 
 
 @contextlib.contextmanager
-def _single_rank_capture():
-    yield SimpleNamespace(stream=torch.cuda.Stream())
+def _single_rank_capture(stream):
+    yield SimpleNamespace(stream=stream)
 
 
 def _graph(epi, sampler, monkeypatch, rejection_noise=None):
@@ -189,12 +198,76 @@ def test_replay_equals_eager_at_same_seed(monkeypatch, bs):
         torch.cuda.manual_seed(1234 + step)
         ref = _eager_reference(io, sampler, bs)
         torch.cuda.manual_seed(1234 + step)
-        out = graph.run(bs=bs, target_logits=io.logits)
+        out = graph.run(bs=bs, target_logits=io.logits, target_hidden=io.hidden)
         torch.cuda.synchronize()
         got, want = msgspec.structs.asdict(out), msgspec.structs.asdict(ref)
         for name in _FIELDS:
             assert torch.equal(got[name], want[name]), (step, name)
     assert graph.num_replays == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_injects_the_hidden_of_the_replayed_verify_graph(monkeypatch):
+    """Two verify graphs of one batch size share every input buffer and the logits."""
+    io, sampler, epi = _gpu_case(bs=2, graph_bs=2, vocab=512, seed=11)
+    graphs = [
+        msgspec.structs.replace(io, hidden=torch.full_like(io.hidden, value))
+        for value in (1.0, 2.0)
+    ]
+    epi.static_io = {(2, g.hidden.data_ptr()): g for g in graphs}
+    seen = torch.zeros_like(io.hidden)
+
+    def inject_target_hidden(*, target_hidden, **_):
+        seen.copy_(target_hidden)
+
+    epi.commit_ctx = dspark_verify.CommitInjectCtx(
+        draft_model=None,
+        block_pos_offsets=None,
+        resolve_pool=lambda: SimpleNamespace(
+            set_swa_key_buffer_radix_fused_norm_rope=None
+        ),
+        resolve_req_to_token=None,
+        kv_injector=SimpleNamespace(
+            swa_ring_size=None, inject_target_hidden=inject_target_hidden
+        ),
+    )
+    region = _graph(epi, sampler, monkeypatch)
+    for step in range(6):  # per graph: eager warm-up, capture + replay, replay
+        replayed = graphs[step % 2]
+        region.run(bs=2, target_logits=io.logits, target_hidden=replayed.hidden)
+        torch.cuda.synchronize()
+        assert torch.equal(seen, replayed.hidden), step
+    assert region.num_replays == 4
+
+
+@pytest.fixture
+def server_args():
+    reset_context()
+    yield get_context().override_server_args
+    reset_context()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("bs,tp_size", [(1, 1), (3, 4)])
+def test_top_p_replay_equals_eager(monkeypatch, server_args, bs, tp_size):
+    """A top-p batch, on one rank and under TP 4 (deterministic renorm)."""
+    with server_args(tp_size=tp_size):
+        io, sampler, epi = _gpu_case(bs=bs, graph_bs=bs, vocab=2048, seed=200 + bs)
+        graph = _graph(epi, sampler, monkeypatch)
+        top_ps = torch.linspace(0.5, 0.9, bs, device="cuda")
+        sampler.params.top_ps[:bs].copy_(top_ps)
+        for step in range(4):  # eager warm-up, capture + replay, then replays
+            torch.cuda.manual_seed(1234 + step)
+            ref = _eager_reference(io, sampler, bs, top_ps=top_ps)
+            torch.cuda.manual_seed(1234 + step)
+            out = graph.run(
+                bs=bs, target_logits=io.logits, target_hidden=io.hidden, top_p=True
+            )
+            torch.cuda.synchronize()
+            got, want = msgspec.structs.asdict(out), msgspec.structs.asdict(ref)
+            for name in _FIELDS:
+                assert torch.equal(got[name], want[name]), (step, name)
+        assert graph.num_replays == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -212,7 +285,7 @@ def test_blockwise_replay_equals_eager_at_same_counter(monkeypatch, bs):
     ref_noise = make_rejection_noise(1234, "cuda")
     for step in range(4):  # eager warm-up, capture + replay, then replays
         ref = _eager_reference(io, sampler, bs, rejection_noise=ref_noise)
-        out = graph.run(bs=bs, target_logits=io.logits)
+        out = graph.run(bs=bs, target_logits=io.logits, target_hidden=io.hidden)
         torch.cuda.synchronize()
         got, want = msgspec.structs.asdict(out), msgspec.structs.asdict(ref)
         for name in _FIELDS:
@@ -232,7 +305,7 @@ def test_replay_acceptance_distribution_matches_eager(monkeypatch):
     rows = torch.arange(3, device="cuda")
     torch.cuda.manual_seed(99)
     for _ in range(trials):
-        out = graph.run(bs=3, target_logits=io.logits)
+        out = graph.run(bs=3, target_logits=io.logits, target_hidden=io.hidden)
         hist_graph[rows, out.correct_len] += 1
         ref = _eager_reference(io, sampler, 3)
         hist_eager[rows, ref.correct_len] += 1

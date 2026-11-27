@@ -125,6 +125,7 @@ class DraftParams(NamedTuple):
     greedy_mask: torch.Tensor
     # The temperature each step samples at: 0 on argmax rows.
     step_temperatures: torch.Tensor
+    top_ps: torch.Tensor
 
 
 @functools.cache
@@ -148,12 +149,14 @@ def resolve_draft_params(
             temperatures=torch.empty(bs, dtype=torch.float32, device=device),
             greedy_mask=torch.empty(bs, dtype=torch.bool, device=device),
             step_temperatures=torch.empty(bs, dtype=torch.float32, device=device),
+            top_ps=torch.empty(bs, dtype=torch.float32, device=device),
         )
-    temperatures, greedy_mask, step_temperatures = (buf[:bs] for buf in out)
+    temperatures, greedy_mask, step_temperatures, top_ps = (buf[:bs] for buf in out)
     if sampling_info is None:
         temperatures.fill_(1.0)
         greedy_mask.fill_(True)
         step_temperatures.zero_()
+        top_ps.fill_(1.0)
     else:
         torch.clamp(
             sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
@@ -162,7 +165,8 @@ def resolve_draft_params(
         )
         torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=greedy_mask)
         torch.where(greedy_mask, _zero(device), temperatures, out=step_temperatures)
-    return DraftParams(temperatures, greedy_mask, step_temperatures)
+        top_ps.copy_(sampling_info.top_ps.view(-1)[:bs])
+    return DraftParams(temperatures, greedy_mask, step_temperatures, top_ps)
 
 
 # Arbitrary; how often the proposer logs its restage-skip count, in graph steps.
@@ -421,19 +425,20 @@ class DraftBlockProposer:
 
     def _stage_sampling_params(self, draft_sampler, *, bs: int, sampling_info) -> None:
         """The draft graph's sampling params, restaged only when the sampler, bs or
-        the batch's temperature / top-k tensors changed since the last stage."""
+        the batch's temperature / top-k / top-p tensors changed since the last stage."""
         key = (
             draft_sampler,
             bs,
             None if sampling_info is None else sampling_info.temperatures,
             None if sampling_info is None else sampling_info.top_ks,
+            None if sampling_info is None else sampling_info.top_ps,
         )
         staged = self._staged_params_key
         self.num_staged_params_calls += 1
         skip = (
             staged is not None
             and staged[1] == bs
-            and all(staged[i] is key[i] for i in (0, 2, 3))
+            and all(staged[i] is key[i] for i in (0, 2, 3, 4))
         )
         self.num_staged_params_skips += skip
         if self.num_staged_params_calls % STAGED_PARAMS_LOG_EVERY == 0:
