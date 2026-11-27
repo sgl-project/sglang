@@ -357,18 +357,16 @@ def check_simulate_acc_token_mode() -> None:
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 
 
-def draft_kv_indices_buffer_width(
-    num_seqs: int, topk: int, max_context_len: int
-) -> int:
+def draft_kv_indices_buffer_width(num_seqs: int, topk: int, max_kv_len: int) -> int:
     """Per-step row width of the EAGLE draft-decode kv_indices buffer.
 
-    num_seqs * topk branches each attend up to max_context_len KV slots; the topk
+    num_seqs * topk branches each attend up to max_kv_len KV slots; the topk
     factor is mandatory -- dropping it under-allocates and overflows the row (#27338, #27460).
     """
-    assert num_seqs * topk * max_context_len < 2**31, (
+    assert num_seqs * topk * max_kv_len < 2**31, (
         "kv_indices flat offset would overflow int32; reduce batch/topk/context"
     )
-    return num_seqs * topk * max_context_len
+    return num_seqs * topk * max_kv_len
 
 
 def draft_kv_indices_used_len(
@@ -958,8 +956,6 @@ def build_grammar_vocab_mask(
     # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
     # order keeps the copy ahead of the sampler's apply_vocab_mask.
     vocab_mask = vocab_mask.to(device, non_blocking=True)
-    # Otherwise the extend stage's leftover mask is applied instead.
-    sampling_info.grammar_mask = None
     return GrammarMask(grammar, vocab_mask)
 
 
@@ -1488,10 +1484,6 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
-        # Per branch, not above the dispatch: eagle_prepare_for_decode cumulates
-        # its own, and frequency/presence penalties are counters.
-        if batch.sampling_info.penalizer_orchestrator.is_required:
-            batch.cumulate_penalty_output_tokens()
         batch.spec_info.prepare_for_decode(batch)
     elif batch.spec_algorithm.is_uno():
         from sglang.srt.speculative.uno_info import UnoDraftInput

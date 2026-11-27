@@ -2321,8 +2321,18 @@ mod tests {
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
         let named = Arc::new(Named::default());
+        let mut server_args = test_server_args();
+        // The listener table names this listener, so its relay route serves
+        // the requests that present its token.
+        server_args.deployment_info.rust_server_endpoints =
+            vec![crate::message::config::RustServerEndpoint {
+                dp_rank: 0,
+                endpoint: format!("http://{http_addr}"),
+                peer_token: Some("own-token".into()),
+            }];
         let cfg = RuntimeConfig {
             abort_hook: Some(named.clone()),
+            server_args: Arc::new(server_args),
             ..test_config(http_addr, Some(grpc_addr))
         };
         let rt = start(cfg, None).expect("start runtime");
@@ -2343,7 +2353,7 @@ mod tests {
             write!(
                 conn,
                 "POST /internal/peer HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\
-                 Connection: close\r\n\r\n",
+                 x-sglang-peer-token: own-token\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .unwrap();

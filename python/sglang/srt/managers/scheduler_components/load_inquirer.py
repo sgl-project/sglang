@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.observability.metrics_collector import StorageMetricsCollector
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
     disaggregation_mode: DisaggregationMode
-    server_args: ServerArgs
     max_total_num_tokens: int
     max_running_requests: int
     pool_stats_observer: SchedulerPoolStatsObserver
@@ -56,6 +55,9 @@ class SchedulerLoadInquirer:
     get_decode_moment_totals: Callable
     get_waiting_storage_span: (
         Callable[[CacheRequestHandle], tuple[int, int] | None] | None
+    ) = None
+    get_storage_metrics_collector: (
+        Callable[[], StorageMetricsCollector | None] | None
     ) = None
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
@@ -143,6 +145,12 @@ class SchedulerLoadInquirer:
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in pending_token_queues for req in queue
         )
+        # A chunked request is in no queue, so count the part of its prompt not yet
+        # in num_used_tokens; prefix_len lags the chunk just run until the next pass.
+        chunked_req = self.get_chunked_req()
+        if chunked_req is not None:
+            held = max(chunked_req.prefix_len, chunked_req.kv.kv_allocated_len)
+            num_total_tokens += max(0, chunked_req.seqlen - held)
         num_active_tokens = max(0, num_total_tokens - awaiting_kv_tokens)
 
         memory = None
@@ -232,6 +240,18 @@ class SchedulerLoadInquirer:
         totals = self.get_decode_moment_totals()
         decode_moments = list(totals) if totals[0] > 0 else None
 
+        storage_hit_tokens = storage_unfulfilled_tokens = None
+        storage = (
+            self.get_storage_metrics_collector()
+            if self.get_storage_metrics_collector is not None
+            else None
+        )
+        if storage is not None:
+            storage_hit_tokens = storage.total_storage_prefetch_hit_tokens
+            storage_unfulfilled_tokens = dict(
+                storage.total_storage_prefetch_unfulfilled_tokens
+            )
+
         return LoadSnapshot(
             dp_rank=int(get_parallel().dp_rank)
             if get_parallel().dp_rank is not None
@@ -257,5 +277,7 @@ class SchedulerLoadInquirer:
             queues=queues,
             total_prefill_uncached_tokens=self.get_total_prefill_uncached_tokens(),
             total_prefill_busy_us=self.get_total_prefill_busy_us(),
+            total_storage_prefetch_hit_tokens=storage_hit_tokens,
+            total_storage_prefetch_unfulfilled_tokens=storage_unfulfilled_tokens,
             decode_moments=decode_moments,
         )

@@ -5,7 +5,7 @@ import os
 import warnings
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 
 
 @functools.lru_cache(maxsize=1)
@@ -44,6 +44,9 @@ def _default_on_in_ci() -> bool:
 
 class EnvField:
     _allow_set_name = True
+    # An empty value reads as unset for a type where "" cannot parse; a string
+    # or list field keeps "" as its value.
+    _empty_is_unset = True
 
     def __init__(self, default: Any, secret: bool = False):
         self.default = default
@@ -72,21 +75,17 @@ class EnvField:
             assert value == str(None)
             return None
 
-        # Not set, return default
-        if value is None:
+        if not self.is_set():
             return self._resolve_default()
 
         try:
             return self.parse(value)
         except ValueError as e:
-            default = self._resolve_default()
-            warnings.warn(
-                f'Invalid value for {self.name}: {e}, using default "{default}"'
-            )
-            return default
+            raise ValueError(f"Invalid value for {self.name}: {e}") from None
 
     def is_set(self):
-        return self.name in os.environ
+        value = os.environ.get(self.name)
+        return value is not None and not (value == "" and self._empty_is_unset)
 
     def set(self, value: Any):
         self._set_to_none = value is None
@@ -123,31 +122,38 @@ class EnvField:
 
 
 class EnvTuple(EnvField):
+    _empty_is_unset = False
+
     def parse(self, value: str) -> tuple[str, ...]:
         return tuple(s.strip() for s in value.split(",") if s.strip())
 
 
 class EnvStr(EnvField):
+    _empty_is_unset = False
+
     def parse(self, value: str) -> str:
         return value
 
 
 class EnvJSON(EnvField):
-    def parse(self, value: str | None) -> list | dict | None:
-        if not value:
-            return None
-        if os.path.exists(value):
-            with open(value) as f:
-                return json.load(f)
-        return json.loads(value)
+    def parse(self, value: str) -> list | dict:
+        try:
+            if os.path.exists(value):
+                with open(value) as f:
+                    return json.load(f)
+            return json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f'"{value}" is not valid JSON, inline or in the file it names ({e})'
+            )
 
 
 class EnvBool(EnvField):
     def parse(self, value: str) -> bool:
         value = value.lower()
-        if value in ["true", "1", "yes", "y"]:
+        if value in ["true", "1", "yes", "y", "on"]:
             return True
-        if value in ["false", "0", "no", "n"]:
+        if value in ["false", "0", "no", "n", "off"]:
             return False
         raise ValueError(f'"{value}" is not a valid boolean value')
 
@@ -173,7 +179,7 @@ class _DeprecatedEnvFallback:
         self.deprecated_name = deprecated_name
 
     def get(self) -> Any:
-        if os.getenv(self.name) is None:
+        if not self.is_set():
             fallback = os.getenv(self.deprecated_name)
             if fallback is not None:
                 warnings.warn(
@@ -332,6 +338,9 @@ class Envs:
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
+    # Fallback for the expert_pack load format when --model-loader-extra-config
+    # carries no pack_path.
+    SGLANG_EXPERT_PACK_PATH = EnvStr(None)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
@@ -672,10 +681,10 @@ class Envs:
     # gather stays an NCCL allgather.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
-    # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
-    # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
-    # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
-    # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
+    # Attention (aiter, ROCm): route NEXTN/EAGLE draft_extend through aiter
+    # unified_attention instead of mha_batch_prefill. On by default for non-MLA
+    # topk<=1 even when prefill/target verify keep their default kernels; set 0
+    # for the CK fallback. Target verify still requires SGLANG_USE_AITER_UNIFIED_ATTN.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
     # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
     SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
@@ -1009,6 +1018,8 @@ class Envs:
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
+    MOONCAKE_ENABLE_EGM_STORE_POOL = EnvBool(False)
+    MOONCAKE_EGM_NUMA_NODES = EnvStr(None)
 
     # ===================================================================
     # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
@@ -1298,6 +1309,10 @@ class Envs:
     # Ascend NPU
     # ===================================================================
     SGLANG_NPU_ENABLE_STATIC_KERNEL = EnvBool(False)
+    # True means an unrotated dense DSpark draft needs correction for a GLM DSA
+    # ModelSlim QuaRot target: use checkpoint-local vocab and fold Q into the FC
+    # weights at load time. False preserves the existing loading behavior.
+    SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
     # time for arch35 (Ascend 950) Linear and MoE MXFP8 GEMMs. Disabled keeps
@@ -1326,6 +1341,12 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # DCP extend on NPU: rows per prefix-gather collective, capping the scratch.
+    # <= 0 gathers the whole prefix in one.
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
+    # DCP extend on NPU: above this many new tokens the prefix KV is gathered
+    # whatever the bytes say, as the query path's fp32 merge grows with them.
+    SGLANG_NPU_DCP_EXTEND_QUERY_GATHER_MAX_TOKENS = EnvInt(4096)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Opt in to fused MHA KV writes. Disabled by default because ScatterPa
@@ -1488,7 +1509,6 @@ class Envs:
     # decode. Exposed as a knob (e.g. set 2.0) for grid A/B tuning without a rebuild.
     SGLANG_FORCE_LEAN_GRID_CU_MULT = EnvFloat(1.0)
 
-    # Torch Compile
     # Compact extend-attention query-tile grid (parity with flash-attn's
     # ragged-aware launch). HIP only (ignored elsewhere), and used only when it
     # launches fewer tiles than the legacy grid; 0 turns it off.
@@ -1506,6 +1526,7 @@ class Envs:
     # cached-prefix shapes. Validated at 98% GSM8K accuracy.
     SGLANG_TRITON_FP8_PREFILL_ATTN = EnvBool(True)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
+    SGLANG_TORCH_COMPILE_MODE = EnvStr("max-autotune-no-cudagraphs")
     SGLANG_TORCH_DYNAMIC_SHAPE = EnvBool(False)
     # torch.compile backend for CPU graphs (defaults to "inductor"; "eager" or "aot_eager" for debugging)
     SGLANG_CPU_GRAPH_COMPILE_BACKEND = EnvStr("inductor")
@@ -1523,12 +1544,17 @@ class Envs:
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvInt(32)
+    # Reshuffle experts in the elastic scale finalizer, not the next EPLB tick.
+    SGLANG_ENABLE_ELASTIC_SCALE_REBALANCE = EnvBool(True)
 
     # ===================================================================
     # DeepGEMM
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM = EnvBool(True)
     SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT = EnvBool(False)
+    # Debug: cross-check every DeepGEMM matmul against the Triton kernel.
+    SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST = EnvBool(False)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
@@ -1577,6 +1603,10 @@ class Envs:
     # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
     # point it at a persistent mount to share builds across CI jobs.
     SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # The CUDA target of a JIT module whose load_jit names no cuda_arch_policy:
+    # "specific" (the local GPU's arch-specific target, e.g. sm_103a) or
+    # "family" (its family target, e.g. sm_100f: one build for 10.0 and 10.3).
+    SGLANG_JIT_CUDA_ARCH_POLICY = EnvStr("specific")
     # Log, at INFO, which dependency changed whenever a module is rebuilt.
     SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
     # How many builds to keep per module variant. None = unset = keep all, which
@@ -1655,6 +1685,8 @@ class Envs:
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
+    # Unset, mooncake sends fp8, which cannot feed a deep_gemm runner on BF16 weights.
+    SGLANG_MOONCAKE_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
@@ -1700,6 +1732,13 @@ class Envs:
     # equal torch.topk's; the default on every platform), 2 exact with the same
     # selected set on every run.
     SGLANG_TOPK_V2_MODE = EnvInt(1)
+    # DeepSelect bf16 top-k with more rows than any cluster tier runs in one wave:
+    # off keeps the one-CTA-per-row kernel, whose time follows the longest row. On
+    # runs the cluster tier with the most rows per wave over several waves instead,
+    # whose time follows the total row length. It wins on long-tailed row lengths
+    # (the DSV4.1 decode indexer at mixed contexts) and loses on uniform long ones.
+    # Same values as off; on ties it may pick other columns.
+    SGLANG_DEEP_SELECT_MULTIWAVE = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends
@@ -1761,6 +1800,11 @@ class Envs:
     # RoPE cache
     # ===================================================================
     SGLANG_SPEC_EXPANSION_SAFETY_FACTOR = EnvInt(2)
+    # Tiled fused RoPE + KV-cache write (16 tokens x 8 q heads per program).
+    # Only used on gfx1250 (is_gfx1250_supported) for T >= 256, with fp32
+    # cos/sin, fp16/bf16/fp32 Q/K and neox layout; a no-op on every other arch.
+    # False forces the per-token kernel.
+    SGLANG_FUSED_ROPE_KV_TILED = EnvBool(True)
     SGLANG_ROPE_CACHE_FP32 = EnvBool(False)
     SGLANG_ROPE_CACHE_SAFETY_MARGIN = EnvInt(256)
     SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
@@ -2145,6 +2189,8 @@ class Envs:
     SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
+    # Single-pass Mega-mHC prefill. SM100 uses DeepGEMM; gfx950 uses aiter
+    # flydsl_mega_mhc (ROCm/aiter#6179). Off by default.
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
@@ -2207,6 +2253,35 @@ class Envs:
     # CUDA: fuse inverse RoPE into the UE8M0 FP8 wo_a activation quantization.
     # Off by default; requires the FP8 wo_a path.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
+    # ROCm gfx950 TP-only: overlap wo_b's all-reduce with its GEMM through mori
+    # cco. Off by default: it reserves a symmetric window outside torch's
+    # allocator, so a run that enables it wants a lower --mem-fraction-static.
+    # It also substitutes the GEMM, so the output moves. Only where wo_a hands
+    # over an Fp8GridActivation -- the gfx950 native mxfp8 route -- do the two
+    # quantise identically and agree bit for bit. On --fp8-gemm-backend aiter,
+    # which the MI355X recipes pin, wo_b gets a plain bf16 tensor and each path
+    # rounds it itself: relative L2 7.5e-3 to 8.2e-3, measured at M=16384 TP4.
+    SGLANG_OPT_FUSED_WO_B_AR = EnvBool(False)
+    # Send the fused wo_b's all-gather leg as fp8 e4m3 with a per-row scale,
+    # halving its bytes. Off by default: it costs accuracy, and that is e4m3's
+    # mantissa width rather than a granularity that can be tuned away.
+    SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER = EnvBool(False)
+    # Which transport carries the fused wo_b's all-gather leg, "lsa" or "sdma".
+    # LSA pulls, so with an fp8 gather it widens on the way in rather than in a
+    # second kernel. Only read when the fused path is on.
+    SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT = EnvStr("lsa")
+    # Seconds the fused wo_b's self-test may spend in its device phases. They end
+    # in cross-rank barriers with no timeout of their own, so a stack whose SDMA
+    # queues exist but never complete wedges every rank there; past this the path
+    # is turned off instead. A healthy self-test is well under a second -- the
+    # compile already happened in warmup -- so this is a loose upper bound.
+    SGLANG_OPT_FUSED_WO_B_AR_SELF_TEST_TIMEOUT_S = EnvFloat(60.0)
+    # Debug: log the distribution of M the fused wo_b is offered. M is the token
+    # count of one forward, not of one request, so this is the only way to see
+    # what the scheduler actually batches.
+    SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG = EnvBool(False)
+    # Debug: run both the fused and the unfused wo_b and log their relative L2.
+    SGLANG_DEBUG_FUSED_WO_B_AR = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     # DSpark decode: build the verify window and the draft anchor column in one
@@ -2292,6 +2367,11 @@ class Envs:
     # Override shared-expert selection: true uses grouped GEMM, false uses BMM.
     # When unset, selection follows model, quantization, and LoRA requirements.
     SGLANG_OPT_USE_INKLING_SHARED_FUSED_MOE = EnvBool(True)
+    # Fold the MoE shared-expert partials into the custom AR kernels instead
+    # of a separate {routed + shared} torch.add per MoE layer; some buckets
+    # keep a pre-add during the AR stage-in. torch.add numerics
+    # (bit-identical). Requires SGLANG_OPT_USE_INKLING_CUSTOM_AR.
+    SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED = EnvBool(True)
     # Fold the conditional long-context log-scaling tau into its producers
     # instead of separate output-sized scale kernels: the fused attn
     # prologue's q path (bit-exact, before MXFP8 quantization there) and the
@@ -2299,11 +2379,6 @@ class Envs:
     # the einsum, shrinking the pass by rel_extent/d_rel = 64x; rounding moves
     # before the GEMM). Flag-off keeps the standalone apply_log_scaling_tau
     # on the outputs.
-    # Fold the MoE shared-expert partials into the custom AR kernels instead
-    # of a separate {routed + shared} torch.add per MoE layer; some buckets
-    # keep a pre-add during the AR stage-in. torch.add numerics
-    # (bit-identical). Requires SGLANG_OPT_USE_INKLING_CUSTOM_AR.
-    SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED = EnvBool(True)
     SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU = EnvBool(True)
     # Dispatch the rel_logits projection around einsum's hidden compaction
     # copy of the strided r operand (a view into the packed qkvr output):
@@ -2616,6 +2691,7 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    SGLANG_GDN_REPLAYSSM_VERIFY_NUM_STAGES = EnvInt(2)
 
     # ===================================================================
     # Plugin system
@@ -2655,6 +2731,10 @@ class Envs:
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
+    # A request-log line that finds the log writer's buffer full: "wait" holds
+    # the request until the sink takes it, as in the Python server; "drop"
+    # drops the line (counted in sglang:request_log_dropped_lines_total).
+    SGLANG_RUST_REQUEST_LOG_FULL_BUFFER = EnvStr("wait")
 
     # ===================================================================
     # Weight Cache Daemon
@@ -2675,15 +2755,24 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
+def _registered_fields() -> Iterator[EnvField]:
+    return (value for value in vars(Envs).values() if isinstance(value, EnvField))
+
+
 def exportable_env_vars() -> dict[str, str]:
     return {
         field.name: _exportable_value(os.environ[field.name])
-        for field in sorted(
-            (value for value in vars(Envs).values() if isinstance(value, EnvField)),
-            key=lambda field: field.name,
-        )
+        for field in sorted(_registered_fields(), key=lambda field: field.name)
         if not field.secret and field.name in os.environ
     }
+
+
+def validate_env_values() -> None:
+    """Parse every registered variable that is set, so a malformed value stops
+    startup instead of failing at its first read, which may be mid-serving."""
+    for field in _registered_fields():
+        if field.is_set():
+            field.get()
 
 
 def _exportable_value(value: str) -> str:

@@ -27,12 +27,12 @@ from sglang.multimodal_gen.configs.sample.glmimage import (
     GlmImageSamplingParams,
     align_glm_image_dimension,
 )
+from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     QUALITY_LEVELS,
     SamplingParams,
     SkipSoftmaxParams,
-    _json_safe,
     normalize_quality,
     quality_allows,
     resolve_skip_softmax_params,
@@ -46,6 +46,7 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
 )
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 
 
@@ -287,7 +288,7 @@ class TestSamplingParamsSubclass(unittest.TestCase):
         self.assertEqual((params.width, params.height), (832, 480))
         self.assertIn((params.width, params.height), params.supported_resolutions)
 
-    def test_output_file_name_supports_callable_teacache_params(self):
+    def test_auto_output_file_name_is_opaque_and_stable_once_selected(self):
         def coefficients_callback(_: TeaCacheParams) -> list[float]:
             return [1.0, 2.0, 3.0, 4.0, 5.0]
 
@@ -300,11 +301,18 @@ class TestSamplingParamsSubclass(unittest.TestCase):
 
         params._set_output_file_name()
 
-        self.assertTrue(params.output_file_name.endswith(".mp4"))
-        self.assertIn(
-            "test_sampling_params.TestSamplingParamsSubclass.test_output_file_name_supports_callable_teacache_params",
-            _json_safe(coefficients_callback),
-        )
+        first = params.output_file_name
+        self.assertRegex(first, r"^output_[0-9a-f]{32}\.mp4$")
+        params._set_output_file_name()
+        self.assertEqual(params.output_file_name, first)
+        params.output_file_name = None
+        params._set_output_file_name()
+        self.assertNotEqual(params.output_file_name, first)
+
+    def test_explicit_output_file_name_is_preserved(self):
+        params = SamplingParams(output_file_name="my sample.mp4")
+        params._set_output_file_name()
+        self.assertEqual(params.output_file_name, "my_sample.mp4")
 
     def test_teacache_callback_takes_precedence_over_static_coefficients(self):
         def coefficients_callback(_: TeaCacheParams) -> list[float]:
@@ -535,6 +543,58 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertNotIn("height", implicit_fields)
         self.assertIn("width", explicit_fields)
         self.assertIn("height", explicit_fields)
+
+    def test_default_output_quality_follows_the_request_data_type(self):
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+
+        with (
+            patch.object(
+                SamplingParams,
+                "from_pretrained",
+                side_effect=lambda *args, **kwargs: Flux2SamplingParams(),
+            ),
+            patch.object(
+                SamplingParams, "resolve_task_type", return_value=ModelTaskType.T2I
+            ),
+            patch.object(SamplingParams, "_validate_with_pipeline_config"),
+        ):
+            default = SamplingParams.from_user_sampling_params_args(
+                "dummy-model", server_args=server_args, prompt="p"
+            )
+            explicit = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="p",
+                output_compression=50,
+            )
+
+        # 75 is the image default, which writes a stored PNG; 50 is the video one
+        self.assertEqual(default.output_compression, 75)
+        self.assertEqual(explicit.output_compression, 50)
+
+    def test_action_request_has_no_output_quality_to_resolve(self):
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+
+        with (
+            patch.object(
+                SamplingParams,
+                "from_pretrained",
+                side_effect=lambda *args, **kwargs: Pi05SamplingParams(),
+            ),
+            patch.object(Pi05SamplingParams, "_validate_with_pipeline_config"),
+        ):
+            action = SamplingParams.from_user_sampling_params_args(
+                "dummy-model", server_args=server_args, prompt="p"
+            )
+
+        self.assertEqual(action.data_type, DataType.ACTION)
+        self.assertFalse(hasattr(action, "output_quality"))
 
     def test_cli_path_preserves_diffusers_kwargs_in_request_extra(self):
         server_args = MagicMock()
