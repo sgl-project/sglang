@@ -48,17 +48,15 @@ struct Target {
     default_stubs: bool,
 }
 
-const TARGETS: &[Target] = &[
-    Target {
-        root: "sglang/api/v1/service.proto",
-        package: "sglang.api.v1",
-        rust_out: "rust/sglang-api-types/src/generated",
-        python_out: Some("python/sglang/api/v1/api_types.py"),
-        // Boxed abort payload won't set the size of every ChunkEvent.
-        boxed: &[".sglang.api.v1.FinishReason.kind.abort"],
-        default_stubs: false,
-    },
-];
+const TARGETS: &[Target] = &[Target {
+    root: "sglang/api/v1/service.proto",
+    package: "sglang.api.v1",
+    rust_out: "rust/sglang-api-types/src/generated",
+    python_out: Some("python/sglang/api/v1/api_types.py"),
+    // Boxed abort payload won't set the size of every ChunkEvent.
+    boxed: &[".sglang.api.v1.FinishReason.kind.abort"],
+    default_stubs: false,
+}];
 
 fn main() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
