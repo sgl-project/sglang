@@ -30,16 +30,7 @@ _MU_Y1 = 0.5
 _MU_Y2 = 1.15
 
 
-@register_denoising_env_args(
-    [
-        "encoder_hidden_states",
-        "pos",
-        "mask",
-        # The DiT ignores it but miles_diffusion's Krea-2 training reads it.
-        # TODO(Rockdu): drop once that training derives its text mask from "mask".
-        "encoder_hidden_states_mask",
-    ]
-)
+@register_denoising_env_args(["encoder_hidden_states", "pos", "mask"])
 @dataclass
 class Krea2PipelineConfig(ImagePipelineConfig):
     """Krea-2 single-stream MMDiT, text-to-image.
