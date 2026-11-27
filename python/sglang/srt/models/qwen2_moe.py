@@ -112,6 +112,7 @@ from sglang.srt.models.utils import (
     can_run_silu_fp4_quant_fusion,
     silu_and_mul_fp4_quant,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -170,10 +171,6 @@ def can_fuse_shared_expert(
         return False
 
     if quant_config is not None:
-        exclude_layers = getattr(quant_config, "exclude_layers", None)
-        if exclude_layers is None:
-            exclude_layers = getattr(quant_config, "ignored_layers", [])
-
         # Other backends than quark do not exclude the shared expert here, so they
         # intentionally fall through and remain fusable
         can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
@@ -919,8 +916,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.reduce_results:
             final_hidden_states = reduce_moe_output(final_hidden_states)
 
-        # Debug removed - was causing issues during CUDA graph capture
-
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -1385,14 +1380,11 @@ class Qwen2MoeForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -1418,6 +1410,17 @@ class Qwen2MoeForCausalLM(nn.Module):
             )  # Specific layers for EAGLE3 support
         else:
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
 
 EntryClass = Qwen2MoeForCausalLM

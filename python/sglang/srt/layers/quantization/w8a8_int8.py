@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import logging
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 import torch
 from torch.nn.parameter import Parameter
@@ -118,37 +117,6 @@ class W8A8Int8Config(QuantizationConfig):
             return W8A8Int8MoEMethod(self)
         return None
 
-    def is_layer_skipped(
-        self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
-    ):
-        # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
-        proj_name = prefix.split(".")[-1]
-        if proj_name in fused_mapping:
-            shard_prefixes = [
-                prefix.replace(proj_name, shard_proj_name)
-                for shard_proj_name in fused_mapping[proj_name]
-            ]
-
-            is_skipped = None
-            for shard_prefix in shard_prefixes:
-                is_shard_skipped = (
-                    self.quant_description[shard_prefix + ".weight"] == "FLOAT"
-                )
-
-                if is_skipped is None:
-                    is_skipped = is_shard_skipped
-                elif is_shard_skipped != is_skipped:
-                    raise ValueError(
-                        f"Detected some but not all shards of {prefix} "
-                        "are quantized. All shards of fused layers "
-                        "to have the same precision."
-                    )
-        else:
-            is_skipped = self.quant_description[prefix + ".weight"] == "FLOAT"
-
-        assert is_skipped is not None
-        return is_skipped
-
     def get_scaled_act_names(self) -> List[str]:
         return []
 
@@ -181,7 +149,6 @@ class W8A8Int8LinearMethod(LinearMethodBase):
     ):
 
         weight_loader = extra_weight_attrs.get("weight_loader")
-        self.logical_widths = output_partition_sizes
 
         weight = ModelWeightParameter(
             data=torch.empty(

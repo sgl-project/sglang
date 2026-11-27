@@ -1356,7 +1356,6 @@ class DeepseekV4AttnBackend(
         self.encoder_replay = False
         self.encoder_row_floor = None
         self.device = torch.device(model_runner.device)
-        self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert head_dim == 512, (
             "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
@@ -1409,7 +1408,7 @@ class DeepseekV4AttnBackend(
             index_heads=int(cfg.index_n_heads),
             index_topk=self.index_topk,
         )
-        self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
+        self.max_kv_len = self.req_to_token_pool.row_width
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
@@ -1438,7 +1437,7 @@ class DeepseekV4AttnBackend(
         if self.dsv4_prefill_backend == DSV4_CUTEDSL_H16_PREFILL_BACKEND:
             self._cutedsl_h16_c128_combined_topk = (
                 _validate_dsv4_cutedsl_h16_combined_topk(
-                    self.max_context_len,
+                    model_runner.model_config.context_len,
                     self.index_topk,
                 )
             )
@@ -2432,7 +2431,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
             seq_lens_casual=seq_lens_casual,
-            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len=self.max_kv_len,
             out_loc=out_cache_loc,
             need_compress=True,
             num_groups=bs,
@@ -2502,7 +2501,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices,
             seq_lens_casual=seq_lens,
-            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len=self.max_kv_len,
             out_loc=out_cache_loc,
             need_compress=True,
         )
@@ -2853,7 +2852,7 @@ class DeepseekV4AttnBackend(
 
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
-        chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
+        chosen_max_seq_len = self.max_kv_len
         if seq_lens_cpu is not None:
             seq_lens_cpu = seq_lens_cpu[:bs]
             actual_max_seq_len = seq_lens_cpu.max().item()
@@ -3262,7 +3261,7 @@ class DeepseekV4AttnBackend(
         elif seq_lens_cpu is not None:
             max_seq_len = int(seq_lens_cpu.max().item())
         else:
-            max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
+            max_seq_len = self.max_kv_len
         verify_bs = _get_target_verify_bs(forward_batch)
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
@@ -3402,7 +3401,7 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu = forward_batch.seq_lens_cpu
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
                 return int(seq_lens_cpu.max().item())
-        max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+        max_seq_len = forward_batch.max_seq_len_override or self.max_kv_len
         if self.low_ratios == (1, 2):
             graph_context_limit = self._prefill_graph_seq_limit()
             if graph_context_limit is not None:
@@ -3538,7 +3537,7 @@ class DeepseekV4AttnBackend(
             is_draft_runner=self.is_draft_runner,
             skip_prefill=False,
             max_bs=max_bs,
-            max_context_len=self.max_context_len,
+            max_kv_len=self.max_kv_len,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
             is_read=False,
