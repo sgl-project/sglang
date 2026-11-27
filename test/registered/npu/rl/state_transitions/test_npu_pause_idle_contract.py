@@ -4,10 +4,10 @@
 ``aclrtUnmapMem`` does not wait for the device. This case asserts the contract
 behind that: once ``pause()`` returns, the device is idle.
 
-Nothing is allocated inside the region — the matmuls write through a preallocated
-``out`` — so a missing drain cannot fault on unmapped pages. It only leaves the
-stream busy, which is what the assertion reports, and a failing run therefore
-does not put the device into an error state for the tests that follow.
+The work is queued before the region is entered, so nothing is allocated inside
+it — not the matmul outputs, and not the scratch an aclnn op may take from the
+current pool. The region therefore wraps only ``pause()``/``resume()``, and a
+missing drain leaves the stream busy instead of faulting on unmapped pages.
 """
 
 import time
@@ -56,10 +56,11 @@ class TestPauseLeavesIdleDevice(CustomTestCase):
         left = torch.randn(MATMUL, MATMUL, dtype=torch.float16, device="npu")
         right = torch.randn(MATMUL, MATMUL, dtype=torch.float16, device="npu")
         out = torch.empty(MATMUL, MATMUL, dtype=torch.float16, device="npu")
+        for _ in range(ITERATIONS):
+            torch.matmul(left, right, out=out)
+
         try:
             with adapter.region(TAG, enable_cpu_backup=False):
-                for _ in range(ITERATIONS):
-                    torch.matmul(left, right, out=out)
                 self.assertFalse(
                     stream.query(),
                     "the queued work drained before pause(); raise ITERATIONS",
@@ -80,7 +81,11 @@ class TestPauseLeavesIdleDevice(CustomTestCase):
                 )
                 adapter.resume(TAG)
         finally:
-            device_module.synchronize()
+            # A hardware error here must not replace the assertion above.
+            try:
+                device_module.synchronize()
+            except RuntimeError:
+                pass
 
 
 if __name__ == "__main__":
