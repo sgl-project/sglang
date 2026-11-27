@@ -6,14 +6,13 @@ penalty index, its seed, and the watermark algorithm's per-request values.
   one `gather`, so a step with no admission copies none of them to the device.
 - Writes and gathers are enqueued on the scheduler's stream in host order: a
   launch's gather runs before a later admission rewrites a reused slot.
-- A graph reads the table at replay, on the forward stream. Under overlap a
-  later admission may rewrite a slot before an earlier replay reads it; only a
-  finished, retracted, or aborted row's slot is reused, so the row it changes is
-  discarded, and the target sampler reads the launch's gather.
+- A captured graph reads the table by its batch's slots at replay, on the
+  forward stream (see `SamplingParamsTable`), so a replay stages none of them.
+  Under overlap a later admission may rewrite a slot before an earlier replay
+  reads it; only a finished, retracted, or aborted row's slot is reused, so the
+  row it changes is discarded, and the target sampler reads the launch's gather.
 - The host keeps what the batch-level flags and counts need, so a launch derives
   them without a pass over its requests or a device sync.
-- A captured graph reads the table by its batch's slots instead (see
-  `SamplingParamsTable`), so a replay stages none of them.
 """
 
 from __future__ import annotations
@@ -92,8 +91,8 @@ class SamplingRows(NamedTuple):
 class SamplingParamsTable:
     """Each request slot's sampling state on the device, one column per slot,
     addressed by its `req_pool_idx`. The model runner builds its
-    `SamplingParamsPool` before any graph capture: a graph reads its rows by slot
-    index, and the pool writes them at admission."""
+    `SamplingParamsPool` before any graph capture: a graph reads its columns by
+    slot index, and the pool writes them at admission."""
 
     # One row per field, floats as fp32 bits and int64 values as (low, high)
     # int32 halves: one int32 gather reads them all, top_k exact.
@@ -188,7 +187,7 @@ class SamplingParamsPool:
         req_pool_indices: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
         # The pool the penalty indices point into; None where no request takes one.
-        penalty_status_pool: Optional[PenaltyStatusPool] = None,
+        penalty_status_pool: Optional[PenaltyStatusPool],
     ) -> SamplingRows:
         slots = req_pool_indices_cpu.numpy()
         if slots.size == 0:

@@ -1246,7 +1246,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._draft_sampler_reads_slots:
             sampler.force_greedy.set(sampling_info is None)
         elif sampler.max_bs is None or bs <= sampler.max_bs:
-            # A batch past the sampler's static buffers has no captured bucket,
+            # A bound runtime's sampler stages its rows. A batch past the sampler's static buffers has no captured bucket,
             # so its draft runs eager and the eager head reads none of them.
             sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
 
