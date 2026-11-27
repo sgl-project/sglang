@@ -1534,9 +1534,8 @@ class SchedulerBatchResultProcessor:
         if status == SamplingMaskStatus.OVERFLOW:
             return FINISH_ABORT(
                 "Sampling support exceeds --sampling-mask-max-tokens="
-                f"{get_exec().features.sampling_mask_max_tokens}, commonly because "
-                "of cutoff ties. Lower top_k to leave more headroom or increase "
-                "the server limit.",
+                f"{get_exec().features.sampling_mask_max_tokens}. Lower top_p or "
+                "top_k to narrow the support, or increase the server limit.",
                 HTTPStatus.BAD_REQUEST,
                 "BadRequestError",
             )

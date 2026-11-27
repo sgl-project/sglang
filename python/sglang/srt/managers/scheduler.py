@@ -402,6 +402,7 @@ from sglang.srt.rust_server.server import (
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampler_params import SamplerParamsPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -3711,12 +3712,19 @@ class Scheduler(
                 return
             top_k = req.sampling_params.top_k
             sampling_mask_cap = self.server_args.sampling_mask_max_tokens
-            if top_k != 1 and not (1 < top_k <= sampling_mask_cap):
+            # The sampling probability threshold does not bound the record size.
+            # The producer must return an exact row within the cap or abort.
+            top_p_only = (
+                top_k == TOP_K_ALL
+                and req.sampling_params.top_p < 1
+                and req.sampling_params.min_p == 0
+            )
+            finite_top_k = top_k != TOP_K_ALL and 1 <= top_k <= sampling_mask_cap
+            if not (finite_top_k or top_p_only):
                 error_msg = (
-                    "return_sampling_mask requires top_k=1 for greedy sampling "
-                    f"or finite 1 < top_k <= {sampling_mask_cap}; got top_k="
-                    f"{top_k}. Lower top_k or increase "
-                    "--sampling-mask-max-tokens."
+                    f"return_sampling_mask requires 1 <= top_k <= {sampling_mask_cap} "
+                    "or top-p-only sampling "
+                    "(top_p < 1, min_p = 0, top_k unset or -1)."
                 )
                 self._reject_bad_request(req, error_msg)
                 return

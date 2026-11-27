@@ -25,7 +25,10 @@ from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
 )
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.sampling_pipeline import _adjust_after_watermark
+from sglang.srt.speculative import spec_sampling_mask
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -51,12 +54,34 @@ _SERVER_ARGS = (
     "--sampling-mask-max-tokens",
     "64",
 )
-_INVALID_SAMPLING_MASK_ERROR = (
-    "return_sampling_mask requires top_k=1 for greedy sampling"
-)
+_INVALID_SAMPLING_MASK_ERROR = "return_sampling_mask requires 1 <= top_k"
 
 
 class TestSamplingMaskCapture(CustomTestCase):
+    def test_dflash_family_capture_still_requires_finite_top_k(self):
+        req = SimpleNamespace(sampling_params=SimpleNamespace(top_k=TOP_K_ALL, min_p=0))
+        spec = SimpleNamespace(
+            speculative_accept_threshold_single=1.0,
+            speculative_accept_threshold_acc=1.0,
+        )
+        with (
+            patch.object(spec_sampling_mask, "get_spec", return_value=spec),
+            patch.object(
+                spec_sampling_mask,
+                "is_dflash_sampling_verify_available",
+                return_value=True,
+            ),
+            spec_sampling_mask.envs.SGLANG_SIMULATE_ACC_LEN.override(0),
+        ):
+            for alg in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
+                with self.subTest(alg=alg):
+                    self.assertIn(
+                        "finite top_k",
+                        spec_sampling_mask.validate_spec_sampling_mask_request(
+                            req, alg
+                        ),
+                    )
+
     def setUp(self):
         # The renorm policy (sampling_renorm.py) reads the published parallel /
         # exec config on every call; the sampler's own get_exec is patched per
@@ -610,8 +635,42 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
 
         self.assertEqual(len(output_ids), _MAX_NEW_TOKENS)
 
+    def test_top_p_only_returns_the_exact_nucleus(self):
+        # Scale the model logits down and separate the first three ranks.
+        # Their weights are approximately proportional to 1, exp(-1), exp(-2).
+        response = self._post_generate(
+            {
+                "temperature": 100,
+                "logit_bias": {"0": 30000, "1": 29900, "2": 29800},
+                "top_p": 0.8,
+                "max_new_tokens": 1,
+            },
+            return_logprob=True,
+            top_logprobs_num=3,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        output = response.json()
+        meta = output["meta_info"]
+        mask = self._assert_sampling_masks(output["output_ids"], meta)[0]
+        self.assertEqual(set(mask), {0, 1})
+        probs = {tid: math.exp(lp) for lp, tid, _ in meta["output_top_logprobs"][0]}
+        mass = probs[0] + probs[1]
+        self.assertLess(probs[0], 0.8)
+        self.assertGreater(mass, 0.8)
+        for token, actual in zip(mask, meta["output_token_sampling_logprobs"][0]):
+            self.assertAlmostEqual(actual, math.log(probs[token] / mass), delta=1e-3)
+
+    def test_top_p_only_rejects_realized_support_over_capacity(self):
+        response = self._post_generate(
+            {"top_k": -1, "top_p": 0.99, "temperature": 100, "max_new_tokens": 1}
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn(
+            "Sampling support exceeds --sampling-mask-max-tokens=64", response.text
+        )
+
     def test_generate_rejects_unbounded_sampling_mask(self):
-        for params in ({"top_p": _TOP_P}, {"top_k": 65}, {"top_p": 1.0}):
+        for params in ({"top_p": _TOP_P, "min_p": 0.1}, {"top_k": 65}, {"top_p": 1.0}):
             with self.subTest(sampling_params=params):
                 response = self._post_generate(params)
                 self.assertEqual(response.status_code, 400, response.text)

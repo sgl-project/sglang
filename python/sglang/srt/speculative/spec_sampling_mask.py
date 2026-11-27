@@ -8,6 +8,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import SamplingMaskOutput, SamplingMaskStatus
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.dflash_utils import (
     build_speculative_verify_target_probs,
     is_dflash_sampling_verify_available,
@@ -50,6 +51,10 @@ def validate_spec_sampling_mask_request(
                 "return_sampling_mask with non-greedy DFlash decoding requires "
                 "sampling verification support."
             )
+
+    # These verifiers size capture from the request's finite top-k.
+    if spec_algorithm.is_dflash_family() and req.sampling_params.top_k == TOP_K_ALL:
+        return "DFlash/DSpark sampling masks require a finite top_k."
 
     return None
 
