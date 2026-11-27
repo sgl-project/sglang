@@ -25,7 +25,12 @@ def decoder_setup(monkeypatch):
             kwargs["on_frames"](frames)
         return frames.clone()
 
+    def use_decoder_fp8(enabled):
+        assert enabled is False
+        return nullcontext()
+
     video_vae = SimpleNamespace(
+        use_decoder_fp8=use_decoder_fp8,
         training=False,
         decode_base=decode_video,
         processor=SimpleNamespace(revert_tensor=lambda x, **kwargs: x),
