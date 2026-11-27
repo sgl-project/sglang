@@ -779,10 +779,15 @@ def create_app(
         app.include_router(vertex_router)
         app.include_router(common_api.router)
         app.include_router(realtime_video_api.router)
-        if server_args.pipeline_config.supports_action_endpoint():
-            app.include_router(action_api.router)
-        if server_args.pipeline_config.supports_openpi_endpoint():
-            app.include_router(openpi.router)
+        pipeline_config = server_args.pipeline_config
+        make_router = getattr(type(pipeline_config), "get_action_router", None)
+        if make_router is not None:
+            app.include_router(make_router(pipeline_config))
+        else:
+            if pipeline_config.supports_action_endpoint():
+                app.include_router(action_api.router)
+            if pipeline_config.supports_openpi_endpoint():
+                app.include_router(openpi.router)
         app.include_router(weights_api.router)
         app.include_router(rollout_api.router)
 

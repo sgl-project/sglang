@@ -378,15 +378,12 @@ def _build_action_model_sampling_params(
     prefix_cache = runtime.get("prefix_cache")
     if prefix_cache is None:
         prefix_cache = observation.get("enable_prefix_cache")
-    use_legacy_options = getattr(
-        sampling_params_cls, "allow_legacy_runtime_options", True
-    )
-    if prefix_cache is None and use_legacy_options:
+    if prefix_cache is None:
         prefix_cache = observation.get("enable_pi_prefix_cache")
     cuda_graph = runtime.get("cuda_graph")
     if cuda_graph is None:
         cuda_graph = observation.get("enable_cuda_graph")
-    if cuda_graph is None and use_legacy_options:
+    if cuda_graph is None:
         cuda_graph = observation.get("enable_pi_cuda_graph")
     output_format = str(
         runtime.get(
@@ -433,17 +430,10 @@ def _build_action_model_sampling_params(
         "output_format": output_format,
         "return_timing": _runtime_bool(runtime.get("return_timing"), True),
         "enable_prefix_cache": _runtime_bool(prefix_cache, True),
-        "enable_cuda_graph": _runtime_bool(
-            cuda_graph, getattr(sampling_params_cls, "enable_cuda_graph", True)
-        ),
+        "enable_cuda_graph": _runtime_bool(cuda_graph, True),
     }
     # Optional per-request overrides; absent keys keep the model defaults.
-    for name in (
-        "seed",
-        "guidance_scale",
-        "guidance_scale_action",
-        "return_native_outputs",
-    ):
+    for name in ("seed", "guidance_scale", "guidance_scale_action"):
         value = parameters.get(name, observation.get(name))
         if value is not None:
             sampling_kwargs[name] = value

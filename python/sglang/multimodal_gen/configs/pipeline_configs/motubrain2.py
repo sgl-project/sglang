@@ -121,10 +121,6 @@ class Motubrain2PipelineConfig(PipelineConfig):
     action_parallel_strategy: str = "monolithic"
     parallel_layout_version: str = "motubrain2-policy-v0"
 
-    @property
-    def action_websocket_sessions(self) -> bool:
-        return True
-
     def check_pipeline_config(self) -> None:
         super().check_pipeline_config()
         if self.model_impl != "real":
@@ -311,6 +307,11 @@ class Motubrain2PipelineConfig(PipelineConfig):
         }
 
     # ------------------------------------------------- SGLang server contract
+    def get_action_router(self):
+        from sglang.multimodal_gen.runtime.entrypoints.action.motubrain2 import router
+
+        return router
+
     def supports_action_endpoint(self) -> bool:
         return True
 

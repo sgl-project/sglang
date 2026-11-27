@@ -132,6 +132,21 @@ class _SessionState:
     action: torch.Tensor | None = None
     rng_state: torch.Tensor | None = None
 
+    @classmethod
+    def from_arrays(cls, arrays: dict) -> _SessionState:
+        return cls(
+            torch.from_numpy(arrays["action"]) if "action" in arrays else None,
+            torch.from_numpy(arrays["rng_state"]) if "rng_state" in arrays else None,
+        )
+
+    def to_arrays(self) -> dict:
+        arrays = {}
+        if self.action is not None:
+            arrays["action"] = self.action.numpy()
+        if self.rng_state is not None:
+            arrays["rng_state"] = self.rng_state.numpy()
+        return arrays
+
 
 def _check_native_dit_cache(args: SimpleNamespace) -> None:
     try:
@@ -377,6 +392,7 @@ class Motubrain2PolicyModel(nn.Module):
         *,
         num_steps: int,
         generator: Any = None,
+        connection_state: dict | None = None,
     ) -> tuple[torch.Tensor, dict | None]:
         session_id = observation.session_id
         if self.rtc_config is not None and (
@@ -392,11 +408,12 @@ class Motubrain2PolicyModel(nn.Module):
             if self.config.enforce_eager
             else nullcontext(),
         ):
-            previous = (
-                self.sessions.get(session_id, _SessionState())
-                if not observation.reset
-                else _SessionState()
-            )
+            if observation.reset:
+                previous = _SessionState()
+            elif connection_state is not None:
+                previous = _SessionState.from_arrays(connection_state)
+            else:
+                previous = self.sessions.get(session_id, _SessionState())
             gen = self._resolve_generator(None if seed is None else generator, seed)
             if seed is None and previous.rng_state is not None:
                 gen.set_state(previous.rng_state)
@@ -442,25 +459,26 @@ class Motubrain2PolicyModel(nn.Module):
                     "encoding": "base64",
                     "data": base64.b64encode(save(tensors)).decode("ascii"),
                 }
-            if session_id is not None:
+            if session_id is not None or connection_state is not None:
                 # Publish both pieces of state only after successful validation and
                 # serialization. A failed draw or reset leaves the episode retryable.
                 rng_state = gen.get_state() if seed is None else previous.rng_state
                 prefix = (
                     actions.cpu().clone() if self.rtc_config and fully_valid else None
                 )
-                if prefix is None and rng_state is None:
+                next_state = _SessionState(prefix, rng_state)
+                if connection_state is not None:
+                    arrays = next_state.to_arrays()
+                    connection_state.clear()
+                    connection_state.update(arrays)
+                elif prefix is None and rng_state is None:
                     self.sessions.pop(session_id, None)
                 else:
-                    self.sessions[session_id] = _SessionState(prefix, rng_state)
+                    self.sessions[session_id] = next_state
                     self.sessions.move_to_end(session_id)
                     if len(self.sessions) > self.max_sessions:
                         self.sessions.popitem(last=False)
         return actions, native_outputs
-
-    def release_session(self, session_id: str) -> bool:
-        with self._lock:
-            return self.sessions.pop(session_id, None) is not None
 
 
 def _resolve_device() -> torch.device:

@@ -97,14 +97,22 @@ class Motubrain2ActionStage(PipelineStage):
                 "prefix_len": int(example["video"].shape[0]),
             }
             start = perf_counter()
+            # Each WebSocket owns its state in the frontend. Update a request-local
+            # copy so a failed prediction cannot advance the previous episode.
+            connection_state = request.get("connection_state")
+            if connection_state is not None:
+                connection_state = connection_state.copy()
             decoded, native_outputs = self.model.predict(
                 observation,
                 example,
                 num_steps=batch.num_inference_steps,
                 generator=batch.generator,
+                connection_state=connection_state,
             )
             actions = decoded.cpu().numpy()
             timings["action_denoise_ms"] = (perf_counter() - start) * 1000
+            if connection_state is not None:
+                payload["_motubrain2_connection_state"] = connection_state
             if native_outputs is not None:
                 payload["extras"] = {"native_outputs": native_outputs}
         start = perf_counter()
@@ -140,9 +148,6 @@ class Motubrain2Pipeline(ComposedPipelineBase):
         model = Motubrain2PolicyModel.from_pretrained(self.model_path, config)
         logger.info("Loaded Motubrain2 policy backend: %r", model)
         return {"policy_model": model}
-
-    def release_action_session(self, session_id: str) -> bool:
-        return self.get_module("policy_model").release_session(session_id)
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(

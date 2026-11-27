@@ -21,6 +21,13 @@ class Motubrain2Observation:
     return_native_outputs: bool = False
 
 
+@dataclass(frozen=True)
+class _ConnectionState:
+    """Frontend-only marker that decoded client messages cannot construct."""
+
+    values: dict
+
+
 def validate_observation_options(observation: dict[str, Any], config: Any):
     if (
         observation.get("noise") is not None
@@ -104,13 +111,12 @@ class Motubrain2SamplingParams(ActionSamplingParams):
         default=None, metadata={"batch_sig_exclude": True}
     )
     _implicit_seed = False
-    allow_legacy_runtime_options = False
     action_horizon: int | None = None
     action_dim: int | None = None
 
     output_format: str = "list"
     return_timing: bool = True
-    return_native_outputs: bool = False
+    return_native_outputs: bool | None = None
     enable_prefix_cache: bool = True
     enable_cuda_graph: bool = False
 
@@ -129,8 +135,16 @@ class Motubrain2SamplingParams(ActionSamplingParams):
         default=None, metadata={"batch_sig_exclude": True}
     )
 
+    def __post_init__(self) -> None:
+        if self.return_native_outputs is None:
+            self.return_native_outputs = (self.observation or {}).get(
+                "return_native_outputs", False
+            )
+        super().__post_init__()
+
     def _request_observation(self) -> dict[str, Any]:
         observation = dict(self.observation or {})
+        observation.pop("_motubrain2_connection_state", None)
         observation["return_native_outputs"] = self.return_native_outputs
         if self.images is not None:
             observation["images"] = self.images
@@ -163,6 +177,13 @@ class Motubrain2SamplingParams(ActionSamplingParams):
             },
         }
         return extra
+
+    def apply_request_extra(self, req: Any) -> None:
+        # Move the trusted state into the worker envelope before serializing the request.
+        state = (self.observation or {}).pop("_motubrain2_connection_state", None)
+        super().apply_request_extra(req)
+        if isinstance(state, _ConnectionState):
+            req.extra["motubrain2"]["connection_state"] = state.values
 
     def _adjust(self, server_args) -> None:
         super()._adjust(server_args)

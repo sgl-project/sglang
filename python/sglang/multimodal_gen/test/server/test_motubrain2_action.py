@@ -99,11 +99,11 @@ class NativeOutputValidityTest(unittest.TestCase):
         from sglang.multimodal_gen.configs.pipeline_configs.motubrain2 import (
             Motubrain2PipelineConfig,
         )
-        from sglang.multimodal_gen.configs.sample.motubrain2 import (
-            Motubrain2SamplingParams,
+        from sglang.multimodal_gen.runtime.entrypoints.action.motubrain2 import (
+            prepare_motubrain2_payload,
         )
         from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
-            _build_action_model_sampling_params,
+            build_action_sampling_params,
         )
 
         config = Motubrain2PipelineConfig(
@@ -114,21 +114,69 @@ class NativeOutputValidityTest(unittest.TestCase):
             default_num_inference_steps=4,
         )
         server_args = SimpleNamespace(
-            pipeline_config=config, output_path=None, comfyui_mode=False
+            model_path="unused",
+            pipeline_class_name="Motubrain2Pipeline",
+            pipeline_config=config,
+            output_path=None,
+            comfyui_mode=False,
         )
-        request = {
-            "input": {
-                "task": "pick up the block",
-                "observation": {"images": {"head": [[[0, 0, 0]]]}, "state": [0, 1]},
-            },
+
+        def build(payload, **connection):
+            request = dict(payload)
+            prepare_motubrain2_payload(request, **connection)
+            return build_action_sampling_params(request, server_args)
+
+        observation = {
+            "images": {"head": [[[0, 0, 0]]]},
+            "state": [0, 1],
+            "connection_state": {"spoofed": True},
+            "_motubrain2_connection_state": {"spoofed": True},
+        }
+        nested = {
+            "input": {"task": "pick up the block", "observation": observation},
             "parameters": {"return_native_outputs": True},
         }
-        params = _build_action_model_sampling_params(
-            request, server_args, Motubrain2SamplingParams
-        )
-        self.assertTrue(params.return_native_outputs)
-        self.assertFalse(params.enable_cuda_graph)
-        self.assertEqual(params.num_inference_steps, 4)
+        flat = {
+            **observation,
+            "prompt": "pick up the block",
+            "return_native_outputs": True,
+            "enable_cuda_graph": True,
+            "runtime": {"cuda_graph": False, "prefix_cache": False},
+        }
+        override = {**flat, "parameters": {"return_native_outputs": False}}
+        for name, payload, native, cache in (
+            ("nested", nested, True, True),
+            ("flat", flat, True, False),
+            ("override", override, False, False),
+        ):
+            with self.subTest(name):
+                params = build(payload)
+                self.assertIs(params.return_native_outputs, native)
+                self.assertIs(params.enable_prefix_cache, cache)
+                self.assertFalse(params.enable_cuda_graph)
+                self.assertEqual(params.num_inference_steps, 4)
+                req = SimpleNamespace(extra={})
+                params.apply_request_extra(req)
+                worker = req.extra["motubrain2"]
+                self.assertIs(worker["observation"]["return_native_outputs"], native)
+                self.assertNotIn("connection_state", worker)
+                self.assertNotIn("connection_state", worker["observation"])
+                self.assertNotIn("_motubrain2_connection_state", worker["observation"])
+
+        state = {}
+        params = build(nested, session_id="server-session", connection_state=state)
+        req = SimpleNamespace(extra={})
+        params.apply_request_extra(req)
+        worker = req.extra["motubrain2"]
+        self.assertIs(worker["connection_state"], state)
+        self.assertEqual(worker["observation"]["session_id"], "server-session")
+        self.assertNotIn("_motubrain2_connection_state", params.observation)
+        self.assertNotIn("_motubrain2_connection_state", worker["observation"])
+
+        with self.assertRaisesRegex(ValueError, "does not implement CUDA graphs"):
+            build({**flat, "runtime": {}})
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            build({**flat, "return_native_outputs": "true"})
 
     def test_stage_caches_only_identical_native_inputs(self):
         import numpy as np
@@ -303,7 +351,14 @@ class NativeOutputValidityTest(unittest.TestCase):
         config = Motubrain2PipelineConfig(text_cache_size=0, max_sessions=2)
         model = Motubrain2PolicyModel("tiny", config, policy)
 
-        def request(session_id=None, *, seed=None, reset=False, fail=False):
+        def request(
+            session_id=None,
+            *,
+            seed=None,
+            reset=False,
+            fail=False,
+            connection_state=None,
+        ):
             from sglang.multimodal_gen.configs.sample.motubrain2 import (
                 Motubrain2Observation,
             )
@@ -311,13 +366,25 @@ class NativeOutputValidityTest(unittest.TestCase):
             observation = Motubrain2Observation(
                 inputs={"fail": fail}, session_id=session_id, seed=seed, reset=reset
             )
-            return model.predict(observation, {}, num_steps=1)[0]
+            return model.predict(
+                observation, {}, num_steps=1, connection_state=connection_state
+            )[0]
 
         expected = torch.Generator().manual_seed(0)
         first = torch.rand(2, 2, generator=expected)
         second = torch.rand(2, 2, generator=expected)
         self.assertTrue(torch.equal(request("left"), first))
         self.assertTrue(torch.equal(request("right"), first))
+        socket = {}
+        self.assertTrue(torch.equal(request("left", connection_state=socket), first))
+        self.assertTrue(
+            torch.equal(request("left", seed=0, connection_state=socket), first)
+        )
+        with self.assertRaisesRegex(ValueError, "after drawing noise"):
+            request("left", reset=True, fail=True, connection_state=socket)
+        self.assertTrue(torch.equal(request("left", connection_state=socket), second))
+        self.assertTrue(torch.equal(request("socket-only", connection_state={}), first))
+        self.assertEqual(set(model.sessions), {"left", "right"})
         self.assertTrue(torch.equal(request("left", seed=0), first))
         for reset in (False, True):
             with self.assertRaisesRegex(ValueError, "after drawing noise"):
@@ -325,8 +392,6 @@ class NativeOutputValidityTest(unittest.TestCase):
         self.assertTrue(torch.equal(request("left"), second))
         self.assertTrue(torch.equal(request("right"), second))
         self.assertTrue(torch.equal(request("left", reset=True), first))
-        self.assertTrue(model.release_session("left"))
-        self.assertTrue(torch.equal(request("left"), first))
         self.assertTrue(torch.equal(request("other"), first))
         self.assertTrue(torch.equal(request("right"), first))  # evicted episode
         self.assertTrue(torch.equal(request(), first))
@@ -378,22 +443,26 @@ class NativeOutputValidityTest(unittest.TestCase):
 
         obs = Motubrain2Observation(inputs={}, session_id="left")
 
-        def request():
-            return model.predict(obs, {}, num_steps=1)
+        def request(connection_state):
+            return model.predict(
+                obs, {}, num_steps=1, connection_state=connection_state
+            )
 
-        self.assertIsNone(request()[1])
-        mask[0, 1] = False
-        with self.assertRaisesRegex(ValueError, "invalid controller"):
-            request()
-        obs.return_native_outputs = True
-        _, native_outputs = request()
-        result = load(base64.b64decode(native_outputs["data"]))
-        self.assertTrue(torch.equal(result["decoded_valid"], mask))
-        self.assertEqual(result["decoded_valid"].dtype, torch.bool)
-        self.assertIsNotNone(observed_rtc[-1])
-        mask.fill_(True)
-        request()
-        self.assertIsNone(observed_rtc[-1])
+        for state in (None, {}):  # HTTP session and WebSocket continuation
+            obs.return_native_outputs = False
+            self.assertIsNone(request(state)[1])
+            mask[0, 1] = False
+            with self.assertRaisesRegex(ValueError, "invalid controller"):
+                request(state)
+            obs.return_native_outputs = True
+            _, native_outputs = request(state)
+            result = load(base64.b64decode(native_outputs["data"]))
+            self.assertTrue(torch.equal(result["decoded_valid"], mask))
+            self.assertEqual(result["decoded_valid"].dtype, torch.bool)
+            self.assertIsNotNone(observed_rtc[-1])
+            mask.fill_(True)
+            request(state)
+            self.assertIsNone(observed_rtc[-1])
 
 
 @requires_motubrain
@@ -637,34 +706,39 @@ class TinyServingTest(unittest.TestCase):
                 async def check_connections():
                     from websockets import connect
 
+                    async def receive(ws):
+                        reply = unpack_msgpack(await ws.recv())
+                        self.assertNotIn("_motubrain2_connection_state", reply)
+                        return reply
+
+                    uri = f"ws://127.0.0.1:{port}/openpi/policy"
                     async with (
-                        connect(f"ws://127.0.0.1:{port}/openpi/policy") as left,
+                        connect(uri) as left,
                         connect(f"ws://127.0.0.1:{port}/v1/actions/realtime") as right,
                     ):
                         for ws in (left, right):
                             self.assertEqual(
                                 unpack_msgpack(await ws.recv())["model_impl"], "real"
                             )
-                        await left.send(pack_msgpack(dict(observation, seed=13)))
-                        l1 = unpack_msgpack(await left.recv())["actions"]
-                        # The shared client-supplied ID cannot join another connection's state.
+                        await left.send(
+                            pack_msgpack(dict(observation, seed=13, session_id="left"))
+                        )
+                        l1 = (await receive(left))["actions"]
                         await right.send(
                             pack_msgpack(dict(observation, seed=29, session_id="left"))
                         )
-                        r1 = unpack_msgpack(await right.recv())["data"][0]["action"][
-                            "values"
-                        ]
+                        r1 = (await receive(right))["data"][0]["action"]["values"]
                         await left.send(
                             pack_msgpack(dict(observation, seed=29, session_id="left"))
                         )
-                        l2 = unpack_msgpack(await left.recv())["actions"]
+                        l2 = (await receive(left))["actions"]
                         np.testing.assert_allclose(l1, first, atol=1e-5)
                         np.testing.assert_allclose(r1, other, atol=1e-5)
                         np.testing.assert_allclose(l2[:2], l1[1:3], atol=1e-5)
                         await left.send(
                             pack_msgpack(dict(observation, seed=29, rtc=anchored))
                         )
-                        explicit_ws = unpack_msgpack(await left.recv())["actions"]
+                        explicit_ws = (await receive(left))["actions"]
                         np.testing.assert_array_equal(explicit_ws, anchored_chunk)
                         for reset, expected in (
                             (True, implicit_first),
@@ -673,10 +747,20 @@ class TinyServingTest(unittest.TestCase):
                             await left.send(
                                 pack_msgpack(dict(observation, reset=reset))
                             )
-                            actual = unpack_msgpack(await left.recv())["actions"]
+                            actual = (await receive(left))["actions"]
                             np.testing.assert_allclose(
                                 actual, expected, rtol=0, atol=1e-6
                             )
+
+                    async with connect(uri) as reconnected:
+                        await receive(reconnected)  # metadata
+                        await reconnected.send(
+                            pack_msgpack(dict(observation, session_id="left"))
+                        )
+                        fresh = (await receive(reconnected))["actions"]
+                        np.testing.assert_allclose(
+                            fresh, implicit_first, rtol=0, atol=1e-6
+                        )
 
                 asyncio.run(asyncio.wait_for(check_connections(), timeout=120))
             finally:
