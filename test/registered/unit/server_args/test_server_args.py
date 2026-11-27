@@ -195,18 +195,18 @@ class TestServerArgsPositionalOrder(CustomTestCase):
         fields = msgspec.structs.fields(ServerArgs)
         for index, name in (
             (563, "disable_multimodal"),
-            (565, "enable_dsa_fp4_indexer"),
-            (566, "kda_dwdp_size"),
-            (567, "weight_cache_transport"),
-            (581, "shortest_prefill_budget_doubling_chunks"),
-            (582, "mps_execution_backend"),
+            (567, "enable_dsa_fp4_indexer"),
+            (568, "kda_dwdp_size"),
+            (569, "weight_cache_transport"),
+            (585, "shortest_prefill_budget_doubling_chunks"),
+            (590, "mps_execution_backend"),
         ):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
-        positional = [getattr(defaults, field.name) for field in fields[:582]]
-        positional[565:568] = [True, 2, "shm"]
-        positional[581] = 4.0
+        positional = [getattr(defaults, field.name) for field in fields[:590]]
+        positional[567:570] = [True, 2, "shm"]
+        positional[585] = 4.0
 
         args = ServerArgs(*positional)
 
