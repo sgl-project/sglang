@@ -169,7 +169,7 @@ def make_req_to_token_pool(
 ) -> SimpleNamespace:
     req_to_token = torch.zeros(max_reqs, max_seq_len, dtype=torch.int32, device=device)
     return SimpleNamespace(
-        req_to_token=req_to_token, size=max_reqs, max_context_len=max_seq_len
+        req_to_token=req_to_token, size=max_reqs, row_width=max_seq_len
     )
 
 

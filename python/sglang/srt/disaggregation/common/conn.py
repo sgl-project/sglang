@@ -433,6 +433,11 @@ class CommonKVManager(BaseKVManager):
             get_disagg().disaggregation_max_top_logprobs_num
             != MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
         )
+        # Decode reports this at registration: with a radix cache it reuses
+        # draft KV beyond the sliding window, so prefill must send all of it.
+        self.decode_enable_radix_cache = (
+            get_disagg().disaggregation_decode_enable_radix_cache
+        )
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
@@ -1620,14 +1625,23 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        minimax_state_types = set(getattr(self.kv_args, "state_types", ())) & {
+            StateType.MINIMAX_INDEX_K,
+            StateType.MINIMAX_DENSE_KV,
+        }
         if (
-            StateType.MINIMAX_INDEX_K in getattr(self.kv_args, "state_types", ())
+            minimax_state_types
             and info.attn_tp_size != self.attn_tp_size
+            and (
+                not self.kv_args.main_kv_page_row
+                or StateType.MINIMAX_DENSE_KV in minimax_state_types
+            )
         ):
-            # MiniMax main KV pages are head-major page rows and its index state
-            # is replicated per rank; neither can be resliced by attention head.
+            # Only the NVFP4 page-row main KV has a head-sliced sender; dense KV
+            # state is a compacted layer list with no per-head split.
             raise RuntimeError(
-                "MiniMax sparse PD requires matching attention TP sizes: "
+                "MiniMax sparse PD with different attention TP sizes needs the "
+                "NVFP4 page-row KV pool and no dense layers: "
                 f"prefill={info.attn_tp_size}, decode={self.attn_tp_size}."
             )
 
@@ -2729,9 +2743,17 @@ class CommonKVSender(BaseKVSender):
             status = self.kv_mgr.request_status.get(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        if isinstance(self.kv_mgr.request_status, PPConsensusStore):
-            self.kv_mgr.request_status.pop(_pp_held_key(self.bootstrap_room), None)
+        # Serialized with update_status and, under PP, the staging counter's _sync
+        # (same lock order), so neither writes the room back after the pop.
+        with self.kv_mgr._status_lock:
+            if isinstance(self.kv_mgr.request_status, PPConsensusStore):
+                with self.kv_mgr._staging_outstanding._lock:
+                    self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+                    self.kv_mgr.request_status.pop(
+                        _pp_held_key(self.bootstrap_room), None
+                    )
+            else:
+                self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self._retire_sends()
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
@@ -3267,7 +3289,8 @@ class CommonKVReceiver(BaseKVReceiver):
             self.conclude_state = (
                 status if status in (KVPoll.Success, KVPoll.Failed) else KVPoll.Failed
             )
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        with self.kv_mgr._status_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
