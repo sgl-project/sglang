@@ -1131,14 +1131,14 @@ class TestGetHfTextConfig(CustomTestCase):
 
 
 class TestAttachAdditionalStopTokenIds(CustomTestCase):
-    """Bug regression: the Inkling bundle ships eos metadata unset while its
-    turn-final marker <|content_model_end_sampling|> sits in added_tokens; the
-    old detector only recognized <|eom_id|>, so generation ran to max length
-    (documented by the Inkling GSM8K test)."""
+    """Cover model turn boundaries that can be missing from checkpoint EOS metadata."""
 
     @staticmethod
-    def _tokenizer(added):
-        return SimpleNamespace(get_added_vocab=lambda: added)
+    def _tokenizer(added, chat_template=None):
+        return SimpleNamespace(
+            get_added_vocab=lambda: added,
+            chat_template=chat_template,
+        )
 
     def test_inkling_end_sampling_registers_as_stop(self):
         tok = self._tokenizer({"<|content_model_end_sampling|>": 200006})
@@ -1154,6 +1154,29 @@ class TestAttachAdditionalStopTokenIds(CustomTestCase):
         tok = self._tokenizer({"<|ifm|im_end|>": 64019})
         attach_additional_stop_token_ids(tok)
         self.assertEqual(tok.additional_stop_token_ids, {64019})
+
+    def test_glm53_assistant_turn_marker_ends_generation(self):
+        # A generated assistant turn opener can start a duplicate answer (#50119).
+        template = (
+            "[gMASK]<sop>Reasoning Effort: {{ reasoning_effort }}"
+            "<tool_call><arg_key><arg_value>"
+        )
+        tokenizer = self._tokenizer({"<|assistant|>": 154828}, template)
+
+        attach_additional_stop_token_ids(tokenizer)
+
+        self.assertEqual(tokenizer.additional_stop_token_ids, {154828})
+
+    def test_glm45_assistant_turn_marker_keeps_existing_behavior(self):
+        template = (
+            "[gMASK]<sop>{% if enable_thinking %}{% endif %}"
+            "<tool_call><arg_key><arg_value>"
+        )
+        tokenizer = self._tokenizer({"<|assistant|>": 151337}, template)
+
+        attach_additional_stop_token_ids(tokenizer)
+
+        self.assertIsNone(tokenizer.additional_stop_token_ids)
 
     def test_no_known_marker_yields_none(self):
         tok = self._tokenizer({"<|other|>": 7})
