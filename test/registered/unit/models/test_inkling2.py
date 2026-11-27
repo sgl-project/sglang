@@ -25,6 +25,7 @@ from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.models import inkling2 as inkling2_model
 from sglang.srt.models.inkling2 import (
     Inkling2ForConditionalGeneration,
     Inkling2LogitsProcessor,
@@ -628,6 +629,77 @@ def test_multiple_images_have_independent_attention(encoder):
     assert torch.isfinite(expected).all()
     assert torch.equal(expected[:1], actual[:1])
     assert not torch.equal(expected[1:], actual[1:])
+
+
+class _GatherGroup:
+    """One rank of a simulated attention TP group; `gathered` holds every rank's shard."""
+
+    def __init__(self, rank, world_size, gathered):
+        self.rank_in_group, self.world_size, self.gathered = rank, world_size, gathered
+        self.local = None
+
+    def all_gather_into_tensor(self, output, input_):
+        self.local = input_.clone()
+        if self.gathered is not None:
+            output.copy_(self.gathered)
+
+
+@pytest.mark.parametrize("world_size", [2, 3, 8])
+def test_data_parallel_image_encode_matches_per_image_encode(encoder, world_size):
+    """Every rank returns the per-image embeddings in item order, whichever rank encoded each."""
+    grids = [[[1, 1, 1]], [[1, 1, 2], [1, 2, 2]], [[1, 1, 1]], [[1, 2, 1]]]
+    items = [
+        SimpleNamespace(
+            feature=torch.randn(
+                sum(h * w for _, h, w in g), 2, 4, 4, 3, dtype=torch.bfloat16
+            ),
+            model_specific_data={"vision_grid_thw": torch.tensor(g)},
+        )
+        for g in grids
+    ]
+    all_grids = torch.cat(
+        [item.model_specific_data["vision_grid_thw"] for item in items]
+    )
+    stance = "force_eager" if is_host_cpu_arm64() else "default"
+    with torch.compiler.set_stance(stance), torch.inference_mode():
+        expected = torch.cat(
+            [
+                encoder(pixels, grid[None])
+                for item in items
+                for pixels, grid in zip(
+                    item.feature.split(
+                        [
+                            h * w
+                            for _, h, w in item.model_specific_data[
+                                "vision_grid_thw"
+                            ].tolist()
+                        ]
+                    ),
+                    item.model_specific_data["vision_grid_thw"],
+                )
+            ]
+        )
+
+        def encode(group):
+            return inkling2_model._encode_images_data_parallel(
+                visual=encoder,
+                items=items,
+                grids=all_grids,
+                hidden_size=24,
+                group=group,
+                device=torch.device("cpu"),
+            )
+
+        shards = []
+        for rank in range(world_size):
+            group = _GatherGroup(rank, world_size, gathered=None)
+            encode(group)
+            shards.append(group.local)
+        gathered = torch.cat(shards)
+        for rank in range(world_size):
+            assert torch.equal(
+                encode(_GatherGroup(rank, world_size, gathered)), expected
+            )
 
 
 @pytest.mark.parametrize(

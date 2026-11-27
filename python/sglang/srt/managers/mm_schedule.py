@@ -259,6 +259,20 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
     }
 
 
+def _encoder_batches_on_hip(data_embedding_func: DataEmbeddingFunc) -> bool:
+    # A data-parallel encoder never runs the whole cross-request batch on one rank.
+    owner = getattr(data_embedding_func, "__self__", None)
+    if owner is None or getattr(data_embedding_func, "__name__", None) != (
+        "get_image_feature"
+    ):
+        return False
+    return (
+        owner.__class__.__name__
+        in {"Inkling2ForConditionalGeneration", "Inkling2LoopForConditionalGeneration"}
+        and owner.dp_vision_encode
+    )
+
+
 def _move_items_to_device(
     items: List[MultimodalDataItem],
     device: torch.device,
@@ -647,7 +661,9 @@ def _get_chunked_prefill_embedding(
             for item in embedding_items_per_req
         )
         if is_per_image:
-            if _is_hip or _is_xpu:
+            if (
+                _is_hip and not _encoder_batches_on_hip(data_embedding_func)
+            ) or _is_xpu:
                 # ROCm CI regressed with one large cross-request ViT batch; keep
                 # the previous per-request path on HIP/XPU while CUDA and NPU use batching.
                 chunk_slices = _get_chunked_embedding_by_item(
