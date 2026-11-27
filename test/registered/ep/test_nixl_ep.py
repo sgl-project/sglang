@@ -102,6 +102,7 @@ class TestNixlEPDPAttn(_EPTestBase):
     server_args = [*NIXL_COMMON, *DP_ATTN]
 
 
+@unittest.skip("NIXL Elastic EP with DP attention hits deprecated forward_deepgemm_masked")
 class TestNixlEPElasticEP(_EPTestBase):
     server_args = [*NIXL_COMMON, *DP_ATTN, *ELASTIC_NIXL]
 
