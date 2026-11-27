@@ -10,10 +10,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 import torch
+from huggingface_hub.errors import GatedRepoError
 
+import sglang.srt.model_loader.weight_utils as weight_utils
 from sglang.srt.model_loader.weight_utils import (
     _load_pt_file,
+    download_safetensors_index_file_from_hf,
     filter_duplicate_safetensors_files,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
@@ -231,6 +235,33 @@ class TestMaybeAddMtpSafetensors(CustomTestCase):
                     [model, mtp],
                 )
                 listing.assert_not_called()
+
+
+class TestDownloadSafetensorsIndexFile(CustomTestCase):
+    def test_gated_repo_without_token_is_skipped(self):
+        response = httpx.Response(
+            401, request=httpx.Request("GET", "https://huggingface.co/x")
+        )
+        err = GatedRepoError("401 Client Error", response=response)
+        with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            patch.object(weight_utils, "hf_hub_download", side_effect=err),
+        ):
+            download_safetensors_index_file_from_hf(
+                "meta-llama/Llama-3.2-1B", INDEX_NAME, cache_dir
+            )
+
+    def test_other_hub_errors_still_raise(self):
+        with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            patch.object(
+                weight_utils, "hf_hub_download", side_effect=RuntimeError("boom")
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                download_safetensors_index_file_from_hf(
+                    "meta-llama/Llama-3.2-1B", INDEX_NAME, cache_dir
+                )
 
 
 class _OpenOnUnpickle:
