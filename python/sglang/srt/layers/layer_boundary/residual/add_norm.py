@@ -177,7 +177,7 @@ def _aiter_ar_fusion_max_bytes() -> int:
     limit = 8 * 1024 * 8192
     qr_comm = get_tp_group().qr_comm
     if qr_comm is not None and not qr_comm.disabled:
-        limit = max(limit, getattr(qr_comm, "fused_rmsnorm_max_size", lambda: 0)())
+        limit = max(limit, qr_comm.fused_rmsnorm_max_size())
     return limit
 
 

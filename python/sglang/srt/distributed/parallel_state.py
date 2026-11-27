@@ -871,12 +871,12 @@ class GroupCoordinator:
         custom all-reduce, which cannot take payloads above its 64 MiB pool.
         """
         qr_comm = self.qr_comm
-        if qr_comm is not None and not qr_comm.disabled:
-            should_fuse = getattr(qr_comm, "should_fused_allreduce_rmsnorm", None)
-            if should_fuse is not None and should_fuse(input_, residual_inp_, weight_):
-                return qr_comm.fused_allreduce_rmsnorm(
-                    input_, residual_inp_, weight_, eps
-                )
+        if (
+            qr_comm is not None
+            and not qr_comm.disabled
+            and qr_comm.should_fused_allreduce_rmsnorm(input_, residual_inp_, weight_)
+        ):
+            return qr_comm.fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
         if input_.numel() * input_.element_size() > _CUSTOM_AR_FUSION_MAX_BYTES:
             return None
 
