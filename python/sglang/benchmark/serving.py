@@ -2251,6 +2251,15 @@ def _finite_positive_float(value) -> float:
     return parsed
 
 
+def _parse_request_rate(value: str) -> float:
+    rate = float(value)
+    if not rate > 0:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive rate or 'inf', got {value!r}"
+        )
+    return rate
+
+
 def _goodput_slo(pair: str) -> Tuple[str, float]:
     """argparse type for one --goodput KEY:VALUE entry; VALUE is in milliseconds."""
     name, _, value = pair.partition(":")
@@ -2470,7 +2479,7 @@ def cli_main():
     )
     parser.add_argument(
         "--request-rate",
-        type=float,
+        type=_parse_request_rate,
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",

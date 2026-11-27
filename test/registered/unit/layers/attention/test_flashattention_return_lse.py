@@ -30,7 +30,7 @@ def _make_backend(tokens, heads, head_dim):
         enable_memory_saver=False,
     )
     req_pool = SimpleNamespace(
-        max_context_len=64,
+        row_width=64,
         req_to_token=torch.arange(1, 65, device="cuda", dtype=torch.int32).view(1, -1),
     )
     runner = SimpleNamespace(
