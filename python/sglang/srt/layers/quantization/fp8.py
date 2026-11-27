@@ -3776,7 +3776,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         fused_moe_kwargs = None
         gate_up_interleaved = getattr(layer, "_aiter_gate_up_interleaved", None)
-        if self.is_fp4_expert and gate_up_interleaved is not None:
+        swiglu_limit = self.moe_runner_config.swiglu_limit or 0.0
+        if gate_up_interleaved is not None and (
+            self.is_fp4_expert or swiglu_limit > 0
+        ):
             from aiter.ops.flydsl.moe_common import GateMode
 
             fused_moe_kwargs = {
@@ -3798,7 +3801,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_scale=w13_scale,
             w2_scale=w2_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
-            swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
+            swiglu_limit=swiglu_limit,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
             fp8_activations=self.is_fp4_expert and fp8_activations,
