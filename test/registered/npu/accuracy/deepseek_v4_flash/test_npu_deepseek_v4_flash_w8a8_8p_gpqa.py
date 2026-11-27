@@ -21,11 +21,10 @@ register_npu_ci(
     nightly=True,
 )
 
-# Nightly is also PR-triggered, so exclude it by workflow ref; every other caller
-# (local runs, full test) still gets the full run.
-_is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request" and (
-    "nightly-test-npu.yml" not in os.environ.get("GITHUB_WORKFLOW_REF", "")
-)
+# The PR pipeline (pr-test-npu.yml) runs on both `pull_request` and a daily
+# `schedule`, so match the workflow file instead of the event name. Every other
+# caller (nightly, full test) still gets the full run.
+_is_pr_pipeline = "pr-test-npu.yml" in os.environ.get("GITHUB_WORKFLOW_REF", "")
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
