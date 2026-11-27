@@ -1403,11 +1403,14 @@ fn encode_like_worker(req: &mut Request, input_ids: Vec<i64>, buffers: Vec<Buffe
 
 /// An abort while the request is out in the mm pool cancels it: the sink is
 /// deregistered at once, no AbortReq is sent (the scheduler never saw the
-/// rid), and the returning request is dropped instead of pushed -- releasing
-/// the shm its buffers carry -- so no GPU time or KV memory goes to a client
-/// that left.
+/// rid), the request's `MmCancellation` runs its callbacks for the processor,
+/// and the returning request is dropped instead of pushed -- releasing the shm
+/// its buffers carry -- so no GPU time or KV memory goes to a client that left.
 #[test]
 fn abort_while_in_mm_pool_drops_on_return() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let (mut intake, detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
     let (tx, mut rx) = mpsc::channel(8);
     let mut req = mm_pretokenized_req("mm-gone");
@@ -1415,8 +1418,26 @@ fn abort_while_in_mm_pool_drops_on_return() {
     intake.drive(req);
     let mut req = mm_rx.try_recv().expect("sent to the mm pool");
     assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+    let RequestKind::Generate(g) = &req.kind else {
+        panic!("a generate request");
+    };
+    let cancellation = g.mm.as_ref().unwrap().cancellation.clone();
+    let cancels = Arc::new(AtomicUsize::new(0));
+    let count = |cancels: &Arc<AtomicUsize>| {
+        let cancels = cancels.clone();
+        move || {
+            cancels.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    cancellation.on_cancel(count(&cancels));
+    assert!(!cancellation.is_cancelled());
 
     intake.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
+    assert!(cancellation.is_cancelled());
+    assert_eq!(cancels.load(Ordering::SeqCst), 1);
+    // A processor that registers after the abort is told at once.
+    cancellation.on_cancel(count(&cancels));
+    assert_eq!(cancels.load(Ordering::SeqCst), 2);
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "mm-gone")
     );

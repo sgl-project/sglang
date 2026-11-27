@@ -17,7 +17,10 @@ import torch.distributed as dist
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
+from sglang.srt.disaggregation.utils import (
+    ReqToMetadataIdxAllocator,
+    TransferBackend,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
@@ -139,9 +142,11 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
     pause_generation = Scheduler.pause_generation
+    _start_pause_window = Scheduler._start_pause_window
     _retract_batches = Scheduler._retract_batches
     _publish_paused_state = Scheduler._publish_paused_state
     continue_generation = Scheduler.continue_generation
+    _resume_pause = Scheduler._resume_pause
     increment_scheduler_iterations = Scheduler.increment_scheduler_iterations
     _on_step_processed = Scheduler._on_step_processed
     _release_mm_inputs = Scheduler._release_mm_inputs
@@ -175,6 +180,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.depths = []
         self.scheduler_stage_metrics = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
+        self.transfer_backend = TransferBackend.MOONCAKE
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.is_generation = True
         self.dllm_config = None
@@ -234,6 +240,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
                 "log_batch_result_stats",
                 "update_device_timer",
                 "record_scheduler_active",
+                "prefill_busy_clock",
             ]
         )
         self.metrics_reporter.current_scheduler_metrics_enabled = False
@@ -1397,6 +1404,7 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
         self.forward_sleep_time = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
+        self.transfer_backend = TransferBackend.MOONCAKE
         self.enable_staging = False
         self.enable_overlap = False
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)

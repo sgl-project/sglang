@@ -202,11 +202,14 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 self.request_retirer.release(req, checkpoint=True)
 
-        # Running requests send the prefill token with their first decode output.
+        # With "first_decode", running requests send the prefill token with their
+        # first decode output instead (--disaggregation-decode-first-token-stream).
         # Note: Logprobs should be handled on the prefill engine.
-        self.output_streamer.stream_output(
-            [req for req in batch.reqs if req.finished()], batch.return_logprob
-        )
+        if get_disagg().disaggregation_decode_first_token_stream == "admission":
+            stream_reqs = batch.reqs
+        else:
+            stream_reqs = [req for req in batch.reqs if req.finished()]
+        self.output_streamer.stream_output(stream_reqs, batch.return_logprob)
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
 
