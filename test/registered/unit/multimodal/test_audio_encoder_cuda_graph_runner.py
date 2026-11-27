@@ -89,6 +89,35 @@ def test_no_stale_rows_after_larger_batch():
     torch.testing.assert_close(graph_out, eager_out)
 
 
+def test_replays_on_different_streams():
+    """A new replay must not overwrite inputs still consumed on another stream."""
+
+    def delayed_forward(hidden_states, metadata):
+        # Keep the first graph's consumer pending while the second stream
+        # reaches its input copy. No host synchronization hides the overlap.
+        torch.cuda._sleep(100_000_000)
+        return _forward_transformer(hidden_states, metadata)
+
+    runner = _runner()
+    runner.forward_transformer = delayed_forward
+    runner.capture_all()
+    cu = [0, 11]
+    first = torch.randn(11, HIDDEN, device="cuda")
+    second = torch.randn_like(first)
+    first_ref = _eager(first, cu)
+    second_ref = _eager(second, cu)
+    torch.cuda.synchronize()
+    first_stream, second_stream = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(first_stream):
+        first_out = runner.run(first, cu, 32)
+    with torch.cuda.stream(second_stream):
+        second_out = runner.run(second, cu, 32)
+    torch.cuda.current_stream().wait_stream(first_stream)
+    torch.cuda.current_stream().wait_stream(second_stream)
+    torch.testing.assert_close(first_out, first_ref)
+    torch.testing.assert_close(second_out, second_ref)
+
+
 def test_oversized_batches_fall_back():
     runner = _runner()
     assert runner.select_budget(257, 17) is None

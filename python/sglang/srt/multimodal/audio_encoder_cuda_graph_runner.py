@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import bisect
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence
@@ -99,6 +100,8 @@ class AudioEncoderCudaGraphRunner:
         # still live between their replays, so an encoder graph captured into
         # it can overwrite another batch's buffers under load.
         self._pool = None
+        self._replay_lock = threading.Lock()
+        self._replay_done: Optional[torch.cuda.Event] = None
         logger.info(
             "Audio encoder CUDA graph: window=%d budgets=%s",
             window_size,
@@ -181,19 +184,30 @@ class AudioEncoderCudaGraphRunner:
         included). Returns ``None`` if that budget failed to capture; the
         caller then runs eagerly.
         """
-        if not self.graphs and not self.failed_budgets:
-            self.capture_all()
-        entry = self.graphs.get(budget)
-        if entry is None:
-            return None
+        # All buckets share a graph pool, and each bucket reuses its input and
+        # output buffers. Order the whole copy/replay/clone sequence, including
+        # calls made on different CUDA streams or host threads.
+        with self._replay_lock:
+            if not self.graphs and not self.failed_budgets:
+                self.capture_all()
+            entry = self.graphs.get(budget)
+            if entry is None:
+                return None
 
-        num_tokens = hidden_states.shape[0]
-        num_slots = entry.cu_seqlens.numel()
-        padded = cu_seqlens + [cu_seqlens[-1]] * (num_slots - len(cu_seqlens))
-        entry.cu_seqlens.copy_(
-            torch.tensor(padded, dtype=torch.int32).pin_memory(), non_blocking=True
-        )
-        entry.hidden_states[:num_tokens].copy_(hidden_states)
-        entry.graph.replay()
-        output = entry.output.reshape(-1, entry.output.shape[-1])
-        return output[:num_tokens].clone()
+            stream = torch.cuda.current_stream(self.device)
+            if self._replay_done is not None:
+                stream.wait_event(self._replay_done)
+            num_tokens = hidden_states.shape[0]
+            num_slots = entry.cu_seqlens.numel()
+            padded = cu_seqlens + [cu_seqlens[-1]] * (num_slots - len(cu_seqlens))
+            entry.cu_seqlens.copy_(
+                torch.tensor(padded, dtype=torch.int32).pin_memory(), non_blocking=True
+            )
+            entry.hidden_states[:num_tokens].copy_(hidden_states)
+            entry.graph.replay()
+            output = entry.output.reshape(-1, entry.output.shape[-1])
+            result = output[:num_tokens].clone()
+            if self._replay_done is None:
+                self._replay_done = torch.cuda.Event()
+            self._replay_done.record(stream)
+            return result
