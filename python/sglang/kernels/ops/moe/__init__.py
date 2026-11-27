@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     import torch
 
 _HIP = frozenset({CapabilityRequirement.HIP})
+_SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 
 register_kernel(
     KernelSpec(
@@ -341,6 +342,17 @@ register_kernel(
 )
 
 
+# Vendored tlx.ops.moe (gfx950); needs triton.language.extra.tlx from fbtriton or the uTLX plugin.
+register_kernel(
+    KernelSpec(
+        op="moe.tlx_moe",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.tlx_ops.kernels.moe.gfx950:moe",
+        capabilities=_HIP,
+    )
+)
+
+
 # Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
 # Triton attention backends dispatch to by shape; registered for inventory.
 _MUSE_SPARK_GFX950_KERNELS = [
@@ -407,3 +419,18 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+for _fn in (
+    "nvfp4_routed_quantize",
+    "nvfp4_routed_swiglu_quantize",
+    "mxfp8_routed_quantize",
+    "mxfp8_routed_swiglu_quantize",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"moe.inkling2_{_fn}_sm120",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.moe.inkling2_experts_sm120:{_fn}",
+            capabilities=_SM12X,
+        )
+    )
+del _fn

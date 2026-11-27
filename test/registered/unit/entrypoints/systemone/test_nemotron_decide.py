@@ -13,6 +13,7 @@ from transformers import Ministral3Config, PreTrainedTokenizerFast
 from sglang.srt.configs.nemotron_decision import (
     is_nemotron_decision,
     load_nemotron_decision_config,
+    nemotron_decision_attention_layout,
 )
 from sglang.srt.entrypoints.systemone.nemotron_decide import NemotronDecideEncoder
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -31,7 +32,13 @@ class TestNemotronDecisionEncoding(CustomTestCase):
         backend.decoder = decoders.ByteLevel()
         self.tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
         self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": ["<SPECIAL_100>", "<|im_end|>"]}
+            {
+                "additional_special_tokens": [
+                    "<SPECIAL_100>",
+                    "<|im_end|>",
+                    "<SPECIAL_101>",
+                ]
+            }
         )
         self.metadata = {
             "labels": {
@@ -56,6 +63,77 @@ class TestNemotronDecisionEncoding(CustomTestCase):
             tokenizer=self.tokenizer,
             max_prompt_tokens=4096,
         )
+
+    def test_separator_and_literal_controls_match_checkpoint_prompt_tokens(self):
+        self.config.state_end_token_id = self.tokenizer.convert_tokens_to_ids(
+            "<SPECIAL_101>"
+        )
+        encoder = NemotronDecideEncoder(
+            config=self.config,
+            metadata=self.metadata,
+            tokenizer=self.tokenizer,
+            max_prompt_tokens=4096,
+        )
+        state = {"city": "Montréal", "literal": "<SPECIAL_101>", "escape": r"\u003c"}
+        question = SimpleNamespace(
+            type="choice",
+            instructions="<SPECIAL_100> Which city?",
+            criteria={"yes": "<|im_end|>", "no": "Other"},
+        )
+        ids, _, _ = encoder.encode(state, question, {})
+        expected = r'{"state": {"city": "Montréal", "literal": "\u003cSPECIAL_101>", "escape": "\\u003c"}<SPECIAL_101>, "question": "\u003cSPECIAL_100> Which city?", "options": [{"code": "A", "label": "yes", "meaning": "\u003c|im_end|>"}, {"code": "C", "label": "no", "meaning": "Other"}]}<SPECIAL_100>'
+        self.assertEqual(ids, self.tokenizer.encode(expected, add_special_tokens=False))
+
+    def test_separator_and_template_errors_fail_during_encoder_setup(self):
+        valid = self.tokenizer.convert_tokens_to_ids("<SPECIAL_101>")
+        for value in (True, -1, len(self.tokenizer) + 1, self.config.mask_token_id):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "state_end_token_id"),
+            ):
+                self.config.state_end_token_id = value
+                NemotronDecideEncoder(
+                    config=self.config,
+                    metadata=self.metadata,
+                    tokenizer=self.tokenizer,
+                    max_prompt_tokens=4096,
+                )
+        self.config.state_end_token_id = valid
+        for template, message in (
+            ("{{ decision_content }}<SPECIAL_101><SPECIAL_100>", "state-end"),
+            ("{{ decision_content }}<SPECIAL_100><SPECIAL_100>", "trailing mask"),
+        ):
+            with (
+                self.subTest(template=template),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                NemotronDecideEncoder(
+                    config=self.config,
+                    metadata={**self.metadata, "chat_template": template},
+                    tokenizer=self.tokenizer,
+                    max_prompt_tokens=4096,
+                )
+
+    def test_attention_layout_rejects_unknown_modes_and_missing_separator(self):
+        self.assertEqual(
+            nemotron_decision_attention_layout(self.config), "state_sees_own_question"
+        )
+        self.config.decision_attention_layout = "state_sees_no_questions"
+        with self.assertRaisesRegex(ValueError, "requires state_end_token_id"):
+            nemotron_decision_attention_layout(self.config)
+        self.config.state_end_token_id = self.tokenizer.convert_tokens_to_ids(
+            "<SPECIAL_101>"
+        )
+        self.assertEqual(
+            nemotron_decision_attention_layout(self.config), "state_sees_no_questions"
+        )
+        for value in ("state_sees_all_questions", "state_sees_own_questions", None):
+            self.config.decision_attention_layout = value
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "decision_attention_layout"),
+            ):
+                nemotron_decision_attention_layout(self.config)
 
     def test_checkpoint_label_order_and_template_override_the_generic_chat_template(
         self,

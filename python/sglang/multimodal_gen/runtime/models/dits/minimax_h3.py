@@ -33,15 +33,18 @@ from sglang.kernels.ops.diffusion import (
     can_use_aten_head_rmsnorm,
     can_use_aten_head_rmsnorm_rope,
     can_use_fused_inplace_qknorm_rope,
+    can_use_indexed_gate_bf16_sum2,
     can_use_indexed_gate_rmsnorm_scale_shift,
     can_use_rmsnorm_indexed_scale_shift,
     fused_inplace_qknorm_rope,
     fused_qknorm_rope_out_of_place,
     indexed_gate_bf16,
     indexed_gate_bf16_,
+    indexed_gate_bf16_sum2_,
     indexed_gate_fp32,
     indexed_gate_fp32_,
     indexed_gate_rmsnorm_scale_shift_,
+    indexed_gate_rmsnorm_scale_shift_sum2_,
     indexed_scale_shift_bf16_,
     indexed_scale_shift_fp32_,
     indexed_scale_shift_mxfp8_,
@@ -60,6 +63,7 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTConfig,
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_block
+from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_weights_epoch
 from sglang.multimodal_gen.runtime.cache.spectrum import (
     SpectrumMixin,
     blend_h3_spectrum_prediction,
@@ -69,6 +73,9 @@ from sglang.multimodal_gen.runtime.cache.spectrum import (
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.tp_peer_partial import (
+    staged_partials,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
@@ -264,6 +271,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "rope_cache",
         "unique_timesteps",
         "adaln_cache_slot",
+        "adaln_timestep_bits",
         "inverse_indices",
         "update_mask",
         "update_audio_mask",
@@ -865,7 +873,11 @@ def _minimax_h3_pipelined_dense_attention(
     of each shape checks the pipeline against it.
     """
     groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
-    if groups in (0, 1) or torch.compiler.is_compiling():
+    if (
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
+        or torch.compiler.is_compiling()
+    ):
         return None
     if attention._attention_backend_enum not in PIPELINED_ATTENTION_BACKENDS:
         return None
@@ -966,7 +978,8 @@ def _minimax_h3_collective_pipelined_attention(
         groups = 2
     world_size, _ = get_ulysses_ctx()
     if (
-        groups in (0, 1)
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
         or attention._attention_backend_enum
         not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
         or q.shape[1] % (world_size * groups)
@@ -1011,7 +1024,8 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     # under graph capture the forward keeps the in-place norm, and the pipeline
     # runs from the attention core's eager break point instead
     if (
-        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
@@ -1591,10 +1605,13 @@ class MiniMaxH3Attention(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         x_prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
+        project_out: bool = True,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
         ``x_prequant``: ``x`` already quantized for ``qkv_proj`` as ``(fp8, scales)``.
+        ``project_out=False`` returns the attention rows before ``out_proj``
+        (dense attention only).
 
         Operation order: fused qkv projection -> per-head q/k RMSNorm -> RoPE
         on q/k -> variable-length non-causal flash attention -> output projection.
@@ -1655,6 +1672,8 @@ class MiniMaxH3Attention(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
+        if not project_out:
+            return out
         out, _ = self.out_proj(out)
         return out
 
@@ -1803,16 +1822,22 @@ class MiniMaxH3MLP(nn.Module):
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
+        out, _ = self.fc2(self._activate(hidden))
+        return out
+
+    def fc2_input(self, x: torch.Tensor) -> torch.Tensor:
+        """fc2's input for ``x``: fc1 and SwiGLU, unquantized layers only."""
+        hidden, _ = self.fc1(x)
+        return self._activate(hidden)
+
+    def _activate(self, hidden: torch.Tensor) -> torch.Tensor:
         if (
             self._npu_swiglu is not None
             and hidden.device.type == "npu"
             and hidden.dtype in (torch.float16, torch.bfloat16)
         ):
-            hidden = self._npu_swiglu(hidden)
-        else:
-            hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
-        out, _ = self.fc2(hidden)
-        return out
+            return self._npu_swiglu(hidden)
+        return _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
 
 
 class MiniMaxH3AdalnProj(nn.Module):
@@ -2051,6 +2076,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 dtype=_BF16_DTYPE,
                 fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
             )
+        peer = self._takes_peer_partials(x)
         h = self.attn(
             h,
             x_prequant=h_prequant,
@@ -2061,32 +2087,58 @@ class MiniMaxH3DiTBlock(nn.Module):
             subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            project_out=not peer,
         )
+        # two-rank TP: the gate kernels add both ranks' out_proj partial sums
+        # as they load them instead of reading an all-reduced tensor
+        partials = staged_partials(self.attn.out_proj, h, residual) if peer else None
+        if peer and partials is None:
+            h, _ = self.attn.out_proj(h)
         if self._fuses_gate_norm2(
-            residual, gate_msa, h, shift_mlp, scale_mlp, combined_indices
+            residual,
+            gate_msa,
+            h if partials is None else partials[0],
+            shift_mlp,
+            scale_mlp,
+            combined_indices,
         ):
             # the gated residual and norm2 in one pass, at the same roundings
-            h = indexed_gate_rmsnorm_scale_shift_(
-                residual,
-                gate_msa,
-                h,
+            norm2_args = (
                 self.norm2.weight,
                 shift_mlp,
                 scale_mlp,
                 combined_indices,
                 self.norm2.eps,
             )
-            return _modulate_gate(
-                residual, gate_mlp, self.mlp(h), combined_indices, dtype=_BF16_DTYPE
+            if partials is None:
+                h = indexed_gate_rmsnorm_scale_shift_(
+                    residual, gate_msa, h, *norm2_args
+                )
+            else:
+                h = indexed_gate_rmsnorm_scale_shift_sum2_(
+                    residual, gate_msa, *partials, *norm2_args
+                )
+            return self._mlp_gated_residual(
+                residual, gate_mlp, h, combined_indices, peer
             )
-        x = _modulate_gate(
-            residual,
-            gate_msa,
-            h,
-            combined_indices,
-            dtype=_BF16_DTYPE,
-            allow_inplace=not self.preserve_input_for_cache_dit,
-        )
+        if partials is not None and (
+            self.preserve_input_for_cache_dit
+            or not can_use_indexed_gate_bf16_sum2(
+                residual, gate_msa, *partials, combined_indices
+            )
+        ):
+            h, partials = partials[0] + partials[1], None
+        if partials is not None:
+            x = indexed_gate_bf16_sum2_(residual, gate_msa, *partials, combined_indices)
+        else:
+            x = _modulate_gate(
+                residual,
+                gate_msa,
+                h,
+                combined_indices,
+                dtype=_BF16_DTYPE,
+                allow_inplace=not self.preserve_input_for_cache_dit,
+            )
 
         residual = x
         if _accepts_mxfp8_input(self.mlp.fc1):
@@ -2111,9 +2163,11 @@ class MiniMaxH3DiTBlock(nn.Module):
                 dtype=_BF16_DTYPE,
                 fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
             )
-            h = self.mlp(h)
-        # `residual` is block-local here (see above), so this stays in-place
-        # even while Cache-DiT is attached.
+            # `residual` is block-local here (see above), so this stays
+            # in-place even while Cache-DiT is attached.
+            return self._mlp_gated_residual(
+                residual, gate_mlp, h, combined_indices, peer
+            )
         return _modulate_gate(
             residual,
             gate_mlp,
@@ -2121,6 +2175,45 @@ class MiniMaxH3DiTBlock(nn.Module):
             combined_indices,
             dtype=_BF16_DTYPE,
         )
+
+    def _takes_peer_partials(self, x: torch.Tensor) -> bool:
+        """Whether out_proj and fc2 may hand their two-rank TP partial sums to
+        the gate kernels (``staged_partials`` makes the per-call decision)."""
+        # unquantized only: a declined call then runs the forward unchanged
+        return (
+            x.is_cuda
+            and x.dtype == _BF16_DTYPE
+            and self.attn.hybrid is None
+            and self.attn.out_proj.tp_size == 2
+            and all(
+                type(layer) is RowParallelLinear
+                and type(layer.quant_method) is UnquantizedLinearMethod
+                for layer in (self.attn.out_proj, self.mlp.fc2)
+            )
+        )
+
+    def _mlp_gated_residual(
+        self,
+        residual: torch.Tensor,
+        gate: torch.Tensor,
+        h: torch.Tensor,
+        indices: torch.Tensor,
+        peer: bool,
+    ) -> torch.Tensor:
+        """``residual`` updated in place with ``gate[indices] * mlp(h)``."""
+        if not peer:
+            return _modulate_gate(
+                residual, gate, self.mlp(h), indices, dtype=_BF16_DTYPE
+            )
+        hidden = self.mlp.fc2_input(h)
+        partials = staged_partials(self.mlp.fc2, hidden, residual)
+        if partials is None:
+            out, _ = self.mlp.fc2(hidden)
+        elif can_use_indexed_gate_bf16_sum2(residual, gate, *partials, indices):
+            return indexed_gate_bf16_sum2_(residual, gate, *partials, indices)
+        else:
+            out = partials[0] + partials[1]
+        return _modulate_gate(residual, gate, out, indices, dtype=_BF16_DTYPE)
 
     def _fuses_gate_norm2(
         self,
@@ -2541,6 +2634,73 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         self.validate_weight_update_source(weights_path=weights_path)
         cache.weight_files = native_adaln_weight_files(weights_path)
         cache.invalidate()
+
+    def _adaln_memo_params(
+        self, adaln_input: torch.Tensor, timestep_bits: tuple[int, ...] | None
+    ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
+        """Per-block AdaLN parameters memoized by the step's exact timesteps.
+
+        A block's AdaLN projection depends only on the step's unique timesteps
+        (the time embedding feeds a fixed weight), and a few-step release
+        reuses the same timestep schedule for every request. Each block's
+        projection is a weight-bandwidth-bound GEMV (2688 x 96768 BF16 =
+        520 MB read per block per step), so serving it from a small memo keyed
+        by the timesteps' bit patterns removes it after the first request with
+        the same schedule. The memo holds exactly what the same projection
+        computed for the same input, so outputs are bit-identical.
+        The memo is dropped when an AdaLN weight is rebound and whenever the
+        conditioning weights epoch advances: weight updates and LoRA merges
+        write in place, and an unmerged LoRA changes the projection without
+        touching its weight.
+        """
+        max_entries = 32
+        if (
+            timestep_bits is None
+            or self.adaln_cache is not None
+            or get_tp_world_size() > 1
+            or torch.compiler.is_compiling()
+            # CUDA only: torch.cuda's capture query is a stub on other builds
+            or adaln_input.device.type != "cuda"
+            or torch.cuda.is_current_stream_capturing()
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or hasattr(self, "_sglang_cache_dit_adapter")
+            or is_layerwise_offloaded_module(self)
+            or not all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
+            or any(block.adaln_proj is None for block in self.blocks)
+        ):
+            return None
+        weights = [block.adaln_proj.linear.weight for block in self.blocks]
+        version = (
+            conditioning_weights_epoch(),
+            # inference tensors track no version counter
+            *(
+                (w.data_ptr(), None if w.is_inference() else w._version)
+                for w in weights
+            ),
+        )
+        memo = self.__dict__.get("_adaln_memo")
+        if memo is None or memo[0] != version:
+            memo = (version, {})
+            self.__dict__["_adaln_memo"] = memo
+        entries = memo[1]
+        key = (
+            timestep_bits,
+            tuple(adaln_input.shape),
+            adaln_input.dtype,
+            adaln_input.device,
+        )
+        outputs = entries.pop(key, None)
+        if outputs is None:
+            outputs = [
+                block.adaln_proj.project_local(adaln_input) for block in self.blocks
+            ]
+            while len(entries) >= max_entries:
+                entries.pop(next(iter(entries)))
+        entries[key] = outputs
+        return tuple(
+            block.adaln_proj.split_output(output)
+            for block, output in zip(self.blocks, outputs)
+        )
 
     def _can_batch_block_adaln(self) -> bool:
         return (
@@ -3488,6 +3648,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     cache_plan_index=adaln_cache_plan_index,
                     num_timesteps=adaln_input.shape[0],
                 )
+            elif (
+                memo := self._adaln_memo_params(
+                    adaln_input, kwargs.get("adaln_timestep_bits")
+                )
+            ) is not None:
+                block_adaln_params = memo
             elif self._can_batch_block_adaln():
                 local_adaln = torch.stack(
                     [

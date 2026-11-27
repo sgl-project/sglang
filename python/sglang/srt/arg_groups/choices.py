@@ -3,6 +3,8 @@
 import argparse
 from typing import Any, Callable, Optional
 
+from sglang.srt.sampling.watermarking.config import ALGORITHM_CONFIG_FIELDS
+
 LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
@@ -76,6 +78,7 @@ BUILT_IN_KV_CACHE_DTYPES = (
     "mxfp8",
     "bf16",
     "bfloat16",
+    "int8",
     "nvfp4",
     "fp4_mx_block16",
 )
@@ -110,6 +113,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "mlu",
 ]
 
 _REMOVED_ATTENTION_BACKENDS = {
@@ -192,6 +196,9 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 BUILT_IN_SAMPLING_BACKENDS = frozenset({"flashinfer", "pytorch", "ascend", "intel_xpu"})
 SAMPLING_BACKEND_CHOICES = set(BUILT_IN_SAMPLING_BACKENDS)
+
+# Each name has an adapter in sampling/watermarking/runtime.py.
+WATERMARK_ALGORITHM_CHOICES = list(ALGORITHM_CONFIG_FIELDS)
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -319,6 +326,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "flashmla",
     "cutedsl_mla",
     "trtllm_mla",
+    "mlu",
 ]
 add_chunked_prefix_cache_attention_backend = (
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append

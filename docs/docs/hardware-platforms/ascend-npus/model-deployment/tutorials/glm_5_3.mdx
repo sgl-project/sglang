@@ -13,30 +13,29 @@ hybrid sparse/linear-attention architecture.
 
 This document demonstrates the deployment of GLM-5.3 on Ascend NPUs using SGLang, including single-node deployment,
 multi-node co-located (mixed) deployment, prefill-decode disaggregation, feature configuration, and performance optimization.
-The multi-node and prefill-decode disaggregation examples use a locally prepared `GLM-5.3-w8a8` checkpoint and a CANN 9.1.0 runtime.
+The examples use a ModelSlim W8A8 `GLM-5.3-w8a8` checkpoint and a CANN 9.2.0 runtime.
 
 ## Supported features
 
 | Feature                       | Example usage                                                                                           |
 |-------------------------------|---------------------------------------------------------------------------------------------------------|
-| Tensor Parallelism            | `--tp-size 16` or `--tp-size 32`                                                                          |
-| Data Parallelism              | `--attn-dp-size 16` (mixed) or `--attn-dp-size 32` (decode)                                                      |
-| Expert Parallelism            | `--ep-size 32` with `--moe-a2a-backend deepep` and `--deepep-mode low_latency`                             |
-| Pipeline Parallelism          | `--pp-size 4` with `SGLANG_PP_LAYER_PARTITION=18,20,24,16`                                                |
+| Tensor Parallelism            | `--tp-size 8` (prefill), `16` (single-node), or `32` (mixed/decode)                                      |
+| DP Attention                  | `--attn-dp-size 16` (mixed), `--attn-dp-size 32` (decode), or `--attn-dp-size 1` (prefill)                     |
+| Expert Parallelism            | `--moe-a2a-backend deepep` with `--deepep-mode normal` (prefill), `auto` (mixed), or `low_latency` (decode); `--ep-size 32` (decode) |
+| Pipeline Parallelism          | `--pp-size 4` with `SGLANG_PP_LAYER_PARTITION=18,20,24,16` (prefill)                                       |
 | Prefill Context Parallelism   | `--attn-cp-size 8` with `--enable-prefill-cp` and `--cp-strategy interleave`                                |
 | PD Disaggregation             | `--disaggregation-mode prefill` / `decode` with `--disaggregation-transfer-backend ascend`                  |
 | Quantization                  | `--quantization modelslim`                                                                               |
-| Chunked Prefill               | `--chunked-prefill-size 65536` / `--max-prefill-tokens 280000` (mixed deployment)                    |
+| Chunked Prefill               | `--chunked-prefill-size 4096` / `--max-prefill-tokens 180000` (prefill); `65536` / `280000` (mixed)  |
 | NPU Graph                     | `--cuda-graph-bs-decode 2` (mixed); `--disable-decode-cuda-graph --disable-prefill-cuda-graph` (prefill); `--cuda-graph-bs-decode 1 2 3` (decode)                               |
-| Speculative Decoding          | `--speculative-algorithm NEXTN` with `--speculative-num-steps 3` and `--speculative-num-draft-tokens 4`     |
+| Speculative Decoding          | `--speculative-algorithm NEXTN` with `--speculative-num-steps 3`, `--speculative-eagle-topk 1`, and `--speculative-num-draft-tokens 4` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                             |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                                    |
 
 <Note>
 The values in the **Example usage** column reflect the deployment scenarios described below and are not universal
 defaults. Some flags require a specific SGLang version or model checkpoint. For parameter details, see
-[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference); for
-recommended configurations, see [Best practices](#best-practices).
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference).
 </Note>
 
 For feature compatibility and conflict information between features,
@@ -49,13 +48,15 @@ see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/optimization/pa
 Before following this tutorial, complete the environment setup in the documents below:
 
 - [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start) — the fastest way to get started.
-  It walks you through launching a container, starting the SGLang server, and sending a test request.
+  It walks you through launching the official container image, starting the SGLang server, and sending a test request.
+  Recommended if you are new to SGLang on Ascend.
 - [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/getting-started/installation) — the full installation guide.
-  It covers version compatibility (CANN, TorchNPU, Triton, kernels, etc.), building from source or from a Dockerfile,
-  and recommended system settings (CPU power scheme, NUMA, swap).
+  It covers the component version mapping (CANN, TorchNPU, Triton, kernels, etc.), building from source or from a Dockerfile,
+  and recommended system settings (CPU power scheme, NUMA, swap). Use it when you need to install or customize the
+  environment instead of using the official image.
 
-The mixed and PD disaggregation scripts below require a CANN **9.1.0** environment, the corresponding ATB and customized
-operator libraries, a compatible SGLang source checkout, and working inter-node HCCL/Gloo connectivity. Ensure that
+The mixed and PD disaggregation scripts below assume the CANN **9.2.0** environment from the image, including the ATB
+and customized operator libraries, and require working inter-node HCCL/Gloo connectivity. Ensure that
 all participating nodes use compatible software versions and can access the model weights. The PD topology additionally requires the configured MemFabric components.
 
 ### Model weights
@@ -65,126 +66,77 @@ For multi-node deployment, download the weights to a shared directory accessible
 identical checkpoint to the same local path on every node.
 
 - [GLM-5.3-BF16](https://www.modelscope.cn/models/ZhipuAI/GLM-5.3-BF16) (BF16, approximately 1.51 TB).
-- `GLM-5.3-w8a8` (a locally prepared W8A8 ModelSlim-quantized checkpoint used in the scripts below; set `MODEL_PATH`
-  to the actual location). The checkpoint size and MTP-weight availability depend on the conversion output.
-- You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize model weights for Ascend devices.
+- [GLM-5.3-w8a8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-w8a8) (W8A8 ModelSlim-quantized checkpoint, 764.24GB, used in the scripts below).
 
 <Info>
-The deployment examples below use a W8A8 checkpoint with `--quantization modelslim`. The PD disaggregation topology
-uses **two A3 series nodes for prefill and two additional A3 nodes for decode**. Make sure that the checkpoint
+The deployment examples below use a W8A8 checkpoint with `--quantization modelslim`. Make sure that the checkpoint
 contains the required MTP weights before enabling NEXTN speculative decoding.
 </Info>
 
-For hardware specifications (memory per device, devices per node, and differences between A2 and A3),
+For hardware specifications (memory per device and devices per node),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ## Installation
 
 <Warning>
-Ensure sufficient disk space before pulling images. A CANN Docker image requires at least **30GB** of free space.
-CANN 9.1.0 base images do **not** by themselves include a ready-to-run SGLang environment: install a compatible
-SGLang build, TorchNPU, ATB, custom operators, and other required dependencies before running the deployment scripts.
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30GB** of free space.
 </Warning>
 
-The commands below start CANN 9.1.0 base images. Follow
-[SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/getting-started/installation)
-to install SGLang and the required runtime components inside the container. Use the matching image for your hardware.
+The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
+online platform. You can directly pull it.
 
-<Tabs>
-  <Tab title="A3 series">
+Both **stable releases** and **daily builds** are available. CANN 9.2.0 has no stable release yet, so the command
+below uses the validated build tag `cann9.2.0-a3-B051`.
+For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
+
+The command requires
+[Ascend Docker Runtime](/docs/hardware-platforms/ascend-npus/getting-started/installation#install-ascend-docker-runtime)
+on the host; it selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
 
 ```bash Command
-docker pull quay.io/ascend/sglang:cann9.1.0-a3-B080
+# ============================================================
+# Before running, update the following variables or use default values:
+#   NAME: container name
+# ============================================================
 
-docker run -itd --shm-size=16g --name ${NAME} \
+NAME=sglang-glm-5-3
+
+# pull image
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
+
+# create container
+docker run -itd --shm-size=16g --name "$NAME" \
 --privileged=true --net=host \
--v /var/queue_schedule:/var/queue_schedule \
+-e ASCEND_VISIBLE_DEVICES=0-15 \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
 -v /usr/local/sbin:/usr/local/sbin \
 -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
---device=/dev/davinci0:/dev/davinci0 \
---device=/dev/davinci1:/dev/davinci1 \
---device=/dev/davinci2:/dev/davinci2 \
---device=/dev/davinci3:/dev/davinci3 \
---device=/dev/davinci4:/dev/davinci4 \
---device=/dev/davinci5:/dev/davinci5 \
---device=/dev/davinci6:/dev/davinci6 \
---device=/dev/davinci7:/dev/davinci7 \
---device=/dev/davinci8:/dev/davinci8 \
---device=/dev/davinci9:/dev/davinci9 \
---device=/dev/davinci10:/dev/davinci10 \
---device=/dev/davinci11:/dev/davinci11 \
---device=/dev/davinci12:/dev/davinci12 \
---device=/dev/davinci13:/dev/davinci13 \
---device=/dev/davinci14:/dev/davinci14 \
---device=/dev/davinci15:/dev/davinci15 \
---device=/dev/davinci_manager:/dev/davinci_manager \
---device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:cann9.1.0-a3-B080
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
+
+# enter container
+docker exec -it "$NAME" bash
 ```
-
-  </Tab>
-  <Tab title="A2 series">
-
-```bash Command
-docker pull quay.io/ascend/sglang:cann9.1.0-a3-B080
-
-docker run -itd --shm-size=16g --name ${NAME} \
---privileged=true --net=host \
--v /var/queue_schedule:/var/queue_schedule \
--v /etc/ascend_install.info:/etc/ascend_install.info \
--v /usr/local/sbin:/usr/local/sbin \
--v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
--v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
---device=/dev/davinci0:/dev/davinci0 \
---device=/dev/davinci1:/dev/davinci1 \
---device=/dev/davinci2:/dev/davinci2 \
---device=/dev/davinci3:/dev/davinci3 \
---device=/dev/davinci4:/dev/davinci4 \
---device=/dev/davinci5:/dev/davinci5 \
---device=/dev/davinci6:/dev/davinci6 \
---device=/dev/davinci7:/dev/davinci7 \
---device=/dev/davinci8:/dev/davinci8 \
---device=/dev/davinci9:/dev/davinci9 \
---device=/dev/davinci10:/dev/davinci10 \
---device=/dev/davinci11:/dev/davinci11 \
---device=/dev/davinci12:/dev/davinci12 \
---device=/dev/davinci13:/dev/davinci13 \
---device=/dev/davinci14:/dev/davinci14 \
---device=/dev/davinci15:/dev/davinci15 \
---device=/dev/davinci_manager:/dev/davinci_manager \
---device=/dev/hisi_hdc:/dev/hisi_hdc \
---entrypoint=bash \
-quay.io/ascend/sglang:cann9.1.0-a3-B080
-```
-
-  </Tab>
-</Tabs>
 
 <Tip>
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
   container, for example: `-v /path/to/models:/models`.
-- Replace `${NAME}` with your container name or remove `--name` to use the default name.
-- The listed `/dev/davinci*` mappings follow the 16-device A3 example in the original tutorial. Remove mappings for
-  devices that do not exist on your host, particularly when using A2 nodes.
-- If you already have a validated CANN 9.1.0 SGLang development image, you can use it instead of building from the base image.
 </Tip>
 
 ## Online service deployment
 
 ### Single-node deployment
 
-The following single-node example is adapted from the GLM-5.2 tutorial and is provided as a
-**reference configuration**.
+The following single-node example is provided as a **reference configuration**.
 
 ```shell
-#!/usr/bin/env bash
-# Reference only: adapted from the GLM-5.2 tutorial; not yet verified for GLM-5.3.
-# Update MODEL_PATH, SGLANG_ROOT, and the installed custom-op paths as required.
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: GLM-5.3 W8A8 weight directory
+# Ensure the CANN custom ops are installed; update the sourced custom-op paths if your install differs.
+# ============================================================
 MODEL_PATH='/path/to/GLM-5.3-w8a8'
-SGLANG_ROOT='/path/to/sglang'
 
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
@@ -194,14 +146,14 @@ export SGLANG_SET_CPU_AFFINITY=1
 unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
-export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export HCCL_BUFFSIZE=1000
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 export SGLANG_NPU_USE_MULTI_STREAM=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 
 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
@@ -223,30 +175,23 @@ python3 -m sglang.launch_server \
 
 ### Multi-node deployment
 
-For co-located (mixed) serving across **two A3 series nodes**, both nodes participate in a single GLM-5.3
-inference instance. The following script is adapted from the supplied GLM-5.3 W8A8 multi-node configuration, using
-**TP=32**, **DP=16**, DeepEP `auto`, and NEXTN speculative decoding.
+For co-located (mixed) serving across **two A3 Series nodes**, both nodes participate in a single GLM-5.3
+inference instance. The following script uses **TP=32**, **DP=16**, DeepEP `auto`, and NEXTN speculative decoding.
 
-Modify the node IP addresses, model/source paths, and network interface, then run the **same script on both nodes**.
+Modify the node IP addresses, model path, and network interface, then run the **same script on both nodes**.
 The two nodes must use the same compatible runtime and be able to communicate with rank 0 via the distributed
 initialization address. In this script, the mixed-serving HTTP port is **6688** (not 8000).
 
 ```shell
-#!/usr/bin/env bash
-# GLM-5.3 W8A8: two-node co-located (mixed) deployment (A3 series).
-# Run the same script on both nodes after replacing the variables below.
-
 # ============================================================
-# Before running, update the following variables:
+# Run the same script on both nodes after replacing the variables below.
 #   IPS: IP addresses of two nodes (rank 0 first)
 #   NIC: network interface name for HCCL and Gloo
 #   MODEL_PATH: GLM-5.3 W8A8 weight directory
-#   SGLANG_ROOT: compatible SGLang source checkout
 # ============================================================
 IPS=('<node-0-ip>' '<node-1-ip>')
 NIC='<network-interface>'
 MODEL_PATH='/path/to/GLM-5.3-w8a8'
-SGLANG_ROOT='/path/to/sglang'
 
 # High-performance CPU settings (requires sufficient permissions).
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
@@ -258,19 +203,19 @@ export SGLANG_SET_CPU_AFFINITY=1
 unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 export LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/op_api/lib/:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
 
-# Keep the allocator configuration disabled as in the supplied script.
+# The allocator configuration remains disabled for this deployment.
 # export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export HCCL_SOCKET_IFNAME="${NIC}"
 export GLOO_SOCKET_IFNAME="${NIC}"
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=40
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 
-# Optional tuning flags from the original script (disabled by default).
+# Optional tuning flags (disabled by default).
 # export SGLANG_NPU_USE_MLAPO=1
 # export HCCL_OP_EXPANSION_MODE=AIV
 # export SGLANG_NPU_USE_MULTI_STREAM=1
@@ -323,7 +268,7 @@ exit 1
 ### Prefill-decode disaggregation deployment
 
 PD disaggregation splits the prefill and decode stages onto separate node groups, reducing interference between
-long-prompt processing and autoregressive generation. This configuration uses **four A3 series nodes**:
+long-prompt processing and autoregressive generation. This configuration uses **four A3 Series nodes**:
 
 - **Prefill group:** 2 nodes, `TP=8`, `PP=4`, `DP=1`, and prefill context parallelism `CP=8`. It runs DeepEP in `normal`
   mode and disables NPU graph capture.
@@ -331,30 +276,25 @@ long-prompt processing and autoregressive generation. This configuration uses **
   and NEXTN speculative decoding.
 
 Run the following **same script on all four nodes**. The script selects the role and node rank by matching a configured
-IP address against the local network addresses. Update the model/source paths, the two prefill and two decode IP
+IP address against the local network addresses. Update the model path, the two prefill and two decode IP
 addresses, and the HCCL/Gloo interface before running it. The nodes must reach the prefill master for MemFabric
 bootstrap and should be started before the router.
 
 ```shell
-#!/usr/bin/env bash
-# GLM-5.3 W8A8: 2 prefill nodes + 2 decode nodes (A3 series).
+# ============================================================
+# GLM-5.3 W8A8: 2 prefill nodes + 2 decode nodes (A3 Series).
 # Run this same script on all four nodes, after replacing the placeholders below.
 # The IP addresses must match addresses returned by `hostname -I` on each node.
-
-# ============================================================
-# Before running, update the following variables:
 #   P_IP: two prefill node IP addresses (rank 0 first)
 #   D_IP: two decode node IP addresses (rank 0 first)
 #   NIC: HCCL/Gloo network interface name
 #   MODEL_PATH: local/shared GLM-5.3 W8A8 model directory
-#   SGLANG_ROOT: SGLang source directory
-# Ensure MemFabric, ATB, and CANN 9.1.0 custom ops are installed.
+# Ensure MemFabric, ATB, and CANN 9.2.0 custom ops are installed.
 # ============================================================
 P_IP=('<prefill-node-0-ip>' '<prefill-node-1-ip>')
 D_IP=('<decode-node-0-ip>' '<decode-node-1-ip>')
 NIC='<network-interface>'
 MODEL_PATH='/path/to/GLM-5.3-w8a8'
-SGLANG_ROOT='/path/to/sglang'
 
 # High-performance CPU configuration (requires sufficient permissions).
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
@@ -366,9 +306,8 @@ export SGLANG_SET_CPU_AFFINITY=1
 unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 export LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/op_api/lib:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
@@ -413,7 +352,7 @@ for i in "${!P_IP[@]}"; do
             --quantization modelslim --dtype bfloat16 \
             --tp-size 8 --pp-size 4 --attn-dp-size 1 \
             --attn-cp-size 8 --enable-prefill-cp --cp-strategy interleave \
- --enable-dp-lm-head \
+            --enable-dp-lm-head \
             --moe-dense-tp 1 --load-balance-method round_robin \
             --disaggregation-transfer-backend ascend \
             --max-running-requests 64 \
@@ -467,8 +406,8 @@ echo "ERROR: None of the P_IP/D_IP addresses matches this host: ${LOCAL_IPS[*]}"
 exit 1
 ```
 
-Launch the router after the prefill and decode services are ready. The router example below preserves the
-GLM-5.2 document's PD routing syntax and uses the prefill/decode group master addresses.
+Launch the router after the prefill and decode services are ready. The router example below uses the prefill/decode
+group master addresses.
 
 ```shell
 # ============================================================
@@ -540,18 +479,14 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 
 ### Best practice configuration reference
 
-GLM-5.3 does not have a validated standalone best-practice page in this tutorial. The
-[Online service deployment](#online-service-deployment) section above includes a four-node PD disaggregation
-configuration and a two-node mixed deployment configuration based on supplied GLM-5.3 scripts. The single-node
-co-located example remains a GLM-5.2-derived reference. The configurations have not been independently verified on hardware.
-
-The two-node mixed example uses `TP=32`, `DP=16`, `HCCL_BUFFSIZE=2000`, and `--cuda-graph-bs-decode 2`.
-Disable profiling when measuring uninstrumented service performance.
+GLM-5.3 has no standalone best practice page yet. The [Online service deployment](#online-service-deployment) section
+above provides the two-node mixed and four-node PD disaggregation configurations; the single-node example remains a
+reference configuration and has not been independently verified on hardware.
 
 For this PD disaggregation configuration, prefill prioritizes long sequences using pipeline/context parallelism and
 DeepEP `normal`, while decode prioritizes low latency using DP/EP, DeepEP `low_latency`, NPU multi-stream,
 and NEXTN. Tune `--mem-fraction-static`, graph capture batch sizes, and concurrency based on observed HBM usage,
-TTFT, TPOT, and request throughput. Check that the weight conversion and MTP settings are compatible.
+TTFT, TPOT, and request throughput. Check that the quantized checkpoint and MTP settings are compatible.
 
 For the full catalog of optimization features and their parameter and compatibility details,
 see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning).
