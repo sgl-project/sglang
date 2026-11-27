@@ -5,19 +5,36 @@ from __future__ import annotations
 
 import enum
 import importlib
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Protocol, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
 import msgspec
+import torch
 
 if TYPE_CHECKING:
-    import torch
+    from sglang.srt.kernel_plugins.nvidia.binding import PreparationView
 
 # bumped on any breaking change to the contracts in this module
-MEGAKERNEL_API_VERSION = 1
+MEGAKERNEL_API_VERSION = 3
 
 # the sglang.srt.plugins entry point that registers the specs
 ENTRY_POINT = "nvidia_megakernel"
 FLAG = "--enable-nvidia-megakernel"
+# The EAGLE draft graph runners run a draft model's capture check (Step); a draft
+# spec that serves steps can require it
+EAGLE_DRAFT_CAPTURE_CHECK = True
+# The variables of Requirements.env that the flag sets to the spec's value when they
+# are unset, at argument resolution: SGLang reads each only when a model is built, in
+# the model processes started after it. A value the user set is kept and checked.
+FLAG_SETS_ENV = frozenset({"SGLANG_ENABLE_EMBED_REPLICATION"})
 
 
 class Feature(enum.Enum):
@@ -59,7 +76,8 @@ class Requirements(msgspec.Struct, frozen=True):
     server_args: Mapping[str, frozenset] = {}
     # an HF config field -> the value the kernels are built for
     hf_config: Mapping[str, Any] = {}
-    # an SGLang environment variable in envs -> its required value
+    # an SGLang environment variable in envs -> its required value (the flag sets one
+    # in FLAG_SETS_ENV that is unset)
     env: Mapping[str, Any] = {}
 
 
@@ -80,7 +98,7 @@ class Numerics(msgspec.Struct, frozen=True):
 
 
 class BuildContext(msgspec.Struct, frozen=True):
-    widths: tuple[int, ...]  # step rows to build, ascending
+    widths: tuple[int, ...]  # decode step rows to build, ascending
     tokens_per_request: int
     deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
     # SGLang's runtime state for this model (sglang.srt.kernel_plugins.nvidia.binding)
@@ -88,12 +106,288 @@ class BuildContext(msgspec.Struct, frozen=True):
 
 
 class Step(msgspec.Struct, frozen=True):
-    """A covered step, decided from host state alike on every rank."""
+    """A covered step, decided from host state alike on every rank.
 
-    mode: str  # "decode" or "target_verify"
+    mode is one of:
+      "decode"        – autoregressive single-token decode; runs in a CUDA graph.
+      "target_verify" – speculative-decoding target verify; runs in a CUDA graph.
+      "prefill"       – context prefill; runs eagerly. With prefill_graph its
+                        transformer body may be captured (SupportsPrefillBody).
+      "draft_decode", "draft_extend" – a draft spec's EAGLE draft steps.
+
+    A draft spec's steps may be off its width grid (an EAGLE draft decode step has
+    one row a request); the dispatch does not check rows against the widths. The
+    capture check of a draft model runs once, when the first of its EAGLE draft
+    graph runners has captured every batch size.
+    """
+
+    mode: str
     rows: int
     # the running forward's ForwardView, set by SGLang before forward runs the step
     view: Any = None
+
+
+class VocabShardView(msgspec.Struct, frozen=True):
+    """The valid global-vocabulary columns stored on this rank."""
+
+    start: int
+    valid: int
+    vocab_size: int
+
+
+class ShardedLogitsView(msgspec.Struct, frozen=True):
+    """Borrowed local logits used to build provider-neutral reduction keys.
+
+    ``values`` is floating ``[rows, local_cols]`` on one device with unit last
+    stride. ``shard`` satisfies ``0 <= start``, ``0 < valid <= local_cols`` and
+    ``start + valid <= vocab_size``. ``temperatures`` is ``None`` for greedy,
+    otherwise contiguous float32 ``[rows]`` on the same device. ``splits`` is the
+    positive runtime-selected number of column partitions and must not be changed.
+
+    The choice between returning keys and returning ``None`` must be identical on
+    every TP rank. Applicability checks may use only rank-uniform predicates, such
+    as ``values.shape`` and dtype, whether ``temperatures`` or ``seeds`` is
+    ``None``, and ``splits``. They must not make a rank-local refusal from logits
+    contents or ``shard.start``/``shard.valid`` alone. A provider that uses
+    rank-local shard metadata must collectively establish the complete descriptor
+    at bind time and still derive the same choice on every rank; otherwise ranks
+    can enter different collective sequences.
+
+    A local policy returns contiguous int64 keys on ``values.device`` without any
+    collective, or ``None`` before consuming RNG when it cannot serve the view.
+    ``seeds`` is the runtime's existing per-request sampling seed material, passed
+    through unchanged as contiguous int64 ``[batch]`` on the same device. It is
+    not a per-logit-row seed: for temperature sampling, a provider seeing a
+    non-``None`` value must return ``None`` without consuming RNG so stock seeded
+    sampling handles it. Greedy ignores seeds and the default local policy may
+    still serve it bitwise. When ``seeds`` is ``None``, a temperature provider may
+    create per-row CUDA int64 seeds only after every applicability check succeeds.
+    Each key stores a monotonic score in its high 32 bits and
+    ``0xffffffff - global_token_id`` in its low 32 bits. ``splits`` must be used
+    unchanged: one split returns ``[rows]`` and multiple splits return
+    ``[rows, splits]``.
+    """
+
+    values: torch.Tensor
+    shard: VocabShardView
+    temperatures: Optional[torch.Tensor]
+    seeds: Optional[torch.Tensor]
+    splits: int
+
+
+LocalKeysFn = Callable[[ShardedLogitsView], Optional[torch.Tensor]]
+
+
+class VerifyLogitsView(Protocol):
+    """The mutable logits fields consumed by the stock verifier.
+
+    If verification gathers a full vocabulary, it writes the full tensor back to
+    ``next_token_logits`` and clears ``next_token_logits_vocab_shard`` in place.
+    """
+
+    next_token_logits: torch.Tensor
+    next_token_logits_vocab_shard: Optional[VocabShardView]
+
+
+class GrammarMaskView(Protocol):
+    def apply(self, logits: torch.Tensor) -> None:
+        """Mask ``logits`` in place."""
+
+
+class VerifyTreeView(msgspec.Struct, frozen=True):
+    """Borrowed tree topology and proposal tensors for one verify."""
+
+    draft_tokens: torch.Tensor
+    draft_probabilities: Optional[torch.Tensor]
+    retrieve_index: torch.Tensor
+    next_child: torch.Tensor
+    next_sibling: torch.Tensor
+    custom_mask: Optional[torch.Tensor]
+    positions: Optional[torch.Tensor]
+    tokens_per_request: int
+    max_depth: int
+    topk: int
+
+    # Compatibility names used by the stock verifier. They are properties rather
+    # than stored fields, so the frozen public view stays exact.
+    @property
+    def draft_token(self) -> torch.Tensor:
+        return self.draft_tokens
+
+    @property
+    def draft_probs(self) -> Optional[torch.Tensor]:
+        return self.draft_probabilities
+
+    @property
+    def retrieve_next_token(self) -> torch.Tensor:
+        return self.next_child
+
+    @property
+    def retrieve_next_sibling(self) -> torch.Tensor:
+        return self.next_sibling
+
+    @property
+    def draft_token_num(self) -> int:
+        return self.tokens_per_request
+
+    @property
+    def max_tree_depth(self) -> int:
+        return self.max_depth
+
+    @property
+    def tree_topk(self) -> int:
+        return self.topk
+
+
+class VerifyPenaltiesView(Protocol):
+    def apply_verify(
+        self,
+        logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        next_child: Optional[torch.Tensor] = None,
+        next_sibling: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Apply each verify row's own sampling penalties to ``logits`` in place."""
+
+
+class VerifySamplingView(msgspec.Struct, frozen=True):
+    """Borrowed model-independent sampling tensors and resolved host flags."""
+
+    sequence_lengths: torch.Tensor
+    temperatures: torch.Tensor
+    top_ks: torch.Tensor
+    top_ps: torch.Tensor
+    min_ps: torch.Tensor
+    step_penalties: Optional[VerifyPenaltiesView]
+    logit_bias: Optional[torch.Tensor]
+    sampling_seed: Optional[torch.Tensor]
+    is_all_greedy: bool
+    need_top_k_sampling: bool
+    need_top_p_sampling: bool
+    need_min_p_sampling: bool
+    watermark_keys: Optional[torch.Tensor]
+    watermark_context_windows: Optional[torch.Tensor]
+    watermark_enabled: Optional[torch.Tensor]
+    has_watermark_candidates: bool
+    max_top_k: Optional[int]
+    device: torch.device
+
+
+class WatermarkStateView(Protocol):
+    """The watermark operations used during speculative verification."""
+
+    def context_windows(self, sampling: VerifySamplingView) -> torch.Tensor: ...
+
+    def speculative_contexts(
+        self,
+        req_pool_indices: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        custom_mask: torch.Tensor,
+        positions: torch.Tensor,
+        draft_token_num: int,
+        full_mask: bool,
+        context_windows: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    def force_speculative(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        contexts: torch.Tensor,
+        context_lengths: torch.Tensor,
+        sampling_info: VerifySamplingView,
+        draft_token_num: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    def force_speculative_from_tree(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        custom_mask: torch.Tensor,
+        positions: torch.Tensor,
+        sampling_info: VerifySamplingView,
+        draft_token_num: int,
+        full_mask: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    def record_speculative(
+        self,
+        req_pool_indices: torch.Tensor,
+        context_hashes: torch.Tensor,
+        selected: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_lens: torch.Tensor,
+    ) -> None: ...
+
+
+class PostVerifyIO(msgspec.Struct, frozen=True):
+    """Borrowed inputs for target-side speculative acceptance and sampling.
+
+    The runtime owns every object in this view. A hook may use them for the current
+    call but must not retain references after it returns.
+    """
+
+    logits: VerifyLogitsView
+    verify_tree: VerifyTreeView
+    sampling: VerifySamplingView
+    grammar_mask: Optional[GrammarMaskView]
+    watermark: Optional[WatermarkStateView]
+    watermark_full_mask: bool
+    request_pool_indices: torch.Tensor
+    return_logprob: bool
+    is_idle: bool
+    simulated_accept_length: Optional[torch.Tensor]
+    simulated_accept_length_rng: Optional[torch.Generator]
+    sparse_target_max_top_k: Optional[int]
+    sparse_bonus_argmax: bool
+
+    # Compatibility names used by the stock verifier.
+    @property
+    def seq_lens(self) -> torch.Tensor:
+        return self.sampling.sequence_lengths
+
+    @property
+    def sampling_info(self) -> VerifySamplingView:
+        return self.sampling
+
+    @property
+    def req_pool_indices(self) -> torch.Tensor:
+        return self.request_pool_indices
+
+    @property
+    def device(self) -> torch.device:
+        return self.sampling.device
+
+
+class PostVerifyOutput(msgspec.Struct, frozen=True):
+    """Runtime-consumed results valid until this round's graph slot is reused."""
+
+    token_ids: torch.Tensor
+    accepted_lengths: torch.Tensor
+    accepted_indices: torch.Tensor
+
+
+VerifyRunner = Callable[[PostVerifyIO, LocalKeysFn], PostVerifyOutput]
+
+
+class PostVerifyStrategy(msgspec.Struct, frozen=True):
+    """Runtime verifier plus the provider-replaceable local key builder."""
+
+    run: VerifyRunner
+    local_keys: LocalKeysFn
+
+    def __call__(self, io: PostVerifyIO) -> PostVerifyOutput:
+        return self.run(io, self.local_keys)
+
+
+class SpeculativeRuntimeHooks(msgspec.Struct, frozen=True):
+    """The provider-adjustable strategy around speculative verification."""
+
+    post_verify: PostVerifyStrategy
+
+
+HooksFactory = Callable[[SpeculativeRuntimeHooks], SpeculativeRuntimeHooks]
 
 
 class BuiltMegakernel(Protocol):
@@ -110,12 +404,48 @@ class BuiltMegakernel(Protocol):
     noise.offset once per sampled block.
 
     SGLang's runtime state reaches a build as BuildContext.binding and a covered
-    step as Step.view (sglang.srt.kernel_plugins.nvidia.binding, which also lists what else may be
-    called, written or read).
+    step as Step.view (sglang.srt.kernel_plugins.nvidia.binding, which also lists
+    what else may be called, written or read). The binding is MegakernelBinding
+    unless SGLang has one for the model's architecture.
+
+    A built object may also offer the EAGLE entries ENTRIES names (None means
+    SGLang's own path). A draft model's draft_loop and draft_extend are factories an
+    SGLang component calls once with its own buffers: like draft_sampler, they return
+    bs -> None (SGLang's code at that batch size) or the step to run there, and every
+    rank must serve the same sizes. A draft's begin_draft_round is called as it is.
+    A draft's optional draft_step_fold(*, batch_size, num_steps) runs before each
+    topk-1 EAGLE draft graph is captured and returns None or a fold whose
+    finalize(logits, positions, draft_tokens, column, mrope_positions) replaces the
+    greedy chain's top-1 postprocess and M-RoPE + 1, returning (topk_p, topk_index);
+    the round's draft forwards see it as ForwardBatch.draft_step_fold.
+    The entries a built object offers must agree on every rank.
+
+    A built object may also offer graph_variants: None, or a mapping from a
+    graph runner GRAPH_VARIANT_RUNNERS names to an AttentionGraphVariants
+    (layers/attention/graph_variants.py), with the same runners and capture labels
+    on every rank. At each batch size whose graph runs the megakernel, that runner
+    then captures one graph per label, in order, the label readable through
+    capture_mode.get_capture_attention_variant() during the capture, and replays the
+    one select picks. select reads host state only, such as
+    ForwardBatch.attention_kv_len_lower_bound, and picks alike on every rank. Other
+    runners and batch sizes capture as they would without these variants.
+
+    Every built object must define ``speculative_runtime_hooks``, with ``None``
+    when it provides no factory. A target's factory receives SGLang's stock bundle
+    and returns a bundle. SGLang selects it only under the independent
+    runtime-optimization master switch and otherwise keeps the caller's stock
+    strategies unchanged. A provider may replace only the local key builder within
+    post-verify; the runtime runner remains authoritative.
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested
     draft_sampler: Optional[Callable[..., Callable[[int], Optional[Callable]]]]
+    draft_loop: Optional[Callable]
+    draft_extend: Optional[Callable]
+    begin_draft_round: Optional[Callable]
+    graph_variants: Optional[Mapping[str, Any]]
+    # Required member; None when the provider does not offer a factory.
+    speculative_runtime_hooks: Optional[HooksFactory]
 
     def summary(self) -> str:
         """What was built, for the startup line."""
@@ -124,11 +454,116 @@ class BuiltMegakernel(Protocol):
         self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
     ) -> Optional[Step]:
         """The step to run, or None for the model's own forward; host-only, so a
-        captured graph replays the decision made at capture."""
+        captured graph replays the decision made at capture.  A "prefill" step
+        is always eager and is never replayed from a captured graph."""
 
     def forward(self, step: Step, original: Callable, *args: Any, **kwargs: Any) -> Any:
         """Run step in place of original (the model's bound forward), taking and
-        returning what it does; capturable in a CUDA graph."""
+        returning what it does; capturable in a CUDA graph for decode and
+        target_verify steps (prefill runs eagerly)."""
+
+
+# The optional entries of a built megakernel, beyond draft_sampler the EAGLE ones
+ENTRIES = (
+    "draft_sampler",
+    "draft_loop",
+    "draft_extend",
+    "begin_draft_round",
+    "draft_step_fold",
+)
+# The graph runners a built object's graph_variants may key: the target's verify
+# graphs, the EAGLE draft graphs and the EAGLE draft-extend graphs
+GRAPH_VARIANT_RUNNERS = ("target_verify", "draft_loop", "draft_extend")
+
+
+@runtime_checkable
+class SupportsPrefillBody(Protocol):
+    """A build running a prefill's transformer body (the layer module's forward),
+    which breakable prefill graphs capture per token bucket. plan_body is host-only
+    like plan; forward_body takes and returns what the layer module's forward does.
+    """
+
+    def plan_body(
+        self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
+    ) -> Optional[Step]: ...
+
+    def forward_body(
+        self, step: Step, original: Callable, *args: Any, **kwargs: Any
+    ) -> Any: ...
+
+    def linear_prefill_graph_seqs(self, backend: Any) -> Optional[int]:
+        """Asked by a linear backend whose own chain cannot be captured: the most
+        sequences a bucket holds when this body runs the extend core in the graph on
+        tables of its own, or None to keep the layers' graph breaks."""
+
+    def refill_prefill_graph(self, metadata: Any, forward_batch: Any) -> None:
+        """Before a bucket's capture and each replay, after the backend filled its
+        per-bucket metadata: refill this body's own tables for that bucket."""
+
+
+class RecurrentCommitIO(msgspec.Struct, frozen=True):
+    """One chain verify's accepted recurrent state, per request ([bs] tensors). The
+    slots are the verify's resolved ones: the request table may name others."""
+
+    state_slots: torch.Tensor
+    track_slots: Optional[torch.Tensor]
+    request_rows: torch.Tensor
+    accept_lens: torch.Tensor  # including the bonus token
+    last_step: torch.Tensor
+    track_steps: Optional[torch.Tensor]
+    draft_token_num: int
+    src_indices_raw: Optional[torch.Tensor]
+
+
+@runtime_checkable
+class SupportsStateSlotReset(Protocol):
+    """A target build keeping recurrent state of its own beside the state pool,
+    allocated in its prepare and charged to the pool's budget per slot and per
+    request-table row. reset_state_slots(slots, request_rows) runs on the forward
+    stream before each target extend and when a slot is newly bound. False flags
+    drop the per-draft SSM scratch, decode-time checkpoints and host backups."""
+
+    state_bytes_per_slot: int
+    state_bytes_per_request_row: int
+    keeps_draft_ssm: bool
+    tracks_decode_state: bool
+    backs_up_state: bool
+
+    def reset_state_slots(
+        self, slots: torch.Tensor, request_rows: torch.Tensor
+    ) -> None: ...
+
+
+@runtime_checkable
+class SupportsRecurrentCommit(Protocol):
+    """A target build committing a chain verify's recurrent state on the current
+    stream. True: SGLang commits only its per-request side states (PLE); False:
+    SGLang commits as without it. Capturable: no collective or host sync."""
+
+    def commit_recurrent_state(self, io: RecurrentCommitIO) -> bool: ...
+
+
+@runtime_checkable
+class SupportsDFlashRuntime(Protocol):
+    """A target build that runs the DFLASH decode round itself.
+
+    dflash_runtime is the "module:attribute" path of its runtime class, which SGLang
+    imports only when every TP rank names the same and binds to the DFLASH worker
+    (sglang.srt.kernel_plugins.nvidia.kimi_k31_dflash_binding); "" keeps SGLang's
+    round.
+    """
+
+    dflash_runtime: str
+
+
+@runtime_checkable
+class SupportsDecodeTensorEntry(Protocol):
+    """A build whose decode steps SGLang runs through a tensor entry.
+
+    tensor_binding_kind names the host adapter (binding.TENSOR_ENTRY_KINDS); 0 is none.
+    """
+
+    tensor_binding_kind: int
 
 
 class MegakernelSpec(msgspec.Struct, frozen=True):
@@ -137,6 +572,11 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     Argument resolution checks the served model's spec in full. A spec found only
     at load, e.g. for a draft model, is checked there against its ISA, tp_sizes,
     decode_graph_backends, hf_config, env and model_disable_reasons.
+
+    Optional prepare(built, view) runs after model preparation, once the attention
+    backends and pools exist, before autotune and graph capture. It receives a
+    typed PreparationView rather than the model runner and must be idempotent:
+    preparation may repeat when the warmup lifecycle resets for recapture.
     """
 
     name: str
@@ -150,6 +590,15 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     model_disable_reasons: Optional[Callable[[torch.nn.Module, Any], list[str]]] = None
     # (cfg, hf_config), before load: the checks requires cannot state
     config_disable_reasons: Optional[Callable[[Any, Any], list[str]]] = None
+    # Optional tensor entry: (weights view, deadline seconds), for a multi-token verify
+    tensor_verify_binding_kind: int = 0
+    tensor_verify_build: Optional[Callable[[Any, float], BuiltMegakernel]] = None
+    # Pool preparation after allocation and before any forward or graph capture.
+    prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]] = None
+    # A key of binding.BINDING_KINDS; empty picks the binding by architecture.
+    binding: str = ""
+    # The build offers SupportsPrefillBody.
+    prefill_graph: bool = False
 
 
 # HF architecture -> the "module:attribute" path of its spec

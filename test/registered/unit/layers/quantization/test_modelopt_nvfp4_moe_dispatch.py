@@ -12,7 +12,7 @@ tensors, so the tests stay on CPU; the kernels are covered on-device.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import sys
 import unittest
@@ -256,7 +256,7 @@ class TestNvFp4MoeDispatch(CustomTestCase):
             gemm1_clamp_limit=None,
             activation_type=None,
         )
-        bf16_info = SimpleNamespace(
+        bf16_info = kernels.FlashInferTrtllmBf16MoeQuantInfo(
             gemm1_weights=common["w13_weight"],
             gemm2_weights=common["w2_weight"],
             global_num_experts=4,

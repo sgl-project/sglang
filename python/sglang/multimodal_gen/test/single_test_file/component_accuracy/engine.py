@@ -26,10 +26,12 @@ except ImportError:
     AutoVisionTextModel = None
 
 import sglang.multimodal_gen.runtime.managers.forward_context as fc_mod
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
+    get_local_torch_device,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     destroy_model_parallel,
-    get_local_torch_device,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,

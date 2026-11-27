@@ -1,4 +1,4 @@
-"""Idle gaps must not inflate prefill busy time or decode timing samples."""
+"""Prefill busy time and decode timing samples across idle gaps and pauses."""
 
 import importlib.util
 import sys
@@ -11,8 +11,8 @@ from unittest.mock import Mock, patch
 
 from parameterized import parameterized
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import parallel_state
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.io_struct import (
@@ -21,8 +21,24 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components import (
+    metrics_reporter as metrics_reporter_module,
+)
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    SchedulerMetricsReporter,
+)
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.prefill_busy_clock import (
+    PrefillBusyClock,
+)
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.observability.metrics_collector import SchedulerStats
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -33,13 +49,13 @@ from sglang.test.test_utils import (
     published_topology,
 )
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 LAUNCH_TIMESTAMPS = (0.0, 0.125, 1.0, 1.125)
 # Prefill busy time is charged launch -> result, so the result clock matters too.
 RESULT_TIMESTAMPS = tuple(ts + 0.1 for ts in LAUNCH_TIMESTAMPS)
 PP_MODULE = "sglang.srt.managers.scheduler_pp_mixin"
-PDMUX_MODULE = "sglang.srt.multiplex.multiplexing_mixin"
+SECOND_NS = 1_000_000_000
 
 
 class _BeforeModelForward(Exception):
@@ -66,6 +82,11 @@ def load_mlx_scheduler_module():
     with patch.dict(sys.modules, {spec.name: module, "mlx": mlx, "mlx.core": core}):
         spec.loader.exec_module(module)
     return module
+
+
+class _Request(SimpleNamespace):
+    # Requests are tracked by identity.
+    __hash__ = object.__hash__
 
 
 class TestSchedulerIdleStepCounters(CustomTestCase):
@@ -178,10 +199,12 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             ]
                         schedule += [None] * loop_size  # Drain the last result.
                         scheduler = self.make_scheduler(schedule)
+                        if name == "unified":
+                            scheduler.disaggregation_mode = DisaggregationMode.NULL
                         self.prepare_pp_scheduler(scheduler)
                         if pending_transfer:
                             if name == "prefill":
-                                scheduler.disagg_prefill_inflight_queue = [object()]
+                                scheduler.disagg_prefill_transfer_queue = [object()]
                             else:
                                 scheduler.disagg_decode_transfer_queue.queue = [
                                     object()
@@ -202,48 +225,13 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             self.run_and_check(
                                 scheduler, event_loop, mode, pattern == "idle_cycle"
                             )
+                        # Each launched micro-batch gets its write-after-read barrier.
+                        self.assertEqual(scheduler._apply_war_barrier.call_count, 4)
                         # Transfers suppress housekeeping, not the idle flag.
                         self.assertEqual(
                             scheduler.on_idle.call_count,
                             0 if pending_transfer else 1 + (pattern == "idle_cycle"),
                         )
-
-    def test_pdmux_idle_gap(self):
-        for idle_iterations in (0, 1, 2):
-            with self.subTest(idle_iterations=idle_iterations):
-                batches = self.make_batches(ForwardMode.DECODE)
-                schedule = batches[:2] + [None] * idle_iterations + batches[2:] + [None]
-                scheduler = self.make_scheduler(schedule)
-                scheduler.stream_groups = [(Mock(), Mock())]
-                scheduler.sm_counts = [(80, 52)]
-                scheduler.split_prefill_batch = None
-                scheduler.update_split_prefill_batch = lambda sm_count, running_batch: (
-                    False,
-                    running_batch,
-                )
-                scheduler.update_running_batch = Mock(
-                    side_effect=[batch or ScheduleBatch(reqs=[]) for batch in schedule]
-                )
-                with (
-                    patch(f"{PDMUX_MODULE}.get_current_stream_idx", return_value=0),
-                    patch(f"{PDMUX_MODULE}.torch.cuda.empty_cache"),
-                    patch(
-                        f"{PDMUX_MODULE}.torch.cuda.stream",
-                        side_effect=lambda stream: nullcontext(),
-                    ),
-                    # PD multiplexing requires a separate prefill communicator.
-                    patch.object(
-                        parallel_state,
-                        "_PDMUX_PREFILL_TP_GROUP",
-                        SimpleNamespace(world_size=1, rank_in_group=0),
-                    ),
-                ):
-                    self.run_and_check(
-                        scheduler,
-                        Scheduler.event_loop_pdmux,
-                        ForwardMode.DECODE,
-                        idle_iterations > 0,
-                    )
 
     @parameterized.expand([("fresh", False), ("chained", True)])
     def test_mlx_idle_gap(self, name, chained):
@@ -253,6 +241,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         for idle_iterations in (0, 1, 2):
             with self.subTest(idle_iterations=idle_iterations):
                 batches = self.make_batches(mode)
+                for batch in batches:
+                    batch.sampling_info = Mock()
                 if chained:
                     # Finishing the request drains its already-launched lookahead
                     # before scheduling fresh work, allowing the loop to go idle.
@@ -266,6 +256,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                         batches[:2] + [None] * idle_iterations + batches[2:] + [None]
                     )
                 scheduler = self.make_scheduler(schedule)
+                scheduler.disaggregation_mode = DisaggregationMode.NULL
+                scheduler.scripted_scheduler_hook = None
                 scheduler.future_map = None
                 scheduler.result_queue = deque()
                 scheduler._prepare_mlx_launch = MethodType(
@@ -276,9 +268,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 )
                 scheduler._mlx_batch_chain_safe = MethodType(
                     mixin._mlx_batch_chain_safe, scheduler
-                )
-                scheduler.profiler_manager = SimpleNamespace(
-                    _profile_batch_predicate=Mock()
                 )
                 launch = SimpleNamespace(
                     mode="decode" if chained else "extend",
@@ -297,7 +286,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                         return_value=SimpleNamespace(mlx_enable_sampling=False),
                     ),
                     patch.object(
-                        module.time, "monotonic", side_effect=LAUNCH_TIMESTAMPS
+                        scheduler_module.time,
+                        "monotonic",
+                        side_effect=LAUNCH_TIMESTAMPS,
                     ),
                 ):
                     self.run_and_check(
@@ -325,33 +316,28 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             reqs=batch.reqs[:],
         )
         scheduler.result_queue = deque([pending])
+        # The partial scheduler has none of the lists request_lists() reads.
+        scheduler.request_lists = lambda: {}
 
         self.assertEqual(scheduler.collect_inflight_reqs(), {req})
 
-    def test_split_prefill_is_charged_once_from_its_first_chunk(self):
-        # A split prefill spans several run_batch calls but yields one result,
-        # so only its first chunk may set the burst's start and its idle flag.
+    def test_processed_tokens_count_each_prefill_once(self):
+        # The aging counter must not grow when a prefill batch is reused for
+        # decode with a stale extend_num_tokens.
         scheduler = self.make_scheduler([])
-        scheduler._sched_idled = True
-        batch = self.make_batch(ForwardMode.SPLIT_PREFILL)
-        for split_index, launch_ts in enumerate((0.0, 0.2, 0.4)):
-            batch.split_index = split_index
+        batch = self.make_batch(ForwardMode.EXTEND)
+        self.launch_batch(scheduler, batch, 0.0)
+        # As prepare_for_decode does: switch the mode, keep extend_num_tokens.
+        batch.forward_mode = ForwardMode.DECODE
+        for launch_ts in (0.1, 0.2, 0.3):
             self.launch_batch(scheduler, batch, launch_ts)
-
-        self.assertEqual(scheduler.forward_ct, 3)
-        self.assertEqual(batch.forward_iter, 3)
-        self.assertEqual(batch.split_prefill_start, (1, 0.0))
-        self.assertTrue(batch.after_idle_gap)
-
-        self.record_result(scheduler, batch, 0.5)
-        # One charge for the whole burst: first chunk's launch to the result.
-        self.assertEqual(scheduler.total_prefill_busy_us, total_us([0.5 - 0.0]))
-        self.assertEqual(scheduler.total_prefill_uncached_tokens, 1024)
+        self.assertEqual(scheduler.processed_tokens_counter, 1024)
 
     def test_a_prefill_is_not_charged_for_an_overlapping_earlier_one(self):
         # An overlapped launch can precede the previous prefill's result; the
         # span already charged to that prefill must not be charged twice.
         scheduler = self.make_scheduler([])
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         prefill = self.make_batch(ForwardMode.EXTEND)
         decode = self.make_batch(ForwardMode.DECODE, extend_num_tokens=None)
         next_prefill = self.make_batch(ForwardMode.EXTEND)
@@ -375,6 +361,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         # A long-context chunk can outlast STEP_MAX_US and is still busy time.
         long_step = scheduler_module.STEP_MAX_US / 1e6 + 1.5
         scheduler = self.make_scheduler([])
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         for i in range(2):
             prefill = self.make_batch(ForwardMode.EXTEND)
             self.launch_batch(scheduler, prefill, i * long_step)
@@ -393,7 +380,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def test_pause_between_prefills_is_not_charged(self):
         scheduler = self.make_scheduler([])
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         first, second = (self.make_batch(ForwardMode.EXTEND) for _ in range(2))
         self.launch_batch(scheduler, first, 0.0)
         self.record_result(scheduler, first, 0.125)
@@ -407,7 +394,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def test_result_held_across_a_pause_excludes_the_pause(self):
         # An overlapped prefill launched before the pause has its result processed after resume.
         scheduler = self.make_scheduler([])
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         batch = self.make_batch(ForwardMode.EXTEND)
         self.launch_batch(scheduler, batch, 0.0)
         self.pause_and_resume(scheduler, 0.05, 10.0)
@@ -418,7 +405,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def test_result_processed_during_an_open_pause_excludes_it(self):
         # A retract after an in-place pause processes the held result before resume.
         scheduler = self.make_scheduler([])
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         first, second = (self.make_batch(ForwardMode.EXTEND) for _ in range(2))
         self.launch_batch(scheduler, first, 0.0)
         self.pause(scheduler, 0.125)
@@ -432,7 +419,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def test_many_pauses_inside_one_step_are_all_excluded(self):
         scheduler = self.make_scheduler([])
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         batch = self.make_batch(ForwardMode.EXTEND)
         self.launch_batch(scheduler, batch, 0.0)
         for i in range(100):
@@ -441,11 +428,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
         self.assertEqual(scheduler.total_prefill_busy_us, total_us([14.0 - 6.25]))
         # Every window ended before this step's end, so none is kept.
-        self.assertEqual(len(scheduler._pause_intervals), 0)
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 14.0), 0.0)
 
     def test_pause_inside_an_idle_gap_is_not_subtracted_from_the_next_prefill(self):
         scheduler = self.make_scheduler([])
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         first, second = (self.make_batch(ForwardMode.EXTEND) for _ in range(2))
         self.launch_batch(scheduler, first, 0.0)
         self.record_result(scheduler, first, 0.125)
@@ -461,19 +448,304 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         self.pause(scheduler, 1.0)
         self.pause(scheduler, 2.0)
         self.resume(scheduler, 3.0)
-        self.assertEqual(list(scheduler._pause_intervals), [(1.0, 3.0)])
+        # One window, [1.0, 3.0].
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 1.5), 0.5)
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 4.0), 2.0)
 
-    def pause(self, scheduler, paused_at):
-        with patch(
-            "sglang.srt.managers.scheduler.time.monotonic", return_value=paused_at
-        ):
-            Scheduler.pause_generation(
-                scheduler, PauseGenerationReqInput(mode="in_place")
+    def test_pd_prefill_steps_count_tokens_but_not_step_time(self):
+        scheduler = self.make_scheduler([])
+        # A long step and a zero-length step both credit their tokens.
+        for launch_ts, result_ts in ((0.0, 5.0), (6.0, 6.0)):
+            batch = self.make_batch(ForwardMode.EXTEND)
+            self.launch_batch(scheduler, batch, launch_ts)
+            self.record_result(scheduler, batch, result_ts)
+        probe = self.make_batch(ForwardMode.EXTEND)
+        probe.reqs[0].rid = f"{HEALTH_CHECK_RID_PREFIX}_probe"
+        self.launch_batch(scheduler, probe, 7.0)
+        self.record_result(scheduler, probe, 7.1)
+
+        self.assertEqual(scheduler.total_prefill_busy_us, 0)
+        self.assertEqual(scheduler.total_prefill_uncached_tokens, 2 * 1024)
+
+    @parameterized.expand(
+        [
+            ("pd_prefill", DisaggregationMode.PREFILL, 2_000_000),
+            ("unified", DisaggregationMode.NULL, 7),
+            ("pd_decode", DisaggregationMode.DECODE, 7),
+        ]
+    )
+    def test_load_snapshot_carries_the_busy_clock_only_on_pd_prefill(
+        self, name, mode, expected
+    ):
+        clock = PrefillBusyClock()
+        scheduler = SimpleNamespace(
+            disaggregation_mode=mode,
+            server_args=None,
+            max_total_num_tokens=1000,
+            kv_shard_widening=1,
+            max_running_requests=10,
+            pool_stats_observer=SimpleNamespace(
+                get_pool_stats=lambda: SimpleNamespace(
+                    get_kv_token_stats=lambda: (0, 0.0)
+                )
+            ),
+            tp_worker=None,
+            token_to_kv_pool_allocator=None,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            tree_cache=SimpleNamespace(
+                waiting_storage_span=lambda handle: None,
+                storage_metrics_collector=None,
+            ),
+            policy=SimpleNamespace(waiting_queue_prefix_matched=lambda queue: True),
+            metrics_reporter=SimpleNamespace(
+                recent_cache_hit_rate=0.0,
+                stats=SchedulerStats(),
+                prefill_busy_clock=clock,
+            ),
+            running_batch=SimpleNamespace(reqs=[]),
+            waiting_queue=[],
+            chunked_req=None,
+            request_lists=lambda: {kind: [] for kind in ListKind},
+            disagg_decode_prealloc_queue=SimpleNamespace(
+                queue={},
+                host_pool_blocked=False,
+                transfer_queue=SimpleNamespace(num_host_staged_landed=0),
+            ),
+        )
+        scheduler._get_total_prefill_busy_us = MethodType(
+            Scheduler._get_total_prefill_busy_us, scheduler
+        )
+        with published_topology(role="scheduler"):
+            Scheduler.init_load_inquirer(scheduler)
+            scheduler.total_prefill_busy_us = 7
+            clock.mark_busy(SECOND_NS)
+            with patch(
+                "sglang.srt.managers.scheduler.time.monotonic_ns",
+                return_value=3 * SECOND_NS,
+            ):
+                snapshot = scheduler.load_inquirer.get_loads()
+
+        self.assertEqual(snapshot.total_prefill_busy_us, expected)
+
+    def test_pd_prefill_snapshot_includes_the_step_tokens(self):
+        scheduler = self.make_scheduler([])
+        published = []
+        scheduler.deferred_responses = SimpleNamespace(stream_released=Mock())
+        scheduler.publish_load_snapshot = Mock(
+            side_effect=lambda force: published.append(
+                scheduler.total_prefill_uncached_tokens
             )
+        )
+        scheduler.load_publisher = SimpleNamespace(publish_load_stat=Mock())
+        scheduler.load_inquirer = SimpleNamespace(get_loads=Mock())
+        scheduler.process_batch_result_disagg_prefill = Mock()
+        scheduler._on_step_processed = Mock()
+        scheduler.tree_cache = SimpleNamespace(flush_pending_backups=Mock())
+        scheduler.metrics_reporter.log_batch_result_stats = Mock()
+        scheduler.metrics_reporter.update_device_timer = Mock()
+        scheduler.enable_fpm = False
+        scheduler._maybe_clear_mm_inputs = Mock()
+        scheduler.maybe_send_health_check_signal = Mock()
+        batch = self.make_batch(ForwardMode.EXTEND)
+        self.launch_batch(scheduler, batch, 0.0)
+        with patch.object(scheduler_module, "flush_trace_batch"):
+            Scheduler.process_batch_result(scheduler, batch, GenerationBatchResult())
+
+        self.assertEqual(published, [1024])
+        self.assertEqual(scheduler.total_prefill_uncached_tokens, 1024)
+
+    @parameterized.expand([("in_place",), ("retract",), ("pp_retract",)])
+    def test_pause_stops_the_pd_prefill_busy_clock_and_resume_restarts_it(self, mode):
+        scheduler = self.make_scheduler([])
+        scheduler.enable_overlap_mlx = False
+        scheduler.decode_offload_manager = None
+        scheduler.hisparse_coordinator = None
+        scheduler.dllm_config = None
+        scheduler.kv_events_publisher = Mock()
+        scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
+        if mode == "pp_retract":
+            enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
+            # The micro-batch retract has its own tests; this checks the clock.
+            scheduler._pp_retract_microbatches = Mock()
+        clock = scheduler.metrics_reporter.prefill_busy_clock
+        clock.mark_busy(0)
+        self.pause(scheduler, 1.0, mode="retract" if mode == "pp_retract" else mode)
+        # A paused loop pass with queued work does not reopen the clock.
+        clock.mark_busy(2 * SECOND_NS)
+        self.resume(scheduler, 5.0)
+        self.assertEqual(clock._read_us(6 * SECOND_NS), 2_000_000)
+
+    def test_receive_and_launch_open_the_pd_prefill_busy_clock(self):
+        scheduler = self.make_scheduler([])
+        scheduler.metrics_reporter = self.make_reporter()
+        scheduler.uocr_runtime = None
+        scheduler.request_receiver = SimpleNamespace(
+            recv_requests=Mock(side_effect=[[], [SimpleNamespace()]])
+        )
+        clock = scheduler.metrics_reporter.prefill_busy_clock
+        # An empty receive at 0.5 s, then one starting at 1 s; later readings are 3 s.
+        readings = iter((SECOND_NS // 2, SECOND_NS))
+        scheduler_time = SimpleNamespace(
+            monotonic_ns=lambda: next(readings, 3 * SECOND_NS)
+        )
+        with (
+            patch.object(metrics_reporter_module, "ENABLE_METRICS_DEVICE_TIMER", False),
+            patch.object(scheduler_module, "time", scheduler_time),
+        ):
+            scheduler.ingest_requests()
+            self.assertEqual(clock._read_us(SECOND_NS), 0)
+            scheduler.ingest_requests()
+        clock._mark_idle(2 * SECOND_NS)
+        with (
+            patch.object(metrics_reporter_module, "ENABLE_METRICS_DEVICE_TIMER", False),
+            patch(
+                "sglang.srt.managers.scheduler.time.monotonic_ns",
+                return_value=4 * SECOND_NS,
+            ),
+        ):
+            self.launch_batch(scheduler, self.make_batch(ForwardMode.EXTEND), 4.0)
+        self.assertEqual(clock._read_us(5 * SECOND_NS), 2_000_000)
+
+    @parameterized.expand(
+        [
+            ("normal", Scheduler.event_loop_normal_disagg_prefill),
+            ("overlap", Scheduler.event_loop_overlap_disagg_prefill),
+        ]
+    )
+    def test_pd_prefill_loop_closes_the_busy_clock_once_fully_idle(
+        self, name, event_loop
+    ):
+        scheduler = self.make_scheduler([None])
+        scheduler.__dict__.update(self.make_idle_scheduler().__dict__)
+        # Run the loop's real on_idle instead of the fixture's mock.
+        del scheduler.on_idle
+        scheduler.ingest_requests = Mock()
+        scheduler.is_fully_idle = Mock(return_value=True)
+
+        def stop_after_one_pass():
+            scheduler.gracefully_exit = True
+
+        scheduler.process_disagg_prefill_transfer_queue = stop_after_one_pass
+        clock = scheduler.metrics_reporter.prefill_busy_clock
+        clock.mark_busy(0)
+        with (
+            patch.object(metrics_reporter_module, "ENABLE_METRICS_DEVICE_TIMER", False),
+            patch(
+                "sglang.srt.managers.scheduler.time.monotonic_ns",
+                return_value=3 * SECOND_NS,
+            ),
+        ):
+            event_loop(scheduler)
+
+        self.assertEqual(clock._read_us(10 * SECOND_NS), 3_000_000)
+
+    def test_on_idle_counts_head_and_tail_with_metrics_off(self):
+        scheduler = self.make_idle_scheduler()
+        clock = scheduler.metrics_reporter.prefill_busy_clock
+        clock.mark_busy(0)
+        # Tail waiting on decode, fully idle at 3 s, then a 2 s head from 10 s.
+        timeline = ((False, 2.5), (True, 3.0), (False, 10.0), (True, 12.0))
+        with patch.object(
+            metrics_reporter_module, "ENABLE_METRICS_DEVICE_TIMER", False
+        ):
+            for fully_idle, now_s in timeline:
+                scheduler.is_fully_idle = Mock(return_value=fully_idle)
+                with patch(
+                    "sglang.srt.managers.scheduler.time.monotonic_ns",
+                    return_value=int(now_s * SECOND_NS),
+                ):
+                    scheduler.on_idle()
+
+        self.assertEqual(clock._read_us(20 * SECOND_NS), 5_000_000)
+
+    def test_on_idle_closes_the_clock_before_the_idle_sleep(self):
+        scheduler = self.make_idle_scheduler()
+        scheduler.is_fully_idle = Mock(return_value=True)
+        clock = scheduler.metrics_reporter.prefill_busy_clock
+        clock.mark_busy(0)
+        now = {"ns": 3 * SECOND_NS}
+
+        def sleep_30_s():
+            now["ns"] += 30 * SECOND_NS
+
+        scheduler.maybe_sleep_on_idle = Mock(side_effect=sleep_30_s)
+        with (
+            patch.object(metrics_reporter_module, "ENABLE_METRICS_DEVICE_TIMER", False),
+            patch(
+                "sglang.srt.managers.scheduler.time.monotonic_ns",
+                side_effect=lambda: now["ns"],
+            ),
+        ):
+            scheduler.on_idle()
+
+        self.assertEqual(clock._read_us(now["ns"]), 3_000_000)
+
+    def make_reporter(self):
+        reporter = SimpleNamespace(
+            scheduler=SimpleNamespace(enable_fpm=False),
+            enable_metrics=False,
+            prefill_busy_clock=PrefillBusyClock(),
+            _maybe_log_idle_metrics=Mock(),
+        )
+        for name in (
+            "record_scheduler_active",
+            "record_scheduler_idle",
+            "_record_scheduler_time",
+        ):
+            method = getattr(SchedulerMetricsReporter, name)
+            setattr(reporter, name, MethodType(method, reporter))
+        return reporter
+
+    def make_idle_scheduler(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.metrics_reporter = self.make_reporter()
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.scheduler_stage_metrics = None
+        scheduler.dp_attn_adapter = Mock()
+        scheduler.deferred_responses = SimpleNamespace(
+            stream_released=Mock(), has_pending=Mock(return_value=False)
+        )
+        scheduler.maybe_send_health_check_signal = Mock()
+        scheduler._last_stall_publish_ts = float("-inf")
+        scheduler.publish_load_snapshot = Mock(return_value=None)
+        scheduler.load_publisher = Mock()
+        scheduler.load_inquirer = Mock()
+        scheduler.enable_hicache_storage = False
+        scheduler.enable_lmcache = False
+        scheduler.enable_unified_cache_external_linker = False
+        scheduler.request_receiver = SimpleNamespace(wait_for_progress=Mock())
+        scheduler.enable_unified_memory = False
+        scheduler.invariant_checker = Mock()
+        scheduler.gc_freezer = Mock()
+        scheduler.forward_ct = 0
+        scheduler.kv_events_publisher = Mock()
+        scheduler.new_token_ratio_tracker = Mock()
+        scheduler.maybe_sleep_on_idle = Mock()
+        return scheduler
+
+    def pause(self, scheduler, paused_at, mode="in_place"):
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.pause_state.time.monotonic",
+                return_value=paused_at,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.time.monotonic_ns",
+                return_value=int(paused_at * SECOND_NS),
+            ),
+        ):
+            Scheduler.pause_generation(scheduler, PauseGenerationReqInput(mode=mode))
 
     def resume(self, scheduler, resumed_at):
-        with patch(
-            "sglang.srt.managers.scheduler.time.monotonic", return_value=resumed_at
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.pause_state.time.monotonic",
+                return_value=resumed_at,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.time.monotonic_ns",
+                return_value=int(resumed_at * SECOND_NS),
+            ),
         ):
             Scheduler.continue_generation(
                 scheduler, ContinueGenerationReqInput(torch_empty_cache=False)
@@ -485,7 +757,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_batch(self, mode, *, launch_ts=None, extend_num_tokens=1024):
         return ScheduleBatch(
-            reqs=[SimpleNamespace(rid="request", finished=Mock(return_value=False))],
+            reqs=[
+                _Request(
+                    rid="request", finished=Mock(return_value=False), inflight_steps=0
+                )
+            ],
             forward_mode=mode,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             launch_ts=launch_ts,
@@ -542,7 +818,17 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         self.assertEqual(observed_idle_flags, [False, False, after_idle, False])
         self.assertEqual(scheduler.forward_ct, 4)
         self.assertEqual(observed_iters, [1, 2, 3, 4])
-        if mode == ForwardMode.EXTEND:
+        if (
+            mode == ForwardMode.EXTEND
+            and scheduler.disaggregation_mode == DisaggregationMode.PREFILL
+        ):
+            # PD prefill busy time is the busy clock; steps only credit tokens.
+            self.assertEqual(scheduler.total_prefill_busy_us, 0)
+            self.assertEqual(
+                scheduler.total_prefill_uncached_tokens,
+                len(LAUNCH_TIMESTAMPS) * 1024,
+            )
+        elif mode == ForwardMode.EXTEND:
             # A prefill is charged from the previous prefill's result, or from
             # its own launch when none applies -- the first one, or after a gap.
             expected_intervals = [
@@ -592,15 +878,19 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
+        scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.tp_size = get_parallel().tp_size
+        scheduler.dp_tp_group = SimpleNamespace(
+            world_size=get_parallel().attn_tp_size
+            if get_parallel().attn_dp_enabled
+            else get_parallel().tp_size
+        )
         scheduler.gracefully_exit = False
-        scheduler._engine_paused = False
-        scheduler._deferred_input_requests = []
+        scheduler.pause_state = PauseState()
         scheduler._sched_idled = False
         scheduler._prev_step = None
         scheduler._prev_prefill_end_ts = None
-        scheduler._pause_intervals = deque(maxlen=scheduler_module.PAUSE_WINDOWS_MAX)
-        scheduler._pause_started_at = None
         scheduler.forward_ct = 0
         scheduler.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
@@ -611,30 +901,38 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.scheduler_stage_metrics = None
-        scheduler.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
+        scheduler.metrics_reporter = SimpleNamespace(
+            record_scheduler_active=Mock(), prefill_busy_clock=PrefillBusyClock()
+        )
+        scheduler.invariant_checker = Mock()
         scheduler.scripted_scheduler_hook = SimpleNamespace(
             on_run_batch=Mock(side_effect=_BeforeModelForward)
         )
+        scheduler.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
         scheduler.total_prefill_busy_us = 0
         scheduler.total_prefill_uncached_tokens = 0
         scheduler.decode_moment_totals = [0.0] * 6
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
-        scheduler.chunked_req = None
-        scheduler.waiting_queue = []
-        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+        scheduler._pending_chunked_abort_req = None
+        scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
+        scheduler.disagg_prefill_transfer_queue = []
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], staging_handler=None
+        )
         scheduler.enable_staging = False
         scheduler.request_receiver = SimpleNamespace(
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
         )
         scheduler.process_input_requests = Mock()
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            pop_bootstrapped=Mock(return_value=[])
+            move_bootstrapped=Mock(return_value=[])
         )
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
             prefetch_prefill_dp_rank_queries=Mock(), queue=[]
         )
-        scheduler.process_decode_queue = Mock()
+        scheduler.process_decode_queue = Mock(return_value=False)
         scheduler.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch
         )
@@ -650,28 +948,28 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.get_next_disagg_decode_batch_to_run = next_plan
         scheduler.get_next_batch_to_run = next_plan
         scheduler.get_new_batch_prefill = next_plan
-        scheduler.is_disable_overlap_for_batch = Mock(return_value=False)
+        scheduler.should_process_last_batch_early = Mock(return_value=False)
         scheduler._war_barrier_is_coarse = Mock(return_value=True)
         scheduler._apply_war_barrier = Mock()
-        scheduler.process_disagg_prefill_inflight_queue = Mock()
+        scheduler.process_disagg_prefill_transfer_queue = Mock()
         scheduler.launch_batch_sample_if_needed = Mock()
         scheduler.on_idle = Mock()
         return scheduler
 
     def prepare_pp_scheduler(self, scheduler):
         enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
-        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=True)
+        scheduler.token_to_kv_pool_allocator = None
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()
         scheduler.device_module = SimpleNamespace(Event=Mock, current_stream=Mock())
-        scheduler._pp_recv_proxy_tensors = Mock()
+        scheduler._pp_recv_proxy_tensors = Mock(return_value=None)
         scheduler._pp_commit_comm_work = Mock()
         scheduler._pp_prepare_tensor_dict = Mock(return_value={})
         scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
             return_value=(None, GenerationBatchResult(), Mock())
         )
-        scheduler._pp_pd_get_prefill_transferred_ids = Mock(return_value=None)
         scheduler._pp_pd_get_retract_ids = Mock(return_value=None)
         scheduler._pp_pd_get_prealloc_ids = Mock(return_value=None)
         scheduler._pp_pd_get_decode_transferred_ids = Mock(return_value=None)
@@ -682,8 +980,138 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
-        scheduler.disagg_prefill_inflight_queue = []
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_prefill_transfer_queue = []
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], staging_handler=None
+        )
+
+
+class TestPrefillBusyClock(CustomTestCase):
+    def test_head_tail_and_long_spans_count_but_fully_idle_does_not(self):
+        clock = PrefillBusyClock()
+        # A burst received at 0 whose tail waits on decode until 3 s.
+        clock.mark_busy(0)
+        clock.mark_busy(int(0.05 * SECOND_NS))
+        self.assertEqual(clock._read_us(int(1.5 * SECOND_NS)), 1_500_000)
+        clock._mark_idle(3 * SECOND_NS)
+        self.assertEqual(clock._read_us(10 * SECOND_NS), 3_000_000)
+        # A head received at 10 s that waits on L3 before its forward.
+        clock.mark_busy(10 * SECOND_NS)
+        clock._mark_idle(13 * SECOND_NS)
+        self.assertEqual(clock._read_us(20 * SECOND_NS), 6_000_000)
+
+    def test_a_backdated_receive_does_not_reopen_closed_time(self):
+        clock = PrefillBusyClock()
+        clock.mark_busy(0)
+        clock._mark_idle(5 * SECOND_NS)
+        clock.mark_busy(4 * SECOND_NS)
+        clock._mark_idle(6 * SECOND_NS)
+        self.assertEqual(clock._read_us(6 * SECOND_NS), 6_000_000)
+
+    def test_pause_closes_the_span_and_resume_reopens_it(self):
+        clock = PrefillBusyClock()
+        clock.mark_busy(0)
+        clock._pause(2 * SECOND_NS)
+        clock.mark_busy(3 * SECOND_NS)
+        self.assertEqual(clock._read_us(4 * SECOND_NS), 2_000_000)
+        clock._resume(5 * SECOND_NS)
+        self.assertEqual(clock._read_us(6 * SECOND_NS), 3_000_000)
+
+    def test_restart_drops_counted_time_and_keeps_a_pause(self):
+        clock = PrefillBusyClock()
+        clock.mark_busy(0)
+        clock._pause(SECOND_NS)
+        clock._restart(7, 2 * SECOND_NS)
+        clock.mark_busy(3 * SECOND_NS)
+        self.assertEqual(clock._read_us(4 * SECOND_NS), 7)
+        clock._resume(5 * SECOND_NS)
+        self.assertEqual(clock._read_us(6 * SECOND_NS), 1_000_007)
+
+    def test_a_receive_from_before_a_restart_counts_from_the_restart(self):
+        clock = PrefillBusyClock()
+        clock._restart(7, 2 * SECOND_NS)
+        clock.mark_busy(SECOND_NS)
+        self.assertEqual(clock._read_us(3 * SECOND_NS), 1_000_007)
+
+    def test_reads_never_decrease(self):
+        clock = PrefillBusyClock()
+        clock.mark_busy(0)
+        reads = [clock._read_us(SECOND_NS)]
+        clock._mark_idle(2 * SECOND_NS)
+        reads.append(clock._read_us(2 * SECOND_NS))
+        clock._pause(3 * SECOND_NS)
+        reads.append(clock._read_us(3 * SECOND_NS))
+        clock._resume(3 * SECOND_NS)
+        clock._mark_idle(3 * SECOND_NS)
+        # A receive stamped before the last close counts only from that close.
+        clock.mark_busy(SECOND_NS)
+        reads.append(clock._read_us(4 * SECOND_NS))
+        self.assertEqual(reads, [1_000_000, 2_000_000, 2_000_000, 3_000_000])
+
+    def test_public_methods_read_the_current_time(self):
+        clock = PrefillBusyClock()
+        with patch(
+            "sglang.srt.managers.scheduler_components.prefill_busy_clock.time.monotonic_ns"
+        ) as now:
+            now.return_value = SECOND_NS
+            clock.restart(7)
+            # A receive stamped before the restart counts from the restart.
+            clock.mark_busy(0)
+            now.return_value = 2 * SECOND_NS
+            clock.pause()
+            now.return_value = 4 * SECOND_NS
+            clock.resume()
+            now.return_value = 5 * SECOND_NS
+            reads = now.call_count
+            # mark_idle closes and returns the same single read.
+            self.assertEqual(clock.mark_idle(), 5 * SECOND_NS)
+            self.assertEqual(now.call_count, reads + 1)
+            clock.mark_busy(6 * SECOND_NS)
+            now.return_value = 7 * SECOND_NS
+            self.assertEqual(clock.read_us(), 3_000_007)
+
+    def test_a_span_after_the_clock_moves_back_counts_in_full(self):
+        clock = PrefillBusyClock()
+        clock.mark_busy(0)
+        clock._mark_idle(100 * SECOND_NS)
+        # A restore onto a host with less uptime moves the clock back to 10 s.
+        clock._mark_idle(10 * SECOND_NS)
+        clock.mark_busy(11 * SECOND_NS)
+        clock._mark_idle(14 * SECOND_NS)
+        self.assertEqual(clock._read_us(14 * SECOND_NS), 103_000_000)
+        clock._restart(7, 5 * SECOND_NS)
+        clock.mark_busy(6 * SECOND_NS)
+        self.assertEqual(clock._read_us(8 * SECOND_NS), 2_000_007)
+
+
+class TestPrefillOverlapShutdownVote(CustomTestCase):
+    """On shutdown the overlap prefill loop launches nothing new, yet still runs
+    the one batch selection whose MLP-sync gather carries a group-local
+    ShutdownReq to the other attention-DP ranks."""
+
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, published_topology(role="scheduler"))
+
+    def _selections_after_shutdown(self, vote_pending: bool) -> int:
+        scheduler = TestSchedulerIdleStepCounters.make_scheduler(self, [None])
+
+        def honor_shutdown(**kwargs):
+            scheduler.gracefully_exit = True
+            return True
+
+        scheduler.ingest_requests = Mock(side_effect=honor_shutdown)
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            shutdown_vote_pending=lambda: vote_pending
+        )
+        Scheduler.event_loop_overlap_disagg_prefill(scheduler)
+        return scheduler.get_next_disagg_prefill_batch_to_run.call_count
+
+    def test_unsent_vote_still_reaches_the_gather(self):
+        self.assertEqual(self._selections_after_shutdown(vote_pending=True), 1)
+
+    def test_no_new_selection_without_a_vote_to_send(self):
+        self.assertEqual(self._selections_after_shutdown(vote_pending=False), 0)
 
 
 if __name__ == "__main__":

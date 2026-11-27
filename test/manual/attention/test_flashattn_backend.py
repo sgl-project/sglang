@@ -10,11 +10,12 @@ from sglang.srt.layers.attention.flashattention_backend import (
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     set_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -69,6 +70,7 @@ class MockModelRunner:
             {
                 # A typical max_bs * max_context_len for cuda graph decode
                 "size": max_batch_size,
+                "row_width": max_context_len,
                 # Add req_to_token attribute
                 "req_to_token": torch.zeros(
                     max_batch_size,

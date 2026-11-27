@@ -7,11 +7,10 @@ use std::collections::{BinaryHeap, HashMap};
 use tch::{Kind, Tensor};
 
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, FULL};
+use crate::components::{ComponentType, FULL, Family};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
-use crate::unified_lru_list::PriorityKey;
 use crate::unified_tree_core::{
     CacheActions, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertResult,
     MatchPrefixParams, MatchResult, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
@@ -30,6 +29,10 @@ impl FullComponent {
 impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
     fn component_type(&self) -> ComponentType {
         FULL
+    }
+
+    fn family(&self) -> Family {
+        Family::Token
     }
 
     fn create_match_validator(
@@ -167,7 +170,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         // D-leaf; the parent id was captured at return time because the leaf
         // itself may have been freed by the eviction in between.
         if let Some(last_node_parent) = tree_core.component_state(FULL).evict_device_cursor
-            && tree_core.evictable_device_leaves.contains(last_node_parent)
+            && tree_core.is_device_walk_candidate_(last_node_parent)
         {
             let key = tree_core
                 .eviction_strategy
@@ -183,7 +186,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             return None;
         }
         while let Some(Reverse((_, x))) = tree_core.full_evict_device_heap.pop() {
-            if !tree_core.evictable_device_leaves.contains(x) {
+            if !tree_core.is_device_walk_candidate_(x) {
                 continue;
             }
             let last_node_parent = tree_core.arena.node(x).try_parent();
@@ -196,6 +199,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
     fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K>) {
         tree_core.set_evict_device_end(FULL);
         tree_core.full_evict_device_heap.clear();
+        tree_core.full_evict_host_heap = None;
     }
 
     fn reclaim_coexisting_host_values(
@@ -217,11 +221,15 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                     break;
                 }
                 let node = tree_core.arena.node(node_id);
-                if !node.has_device_value(FULL) || !node.has_host_value(FULL) {
+                // Queued victims count as demoted.
+                if !node.has_device_value(FULL)
+                    || !node.has_host_value(FULL)
+                    || node.write_back_queued
+                {
                     tree_core.full_coexisting_host_nodes.discard(node_id);
                     continue;
                 }
-                if spare_imminent_demotes && tree_core.evictable_device_leaves.contains(node_id) {
+                if spare_imminent_demotes && tree_core.is_device_walk_candidate_(node_id) {
                     continue;
                 }
                 if !tree_core.can_reclaim_coexisting_host_value_(node_id, FULL) {
@@ -251,31 +259,35 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         cache_actions: &mut CacheActions,
     ) {
         let ct = FULL;
-        let arena = &tree_core.arena;
-        let strategy = &tree_core.eviction_strategy;
-        let mut heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>> = tree_core
-            .evictable_host_leaves
-            .iter()
-            .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
-            .collect();
+        if tracker[&ct] >= num_tokens {
+            return;
+        }
+        if tree_core.full_evict_host_heap.is_none() {
+            let arena = &tree_core.arena;
+            let strategy = &tree_core.eviction_strategy;
+            tree_core.full_evict_host_heap = Some(
+                tree_core
+                    .evictable_host_leaves
+                    .iter()
+                    .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
+                    .collect(),
+            );
+        }
         while tracker[&ct] < num_tokens {
-            let Some(Reverse((_, x))) = heap.pop() else {
+            let Some(Reverse((_, x))) = tree_core
+                .full_evict_host_heap
+                .as_mut()
+                .and_then(BinaryHeap::pop)
+            else {
                 break;
             };
             if !tree_core.evictable_host_leaves.contains(x) {
                 continue;
             }
-            // The parent id is captured before the eviction frees the leaf.
-            let parent = tree_core.arena.node(x).try_parent();
             tree_core.evict_host_leaf_(x, tracker, device_frees, host_frees, cache_actions);
-            if let Some(parent) = parent
-                && tree_core.evictable_host_leaves.contains(parent)
-            {
-                let key = tree_core
-                    .eviction_strategy
-                    .get_priority(tree_core.arena.node(parent));
-                heap.push(Reverse((key, parent)));
-            }
+        }
+        if !tree_core.component_state(FULL).is_evict_device_ongoing {
+            tree_core.full_evict_host_heap = None;
         }
     }
 
@@ -509,12 +521,29 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 if let Some(transfer) = transfers.first()
                     && let Some(device_indices) = &transfer.device_indices
                 {
+                    let loaded_nodes: Vec<NodeIdx_> = transfer
+                        .nodes_to_load
+                        .iter()
+                        .flatten()
+                        .map(|&loaded_id| {
+                            tree_core
+                                .arena
+                                .resolve(loaded_id)
+                                .expect("load-back transfers must reference live nodes")
+                        })
+                        .collect();
+                    let loaded_len = device_indices.size1().expect("1-D load-back indices");
+                    let chain_len: i64 = loaded_nodes
+                        .iter()
+                        .map(|&loaded_idx| tree_core.arena.host_value_len(loaded_idx, FULL) as i64)
+                        .sum();
+                    assert_eq!(
+                        loaded_len, chain_len,
+                        "load-back filled {loaded_len} device slots for a chain of \
+                         {chain_len} host tokens"
+                    );
                     let mut offset = 0i64;
-                    for &loaded_id in transfer.nodes_to_load.iter().flatten() {
-                        let loaded_idx = tree_core
-                            .arena
-                            .resolve(loaded_id)
-                            .expect("load-back transfers must reference live nodes");
+                    for loaded_idx in loaded_nodes {
                         let loaded = tree_core.arena.node_mut(loaded_idx);
                         let n_len = loaded.host_value_len(FULL) as i64;
                         loaded

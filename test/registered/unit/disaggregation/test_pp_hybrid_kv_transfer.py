@@ -14,10 +14,14 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_transfer_entry_pairs,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.runtime_context import get_memory, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -30,6 +34,9 @@ def _full_attention_ids(*, num_layers: int, interval: int) -> list:
 def _hybrid_pool(*, start_layer: int) -> HybridLinearKVPool:
     pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
     pool.start_layer = start_layer
+    # The inner full-attention view its router reports as the wrapped view.
+    pool.full_kv_pool = object()
+    pool.full_attention_layer_id_mapping = {}
     return pool
 
 
@@ -56,6 +63,8 @@ class TestTransferStartLayer(CustomTestCase):
 class _RecordingKVManager:
     get_mha_kv_ptrs_with_pp = CommonKVManager.get_mha_kv_ptrs_with_pp
     get_mla_kv_ptrs_with_pp = CommonKVManager.get_mla_kv_ptrs_with_pp
+    _generic_entry_pairs = MooncakeKVManager._generic_entry_pairs
+    _transfer_copies = MooncakeKVManager._transfer_copies
 
     def __init__(self, *, prefill_start_layer: int, pp_size: int):
         self.is_mla_backend = False
@@ -66,8 +75,12 @@ class _RecordingKVManager:
         self.kv_args = SimpleNamespace(prefill_start_layer=prefill_start_layer)
         self.blocks = []
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
-        self.blocks.extend(transfer_blocks)
+    def attach(self, **buffers):
+        """Real transport over an engine that records every block it is handed."""
+        attach_mooncake_transport(self, engine_writes(self._record), **buffers)
+
+    def _record(self, session, blocks):
+        self.blocks.extend(blocks)
         return 0
 
 
@@ -89,17 +102,18 @@ class TestHybridSendUsesLayerIdPairing(CustomTestCase):
         dst_ptrs = [2000 + i for i in range(2 * num_model)]
         item_lens = [10 + i for i in range(2 * num_stage)]
         manager = _RecordingKVManager(prefill_start_layer=start_offset, pp_size=2)
+        manager.attach(kv=src_ptrs, peer_kv=dst_ptrs)
         rc = MooncakeKVManager._send_kvcache_generic(
             manager,
             mooncake_session_id="session",
-            src_data_ptrs=src_ptrs,
-            dst_data_ptrs=dst_ptrs,
             item_lens=item_lens,
             prefill_data_indices=np.array([0], dtype=np.int32),
             dst_data_indices=np.array([0], dtype=np.int32),
             executor=None,
             src_layer_ids=stage_full_ids * 2,
             dst_layer_ids=model_full_ids * 2,
+            src_keys=manager._local_keys.kv,
+            dst_keys=manager._peers["session"].keys.kv,
         )
         self.assertEqual(rc, 0)
         expected = [
@@ -128,6 +142,7 @@ class TestSingleRegionSWATransfer(CustomTestCase):
         manager.kv_args.kv_data_ptrs = [1000]
         manager.kv_args.kv_item_lens = [64]
         manager.kv_args.kv_layer_ids = []
+        manager.attach(kv=[1000], peer_kv=[2000])
         manager._validate_envelope_kv_layout = (
             MooncakeKVManager._validate_envelope_kv_layout.__get__(manager)
         )
@@ -158,6 +173,12 @@ class _RecordingAscendManager:
             kv_layer_ids=[31, 35, 31, 35],
         )
         self.generic_call = None
+        attach_mooncake_transport(
+            self,
+            engine_writes(lambda session, blocks: 0),
+            kv=self.kv_args.kv_data_ptrs,
+            peer_kv=range(8),
+        )
 
     def _validate_envelope_kv_layout(self, *args):
         pass
@@ -185,36 +206,57 @@ class TestAscendHybridPpDispatch(CustomTestCase):
         self.assertEqual(manager.generic_call["src_layer_ids"], [31, 35, 31, 35])
         self.assertEqual(manager.generic_call["dst_layer_ids"], dst_layer_ids)
 
+    def test_send_kvcache_accepts_transfer_worker_keywords(self):
+        manager = _RecordingAscendManager()
+        rc = AscendKVManager.send_kvcache(
+            manager,
+            mooncake_session_id="session",
+            prefill_kv_indices=np.array([1], dtype=np.int32),
+            dst_kv_ptrs=list(range(8)),
+            dst_kv_indices=np.array([2], dtype=np.int32),
+            executor=None,
+            dst_layer_ids=[3, 7, 31, 35, 3, 7, 31, 35],
+            dst_device_kv_indices=None,
+            dst_kv_item_len=16,
+            dst_attn_tp_size=1,
+            dst_num_draft_entries=None,
+        )
+
+        self.assertEqual(rc, 7)
+        self.assertIsNotNone(manager.generic_call)
+
 
 class TestMambaSlotTransfer(CustomTestCase):
     def test_stage1_uses_paired_slot_sizes_and_offsets(self):
         manager = _RecordingKVManager(prefill_start_layer=1, pp_size=2)
+        manager.attach(state=[[1000]], peer_state=[[2000, 3000]])
         MooncakeKVManager._send_mamba_state(
             manager,
             req=SimpleNamespace(mooncake_session_id="session"),
             prefill_mamba_index=[2],
-            src_state_data_ptrs=[1000],
             src_state_item_lens=[16],
-            dst_state_data_ptrs=[2000, 3000],
             dst_mamba_index=[3],
             src_layer_ids=[7],
             dst_layer_ids=[3, 7],
             dst_state_item_lens=[8, 16],
+            src_keys=manager._local_keys.state[0],
+            dst_keys=manager._peers["session"].keys.state[0],
         )
         self.assertEqual(manager.blocks, [(1032, 3048, 16)])
 
     def test_slot_size_mismatch_rejected_before_transfer(self):
         manager = _RecordingKVManager(prefill_start_layer=0, pp_size=1)
+        manager.attach(state=[[1000]], peer_state=[[2000]])
         with self.assertRaisesRegex(RuntimeError, "Mamba slot size mismatch"):
             MooncakeKVManager._send_mamba_state(
                 manager,
                 req=SimpleNamespace(mooncake_session_id="session"),
                 prefill_mamba_index=[1],
-                src_state_data_ptrs=[1000],
                 src_state_item_lens=[16],
-                dst_state_data_ptrs=[2000],
                 dst_mamba_index=[1],
                 dst_state_item_lens=[32],
+                src_keys=manager._local_keys.state[0],
+                dst_keys=manager._peers["session"].keys.state[0],
             )
         self.assertEqual(manager.blocks, [])
 
@@ -256,11 +298,29 @@ class TestBuildTransferEntryPairsDuplicateIds(CustomTestCase):
         self.assertEqual(pairs, [(0, 0), (1, 1), (2, 3), (3, 4)])
 
 
+def _plain_pool(*, layer_num: int) -> SimpleNamespace:
+    """A one-sub-pool pool that is its own view."""
+    pool = SimpleNamespace(layer_num=layer_num, start_layer=0)
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
+
+
 def _hybrid_pool_with_ids(*, layer_ids: list) -> HybridLinearKVPool:
     pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
-    pool.full_attention_layer_id_mapping = layer_ids
+    pool.full_kv_pool = object()
+    pool.full_attention_layer_id_mapping = {
+        layer_id: index for index, layer_id in enumerate(layer_ids)
+    }
     pool.use_mla = False
+    # No buffers: the layer ids are what these tests read.
+    pool.get_contiguous_buf_infos = lambda: ([], [], [])
     return pool
+
+
+def _static_storage(pool) -> StaticKVStorage:
+    """The storage a static pool registers with PD peers through."""
+    allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+    return StaticKVStorage(None, allocator)
 
 
 class TestBuildKvLayerIds(CustomTestCase):
@@ -278,8 +338,10 @@ class TestBuildKvLayerIds(CustomTestCase):
         """The EAGLE draft pool for a hybrid-linear model is itself a
         HybridLinearKVPool that numbers its single MTP layer from zero, so its
         raw ids collide with target layer 0 and must be remapped into the band."""
+        target = _hybrid_pool_with_ids(layer_ids=self._stage1_ids())
         ids = build_kv_layer_ids(
-            token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=self._stage1_ids()),
+            token_to_kv_pool=target,
+            storage=_static_storage(target),
             draft_token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=[0]),
             num_draft_entries=2,
             num_hidden_layers=60,
@@ -288,10 +350,12 @@ class TestBuildKvLayerIds(CustomTestCase):
         self.assertEqual(ids, stage1 + stage1 + [60, 60])
 
     def test_ragged_draft_registration_is_rejected(self):
+        target = _hybrid_pool_with_ids(layer_ids=self._stage1_ids())
         with self.assertRaises(RuntimeError):
             build_kv_layer_ids(
-                token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=self._stage1_ids()),
-                draft_token_to_kv_pool=SimpleNamespace(layer_num=2),
+                token_to_kv_pool=target,
+                storage=_static_storage(target),
+                draft_token_to_kv_pool=_plain_pool(layer_num=2),
                 num_draft_entries=3,
                 num_hidden_layers=60,
             )
@@ -306,14 +370,18 @@ class TestDraftBandPairsAcrossPipelineStages(CustomTestCase):
     def test_stage1_pairs_onto_the_decode_layout(self):
         full = _full_attention_ids(num_layers=60, interval=4)
         stage1 = [lid for lid in full if lid >= 30]
+        target = _hybrid_pool_with_ids(layer_ids=stage1)
         src = build_kv_layer_ids(
-            token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=stage1),
+            token_to_kv_pool=target,
+            storage=_static_storage(target),
             draft_token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=[0]),
             num_draft_entries=2,
             num_hidden_layers=60,
         )
+        target = _hybrid_pool_with_ids(layer_ids=full)
         dst = build_kv_layer_ids(
-            token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=full),
+            token_to_kv_pool=target,
+            storage=_static_storage(target),
             draft_token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=[0]),
             num_draft_entries=2,
             num_hidden_layers=60,

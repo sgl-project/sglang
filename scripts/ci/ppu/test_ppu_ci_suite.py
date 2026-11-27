@@ -1,6 +1,7 @@
 import fnmatch
 import hashlib
 import importlib.util
+import itertools
 import json
 import os
 import shutil
@@ -36,7 +37,7 @@ class TestPPUCISuite(CustomTestCase):
             list((RUNNER.parent / "registered").rglob("test_ppu_ci_*.py")), []
         )
 
-    def test_ppu_suite_contains_both_speculative_sanity_files(self):
+    def test_ppu_suite_contains_speculative_and_attention_model_sanity_files(self):
         registered = RUNNER.parent / "registered"
         files = [
             str(path)
@@ -48,7 +49,7 @@ class TestPPUCISuite(CustomTestCase):
             test
             for test in tests
             if test.backend == HWBackend.PPU
-            and test.effective_suite == "stage-a-test-1-gpu-ppu"
+            and test.effective_suite == "extra-test-1-gpu-ppu"
             and not test.disabled
         ]
         self.assertCountEqual(
@@ -56,10 +57,16 @@ class TestPPUCISuite(CustomTestCase):
                 Path(test.filename).relative_to(registered).as_posix()
                 for test in ppu_tests
             ],
-            ["core/test_basic_sanity_eagle3.py", "core/test_basic_sanity_dflash.py"],
+            [
+                "core/test_basic_sanity_eagle3.py",
+                "core/test_basic_sanity_dflash.py",
+                "core/test_basic_sanity.py",
+                "radix_cache/test_radix_attention.py",
+                "ppu/test_sail_attention_backends.py",
+            ],
         )
 
-    def test_runtime_requires_both_sanity_files_to_pass(self):
+    def test_runtime_requires_every_sanity_file_to_pass(self):
         source = Path(__file__).with_name("build_and_test.sh").read_text()
         marker = 'cd "$artifacts"\n'
         self.assertIn(marker, source)
@@ -80,13 +87,13 @@ class TestPPUCISuite(CustomTestCase):
                 "sys.exit(int(os.environ['FIXTURE_EXIT']))\n"
             )
             for summary, exit_code, expected in (
-                ("Test Summary: 2/2 passed", 0, 0),
+                ("Test Summary: 5/5 passed", 0, 0),
                 ("Test Summary: 0/0 passed", 0, 1),
                 ("Test Summary: 1/1 passed", 0, 1),
                 ("Test Summary: 1/2 passed", 0, 1),
-                ("Test Summary: 3/3 passed", 0, 1),
-                ("Test Summary: 2/2 passed", 7, 7),
-                ("Test Summary: 2/2 passed (incomplete)", 0, 1),
+                ("Test Summary: 6/6 passed", 0, 1),
+                ("Test Summary: 5/5 passed", 7, 7),
+                ("Test Summary: 5/5 passed (incomplete)", 0, 1),
                 ("", 0, 1),
             ):
                 with self.subTest(summary=summary, exit_code=exit_code):
@@ -137,6 +144,8 @@ class TestPPUCIWorkflow(CustomTestCase):
             ("scripts/ci/ppu/run_test.sh", True),
             ("python/sglang/srt/platforms/sail.py", True),
             ("scripts/ci/ppu/test_ppu_ci_suite.py", True),
+            ("test/registered/core/test_basic_sanity.py", True),
+            ("test/registered/radix_cache/test_radix_attention.py", True),
         ):
             with self.subTest(path=path):
                 self.assertEqual(
@@ -157,11 +166,14 @@ class TestPPUCIWorkflow(CustomTestCase):
             ["pr-gate", "check-changes", "ppu-build", "ppu-sanity"],
         )
         self.assertEqual(
-            self.jobs["ppu-sanity"]["if"], "needs.check-changes.outputs.ppu == 'true'"
+            self.jobs["ppu-sanity"]["if"],
+            "needs.check-changes.outputs.ppu == 'true' "
+            "&& needs.pr-gate.outputs.opted-in != 'false'",
         )
         self.assertEqual(
             self.jobs["pr-test-ppu-finish"]["if"],
-            "always() && needs.check-changes.result != 'skipped'",
+            "always() && needs.check-changes.result != 'skipped' "
+            "&& needs.pr-gate.outputs.opted-in != 'false'",
         )
         runtime = RUNNER.parent.parent / "scripts/ci/ppu/build_and_test.sh"
         self.assertNotIn("--hw cpu", runtime.read_text())
@@ -206,35 +218,35 @@ class TestPPUCIWorkflow(CustomTestCase):
     def test_finish_requires_successful_build_and_sanity_when_in_scope(self):
         finish = self.jobs["pr-test-ppu-finish"]["steps"][0]
         statuses = ("success", "failure", "cancelled", "skipped")
-        for build in statuses:
-            for sanity in statuses:
-                for in_scope in (True, False):
-                    with self.subTest(build=build, sanity=sanity, in_scope=in_scope):
-                        needs = {
-                            name: {"result": "success"}
-                            for name in self.jobs["pr-test-ppu-finish"]["needs"]
-                        }
-                        needs["ppu-build"] = {"result": build}
-                        needs["ppu-sanity"] = {"result": sanity}
-                        result = subprocess.run(
-                            ["bash", "-e", "-o", "pipefail", "-c", finish["run"]],
-                            env=dict(
-                                os.environ,
-                                NEEDS_JSON=json.dumps(needs),
-                                PPU_IN_SCOPE=str(in_scope).lower(),
-                                BUILD_RESULT=build,
-                                SANITY_RESULT=sanity,
-                            ),
-                            capture_output=True,
-                            text=True,
-                            timeout=10,
-                        )
-                        allowed = {"success"} if in_scope else {"success", "skipped"}
-                        self.assertEqual(
-                            result.returncode == 0,
-                            build in allowed and sanity in allowed,
-                            result.stdout + result.stderr,
-                        )
+        for build, sanity, in_scope in itertools.product(
+            statuses, statuses, (True, False)
+        ):
+            with self.subTest(build=build, sanity=sanity, in_scope=in_scope):
+                needs = {
+                    name: {"result": "success"}
+                    for name in self.jobs["pr-test-ppu-finish"]["needs"]
+                }
+                needs["ppu-build"] = {"result": build}
+                needs["ppu-sanity"] = {"result": sanity}
+                result = subprocess.run(
+                    ["bash", "-e", "-o", "pipefail", "-c", finish["run"]],
+                    env=dict(
+                        os.environ,
+                        NEEDS_JSON=json.dumps(needs),
+                        PPU_IN_SCOPE=str(in_scope).lower(),
+                        BUILD_RESULT=build,
+                        SANITY_RESULT=sanity,
+                    ),
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                allowed = {"success"} if in_scope else {"success", "skipped"}
+                self.assertEqual(
+                    result.returncode == 0,
+                    build in allowed and sanity in allowed,
+                    result.stdout + result.stderr,
+                )
         for variable, job in (
             ("BUILD_RESULT", "ppu-build"),
             ("SANITY_RESULT", "ppu-sanity"),

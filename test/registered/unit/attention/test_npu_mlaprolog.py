@@ -54,15 +54,20 @@ class TestDynamicInt8MLAProlog(CustomTestCase):
     def setUpClass(cls):
         super().setUpClass()
         # The attention wrapper imports vendor packages even on a CPU host.
-        vendor_norm = ModuleType("sgl_kernel_npu.norm.fused_split_qk_norm")
+        vendor_norm = ModuleType("sgl_kernel_npu.operators.norm")
         vendor_norm.fused_split_qk_norm = Mock(
             side_effect=AssertionError("Unexpected unfused NPU operator")
+        )
+        vendor_matmul = ModuleType("sgl_kernel_npu.operators.matmul")
+        vendor_matmul.batch_matmul_transpose = Mock(
+            side_effect=AssertionError("Unexpected NPU batch matmul")
         )
         with patch.dict(
             "sys.modules",
             {
                 "torch_npu": ModuleType("torch_npu"),
-                "sgl_kernel_npu.norm.fused_split_qk_norm": vendor_norm,
+                vendor_norm.__name__: vendor_norm,
+                vendor_matmul.__name__: vendor_matmul,
             },
         ):
             cls.attention = importlib.import_module(
@@ -210,6 +215,79 @@ class TestDynamicInt8MLAProlog(CustomTestCase):
         self.assertIs(result[3], self.k_cache)
         self.assertIs(result[4], self.latent)
         torch.testing.assert_close(result[-1], self.latent_scale.flatten())
+
+    def use_packed_int8_cache(self):
+        """The DSA pool's packed INT8 record: one-byte rows, zero-width rope."""
+        self.pool.dsa_kv_cache_store_fp8 = True
+        self.k_cache = torch.zeros(1, 4, 1, 3, dtype=torch.int8)
+        self.kr_cache = torch.zeros(1, 4, 1, 0, dtype=torch.bfloat16)
+
+    def test_packed_int8_cache_takes_the_packed_cache_contract(self):
+        """MLAProlog writes the same record the pool writer and sparse attention
+        use: per-128-tile quantization with the scales and rope in the row."""
+        self.use_packed_int8_cache()
+        preprocess = self.make_preprocess(self.make_model())
+        result = preprocess(self.positions, self.x, self.batch, None)
+        args = self.vendor.npu_mla_prolog_v3.call_args.kwargs
+        self.assertEqual(args["weight_quant_mode"], 2)
+        self.assertEqual(args["kv_cache_quant_mode"], 3)
+        self.assertEqual(args["query_quant_mode"], 0)
+        self.assertEqual(args["ckvkr_repo_mode"], 1)
+        self.assertEqual(args["quant_scale_repo_mode"], 1)
+        self.assertEqual(args["tile_size"], 128)
+        self.assertEqual(args["cache_mode"], "PA_BSND")
+        self.assertIs(args["kv_cache"], self.k_cache)
+        self.assertIs(args["kr_cache"], self.kr_cache)
+        alpha = args["k_nope_clip_alpha"]
+        torch.testing.assert_close(alpha, torch.ones(1, dtype=torch.float32))
+        self.assertIs(result[3], self.k_cache)
+        # Warmup and graph capture reuse the tensor on later steps.
+        preprocess(self.positions, self.x, self.batch, None)
+        self.assertIs(
+            self.vendor.npu_mla_prolog_v3.call_args.kwargs["k_nope_clip_alpha"], alpha
+        )
+
+    def test_packed_cache_takes_the_pool_quant_block_size(self):
+        """MLAProlog's tile follows the pool, not a literal 128."""
+        self.use_packed_int8_cache()
+        self.pool.quant_block_size = 64
+        preprocess = self.make_preprocess(self.make_model())
+        preprocess(self.positions, self.x, self.batch, None)
+        self.assertEqual(
+            self.vendor.npu_mla_prolog_v3.call_args.kwargs["tile_size"], 64
+        )
+
+    def test_unpacked_cache_passes_no_packed_arguments(self):
+        preprocess = self.make_preprocess(self.make_model())
+        preprocess(self.positions, self.x, self.batch, None)
+        args = self.vendor.npu_mla_prolog_v3.call_args.kwargs
+        self.assertEqual(args["kv_cache_quant_mode"], 0)
+        for name in ("k_nope_clip_alpha", "ckvkr_repo_mode", "tile_size"):
+            self.assertNotIn(name, args)
+
+    def test_packed_int8_cache_rejects_other_projection_weights(self):
+        """Only dynamic INT8 projections write the INT8 record; a BF16 draft
+        takes a BF16 draft KV cache instead."""
+        self.use_packed_int8_cache()
+        for mode in (0, 1, 3):
+            with self.subTest(weight_quant_mode=mode):
+                preprocess = self.make_preprocess(self.make_model())
+                preprocess.has_preprocess_weights = True
+                preprocess.weight_quant_mode = mode
+                with self.assertRaisesRegex(RuntimeError, "dynamic INT8"):
+                    preprocess.forward_mlaprolog(self.positions, self.x, self.batch)
+        self.vendor.npu_mla_prolog_v3.assert_not_called()
+
+    def test_packed_cache_rejects_the_legacy_preprocessing(self):
+        """Static INT8 projections keep the legacy MLAPO path, which writes a
+        BF16 cache and cannot write the packed record."""
+        self.use_packed_int8_cache()
+        preprocess = self.make_preprocess(
+            self.make_model(kernel_type=NPUW8A8Int8LinearMethod)
+        )
+        self.assertFalse(preprocess.uses_mlaprolog())
+        with self.assertRaisesRegex(RuntimeError, "requires MLAProlog"):
+            preprocess(self.positions, self.x, self.batch, None)
 
     def test_static_and_mixed_int8_do_not_select_dynamic_mlaprolog(self):
         for mixed in (False, True):

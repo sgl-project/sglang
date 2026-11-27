@@ -1,7 +1,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=534, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=524, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=536, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=1500, suite="extra-a-test-1-gpu-small-amd")
 """
 Consolidated HiCache variant tests.
 Tests HiCache with different configurations: standard, MLA, EAGLE, and page size variants.
@@ -96,7 +96,11 @@ class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
 
     model_name = DEFAULT_TARGET_MODEL_EAGLE3
     needs_tokenizer = True
-    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
+    server_env = {
+        "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+        # The EAGLE3 draft derives a shorter context than the target.
+        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
+    }
     hicache_args = [
         "--enable-hierarchical-cache",
         "--hicache-ratio",

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import threading
 import time
 from collections import deque
@@ -15,6 +16,7 @@ import torch
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.utils import _sample_to_uint8_frames
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler, _DeferredOutput
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 
@@ -199,6 +201,58 @@ def test_generation_with_one_pending_finalize_still_overlaps():
             scheduler.worker.execute_forward.assert_called_once()
         finally:
             pending.set_result(None)
+
+
+def test_continuous_finalize_overlap_leaves_a_gc_window(monkeypatch):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._async_output_save = True
+    scheduler._inflight_finalizes = deque()
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            supports_sequential_multi_output_inference=lambda: False
+        )
+    )
+    entered, release, waiting = (threading.Event() for _ in range(3))
+
+    class ObservedFuture(Future):
+        def result(self, timeout=None):
+            waiting.set()
+            return super().result(timeout)
+
+    pending = ObservedFuture()
+    scheduler._inflight_finalizes.append(pending)
+
+    def save():
+        try:
+            with request_gc.defer():
+                entered.set()
+                assert release.wait(10)
+                assert not gc.isenabled()
+        finally:
+            pending.set_result(None)
+
+    def forward(*args, **kwargs):
+        assert pending.done()
+        assert gc.isenabled()
+        return OutputBatch()
+
+    scheduler.worker = SimpleNamespace(
+        is_sleeping=lambda: False,
+        execute_forward=forward,
+        take_deferred_finalize=lambda: None,
+    )
+    monkeypatch.setattr(request_gc, "MAX_DEFER_SECONDS", 0)
+    with ThreadPoolExecutor(2) as executor:
+        saving = executor.submit(save)
+        try:
+            assert entered.wait(10)
+            dispatch = executor.submit(scheduler._handle_generation, [_req()])
+            assert waiting.wait(10)
+            assert not dispatch.done()
+        finally:
+            release.set()
+            saving.result(timeout=10)
+        assert isinstance(dispatch.result(timeout=10), OutputBatch)
 
 
 def _finalize_scheduler(replies):

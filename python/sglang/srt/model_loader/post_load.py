@@ -128,13 +128,16 @@ def stage_module_for_post_load(
     if process_device.type == "meta":
         raise ValueError("process_device cannot be meta")
 
+    # Resolve npu/cuda aliases to avoid restore-copying already-resident NZ views.
+    process_device = torch.empty(0, device=process_device).device
+
     original_slots: dict[_SlotKey, _TensorState] = {}
     original_nonpersistent_buffer_slots: set[_SlotKey] = set()
     original_name_origins: dict[tuple[int, str], torch.device] = {}
     owner_origins: dict[int, set[torch.device]] = {}
     module_origins: set[torch.device] = set()
     tensor_states: dict[int, _TensorState] = {}
-    # Offloader-parked parameters (see sglang.srt.utils.offloader) live on the
+    # Offloader-parked parameters (see sglang.srt.layers.offloader) live on the
     # meta device through post-load processing; kernels are expected to skip
     # them. Pass them through untouched, matching the pre-staging behaviour.
     meta_tensor_ids: set[int] = set()

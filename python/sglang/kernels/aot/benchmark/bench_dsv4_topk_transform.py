@@ -8,9 +8,9 @@ import triton.testing
 from sgl_kernel import deepseek_v4_topk_transform_512
 
 try:
-    from sglang.utils import is_in_ci
+    from sglang.srt.environ import envs
 
-    IS_CI = is_in_ci()
+    IS_CI = envs.SGLANG_IS_IN_CI.get()
 except ImportError:
     IS_CI = False
 

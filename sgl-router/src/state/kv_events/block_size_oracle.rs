@@ -9,13 +9,8 @@
 //! worker uses to publish KV-cache events; otherwise every cache-aware
 //! lookup misses silently. The worker advertises its `page_size` via
 //! `/server_info` (parsed into [`crate::state::kv_events::EventConfig::block_size`]).
-//! Dynamo's design treats `kv_cache_block_size` as a property of the
-//! `ModelDeploymentCard` populated by the worker registrar (see
-//! `~/dynamo/components/src/dynamo/sglang/register.py`); a mismatch
-//! across workers for the same model is rejected loudly
-//! (`lib/kv-router/src/standalone_indexer/registry.rs::bail!`). The
-//! oracle here is the sgl-router analog — first worker establishes the
-//! value, mismatches are refused.
+//! The first worker to report establishes the value; a later worker that
+//! reports a different one is refused.
 //!
 //! # Single oracle vs per-model
 //!

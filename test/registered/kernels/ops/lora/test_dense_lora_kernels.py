@@ -20,7 +20,7 @@ from sglang.srt.lora.utils import Phase  # noqa: E402
 from sglang.srt.lora.workspace import LoraWorkspace  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="dense LoRA kernels need CUDA"
@@ -174,6 +174,22 @@ PLANS = {
     "per_row_ab_delta": DensePlan(
         a_family=AFamily.PER_ROW, b_family=BFamily.PER_ROW, overlap=Overlap.AB_DELTA
     ),
+    # Combinations only sm100.plans.json selects. On H100 this checks their
+    # Triton logic, not Blackwell hardware.
+    "all_slots_ab_delta": DensePlan(
+        a_family=AFamily.ALL_SLOTS, b_family=BFamily.PER_ROW, overlap=Overlap.AB_DELTA
+    ),
+    "all_slots_bk256_ov": DensePlan(
+        a_family=AFamily.ALL_SLOTS,
+        b_family=BFamily.PER_ROW,
+        overlap=Overlap.A,
+        b_tiles={**DensePlan().b_tiles, "BLOCK_SIZE_K": 256},
+    ),
+    "sorted16_splitk16_planes_ov": DensePlan(
+        block_size=16,
+        overlap=Overlap.A,
+        a_tiles={**DensePlan().a_tiles, "SPLIT_K": 16, "SPLIT_MODE": "planes"},
+    ),
 }
 
 
@@ -202,7 +218,6 @@ def test_engine_matches_reference(batch_name, site_kind, plan_name):
 
     phase = Phase.PREFILL if batch_name == "prefill" else Phase.DECODE
     engine = _engine(batch_info, token_slots, phase)
-    assert torch.equal(engine.token_slots, token_slots)
     out = engine.apply(
         x,
         lambda: base.clone(),

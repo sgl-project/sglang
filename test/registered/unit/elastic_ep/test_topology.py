@@ -22,7 +22,7 @@ from sglang.srt.managers.io_struct import ScaleElasticEPReqInput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def test_attention_topology_mapping_and_complete_boundaries():
@@ -90,6 +90,8 @@ def test_attention_tp_scale_requires_moe_dense_tp_one():
         enable_eplb=False,
         pp_size=1,
         mooncake_ib_device=None,
+        enable_symm_mem=False,
+        elastic_ep_reuse_cuda_graph=False,
         ep_join_mode=None,
         ep_join_rank_offset=0,
         max_ep_size=8,

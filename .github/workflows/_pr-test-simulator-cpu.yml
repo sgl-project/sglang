@@ -19,7 +19,7 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
-  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
 jobs:
@@ -32,7 +32,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
+          persist-credentials: false
+          ref: ${{ fromJson(inputs.caller_inputs).git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       - uses: ./.github/actions/check-pr-test-health
 
@@ -62,6 +66,7 @@ jobs:
         with:
           workspaces: rust
           shared-key: "sglang-grpc-cpu"
+          save-if: ${{ github.event_name != 'pull_request_target' }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -70,7 +75,7 @@ jobs:
         run: |
           uv pip install -e "python" --index-strategy unsafe-best-match --prerelease allow
           uv pip install pytest
-          uv pip install "./tools/sglang-simulator[aic]"
+          uv pip install "./tools/sglang-simulator[aisimulate]"
 
       - name: Prebuild HiCache native hash extension
         timeout-minutes: 5
@@ -91,8 +96,10 @@ jobs:
           PYTEST_ADDOPTS: "-s"
           TORCH_EXTENSIONS_DIR: ${{ runner.temp }}/torch-extensions
         run: |
+          python3 -m pytest -q tools/sglang-simulator/test/test_optional_aisimulate.py
           OMP_NUM_THREADS=2 python3 -m pytest -q tools/sglang-simulator/test/test_train_latency_model.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_runner.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_predictor.py

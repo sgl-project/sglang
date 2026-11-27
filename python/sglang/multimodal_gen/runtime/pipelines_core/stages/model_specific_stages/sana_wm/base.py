@@ -1023,6 +1023,7 @@ class SanaWMDenoisingStage(DenoisingStage):
                 if latents.dtype != latents_dtype:
                     latents = latents.to(latents_dtype)
 
+                self.check_cancelled(batch)
                 if sana_wm_diagnostics_enabled() and (
                     step_idx == 0 or step_idx == len(timesteps) - 1
                 ):
@@ -2224,9 +2225,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         num_frames = self.pipeline_config.adjust_num_frames(num_frames)
         batch.num_frames = num_frames
         self.log_info(
-            "SANA-WM prepare: seed=%s, size=%dx%d, frames=%d, "
-            "vae_stride=%s, diagnostics=%s",
-            getattr(batch, "seed", None),
+            "SANA-WM prepare: size=%dx%d, frames=%d, vae_stride=%s, diagnostics=%s",
             batch.width,
             batch.height,
             num_frames,

@@ -19,20 +19,28 @@ from sglang.multimodal_gen.configs.models.dits.nomas import (
     NomasArchConfig,
     NomasConfig,
 )
+from sglang.multimodal_gen.runtime.layers.kvcache.nomas_segment_cache import (
+    NomasAttentionPlan,
+    NomasCache,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.quanto_int8 import (
+    QuantoInt8LinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import ModulateProjection
+from sglang.multimodal_gen.runtime.loader.nomas_weights import (
+    NomasInt8Config,
+    configure_nomas_int8,
+    resolve_nomas_checkpoint_quantization,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
-from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import (
-    NomasAttentionPlan,
-    NomasCache,
-)
 from sglang.multimodal_gen.runtime.models.dits.nomas_layers import (
     FinalLayerPerBlock,
     IndividualTokenRefiner,
@@ -219,42 +227,49 @@ class NomasCameraAttention(nn.Module):
         """``x`` holds video tokens [token_offset, token_offset + n) of the segment."""
         b, n, _ = x.shape
         frames = camera.shape[1]
-        q = self.img_attn_q(x).view(b, n, 16, 64)
-        k, v = (
-            self.keyboard_attn_kv(self.keyboard_embed(camera))
-            .view(b, frames, 2, 16, 64)
-            .unbind(2)
-        )
-        tokens = torch.arange(n, device=x.device) + token_offset
-        qids = (tokens // spatial_tokens).clamp(max=7499)
-        kids = torch.arange(frames, device=x.device).clamp(max=7499)
-        q = rms_norm_rotate(
-            self.key_attn_q_norm,
-            q,
-            (self.freqs_cos[qids], self.freqs_sin[qids]),
-            v.dtype,
-        )
-        k = rms_norm_rotate(
-            self.key_attn_k_norm,
-            k,
-            (self.freqs_cos[kids], self.freqs_sin[kids]),
-            v.dtype,
-        )
-        chunks = []
-        # Each camera chunk covers a contiguous token range; intersect with ours.
-        for start in range(0, frames, self.chunk_size):
-            end = min(start + self.chunk_size, frames)
-            lo = max(start * spatial_tokens, token_offset) - token_offset
-            hi = min(end * spatial_tokens, token_offset + n) - token_offset
-            if hi <= lo:
-                continue
-            out = F.scaled_dot_product_attention(
-                q[:, lo:hi].transpose(1, 2),
-                k[:, start:end].transpose(1, 2),
-                v[:, start:end].transpose(1, 2),
+        if self.chunk_size == 1:
+            # Softmax over a single key is exactly 1, so each token reads its frame's value.
+            v = self.keyboard_attn_kv(self.keyboard_embed(camera))
+            v = v.view(b, frames, 2, 16, 64)[:, :, 1]
+            frame = (torch.arange(n, device=x.device) + token_offset) // spatial_tokens
+            out = self.proj_keyboard(v[:, frame].flatten(2))
+        else:
+            q = self.img_attn_q(x).view(b, n, 16, 64)
+            k, v = (
+                self.keyboard_attn_kv(self.keyboard_embed(camera))
+                .view(b, frames, 2, 16, 64)
+                .unbind(2)
             )
-            chunks.append(out.transpose(1, 2).flatten(2))
-        out = self.proj_keyboard(torch.cat(chunks, 1))
+            tokens = torch.arange(n, device=x.device) + token_offset
+            qids = (tokens // spatial_tokens).clamp(max=7499)
+            kids = torch.arange(frames, device=x.device).clamp(max=7499)
+            q = rms_norm_rotate(
+                self.key_attn_q_norm,
+                q,
+                (self.freqs_cos[qids], self.freqs_sin[qids]),
+                v.dtype,
+            )
+            k = rms_norm_rotate(
+                self.key_attn_k_norm,
+                k,
+                (self.freqs_cos[kids], self.freqs_sin[kids]),
+                v.dtype,
+            )
+            chunks = []
+            # Each camera chunk covers a contiguous token range; intersect with ours.
+            for start in range(0, frames, self.chunk_size):
+                end = min(start + self.chunk_size, frames)
+                lo = max(start * spatial_tokens, token_offset) - token_offset
+                hi = min(end * spatial_tokens, token_offset + n) - token_offset
+                if hi <= lo:
+                    continue
+                out = F.scaled_dot_product_attention(
+                    q[:, lo:hi].transpose(1, 2),
+                    k[:, start:end].transpose(1, 2),
+                    v[:, start:end].transpose(1, 2),
+                )
+                chunks.append(out.transpose(1, 2).flatten(2))
+            out = self.proj_keyboard(torch.cat(chunks, 1))
         if has_camera is not None:
             # Upstream intentionally promotes this residual to float32.
             out = out * has_camera.float()[:, None, None]
@@ -268,6 +283,11 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     # general SGL attention backend.
     _supported_attention_backends = {AttentionBackendEnum.TORCH_SDPA}
 
+    @staticmethod
+    def resolve_checkpoint_quantization(weight_files):
+        """Detect and validate the official INT8 format before model creation."""
+        return resolve_nomas_checkpoint_quantization(weight_files)
+
     def __init__(
         self,
         config: NomasConfig,
@@ -276,10 +296,15 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         quant_config=None,
         attention_backend="auto",
     ):
-        if quant_config is not None:
-            raise ValueError("Nomas does not support quantized weights yet")
-        if config.quant_config is not None:
-            raise NotImplementedError("Nomas v1 does not implement quantized loading")
+        if (
+            quant_config is not None
+            and config.quant_config is not None
+            and quant_config is not config.quant_config
+        ):
+            raise ValueError("Conflicting Nomas quantization configs")
+        quant_config = quant_config or config.quant_config
+        if quant_config is not None and not isinstance(quant_config, NomasInt8Config):
+            raise ValueError("Nomas supports only its official INT8 checkpoint format")
         if attention_backend == "auto":
             # FA3 + log-sum-exp merge is about 2x FlexAttention on Hopper.
             attention_backend = "fa3" if current_platform.is_hopper() else "flex"
@@ -298,6 +323,8 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.num_attention_heads = c.num_attention_heads
         self.local_attention_heads = c.num_attention_heads // self.parallel.head_shards
         self.num_channels_latents = c.in_channels
+        self._offline_graph = None
+        self.quant_config = quant_config
         self.attention_backend = attention_backend
         # Framework layerwise offload hooks this ModuleList; action_modules stay resident.
         self.layer_names = ["double_blocks"]
@@ -316,6 +343,25 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.extrinsics_embedding_camctrl = nn.Linear(64, 64)
         self.c2ws_hidden_states_layer1 = nn.Linear(64, 64)
         self.c2ws_hidden_states_layer2 = nn.Linear(64, 64)
+        if quant_config is not None:
+            configure_nomas_int8(self, quant_config)
+
+    def _apply(self, fn, recurse=True):
+        # Protect INT8 scales at the model boundary. Byte views carry device and
+        # non_blocking transforms through without rounding the FP32 values.
+        modules = self.modules() if recurse else (self,)
+        protected = {
+            id(module.weight_scale)
+            for module in modules
+            if isinstance(getattr(module, "quant_method", None), QuantoInt8LinearMethod)
+        }
+
+        def preserve_scale_dtype(tensor):
+            if id(tensor) in protected:
+                return fn(tensor.view(torch.uint8)).view(tensor.dtype)
+            return fn(tensor)
+
+        return super()._apply(preserve_scale_dtype, recurse=recurse)
 
     def post_load_weights(self):
         # Meta initialization / to_empty() does not restore nonpersistent buffers
@@ -325,6 +371,20 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             p = module.img_attn_q.weight
             module.freqs_cos = cos.to(device=p.device, dtype=p.dtype)
             module.freqs_sin = sin.to(device=p.device, dtype=p.dtype)
+
+    def offline_graph(self, warmup):
+        if warmup and self._offline_graph is None:
+            from sglang.multimodal_gen.runtime.models.dits.nomas_graph import (
+                NomasGraphRunner,
+            )
+
+            self._offline_graph = NomasGraphRunner(self)
+        return self._offline_graph
+
+    def release_cuda_graphs(self):
+        if self._offline_graph is not None:
+            self._offline_graph.reset()
+            self._offline_graph = None
 
     def allocate_cache(self, capacity):
         p = next(self.parameters())

@@ -5,6 +5,7 @@ parses them, and tool-call arguments arrive as the API streams them."""
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Sequence
 from typing import Any, Optional
 
@@ -16,6 +17,11 @@ from sglang.srt.parser.deepseek_recipe_renderer import (
     DeepSeekRecipe,
     load_deepseek_recipe,
 )
+
+logger = logging.getLogger(__name__)
+
+# The most tokens one UTF-8 character can span, a byte each.
+_MAX_UTF8_BYTES = 4
 
 
 class RecipeToolCallDelta(msgspec.Struct, frozen=True):
@@ -74,6 +80,7 @@ class DeepSeekRecipeOutputParser:
         separate_reasoning: bool = True,
         stream_reasoning: bool = True,
         stop: Sequence[str] = (),
+        callable_names: Optional[frozenset[str]] = None,
     ):
         recipe = load_deepseek_recipe()
         options = recipe.ParsingOptions(
@@ -101,6 +108,10 @@ class DeepSeekRecipeOutputParser:
         # out, so a matched stop is cut before recipe has emitted any of it.
         self._stop_hold_chars = max(map(len, stop), default=1) - 1
         self._pending_ids: list[int] = []
+        self._callable_names = callable_names
+        # recipe's index of each call so far, mapped to the index it is reported
+        # at; None for a dropped call.
+        self._call_indices: dict[int, Optional[int]] = {}
         self.num_consumed_tokens = 0
 
     def feed(self, token_ids: Sequence[int]) -> RecipeOutputDelta:
@@ -174,12 +185,19 @@ class DeepSeekRecipeOutputParser:
     ) -> list[int]:
         # The scheduler matched `stop` in the decoded text and ended on the token
         # completing it; the earliest match ending there starts at most
-        # len(stop) - 1 characters before that token.
+        # len(stop) - 1 characters before that token. A stop not found there, as
+        # a `stop_regex` pattern is not, is not cut.
         decode = self._hf_tokenizer.decode
         start = len(token_ids) - 1
-        last = decode(token_ids[start:], skip_special_tokens=False)
-        text = last
-        while start > 0 and (stop not in text or len(text) - len(last) < len(stop) - 1):
+        text = decode(token_ids[start:], skip_special_tokens=False)
+        reach = len(text) + len(stop) - 1
+        tokens_past_reach = 0
+        while start > 0 and (stop not in text or len(text) < reach):
+            if len(text) >= reach:
+                # A character split across tokens decodes whole only with all of them.
+                if tokens_past_reach == _MAX_UTF8_BYTES:
+                    break
+                tokens_past_reach += 1
             start -= 1
             text = decode(token_ids[start:], skip_special_tokens=False)
         cut = text.find(stop)
@@ -192,6 +210,28 @@ class DeepSeekRecipeOutputParser:
             + self._hf_tokenizer.encode(text[:cut], add_special_tokens=False).ids
         )
 
+    def _reported_call(
+        self, call: RecipeToolCallDelta
+    ) -> Optional[RecipeToolCallDelta]:
+        """`call` at the index it is reported at; None when it belongs to a call
+        outside `callable_names`."""
+        if self._callable_names is None:
+            return call
+        if call.name is not None:
+            index = None
+            if call.name in self._callable_names:
+                index = sum(kept is not None for kept in self._call_indices.values())
+            # No callable name is `tool_choice: none`, which drops calls by design.
+            elif self._callable_names:
+                logger.warning(
+                    "Model attempted to call undefined function: %s", call.name
+                )
+            self._call_indices[call.index] = index
+        index = self._call_indices[call.index]
+        if index is None:
+            return None
+        return msgspec.structs.replace(call, index=index)
+
     def _deltas(self, chunks: list[Any]) -> RecipeOutputDelta:
         delta = RecipeOutputDelta()
         for chunk in chunks:
@@ -202,12 +242,19 @@ class DeepSeekRecipeOutputParser:
             reasoning = piece.get("reasoning_content") or ""
             content = piece.get("content") or ""
             tool_calls = tuple(
-                RecipeToolCallDelta(
-                    index=call["index"],
-                    arguments=call["function"]["arguments"],
-                    name=call["function"].get("name"),
+                call
+                for call in map(
+                    self._reported_call,
+                    (
+                        RecipeToolCallDelta(
+                            index=call["index"],
+                            arguments=call["function"]["arguments"],
+                            name=call["function"].get("name"),
+                        )
+                        for call in piece.get("tool_calls") or ()
+                    ),
                 )
-                for call in piece.get("tool_calls") or ()
+                if call is not None
             )
             if self._reasoning_as_content:
                 content, reasoning = reasoning + content, ""
