@@ -362,6 +362,25 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="attention.step5_dsa_sparse_attention",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.step5_dsa_sparse_attention:step5_dsa_sparse_attention",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.step5_dsa_select_blocks",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.step5_dsa_indexer:step5_dsa_select_blocks",
+        capabilities=frozenset(
+            CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
+            for sm in ((9, 0), (10, 0), (10, 3), (10, 7))
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.fast_topk",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.fast_topk:fast_topk",

@@ -491,7 +491,6 @@ def _launch_argv(argv):
 # Recipes with CLI options only available on a model-support branch. A model
 # may have both parseable and branch-only recipes; parsing does not prove it runs.
 BRANCH_ONLY_CLI_MODES = {
-    "stepfun-ai/Step-5-Preview": None,  # every recipe
     # The Hy4-flash low-latency recipes need the DFly arguments from #51159.
     "tencent/Hy4-flash": {"low-latency"},
     "tencent/Hy4-flash-FP8": {"low-latency"},
