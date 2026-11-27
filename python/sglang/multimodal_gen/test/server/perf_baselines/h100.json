@@ -2105,7 +2105,7 @@
                 "TimestepPreparationStage": 28.98,
                 "LatentPreparationStage": 0.13,
                 "DenoisingStage": 5229.75,
-                "DecodingStage": 2888.31,
+                "DecodingStage": 5580.63,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
@@ -2116,7 +2116,7 @@
                 "4": 1011.33,
                 "5": 1011.9
             },
-            "expected_e2e_ms": 9123.68,
+            "expected_e2e_ms": 11837.62,
             "expected_avg_denoise_ms": 871.39,
             "expected_median_denoise_ms": 1010.9,
             "load_peak_vram_mb": 40050.0,

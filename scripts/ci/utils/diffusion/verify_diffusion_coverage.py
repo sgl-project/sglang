@@ -15,6 +15,7 @@ Exit codes:
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -47,7 +48,9 @@ def load_execution_reports(reports_dir: Path) -> list[dict]:
     return [report for _, report in reports.values()]
 
 
-def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
+def get_expected_cases(
+    repo_root: Path, pr_families: tuple[str, ...] = ()
+) -> dict[str, set[str]]:
     """
     Get all expected cases from case config and run_suite.py.
 
@@ -59,7 +62,9 @@ def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
     run_suite_path = repo_root / RUN_SUITE_REL_PATH
     case_config_path = resolve_case_config_path(repo_root, run_suite_path)
 
-    suites = collect_diffusion_suites(case_config_path, baseline_path)
+    suites = collect_diffusion_suites(
+        case_config_path, baseline_path, pr_families=pr_families
+    )
 
     expected = {}
     for suite_name, suite_info in suites.items():
@@ -74,8 +79,8 @@ def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
     empty_dynamic_suites = [
         suite_name
         for suite_name in DYNAMIC_SUITES
-        if suite_name in expected
-        and not any(
+        if suite_name not in expected
+        or not any(
             not case_id.startswith("standalone:") for case_id in expected[suite_name]
         )
     ]
@@ -290,7 +295,10 @@ def main():
 
     # Get expected cases
     try:
-        expected = get_expected_cases(repo_root)
+        families = tuple(
+            json.loads(os.environ.get("DIFFUSION_H100_PR_FAMILIES") or "[]")
+        )
+        expected = get_expected_cases(repo_root, families)
     except (RuntimeError, FileNotFoundError) as exc:
         print(f"\nERROR: {exc}")
         sys.exit(1)
