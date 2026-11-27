@@ -23,6 +23,11 @@ class InputLogprobChunkCap:
     """Admits prefills so that the requests returning input logprobs take at most the
     cap in chunk tokens per batch; other requests keep the batch's chunk budget.
 
+    A capped request cut short is the batch's one chunked request, so later requests
+    join the batch only whole (`PrefillAdder.add_one_req`). A request returning input
+    logprobs that finds no cap room left is not admitted, which ends the pass like
+    any other request that is not admitted.
+
     Input logprobs materialize fp32 full-vocab logits for each of those rows, outside
     the prefill graph.
     """
@@ -79,9 +84,15 @@ class InputLogprobChunkCap:
         return self._admit(adder, req, lambda: adder.add_chunked_req(req))
 
     def add_one_req(self, adder: PrefillAdder, req: Req, **kwargs) -> AddReqResult:
-        if self._capped(adder, req) and self.room <= 0:
+        capped = self._capped(adder, req)
+        if capped and self.room <= 0:
             return AddReqResult.OTHER
-        return self._admit(adder, req, lambda: adder.add_one_req(req, **kwargs))
+        result = self._admit(adder, req, lambda: adder.add_one_req(req, **kwargs))
+        if capped and adder.can_run_list and adder.can_run_list[-1] is req:
+            # The verdict for the next request was taken against the cap; take it
+            # again against the batch's chunk budget, now restored.
+            return adder.budget_state()
+        return result
 
     def _capped(self, adder: PrefillAdder, req: Req) -> bool:
         return (

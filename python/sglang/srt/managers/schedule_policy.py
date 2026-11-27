@@ -1905,7 +1905,10 @@ class PrefillAdder:
 
     @capacity_decision
     def add_one_req_ignore_eos(
-        self, req: Req, truncation_align_size: Optional[int] = None
+        self,
+        req: Req,
+        truncation_align_size: Optional[int] = None,
+        has_chunked_req: bool = False,
     ):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         if is_cp_sharded_padded():
@@ -2052,7 +2055,7 @@ class PrefillAdder:
                 cached_tokens=req.prefix_len,
             )
         else:
-            if chunk_limit <= 0:
+            if chunk_limit <= 0 or has_chunked_req:
                 return AddReqResult.OTHER
 
             # Chunked prefill
@@ -2128,8 +2131,14 @@ class PrefillAdder:
         if self.chunked_req_waits:
             return AddReqResult.NO_TOKEN
 
+        # A batch tracks one unfinished chunked request: once one is cut in this
+        # batch, a later request is admitted only whole.
+        has_chunked_req = has_chunked_req or self.new_chunked_req is not None
+
         if req.sampling_params.ignore_eos and self.tree_cache.disable:
-            return self.add_one_req_ignore_eos(req, truncation_align_size)
+            return self.add_one_req_ignore_eos(
+                req, truncation_align_size, has_chunked_req=has_chunked_req
+            )
 
         max_new = self._swa_new_tokens(req)
         total_tokens, state_slots = self._prefill_charge(req)
