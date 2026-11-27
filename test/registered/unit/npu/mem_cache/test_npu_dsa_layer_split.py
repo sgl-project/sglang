@@ -119,30 +119,63 @@ class TestShardBookkeeping(CustomTestCase):
             pool._kv_capacity_tokens,
         )
 
-    def test_get_kv_layer_ids_doubles_owned_layers(self):
+    def test_get_kv_layer_ids_follow_the_owned_pd_entries(self):
+        """PD entries cover only the owned k/v rows; the packed record also
+        drops the V entries, so the ids are not simply the owned layers twice."""
         pool = _make_pool(layer_num=10, start_layer=2, shard_rank=1, shard_size=4)
-        with patch.object(POOL, "get_state_layer_ids", lambda self: [10]):
-            self.assertEqual(pool.get_kv_layer_ids(), [5, 6, 7, 5, 6, 7, 10])
+        pool.is_draft_worker = False
+        pool.dcp_size = 1
+        pool.index_k_scale_buffer = None
+        pool.indexer_layer_ids = (5, 7)
+        cases = [
+            # (dsa_kv_cache_store_c8, expected ids)
+            (False, [5, 6, 7, 5, 6, 7, 5, 7]),  # k + v + indexer k
+            (True, [5, 6, 7, 5, 7]),  # packed k/v + indexer k
+        ]
+        for packed, expected in cases:
+            pool.dsa_kv_cache_store_c8 = packed
+            ptrs, _, _ = pool.get_contiguous_buf_infos()
+            self.assertEqual(pool.get_kv_layer_ids(), expected)
+            self.assertEqual(len(ptrs), len(expected))
 
     def test_get_kv_transfer_layer_span_counts_buffer_groups(self):
         pool = _make_pool()
         cases = [
-            # (dsa_kv_cache_store_fp8, has_scale, expected_groups)
+            # (dsa_kv_cache_store_c8, has_scale, expected_groups)
             (False, False, 3),  # k + v + indexer k
             (True, False, 2),  # packed k/v + indexer k
             (True, True, 3),  # packed k/v + indexer k + fp32 scale
         ]
-        for fp8, has_scale, groups in cases:
-            pool.dsa_kv_cache_store_fp8 = fp8
+        for c8, has_scale, groups in cases:
+            pool.dsa_kv_cache_store_c8 = c8
             pool.index_k_scale_buffer = object() if has_scale else None
             self.assertEqual(pool.get_kv_transfer_layer_span(6 * groups), 6)
 
         # Non-multiple entry counts are a registration bug: refuse silently
         # mis-slicing the layer span.
-        pool.dsa_kv_cache_store_fp8 = False
+        pool.dsa_kv_cache_store_c8 = False
         pool.index_k_scale_buffer = None
         with self.assertRaises(AssertionError):
             pool.get_kv_transfer_layer_span(7)
+
+    def test_packed_remote_copy_uses_the_pool_record_packer(self):
+        """The CP-gathered copy of a packed layer goes through the base pool's
+        record packer, the same one set_kv_buffer uses."""
+        from sglang.srt.hardware_backend.npu import dsa_cache_layer_split
+
+        pool = _make_pool(kv_dim=6)
+        pool.dsa_kv_cache_store_c8 = True
+        loc = torch.tensor([0, 1])
+        packed = torch.zeros((2, 6))
+        with (
+            patch.object(POOL, "_pack_dsa_quant_kv_cache", return_value=packed) as pack,
+            patch.object(dsa_cache_layer_split, "torch_npu", create=True) as npu,
+        ):
+            pool._store_remote_copy(
+                SimpleNamespace(layer_id=5), loc, torch.zeros(2, 4), torch.zeros(2, 2)
+            )
+        pack.assert_called_once()
+        npu.npu_scatter_nd_update_.assert_called_once()
 
 
 class _FakeParallel:

@@ -288,6 +288,15 @@ class Qwen3_5TextModel(nn.Module):
         )
 
 
+# A full Qwen3_5ForConditionalGeneration checkpoint nests the text model under
+# "model." and also carries the vision tower, the MTP head and lm_head.
+_NON_TEXT_PREFIXES = ("visual.", "mtp.", "lm_head.")
+
+
+def _text_weight_name(name: str) -> str:
+    return name.removeprefix("model.")
+
+
 class Qwen3_5Model(TextEncoder):
     """Qwen3.5 text-only prefill for diffusion conditioning."""
 
@@ -309,7 +318,7 @@ class Qwen3_5Model(TextEncoder):
 
     @staticmethod
     def should_materialize_checkpoint_weight(name: str) -> bool:
-        return not name.startswith("visual.")
+        return not _text_weight_name(name).startswith(_NON_TEXT_PREFIXES)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
@@ -317,6 +326,7 @@ class Qwen3_5Model(TextEncoder):
         for name, weight in weights:
             if not self.should_materialize_checkpoint_weight(name):
                 continue
+            name = _text_weight_name(name)
             target = load_stacked_weight(name, weight, params, _MLP_STACKED_PARAMS)
             if target is None:
                 raise KeyError(name)
