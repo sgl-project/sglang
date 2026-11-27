@@ -218,12 +218,13 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(TestNpuAccuracyMultiNodePdSepTestCas
         self.run_accuracy()
 
     def test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_l2_host_hit_rate(self):
-        """Run the 28k GSP bench; assert_metrics checks the host hit rate"""
-        # 3 groups x 32 prompts share a 25200-token system prompt (28k * 0.9)
-        # plus a 2800-token question, which exceeds L1 so evictions land in L2.
-        # The prompt must stay below the prefill KV pool, which only holds
-        # ~31.5k tokens per rank once the DSPARK draft model is resident on
-        # prefill; a 32k prompt is rejected with a 400 and warmup fails.
+        """Run the 18k GSP bench; assert_metrics checks the host hit rate"""
+        # 3 groups x 32 prompts share a 16200-token system prompt (18k * 0.9)
+        # plus a 1800-token question, which exceeds L1 so evictions land in L2.
+        # The prompt must stay well below the prefill KV pool, which is tight
+        # once the DSPARK draft model is resident on prefill at
+        # --mem-fraction-static 0.82; a 32k prompt is rejected with a 400 and
+        # warmup fails.
         metrics = run_bench_serving(
             host=self.host,
             port=self.port,
