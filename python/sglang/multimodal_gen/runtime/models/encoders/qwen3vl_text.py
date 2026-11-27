@@ -17,6 +17,7 @@ unquantized one keeps srt's fused layers.
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Iterable, Optional
 
@@ -25,6 +26,9 @@ from torch import nn
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from sglang.multimodal_gen.runtime.distributed import tensor_model_parallel_all_gather
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    use_tensor_parallel_group,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -51,7 +55,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig as SrtQuantizationConfig,
 )
-from sglang.srt.model_executor.prefill_only import prefill_only
+from sglang.srt.model_executor.prefill_only import eager_graphs, prefill_only
 from sglang.srt.models.qwen3_vl import Qwen3LLMModel
 from sglang.srt.runtime_context import get_parallel
 
@@ -59,6 +63,9 @@ from sglang.srt.runtime_context import get_parallel
 _SINGLE_PIPELINE_STAGE = SimpleNamespace(
     is_first_rank=True, is_last_rank=True, rank_in_group=0, world_size=1
 )
+
+# The TP "group" of a replicated encoder: one rank, so no collective runs.
+_SINGLE_RANK = SimpleNamespace(world_size=1, rank_in_group=0)
 
 # checkpoint projection -> (fused srt parameter, shard id)
 _STACKED_PARAMS = (
@@ -332,23 +339,35 @@ class Qwen3VLTextModel(Qwen3LLMModel):
                 weight_only_fp8=weight_only_fp8,
                 replicate=replicate_projections,
             )
-        with get_parallel().override(pp_group=_SINGLE_PIPELINE_STAGE):
+        # Replicated projections replicate the whole stack: every rank runs all
+        # heads, as one TP rank, and no layer exchanges anything.
+        scope = (
+            use_tensor_parallel_group(_SINGLE_RANK)
+            if replicate_projections
+            else nullcontext()
+        )
+        with (
+            scope,
+            eager_graphs(),
+            get_parallel().override(pp_group=_SINGLE_PIPELINE_STAGE),
+        ):
             super().__init__(
                 config=srt_config, quant_config=projection_quant, prefix=prefix
             )
-        embedding_prefix = add_prefix("embed_tokens", prefix)
-        if quant_config is not None and quant_config.quantizes_embedding(
-            embedding_prefix
-        ):
-            # a quantized table keeps the checkpoint's own format
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                params_dtype=torch.get_default_dtype(),
-                quant_config=quant_config,
-                prefix=embedding_prefix,
-            )
-        self.attn = causal_text_attention(config, get_parallel().attn_tp_size)
+            embedding_prefix = add_prefix("embed_tokens", prefix)
+            if quant_config is not None and quant_config.quantizes_embedding(
+                embedding_prefix
+            ):
+                # a quantized table keeps the checkpoint's own format
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    params_dtype=torch.get_default_dtype(),
+                    quant_config=quant_config,
+                    prefix=embedding_prefix,
+                )
+            self.attn = causal_text_attention(config, get_parallel().attn_tp_size)
+        self.replicated = replicate_projections
 
     def drop_final_norm(self) -> None:
         """Return the last layer's residual stream instead of normalizing it."""
@@ -419,9 +438,17 @@ class Qwen3VLTextModel(Qwen3LLMModel):
                 )
             )
         try:
-            with prefill_only(
-                [seq_len] * batch, positions, attention=self._attention
-            ) as forward_batch:
+            scope = (
+                use_tensor_parallel_group(_SINGLE_RANK)
+                if self.replicated
+                else nullcontext()
+            )
+            with (
+                scope,
+                prefill_only(
+                    [seq_len] * batch, positions, attention=self._attention
+                ) as forward_batch,
+            ):
                 out = super().forward(
                     None,
                     positions,

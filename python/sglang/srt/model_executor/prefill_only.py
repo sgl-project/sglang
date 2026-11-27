@@ -70,6 +70,13 @@ class PrefillOnlyAttnBackend(AttentionBackend):
         raise NotImplementedError("a prefill-only forward has no decode step")
 
 
+def eager_graphs():
+    """Scope a model's build or forward to no graph runner, whatever the
+    process configured for serving (srt layers read the config while built)."""
+    no_graphs = CudaGraphConfig(decode=PhaseConfig(), prefill=PhaseConfig())
+    return get_exec().graph.override(cuda_graph_config=no_graphs)
+
+
 @contextmanager
 def prefill_only(
     seq_lens: Sequence[int],
@@ -103,10 +110,8 @@ def prefill_only(
         is_prefill_only=True,
     )
     backend = PrefillOnlyAttnBackend(attention or sdpa_causal_attention)
-    # Eager: no graph runner, whatever the process configured for serving.
-    no_graphs = CudaGraphConfig(decode=PhaseConfig(), prefill=PhaseConfig())
     with (
-        get_exec().graph.override(cuda_graph_config=no_graphs),
+        eager_graphs(),
         forward_context(ForwardContext(backend)),
         set_forward_batch(forward_batch),
     ):
