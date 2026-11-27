@@ -759,6 +759,8 @@ This cookbook provides deployment recipes for the Muse Spark Open 816B-A42B chec
 
 NVFP4 runs on one 8x H200 node with Marlin W4A16 experts (`--moe-runner-backend marlin`), since Hopper has no TRT-LLM FP4 MoE. The BF16 checkpoint does not fit on one node, so it runs TP16/EP16 across two nodes; replace `<node-rank>` and `<node0-ip>` for each node. Prefill sequence parallel and MegaMoE need SM100 kernels and are unavailable on H200.
 
+For NVFP4, `--attention-backend trtllm_mha` is an alternative to the default FA3 attention: prefill runs on fmha_v2, decode and verify run on XQA, and the page size becomes 64. In a single-repetition comparison at 16 users on 8x H200 (TP8/EP8, DFlash2, HiCache, SGLang v0.5.23) with multi-turn agentic coding conversations (a first turn of about 74K tokens, then about 750 new tokens per turn), it cut first-turn TTFT p90 by 14% and raised throughput by about 11% at the same decode speed, while later-turn TTFT p90 rose from 0.352 s to 0.415 s. It has not been measured in isolation, above 32 users, or with the High Throughput recipe, so compare both backends on your workload before switching.
+
 ### Xeon CPU service configuration
 
 - Xeon serves the **INT4** checkpoint (quantized by Intel AutoRound, HF id: `intel-ai/Muse-Spark-Open-816B-A42B-INT4`) on the SGLang CPU engine. A typical Xeon 6 P-core platform (e.g., Xeon 6980P) is recommended.
