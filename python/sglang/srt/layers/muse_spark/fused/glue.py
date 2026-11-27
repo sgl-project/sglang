@@ -166,6 +166,10 @@ def run_attention(
     last_only=False,
 ) -> Optional[torch.Tensor]:
     if is_cp_active(forward_batch):
+        # Mixed verify never runs under context parallelism
+        # (`DFlashWorkerV2._runs_mixed_verify`), so no token tree reaches here.
+        if forward_batch.mixed_verify_tree is not None:
+            _tree_uncovered()
         return None
     if not forward_batch.forward_mode.is_target_verify():
         out = run_prefill_attention(

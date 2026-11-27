@@ -29,6 +29,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.kimi_k31_dflash_binding import (
     bind_dflash_runtime,
 )
+from sglang.srt.layers.cp.base import is_cp_enabled
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
 from sglang.srt.layers.logits_processor import (
@@ -4193,6 +4194,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             and not get_parallel().attn_dp_enabled
             and get_parallel().pp_group.world_size == 1
+            # a context-parallel forward splits the rows across ranks and runs the
+            # stock attention, which has no tree mask for the verify rows
+            and not is_cp_enabled()
             # a full prefill graph replays the extend body with no eager break for the verify rows
             and not getattr(
                 self.model_runner.prefill_cuda_graph_runner, "_is_full_backend", False
