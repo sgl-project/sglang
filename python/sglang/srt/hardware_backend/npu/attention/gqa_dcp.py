@@ -8,7 +8,6 @@ from itertools import accumulate
 from typing import TYPE_CHECKING
 
 import torch
-import torch_npu
 
 from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
     build_gqa_dcp_extend_layout,
@@ -49,10 +48,15 @@ class GQADCPMetadata:
 def prepare_gqa_dcp_metadata(
     backend: AscendAttnBackend, batch: ForwardBatch
 ) -> GQADCPMetadata:
+    mode = batch.forward_mode
+    cache_locs = batch.out_cache_loc
+    if mode.is_extend():
+        # MLP sync appends zero slots, but attention only sees the real rows.
+        cache_locs = cache_locs[: sum(batch.extend_seq_lens_cpu)]
     # RunnerIds already localizes write slots and marks non-owners with -1.
-    rows = (batch.out_cache_loc >= 0).nonzero().flatten()
-    meta = GQADCPMetadata(rows, batch.out_cache_loc.index_select(0, rows))
-    if batch.forward_mode.is_decode():
+    rows = (cache_locs >= 0).nonzero().flatten()
+    meta = GQADCPMetadata(rows, cache_locs.index_select(0, rows))
+    if mode.is_decode():
         lens = (
             batch.seq_lens_cpu
             if batch.seq_lens_cpu is not None
@@ -65,7 +69,7 @@ def prepare_gqa_dcp_metadata(
         meta.empty_shards = (local_lens == 0).to(
             batch.seq_lens.device, non_blocking=True
         )
-    elif batch.forward_mode.is_extend():
+    elif mode.is_extend():
         prefix_lens = batch.extend_prefix_lens_cpu
         extend_lens = batch.extend_seq_lens_cpu
         device = batch.req_pool_indices.device
@@ -152,6 +156,8 @@ def forward_gqa_dcp(
     batch: ForwardBatch,
     save_kv_cache: bool,
 ) -> torch.Tensor:
+    import torch_npu
+
     meta = backend.forward_metadata.gqa_dcp
     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
     k = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim)
