@@ -22,11 +22,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
-from sglang.multimodal_gen.runtime.layers.moe_multihead import (
-    MAX_KERNEL_EXPERTS,
-    Magi2MultiHeadExperts,
-    Magi2MultiHeadRouter,
-)
 from sglang.multimodal_gen.runtime.loader.component_loaders import magi2_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.magi2_loader import (
     Magi2AudioVAELoader,
@@ -49,6 +44,11 @@ from sglang.multimodal_gen.runtime.models.dits.magi2_layers import (
     modality_runs,
     pad_rows_to_multiple,
     sharded_cu_seqlens,
+)
+from sglang.multimodal_gen.runtime.models.dits.magi2_moe import (
+    MAX_KERNEL_EXPERTS,
+    Magi2MultiHeadExperts,
+    Magi2MultiHeadRouter,
 )
 from sglang.multimodal_gen.runtime.models.dits.magi2_preview import (
     Magi2PreviewDiT,
