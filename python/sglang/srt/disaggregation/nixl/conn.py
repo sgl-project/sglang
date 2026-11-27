@@ -382,7 +382,7 @@ class KVArgsRegisterInfo:
     dst_state_data_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_aux_item_lens: Optional[List[int]] = None
     dst_unified_layout: Optional[dict] = None
-    unified_layout_error: Optional[str] = None
+    peer_layout_error: Optional[str] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -1585,8 +1585,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
 
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
-        if peer_info.unified_layout_error:
-            raise ValueError(peer_info.unified_layout_error)
+        if peer_info.peer_layout_error:
+            raise ValueError(peer_info.peer_layout_error)
         # If prefill does not run speculative decoding (the usual case),
         # decode with speculative decoding will have more kv items.
         # Prefill having more kv items is impossible.
@@ -1826,8 +1826,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self.validate_aux_buffers(
                         dst_info.dst_aux_ptrs, dst_info.dst_aux_item_lens
                     )
-                    if dst_info.unified_layout_error:
-                        raise ValueError(dst_info.unified_layout_error)
+                    if dst_info.peer_layout_error:
+                        raise ValueError(dst_info.peer_layout_error)
                     decode_tp_size = dst_info.decode_tp_size
                     if self.kv_shard_state_peer_only:
                         # Every prefill rank checks, not only the state peer:
@@ -2219,24 +2219,34 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if agent_name in self.decode_kv_args_table:
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
-        decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-            decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
-        )
-        if decode_kv_args.requires_dcp_relayout:
-            self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
-        decode_kv_args.unified_layout_error = None
+        decode_kv_args.peer_layout_error = None
         try:
+            if self.kv_args.require_plain_tp_peer and (
+                decode_kv_args.decode_tp_size != self.state_tp_size
+                or decode_kv_args.dst_dcp_size != 1
+            ):
+                raise ValueError(
+                    f"GLM5Next NIXL CP/TP sharing requires decode attention TP "
+                    f"{self.state_tp_size} and DCP 1, got TP {decode_kv_args.decode_tp_size} "
+                    f"and DCP {decode_kv_args.dst_dcp_size}"
+                )
             self._validate_unified_peer(decode_kv_args)
         except ValueError as exc:
-            decode_kv_args.unified_layout_error = str(exc)
+            decode_kv_args.peer_layout_error = str(exc)
+        if not decode_kv_args.peer_layout_error:
+            decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
+                decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
+            )
+            if decode_kv_args.requires_dcp_relayout:
+                self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
         # Publish the validation result with the peer, including rejected peers
         # whose requests must fail before any KV, state, or aux writes.
         self.decode_kv_args_table[agent_name] = decode_kv_args
-        if decode_kv_args.unified_layout_error:
+        if decode_kv_args.peer_layout_error:
             logger.error(
                 "Rejected NIXL peer %s: %s",
                 agent_name,
-                decode_kv_args.unified_layout_error,
+                decode_kv_args.peer_layout_error,
             )
             return
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
@@ -2252,7 +2262,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # restores it; reload it from the registration we already hold.
         for agent_name in list(room_transfer_infos):
             peer_info = self.decode_kv_args_table.get(agent_name)
-            if peer_info is None or peer_info.unified_layout_error:
+            if peer_info is None or peer_info.peer_layout_error:
                 continue
             try:
                 if self.agent.check_remote_metadata(agent_name):

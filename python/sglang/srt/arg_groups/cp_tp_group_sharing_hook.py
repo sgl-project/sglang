@@ -111,8 +111,11 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             # speculation or one of the algorithms the check above admits.
             unsupported |= {
                 "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
-                "disaggregation-transfer-backend != mooncake": (
-                    cfg.disaggregation_transfer_backend != "mooncake"
+                "disaggregation-transfer-backend outside mooncake/nixl": (
+                    cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
+                ),
+                "NIXL prefill CP size other than 4": (
+                    cfg.disaggregation_transfer_backend == "nixl" and cfg.tp_size != 4
                 ),
                 "pp-size > 1": cfg.pp_size > 1,
                 "dp-size > 1": cfg.dp_size > 1,

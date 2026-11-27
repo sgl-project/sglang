@@ -362,6 +362,12 @@ class PrefillBootstrapQueue:
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
+        kv_args.require_plain_tp_peer = (
+            self.transfer_backend == TransferBackend.NIXL
+            and get_parallel().enable_cp_tp_group_sharing
+            and self.scheduler.model_config.hf_config.architectures[0]
+            == "Glm5NextForConditionalGeneration"
+        )
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = get_parallel().dp_rank
