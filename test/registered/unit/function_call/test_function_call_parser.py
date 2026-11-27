@@ -5966,11 +5966,20 @@ class TestGemma4Detector(CustomTestCase):
                 self.assertEqual(len(result.calls), expected_calls)
 
     def test_detect_and_parse_keeps_unclosed_call_with_complete_arguments(self):
-        text = '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}'
-        result = self.detector.detect_and_parse(text, self.tools)
-        self.assertEqual(result.normal_text, "")
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Tokyo"})
+        for text, expected_name, expected_args in [
+            (
+                '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}',
+                "get_weather",
+                {"location": "Tokyo"},
+            ),
+            ("<|tool_call>\ncall:get_time{}", "get_time", {}),
+        ]:
+            with self.subTest(text=text):
+                result = self.detector.detect_and_parse(text, self.tools)
+                self.assertEqual(result.normal_text, "")
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(result.calls[0].name, expected_name)
+                self.assertEqual(json.loads(result.calls[0].parameters), expected_args)
 
     def test_parse_gemma4_args_empty(self):
         self.assertEqual(_parse_gemma4_args(""), {})

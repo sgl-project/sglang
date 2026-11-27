@@ -258,7 +258,9 @@ class Gemma4Detector(BaseFormatDetector):
                 break
             normal_text.append(text[search_from:start])
             end = text.find(TOOL_CALL_END, start)
-            inner = text[start + len(TOOL_CALL_START) : end if end != -1 else None]
+            inner = text[
+                start + len(TOOL_CALL_START) : end if end != -1 else None
+            ].lstrip(" \n\t")
             if inner.startswith("call:"):
                 brace = inner.find("{")
                 if brace != -1:
