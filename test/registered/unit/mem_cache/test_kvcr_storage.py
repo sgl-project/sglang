@@ -742,6 +742,8 @@ class TestKVCRStorage(CustomTestCase):
             ),
             ({"control_port": 65535}, "control-port range"),
             ({"control_port": 40000, "nixl_listen_port": 40000}, "overlaps"),
+            # Shard 1's control port would be shard 0's NIXL port.
+            ({"control_port": 40000, "nixl_listen_port": 40001}, "overlaps"),
             ({"control_advertise_host": "0.0.0.0"}, "unspecified"),
         ):
             with (
@@ -1072,12 +1074,6 @@ class TestKVCRStorage(CustomTestCase):
             wrapped = HiCacheStorageFailureInjector(backend, 0.0, 0.0)
             self.assertIs(backend.consumes_kv_hints(), expected)
             self.assertIs(wrapped.consumes_kv_hints(), expected)
-            # MLA elects one writer; a rank-local store needs every rank's copy.
-            self.assertIs(wrapped.requires_rank_local_backup, True)
-            controller = object.__new__(HiCacheController)
-            controller.storage_config = SimpleNamespace(is_storage_writer=False)
-            controller.storage_backend = wrapped
-            self.assertFalse(controller.backup_skip)
 
     def test_unified_radix_cache_forwards_hints_only_when_enabled(self):
         """The real URC gate binds hints only for a backend that reads them."""
@@ -1593,21 +1589,28 @@ class TestKVCRInventoryPublication(CustomTestCase):
         backend._offset = 1
         self.assertIsNone(backend.get_kv_hint_source())
 
-    def test_hint_source_rejects_invalid_advertised_coordinates(self):
-        for extra in (
-            {"control_advertise_host": "0.0.0.0"},
-            {"control_advertise_host": "tcp://worker-a"},
-            {"control_advertise_host": "worker-a", "control_port": True},
-            {"control_advertise_host": "worker-a", "control_port": 65535},
+    def test_invalid_advertised_coordinates_fail_construction(self):
+        for extra, message in (
+            ({"control_advertise_host": "0.0.0.0"}, "unspecified"),
+            ({"control_advertise_host": "tcp://worker-a"}, "not a URL"),
+            (
+                {"control_advertise_host": "worker-a", "control_port": True},
+                "control_port must be a valid integer port",
+            ),
+            # dp_rank 1 pushes the replica's port range past 65535.
+            (
+                {"control_advertise_host": "worker-a", "control_port": 65535},
+                "control-port range",
+            ),
         ):
             with (
                 self.subTest(extra=extra),
-                self.assertRaises(ValueError),
+                self.assertRaisesRegex(ValueError, message),
                 get_parallel().override(dp_rank=1),
             ):
                 config = copy.copy(self.config)
                 config.extra_config = {"enable_remote_hint": True, **extra}
-                self._backend(config).get_kv_hint_source()
+                self._backend(config)
 
     def test_inventory_requires_a_routable_hint_source(self):
         for extra in (
@@ -2683,11 +2686,16 @@ class TestCompletionPollThread(CustomTestCase):
 
     def test_progress_failure_terminates_the_worker(self):
         self.store.batch_set_v1(self.keys[:1], torch.arange(2))
-        self.store._runner.fail = True
-        deadline = time.monotonic() + 5
-        while not self.exits and time.monotonic() < deadline:
-            time.sleep(0.01)
+        logger = "sglang.srt.mem_cache.storage.kvcr.kvcr_store"
+        with self.assertLogs(logger, "CRITICAL") as logs:
+            self.store._runner.fail = True
+            deadline = time.monotonic() + 5
+            while not self.exits and time.monotonic() < deadline:
+                time.sleep(0.01)
+            # The patched os._exit returns: stop the poll thread inside the capture.
+            self.store.close()
         self.assertEqual(self.exits[:1], [1])
+        self.assertIn("progress failed", logs.output[0])
 
     def test_stalled_source_is_an_error_not_an_exit(self):
         logger = "sglang.srt.mem_cache.storage.kvcr.kvcr_store"

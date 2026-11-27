@@ -11,7 +11,12 @@ CUDA 12 NIXL binary:
 
 ```bash
 pip install --no-deps "kvcr>=0.2.0"
+python -c "import importlib.metadata as m; print(m.version('nixl'))"
 ```
+
+`--no-deps` skips KVCR's NIXL requirement, and the image does not pin NIXL, so
+check that the second command prints 1.5.x. `pip check` does not help here: the
+image's `nixl` package always reports its missing CUDA 12 binary.
 
 Elsewhere, `pip install "kvcr>=0.2.0"` also installs NIXL, msgspec and pyzmq.
 
@@ -50,7 +55,9 @@ recommendation. Account separately for GPU cache, HiCache host staging, and
 KVCR DRAM, which each rank allocates. Control ports must accommodate the rank
 offsets and be reachable by peers. The control endpoint's TCP scheme does not
 select the NIXL payload transport. The backend currently requires PP=1 and
-DCP=1.
+DCP=1, rejects replica DP (`--dp-size`) combined with attention DP, and on a
+decode worker rejects decode KV offload together with the decode radix cache
+(both would bind the same ports).
 
 Keys and defaults (ports are bases; each rank adds its DP/TP/CP offset):
 
@@ -102,18 +109,20 @@ recorded for KVCR.
 
 ## Remote hints
 
-`enable_remote_hint` is off by default; without it, KVCR serves only its own
-local DRAM and binds no control endpoint (each rank still binds its NIXL
-listen port). Add `"enable_remote_hint": true` to the extra config to turn it
-on.
-When on, lookups and reads consume the request's `kv_hints`
-(`kv.fetch` actions, version 1.0, copy mode). A hint names a source replica's
+`enable_remote_hint` is off by default; without it, KVCR reads no other
+replica's DRAM and, unless `share_replicated_kv` is on, binds no control
+endpoint (each rank still binds its NIXL listen port). Add
+`"enable_remote_hint": true` to the extra config to turn it on.
+When on, lookups and reads consume the request's `kv_hints` (protocol version
+0.1; `kv.fetch` actions, version 1.0, copy mode). An action whose `no_retain`
+is anything but `false` or `null` is skipped without a log message, because
+this version does not forward retention marks. A hint names a source replica's
 `tcp://` control endpoint, and each rank fetches from the same shard offset
 there. Hints are caller-supplied and unauthenticated: enable them only where
 the request source is trusted and every advertised endpoint is a peer you
 intend to read from. For salted or adapter-keyed requests, only pages bound to
-the request's own event IDs are fetched. A query is advisory; terminal delivery
-decides which pages are usable.
+the request's own event IDs are fetched. A query is advisory; terminal
+delivery decides which pages are usable.
 
 With an explicit `control_advertise_host`, remote hints also report the
 worker's control endpoint to a router (see below). Without
@@ -243,13 +252,12 @@ hinted pages from that peer's KVCR DRAM. See Dynamo's SGLang README
 ("KVCR-owned inventory") and router docs ("KV Fetch Hints").
 
 Limits of this version: with remote hints or inventory, each worker runs on one
-node (`--nnodes 1`; peers may be on other hosts); PP=1, no DCP, one tokenizer
-worker, and not replica DP combined with attention DP; the backend must be
-configured at launch (no runtime attach or detach). Inventory is process-local
-and starts empty: each page is announced once, so pages stored before the
-worker attaches to the state agent stay unknown to the router, and a dropped
-event (a ZMQ sequence gap) stops the inventory until the worker restarts. Warm
-KVCR only after the worker is attached.
+node (`--nnodes 1`; peers may be on other hosts) with one tokenizer worker, and
+the backend must be configured at launch (no runtime attach or detach).
+Inventory is process-local and starts empty: each page is announced once, so
+pages stored before the worker attaches to the state agent stay unknown to the
+router, and a dropped event (a ZMQ sequence gap) stops the inventory until the
+worker restarts. Warm KVCR only after the worker is attached.
 
 ## Failure handling
 

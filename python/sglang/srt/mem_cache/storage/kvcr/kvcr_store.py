@@ -64,7 +64,7 @@ _POLL_INTERVAL_SECONDS = 0.001
 _IDLE_POLL_MAX_SECONDS = 0.02
 _IDLE_POLL_MAX_SECONDS_WITHOUT_PEERS = 0.1
 
-# Parsed router hints kept per (envelope, mapping) object pair: the prefetch
+# Parsed router hints kept per (envelope object, source offset): the prefetch
 # thread's operation and the scheduler's lookup may interleave. Arbitrary.
 _ROUTER_HINT_CACHE_SIZE = 8
 
@@ -137,7 +137,7 @@ _HICACHE_GENERIC_KEYS = frozenset(
 def _bool_option(options: dict, name: str, default: bool = False) -> bool:
     value = options.get(name, default)
     if type(value) is not bool:
-        raise ValueError(f"{name} must be a boolean")
+        raise ValueError(f"KVCR {name} must be a boolean")
     return value
 
 
@@ -182,8 +182,8 @@ class KVCRStore(HiCacheStorage):
     """Optional NIXL/UCX L3 backend using KVCR's indexed-region public API."""
 
     # Objects of rank-sharded pools are keyed by this rank's shard, so every
-    # rank backs up its own copy. Rank-replicated pools (MLA) are shared
-    # unless share_replicated_kv is off; see _share_replicated.
+    # rank backs up its own copy. Rank-replicated pools (MLA) are shared only
+    # with share_replicated_kv on; see _share_replicated.
     requires_rank_local_backup = True
     rank_keyed_mha_drafts = True
 
@@ -241,18 +241,18 @@ class KVCRStore(HiCacheStorage):
         # The controller elects the writer from the config it holds; with CP=1
         # (required to share) KVCR's own config does not renumber it.
         self._writer = storage_config.is_storage_writer
-        if self._shared and self._writer != (rank_offset(storage_config) == 0):
+        self._offset = rank_offset(storage_config)
+        if self._shared and self._writer != (self._offset == 0):
             raise ValueError("KVCR expects the replica's first shard to write")
         self.requires_rank_local_backup = not self._shared
         if "startup_timeout_seconds" in self._extra and (
             type(self._extra["startup_timeout_seconds"]) is not int
             or self._extra["startup_timeout_seconds"] <= 0
         ):
-            raise ValueError("startup_timeout_seconds must be a positive integer")
+            raise ValueError("KVCR startup_timeout_seconds must be a positive integer")
         tag = self._extra.get("extra_backend_tag")
         if tag is not None and (type(tag) is not str or not tag):
             raise ValueError("KVCR extra_backend_tag must be a non-empty string")
-        self._offset = rank_offset(storage_config)
         # Fail the attach, not every later storage call, on a static
         # misconfiguration. Memory registration stays at the first IO: host
         # pools (e.g. a draft sidecar) may still register.
@@ -310,7 +310,13 @@ class KVCRStore(HiCacheStorage):
         if type(nixl_base_port) is not int or not 0 < nixl_base_port <= 65535:
             raise ValueError("KVCR nixl_listen_port must be a valid integer port")
         self._nixl_port = nixl_base_port + offset
-        if not 0 < self._nixl_port <= 65535 or port == self._nixl_port:
+        # Both ranges add the same offset to their base; DP replicas up to this
+        # one span (dp_rank + 1) strides, so the bases must be that far apart.
+        span = (self.config.dp_rank + 1) * dp_stride
+        if (
+            not 0 < self._nixl_port <= 65535
+            or abs(nixl_base_port - (port - offset)) < span
+        ):
             raise ValueError("KVCR control/NIXL port range is invalid or overlaps")
         self._agent_name = f"sglang-kvcr-{uuid.uuid4().hex}"
         # A shared rank's source: the replica's first shard, on this host.
@@ -392,14 +398,13 @@ class KVCRStore(HiCacheStorage):
     def _shares(self, pool: str) -> bool:
         return self._shared and pool not in self._rank_local_pools
 
-    def _namespaces(self, layouts=None) -> tuple[str, str]:
+    def _namespaces(self) -> tuple[str, str]:
         """(this shard's, the writer's) storage namespace; equal on the writer."""
-        layouts = self._layouts if layouts is None else layouts
-        own = storage_namespace(self.config, layouts, shared=self._shared)
+        own = storage_namespace(self.config, self._layouts, shared=self._shared)
         if not self._shared or self._writer:
             return own, own
         writer = dataclasses.replace(self.config, tp_rank=0)
-        return own, storage_namespace(writer, layouts, shared=True)
+        return own, storage_namespace(writer, self._layouts, shared=True)
 
     def _key(self, page_key: str, pool: str) -> bytes:
         namespace = self._shared_namespace if self._shares(pool) else self._namespace
@@ -513,7 +518,7 @@ class KVCRStore(HiCacheStorage):
         """
         if self._nixl_hold is not None or self._runner is not None:
             return
-        host, port = self._control
+        port = self._control[1]
         try:
             with ExitStack() as reserved:
                 hold = reserved.enter_context(socket.socket())
@@ -528,11 +533,10 @@ class KVCRStore(HiCacheStorage):
         except OSError:
             # One rank failing a runtime attach would leave the others in its
             # collectives; at launch this fails the launch all the same.
+            ports = [self._nixl_port] + ([port] if self._needs_control() else [])
             logger.critical(
-                "KVCR cannot bind its control port %d or NIXL port %d; "
-                "terminating worker",
-                port,
-                self._nixl_port,
+                "KVCR cannot bind its listen ports %s; terminating worker",
+                ports,
                 exc_info=True,
             )
             os._exit(1)
@@ -873,30 +877,35 @@ class KVCRStore(HiCacheStorage):
         # drain another caller's completion; keep it until the owner consumes it.
         with self._completion:
             while handle not in self._completed:
-                self._completed.update(self._runner.poll_completed())
+                self._drain_completed()
                 if handle not in self._completed:
                     self._completion.wait(timeout=_POLL_INTERVAL_SECONDS)
             result = self._completed.pop(handle)
             self._completion.notify_all()
             return result
 
+    def _drain_completed(self):
+        # Caller holds self._completion. Waiters poll more often than
+        # _poll_loop, so either may see a native progress failure first. It
+        # cannot safely be treated as a cache miss: HiCache could recycle a
+        # buffer still exposed to NIXL.
+        completed = []
+        try:
+            completed = list(self._runner.poll_completed())
+        except Exception:
+            logger.critical(
+                "KVCR L3 progress failed; terminating worker", exc_info=True
+            )
+            os._exit(1)
+        self._completed.update(completed)
+        return completed
+
     def _poll_loop(self):
         wait = _POLL_INTERVAL_SECONDS
         while not self._stop_poll.is_set():
-            busy = True
-            try:
-                with self._completion:
-                    completed = list(self._runner.poll_completed())
-                    self._completed.update(completed)
-                    self._completion.notify_all()
-                    busy = bool(completed)
-            except Exception:
-                # Native progress failure cannot safely be treated as a cache
-                # miss: HiCache could recycle a buffer still exposed to NIXL.
-                logger.critical(
-                    "KVCR L3 progress failed; terminating worker", exc_info=True
-                )
-                os._exit(1)
+            with self._completion:
+                busy = bool(self._drain_completed())
+                self._completion.notify_all()
             wait = (
                 _POLL_INTERVAL_SECONDS if busy else min(wait * 2, self._idle_poll_max)
             )

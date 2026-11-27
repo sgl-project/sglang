@@ -369,7 +369,7 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
 
 
 class HiCacheController:
-    # Set in __init__ and by storage attach/detach.
+    # Default for controllers built without __init__ (unit tests read backup_skip).
     storage_backend = None
 
     def __init__(
