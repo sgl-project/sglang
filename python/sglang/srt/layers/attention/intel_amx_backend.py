@@ -28,6 +28,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.req_to_token_pool.row_width
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.runner_ids = model_runner.runner_ids
         self.use_mla = model_runner.use_mla_backend
@@ -464,7 +465,7 @@ class IntelAMXMultiStepDraftBackend:
             seq_lens,
             topk,
             num_steps,
-            self.attn_backends[0].req_to_token_pool.row_width,
+            self.attn_backends[0].max_kv_len,
         )
 
         req_pool_indices_expanded = torch.arange(bs, dtype=torch.int64, device=device)
