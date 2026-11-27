@@ -10,6 +10,10 @@ the transfer is that kernel's loads and the separate reduce pass is gone.
 Two slots alternate per call. A rank rewrites a slot two calls later, queued
 behind its wait for the peer's next publish, and the peer issues that publish
 in stream order after the kernel that read the slot.
+
+A model opts a row-parallel layer in with ``row_parallel_deferred`` and hands
+the result to an epilogue kernel that takes a ``PartialSum`` (its input loaded
+through ``load_partial_sum``); every other case gets the all-reduced tensor.
 """
 
 import logging
@@ -17,6 +21,7 @@ import logging
 import torch
 import torch.distributed as dist
 
+from sglang.kernels.ops.diffusion.common.partial_sum import PartialSum
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     _Unsupported,
@@ -25,6 +30,10 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a impo
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
     _member_devices,
     _StreamMemOps,
+)
+from sglang.multimodal_gen.runtime.layers.linear import (
+    RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -188,3 +197,29 @@ def staged_partials(
     layer.partial_into(hidden, mine)
     TP_PEER_PARTIALS.publish_and_wait()
     return mine, theirs
+
+
+def defers_reduce(layer) -> bool:
+    """Whether ``row_parallel_deferred`` may leave ``layer``'s all-reduce to the
+    kernel that reads its output: an unquantized RowParallelLinear (not a
+    wrapper such as LoRA) on a two-rank TP group. Static; the per-call checks
+    are ``staged_partials``'."""
+    return (
+        type(layer) is RowParallelLinear
+        and type(layer.quant_method) is UnquantizedLinearMethod
+        and layer.tp_size == 2
+        and layer.reduce_results
+    )
+
+
+def row_parallel_deferred(
+    layer, hidden: torch.Tensor, like: torch.Tensor
+) -> torch.Tensor | PartialSum:
+    """``layer(hidden)``, or, where the two ranks' partial sums can be staged,
+    a ``PartialSum`` of them shaped like ``like`` for an epilogue kernel that
+    adds them as it reads. Every rank decides alike."""
+    if like.is_cuda and like.dtype == torch.bfloat16 and defers_reduce(layer):
+        partials = staged_partials(layer, hidden, like)
+        if partials is not None:
+            return PartialSum(*(p.view(like.shape) for p in partials))
+    return layer(hidden)[0]

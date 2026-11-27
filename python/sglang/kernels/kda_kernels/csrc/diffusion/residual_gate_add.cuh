@@ -1,6 +1,9 @@
 // KDA provenance: SGLang PR #29361.
 // CUDA fast path for bit-exact diffusion residual-gate updates:
 //   out = residual + update * gate
+// With kHasPeer, update is the sum of two TP ranks' partials (update + peer),
+// rounded as their all-reduce leaves it, so the bytes match the all-reduce
+// followed by the plain kernel.
 
 #pragma once
 
@@ -35,11 +38,31 @@ SGL_DEVICE T residual_gate_value(T residual, T update, T gate) {
   return device::cast<T>(device::cast<fp32_t>(residual) + device::cast<fp32_t>(product));
 }
 
-template <typename T, int kVec>
+template <typename T>
+SGL_DEVICE T all_reduced(T mine, T peer) {
+  return device::cast<T>(device::cast<fp32_t>(mine) + device::cast<fp32_t>(peer));
+}
+
+template <bool kHasPeer, typename T, std::size_t kVec>
+SGL_DEVICE void
+load_update(device::AlignedVector<T, kVec>& update_vec, const T* update, const T* peer, int64_t vector) {
+  update_vec.load(update, vector);
+  if constexpr (kHasPeer) {
+    device::AlignedVector<T, kVec> peer_vec;
+    peer_vec.load(peer, vector);
+#pragma unroll
+    for (std::size_t i = 0; i < kVec; ++i) {
+      update_vec[i] = all_reduced(update_vec[i], peer_vec[i]);
+    }
+  }
+}
+
+template <typename T, int kVec, bool kHasPeer>
 __global__ void residual_gate_add_vec_kernel(
     T* __restrict__ out,
     const T* __restrict__ residual,
     const T* __restrict__ update,
+    const T* __restrict__ peer,
     const T* __restrict__ gate,
     int64_t num_vectors) {
   using Vec = device::AlignedVector<T, kVec>;
@@ -48,7 +71,7 @@ __global__ void residual_gate_add_vec_kernel(
        vector += stride) {
     Vec residual_vec, update_vec, gate_vec, out_vec;
     residual_vec.load(residual, vector);
-    update_vec.load(update, vector);
+    load_update<kHasPeer>(update_vec, update, peer, vector);
     gate_vec.load(gate, vector);
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
@@ -58,11 +81,12 @@ __global__ void residual_gate_add_vec_kernel(
   }
 }
 
-template <typename T, int kVec>
+template <typename T, int kVec, bool kHasPeer>
 __global__ void residual_gate_add_broadcast_kernel(
     T* __restrict__ out,
     const T* __restrict__ residual,
     const T* __restrict__ update,
+    const T* __restrict__ peer,
     const T* __restrict__ gate,
     int64_t rows,
     int64_t row_vectors) {
@@ -86,7 +110,7 @@ __global__ void residual_gate_add_broadcast_kernel(
       const int64_t vector = (static_cast<int64_t>(blockIdx.z) * rows + row) * row_vectors + column;
       Vec residual_vec, update_vec, out_vec;
       residual_vec.load(residual, vector);
-      update_vec.load(update, vector);
+      load_update<kHasPeer>(update_vec, update, peer, vector);
 #pragma unroll
       for (int i = 0; i < kVec; ++i) {
         out_vec[i] = residual_gate_value(residual_vec[i], update_vec[i], gate_vec[i]);
@@ -96,11 +120,12 @@ __global__ void residual_gate_add_broadcast_kernel(
   }
 }
 
-template <typename T, GateMode kGateMode>
+template <typename T, GateMode kGateMode, bool kHasPeer>
 __global__ void residual_gate_add_scalar_kernel(
     T* __restrict__ out,
     const T* __restrict__ residual,
     const T* __restrict__ update,
+    const T* __restrict__ peer,
     const T* __restrict__ gate,
     int64_t numel,
     int64_t hidden_size,
@@ -118,7 +143,11 @@ __global__ void residual_gate_add_scalar_kernel(
       gate_index = index % hidden_size;
     }
     const T gate_value = SGLANG_LDG(gate + gate_index);
-    out[index] = residual_gate_value(residual[index], update[index], gate_value);
+    T update_value = update[index];
+    if constexpr (kHasPeer) {
+      update_value = all_reduced(update_value, peer[index]);
+    }
+    out[index] = residual_gate_value(residual[index], update_value, gate_value);
   }
 }
 
@@ -129,8 +158,10 @@ __global__ void residual_gate_add_scalar_kernel(
  *
  * Python flattens the tensors before dispatch. A broadcast gate contains one
  * hidden-size row; a full gate has the same number of elements as the inputs.
+ * With kHasPeer, ``peer`` holds the other TP rank's partial of ``update``;
+ * otherwise it is ignored (Python passes ``update`` again).
  */
-template <typename T>
+template <typename T, bool kHasPeer>
 struct ResidualGateAddKernel {
   static_assert(std::is_same_v<T, fp16_t> || std::is_same_v<T, bf16_t> || std::is_same_v<T, fp32_t>);
 
@@ -138,6 +169,7 @@ struct ResidualGateAddKernel {
   run(tvm::ffi::TensorView out,
       tvm::ffi::TensorView residual,
       tvm::ffi::TensorView update,
+      tvm::ffi::TensorView peer,
       tvm::ffi::TensorView gate,
       int64_t hidden_size,
       int64_t gate_mode) {
@@ -147,7 +179,7 @@ struct ResidualGateAddKernel {
     auto G = SymbolicSize{"gate_numel"};
     auto device = SymbolicDevice{};
     device.set_options<kDLGPU>();
-    TensorMatcher({N}).with_dtype<T>().with_device(device).verify(out).verify(residual).verify(update);
+    TensorMatcher({N}).with_dtype<T>().with_device(device).verify(out).verify(residual).verify(update).verify(peer);
     TensorMatcher({G}).with_dtype<T>().with_device(device).verify(gate);
 
     const int64_t numel = N.unwrap();
@@ -171,14 +203,16 @@ struct ResidualGateAddKernel {
     auto* out_ptr = static_cast<T*>(out.data_ptr());
     const auto* residual_ptr = static_cast<const T*>(residual.data_ptr());
     const auto* update_ptr = static_cast<const T*>(update.data_ptr());
+    const auto* peer_ptr = static_cast<const T*>(peer.data_ptr());
     const auto* gate_ptr = static_cast<const T*>(gate.data_ptr());
-    CHECK_HOST(out_ptr != residual_ptr && out_ptr != update_ptr && out_ptr != gate_ptr)
+    CHECK_HOST(out_ptr != residual_ptr && out_ptr != update_ptr && out_ptr != peer_ptr && out_ptr != gate_ptr)
         << "output must not alias an input";
 
     constexpr int kVec = kAlignment / sizeof(T);
     const bool aligned = reinterpret_cast<uintptr_t>(out_ptr) % kAlignment == 0 &&
                          reinterpret_cast<uintptr_t>(residual_ptr) % kAlignment == 0 &&
                          reinterpret_cast<uintptr_t>(update_ptr) % kAlignment == 0 &&
+                         reinterpret_cast<uintptr_t>(peer_ptr) % kAlignment == 0 &&
                          reinterpret_cast<uintptr_t>(gate_ptr) % kAlignment == 0;
     const bool vectorized = aligned && hidden_size % kVec == 0;
     if (vectorized) {
@@ -187,17 +221,24 @@ struct ResidualGateAddKernel {
         const auto blocks =
             static_cast<uint32_t>(std::min<int64_t>(div_ceil(num_vectors, static_cast<int64_t>(kBlockSize)), kMaxGrid));
         LaunchKernel(blocks, kBlockSize, device.unwrap())(
-            residual_gate_add_vec_kernel<T, kVec>, out_ptr, residual_ptr, update_ptr, gate_ptr, num_vectors);
+            residual_gate_add_vec_kernel<T, kVec, kHasPeer>,
+            out_ptr,
+            residual_ptr,
+            update_ptr,
+            peer_ptr,
+            gate_ptr,
+            num_vectors);
         return;
       }
       if (gate_mode == 2) {
         const auto blocks =
             static_cast<uint32_t>(std::min<int64_t>(div_ceil(numel, static_cast<int64_t>(kBlockSize)), kMaxGrid));
         LaunchKernel(blocks, kBlockSize, device.unwrap())(
-            residual_gate_add_scalar_kernel<T, GateMode::kPerToken>,
+            residual_gate_add_scalar_kernel<T, GateMode::kPerToken, kHasPeer>,
             out_ptr,
             residual_ptr,
             update_ptr,
+            peer_ptr,
             gate_ptr,
             numel,
             hidden_size,
@@ -212,7 +253,14 @@ struct ResidualGateAddKernel {
       const int64_t row_tiles = div_ceil(rows, static_cast<int64_t>(kBroadcastRowsPerBlock));
       const auto row_blocks = static_cast<uint32_t>(std::min<int64_t>(row_tiles, kMaxGrid));
       LaunchKernel(dim3(column_blocks, row_blocks, batches), kBroadcastColsPerBlock, device.unwrap())(
-          residual_gate_add_broadcast_kernel<T, kVec>, out_ptr, residual_ptr, update_ptr, gate_ptr, rows, row_vectors);
+          residual_gate_add_broadcast_kernel<T, kVec, kHasPeer>,
+          out_ptr,
+          residual_ptr,
+          update_ptr,
+          peer_ptr,
+          gate_ptr,
+          rows,
+          row_vectors);
       return;
     }
 
@@ -220,40 +268,44 @@ struct ResidualGateAddKernel {
         static_cast<uint32_t>(std::min<int64_t>(div_ceil(numel, static_cast<int64_t>(kBlockSize)), kMaxGrid));
     if (gate_mode == 3) {
       LaunchKernel(blocks, kBlockSize, device.unwrap())(
-          residual_gate_add_scalar_kernel<T, GateMode::kBatchedRow>,
+          residual_gate_add_scalar_kernel<T, GateMode::kBatchedRow, kHasPeer>,
           out_ptr,
           residual_ptr,
           update_ptr,
+          peer_ptr,
           gate_ptr,
           numel,
           hidden_size,
           numel / batches);
     } else if (gate_mode == 2) {
       LaunchKernel(blocks, kBlockSize, device.unwrap())(
-          residual_gate_add_scalar_kernel<T, GateMode::kPerToken>,
+          residual_gate_add_scalar_kernel<T, GateMode::kPerToken, kHasPeer>,
           out_ptr,
           residual_ptr,
           update_ptr,
+          peer_ptr,
           gate_ptr,
           numel,
           hidden_size,
           numel / batches);
     } else if (gate_mode == 1) {
       LaunchKernel(blocks, kBlockSize, device.unwrap())(
-          residual_gate_add_scalar_kernel<T, GateMode::kBroadcastRow>,
+          residual_gate_add_scalar_kernel<T, GateMode::kBroadcastRow, kHasPeer>,
           out_ptr,
           residual_ptr,
           update_ptr,
+          peer_ptr,
           gate_ptr,
           numel,
           hidden_size,
           numel / batches);
     } else {
       LaunchKernel(blocks, kBlockSize, device.unwrap())(
-          residual_gate_add_scalar_kernel<T, GateMode::kFull>,
+          residual_gate_add_scalar_kernel<T, GateMode::kFull, kHasPeer>,
           out_ptr,
           residual_ptr,
           update_ptr,
+          peer_ptr,
           gate_ptr,
           numel,
           hidden_size,

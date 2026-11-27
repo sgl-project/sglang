@@ -3,4 +3,5 @@
 - ``platform``  : device predicates and the Triton-vs-fallback selector
 - ``fallback_*``: pure-torch / NPU / MPS implementations for Triton-less devices
 - ``fast_launch``: signature-cached launches for small Triton kernels
+- ``partial_sum``: a two-rank row-parallel output its epilogue kernel reduces
 """

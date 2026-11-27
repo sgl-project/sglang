@@ -262,12 +262,6 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
-        "diffusion.rmsnorm_tanh_residual_sum2",
-        KernelBackend.TRITON,
-        "norm.native_bf16_rmsnorm_triton:rmsnorm_tanh_residual_sum2",
-        _CUDA,
-    ),
-    (
         "diffusion.modulate_scale_shift",
         KernelBackend.JIT,
         "modulate.modulate_scale_shift_jit:modulate_scale_shift",
@@ -278,12 +272,6 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         KernelBackend.KDA,
         "sglang.kernels.kda_kernels.residual_gate_add_jit:residual_gate_add",
         _CUDA,
-    ),
-    (
-        "diffusion.residual_gate_add_sum2",
-        KernelBackend.KDA,
-        "sglang.kernels.kda_kernels.residual_gate_add_jit:residual_gate_add_sum2",
-        _CUDA_SM90_PLUS,
     ),
     (
         "diffusion.residual_gate_add2",
@@ -752,7 +740,6 @@ _EXPORTS: dict[str, str] = {
     "xpu_layernorm_modulate": "norm.layernorm_modulate_xpu_triton",
     "rmsnorm_scale": "norm.native_bf16_rmsnorm_triton",
     "rmsnorm_tanh_residual": "norm.native_bf16_rmsnorm_triton",
-    "rmsnorm_tanh_residual_sum2": "norm.native_bf16_rmsnorm_triton",
     "norm_infer": "norm.norm_triton",
     "rms_norm_fn": "norm.norm_triton",
     "try_fused_bias_mul_add": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
@@ -809,7 +796,6 @@ _EXPORTS: dict[str, str] = {
     "can_use_indexed_gate_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_triton",
     "can_use_rmsnorm_indexed_scale_shift": "norm.rmsnorm_scale_shift_triton",
     "indexed_gate_rmsnorm_scale_shift_": "norm.rmsnorm_scale_shift_triton",
-    "indexed_gate_rmsnorm_scale_shift_sum2_": "norm.rmsnorm_scale_shift_triton",
     "rmsnorm_indexed_scale_shift": "norm.rmsnorm_scale_shift_triton",
     "rmsnorm_scale_shift_per_token": "norm.rmsnorm_scale_shift_triton",
     "h3_vae_rmsnorm": "norm.h3_vae_fused_norm",
@@ -817,8 +803,6 @@ _EXPORTS: dict[str, str] = {
     # adaLN modulation, gating and timestep conditioning
     "indexed_gate_bf16": "modulate.indexed_modulation_triton",
     "indexed_gate_bf16_": "modulate.indexed_modulation_triton",
-    "indexed_gate_bf16_sum2_": "modulate.indexed_modulation_triton",
-    "can_use_indexed_gate_bf16_sum2": "modulate.indexed_modulation_triton",
     "indexed_scale_shift_bf16_": "modulate.indexed_modulation_triton",
     "indexed_gate_fp32": "modulate.indexed_modulation_triton",
     "indexed_gate_fp32_": "modulate.indexed_modulation_triton",
@@ -830,7 +814,6 @@ _EXPORTS: dict[str, str] = {
     "modulate_scale_shift_cuda": "modulate.modulate_scale_shift_jit",
     "can_use_residual_gate_add_cuda": "sglang.kernels.kda_kernels.residual_gate_add_jit",
     "residual_gate_add": "sglang.kernels.kda_kernels.residual_gate_add_jit",
-    "residual_gate_add_sum2": "sglang.kernels.kda_kernels.residual_gate_add_jit",
     "residual_gate_add_cuda": "sglang.kernels.kda_kernels.residual_gate_add_jit",
     "can_use_residual_gate_add2_cuda": "modulate.residual_gate_add2_jit",
     "residual_gate_add2": "modulate.residual_gate_add2_jit",

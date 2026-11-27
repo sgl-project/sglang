@@ -210,17 +210,19 @@ def _tp_worker() -> int:
     torch.set_grad_enabled(False)  # as when serving; the staged GEMM needs it
     maybe_init_distributed_environment_and_model_parallel(tp_size=_WORLD, sp_size=1)
 
+    from sglang.kernels.kda_kernels.residual_gate_add_jit import _route
     from sglang.kernels.ops.diffusion import (
-        can_use_indexed_gate_bf16_sum2,
+        can_use_indexed_gate_rmsnorm_scale_shift,
+        indexed_gate_bf16,
         indexed_gate_bf16_,
-        indexed_gate_bf16_sum2_,
         indexed_gate_rmsnorm_scale_shift_,
-        indexed_gate_rmsnorm_scale_shift_sum2_,
         residual_gate_add,
+        rmsnorm_tanh_residual,
     )
+    from sglang.kernels.ops.diffusion.common.partial_sum import PartialSum
     from sglang.multimodal_gen.runtime.distributed.device_communicators.tp_peer_partial import (
         TP_PEER_PARTIALS,
-        staged_partials,
+        row_parallel_deferred,
     )
     from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
     from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
@@ -228,7 +230,6 @@ def _tp_worker() -> int:
     )
     from sglang.multimodal_gen.runtime.models.dits.zimage import (
         ZImageRMSNorm,
-        zimage_peer_partial_rmsnorm_tanh_mul_add,
         zimage_rmsnorm_scale,
         zimage_rmsnorm_tanh_mul_add,
     )
@@ -270,16 +271,19 @@ def _tp_worker() -> int:
                 x_ref = zimage_rmsnorm_tanh_mul_add(reduced, gate, residual, norm)
                 z_ref = zimage_rmsnorm_scale(x_ref, scale, scale_norm)
 
-                x = zimage_peer_partial_rmsnorm_tanh_mul_add(
-                    layer, hidden, gate, residual, norm
-                )
-                pair = zimage_peer_partial_rmsnorm_tanh_mul_add(
-                    layer, hidden, gate, residual, norm, scale, scale_norm
-                )
                 where = f"dim={dim} batch={batch} tokens={tokens} bias={bias}"
-                if x is None or pair is None:
+                partial = row_parallel_deferred(layer, hidden, residual)
+                if not isinstance(partial, PartialSum):
                     failures.append(f"declined {where}")
                     continue
+                weight = norm.weight.data.contiguous()
+                if rmsnorm_tanh_residual(partial, gate, residual, weight, 1e-5) is None:
+                    failures.append(f"norm kernel rejected the partials {where}")
+                x = zimage_rmsnorm_tanh_mul_add(partial, gate, residual, norm)
+                partial = row_parallel_deferred(layer, hidden, residual)
+                pair = zimage_rmsnorm_tanh_mul_add(
+                    partial, gate, residual, norm, True, scale, scale_norm
+                )
                 if not torch.equal(raw(x), raw(x_ref)):
                     failures.append(f"residual {where}")
                 if not torch.equal(raw(pair[0]), raw(x_ref)):
@@ -294,6 +298,8 @@ def _tp_worker() -> int:
                 gated = projected_residual_gate_add(layer, hidden, residual, tanh_gate)
                 if TP_PEER_PARTIALS.calls == calls:
                     failures.append(f"gate declined {where}")
+                if _route(residual, partial.mine, tanh_gate, partial.theirs) is None:
+                    failures.append(f"gate kernel rejected the partials {where}")
                 if not torch.equal(raw(gated), raw(gated_ref)):
                     failures.append(f"gate {where}")
 
@@ -326,25 +332,31 @@ def _tp_worker() -> int:
             where = f"h3 dim={dim} tokens={tokens}"
 
             x_ref = indexed_gate_bf16_(residual.clone(), gate, reduced, indices)
-            calls = TP_PEER_PARTIALS.calls
-            partials = staged_partials(layer, hidden, residual)
-            if partials is None or TP_PEER_PARTIALS.calls == calls:
+            partial = row_parallel_deferred(layer, hidden, residual)
+            if not isinstance(partial, PartialSum):
                 failures.append(f"declined {where}")
                 continue
-            if not can_use_indexed_gate_bf16_sum2(residual, gate, *partials, indices):
-                failures.append(f"gate operands rejected {where}")
-            x = indexed_gate_bf16_sum2_(residual.clone(), gate, *partials, indices)
+            x = indexed_gate_bf16_(residual.clone(), gate, partial, indices)
             if not torch.equal(raw(x), raw(x_ref)):
                 failures.append(f"gate {where}")
+            # out of place, as with Cache-DiT attached
+            if not torch.equal(
+                raw(indexed_gate_bf16(residual, gate, partial, indices)), raw(x_ref)
+            ):
+                failures.append(f"gate out of place {where}")
 
             x_ref = residual.clone()
             y_ref = indexed_gate_rmsnorm_scale_shift_(
                 x_ref, gate, reduced, weight, shift, scale, indices, 1e-6
             )
-            partials = staged_partials(layer, hidden, residual)
+            partial = row_parallel_deferred(layer, hidden, residual)
+            if not can_use_indexed_gate_rmsnorm_scale_shift(
+                residual, gate, partial, weight, shift, scale, indices
+            ):
+                failures.append(f"gate + norm2 operands rejected {where}")
             x = residual.clone()
-            y = indexed_gate_rmsnorm_scale_shift_sum2_(
-                x, gate, *partials, weight, shift, scale, indices, 1e-6
+            y = indexed_gate_rmsnorm_scale_shift_(
+                x, gate, partial, weight, shift, scale, indices, 1e-6
             )
             if not torch.equal(raw(x), raw(x_ref)):
                 failures.append(f"gate + norm2 residual {where}")

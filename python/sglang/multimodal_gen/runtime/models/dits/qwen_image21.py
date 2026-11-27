@@ -17,7 +17,6 @@ from sglang.kernels.ops.diffusion import (
     qknorm_complex_rope_cuda,
     qknorm_complex_rope_pack_,
     residual_gate_add,
-    residual_gate_add_sum2,
     tensors_equal,
 )
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
@@ -38,7 +37,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.device_communicators.tp_peer_partial import (
-    staged_partials,
+    row_parallel_deferred,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
@@ -255,16 +254,8 @@ def projected_residual_gate_add(layer, hidden, residual, gate):
     """``residual_gate_add(residual, layer(hidden), gate)``. On a two-rank TP
     group the row-parallel ``layer``'s all-reduce is folded into the gate
     kernel, which reads both ranks' partial sums."""
-    if type(layer) is RowParallelLinear and residual.dtype is torch.bfloat16:
-        partials = staged_partials(layer, hidden, residual)
-        if partials is not None:
-            out = residual_gate_add_sum2(residual, *partials, gate)
-            if out is not None:
-                return out
-            # the kernel declined these operands: reduce the staged partials
-            update = (partials[0] + partials[1]).view_as(residual)
-            return residual_gate_add(residual, update, gate)
-    return residual_gate_add(residual, layer(hidden)[0], gate)
+    update = row_parallel_deferred(layer, hidden, residual)
+    return residual_gate_add(residual, update, gate)
 
 
 def apply_modulation(x, norm, scale):

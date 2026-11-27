@@ -33,24 +33,22 @@ from sglang.kernels.ops.diffusion import (
     can_use_aten_head_rmsnorm,
     can_use_aten_head_rmsnorm_rope,
     can_use_fused_inplace_qknorm_rope,
-    can_use_indexed_gate_bf16_sum2,
     can_use_indexed_gate_rmsnorm_scale_shift,
     can_use_rmsnorm_indexed_scale_shift,
     fused_inplace_qknorm_rope,
     fused_qknorm_rope_out_of_place,
     indexed_gate_bf16,
     indexed_gate_bf16_,
-    indexed_gate_bf16_sum2_,
     indexed_gate_fp32,
     indexed_gate_fp32_,
     indexed_gate_rmsnorm_scale_shift_,
-    indexed_gate_rmsnorm_scale_shift_sum2_,
     indexed_scale_shift_bf16_,
     indexed_scale_shift_fp32_,
     indexed_scale_shift_mxfp8_,
     rmsnorm_indexed_scale_shift,
     tensors_equal,
 )
+from sglang.kernels.ops.diffusion.common.partial_sum import PartialSum
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
     can_use_mxfp8_swizzled,
@@ -75,7 +73,8 @@ from sglang.multimodal_gen.runtime.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.device_communicators.tp_peer_partial import (
-    staged_partials,
+    defers_reduce,
+    row_parallel_deferred,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
@@ -504,31 +503,36 @@ def _modulate_scale_shift(
 def _modulate_gate(
     x: torch.Tensor,
     gate: torch.Tensor,
-    other: torch.Tensor,
+    other: torch.Tensor | PartialSum,
     indices: torch.Tensor,
     *,
     dtype: torch.dtype,
     allow_inplace: bool = True,
 ) -> torch.Tensor:
-    """Apply an indexed gated residual, optionally reusing the input buffer."""
+    """Apply an indexed gated residual, optionally reusing the input buffer.
+    ``other`` may be a two-rank row-parallel ``PartialSum``: the BF16 gate
+    kernels add it as they read; the other paths take it reduced."""
     # Apply the per-index gated residual: x + gate[idx] * other.
-    if (
+    rows = other.mine if isinstance(other, PartialSum) else other
+    kernel = (
         x.is_cuda
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
-        and other.dtype == _BF16_DTYPE
+        and rows.dtype == _BF16_DTYPE
         and x.is_contiguous()
-        and other.is_contiguous()
+        and rows.is_contiguous()
         and gate.stride(-1) == 1
-    ):
-        if gate.dtype == _BF16_DTYPE:
-            if allow_inplace:
-                return indexed_gate_bf16_(x, gate, other, indices)
-            return indexed_gate_bf16(x, gate, other, indices)
-        if gate.dtype == _FP32_DTYPE:
-            if allow_inplace:
-                return indexed_gate_fp32_(x, gate, other, indices)
-            return indexed_gate_fp32(x, gate, other, indices)
+    )
+    if kernel and gate.dtype == _BF16_DTYPE:
+        if allow_inplace:
+            return indexed_gate_bf16_(x, gate, other, indices)
+        return indexed_gate_bf16(x, gate, other, indices)
+    if isinstance(other, PartialSum):
+        other = other.reduce()
+    if kernel and gate.dtype == _FP32_DTYPE:
+        if allow_inplace:
+            return indexed_gate_fp32_(x, gate, other, indices)
+        return indexed_gate_fp32(x, gate, other, indices)
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
@@ -2089,56 +2093,35 @@ class MiniMaxH3DiTBlock(nn.Module):
             ring_active=ring_active,
             project_out=not peer,
         )
-        # two-rank TP: the gate kernels add both ranks' out_proj partial sums
-        # as they load them instead of reading an all-reduced tensor
-        partials = staged_partials(self.attn.out_proj, h, residual) if peer else None
-        if peer and partials is None:
-            h, _ = self.attn.out_proj(h)
+        if peer:
+            # two-rank TP: the gate kernels add both ranks' out_proj partial
+            # sums as they load them instead of reading an all-reduced tensor
+            h = row_parallel_deferred(self.attn.out_proj, h, residual)
         if self._fuses_gate_norm2(
-            residual,
-            gate_msa,
-            h if partials is None else partials[0],
-            shift_mlp,
-            scale_mlp,
-            combined_indices,
+            residual, gate_msa, h, shift_mlp, scale_mlp, combined_indices
         ):
             # the gated residual and norm2 in one pass, at the same roundings
-            norm2_args = (
+            h = indexed_gate_rmsnorm_scale_shift_(
+                residual,
+                gate_msa,
+                h,
                 self.norm2.weight,
                 shift_mlp,
                 scale_mlp,
                 combined_indices,
                 self.norm2.eps,
             )
-            if partials is None:
-                h = indexed_gate_rmsnorm_scale_shift_(
-                    residual, gate_msa, h, *norm2_args
-                )
-            else:
-                h = indexed_gate_rmsnorm_scale_shift_sum2_(
-                    residual, gate_msa, *partials, *norm2_args
-                )
             return self._mlp_gated_residual(
                 residual, gate_mlp, h, combined_indices, peer
             )
-        if partials is not None and (
-            self.preserve_input_for_cache_dit
-            or not can_use_indexed_gate_bf16_sum2(
-                residual, gate_msa, *partials, combined_indices
-            )
-        ):
-            h, partials = partials[0] + partials[1], None
-        if partials is not None:
-            x = indexed_gate_bf16_sum2_(residual, gate_msa, *partials, combined_indices)
-        else:
-            x = _modulate_gate(
-                residual,
-                gate_msa,
-                h,
-                combined_indices,
-                dtype=_BF16_DTYPE,
-                allow_inplace=not self.preserve_input_for_cache_dit,
-            )
+        x = _modulate_gate(
+            residual,
+            gate_msa,
+            h,
+            combined_indices,
+            dtype=_BF16_DTYPE,
+            allow_inplace=not self.preserve_input_for_cache_dit,
+        )
 
         residual = x
         if _accepts_mxfp8_input(self.mlp.fc1):
@@ -2178,18 +2161,14 @@ class MiniMaxH3DiTBlock(nn.Module):
 
     def _takes_peer_partials(self, x: torch.Tensor) -> bool:
         """Whether out_proj and fc2 may hand their two-rank TP partial sums to
-        the gate kernels (``staged_partials`` makes the per-call decision)."""
-        # unquantized only: a declined call then runs the forward unchanged
+        the gate kernels (``row_parallel_deferred`` makes the per-call
+        decision)."""
         return (
             x.is_cuda
             and x.dtype == _BF16_DTYPE
             and self.attn.hybrid is None
-            and self.attn.out_proj.tp_size == 2
-            and all(
-                type(layer) is RowParallelLinear
-                and type(layer.quant_method) is UnquantizedLinearMethod
-                for layer in (self.attn.out_proj, self.mlp.fc2)
-            )
+            and defers_reduce(self.attn.out_proj)
+            and defers_reduce(self.mlp.fc2)
         )
 
     def _mlp_gated_residual(
@@ -2201,25 +2180,17 @@ class MiniMaxH3DiTBlock(nn.Module):
         peer: bool,
     ) -> torch.Tensor:
         """``residual`` updated in place with ``gate[indices] * mlp(h)``."""
-        if not peer:
-            return _modulate_gate(
-                residual, gate, self.mlp(h), indices, dtype=_BF16_DTYPE
-            )
-        hidden = self.mlp.fc2_input(h)
-        partials = staged_partials(self.mlp.fc2, hidden, residual)
-        if partials is None:
-            out, _ = self.mlp.fc2(hidden)
-        elif can_use_indexed_gate_bf16_sum2(residual, gate, *partials, indices):
-            return indexed_gate_bf16_sum2_(residual, gate, *partials, indices)
+        if peer:
+            out = row_parallel_deferred(self.mlp.fc2, self.mlp.fc2_input(h), residual)
         else:
-            out = partials[0] + partials[1]
+            out = self.mlp(h)
         return _modulate_gate(residual, gate, out, indices, dtype=_BF16_DTYPE)
 
     def _fuses_gate_norm2(
         self,
         x: torch.Tensor,
         gate: torch.Tensor,
-        other: torch.Tensor,
+        other: torch.Tensor | PartialSum,
         shift: torch.Tensor,
         scale: torch.Tensor,
         indices: torch.Tensor,
