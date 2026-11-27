@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch_npu
+
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_manager import (
     _copy_packed,
 )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
+
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
     C8_ROW_BYTES,
 )

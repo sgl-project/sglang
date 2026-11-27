@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
+
 from sglang.kernels.ops.attention.npu_copy_sfa import (
     fused_scatter_copy_sparse_flash_attention,
     load_copy_sfa_operator,
@@ -234,6 +235,7 @@ class FusedSparseKVCacheManager:
         from sgl_kernel_npu.operators.mem_cache.prepare_sparse_kv_offload_rows import (
             prepare_sparse_kv_offload_rows,
         )
+
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
             sparse_query_width,
         )

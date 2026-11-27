@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch_npu
+
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.model_executor.forward_mode import ForwardMode
 

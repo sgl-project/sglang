@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import msgspec
 import torch
+
 from sglang.kernels.ops.attention.npu_lim import (
     fused_lightning_indexer_manage,
     load_fused_lim_operator,

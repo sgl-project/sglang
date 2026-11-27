@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
     resolve_sparse_kv_budget,
