@@ -34,10 +34,7 @@ from sglang.kernels.ops.diffusion import (
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
-from sglang.multimodal_gen.runtime.distributed import (
-    get_local_torch_device,
-    get_tp_world_size,
-)
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
@@ -94,8 +91,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
-    ModelOptFp8LinearMethod,
     apply_nvfp4_gemm_prequantized,
+    shared_modelopt_fp8_scale,
+    valid_modelopt_fp8_linear,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
@@ -945,6 +943,7 @@ class QwenImageCrossAttention(nn.Module):
         # self-attention: Q/K/V are concatenated before the kernel call.
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=self.num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -1548,27 +1547,6 @@ class QwenImageTransformerBlock(nn.Module):
         self._fp8_img_mlp_norm_quant = False
         self._fp8_txt_mlp_norm_quant = False
 
-    @staticmethod
-    def _valid_modelopt_fp8_linear(linear: nn.Module) -> bool:
-        input_scale = getattr(linear, "input_scale", None)
-        return (
-            isinstance(getattr(linear, "quant_method", None), ModelOptFp8LinearMethod)
-            and isinstance(input_scale, torch.Tensor)
-            and input_scale.is_cuda
-            and input_scale.dtype == torch.float32
-            and input_scale.numel() == 1
-            and input_scale.is_contiguous()
-            and bool(torch.isfinite(input_scale).all().item())
-            and bool((input_scale > 0).all().item())
-        )
-
-    @classmethod
-    def _shared_modelopt_fp8_scale(cls, linears: list[nn.Module]) -> bool:
-        if not all(cls._valid_modelopt_fp8_linear(linear) for linear in linears):
-            return False
-        reference = linears[0].input_scale
-        return all(torch.equal(reference, linear.input_scale) for linear in linears[1:])
-
     def configure_fp8_norm_quant(self) -> None:
         """Enable exact norm+quant paths after checkpoint scales are materialized."""
         if not torch.cuda.is_available():
@@ -1577,28 +1555,26 @@ class QwenImageTransformerBlock(nn.Module):
         if self.dim != 3072 or capability[0] < 10 or self.zero_cond_t:
             return
         if self.attn.use_fused_qkv:
-            self._fp8_img_attn_norm_quant = self._valid_modelopt_fp8_linear(
-                self.attn.to_qkv
-            )
+            self._fp8_img_attn_norm_quant = valid_modelopt_fp8_linear(self.attn.to_qkv)
         else:
-            self._fp8_img_attn_norm_quant = self._shared_modelopt_fp8_scale(
+            self._fp8_img_attn_norm_quant = shared_modelopt_fp8_scale(
                 [self.attn.to_q, self.attn.to_k, self.attn.to_v]
             )
         if self.attn.added_kv_proj_dim is not None:
             if self.attn.use_fused_added_qkv:
-                self._fp8_txt_attn_norm_quant = self._valid_modelopt_fp8_linear(
+                self._fp8_txt_attn_norm_quant = valid_modelopt_fp8_linear(
                     self.attn.to_added_qkv
                 )
             else:
-                self._fp8_txt_attn_norm_quant = self._shared_modelopt_fp8_scale(
+                self._fp8_txt_attn_norm_quant = shared_modelopt_fp8_scale(
                     [self.attn.add_q_proj, self.attn.add_k_proj, self.attn.add_v_proj]
                 )
         if isinstance(self.img_mlp, QwenImageFeedForward):
-            self._fp8_img_mlp_norm_quant = self._valid_modelopt_fp8_linear(
+            self._fp8_img_mlp_norm_quant = valid_modelopt_fp8_linear(
                 self.img_mlp.net[0].proj
             )
         if isinstance(self.txt_mlp, QwenImageFeedForward):
-            self._fp8_txt_mlp_norm_quant = self._valid_modelopt_fp8_linear(
+            self._fp8_txt_mlp_norm_quant = valid_modelopt_fp8_linear(
                 self.txt_mlp.net[0].proj
             )
 
@@ -2225,7 +2201,6 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     """
 
-    _supports_gradient_checkpointing = True
     _no_split_modules = ["QwenImageTransformerBlock"]
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _repeated_blocks = ["QwenImageTransformerBlock"]
@@ -2361,10 +2336,6 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             prefix="proj_out",
         )
 
-        self.timestep_zero = torch.zeros(
-            (1,), dtype=torch.int, device=get_local_torch_device()
-        )
-
         self.layer_names = ["transformer_blocks"]
 
     def post_load_weights(self) -> None:
@@ -2473,7 +2444,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         timestep = (timestep / 1000).to(hidden_states.dtype)
 
         if self.zero_cond_t:
-            timestep = torch.cat([timestep, self.timestep_zero], dim=0)
+            timestep = torch.cat([timestep, torch.zeros_like(timestep)], dim=0)
             device = timestep.device
             modulate_index = self.build_modulate_index(to_hashable(img_shapes), device)
         else:

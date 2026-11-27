@@ -248,10 +248,10 @@ class _Dumper:
 
     Alternatively, disable at startup and configure via HTTP:
     1. `python ...`
-    2. sglang mode:  `curl -X POST http://localhost:30000/dumper/configure -d '{"enable": true}'`
+    2. sglang mode:  `curl -X POST http://localhost:30000/dumper/configure -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" -d '{"enable": true}'`
        standalone:   `curl -X POST http://localhost:40000/dumper/configure -d '{"enable": true}'`
-    3. `curl -X POST http://localhost:30000/dumper/configure -d '{"enable": true, "filter": "layer_id=[0-3]"}'`
-    4. `curl -X POST http://localhost:30000/dumper/reset`
+    3. `curl -X POST http://localhost:30000/dumper/configure -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" -d '{"enable": true, "filter": "layer_id=[0-3]"}'`
+    4. `curl -X POST http://localhost:30000/dumper/reset -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"`
 
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
@@ -1249,7 +1249,9 @@ def _calc_rel_diff(x: "torch.Tensor", y: "torch.Tensor"):
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
-    return 1 - sim
+    # Both all-zero: identical, and 0 / 0 would make the diff NaN. torch.where
+    # keeps this free of a host sync, so it is safe under graph capture.
+    return torch.where(denominator == 0, torch.zeros_like(sim), 1 - sim)
 
 
 def _obj_to_dict(obj):

@@ -13,10 +13,11 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-large-amd")
 
 
 class TestLSECombineTritonVsCPU(CustomTestCase):
@@ -249,9 +250,7 @@ class TestLSEBaseByBackend(CustomTestCase):
     """Which attention backends report LSE in natural log."""
 
     def test_natural_log_lse_backends(self):
-        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
-            is_mla_dcp_lse_base_on_e,
-        )
+        from sglang.srt.layers.dcp.layout import is_mla_dcp_lse_base_on_e
 
         self.assertTrue(is_mla_dcp_lse_base_on_e("flashmla"))
         self.assertTrue(is_mla_dcp_lse_base_on_e("cutedsl_mla"))

@@ -147,11 +147,16 @@ def _small_configurator(rank, state_counts=(6, 9)):
 
 
 def _build_storage(cfg):
+    import msgspec
+
     from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 
     return build_kv_storage(
         cfg._unified_plan,
-        cfg._unified_sized,
+        # The table's rows carry four columns of headroom past the context.
+        msgspec.structs.replace(
+            cfg._unified_sized, req_to_token_row_width=cfg.model_config.context_len + 4
+        ),
         UnifiedBuildContext(
             device="cpu",
             start_layer=0,
@@ -161,8 +166,6 @@ def _build_storage(cfg):
             need_sort=False,
             head_num=1,
             head_dim=8,
-            model_context_len=cfg.model_config.context_len,
-            extra_max_context_len=4,
             state_cache_params=NS(layers=cfg._unified_plan.sub_pool("mamba").layer_ids),
         ),
     )
@@ -260,24 +263,39 @@ def admission_worker(rank, path):
                     _resize_cpu_storage(storage, config)
                     assert config.max_total_num_tokens < initial.max_total_num_tokens
                 input_tokens = config.max_total_num_tokens // 3 + 8
+                alone = _admission(allocator, input_tokens, 8)
+                # Every stage shares its geometry as sized now, after the
+                # resize too, and each asks every question of both.
+                geometries = [None, None]
+                dist.all_gather_object(geometries, allocator.stage_geometry())
+                allocator.install_stage_capacity(rank, geometries)
+                decided = _admission(allocator, input_tokens, 8)
+                held = allocator.stage_counts()
+                allocator.stage_capacity = None
                 record = dict(
                     tokens=config.max_total_num_tokens,
                     requests=config.max_running_requests,
-                    available=allocator.available_size(),
-                    admitted=_admission(allocator, input_tokens, 8),
+                    alone=alone,
+                    held=held,
+                    admitted=decided,
                 )
                 results = [None, None]
                 dist.all_gather_object(results, record)
-                assert results[0] == results[1], (phase, results)
-                assert record["admitted"] == 2, (phase, results)
-                assert record["available"] == record["tokens"], (phase, results)
+                shared = [{k: v for k, v in r.items() if k != "alone"} for r in results]
+                assert shared[0] == shared[1], (phase, results)
+                # Alone, each stage admits what fits its own arena; together
+                # they admit what fits both.
+                alone = [r["alone"] for r in results]
+                assert alone[0] != alone[1], (phase, results)
+                assert record["admitted"] == min(alone), (phase, results)
     finally:
         dist.destroy_process_group()
 
 
 class TestPipelineAdmission(CustomTestCase):
     def test_unequal_stages_admit_identical_batches_after_build_and_resize(self):
-        """Unequal PP stages must select the same batch, including the MIN stage."""
+        """Unequal PP stages select the same batch, the one that fits every
+        stage, before and after the post-capture resize."""
         with tempfile.TemporaryDirectory() as tmp:
             mp.spawn(admission_worker, args=(tmp + "/rendezvous",), nprocs=2, join=True)
 

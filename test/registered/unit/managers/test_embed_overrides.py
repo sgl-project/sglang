@@ -90,6 +90,7 @@ class TestCreateTokenizedObjectEmbedOverrideValidation(CustomTestCase):
         manager.model_config = SimpleNamespace(
             hidden_size=HIDDEN_DIM,
             vocab_size=128,
+            token_id_vocab_size=128,
         )
         manager.fake_bootstrap_room_counter = 0
         manager.rid_to_state = {
@@ -308,70 +309,6 @@ class TestResolveOverridesForSequence(CustomTestCase):
                 embeds=[_vec()],
                 embed_override_token_id=50,
             )
-
-
-# ========================================================================
-# Score mixin: _resolve_embed_overrides_for_request
-# ========================================================================
-
-
-class TestResolveEmbedOverridesForRequest(CustomTestCase):
-    def setUp(self):
-        reset_context()
-        self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="tokenizer")
-        self.mixin = _FakeMixin()
-
-    def test_no_overrides_returns_none(self):
-        result = self.mixin._resolve_embed_overrides_for_request(
-            query=[10, 20],
-            item=[30, 40],
-            embed_override_token_id=50,
-            query_embed_overrides=None,
-            item_embeds=None,
-            item_position_offset=2,
-            item_label="items[0]",
-        )
-        self.assertIsNone(result)
-
-    def test_query_only_overrides(self):
-        pe = self.mixin._resolve_embed_overrides_for_request(
-            query=[50, 20],
-            item=[30, 40],
-            embed_override_token_id=50,
-            query_embed_overrides=[_vec(1)],
-            item_embeds=None,
-            item_position_offset=2,
-            item_label="items[0]",
-        )
-        self.assertIsInstance(pe, PositionalEmbeds)
-        self.assertEqual(pe.positions, [0])
-        self.assertEqual(pe.embeds.shape, (1, HIDDEN_DIM))
-
-    def test_item_only_overrides(self):
-        pe = self.mixin._resolve_embed_overrides_for_request(
-            query=[10, 20],
-            item=[50, 40],
-            embed_override_token_id=50,
-            query_embed_overrides=None,
-            item_embeds=[_vec(2)],
-            item_position_offset=2,
-            item_label="items[0]",
-        )
-        self.assertEqual(pe.positions, [2])  # offset applied
-
-    def test_query_and_item_overrides(self):
-        pe = self.mixin._resolve_embed_overrides_for_request(
-            query=[50, 20],
-            item=[30, 50],
-            embed_override_token_id=50,
-            query_embed_overrides=[_vec(1)],
-            item_embeds=[_vec(2)],
-            item_position_offset=2,
-            item_label="items[0]",
-        )
-        self.assertEqual(pe.positions, [0, 3])  # query pos 0, item pos 1+offset 2
-        self.assertEqual(pe.embeds.shape, (2, HIDDEN_DIM))
 
 
 # ========================================================================

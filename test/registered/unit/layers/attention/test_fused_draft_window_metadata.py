@@ -39,11 +39,12 @@ from sglang.srt.mem_cache.unified_draft_pool import bind_fused_draft
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import arena_of, plan_stand_in
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 class TestFusedDraftWindowMetadata(CustomTestCase):
@@ -116,6 +117,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 state_slots=0,
                 max_running_requests=2,
                 context_len=1024,
+                req_to_token_row_width=1024,
                 alignment=1,
             ),
         )
@@ -129,7 +131,6 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 enable_memory_saver=False,
                 need_sort=False,
                 max_num_reqs=2,
-                model_context_len=1024,
                 lazy_compaction=True,
             ),
         )
@@ -139,7 +140,9 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         old = allocator.alloc(7)
         allocator.free_window_segment(host, old, start_pos=0)
         virtual = allocator.alloc(512)
-        req = SimpleNamespace(size=1, req_to_token=virtual.reshape(1, -1))
+        req = SimpleNamespace(
+            size=1, req_to_token=virtual.reshape(1, -1), row_width=512
+        )
         layer = RadixAttention(
             num_heads=1,
             head_dim=8,
@@ -182,14 +185,14 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         # The model's per-step attention is outside this metadata test. All
         # placement, allocation, translation and multi-step metadata are real.
         if backend_kind == "triton":
-            inner = SimpleNamespace(max_context_len=512)
+            inner = SimpleNamespace(max_kv_len=req.row_width)
             with patch.object(tb, "TritonAttnBackend", return_value=inner):
                 backend = tb.TritonMultiStepDraftBackend(runner, 1, 3)
         else:
             # The step backend writes a window sub-pool, as
             # FlashInferAttnBackend resolves it for this runner.
             inner = SimpleNamespace(
-                max_context_len=512, use_sliding_window_kv_pool=True
+                use_sliding_window_kv_pool=True, max_kv_len=req.row_width
             )
             with patch.object(fb, "FlashInferAttnBackend", return_value=inner):
                 if backend_kind == "flashinfer":
@@ -198,7 +201,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                     # The step backends the trtllm_mha draft builds in place
                     # of its parent's, with the arguments they get.
                     def step(*args, **kwargs):
-                        return SimpleNamespace(kwargs=kwargs, max_context_len=512)
+                        return SimpleNamespace(kwargs=kwargs)
 
                     with patch.object(tm, "TRTLLMHAAttnBackend", side_effect=step):
                         backend = tm.TRTLLMHAAttnMultiStepDraftBackend(runner, 1, 3)

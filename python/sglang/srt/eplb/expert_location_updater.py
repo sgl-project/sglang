@@ -31,9 +31,7 @@ from sglang.srt.utils import get_bool_env_var, is_npu
 
 _is_npu = is_npu()
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.eplb import (
-        update_expert_weights_with_staging,
-    )
+    from sglang.srt.hardware_backend.npu.eplb import migrate_expert_weights
 
 
 logger = logging.getLogger(__name__)
@@ -153,7 +151,7 @@ def _update_expert_weights_raw(
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
     if _is_npu:
-        return update_expert_weights_with_staging(
+        return migrate_expert_weights(
             weights_by_layer=routed_experts_weights_of_layer,
             old_metadata=old_expert_location_metadata,
             new_metadata=new_expert_location_metadata,
@@ -243,6 +241,7 @@ def update_expert_weights_single_layer(
     missing_logical_experts_info: Optional[List[int]] = None,
     debug: bool = False,
     log_metrics: bool = False,
+    group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     assert all(
         tensor.shape[0] == num_local_physical_experts
@@ -290,6 +289,9 @@ def update_expert_weights_single_layer(
         (rank + 1) * num_local_physical_experts,
     )
 
+    # Destination slot per p2p recv entry, so dropping a recv drops its copy too.
+    recv_dst_by_info_index: Dict[int, int] = {}
+
     def _entrypoint():
         # List[Tuple[logical_expert_id, List[P2POp]]]
         p2p_op_infos: List[Tuple[int, List[P2POp]]] = []
@@ -298,7 +300,7 @@ def update_expert_weights_single_layer(
 
         _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
         _create_isend_ops(p2p_op_infos)
-        _filter_p2p_ops(p2p_op_infos)
+        _filter_p2p_ops(p2p_op_infos, buffer2weight_copy_infos)
         _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
 
@@ -411,6 +413,7 @@ def update_expert_weights_single_layer(
         src_rank: int,
         dst_expert_location: int,
     ):
+        recv_dst_by_info_index[len(p2p_op_infos)] = dst_expert_location
         p2p_op_infos.append(
             (
                 logical_expert_id,
@@ -419,6 +422,7 @@ def update_expert_weights_single_layer(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
                         peer=src_rank,
+                        group=group,
                     )
                     for i in range(num_tensors)
                 ],
@@ -467,6 +471,7 @@ def update_expert_weights_single_layer(
                         op=torch.distributed.isend,
                         tensor=_get_tensor(send_weights, i, src_expert_location),
                         peer=dst_rank,
+                        group=group,
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)
@@ -518,11 +523,12 @@ def update_expert_weights_single_layer(
 
         return same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks
 
-    def _filter_p2p_ops(p2p_op_infos):
+    def _filter_p2p_ops(p2p_op_infos, buffer2weight_copy_infos):
         elastic_ep_state = ElasticEPStateManager.instance()
         if elastic_ep_state is not None and missing_logical_experts_info is not None:
             # Filter out inactive P2P ops and record missing expert IDs in missing_logical_experts_info
             is_active = elastic_ep_state.active_ranks_cpu
+            unreceived_slots = set()
             for i, (logical_expert_id, ops) in enumerate(p2p_op_infos):
                 has_isend = any(op.op == torch.distributed.isend for op in ops)
                 has_irecv = any(op.op == torch.distributed.irecv for op in ops)
@@ -540,6 +546,15 @@ def update_expert_weights_single_layer(
                     if any(not is_active[op.peer] for op in ops):
                         missing_logical_experts_info.append(logical_expert_id)
                         p2p_op_infos[i] = (logical_expert_id, [])
+                        unreceived_slots.add(recv_dst_by_info_index[i])
+
+            # A dropped recv's copy would publish a stale reused buffer over a live
+            # slot. Free-riders share the buffer, so key on the source.
+            buffer2weight_copy_infos[:] = [
+                (src, dst)
+                for src, dst in buffer2weight_copy_infos
+                if src not in unreceived_slots
+            ]
 
     def _execute_p2p_ops(p2p_op_infos):
         sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])

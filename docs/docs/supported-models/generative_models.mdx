@@ -175,8 +175,8 @@ in the GitHub search bar.
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**ERNIE 5.5 Flash**</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`baidu/ERNIE-5.5-Flash-Base`, `baidu/ERNIE-5.5-Flash-Base-BF16`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Baidu's ERNIE 5.5 Flash (`Ernie5_5_MoeForCausalLM`), a 280B-total / 14B-active MoE: 37 heavily compressed attention (HCA) layers and 6 full-context MLA layers with DSA sparse attention, low-rank gated attention with a cross-head post-mix (VHA), manifold-constrained hyper-connections, and Multi-Router latent MoE layers with 512 experts (top-10) plus a shared expert. The Base checkpoints (FP8 and BF16) are served through the completions endpoint; ERNIE-5.5-Flash (FP8 / FP4 / BF16), with the `ernie55` reasoning and tool-call parsers and a DSpark draft, is coming soon, and attention TP must divide the 8 output groups. See the ERNIE-5.5-Flash cookbook page for recipes.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`baidu/ERNIE-5.5-Flash-Preview`, `baidu/ERNIE-5.5-Flash-Preview-FP8`, `baidu/ERNIE-5.5-Flash-Preview-BF16`, `baidu/ERNIE-5.5-Flash-Base`, `baidu/ERNIE-5.5-Flash-Base-BF16`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Baidu's ERNIE 5.5 Flash (`Ernie5_5_MoeForCausalLM`), a 280B-total / 14B-active MoE: 37 heavily compressed attention (HCA) layers and 6 full-context MLA layers with DSA sparse attention, low-rank gated attention with a cross-head post-mix (VHA), manifold-constrained hyper-connections, and Multi-Router latent MoE layers with 512 experts (top-10) plus a shared expert. The Base checkpoints (FP8 and BF16) are served through the completions endpoint; the chat model, with the `ernie55` reasoning and tool-call parsers and a DSpark draft, is released as ERNIE-5.5-Flash-Preview (`baidu/ERNIE-5.5-Flash-Preview` is FP4 by default, with `-FP8` and `-BF16` variants), and attention TP must divide the 8 output groups. See the ERNIE-5.5-Flash cookbook page for recipes.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Arcee AFM-4.5B**</td>
@@ -322,6 +322,11 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>GigaChat 3.5</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>ai-sage/GigaChat3.5-432B-A28B</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>GigaChat's hybrid MoE model: per-layer mix of DeepSeek-style MLA full attention and Qwen3 Gated-Delta-Net (GDN) linear attention, DeepSeek-style routed + shared experts, and multiple multi-token-prediction (MTP) heads for speculative decoding. Emits tool calls in GCML format.</td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>GigaChat 4</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>ai-sage/GigaChat4-708B-A41B</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>GigaChat's hybrid MoE model: per-layer mix of MLA with DeepSeek Sparse Attention (DSA) and Qwen3 Gated-Delta-Net (GDN) linear attention, DeepSeek-style routed + shared experts, multi-token prediction (MTP) and DFlash2 for speculative decoding. Supports per-request reasoning and emits tool calls in GCML format.</td>
     </tr>
 </tbody>
 </table>

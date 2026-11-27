@@ -14,7 +14,6 @@
 
 """Inference-only GLM-4.7-Flash model compatible with HuggingFace weights."""
 
-import logging
 import re
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -33,6 +32,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
@@ -82,12 +82,16 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
-from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
+from sglang.srt.models.deepseek_common.utils import (
+    _is_cuda,
+    _use_aiter,
+    fuse_qkv_a_proj_tensors,
+    quant_blocks_shared_experts_fusion,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import BumpAllocator, LazyValue, is_npu
 
-logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
@@ -148,10 +152,8 @@ class Glm4MoeLiteGate(nn.Module):
         self,
         config,
         prefix: str = "",
-        is_nextn: bool = False,
     ):
         super().__init__()
-        self.is_nextn = is_nextn
         self.weight = nn.Parameter(
             torch.empty(
                 (config.n_routed_experts, config.hidden_size), dtype=torch.float32
@@ -174,7 +176,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        is_nextn: bool = False,
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
@@ -184,7 +185,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        self.is_nextn = is_nextn
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -198,9 +198,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.gate = Glm4MoeLiteGate(
-            config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
-        )
+        self.gate = Glm4MoeLiteGate(config=config, prefix=add_prefix("gate", prefix))
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
@@ -234,7 +232,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         )
         self.topk.bind_runner_backend(self.experts.runner_backend)
 
-        self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
         self._shared_expert_tp1 = False
@@ -250,16 +247,13 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group="replicated"
                 if get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_ops()
                 or get_moe_a2a_backend().is_mooncake()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 else "tp",
             )
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            )
-            self.shared_experts_is_int8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
             )
             self.shared_experts_is_fp8 = (
                 not is_packed_weight
@@ -284,7 +278,9 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             )
 
         self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_ops()
+            or get_moe_a2a_backend().is_mooncake()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -450,7 +446,6 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
-                is_nextn=is_nextn,
             )
         else:
             mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
@@ -533,7 +528,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            quant_format=getattr(self, "_gfx95_quant_format", ""),
+            quant_format=self._gfx95_quant_format,
             capture=capture_output,
         )
 
@@ -558,8 +553,6 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
 
 
 class Glm4MoeLiteModel(nn.Module):
-    fall_back_to_pt_during_load = False
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -679,8 +672,12 @@ class Glm4MoeLiteModel(nn.Module):
 
 
 class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
-    # for quark model load
-    packed_modules_mapping = {}
+    # Fused layers -> their checkpoint shards, so quantization ignore lists
+    # that name the shards also match the fused layer.
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
@@ -728,6 +725,12 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
         """Why this checkpoint cannot fuse its shared expert, or None. Asked by
         the loader before any layer is built."""
+        if quant_blocks_shared_experts_fusion(quant_config):
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
+            )
         if (
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
@@ -827,6 +830,36 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.capture_aux_hidden_states = True
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def prepare_context_parallel_metadata_for_dcp(
+        self,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        seq_lens_sum: int,
+        kv_buffer_shape: torch.Size,
+        kv_cache_dtype,
+        kv_cache_device,
+        create_chunked_prefix_cache_kv_indices_fn,
+    ):
+        if _is_npu:
+            return None
+        return prepare_decode_context_parallel_metadata(
+            seq_lens=seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens_sum=seq_lens_sum,
+            kv_buffer_shape=kv_buffer_shape,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_device=kv_cache_device,
+            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+        )
+
     def load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
@@ -905,10 +938,7 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if params_dict is None:
             params_dict = dict(self.named_parameters())
 
-        weight_names = []
         for name, loaded_weight in weights:
-            weight_names.append(name)
-
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1023,8 +1053,11 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                         ):
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                            fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
+                            fused_weight = fuse_qkv_a_proj_tensors(
+                                name,
+                                q_a=q_a_proj_weight,
+                                kv_a=kv_a_proj_weight,
+                                quant_config=self.quant_config,
                             )
                             param_name = (
                                 name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
@@ -1033,6 +1066,8 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                                     "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
                                 )
                             )
+                            cached_a_proj.pop(q_a_proj_name)
+                            cached_a_proj.pop(kv_a_proj_name)
                             if param_name not in params_dict:
                                 continue
                             param = params_dict[param_name]
@@ -1041,31 +1076,21 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                                 param, "weight_loader", default_weight_loader
                             )
                             weight_loader(param, fused_weight)
-                            cached_a_proj.pop(q_a_proj_name)
-                            cached_a_proj.pop(kv_a_proj_name)
                     else:
                         if (
                             "k_scale" in name or "v_scale" in name
                         ) and name not in params_dict:
                             # modelopt attn kv scale is named differently
-                            if any(scale in name for scale in ["k_scale", "v_scale"]):
-                                name = name.replace("_proj", "attn_mqa")
-                            else:
-                                logger.warning(
-                                    f"Unknown scale found in checkpoint: {name}"
-                                )
+                            name = name.replace("_proj", "attn_mqa")
 
                     if name not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
         # DeepseekV2AttentionMLA.forward_* expects post_load_weights() to populate
         # per-layer packed weights like `w_kc`/`w_vc` (used during CUDA graph capture).

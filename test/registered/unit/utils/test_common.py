@@ -1,5 +1,7 @@
 import gc
 import io
+import os
+import subprocess
 import sys
 import unittest
 from array import array
@@ -8,17 +10,20 @@ from unittest import mock
 import torch
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import _load_image
+from sglang.srt.utils import aiter as aiter_utils
 from sglang.srt.utils.common import flatten_arrays_to_int64_tensor
 from sglang.srt.utils.device import (
     _get_device_sm_via_nvml,
+    async_h2d_tensor,
     get_nvidia_driver_version_str,
     is_gfx95_supported,
     is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
 )
-from sglang.srt.utils.log_utils import freeze_gc
+from sglang.srt.utils.gc_utils import freeze_gc
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -28,7 +33,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=5, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -65,6 +70,36 @@ class TestFlattenArraysToInt64Tensor(CustomTestCase):
             array("q", [1000]),
         ]
         self._check(parts, [10, 20, 30, 100, 200, 1000])
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestAsyncH2dTensor(CustomTestCase):
+    """`async_h2d_tensor` moves host tensors to the device through pinned memory."""
+
+    def test_copies_values_from_pageable_and_pinned_hosts(self):
+        src = torch.arange(1024, dtype=torch.int64)
+        for host in (src, src.pin_memory()):
+            out = async_h2d_tensor(host, device=torch.device("cuda"))
+            self.assertEqual(out.device.type, "cuda")
+            self.assertTrue(torch.equal(out.cpu(), src))
+
+    def test_device_tensor_stays_on_device(self):
+        src = torch.arange(8, device="cuda")
+        out = async_h2d_tensor(src, device=torch.device("cuda"))
+        self.assertTrue(torch.equal(out, src))
+
+    def test_copies_without_pinned_memory(self):
+        src = torch.arange(16, dtype=torch.int64)
+        with (
+            mock.patch(
+                "sglang.srt.utils.device.is_pin_memory_available", return_value=False
+            ),
+            mock.patch.object(
+                torch.Tensor, "pin_memory", side_effect=AssertionError("pinned")
+            ),
+        ):
+            out = async_h2d_tensor(src, device=torch.device("cuda"))
+        self.assertTrue(torch.equal(out.cpu(), src))
 
 
 class TestNvidiaDriverVersionStr(CustomTestCase):
@@ -273,6 +308,38 @@ class TestFreezeGc(CustomTestCase):
     def test_applies_configured_threshold(self):
         freeze_gc("test", [700, 10, 1000])
         self.assertEqual(gc.get_threshold(), (700, 10, 1000))
+
+
+class TestDeclaredBoolEnvSpellings(CustomTestCase):
+    """These variables are declared as ``EnvBool``, so ``yes`` must mean true
+    wherever they are read, as it does for the other readers of ``envs``."""
+
+    def test_use_aiter_accepts_yes(self):
+        with (
+            envs.SGLANG_USE_AITER.override("yes"),
+            mock.patch.object(aiter_utils, "is_hip", return_value=True),
+            mock.patch.object(aiter_utils, "_aiter_chip_info_cached", False),
+            mock.patch.dict(os.environ, {"CU_NUM": "1", "GPU_ARCHS": "gfx942"}),
+        ):
+            aiter_utils.maybe_pre_warm_aiter_chip_info()
+            self.assertTrue(aiter_utils._aiter_chip_info_cached)
+
+    def test_torch_inference_mode_accepts_yes(self):
+        # The flag is read once at import, so it needs a fresh interpreter.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from sglang.srt.utils import common\n"
+                "print(common._ENABLE_TORCH_INFERENCE_MODE)",
+            ],
+            env={**os.environ, "SGLANG_ENABLE_TORCH_INFERENCE_MODE": "yes"},
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "True")
 
 
 if __name__ == "__main__":

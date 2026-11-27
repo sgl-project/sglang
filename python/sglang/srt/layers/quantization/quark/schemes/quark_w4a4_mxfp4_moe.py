@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -48,7 +49,7 @@ _is_gfx95 = is_gfx95_supported()
 # This scheme runs only on the AITER runner, so on the arches AITER has an MXFP4
 # MoE layout for, that layout is bound whatever SGLANG_USE_AITER says.
 _use_aiter = _is_hip and (
-    get_bool_env_var("SGLANG_USE_AITER") or _is_gfx95 or is_gfx1250_supported()
+    envs.SGLANG_USE_AITER.get() or _is_gfx95 or is_gfx1250_supported()
 )
 _is_shuffle_moe_mxfp4 = _use_aiter and _is_gfx95
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
@@ -121,6 +122,27 @@ _arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] if _is_hip
 _is_consumer_rdna = _arch.startswith(("gfx11", "gfx120"))
 _use_triton_w4a16 = _is_consumer_rdna
 _TRITON_W4A16_NUM_WARPS = 8
+
+
+def _swizzle_mxfp4(quant_tensor, scale, num_warps):
+    """Convert packed MXFP4 weights and their scales to the triton_kernels matmul
+    layouts. triton_kernels comes from the ROCm image, not the sglang-kernel wheel."""
+    from triton_kernels.numerics import InFlexData
+    from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
+    from triton_kernels.tensor_details import layout
+
+    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
+    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=-2, num_warps=num_warps
+    )
+    # transpose the tensor so that the quantization axis is on dim1
+    quant_tensor = quant_tensor.transpose(-2, -1)
+    scale = scale.transpose(-2, -1)
+    quant_tensor = convert_layout(
+        wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout
+    )
+    scale = convert_layout(wrap_torch_tensor(scale), scale_layout)
+    return quant_tensor, InFlexData(), scale
 
 
 class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
@@ -1166,8 +1188,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
     def _process_weights_triton_w4a16(self, layer: torch.nn.Module) -> None:
         from triton_kernels.matmul import FlexCtx, PrecisionConfig
-
-        from sglang.srt.layers.quantization.mxfp4 import _swizzle_mxfp4
 
         assert (
             self.is_checkpoint_mxfp4_serialized and self.dequantization_config is None

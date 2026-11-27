@@ -1,13 +1,16 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from sgl_kernel_npu.operators.moe import moe_gating_top_k
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     _zero_topk_weights_padded_region,
+    apply_routing_simulation,
     capture_routed_experts_if_allowed,
+    routing_simulation_enabled,
     select_experts,
 )
 
@@ -29,14 +32,14 @@ def fused_topk_npu(
     correction_bias = topk_config.correction_bias
 
     # sqrtsoftplus (DSV4 noaux_tc): top-k over (scores + bias); weights from
-    # un-biased scores. The custom op fuses softplus/sqrt/topk/gather/norm/cast.
+    # un-biased scores. norm_type=2 fuses softplus/sqrt/topk/gather/norm/cast.
     if topk_config.scoring_func == "sqrtsoftplus":
         routed_scaling_factor = (
             topk_config.routed_scaling_factor
             if topk_config.apply_routed_scaling_factor_on_output
             else 1.0
         )
-        topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
+        topk_weights, topk_ids, _ = moe_gating_top_k(
             x=router_logits.to(torch.float32),
             k=topk_config.top_k,
             bias=(
@@ -44,10 +47,8 @@ def fused_topk_npu(
                 if correction_bias is not None
                 else None
             ),
-            input_ids=None,
-            tid2eid=None,
-            routed_scaling_factor=float(routed_scaling_factor),
             norm_type=2,
+            routed_scaling_factor=float(routed_scaling_factor),
         )
         topk_weights = topk_weights.to(torch.float32)
 
@@ -59,7 +60,7 @@ def fused_topk_npu(
         )
 
         if renormalize:
-            from sgl_kernel_npu.norm.l1_norm import l1_norm
+            from sgl_kernel_npu.operators.norm import l1_norm
 
             topk_weights = l1_norm(
                 topk_weights
@@ -74,8 +75,8 @@ def fused_topk_npu(
         or topk_config.scoring_func == "sigmoid"
         or num_token_non_padded is not None
     ):
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
-            router_logits.to(torch.float32),
+        topk_weights, topk_ids, _ = moe_gating_top_k(
+            x=router_logits.to(torch.float32),
             k=topk_config.top_k,
             bias=(
                 correction_bias.to(torch.float32)
@@ -86,7 +87,8 @@ def fused_topk_npu(
             k_group=topk_config.topk_group if use_grouped_topk else 1,
             group_count=topk_config.num_expert_group if use_grouped_topk else 1,
             group_select_mode=(1 if use_grouped_topk else 0),
-            renorm=renormalize,
+            # Sigmoid already normalizes selected weights; CANN 9.1 only accepts 0.
+            renorm=0 if topk_config.scoring_func == "sigmoid" else renormalize,
             # 1 for sigmoid, 0 for softmax
             norm_type=(0 if topk_config.scoring_func == "softmax" else 1),
             routed_scaling_factor=(
@@ -133,6 +135,19 @@ def _finalize_topk_npu(
     layer_id,
 ):
     num_shared = topk_config.num_shared_topk_slots
+    if routing_simulation_enabled():
+        # Benchmark-only override: rewrite the router's pick with a balanced
+        # round-robin/uniform assignment before the logical->physical remap.
+        # Keep valid ids on padded rows (NPU dispatch relies on them) and only
+        # zero their weights below, so pass no padding mask here.
+        apply_routing_simulation(
+            topk_ids,
+            topk_weights,
+            router_logits.shape[1],
+            num_routed_topk=topk_ids.shape[1] - num_shared,
+            top_k=topk_ids.shape[1],
+            layer_id=layer_id,
+        )
     routed_ids = topk_ids[:, :-num_shared] if num_shared else topk_ids
     capture_routed_experts_if_allowed(topk_config, layer_id, routed_ids)
     routed_ids = topk_ids_logical_to_physical(routed_ids, expert_location_dispatch_info)

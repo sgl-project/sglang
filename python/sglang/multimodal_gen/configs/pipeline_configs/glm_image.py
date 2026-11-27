@@ -39,10 +39,6 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
 
     vae_sp: bool = False
 
-    text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (T5Config(),)
-    )
-
     dit_config: DiTConfig = field(default_factory=GlmImageDitConfig)
     # VAE
     vae_config: VAEConfig = field(default_factory=GlmImageVAEConfig)
