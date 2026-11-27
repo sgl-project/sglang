@@ -277,6 +277,7 @@ class HeliosSelfAttention(nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=num_heads,
             head_size=self.head_dim,
             causal=False,
             is_cross_attention=False,
@@ -390,6 +391,7 @@ class HeliosCrossAttention(nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=num_heads,
             head_size=self.head_dim,
             causal=False,
             skip_sequence_parallel=True,

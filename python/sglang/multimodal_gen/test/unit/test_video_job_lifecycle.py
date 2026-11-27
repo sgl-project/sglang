@@ -20,7 +20,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai import video_api, video_progress
-from sglang.multimodal_gen.runtime.entrypoints.openai.stores import AsyncDictStore
+from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VideoJobStore
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import select_output_variant
 from sglang.multimodal_gen.runtime.managers import progress_reporter
 from sglang.multimodal_gen.runtime.managers.progress_reporter import (
@@ -64,7 +64,7 @@ def test_worker_error_with_output_cannot_complete_video_job(monkeypatch, tmp_pat
 
     job = asyncio.run(run())
     assert job["status"] == "failed"
-    assert "save failed" in job["error"]["message"]
+    assert job["error"]["message"] == "Video generation failed"
     assert job["file_paths"] is None and job["url"] is None
 
 
@@ -519,7 +519,7 @@ def test_progress_tracker_averages_outputs():
 
 
 def test_apply_progress_only_moves_running_jobs(monkeypatch):
-    store = AsyncDictStore()
+    store = VideoJobStore()
     monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
 
     async def run_test():
@@ -558,7 +558,7 @@ def test_apply_progress_only_moves_running_jobs(monkeypatch):
     ],
 )
 def test_progress_listener_updates_store(monkeypatch, invalid_message):
-    store = AsyncDictStore()
+    store = VideoJobStore()
     tracker = video_progress.VideoProgressTracker()
     monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
     monkeypatch.setattr(video_progress, "VIDEO_PROGRESS", tracker)
@@ -604,7 +604,7 @@ def test_progress_listener_updates_store(monkeypatch, invalid_message):
 
 def test_progress_reporter_reconnects_after_listener_restart(monkeypatch):
     """Restarting telemetry must not require restarting the generating worker."""
-    store = AsyncDictStore()
+    store = VideoJobStore()
     tracker = video_progress.VideoProgressTracker()
     monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
     monkeypatch.setattr(video_progress, "VIDEO_PROGRESS", tracker)
@@ -644,7 +644,7 @@ def test_progress_reporter_reconnects_after_listener_restart(monkeypatch):
 
 @pytest.mark.parametrize("terminal_status", ["completed", "failed", "deleted"])
 def test_late_progress_cannot_revive_terminal_job(monkeypatch, terminal_status):
-    store = AsyncDictStore()
+    store = VideoJobStore()
     tracker = video_progress.VideoProgressTracker()
     monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
 
@@ -671,7 +671,7 @@ def test_late_progress_cannot_revive_terminal_job(monkeypatch, terminal_status):
 
 @pytest.mark.parametrize("outcome", ["failed", "cancelled"])
 def test_dispatch_always_unregisters_progress(monkeypatch, outcome):
-    store = AsyncDictStore()
+    store = VideoJobStore()
     tracker = video_progress.VideoProgressTracker()
     monkeypatch.setattr(video_api, "VIDEO_STORE", store)
     monkeypatch.setattr(video_api, "VIDEO_PROGRESS", tracker)

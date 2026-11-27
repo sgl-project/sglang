@@ -73,7 +73,7 @@ class TestSpecDecodeAllocationRowGuard(CustomTestCase):
     def _alloc(self, tree_cache, req_to_token, *, nxt_kv_len: int, num_needed: int):
         alloc_for_spec_decode(
             tree_cache,
-            SimpleNamespace(req_to_token=req_to_token),
+            SimpleNamespace(req_to_token=req_to_token, row_width=req_to_token.shape[1]),
             reqs=[SimpleNamespace(kv=MagicMock())],
             req_pool_indices=torch.tensor([0]),
             cur_kv_lens=torch.tensor([0]),
