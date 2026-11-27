@@ -1485,6 +1485,13 @@ class PrefillAdder:
             return encoder_swa_replay.replay_len(prefix_len)
         return 0
 
+    @staticmethod
+    def max_replay_len() -> int:
+        """The most replay rows `_replay_len` adds to a first chunk."""
+        if get_exec().features.enable_encoder_swa_bounded_replay:
+            return encoder_swa_replay.MAX_REPLAY_LEN
+        return 0
+
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
         if req.retracted_stain:
             # Retraction attribution is intentionally omitted for now; discard

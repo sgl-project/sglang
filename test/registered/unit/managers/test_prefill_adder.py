@@ -1372,15 +1372,16 @@ class TestPrefillAdder(CustomTestCase):
         with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(1024):
             self.assertIsNone(InputLogprobChunkCap.for_batch(1024).room)
 
-    def test_input_logprob_cap_below_the_chunk_step_is_rejected_at_startup(self):
+    def test_input_logprob_cap_below_the_first_chunk_is_rejected_at_startup(self):
         """Admission cuts a first chunk down to the truncation alignment, and to
-        whole pages unless it fills chunks exactly. A cap below that step cuts a
-        longer input-logprob prompt to an empty chunk, so it would wait forever;
-        the startup check rejects exactly those caps."""
+        whole pages unless it fills chunks exactly; a prefix hit's encoder replay
+        rows take chunk room ahead of its extend. A cap below the replay rows plus
+        that step cuts a longer input-logprob prompt to an empty chunk, so it would
+        wait forever; the startup check rejects exactly those caps."""
         self.mock_token_allocator.available_size.return_value = 100000
         self.mock_tree_cache.supports_mamba.return_value = False
 
-        def admit(cap_tokens, align):
+        def admit(cap_tokens, align, prefix_len):
             with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(cap_tokens):
                 cap = InputLogprobChunkCap.for_batch(4096)
             adder = self.create_adder(
@@ -1389,8 +1390,11 @@ class TestPrefillAdder(CustomTestCase):
                 rem_input_tokens=100000,
                 rem_chunk_tokens=4096,
             )
-            req = self._create_delayer_req(128, rid=f"lp_{cap_tokens}_{align}")
-            req.return_logprob, req.logprob_start_len = True, 0
+            req = self._create_delayer_req(
+                prefix_len + 128, rid=f"lp_{cap_tokens}_{align}_{prefix_len}"
+            )
+            req.prefix_len = prefix_len
+            req.return_logprob, req.logprob_start_len = True, prefix_len
             req.origin_input_ids = req.full_untruncated_fill_ids
             cap.add_one_req(
                 adder, req, has_chunked_req=False, truncation_align_size=align
@@ -1412,23 +1416,40 @@ class TestPrefillAdder(CustomTestCase):
                     return False
             return True
 
-        # (exact chunk fill, truncation alignment, cap, first chunk admitted)
+        # (exact chunk fill, truncation alignment, encoder replay, cap,
+        #  first chunk admitted); a replay case is a 256-token prefix hit.
         cases = (
-            (False, None, 32, []),
-            (False, None, 64, [64]),
-            (True, None, 32, [32]),
-            (True, 64, 32, []),
-            (True, 64, 64, [64]),
+            (False, None, False, 32, []),
+            (False, None, False, 64, [64]),
+            (True, None, False, 32, [32]),
+            (True, 64, False, 32, []),
+            (True, 64, False, 64, [64]),
+            (False, None, True, 128, []),
+            (False, None, True, 192, [64]),
+            (True, None, True, 128, []),
+            (True, None, True, 129, [1]),
         )
-        for exact, align, cap_tokens, admitted in cases:
-            with (
-                self.subTest(exact=exact, align=align, cap=cap_tokens),
-                patch.object(
-                    schedule_policy, "_use_exact_chunk_fill", return_value=exact
-                ),
-            ):
-                self.assertEqual(admit(cap_tokens, align), admitted)
-                self.assertEqual(accepted_at_startup(cap_tokens, align), bool(admitted))
+        for exact, align, replay, cap_tokens, admitted in cases:
+            override = get_context().override_server_args(
+                enable_encoder_swa_bounded_replay=replay
+            )
+            override.install()
+            try:
+                with (
+                    self.subTest(
+                        exact=exact, align=align, replay=replay, cap=cap_tokens
+                    ),
+                    patch.object(
+                        schedule_policy, "_use_exact_chunk_fill", return_value=exact
+                    ),
+                ):
+                    prefix_len = 256 if replay else 0
+                    self.assertEqual(admit(cap_tokens, align, prefix_len), admitted)
+                    self.assertEqual(
+                        accepted_at_startup(cap_tokens, align), bool(admitted)
+                    )
+            finally:
+                override.restore()
 
     @patch(
         "sglang.srt.managers.schedule_policy.page_interleave_shard_size",

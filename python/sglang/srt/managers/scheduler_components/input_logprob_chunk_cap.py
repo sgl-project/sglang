@@ -6,11 +6,10 @@ import math
 from typing import TYPE_CHECKING, Callable, Optional, TypeVar
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.managers.schedule_policy import PrefillAdder
 
 _T = TypeVar("_T")
 
@@ -49,22 +48,29 @@ class InputLogprobChunkCap:
         exact_chunk_fill: bool,
     ) -> None:
         """A first chunk is cut down to the truncation alignment, and to whole pages
-        unless admission fills chunks exactly (`uses_exact_chunk_fill`). A cap below
-        that step cuts an input-logprob prompt longer than the cap to zero tokens,
-        and the request would wait in the queue forever."""
+        unless admission fills chunks exactly (`uses_exact_chunk_fill`); a prefix
+        hit's encoder replay rows also take chunk room ahead of its extend. A cap
+        below the replay rows plus that step cuts an input-logprob prompt longer
+        than the cap to zero tokens, and the request would wait in the queue
+        forever."""
         cap = cls.for_batch(chunked_prefill_size).room
         align = truncation_align_size or 1
         if not exact_chunk_fill:
             align = math.lcm(page_size, align)
-        if cap is None or cap >= align:
+        replay = PrefillAdder.max_replay_len()
+        if cap is None or cap >= replay + align:
             return
         page_note = "" if exact_chunk_fill else f"page size {page_size}, "
+        step = (
+            f"a {align}-token chunk step ({page_note}truncation alignment "
+            f"{truncation_align_size})"
+        )
+        parts = f"{replay} encoder replay tokens plus {step}" if replay else step
         raise ValueError(
-            f"SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS={cap} is below the prefill chunk "
-            f"alignment of {align} tokens ({page_note}truncation alignment "
-            f"{truncation_align_size}); a request returning input logprobs longer "
-            f"than {cap} tokens could never be scheduled. Set it to at least "
-            f"{align}, or to 0 to disable the cap."
+            f"SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS={cap} is below the smallest first "
+            f"chunk of {replay + align} tokens: {parts}. A request returning input "
+            f"logprobs longer than {cap} tokens could never be scheduled. Set it to "
+            f"at least {replay + align}, or to 0 to disable the cap."
         )
 
     def add_chunked_req(self, adder: PrefillAdder, req: Req) -> Optional[Req]:
