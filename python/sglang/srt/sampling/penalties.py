@@ -374,7 +374,6 @@ class StepPenalties:
         return self._logit_penalties
 
     def apply(self, logits: torch.Tensor) -> None:
-        """Apply each row's penalties to its sampling logits row, in place."""
         additive, scaling = self.logit_penalties()
         if additive is not None:
             logits.add_(additive)
