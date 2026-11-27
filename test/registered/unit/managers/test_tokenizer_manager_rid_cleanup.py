@@ -45,6 +45,7 @@ from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     TokenizerManager,
     _add_sampling_mask_to_meta_info,
 )
+from sglang.srt.managers.worker_rid import strip_worker_rid_suffix  # noqa: E402
 from sglang.srt.multimodal.transport.cuda_ipc import (  # noqa: E402
     CudaIpcTensorTransportProxy,
 )
@@ -1117,6 +1118,80 @@ class TestMultiWorkerRidIsolation(CustomTestCase):
         asyncio.run(tm._handle_batch_output(_make_batch_str_output(handed_on)))
         self.assertEqual(state.out_list[-1]["meta_info"]["id"], "shared")
 
+    def test_a_session_turn_keeps_the_client_rid(self):
+        # A later turn names this one by the rid the client sent, possibly on another worker.
+        tm = self._worker("#aaaaaaaa")
+        obj = GenerateReqInput(
+            text="a", rid="turn-1", session_params={"id": "s"}, received_time=0.0
+        )
+        obj.normalize_batch_and_arguments()
+        tm._init_req_state(obj)
+        self.assertEqual(obj.rid, "turn-1")
+        self.assertIn("turn-1", tm.rid_to_state)
+
+    def test_a_streamed_batch_is_indexed_by_position(self):
+        tm = self._worker("#aaaaaaaa")
+        obj = self._register(tm, ["c0", "c1"])
+
+        async def output(rid):
+            yield {"meta_info": {"id": strip_worker_rid_suffix(rid, "#aaaaaaaa")}}
+
+        async def drive():
+            stream = tm._stream_batch_responses([output(r) for r in obj.rid])
+            return [result async for result in stream]
+
+        results = asyncio.run(drive())
+        self.assertEqual(
+            sorted((r["index"], r["meta_info"]["id"]) for r in results),
+            [(0, "c0"), (1, "c1")],
+        )
+
+    def test_parallel_samples_are_sent_with_the_rid_they_are_registered_by(self):
+        tm = self._worker("#aaaaaaaa")
+        obj = GenerateReqInput(
+            text="a", rid="c", sampling_params={"n": 2}, received_time=0.0
+        )
+        obj.normalize_batch_and_arguments()
+        tm._init_req_state(obj)
+        rids = obj.rid if isinstance(obj.rid, list) else [obj.rid]
+        request_states = {rid: tm.rid_to_state[rid] for rid in rids}
+
+        sent_rids = []
+        registered_at_send = []
+
+        async def tokenize(sub_obj):
+            return SimpleNamespace(
+                rid=sub_obj.rid,
+                mm_inputs=None,
+                input_ids=[1],
+                time_stats=None,
+                sampling_params=SimpleNamespace(
+                    max_new_tokens=8, for_sample=lambda i: SimpleNamespace()
+                ),
+                stream=False,
+            )
+
+        async def send(tokenized_obj):
+            sent_rids.append(tokenized_obj.rid)
+            registered_at_send.append(tokenized_obj.rid in tm.rid_to_state)
+
+        async def wait(sub_obj, request):
+            yield {"meta_info": {"id": sub_obj.rid}}
+
+        tm._tokenize_one_request = tokenize
+        tm._send_one_request = send
+        tm._wait_one_response = wait
+
+        async def drive():
+            async for _ in tm._handle_batch_request(obj, None, request_states):
+                pass
+
+        asyncio.run(drive())
+        # One warmup plus two samples, each sent by a rid this worker registered.
+        self.assertEqual(len(sent_rids), 3)
+        self.assertTrue(all(r.endswith("#aaaaaaaa") for r in sent_rids))
+        self.assertEqual(registered_at_send, [True, True, True])
+
 
 class TestResubmitAfterCompletion(CustomTestCase):
     """End-to-end test: complete a request, then resubmit with the same rid."""
@@ -1382,10 +1457,7 @@ class TestParallelStreamTaskCleanup(CustomTestCase):
                 finally:
                     sibling_closed.set()
 
-            stream = tm._stream_batch_responses(
-                [failing_choice(), blocked_choice()],
-                ["choice-0", "choice-1"],
-            )
+            stream = tm._stream_batch_responses([failing_choice(), blocked_choice()])
             with self.assertRaisesRegex(RuntimeError, "choice failed"):
                 await stream.__anext__()
             self.assertTrue(sibling_closed.is_set())
