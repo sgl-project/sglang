@@ -1639,7 +1639,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(cap + headroom, self.page_size)
 
     def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
-        if self._npu_kv_row_bytes is not None:
+        if _is_npu:
             return self._npu_kv_row_bytes[compress_ratio]
         # Unified rings and the trtllm uniform-FP8 pool have no page-internal pad.
         if self._unified or get_exec().kernel.dsv4_attn_backend == "trtllm":
@@ -1740,14 +1740,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _get_swa_fixed_bytes(self) -> float:
         """Bias bytes of the encoder-replay request window plus the cap-mode pool."""
-        paged_bytes = 0
-        if self.swa_cap_tokens is not None:
-            if self._npu_kv_row_bytes is not None:
-                paged_bytes = (
-                    self._npu_swa_pool_bytes(self.swa_cap_tokens) * self._spec_infl
-                )
-            else:
-                paged_bytes = self.swa_cap_tokens * self.bytes_per_swa_token
+        if _is_npu and self.swa_cap_tokens is not None:
+            return self.request_window_bytes + (
+                self._npu_swa_pool_bytes(self.swa_cap_tokens) * self._spec_infl
+            )
+
+        paged_bytes = (
+            0
+            if self.swa_cap_tokens is None
+            else self.swa_cap_tokens * self.bytes_per_swa_token
+        )
         return self.request_window_bytes + paged_bytes
 
     def _get_swa_tokens(self, full_token: int, page_size: int) -> int:
