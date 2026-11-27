@@ -112,7 +112,6 @@ def pick_idle_gpus(
 
 
 def configure_runtime_env(required_gpus: int = 1) -> str | None:
-    os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     if os.environ.get("CUDA_VISIBLE_DEVICES"):
         return None
     selected = ",".join(str(index) for index in pick_idle_gpus(required_gpus))

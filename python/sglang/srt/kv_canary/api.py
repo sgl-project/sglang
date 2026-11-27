@@ -67,7 +67,7 @@ def install_canary(
     if torch_reference_conflicts_with_decode_graph(device):
         raise ValueError(
             f"kv-canary: {device.type} has no canary CUDA kernels and its torch reference "
-            "cannot be graph-captured; pass --disable-cuda-graph (or "
+            "cannot be graph-captured; pass --disable-decode-cuda-graph --disable-prefill-cuda-graph (or "
             "--cuda-graph-backend-decode=disabled) when canary is enabled"
         )
     # EAGLE draft worker pools rotate input_ids so slot ``p`` stores K/V for the token at position ``p+1``;
@@ -83,7 +83,7 @@ def install_canary(
     swa_allocator = allocator if allocator.has_window_pool else None
     launch_capacities = CanaryLaunchCapacities.from_args(
         req_to_token_pool_size=model_runner.req_to_token_pool.size,
-        max_seq_len_per_req=model_runner.req_to_token_pool.req_to_token.shape[1],
+        max_seq_len_per_req=model_runner.req_to_token_pool.row_width,
         pool_slot_count=model_runner.max_total_num_tokens,
     )
     swa_window_size = model_runner.sliding_window_size or 0

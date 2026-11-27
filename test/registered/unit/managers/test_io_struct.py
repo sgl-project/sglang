@@ -48,8 +48,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
+register_amd_ci(est_time=8, suite="base-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=6, suite="extra-test-cpu-intel")
 
 
 class TestTokenizedReqInputMsgpack(unittest.TestCase):
@@ -118,11 +118,40 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 "GetInternalStateReq",
                 "FlushCacheReqInput",
                 "CheckWeightsReqInput",
+                "FreezeGCReq",
+                "SetInternalStateReq",
+                "ProfileReq",
+                "ExpertDistributionReq",
+                "SlowDownReqInput",
+                "ReleaseMemoryOccupationReqInput",
+                "ResumeMemoryOccupationReqInput",
+                "GetWeightsByNameReqInput",
+                "InitWeightsUpdateGroupReqInput",
+                "DestroyWeightsUpdateGroupReqInput",
+                "InitWeightsSendGroupForRemoteInstanceReqInput",
+                "SendWeightsToRemoteInstanceReqInput",
+                "AddExternalCorpusReqInput",
+                "RemoveExternalCorpusReqInput",
+                "ListExternalCorporaReqInput",
+                "OpenSessionReqInput",
+                "CloseSessionReqInput",
+                "GetHiCacheL3LayoutReq",
+                "ConfigureLoggingReq",
+                "DumperControlReqInput",
+                "UpdateWeightFromDiskReqInput",
+                "UpdateWeightsFromDistributedReqInput",
+                "UpdateWeightsFromTensorReqInput",
+                "UpdateWeightsFromIPCReqInput",
+                "BeginWeightUpdateReqInput",
+                "EndWeightUpdateReqInput",
+                "PluginWeightUpdateReqInput",
+                "PauseGenerationReqInput",
+                "ContinueGenerationReqInput",
+                "PdRoleSwitchReqInput",
+                "UpdateWeightVersionReqInput",
                 "ClearHiCacheReqInput",
                 "DetachHiCacheStorageReqInput",
                 "AttachHiCacheStorageReqInput",
-                "ProfileReq",
-                "FreezeGCReq",
             },
         )
         for name, body in messages:

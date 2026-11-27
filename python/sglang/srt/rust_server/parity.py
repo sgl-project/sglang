@@ -70,10 +70,7 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     # Routes the Rust server does not serve: their clients get a 404.
     "enable_mis": "/v1/decisions is not served.",
     "dllm_algorithm": "/v1/decisions is not served.",
-    "engine_info_bootstrap_url": "/get_remote_instance_transfer_engine_info is not served.",
-    "chunked_prefill_size": "/v1/score is not served.",
-    "enable_pd_role_switch": "/pd_role_switch is not served.",
-    "speculative_ngram_external_corpus_max_tokens": "/add_external_corpus is not served.",
+    "chunked_prefill_size": "Only read by /v1/score's score_extraction_token path, which the Rust frontend refuses.",
     # Settings of features Rust-server mode refuses.
     "SGLANG_WAIT_WEIGHTS_READY_TIMEOUT": "Only with --checkpoint-engine-wait-weights-before-ready, which is refused.",
     "max_loaded_loras": "LoRA (--enable-lora, --lora-paths) is refused.",
@@ -82,10 +79,6 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "otlp_traces_endpoint": "Only with --enable-trace, which is refused.",
     "trace_modules": "Only with --enable-trace, which is refused.",
     "trust_mm_content_hashes": "Only lets Python's preprocessing cache skip reading media it holds; Rust reads every item, with the same result.",
-    "watermark_context_window": "Only with --enable-watermark, which is refused.",
-    "watermark_default_enabled": "Only with --enable-watermark, which is refused.",
-    "watermark_enforce_all": "Only with --enable-watermark, which is refused.",
-    "watermark_key": "Only with --enable-watermark, which is refused.",
     "SGLANG_ENCODER_DISPATCH_MIN_ITEMS": "Encoder dispatch of --language-only, which is refused.",
     "enable_adaptive_dispatch_to_encoder": "Encoder dispatch of --language-only, which is refused.",
     "encoder_bootstrap_port": "Encoder dispatch of --language-only, which is refused.",
@@ -123,17 +116,11 @@ RUST_SERVER_HANDLED_ELSEWHERE: Dict[str, str] = {
     "SGLANG_ENABLE_COLOCATED_BATCH_GEN": "Refused when explicitly configured: Rust does not send the Python batch blocker markers (rust_server_unsupported_args).",
     "SGLANG_CPU_WORKERS": "Refused when explicitly configured (rust_server_unsupported_args).",
     "SGLANG_IO_WORKERS": "Refused when explicitly configured (rust_server_unsupported_args).",
-    "SGLANG_OLLAMA_ROOT_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
-    "SGLANG_OLLAMA_CHAT_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
-    "SGLANG_OLLAMA_GENERATE_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
-    "SGLANG_OLLAMA_TAGS_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
-    "SGLANG_OLLAMA_SHOW_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
     "SGLANG_GRPC_WORKER_THREADS": "Refused when explicitly configured (rust_server_unsupported_args).",
     "grammar_backend": "Per-turn Beam grammar is refused while scheduler grammar remains supported (rust_server_unsupported_args).",
     "context_length": "Passed as model_config.context_len (_build_server_args).",
     "language_model_only": "Passed as model_config.is_multimodal (_build_server_args).",
     "image_processor_backend": "Selects the HF image processor the Rust resize mirrors (RustMmFamily).",
-    "disable_fast_image_processor": "Selects the HF image processor the Rust resize mirrors (RustMmFamily).",
     "enable_watermark": "Refused in Rust-server mode (check_watermark_server_args).",
     "sidecar": "Run next to each node's first Rust listener (rust_server_sidecar).",
     "SGLANG_LOG_REQUEST_HEADERS": "Passed as RequestLogConfig.headers, request_logger's WHITELISTED_HEADERS (request_log_settings).",
@@ -147,7 +134,7 @@ RUST_SERVER_HANDLED_ELSEWHERE: Dict[str, str] = {
 # Python-frontend reads Rust-server mode ignores but should not: each changes
 # what a client or operator gets. Refuse or implement each, then drop it here.
 RUST_SERVER_KNOWN_GAPS: Dict[str, str] = {
-    "speculative_num_draft_tokens": "No per-request speculative-decoding stats in meta_info (also behind the speculative_algorithm read, honored by name).",
+    "speculative_num_draft_tokens": "Native /generate gets the scheduler's per-request speculative-decoding stats (SchedulerOutputStreamer.get_request_stats), but the OpenAI routes drop sglext.spec_tokens_details, and under adaptive speculative decoding the proposed-draft count follows the scheduler's active draft width where Python uses the launch value (also behind the speculative_algorithm read, honored by name).",
 }
 
 # Getters of the resolved config namespaces (``runtime_context``), whose

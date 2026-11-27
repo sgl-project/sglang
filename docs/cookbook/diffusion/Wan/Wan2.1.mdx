@@ -87,6 +87,8 @@ Measured with SGLang main `c7be3e9` (2026-09-29) on RTX 4090 24 GB (PCIe, no P2P
 | 1 | 840 s | 20.7 s | 12.5 GiB | 59 GiB |
 | 8 | 198 s | 4.8 s | 11.9 GiB | 483 GiB |
 
+These numbers were measured with the UMT5 text encoder in FP32. It now loads in BF16 by default, which takes about 10.6 GiB less memory per worker.
+
 Component CPU offload (`--dit-cpu-offload`) does not help here: it moves the whole DiT onto the GPU around each use.
 
 ## 4. Model Invocation

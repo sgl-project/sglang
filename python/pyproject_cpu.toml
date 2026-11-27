@@ -24,7 +24,6 @@ dependencies = [
   "build",
   "compressed-tensors",
   "datasets",
-  "deepseek-recipe==0.2.0 ; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin'",
   "easydict",
   "einops",
   "fastapi",
@@ -44,7 +43,7 @@ dependencies = [
   "openai==2.6.1",
   "openai-harmony==0.0.4",
   "orjson",
-  "outlines",
+  "outlines==0.1.11",
   "packaging",
   "partial_json_parser",
   # The Rust image pipeline (dynamo-multimodal) reproduces Pillow 12.x bicubic.
@@ -63,6 +62,7 @@ dependencies = [
   "scipy",
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
+  "sgl-deepseek-recipe==0.2.1 ; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin'",
   "soundfile==0.13.1",
   "tabulate",
   "tiktoken",
@@ -77,7 +77,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xxhash",
-  "xgrammar==0.2.7",
+  "xgrammar==0.2.9",
   "zstandard",
 ]
 

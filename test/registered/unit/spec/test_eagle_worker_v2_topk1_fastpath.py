@@ -23,7 +23,7 @@ from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorker
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
@@ -322,13 +322,12 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.index_share_for_mtp_iteration = True
                 forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
                 worker.draft_forward = MagicMock(return_value=graph_result)
-                attn_backend = SimpleNamespace(
-                    verify_mask=None,
-                    max_context_len=1,
-                )
+                attn_backend = SimpleNamespace(verify_mask=None)
                 worker.target_worker = SimpleNamespace(
                     model_runner=SimpleNamespace(
-                        attn_backend=attn_backend, runner_ids=None
+                        attn_backend=attn_backend,
+                        runner_ids=None,
+                        req_to_token_pool=SimpleNamespace(row_width=1),
                     )
                 )
                 draft_input = SimpleNamespace(
