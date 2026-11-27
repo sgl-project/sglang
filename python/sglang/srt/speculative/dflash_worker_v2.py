@@ -88,6 +88,7 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
     can_dflash_use_fused_qkv_proj,
+    commit_accept,
     compute_dflash_sampling_correct_drafts_and_bonus,
     get_dflash_attention_sliding_window_size,
     is_dense_head_weight,
@@ -266,16 +267,6 @@ class _DflashDraftSampler:
         selected = self.selected_ids[:, :n]
         torch.gather(gathered_ids.view(self.tp_size, n), 0, best_rank, out=selected)
         self.out[:n].copy_(selected.view(-1))
-
-
-def _commit_accept(candidates, accept_len, bonus_tokens):
-    """The committed block: drafted tokens shifted left, the bonus at the accept
-    boundary. Returns it with the commit lengths."""
-    out_tokens = torch.empty_like(candidates, dtype=torch.int64)
-    out_tokens[:, :-1].copy_(candidates[:, 1:])
-    out_tokens[:, -1].fill_(0)
-    out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus_tokens[:, None])
-    return out_tokens, accept_len.to(torch.int32) + 1
 
 
 def _resolve_dflash_embedding_module(draft_model, target_model):
@@ -2897,7 +2888,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     new_seq_lens_out=new_seq_lens,
                 )
             else:
-                out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+                out_tokens, commit_lens = commit_accept(candidates, accept_len, bonus)
         if SIMULATE_ACC_LEN > 0:
             # new_seq_lens, if a Triton kernel wrote it, holds the real
             # accept; it comes back rewritten from the forced lengths, or None.

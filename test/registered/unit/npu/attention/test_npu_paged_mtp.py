@@ -86,7 +86,9 @@ def batch(lengths=(127, 0)):
         extend_seq_lens=None,
         extend_seq_lens_cpu=[],
         spec_algorithm=SimpleNamespace(
-            is_dflash=lambda: False, is_dflash_family=lambda: True
+            is_dflash=lambda: False,
+            is_dflash_family=lambda: True,
+            uses_block_verify=lambda: True,
         ),
         spec_info=SimpleNamespace(
             draft_token_num=7, spec_input_type=mod.SpecInputType.DFLASH_VERIFY
