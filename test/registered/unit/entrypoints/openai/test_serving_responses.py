@@ -1298,6 +1298,29 @@ class InputItemNormalizationTestCase(CustomTestCase):
             ],
         )
 
+    def test_function_call_output_with_image_keeps_video_parts(self):
+        video = {"type": "video_url", "video_url": {"url": "https://x/clip.mp4"}}
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,AA"},
+                    video,
+                ],
+            }
+        )
+        self.assertEqual(
+            normalized["content"],
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA", "detail": "auto"},
+                },
+                video,
+            ],
+        )
+
     def test_tool_output_image_keeps_its_slot_before_a_user_image(self):
         template = (
             Path(__file__).resolve().parents[5]
