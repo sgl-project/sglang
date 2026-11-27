@@ -84,7 +84,7 @@ from sglang.srt.utils.device import get_compiler_backend
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    from sgl_kernel_npu.operators.norm import split_qkv_rmsnorm_rope
 _is_gfx95 = is_hip() and is_gfx95_supported()
 
 
@@ -549,51 +549,54 @@ class DFlashAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
-        elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
-            from sglang.kernels.ops.attention.table_qk_norm_rope import (
-                table_qk_norm_rope_,
-            )
-
-            # ROCm Muse path: K and V land in their own contiguous rows, which the
-            # attention backend would otherwise copy them into.
-            kv_out = None
-            if _muse_gfx95_like:
-                kv_out = (
-                    qkv.new_empty((qkv.shape[0], self.kv_size)),
-                    qkv.new_empty((qkv.shape[0], self.kv_size)),
-                )
-            table_qk_norm_rope_(
-                qkv,
-                positions,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                self.rotary_emb.cos_sin_cache,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.q_norm.variance_epsilon,
-                kv_out=kv_out,
-            )
-            if kv_out is None:
-                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            else:
-                q = qkv[:, : self.q_size]
-                k, v = kv_out
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            # In-place QK kernels use weight directly; Gemma requires 1 + weight.
-            q, k = apply_qk_norm(
-                q,
-                k,
-                self.q_norm,
-                self.k_norm,
-                self.head_dim,
-                allow_inplace=not self.use_gemma_norm,
-            )
-            q, k = self.rotary_emb(positions, q, k)
+            qkv, _ = self.qkv_proj(hidden_states)
+            if self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
+                from sglang.kernels.ops.attention.table_qk_norm_rope import (
+                    table_qk_norm_rope_,
+                )
+
+                # ROCm Muse path: K and V land in their own contiguous rows, which the
+                # attention backend would otherwise copy them into.
+                kv_out = None
+                if _muse_gfx95_like:
+                    kv_out = (
+                        qkv.new_empty((qkv.shape[0], self.kv_size)),
+                        qkv.new_empty((qkv.shape[0], self.kv_size)),
+                    )
+                table_qk_norm_rope_(
+                    qkv,
+                    positions,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.rotary_emb.cos_sin_cache,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.q_norm.variance_epsilon,
+                    kv_out=kv_out,
+                )
+                if kv_out is None:
+                    q, k, v = qkv.split(
+                        [self.q_size, self.kv_size, self.kv_size], dim=-1
+                    )
+                else:
+                    q = qkv[:, : self.q_size]
+                    k, v = kv_out
+            else:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                # In-place QK kernels use weight directly; Gemma requires 1 + weight.
+                q, k = apply_qk_norm(
+                    q,
+                    k,
+                    self.q_norm,
+                    self.k_norm,
+                    self.head_dim,
+                    allow_inplace=not self.use_gemma_norm,
+                )
+                q, k = self.rotary_emb(positions, q, k)
         if self.v_scale is not None:
             v = v * self.v_scale
         # save_kv_cache is passed only when off, so the default call stays as before.
@@ -1067,6 +1070,8 @@ class DFlashDecoderLayer(nn.Module):
             prefix=attention_prefix,
         )
         self.post_attention_layernorm = norm_cls(hidden_size, eps=rms_norm_eps)
+        self.post_self_attn_layernorm: Optional[nn.Module] = None
+        self.post_feedforward_layernorm: Optional[nn.Module] = None
         mlp_prefix = f"{prefix}.mlp" if prefix else ""
         self.mlp = DFlashMLP(
             config=config, quant_config=quant_config, prefix=mlp_prefix
@@ -1121,17 +1126,25 @@ class DFlashDecoderLayer(nn.Module):
             forward_batch=forward_batch,
             **attn_kwargs,
         )
-        if attention_kernel is not None:
+        if attention_kernel is not None and self.post_self_attn_layernorm is None:
             hidden_states, residual = self.attention_conv.finish_add_norm(
                 attn_out, attention_kernel, residual, self.post_attention_layernorm
             )
         else:
+            if attention_kernel is not None:
+                attn_out = self.attention_conv.finish(attn_out, attention_kernel)
+            if self.post_self_attn_layernorm is not None:
+                attn_out = self.post_self_attn_layernorm(attn_out)
             hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
 
         mlp_kernel = None
         if self.mlp_conv is not None:
             hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self.post_feedforward_layernorm is not None:
+            if mlp_kernel is not None:
+                hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
+            return self.post_feedforward_layernorm(hidden_states), residual, None
         if mlp_kernel is None:
             return hidden_states, residual, None
         if self.mlp_conv.fused:
@@ -1179,11 +1192,12 @@ class DFlashDraftModel(nn.Module):
         )
         attention_cls = self.decoder_layer_cls.attention_cls
         if draft_config.is_mla:
-            if attention_cls is not DFlashAttention:
+            if attention_cls is DFlashAttention:
+                attention_cls = DFlashMLAAttention
+            elif not issubclass(attention_cls, DFlashMLAAttention):
                 raise ValueError(
                     f"{type(self).__name__} does not support mla draft attention."
                 )
-            attention_cls = DFlashMLAAttention
             # No fused qkv_proj to slice.
             self.supports_fused_context_kv = False
         self.block_size = draft_config.resolve_block_size(default=16)

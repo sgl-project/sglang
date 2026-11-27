@@ -190,7 +190,6 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
             config.alloc_size = total_bytes
             config.scene = offload.Scene.LOCAL
             config.executor = offload.Executor.AICPU
-            config.flags = offload.OFFLOAD_FLAG_GIANT_PAGE
             ret = self._pool.initialize(config)
             if ret != 0:
                 self._pool = None
@@ -352,9 +351,11 @@ def reserve_mla_split_host_memory(
     )
     num_indexer_rows = num_index_tokens * len(buffers.index_layer_indices)
     if buffers.index_k is not None:
-        total_bytes += num_indexer_rows * buffers.index_width * dtype.itemsize
+        total_bytes += (
+            num_indexer_rows * buffers.index_width * buffers.index_k.dtype.itemsize
+        )
     if buffers.index_scales is not None:
-        total_bytes += num_indexer_rows * 4  # Host scales are FP32.
+        total_bytes += num_indexer_rows * buffers.index_scales.dtype.itemsize
 
     backend.ensure_capacity(total_bytes, torch.npu.current_device())
 

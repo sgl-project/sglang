@@ -81,7 +81,7 @@ dependencies = [
   "scipy",
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
-  "sgl-deep-ep==0.1.2.post1",
+  "sgl-deep-ep==0.1.3",
   "sgl-deep-gemm==0.2.9",
   "sgl-fa3==0.1.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",  # Only an x86_64 wheel is published.
   "sgl-flash-mla==1.0.5",
@@ -102,7 +102,7 @@ dependencies = [
   "uvicorn>=0.51",
   "uvloop",
   "watchfiles",
-  "xgrammar==0.2.7",
+  "xgrammar==0.2.9",
   "xxhash",
   "zstandard",
 ]
@@ -164,6 +164,13 @@ http2 = [
 
 fastokens = [
   "fastokens>=0.3.2",
+]
+
+# --cuda-graph-persistence (docs/advanced_features/cuda_graph_persistence).
+# foundry-core publishes Linux x86_64 wheels only.
+# TODO(xenshinu): require >=0.1.0 once foundry-core 0.1.0 is released.
+foundry = [
+  "foundry-core>=0.1.0rc5,<0.2 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 test = [

@@ -9,6 +9,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.sampling.penalties import uses_penalty
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu
 
@@ -58,6 +59,13 @@ class DllmAlgorithm:
     @classmethod
     def validate_request(cls, req: Req) -> Optional[str]:
         """Return an error for unsupported request features, if any."""
+        # A dLLM step bypasses the sampler, which keeps the penalty history.
+        if uses_penalty(req.sampling_params):
+            return (
+                "Diffusion LLMs do not support sampling penalties "
+                "(frequency_penalty, presence_penalty, repetition_penalty, "
+                "min_new_tokens)."
+            )
         return None
 
     def prepare_inputs(

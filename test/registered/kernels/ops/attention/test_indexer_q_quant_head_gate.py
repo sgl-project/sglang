@@ -45,5 +45,20 @@ def test_quant_head_gate_matches_bf16_reference(tokens, scale_fmt):
         torch.testing.assert_close(actual_w, expected_w, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("tokens", [0, 1, 17, 1024])
+def test_head_gate_matches_bf16_reference(tokens):
+    from sglang.kernels.ops.attention.dsa.head_gate import indexer_head_gate
+
+    torch.manual_seed(42)
+    heads, width = 32, 128
+    # Merged projection slices need not have a contiguous row stride.
+    gate = torch.randn(tokens, 160, device="cuda", dtype=torch.bfloat16)[:, 128:]
+    actual = indexer_head_gate(gate, width**-0.5)
+    expected = (gate * heads**-0.5).float().unsqueeze(-1) * width**-0.5
+    assert actual.shape == (tokens, heads, 1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
