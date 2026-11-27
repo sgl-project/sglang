@@ -1741,19 +1741,17 @@
                 ]
               },
               {
-                "group": "VLA (Vision-Language-Action) Models",
+                "group": "Action Models",
                 "pages": [
                   "cookbook/vla/intro",
                   {
                     "group": "Black Forest Labs",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/vla/FLUX/FLUX-3-Action"
                     ]
                   },
                   {
                     "group": "OpenPI",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/vla/OpenPI/Pi0.5"
                     ]
@@ -1765,6 +1763,12 @@
                       "cookbook/vla/Runway/Praxis-1"
                     ]
                   }
+                ]
+              },
+              {
+                "group": "Use Cases",
+                "pages": [
+                  "cookbook/use-cases/robotics-physical-ai"
                 ]
               },
               {
