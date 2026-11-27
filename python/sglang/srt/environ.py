@@ -1550,6 +1550,12 @@ class Envs:
     # ===================================================================
     # DeepGEMM
     # ===================================================================
+    # Send the BF16 GEMM shapes in unquant's _BF16_SPLITK_HEURISTIC_M_RANGES (GLM-5.2 at
+    # attention TP 1, tuned on VR200) to split-K kernels: warp split-K up to M 32, TGV
+    # split-K (FP32 partials + fixed-order sum) up to M 128; split_k follows the SM
+    # count. Allowlisted (M, N, K) keep their route. Needs --bf16-gemm-backend cutedsl.
+    # (Stack D H45, ported from ARIA-OP's overlay.)
+    SGLANG_ENABLE_BF16_SPLITK_GEMM_HEURISTIC = EnvBool(False)
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM = EnvBool(True)
     SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT = EnvBool(False)
@@ -1941,6 +1947,17 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Greedy topk=1 EAGLE drafts (decode steps and draft extend) take the token
+    # from per-rank vocab-shard argmax candidates exchanged by a small all-reduce
+    # instead of all-gathering the full logits. Bit-identical tokens; falls back
+    # to the gather when the TP all-reduce would go to NCCL or the LM head layout
+    # is not plain vocab-parallel.
+    SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE = EnvBool(False)
+    # Same exchange for the replicated --enable-dp-lm-head head on a pure-DP-attention
+    # decode node: the draft's LM head runs vocab-parallel over the DP ranks (their
+    # rows all-gathered, a row slice of the full weight per rank). Target untouched.
+    # (Stack D lane a, ported from ARIA-OP's overlay.)
+    SGLANG_OPT_SPEC_DRAFT_TP_LM_HEAD = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing
@@ -2385,6 +2402,16 @@ class Envs:
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
+    # Score each request's MTP draft-extend rows as one DeepGEMM paged-MQA request
+    # (q = [bs, next_n, H, D]), as target verify does, instead of one request per
+    # row, which rereads the index-K cache next_n times (SM100 family, DeepGEMM path).
+    # (Stack D H99, ported from ARIA-OP's overlay.)
+    SGLANG_OPT_DSA_DRAFT_EXTEND_NATIVE_MQA_LOGITS = EnvBool(False)
+    # MLA decode, verify and draft extend: one Triton launch for the q_a and kv_a
+    # RMSNorms, which also sums fused_qkv_a's split-K partials when it splits K.
+    # Same math in another reduction order, so default off.
+    # (Stack D lane e, ported from ARIA-OP's overlay.)
+    SGLANG_OPT_FUSED_MLA_QKV_A_NORM = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)

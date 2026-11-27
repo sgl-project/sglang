@@ -120,6 +120,19 @@ def _decline_fused(reason: str) -> None:
         logger.info("gfx950 fused DSA indexer declined this call: %s", reason)
 
 
+_DRAFT_EXTEND_NATIVE_LOGGED: set = set()
+
+
+def _log_draft_extend_native_once(next_n: int) -> None:
+    if next_n not in _DRAFT_EXTEND_NATIVE_LOGGED:
+        _DRAFT_EXTEND_NATIVE_LOGGED.add(next_n)
+        logger.info(
+            "DSA draft extend: DeepGEMM paged MQA logits score %d rows per "
+            "request as one request (native next_n)",
+            next_n,
+        )
+
+
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
@@ -1519,14 +1532,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 num_heads=self.n_heads,
             )
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
+        native_draft_extend = (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and envs.SGLANG_OPT_DSA_DRAFT_EXTEND_NATIVE_MQA_LOGITS.get()
+        )
         use_dg_native = (
             not use_cute_dsl
             and _is_cuda
-            and forward_batch.forward_mode.is_target_verify()
+            and (forward_batch.forward_mode.is_target_verify() or native_draft_extend)
             and next_n >= 2
             and ctx_2d is not None
             and ctx_2d.shape == (B, next_n)
         )
+        if use_dg_native and native_draft_extend:
+            _log_draft_extend_native_once(next_n)
 
         if use_dg_native:
             seqlens_32_2d = ctx_2d

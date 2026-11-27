@@ -1390,8 +1390,16 @@ class DeepseekSparseAttnBackend(
         # TODO: SM90 supports DG-native next_n in {1,2} too — enable once
         # validated; for now DG-native is SM100+ only.
         next_n = self.speculative_num_draft_tokens
+        # Draft extend v2 extends every request by exactly next_n tokens; the row
+        # count check keeps this layout in step with the indexer's (B, next_n) gate
+        # (SGLANG_OPT_DSA_DRAFT_EXTEND_NATIVE_MQA_LOGITS).
+        native_mode = forward_mode.is_target_verify() or (
+            forward_mode.is_draft_extend_v2()
+            and envs.SGLANG_OPT_DSA_DRAFT_EXTEND_NATIVE_MQA_LOGITS.get()
+            and seqlens_expanded.numel() == batch_size * next_n
+        )
         dg_native_verify = (
-            forward_mode.is_target_verify()
+            native_mode
             and next_n
             and next_n >= 2
             and get_platform().is_sm100

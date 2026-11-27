@@ -50,6 +50,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.models.deepseek_common.attention_forward_methods.fused_qkv_a_norm import (
+    fused_qkv_a_rmsnorm,
+)
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_cpu,
@@ -70,6 +73,7 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+_ENABLE_FUSED_MLA_QKV_A_NORM = envs.SGLANG_OPT_FUSED_MLA_QKV_A_NORM.get()
 
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
@@ -482,18 +486,26 @@ class DeepseekMLAForwardMixin:
         q_nope_out_alt = None
         fusion_plan: Optional[MlaBmmFusionPlan] = None
         if self.q_lora_rank is not None:
-            q, latent_cache = (
-                get_attn_tp_context()
-                .fetch_qkv_latent()
-                .split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                    dim=-1,
-                )
+            fused_norms = (
+                fused_qkv_a_rmsnorm(self, forward_batch)
+                if _ENABLE_FUSED_MLA_QKV_A_NORM
+                else None
             )
-            k_nope = latent_cache[..., : self.kv_lora_rank]
+            if fused_norms is None:
+                q, latent_cache = (
+                    get_attn_tp_context()
+                    .fetch_qkv_latent()
+                    .split(
+                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                        dim=-1,
+                    )
+                )
+                k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            if fused_norms is not None:
+                q, k_nope, latent_cache = fused_norms
+            elif self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)

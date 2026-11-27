@@ -35,6 +35,8 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
+import triton
+import triton.language as tl
 from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
@@ -1677,4 +1679,76 @@ def cutedsl_bf16_gemm_out(
 ) -> torch.Tensor:
     """Write the BF16 GEMM directly into a caller-owned contiguous tensor."""
     torch.ops.sglang.cutedsl_tgv_bf16_gemm_out(x, weight, out, bias)
+    return out
+
+
+_SPLITK_SUM_BLOCK = 1024
+
+
+@triton.jit(do_not_specialize=["numel"])
+def _splitk_sum_kernel(
+    partial_ptr,
+    out_ptr,
+    numel,
+    SPLIT_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # partial is [SPLIT_K, numel] fp32; slices are added in index order, so the
+    # result does not depend on the launch.
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    acc = tl.load(partial_ptr + offs, mask=mask, other=0.0)
+    for s in tl.static_range(1, SPLIT_K):
+        acc += tl.load(partial_ptr + s * numel + offs, mask=mask, other=0.0)
+    tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def tgv_splitk_bf16_gemm_partials(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    tactic: int,
+    split_k: int,
+) -> torch.Tensor:
+    """FP32 partials [split_k, M, N] of x[M, K] @ weight[N, K].T over split_k equal
+    K slices, from one TGV launch with the slices as its batch axis. x and weight
+    must be contiguous."""
+    m, k = x.shape
+    n = weight.shape[0]
+    k_slice = k // split_k
+    partial = torch.empty((split_k, m, n), dtype=torch.float32, device=x.device)
+    # Strided views, no copies: slice s of x is x[:, s*k_slice:(s+1)*k_slice].
+    _run_tgv(
+        x.view(m, split_k, k_slice).transpose(0, 1),
+        weight.view(n, split_k, k_slice).permute(1, 2, 0),
+        None,
+        partial,
+        pdl=True,
+        tactic=tactic,
+    )
+    return partial
+
+
+def tgv_splitk_bf16_gemm_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    tactic: int,
+    split_k: int,
+) -> torch.Tensor:
+    """out[M, N] = bf16(x[M, K] @ weight[N, K].T) with K cut into split_k equal
+    slices: one TGV launch over the slices as its batch axis, FP32 partials,
+    then a fixed-order sum. x, weight and out must be contiguous."""
+    if split_k == 1:
+        return _run_tgv(x, weight.t(), None, out, pdl=True, tactic=tactic)
+    partial = tgv_splitk_bf16_gemm_partials(x, weight, tactic=tactic, split_k=split_k)
+    numel = out.numel()
+    _splitk_sum_kernel[(triton.cdiv(numel, _SPLITK_SUM_BLOCK),)](
+        partial,
+        out,
+        numel,
+        SPLIT_K=split_k,
+        BLOCK=_SPLITK_SUM_BLOCK,
+    )
     return out

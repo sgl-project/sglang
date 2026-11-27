@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import collections
+import functools
 import logging
 import time
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Iterable, List, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, List, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_platform,
 )
+from sglang.srt.utils.device import get_device_core_count
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -239,6 +241,11 @@ _run_direct_dense = None
 _warp_splitk_tactic = None
 _run_warp_splitk_dense = None
 _enable_bf16_splitk_gemm = False
+_enable_bf16_splitk_heuristic = False
+_heuristic_warp_splitk_default_tactic = None
+_run_heuristic_warp_splitk = None
+_run_tgv_splitk = None
+_run_tgv_splitk_partials = None
 _mm_bf16 = None
 _flashinfer_autotuner = None
 # CuTe DSL tactics lose to the hand tables and TGV/cuBLAS at M = 24/32.
@@ -447,6 +454,180 @@ def prefer_bf16_splitk_over_fused_a(x: torch.Tensor, weight: torch.Tensor) -> bo
     return (
         _use_sm107_splitk_tactics
         and (x.shape[0], *weight.shape) in _BF16_SM107_FUSED_A_SPLITK_KEYS
+    ) or (
+        isinstance(x, torch.Tensor)
+        and _bf16_splitk_heuristic_route_for(x, weight, None) is not None
+    )
+
+
+# SGLANG_ENABLE_BF16_SPLITK_GEMM_HEURISTIC: GLM-5.2 projections at attention TP 1,
+# (N, K) -> M ranges where the routes below beat the image's route on VR (sm107)
+# under CUDA-graph replay with cold weights; other (N, K, M) keep their route, and
+# (M, N, K) in the tuned split-K tables above keep that table's tactic.
+_BF16_SPLITK_HEURISTIC_M_RANGES = {
+    (2624, 6144): ((1, 128),),  # fused_qkv_a
+    (6144, 16384): ((1, 128),),  # o_proj
+    (6144, 12288): ((1, 128),),  # dense MLP down
+    (4096, 2048): ((1, 32),),  # indexer wq_b
+    (24576, 6144): ((33, 64), (128, 128)),  # dense MLP gate_up
+}
+_BF16_SPLITK_HEURISTIC_MAX_M = 128
+# dense_bf16_gemm_warp_splitk serves M <= 32.
+_BF16_WARP_SPLITK_MAX_M = 32
+# TGV 2-CTA tactics by rows per CTA pair, as (cta_n, tactic id) with cta_n >= M:
+# 23 = (64, 64, 9), 24 = (64, 128, 7), 27 = (128, 64, 5), 28 = (128, 128, 4).
+_TGV_SPLITK_LADDER = (
+    (128, ((64, 23), (128, 24))),
+    (256, ((64, 27), (128, 28))),
+)
+_TGV_SPLIT_K_CHOICES = (8, 6, 4, 3, 2)
+# Arbitrary; shorter K slices cannot hide the TGV pipeline fill.
+_TGV_MIN_K_SLICE = 1024
+# (N, K, kernel) already logged; one line each per process.
+_bf16_splitk_heuristic_logged: set = set()
+
+
+class Bf16SplitKRoute(NamedTuple):
+    kernel: str  # "warp" or "tgv"
+    tactic: object  # WarpSplitKTactic for "warp", a TGV tactic id for "tgv"
+    split_k: int
+
+
+def bf16_splitk_heuristic_route(
+    m: int, n: int, k: int, num_sms: int
+) -> Optional[Bf16SplitKRoute]:
+    """For a listed (N, K) and M: warp split-K up to M = 32; above, TGV with one
+    token tile covering M and K split over its batch axis while the grid fits
+    one wave; else None."""
+    if not 1 <= m <= _BF16_SPLITK_HEURISTIC_MAX_M or n % 16 or k % 256:
+        return None
+    m_ranges = _BF16_SPLITK_HEURISTIC_M_RANGES.get((n, k), ())
+    if not any(m_lo <= m <= m_hi for m_lo, m_hi in m_ranges):
+        return None
+    if m <= _BF16_WARP_SPLITK_MAX_M:
+        return Bf16SplitKRoute(kernel="warp", tactic=None, split_k=1)
+    for pair_rows, tactics in _TGV_SPLITK_LADDER:
+        ctas = 2 * -(n // -pair_rows)
+        if ctas > num_sms:
+            continue
+        tactic = next(tactic for cta_n, tactic in tactics if cta_n >= m)
+        split_k = next(
+            (
+                split_k
+                for split_k in _TGV_SPLIT_K_CHOICES
+                if (k // 128) % split_k == 0
+                and k // split_k >= _TGV_MIN_K_SLICE
+                and ctas * split_k <= num_sms
+            ),
+            1,
+        )
+        return Bf16SplitKRoute(kernel="tgv", tactic=tactic, split_k=split_k)
+    return None
+
+
+@functools.cache
+def _resolve_bf16_splitk_heuristic_route(
+    m: int, n: int, k: int
+) -> Optional[Bf16SplitKRoute]:
+    route = bf16_splitk_heuristic_route(
+        m=m, n=n, k=k, num_sms=get_device_core_count(torch.cuda.current_device())
+    )
+    if route is not None and route.kernel == "warp":
+        try:
+            route = route._replace(
+                tactic=_heuristic_warp_splitk_default_tactic(m, n, k)
+            )
+        except ValueError:
+            route = None
+    if route is not None and (n, k, route.kernel) not in _bf16_splitk_heuristic_logged:
+        _bf16_splitk_heuristic_logged.add((n, k, route.kernel))
+        logger.info(f"BF16 split-K heuristic: M={m} N={n} K={k} -> {route}")
+    return route
+
+
+def _bf16_splitk_heuristic_route_for(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> Optional[Bf16SplitKRoute]:
+    if not _enable_bf16_splitk_heuristic or bias is not None:
+        return None
+    # Both kernels read packed rows through 32-byte-aligned TMA/cp.async views.
+    if not (x.is_contiguous() and weight.is_contiguous()):
+        return None
+    if x.data_ptr() % 32 or weight.data_ptr() % 32:
+        return None
+    m = x.numel() // x.shape[-1]
+    return _resolve_bf16_splitk_heuristic_route(m, weight.shape[0], weight.shape[1])
+
+
+def _bf16_splitk_heuristic_gemm(
+    x: torch.Tensor, weight: torch.Tensor, route: Bf16SplitKRoute
+) -> torch.Tensor:
+    x_2d = x.view(-1, x.shape[-1])
+    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    if route.kernel == "warp":
+        _run_heuristic_warp_splitk(
+            a=x_2d, b=weight.T, out=out, pdl=True, tactic=route.tactic
+        )
+    else:
+        _run_tgv_splitk(x_2d, weight, out, tactic=route.tactic, split_k=route.split_k)
+    return out.view(*x.shape[:-1], weight.shape[0])
+
+
+def bf16_linear_splitk_partials(
+    layer: torch.nn.Module, x: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """The FP32 partials [split_k, M, N] whose in-order sum is this BF16 linear's
+    output, when its forward would take the TGV split-K heuristic route with
+    split_k > 1; else None. The caller owns the sum."""
+    weight = layer.weight
+    if not (
+        isinstance(layer.quant_method, UnquantizedLinearMethod)
+        and layer.bias is None
+        and not use_intel_amx_backend(layer)
+        and not _use_aiter
+        and (get_bf16_gemm_backend().is_cutedsl() or get_bf16_gemm_backend().is_gemv())
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and not weight.requires_grad
+        and not torch.compiler.is_compiling()
+    ):
+        return None
+    # The route _bf16_gemm_dispatch_impl tries first: the tuned split-K tables.
+    m, n, k = x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
+    if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(m, n, k):
+        return None
+    route = _bf16_splitk_heuristic_route_for(x, weight, None)
+    if route is None or route.kernel != "tgv" or route.split_k == 1:
+        return None
+    return _run_tgv_splitk_partials(
+        x.view(m, k), weight, tactic=route.tactic, split_k=route.split_k
+    )
+
+
+def _init_bf16_splitk_heuristic() -> None:
+    global _enable_bf16_splitk_heuristic
+    global _heuristic_warp_splitk_default_tactic, _run_heuristic_warp_splitk
+    global _run_tgv_splitk, _run_tgv_splitk_partials
+
+    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+        tgv_splitk_bf16_gemm_out,
+        tgv_splitk_bf16_gemm_partials,
+    )
+    from sglang.kernels.ops.gemm.dense_bf16_gemm_warp_splitk import (
+        default_tactic,
+        run_warp_splitk_dense,
+    )
+
+    _heuristic_warp_splitk_default_tactic = default_tactic
+    _run_heuristic_warp_splitk = run_warp_splitk_dense
+    _run_tgv_splitk = tgv_splitk_bf16_gemm_out
+    _run_tgv_splitk_partials = tgv_splitk_bf16_gemm_partials
+    _enable_bf16_splitk_heuristic = True
+    logger.info(
+        "BF16 split-K heuristic enabled for (N, K) -> M ranges "
+        f"{_BF16_SPLITK_HEURISTIC_M_RANGES} on "
+        f"{get_device_core_count(torch.cuda.current_device())} SMs"
     )
 
 
@@ -485,6 +666,7 @@ def initialize_bf16_gemm_config() -> None:
     global _run_direct_dense
     global _warp_splitk_tactic, _run_warp_splitk_dense
     global _enable_bf16_splitk_gemm, _use_sm107_splitk_tactics
+    global _enable_bf16_splitk_heuristic
     global _active_warp_splitk_tactics
     global _mm_bf16, _flashinfer_autotuner
     global _skip_aiter_unquant
@@ -600,6 +782,10 @@ def initialize_bf16_gemm_config() -> None:
         _sm12x_bf16_gemv = sm12x_bf16_gemv
         _use_sm12x_bf16_gemv = use_sm12x_bf16_gemv
         _b12x_bf16_gemv = b12x_bf16_gemv
+
+    _enable_bf16_splitk_heuristic = False
+    if backend.is_cutedsl() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM_HEURISTIC.get():
+        _init_bf16_splitk_heuristic()
 
     _BF16_GEMM_BACKEND = backend
 
@@ -723,6 +909,10 @@ def _bf16_gemm_dispatch_impl(
         m, weight.shape[0], weight.shape[1]
     ):
         output = _bf16_splitk_gemm(x, weight, bias)
+    elif (
+        splitk_route := _bf16_splitk_heuristic_route_for(x, weight, bias)
+    ) is not None:
+        output = _bf16_splitk_heuristic_gemm(x, weight, splitk_route)
     elif _use_bf16_tiny_gemv(x, weight, bias):
         output = _hopper_bf16_tiny_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1

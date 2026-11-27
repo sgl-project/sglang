@@ -6,8 +6,10 @@ from typing import Callable, List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import (
+    draft_topk1_argmax_from_partials,
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
+    draft_topk1_postprocess_from_partials,
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
@@ -25,6 +27,7 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -55,6 +58,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
     get_exec,
+    get_forward,
     get_model,
     get_parallel,
     get_schedule,
@@ -191,6 +195,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     draft_runtime: eagle_megakernel.EagleDraftRuntime = (
         eagle_megakernel.STOCK_EAGLE_DRAFT_RUNTIME
     )
+    # Greedy topk=1 drafts may take the token from exchanged vocab-shard argmax
+    # partials (the draft_argmax_only forward flag); set in __init__, off for
+    # harnesses that skip it.
+    draft_argmax_exchange: bool = False
+    draft_extend_argmax_only: bool = False
+    # Logits width of the opted-in draft processors (the token-id bound).
+    draft_argmax_vocab_size: Optional[int] = None
 
     def __init__(
         self,
@@ -251,6 +262,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        self._init_draft_argmax_exchange()
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
@@ -371,6 +383,62 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         if (c := self.draft_runner.canary_manager) is not None:
             c.mark_init_finished()
+
+    def _init_draft_argmax_exchange(self) -> None:
+        """Opt the draft model's own LM-head processors into argmax partials."""
+        if not (
+            _is_cuda
+            and self.topk == 1
+            and (
+                envs.SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE.get()
+                or envs.SGLANG_OPT_SPEC_DRAFT_TP_LM_HEAD.get()
+            )
+        ):
+            return
+        target_processors = {
+            id(module)
+            for module in self.target_worker.model_runner.model.modules()
+            if isinstance(module, LogitsProcessor)
+        }
+        # The protocol: each draft processor's enable_draft_argmax_exchange()
+        # decides; False (ineligible, or a subclass that serves the draft top-1
+        # on its own path) keeps that processor on its logits path.
+        draft_processors = [
+            module
+            for module in self.draft_runner.model.modules()
+            if isinstance(module, LogitsProcessor)
+            and id(module) not in target_processors
+        ]
+        enabled, declined = [], []
+        for lp in draft_processors:
+            if lp.enable_draft_argmax_exchange():
+                enabled.append(lp)
+            else:
+                # A declining override may not have reset the attribute.
+                lp.draft_argmax_exchange = False
+                declined.append(type(lp).__name__)
+        self.draft_argmax_exchange = bool(enabled)
+        # Draft extend picks its first token by plain argmax unless it samples.
+        self.draft_extend_argmax_only = (
+            self.draft_argmax_exchange
+            and not get_spec().speculative_use_rejection_sampling
+        )
+        if enabled:
+            self.draft_argmax_vocab_size = max(lp.vocab_size for lp in enabled)
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "Draft argmax exchange: %s.",
+                (
+                    f"on, {len(enabled)} draft LM-head processor(s) opted in "
+                    f"(draft extend: {self.draft_extend_argmax_only}, replicated "
+                    f"DP LM head sharded: {any(lp.can_exchange_argmax_dp for lp in enabled)})"
+                    if enabled
+                    else "steps aside, the draft LM-head processor(s) "
+                    f"{', '.join(sorted(set(declined))) or '(none)'} declined "
+                    "(not pure-TP vocab-parallel, or the processor keeps its "
+                    "own draft top-1 path)"
+                ),
+            )
 
     def _init_dsa_index_share_state(self) -> None:
         # Populate DSA index-share fields from the draft runner's hf_config.
@@ -915,6 +983,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ):
             fold = None
         forward_batch.draft_step_fold = fold
+        argmax_only = (
+            self.draft_argmax_exchange and not needs_draft_probs and fold is None
+        )
         mrope = None
         if fold is not None and self.draft_runner.model_config.model_is_mrope:
             mrope = forward_batch.mrope_positions
@@ -965,6 +1036,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         forward_batch=forward_batch,
                     ),
                     canary_index_ctx,
+                    get_forward().scoped(draft_argmax_only=argmax_only),
                 ):
                     logits_output = self.draft_runner.forward(
                         forward_batch
@@ -975,7 +1047,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if needs_draft_probs:
+                argmax_partials = logits_output.next_token_argmax_partials
+                if argmax_partials is not None:
+                    topk_p, topk_index = draft_topk1_postprocess_from_partials(
+                        argmax_partials,
+                        forward_batch.positions,
+                        draft_tokens_topk1,
+                        i + 1,
+                    )
+                elif needs_draft_probs:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
@@ -1019,11 +1099,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch.positions.add_(1)
                 if self.draft_runner.model_config.model_is_mrope and mrope is None:
                     forward_batch.mrope_positions.add_(1)
+                vocab_size = (
+                    logits_output.next_token_logits.shape[-1]
+                    if argmax_partials is None
+                    else self.draft_argmax_vocab_size
+                )
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    vocab_size,
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={vocab_size}",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
@@ -1484,9 +1569,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch, select_index
                 )
             else:
-                draft_logits_output = self.draft_runner.forward(
-                    forward_batch
-                ).logits_output
+                with get_forward().scoped(
+                    draft_argmax_only=self.draft_extend_argmax_only
+                ):
+                    draft_logits_output = self.draft_runner.forward(
+                        forward_batch
+                    ).logits_output
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,
@@ -1510,9 +1598,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Reorganize the spec info for the next batch
         if not can_run_decode_cuda_graph:
-            draft_logits_output.next_token_logits = (
-                draft_logits_output.next_token_logits[select_index]
-            )
+            if draft_logits_output.next_token_logits is not None:
+                draft_logits_output.next_token_logits = (
+                    draft_logits_output.next_token_logits[select_index]
+                )
+            if draft_logits_output.next_token_argmax_partials is not None:
+                draft_logits_output.next_token_argmax_partials = (
+                    draft_logits_output.next_token_argmax_partials[select_index]
+                )
             if draft_logits_output.hidden_states is not None:
                 draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                     select_index
@@ -1521,6 +1614,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # The always-present strategy returns captured top-1 or invokes this
         # unchanged selected-row stock sampler.
         def stock_extend_tokens():
+            if draft_logits_output.next_token_argmax_partials is not None:
+                # Same order as the torch.argmax below: NaN first, lowest index on ties.
+                ret_topk_p, ret_topk_index = draft_topk1_argmax_from_partials(
+                    draft_logits_output.next_token_argmax_partials
+                )
+                return None, ret_topk_p, ret_topk_index
             if get_spec().speculative_use_rejection_sampling:
                 return sample_draft_proposal(
                     draft_logits_output.next_token_logits,
