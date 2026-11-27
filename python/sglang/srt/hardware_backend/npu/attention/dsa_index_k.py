@@ -1,20 +1,4 @@
-from functools import lru_cache
-
 import torch
-
-
-@lru_cache(maxsize=1)
-def get_scored_indexer():
-    try:
-        from sgl_kernel_npu.operators.indexer import lightning_indexer_v2
-
-        # The public wrapper can be installed without its CANN binding.
-        from sgl_kernel_npu._third_party.sgl_ops_transformer.ops import (
-            lightning_indexer,
-        )
-    except (ImportError, OSError, RuntimeError):
-        return None
-    return lightning_indexer_v2 if callable(lightning_indexer) else None
 
 
 def plan_index_k_prefill_gather(
@@ -52,9 +36,11 @@ def score_sharded_index_k(
     if query.shape[0] == 0 or block_table.shape[1] == 0:
         return query.new_full((query.shape[0], topk), -1, dtype=torch.int32)
 
+    from sgl_kernel_npu.operators.indexer import lightning_indexer_v2
+
     # Decode and Verify both supply one KV frontier per query. Treat each
     # query as a separate request so a page boundary cannot change causality.
-    indices, scores = get_scored_indexer()(
+    indices, scores = lightning_indexer_v2(
         query.contiguous(),
         key,
         weights.reshape(query.shape[:-1]).float().contiguous(),

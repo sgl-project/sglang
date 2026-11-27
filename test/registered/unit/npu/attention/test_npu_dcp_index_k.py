@@ -23,16 +23,11 @@ class TestNpuDcpIndexK(unittest.TestCase):
             is_draft_worker=False,
             kv_cache_dtype=torch.bfloat16,
         )
-        scored_indexer = Mock(return_value=None)
         with patch.multiple(
             pool_configurator,
             get_parallel=lambda: parallel,
             get_memory=lambda: SimpleNamespace(enable_hisparse=False),
-            get_scored_indexer=scored_indexer,
         ):
-            with self.assertRaisesRegex(RuntimeError, "scored lightning_indexer_v2"):
-                pool_configurator.resolve_kimi_k31_index_k_sharding(kvc)
-            scored_indexer.return_value = object()
             self.assertTrue(pool_configurator.resolve_kimi_k31_index_k_sharding(kvc))
             kvc.kv_cache_dtype = torch.float8_e4m3fn
             with self.assertRaisesRegex(ValueError, "requires sharded Index-K"):
@@ -64,8 +59,13 @@ class TestNpuDcpIndexK(unittest.TestCase):
             all_gather=lambda local, dim: torch.cat((peer_candidates, local), dim=dim),
         )
         scored_indexer = Mock(return_value=(local_indices, local_scores))
-        with patch.object(
-            dsa_index_k, "get_scored_indexer", return_value=scored_indexer
+        with patch.dict(
+            "sys.modules",
+            {
+                "sgl_kernel_npu.operators.indexer": SimpleNamespace(
+                    lightning_indexer_v2=scored_indexer
+                )
+            },
         ):
             result = dsa_index_k.score_sharded_index_k(
                 torch.zeros((3, 1, 128), dtype=torch.bfloat16),

@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_kpool, is_kimi_k31
-from sglang.srt.hardware_backend.npu.attention.dsa_index_k import get_scored_indexer
 from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
 from sglang.srt.runtime_context import get_memory, get_parallel
 
@@ -28,11 +27,6 @@ def resolve_kimi_k31_index_k_sharding(kvc: KVCacheConfigurator) -> bool:
         raise ValueError(
             "Ascend Kimi K3.1 DCP requires sharded Index-K with BF16 KV "
             "and index_kpool=1, without the HiSparse KV pool."
-        )
-    if get_scored_indexer() is None:
-        raise RuntimeError(
-            "Ascend Kimi K3.1 DCP requires the scored lightning_indexer_v2 "
-            "binding from sgl-kernel-npu for CANN 9.2 on A3."
         )
     return True
 
