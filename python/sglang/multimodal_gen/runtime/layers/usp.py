@@ -496,6 +496,30 @@ def ulysses_head_group_pipelined_attention(
     world_size = get_ulysses_parallel_world_size()
     rows, heads, head_size = q.shape
     group_heads = heads // (world_size * groups)
+    if torch.version.hip is not None and q.is_cuda:
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_rocm import (
+            IPC_A2A_ROCM,
+            rocm_ce_ready,
+        )
+
+        # flag waits and SDMA copies cannot be captured into a graph
+        if not torch.cuda.is_current_stream_capturing() and rocm_ce_ready(group):
+
+            def pack(q_, k_, v_, n):
+                return pack_qkv_destination_major(
+                    q_,
+                    k_,
+                    v_,
+                    n,
+                    out=_a2a_staging_buffer(
+                        "usp_packed_qkv_src",
+                        (n, rows, heads // n, 3 * head_size),
+                        q.dtype,
+                        q.device,
+                    ),
+                )
+
+            return IPC_A2A_ROCM.pipelined_attention(q, k, v, attend, groups, pack)
     # pack block w * groups + g holds rank w's heads of group g
     packed = pack_qkv_destination_major(
         q,
