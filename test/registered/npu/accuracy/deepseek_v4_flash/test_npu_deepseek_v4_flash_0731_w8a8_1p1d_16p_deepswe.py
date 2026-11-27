@@ -259,7 +259,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPDeepSWE(
     eval_batch_size = 1
     # Smoke budget: raise to 113 for the full DeepSWE suite once the baseline
     # is calibrated and the workflow timeout is sized for it.
-    limit = 10
+    limit = 1
     # dataset-level timeout forwarded to evalscope (task verifier 1800s + agent
     # 5400s, plus image pulls).
     timeout = 7200

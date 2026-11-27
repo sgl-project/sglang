@@ -27,6 +27,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 
 # The eval image may bundle torch_npu, but the amd64 eval node has no Ascend
 # driver; torch auto-loading it crashes evalscope. DeepSWE talks to the router
@@ -266,6 +268,42 @@ def run_evalscope(config):
     return process.returncode, output_lines
 
 
+def log_docker_diagnostics(prefix):
+    """Print dind state so a slow first-task build stays visible.
+
+    pier captures ``docker compose build`` output and only surfaces it when the
+    build finishes, so a task can sit at "0%" for the whole image pull + build
+    with nothing in the log. ``docker ps``/``docker images`` reveal whether the
+    pull/build is alive and how far it got.
+    """
+    for args in (
+        ["ps", "-a", "--format", "{{.Names}}|{{.Status}}|{{.Image}}"],
+        ["images", "--format", "{{.Repository}}:{{.Tag}}"],
+    ):
+        try:
+            result = subprocess.run(
+                ["docker", *args], capture_output=True, text=True, timeout=30
+            )
+            lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+            detail = "; ".join(lines[-10:]) if lines else "<none>"
+            print(f"[diag]{prefix} docker {args[0]}: {detail}", flush=True)
+        except Exception as e:  # noqa: BLE001 - diagnostics only
+            print(f"[diag]{prefix} docker {args[0]} failed: {e}", flush=True)
+
+
+def start_docker_heartbeat(interval=60):
+    """Back a daemon thread that logs dind state every ``interval`` seconds."""
+    stop = threading.Event()
+    start = time.time()
+
+    def _loop():
+        while not stop.wait(interval):
+            log_docker_diagnostics(f" +{int(time.time() - start)}s")
+
+    threading.Thread(target=_loop, daemon=True).start()
+    return stop
+
+
 def find_report_path(output_lines, work_dir):
     """Locate the evalscope report.
 
@@ -293,7 +331,11 @@ def main():
     config = build_config()
     print(f"DeepSWE evalscope config: {json.dumps(config, ensure_ascii=False)}")
 
-    returncode, output_lines = run_evalscope(config)
+    stop_heartbeat = start_docker_heartbeat()
+    try:
+        returncode, output_lines = run_evalscope(config)
+    finally:
+        stop_heartbeat.set()
     if returncode != 0:
         print(f"ERROR: DeepSWE evalscope exited with code {returncode}")
         return returncode or 1
