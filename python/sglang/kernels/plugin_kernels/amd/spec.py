@@ -165,6 +165,8 @@ class MonoSpec(msgspec.Struct, frozen=True):
     tokens_per_request: Optional[Callable[[torch.nn.Module], int]] = None
     # per-step metadata the forward never reads; backends skip it on routed steps
     unread_metadata: frozenset[StepMetadata] = frozenset()
+    # Optional draft acceleration can keep the standard path on unsupported setups.
+    allow_model_fallback: bool = False
 
     def widths(self, isa: str) -> tuple[int, ...]:
         return self.devices[isa].widths

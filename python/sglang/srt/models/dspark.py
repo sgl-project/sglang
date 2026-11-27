@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Iterable, Optional, Tuple
 
 import msgspec
@@ -26,7 +27,7 @@ from sglang.srt.layers.quantization.unquant import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     builds_confidence_head,
@@ -210,6 +211,24 @@ class VanillaMarkov(BaseDSparkMarkovHead):
             )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
         self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self.register_buffer("xpu_w2_norms", None, persistent=False)
+
+    @torch.no_grad()
+    def update_xpu_w2_norms(self) -> None:
+        weight = self.markov_w2.weight
+        if (
+            not weight.is_xpu
+            or weight.dtype != torch.bfloat16
+            or self.markov_rank != 256
+            or not weight.is_contiguous()
+            or not get_exec().kernel.enable_xpu_monokernel
+        ):
+            return
+        norms = torch.linalg.vector_norm(weight, dim=1, dtype=torch.float32)
+        if self.xpu_w2_norms is None:
+            self.xpu_w2_norms = norms
+        else:
+            self.xpu_w2_norms.copy_(norms)
 
     def configure_tp_shard(self, *, lm_head: nn.Module, prefer_nvlink: bool) -> None:
         """Bias only this rank's lm_head vocab slice; each step then exchanges
@@ -748,6 +767,11 @@ class DSparkDraftMixin:
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 
+        if type(self.markov_head) is VanillaMarkov and any(
+            name == "markov_head.markov_w2.weight" for name, _ in markov_weights
+        ):
+            self.markov_head.update_xpu_w2_norms()
+
         self._load_confidence_weights(
             confidence_weights=confidence_weights, params_dict=params_dict
         )
@@ -797,6 +821,21 @@ class DSparkDraftMixin:
         layers = list(self.layers)
         if not layers or _has_mla_layers(layers):
             return None
+        first_weight = getattr(layers[0].self_attn.qkv_proj, "weight", None)
+        if (
+            first_weight is not None
+            and first_weight.is_xpu
+            and get_exec().kernel.enable_xpu_monokernel
+        ):
+            project = self._xpu_fp8_kv_projection(layers)
+            if project is not None:
+                bundle = self._fused_kv_write_layout(pool, project=project)
+                if bundle is not None:
+                    logger.info(
+                        "DSpark uses a stacked FP8 KV projection for %d layers",
+                        len(layers),
+                    )
+                return bundle
         weights = []
         for layer in layers:
             attn = layer.self_attn
@@ -809,6 +848,54 @@ class DSparkDraftMixin:
             weights.append(w)
         w_all = torch.cat(weights, dim=0).contiguous()
         return self._fused_kv_write_layout(pool, project=lambda x: F.linear(x, w_all))
+
+    @staticmethod
+    def _xpu_fp8_kv_projection(layers):
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
+
+        weights, scales = [], []
+        for layer in layers:
+            attn = layer.self_attn
+            qkv = attn.qkv_proj
+            method = qkv.quant_method
+            if (
+                type(method) is not Fp8LinearMethod
+                or method.block_quant
+                or not method.use_per_token_if_dynamic
+                or qkv.input_scale is not None
+                or qkv.bias is not None
+                or attn.v_scale is not None
+            ):
+                return None
+            weight = qkv.weight
+            if (
+                not weight.is_xpu
+                or weight.dtype != _FP8_DTYPE
+                or weight.ndim != 2
+                or weight.shape[1] != attn.q_size + 2 * attn.kv_size
+                or not weight.t().is_contiguous()
+            ):
+                return None
+            scale = qkv.weight_scale
+            if (
+                scale.shape != (weight.shape[1], 1)
+                or scale.dtype != torch.float32
+                or not scale.is_contiguous()
+            ):
+                return None
+            kv = slice(attn.q_size, attn.q_size + 2 * attn.kv_size)
+            # Keep the original quantization. Only the K/V rows are copied
+            # into the stacked projection, in the layout the XPU GEMM expects.
+            weights.append(weight.t()[kv].view(torch.uint8))
+            scales.append(scale[kv])
+        return partial(
+            apply_fp8_linear,
+            weight=torch.cat(weights, dim=0).view(_FP8_DTYPE).t(),
+            weight_scale=torch.cat(scales, dim=0),
+            cutlass_fp8_supported=False,
+            use_per_token_if_dynamic=True,
+        )
 
     def _fused_k_norm_weights(self) -> list[torch.Tensor]:
         """Per-layer multipliers the K norm applies to the normalized row."""

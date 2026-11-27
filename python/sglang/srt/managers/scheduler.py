@@ -5571,7 +5571,10 @@ class Scheduler(
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 gpu_only_lens = (
-                    _is_hip
+                    (
+                        _is_hip
+                        or (self.device == "xpu" and self.spec_algorithm.is_dspark())
+                    )
                     and self._confidence_budget_prepare is None
                     and not getattr(self.future_map, "needs_cpu_seq_lens", True)
                 )

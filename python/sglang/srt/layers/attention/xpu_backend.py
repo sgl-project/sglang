@@ -24,6 +24,11 @@ from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
@@ -260,6 +265,18 @@ class XPUAttentionBackend(AttentionBackend):
             self.dcp_group = get_parallel().dcp_group
             self.dcp_comm_backend = get_parallel().dcp_comm_backend
             self._assert_dcp_supported()
+        self.needs_cpu_seq_lens = not (
+            get_exec().kernel.enable_xpu_monokernel
+            and get_spec().speculative_algorithm == "DSPARK"
+            and check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
+            and not self.is_encoder_decoder
+            and not self.use_mla
+            and not self.has_swa
+            and not self.use_sliding_window_kv_pool
+            and self.attention_chunk_size is None
+            and self.dcp_size == 1
+        )
+
         # Paged KV kernels are exact only at page 1/64/128; index per token otherwise.
         if (
             not self.use_mla
@@ -275,6 +292,13 @@ class XPUAttentionBackend(AttentionBackend):
         self.bidirectional_block_ids = None
         # Set with the ids by models whose full-attention layers stay causal.
         self.bidirectional_sliding_layers_only = False
+
+    @staticmethod
+    def _eager_max_seq_len(forward_batch: ForwardBatch) -> int:
+        lengths = forward_batch.seq_lens_cpu
+        if lengths is None:
+            lengths = forward_batch.seq_lens
+        return int(lengths.max().item())
 
     def _assert_dcp_supported(self):
         if self.has_swa:
@@ -408,7 +432,7 @@ class XPUAttentionBackend(AttentionBackend):
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
                     ).to(torch.int32)
-                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
+                    metadata.max_seq_len_k = self._eager_max_seq_len(forward_batch) + (
                         self.speculative_step_id + 1
                     )
                     metadata.cu_seqlens_q = torch.arange(
@@ -426,7 +450,7 @@ class XPUAttentionBackend(AttentionBackend):
                 else:
                     metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
                     metadata.max_seq_len_q = self.topk
-                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                    metadata.max_seq_len_k = self._eager_max_seq_len(forward_batch)
                     metadata.cu_seqlens_q = torch.arange(
                         0,
                         batch_size * self.topk + 1,
@@ -477,7 +501,7 @@ class XPUAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = self._eager_max_seq_len(forward_batch)
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -503,7 +527,7 @@ class XPUAttentionBackend(AttentionBackend):
                 ).to(torch.int32)
                 metadata.max_seq_len_q = num_tokens_per_req
                 metadata.max_seq_len_k = (
-                    forward_batch.seq_lens_cpu.max().item() + num_tokens_per_req
+                    self._eager_max_seq_len(forward_batch) + num_tokens_per_req
                 )
                 metadata.cu_seqlens_q = torch.arange(
                     0,
@@ -526,7 +550,7 @@ class XPUAttentionBackend(AttentionBackend):
             else:
                 metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = self._eager_max_seq_len(forward_batch)
                 metadata.cu_seqlens_q = torch.arange(
                     0,
                     batch_size * self.speculative_num_draft_tokens + 1,
@@ -629,7 +653,7 @@ class XPUAttentionBackend(AttentionBackend):
             or forward_batch.forward_mode.is_dllm_extend()
         ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.max_seq_len_k = self._eager_max_seq_len(forward_batch)
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
@@ -1843,12 +1867,13 @@ class XPUAttentionBackend(AttentionBackend):
         req_pool_indices = req_pool_indices[:bs]
 
         metadata = self.decode_cuda_graph_metadata[bs]
-        max_len = (
-            seq_lens_cpu.max().item()
-            if seq_lens_cpu is not None
-            else seq_lens.max().item()
-        )
-        metadata.max_seq_len_k = max_len + kv_len_offset
+        if seq_lens_cpu is not None:
+            metadata.max_seq_len_k = int(seq_lens_cpu.max().item()) + kv_len_offset
+        elif not self.needs_cpu_seq_lens:
+            # Refresh the live prefix of the static page table with device lengths.
+            metadata.max_seq_len_k = metadata.page_table.shape[1] * self.page_size
+        else:
+            metadata.max_seq_len_k = int(seq_lens.max().item()) + kv_len_offset
 
         # target-verify and draft-extend pack multiple query rows per request;
         # rebuild cu_seqlens_q as a strided ramp (0, q, 2q, ...). Plain/draft
