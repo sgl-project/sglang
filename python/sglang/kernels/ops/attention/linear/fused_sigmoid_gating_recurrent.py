@@ -1099,6 +1099,7 @@ def fused_sigmoid_gating_delta_rule_update(
 
     use_factorized_tree = (
         force_factorized_tree
+        and not match_cutedsl_decode
         and is_kda
         and disable_state_update
         and cu_seqlens is not None

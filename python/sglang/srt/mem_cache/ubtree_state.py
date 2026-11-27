@@ -8,15 +8,13 @@ from sglang.srt.platforms import current_platform
 
 def use_ubtree_factorized_kda(
     *,
-    enabled: bool,
     cache_params: BaseLinearStateParams,
     spec_state_size: int,
     speculative_num_draft_tokens: int | None,
     speculative_eagle_topk: int | None,
 ) -> bool:
     return bool(
-        enabled
-        and current_platform.is_cuda()
+        current_platform.is_cuda()
         and spec_state_size == 1
         and cache_params.is_kda
         and speculative_eagle_topk is not None
@@ -31,8 +29,8 @@ def ubtree_spec_state_bytes_per_req(
 ) -> int:
     """Raw v/k/g/beta plus dense conv windows, across all KDA layers.
 
-    The caller supplies the active request count plus the pool's padding slot;
-    persistent temporal/conv states are budgeted separately.
+    The caller scales this by the active request count plus the pool padding
+    slot. Persistent temporal and conv states are budgeted separately.
     """
     hv, v_dim, k_dim = cache_params.shape.temporal
     h_k = cache_params.shape.num_k_heads_per_tp

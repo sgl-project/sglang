@@ -59,10 +59,6 @@ class UBTreeDraftSegmentGraphRunner:
         )
         self._capture_tail = None
 
-    @property
-    def batch_sizes(self) -> tuple[int, ...]:
-        return self._requested_batch_sizes
-
     def attach_capture_tail(self, capture_tail) -> None:
         """Attach fixed-shape work to the full draft CUDA Graph tail.
 

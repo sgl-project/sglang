@@ -11,12 +11,13 @@ from typing import Iterable, Optional, Tuple
 import torch
 
 from sglang.srt.models.dflash import DFlashDraftModel
-from sglang.srt.speculative.ubtree_components.config import parse_ubtree_config
-from sglang.srt.speculative.ubtree_components.selector import UBTreeSelector
 
 
 class Qwen3UBTreeModel(DFlashDraftModel):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        from sglang.srt.speculative.ubtree_components.config import parse_ubtree_config
+        from sglang.srt.speculative.ubtree_components.selector import UBTreeSelector
+
         parse_ubtree_config(config)
         super().__init__(config, quant_config=quant_config, prefix=prefix)
         self.ubtree_selector = UBTreeSelector(config)

@@ -1407,7 +1407,9 @@ def causal_conv1d_update(
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
-        HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=(
+            retrieve_next_token is not None or bool(direct_parent)
+        ),
         HAS_DIRECT_PARENT=bool(direct_parent),
         SAVE_TREE_RAW_ONLY=bool(save_tree_raw_only),
         DEDUP_CONV_WINDOW=dedup_conv_window,

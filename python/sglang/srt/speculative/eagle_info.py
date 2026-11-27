@@ -4,6 +4,7 @@ from typing import Callable, List, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind, WindowRead
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
@@ -42,12 +43,19 @@ class EagleVerifyInput(SpecInput):
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
+    retrieve_parent_token: Optional[torch.Tensor] = None
+    tree_depths: Optional[torch.Tensor] = None
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
         self.num_tokens_for_logprob_per_req = self.draft_token_num
+
+    @property
+    def uses_direct_parent(self) -> bool:
+        return False
 
     @property
     def max_tree_depth(self) -> int:

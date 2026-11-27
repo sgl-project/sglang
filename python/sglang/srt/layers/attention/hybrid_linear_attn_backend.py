@@ -377,8 +377,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     retrieve_next_sibling = (
                         forward_batch.spec_info.retrieve_next_sibling
                     )
-                    direct_parent = getattr(
-                        forward_batch.spec_info, "retrieve_parent_token", None
+                    direct_parent = (
+                        forward_batch.spec_info.retrieve_parent_token
+                        if isinstance(forward_batch.spec_info, EagleVerifyInput)
+                        else None
                     )
                     if direct_parent is not None:
                         retrieve_parent_token = direct_parent
@@ -498,7 +500,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_sibling_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
             spec_info.retrieve_next_sibling
         )
-        direct_parent = getattr(spec_info, "retrieve_parent_token", None)
+        direct_parent = spec_info.retrieve_parent_token
         if direct_parent is not None:
             self.retrieve_parent_token_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
                 direct_parent
@@ -1080,7 +1082,11 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
                     spec_info.retrieve_next_sibling
                 )
-                direct_parent = getattr(spec_info, "retrieve_parent_token", None)
+                direct_parent = (
+                    spec_info.retrieve_parent_token
+                    if isinstance(spec_info, EagleVerifyInput)
+                    else None
+                )
                 if direct_parent is not None:
                     self.retrieve_parent_token_list[bs - 1][:bs_without_pad].copy_(
                         direct_parent

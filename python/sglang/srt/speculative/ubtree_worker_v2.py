@@ -336,6 +336,7 @@ class UBTreeWorkerV2(DFlashWorkerV2):
             seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
         else:
             seq_lens_cpu.copy_(prefix_lens.to(device="cpu", dtype=torch.int32))
+            seq_lens_cpu.add_(block_size)
             seq_lens_sum = int(seq_lens_cpu.sum())
 
         forward_batch = ForwardBatch(

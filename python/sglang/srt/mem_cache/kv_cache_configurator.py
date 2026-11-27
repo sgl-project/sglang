@@ -3800,7 +3800,6 @@ class KVCacheConfigurator:
             )
 
             ubtree_factorized = use_ubtree_factorized_kda(
-                enabled=True,
                 cache_params=config.mamba2_cache_params,
                 spec_state_size=(get_schedule().max_running_requests or 0)
                 // self.attn_dp_size,

@@ -31,7 +31,6 @@ class UBTreeVerifyResult(msgspec.Struct, frozen=True):
     predict: torch.Tensor
     accept_lens: torch.Tensor
     accept_index: torch.Tensor
-    hidden: torch.Tensor
     bonus_tokens: torch.Tensor
     new_seq_lens: torch.Tensor
 
@@ -536,14 +535,12 @@ class UBTreeVerifyEpilogue:
         )
 
     def read_result(self, bs: int) -> UBTreeVerifyResult:
-        hidden_rows = bs * self.max_depth
         if self.compact_hidden_buf is None:
             raise RuntimeError("UBTree epilogue has not run yet")
         return UBTreeVerifyResult(
             predict=self.compact_predict_buf[:bs].reshape(-1),
             accept_lens=self.accept_lens_buf[:bs],
             accept_index=self.accept_index_buf[:bs],
-            hidden=self.compact_hidden_buf[:hidden_rows],
             bonus_tokens=self.bonus_tokens_buf[:bs],
             new_seq_lens=self.new_seq_lens_buf[:bs],
         )

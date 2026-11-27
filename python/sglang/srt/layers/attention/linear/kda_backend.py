@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.linear.utils import (
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.device import is_gfx95_supported
 from sglang.srt.utils.log_utils import rank0_log
@@ -1325,7 +1326,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # skips the write (CACHE_INTERMEDIATE_STATES=False); the output is unaffected.
         replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
         replayssm_on = replayssm_rawv is not None
-        tree_rawv = getattr(mamba_cache_params, "tree_rawv", None)
+        tree_rawv = (
+            mamba_cache_params.tree_rawv
+            if isinstance(mamba_cache_params, MambaPool.UBTreeSpeculativeState)
+            else None
+        )
         verify_batch_size = query_start_loc.shape[0] - 1
         if tree_rawv is not None and verify_batch_size != 1:
             raise RuntimeError(

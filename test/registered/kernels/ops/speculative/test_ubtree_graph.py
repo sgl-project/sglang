@@ -176,14 +176,29 @@ def test_eagle_full_mask_metadata_reuses_tree_columns(width, mode, batch_size, l
 def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(algorithm, width):
     from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
     from sglang.srt.model_executor.forward_mode import ForwardMode
+    from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
     backend = _make_fa3_verify_backend(width, algorithm)
     q = torch.randn(width, 4, 64, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(3 * 512, 1, 2, 64, dtype=torch.bfloat16, device="cuda")
     v = torch.randn_like(k)
     mode = TreeMaskMode.QLEN_ONLY if algorithm == "UBTREE" else TreeMaskMode.FULL_MASK
-    spec = SimpleNamespace(
-        tree_mask_mode=mode, positions=torch.arange(width, device="cuda")
+    spec_cls = UBTreeVerifyInput if algorithm == "UBTREE" else EagleVerifyInput
+    spec = spec_cls(
+        draft_token=None,
+        custom_mask=None,
+        positions=torch.arange(width, device="cuda"),
+        retrieve_index=None,
+        retrieve_next_token=None,
+        retrieve_next_sibling=None,
+        retrieve_cum_len=None,
+        spec_steps=1,
+        topk=2,
+        draft_token_num=width,
+        capture_hidden_mode=None,
+        seq_lens_sum=None,
+        seq_lens_cpu=None,
+        tree_mask_mode=mode,
     )
     batch = SimpleNamespace(
         forward_mode=ForwardMode.TARGET_VERIFY,
@@ -1118,7 +1133,10 @@ def test_sampling_graph_refreshes_coins_parameters_and_logits(monkeypatch):
     logits = torch.zeros((width, vocab_size), device="cuda")
     hidden = torch.randn((width, 8), device="cuda")
     epilogue.capture_hook(
-        SimpleNamespace(model_runner=SimpleNamespace(is_draft_worker=False)),
+        SimpleNamespace(
+            model_runner=SimpleNamespace(is_draft_worker=False),
+            _verify_checkpoint_ids=None,
+        ),
         LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden),
         metadata,
         width,
@@ -1289,7 +1307,10 @@ def test_verify_graphs_retain_materializer_workspace_after_prefill_growth(
 
     def target_tail():
         epilogue.capture_hook(
-            SimpleNamespace(model_runner=SimpleNamespace(is_draft_worker=False)),
+            SimpleNamespace(
+                model_runner=SimpleNamespace(is_draft_worker=False),
+                _verify_checkpoint_ids=None,
+            ),
             output,
             metadata,
             3,

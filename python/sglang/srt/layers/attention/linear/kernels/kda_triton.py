@@ -36,13 +36,15 @@ class TritonKDAKernel(LinearAttnKernelBase):
     supports_track_state_snapshot: bool = True
 
     def __init__(self):
-        # Per graph/batch-shape output factors. They are transient across layers,
-        # but retained by shape so CUDA graph replay observes stable addresses.
-        self._tree_factor_scratch = {}
-        self._tree_transform_scratch = {}
+        # Lazily allocate per-shape scratch dicts on first UBTree call so
+        # non-UBTree runs keep zero extra host footprint.
+        self._tree_factor_scratch = None
+        self._tree_transform_scratch = None
 
     def get_tree_transform_scratch(self, device, n, hv, tree_width, k):
         """Return graph-stable FP32 node transforms for fused tree conv."""
+        if self._tree_transform_scratch is None:
+            self._tree_transform_scratch = {}
         key = (device.index, n, hv, tree_width, k)
         triple = self._tree_transform_scratch.get(key)
         if triple is None:
@@ -55,6 +57,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         return triple
 
     def _get_tree_factor_scratch(self, q, v, query_start_loc, tree_width):
+        if self._tree_factor_scratch is None:
+            self._tree_factor_scratch = {}
         n = query_start_loc.shape[0] - 1
         hv, k = v.shape[2], q.shape[-1]
         key = (q.device.index, n, hv, tree_width, k)

@@ -716,7 +716,6 @@ class MambaPool:
             from sglang.srt.mem_cache.ubtree_state import use_ubtree_factorized_kda
 
             self.factorized_kda_tree = use_ubtree_factorized_kda(
-                enabled=True,
                 cache_params=cache_params,
                 spec_state_size=spec_state_size,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,

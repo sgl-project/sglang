@@ -246,7 +246,7 @@ def _select_tree_nodes_kernel(
     old_nodes = offsets + 1
     valid = old_nodes < max_nodes
     source_offsets = batch_index * max_nodes + old_nodes
-    values = tl.load(super_scores + source_offsets, mask=valid, other=-3.402823466e38)
+    values = tl.load(super_scores + source_offsets, mask=valid, other=-float("inf"))
     if depth_bonus != 0.0:
         old_depths = tl.load(super_depths + source_offsets, mask=valid, other=0)
         values += depth_bonus * old_depths.to(tl.float32)
@@ -259,7 +259,7 @@ def _select_tree_nodes_kernel(
     for rank in tl.static_range(0, budget):
         chosen_lane = tl.argmax(values, axis=0, tie_break_left=True)
         chosen_old = tl.where(chosen_slots == rank, chosen_lane + 1, chosen_old)
-        values = tl.where(lane_ids == chosen_lane, -3.402823466e38, values)
+        values = tl.where(lane_ids == chosen_lane, -float("inf"), values)
     chosen_old = tl.sort(chosen_old, dim=0, descending=False)
 
     tl.store(selected_old_ids + batch_index * selected_nodes, 0)

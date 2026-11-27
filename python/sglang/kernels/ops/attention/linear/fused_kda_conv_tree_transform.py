@@ -59,7 +59,6 @@ def _fused_kda_conv_tree_transform_kernel(
     K: tl.constexpr,
     BK: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
-    CACHE_TREE_FACTORS: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
     batch = tl.program_id(0)
@@ -155,7 +154,8 @@ def _fused_kda_conv_tree_transform_kernel(
         acc_v += value_v.to(tl.float32) * wv
 
         if tap < 3:
-            # Triton miscompiled runtime branches on the loop-carried node, hence masks.
+            # Triton 3.8.0 miscompiles runtime branches on the loop-carried node.
+            # Revisit once Triton fixes loop-carried CFG phi lowering.
             use_tree_node = current > 0
             safe_node = tl.maximum(current, 0)
             parent = tl.load(
@@ -248,7 +248,6 @@ def _fused_kda_conv_tree_transform_kernel(
         mask=mask,
     )
 
-    raw_k_conv = k_conv.to(tl.float32)
     k_conv_fp32 = k_conv.to(tl.float32)
     v_conv_fp32 = v_conv.to(tl.float32)
     norm = tl.sqrt(tl.sum(k_conv_fp32 * k_conv_fp32, axis=0) + 1e-6)
@@ -279,37 +278,36 @@ def _fused_kda_conv_tree_transform_kernel(
     tl.store(processed_decay + transform_base + offsets, decay, mask=mask)
     tl.store(processed_beta + (batch * HV + hv) * TREE_WIDTH + node, beta)
 
-    if CACHE_TREE_FACTORS:
-        cache_mask = mask & (factor_slot >= 0)
-        tl.store(
-            tree_rawv
-            + factor_slot * stride_rawv_slot
-            + (hv * CACHE_TREE_WIDTH + node) * K
-            + offsets,
-            v_conv_fp32,
-            mask=cache_mask,
-        )
-        tl.store(
-            tree_rawk
-            + factor_slot * stride_rawk_slot
-            + (hv * CACHE_TREE_WIDTH + node) * K
-            + offsets,
-            raw_k_conv,
-            mask=cache_mask,
-        )
-        tl.store(
-            tree_g
-            + factor_slot * stride_g_slot
-            + (hv * CACHE_TREE_WIDTH + node) * K
-            + offsets,
-            g,
-            mask=cache_mask,
-        )
-        tl.store(
-            tree_beta + factor_slot * stride_beta_slot + hv * CACHE_TREE_WIDTH + node,
-            beta,
-            mask=factor_slot >= 0,
-        )
+    cache_mask = mask & (factor_slot >= 0)
+    tl.store(
+        tree_rawv
+        + factor_slot * stride_rawv_slot
+        + (hv * CACHE_TREE_WIDTH + node) * K
+        + offsets,
+        v_conv_fp32,
+        mask=cache_mask,
+    )
+    tl.store(
+        tree_rawk
+        + factor_slot * stride_rawk_slot
+        + (hv * CACHE_TREE_WIDTH + node) * K
+        + offsets,
+        k_conv_fp32,
+        mask=cache_mask,
+    )
+    tl.store(
+        tree_g
+        + factor_slot * stride_g_slot
+        + (hv * CACHE_TREE_WIDTH + node) * K
+        + offsets,
+        g,
+        mask=cache_mask,
+    )
+    tl.store(
+        tree_beta + factor_slot * stride_beta_slot + hv * CACHE_TREE_WIDTH + node,
+        beta,
+        mask=factor_slot >= 0,
+    )
 
 
 def fused_kda_conv_tree_transform(
@@ -420,7 +418,6 @@ def fused_kda_conv_tree_transform(
         K=key_dim,
         BK=bk,
         USE_LOWER_BOUND=lower_bound is not None,
-        CACHE_TREE_FACTORS=True,
         HAS_BIAS=conv_bias is not None,
         num_warps=2,
         num_stages=1,
