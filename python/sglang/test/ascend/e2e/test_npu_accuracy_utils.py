@@ -512,8 +512,12 @@ def _build_deepswe_eval_pod(pod_name, namespace, env_vars, share_volume, share_s
         volume_mounts=[
             k8s.V1VolumeMount(name="dind-storage", mount_path="/var/lib/docker")
         ],
+        # Nested build containers inherit this cgroup, and the per-task
+        # ``docker compose build`` (apt + ~80 uv packages) is CPU/IO bound:
+        # 2 CPU made each Dockerfile step take ~10 minutes. Keep the request
+        # modest so the pod still schedules, but let it burst.
         resources=k8s.V1ResourceRequirements(
-            requests={"cpu": "1", "memory": "2Gi"}, limits={"cpu": "2", "memory": "4Gi"}
+            requests={"cpu": "2", "memory": "4Gi"}, limits={"cpu": "8", "memory": "8Gi"}
         ),
     )
     eval_container = k8s.V1Container(
