@@ -14,6 +14,8 @@ from sglang.srt.runtime_context import (
     mamba_checkpoint_grid,
     mamba_track_grid,
 )
+from sglang.srt.state_capturer import routed_experts_retract
+from sglang.srt.state_capturer.routed_experts_forcing import ForcingBatch
 from sglang.srt.utils.common import (
     async_h2d,
     ceil_align,
@@ -1383,6 +1385,9 @@ class Req(ReqDllmMixin):
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None
+        # [positions, layers, top_k] routed experts as first captured, kept across
+        # retractions (routed_experts_retract.py); None until the first one.
+        self.routed_experts_kept: Optional[torch.Tensor] = None
 
         # For observability
         self.metrics_collector = metrics_collector
@@ -2388,6 +2393,10 @@ def release_req(
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
+    # Must precede release_kv_cache: the rows are indexed by the KV slots it frees.
+    routed_experts_retract.keep_rows_before_release(
+        req=req, req_to_token_pool=req_to_token_pool
+    )
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, checkpoint=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -2532,6 +2541,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Token replacement embeddings and absolute positions (optional).
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
+
+    # Kept routed-expert rows for the tokens this extend recomputes after a retract.
+    forced_routes: Optional[ForcingBatch] = None
 
     # Read by ForwardBatch ngram embedding init
     ne_token_table: torch.Tensor = None
@@ -3084,6 +3096,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.replace_embeds = replace_embeds_tensor
         self.replace_positions = replace_positions_tensor
+        self.forced_routes = routed_experts_retract.build_extend_forcing(
+            reqs=reqs, prefix_lens=prefix_lens, extend_lens=extend_lens
+        )
         for mm_input in multimodal_inputs:
             if mm_input is None:
                 continue
@@ -3366,6 +3381,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.extend_logprob_start_lens + [0] * running_bs
         )
         self.is_prefill_only = False
+        if self.forced_routes is not None:
+            # The decode tails follow the extend rows and are never forced.
+            self.forced_routes = self.forced_routes.padded_to(self.extend_num_tokens)
 
     def convert_decode_to_extend(self):
         """View every decode request as a 1-token extend with its context as
@@ -3747,6 +3765,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_embeds = None
         self.replace_embeds = None
         self.replace_positions = None
+        # Decode computes only new positions.
+        self.forced_routes = None
 
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
@@ -4004,6 +4024,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             reqs=self.reqs[:],
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
+            forced_routes=self.forced_routes,
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
             req_pool_indices_cpu=self.req_pool_indices_cpu,

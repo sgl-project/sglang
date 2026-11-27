@@ -667,6 +667,9 @@ class Resources(_FlagGroupBase):
     # State capturers (installed by their subsystems when capture is on).
     indexer_capturer: Any = None
     experts_capturer: Any = None
+    # Set under SGLANG_ENABLE_ROUTED_EXPERTS_RETRACT_FORCING
+    # (state_capturer.routed_experts_forcing).
+    routed_experts_forcing: Any = None
     # The shared TCPStore created during distributed initialization.
     tcp_store: Any = None
     # Trace verbosity; the accessor seeds it lazily from SGLANG_TRACE_LEVEL.
@@ -716,6 +719,9 @@ class ForwardFlags:
         # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
         # that slices); read by the benchmark routing override.
         "attn_tp_sequence_sharded": False,
+        # This extend's kept routes on the device (routed-experts forcing), read
+        # by select_experts; None in every graph-captured forward.
+        "routed_experts_forced": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -733,6 +739,7 @@ class ForwardFlags:
             "lora_batch_layout",
             "sp_active",
             "attn_tp_sequence_sharded",
+            "routed_experts_forced",
         }
     )
 

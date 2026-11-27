@@ -50,6 +50,7 @@ from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.state_capturer import routed_experts_retract
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -161,6 +162,9 @@ class SchedulerBatchResultProcessor:
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
             start_len=start_len,
+        )
+        req.routed_experts = routed_experts_retract.overlay_kept_rows(
+            req=req, rows=req.routed_experts, start_len=start_len
         )
 
         expected_rows = max(0, seqlen - 1 - start_len)
@@ -274,6 +278,13 @@ class SchedulerBatchResultProcessor:
             )
             auxiliary_output = result.auxiliary_host_output
             if result.routed_experts_output is not None:
+                if batch.forced_routes is not None:
+                    routed_experts_retract.check_forced_extend(
+                        reqs=batch.reqs,
+                        prefix_lens=batch.prefix_lens,
+                        extend_lens=batch.extend_lens,
+                        captured=result.routed_experts_output.topk,
+                    )
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
             if result.indexer_topk_output is not None:

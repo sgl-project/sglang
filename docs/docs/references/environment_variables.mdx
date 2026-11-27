@@ -1420,6 +1420,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>20</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_ROUTED_EXPERTS_RETRACT_FORCING</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-return-routed-experts</code>: a retracted request (KV shortage, <code>/pause_generation</code> in retract mode, preemption) keeps the routed experts captured before the retraction, and its re-prefill routes by them instead of selecting again, so the returned experts and the rebuilt KV are the ones its tokens were sampled with. Forced re-prefills skip the prefill CUDA graph. Requires <code>--moe-runner-backend</code> in <code>triton</code>, <code>flashinfer_cutlass</code> or <code>flashinfer_trtllm_routed</code>; rejected at startup with speculative decoding, DP attention, PD disaggregation, hierarchical cache, or <code>--tp-size</code> above 1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EMPTY_CACHE_INTERVAL</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Interval (seconds) at which to empty the device cache; set this if memory accumulates over a long serving period. <code>-1</code> disables.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>-1</code></td>
