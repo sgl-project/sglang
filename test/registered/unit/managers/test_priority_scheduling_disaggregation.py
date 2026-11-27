@@ -1044,6 +1044,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.model_config = MagicMock()
         scheduler.enable_overlap = enable_overlap
         scheduler.spec_algorithm = MagicMock()
+        scheduler.draft_worker = None
         scheduler.max_running_requests = 1
         scheduler.future_map = MagicMock()
         scheduler.policy = MagicMock()
