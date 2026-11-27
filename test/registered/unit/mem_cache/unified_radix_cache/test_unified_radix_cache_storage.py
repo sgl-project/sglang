@@ -812,6 +812,78 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cache.sanity_check()
         cons.sanity_check()
 
+    def _storage_hit_after_cold_sibling(
+        self, storage_dir, shared, tail_pages, unpublished
+    ) -> int:
+        """A stored prompt, then two cold engines whose prompts leave it at
+        ``shared``: the first recomputes and stores its own prompt, and the
+        second's storage hit is returned. The first finishes in its prefill
+        step, or, ``unpublished``, keeps its chunks private until it completes."""
+        self._produce_buffer_l3(
+            storage_dir, shared + self._make_seq(20_000, tail_pages)
+        )
+
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
+        cons.tree_core.write_through_threshold = 1
+        prompt = shared + self._make_seq(30_000, tail_pages)
+        req, _ = self._make_inflight_req(
+            cons, cons_alloc, cons_rtp, prompt, allocated=True
+        )
+        handle = CacheRequestHandle(req.rid, 0)
+        cons.prefetch_from_storage(
+            handle, cons.root_node_handle(), array("q", prompt), None, None
+        )
+        self._run_prefetch_to_completion(cons, handle)
+        # Storage holds the shared Full KV, but no window ends inside it.
+        self.assertFalse(cons.buffer_pipeline.has_staged(handle))
+        match = cons.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prompt)), req=req)
+        )
+        self.assertEqual(match.device_prefix_len, 0)
+        req.swa_branching_seqlen = match.swa_branching_seqlen
+        # The branch ends a node at ``shared``; the whole prompt is cached either way.
+        if unpublished:
+            cons.advance_unpublished_req(req)
+        finish_req(cons, req, len(prompt))
+        self.assertEqual(match_prefix(cons, prompt).device_prefix_len, len(prompt))
+        self._drain_buffer_writes(cons)
+        cons.sanity_check()
+
+        late, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+        late_prompt = shared + self._make_seq(40_000, tail_pages)
+        late_handle = CacheRequestHandle("late", 0)
+        late.prefetch_from_storage(
+            late_handle, late.root_node_handle(), array("q", late_prompt), None, None
+        )
+        self._run_prefetch_to_completion(late, late_handle)
+        late.sanity_check()
+        return match_prefix(late, late_prompt).device_prefix_len
+
+    @requires_hicache
+    @requires_swa
+    def test_buffer_only_storage_swa_gap_stores_missing_window(self):
+        """A prompt leaving a stored prompt mid-node finds its Full KV in
+        storage with no SWA window at that point. The engine that recomputes
+        it stores the window, so the next such prompt restores the shared prefix."""
+        page = self.cfg.page_size
+        sw_pages = (self.cfg.sliding_window_size + page - 1) // page
+        shared_pages = 2 * sw_pages
+        # Longer than two windows, so no stored window reaches the shared end.
+        tail_pages = 2 * sw_pages + 2
+        if 2 * (shared_pages + tail_pages) * page > self.cfg.kv_size:
+            self.skipTest("prompts do not fit the device pool")
+        shared = self._make_seq(1, shared_pages)
+
+        for unpublished in (False, True):
+            with (
+                self.subTest(unpublished=unpublished),
+                envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.override(True),
+            ):
+                hit = self._storage_hit_after_cold_sibling(
+                    self._make_storage_dir(), shared, tail_pages, unpublished
+                )
+                self.assertEqual(hit, len(shared))
+
     @requires_hicache
     def test_buffer_only_write_path_roundtrip(self):
         """Write path end to end: admission -> D2H staging -> storage write
@@ -1099,6 +1171,53 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self._drain_buffer_writes(cache)
         self.assertEqual(
             self._storage_exists_count(cache, span_hashes, aux_keys), len(span_hashes)
+        )
+        cache.sanity_check()
+
+    def test_buffer_only_child_of_a_split_in_flight_node_is_written(self):
+        storage_dir = self._make_storage_dir()
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            storage_dir
+        )
+        pipeline = cache.buffer_pipeline
+        controller = cache.cache_controller
+        ps = self.cfg.page_size
+
+        seq = self._buffer_swa_seq(min_pages=4)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = match_prefix(cache, seq).last_device_node
+        chain = self._path_chain(cache, leaf)
+        write_backup(cache, leaf)
+        pipeline.flush_pending_writes()
+        for ack in controller.ack_write_queue:
+            ack.finish_event.synchronize()
+        # D2H done: the chain's storage writes are submitted, their acks not drained.
+        cache.writing_check(finish_count=len(controller.ack_write_queue))
+        self.assertTrue(pipeline.ongoing_backup)
+
+        end = len(seq)
+        for node in reversed(chain):
+            node_len = node_key_length(cache, node)
+            if node_len >= 2 * ps:
+                break
+            end -= node_len
+        else:
+            self.fail("no node of two pages to split")
+        child_seq = seq[: end - node_len + ps] + self._make_seq(9000, 2)
+        self._insert(cache, allocator, req_to_token_pool, child_seq)
+        child = match_prefix(cache, child_seq).last_device_node
+        # The split head is a new node; its pages ride the original node's write.
+        self.assertNotIn(node_parent(cache, child), chain)
+
+        write_backup(cache, child)
+        self.assertIn(child, pipeline.inflight_backup_node_ids)
+        self._drain_buffer_writes(cache)
+        child_hashes = self._all_page_hashes(cache, child)
+        self.assertEqual(
+            self._storage_exists_count(
+                cache, child_hashes, aux_storage_key_transfers(cache, child)
+            ),
+            len(child_hashes),
         )
         cache.sanity_check()
 

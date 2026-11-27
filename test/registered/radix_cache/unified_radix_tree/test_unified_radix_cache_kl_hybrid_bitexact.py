@@ -301,6 +301,8 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = _base_args() + [
+            "--hybrid-cache-checkpoints-level",
+            "3",
             "--enable-metrics",
             "--enable-hierarchical-cache",
             "--hicache-ratio",

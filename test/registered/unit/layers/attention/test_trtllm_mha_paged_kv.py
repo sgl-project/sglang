@@ -73,6 +73,7 @@ def _construct_backend(runner, *, configured=0, xqa=False):
 
     def parent_init(backend, model_runner, *args, **kwargs):
         backend.req_to_token_pool = model_runner.req_to_token_pool
+        backend.max_kv_len = model_runner.req_to_token_pool.row_width
         backend.kv_cache_quant_method = SimpleNamespace(
             resolve_attention_access=lambda *args: access
         )
@@ -282,7 +283,7 @@ class TestTRTLLMHAFullAttnKVSplit(CustomTestCase):
         backend = self._backend()
         backend.decode_seq_len_splits = 1
         backend.q_data_type = torch.bfloat16
-        backend.req_to_token_pool = SimpleNamespace(row_width=1024)
+        backend.max_kv_len = 1024
         backend.workspace_buffer = backend._multi_ctas_kv_counter_buffer = None
         seen = []
         decode = SimpleNamespace(get_device_sm_count=lambda device: self.SMS)

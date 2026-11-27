@@ -700,6 +700,7 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.token_to_kv_pool = pool
     backend.req_to_token = req_to_token
     backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+    backend.max_kv_len = req_to_token.shape[1]
     backend._kv_shard_pool = get_kv_shard_pool(pool)
     backend.dsa_index_kpool = 1
     backend.dsa_index_topk = 2048

@@ -498,14 +498,12 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 assert sum(metrics.linker_prefetch_requests.values.values()) == 1
                 self._assert_balanced(cache, allocator)
 
-    def test_timeout_config_overrides_legacy_including_empty_object(self):
+    def test_timeout_config_including_empty_object(self):
         cache, backend, _, _ = self._fixture()
-        for config, legacy, expected in (
-            (None, '{"prefetch_timeout_base":2}', (2, 0.25)),
-            ({}, "@missing-legacy-config.json", (1, 0.25)),
+        for config, expected in (
+            ({}, (1, 0.25)),
             (
                 {"prefetch_timeout_base": 10, "prefetch_timeout_per_ki_token": 512},
-                "@missing-legacy-config.json",
                 (10, 512),
             ),
         ):
@@ -513,7 +511,6 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 self.subTest(config=config),
                 get_context().override_server_args(
                     unified_cache_external_linker_config=config,
-                    hicache_storage_backend_extra_config=legacy,
                 ),
             ):
                 cache.init_cache_linker(backend)

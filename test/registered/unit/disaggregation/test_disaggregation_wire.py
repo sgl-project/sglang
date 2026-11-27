@@ -3586,7 +3586,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
             ),
             req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token, row_width=req_to_token.shape[1]
+            ),
             seq_lens=torch.tensor([4, 4], dtype=torch.int32),
             seq_lens_cpu=torch.tensor([4, 4], dtype=torch.int64),
         )
@@ -3649,7 +3651,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
             ),
             req_pool_indices=torch.tensor([1, 1], dtype=torch.int64),
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token, row_width=req_to_token.shape[1]
+            ),
             seq_lens=torch.tensor([4, 3], dtype=torch.int32),
             seq_lens_cpu=torch.tensor([4, 3], dtype=torch.int64),
         )

@@ -95,7 +95,7 @@ def _decode_mamba_spec_state_size(*, size, pre_alloc_size, verify_rows, replayss
     with patch.object(HybridMambaDecodeReqToTokenPool, "_init_mamba_pool", capture):
         HybridMambaDecodeReqToTokenPool(
             size=size,
-            max_context_len=4,
+            row_width=4,
             device="cpu",
             enable_memory_saver=False,
             cache_params=None,
@@ -162,7 +162,7 @@ def _ple_decode_pool(*, size, pre_alloc_size, verify_rows, draft_tokens):
     )
     return HybridMambaDecodeReqToTokenPool(
         size=size,
-        max_context_len=16,
+        row_width=16,
         device="cpu",
         enable_memory_saver=False,
         cache_params=cache_params,

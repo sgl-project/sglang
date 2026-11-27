@@ -67,6 +67,7 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.metrics_reporter = MagicMock()
         s.dp_attn_adapter = MagicMock()
         s.request_receiver = object.__new__(SchedulerRequestReceiver)
+        object.__setattr__(s.request_receiver, "input_blocker", None)
         s._last_stall_publish_ts = float("-inf")
         return s
 
@@ -181,6 +182,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.dp_attn_adapter = MagicMock()
         scheduler.pause_state = PauseState()
         receiver = object.__new__(UocrRequestReceiver)
+        object.__setattr__(receiver, "input_blocker", None)
         object.__setattr__(receiver, "async_shm_materializer", materializer)
         scheduler.request_receiver = receiver
         scheduler._last_stall_publish_ts = 0.0
@@ -197,6 +199,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.kv_events_publisher = MagicMock()
         scheduler.new_token_ratio_tracker = MagicMock()
         scheduler.idle_sleeper = MagicMock()
+        scheduler.input_blocker = None
         return scheduler
 
     def test_async_shm_entries_block_idle_until_drained(self):
