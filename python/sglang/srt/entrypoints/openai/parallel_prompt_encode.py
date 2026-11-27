@@ -22,8 +22,15 @@ Any configuration where that argument does not hold falls back to the original
 encode: slow or wrapped tokenizers, specials added by the post-processor,
 post-processors that can rewrite sequence ids, lstrip / rstrip / single_word
 added tokens, pre-tokenizers that treat the first piece of a sequence
-differently (Metaspace), split_special_tokens, and truncation or padding left
-enabled on the backend.
+differently (Metaspace), and split_special_tokens.
+
+The pieces are encoded on a private copy of the backend. The HF encode sets the
+shared backend's padding, truncation and encode_special_tokens on every call
+(a multimodal processor call with padding=True leaves padding on), and
+``encode_batch`` applies whatever is set when it starts: on the shared backend,
+a call from another thread between the gates and ``encode_batch`` could pad
+the pieces. Nothing configures the copy, which has padding and truncation off
+like the HF encode of a single text.
 
 ``encode_prompt_segments`` serves renderers that hand over the prompt as
 segments with their special tokens on their own. Those are the cut points, so
@@ -188,7 +195,8 @@ def _build_plan(tokenizer):
     if getattr(tokenizer, "split_special_tokens", False):
         return None
     try:
-        cfg = json.loads(backend.to_str())
+        serialized = backend.to_str()
+        cfg = json.loads(serialized)
     except Exception:
         return None
     if not _pre_tokenizer_safe(cfg.get("pre_tokenizer")):
@@ -208,6 +216,14 @@ def _build_plan(tokenizer):
     intra = _INTRA_CUT if _intra_cut_safe(cfg) else None
     if pattern is None and npattern is None and intra is None:
         return None
+    # The private copy the pieces are encoded on (see the module docstring).
+    try:
+        backend = type(backend).from_str(serialized)
+    except Exception:
+        return None
+    backend.no_padding()
+    backend.no_truncation()
+    backend.encode_special_tokens = False
     pp = backend.post_processor
     specials_added = pp.num_special_tokens_to_add(False) if pp is not None else 0
     return backend, specials_added, pattern, npattern, intra
@@ -285,12 +301,8 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     if plan is None:
         return tokenizer.encode(text, **encode_kwargs)
     backend, specials_added, pattern, npattern, intra = plan
-    if encode_kwargs.get("add_special_tokens", True) and specials_added:
-        return tokenizer.encode(text, **encode_kwargs)
-    if (
-        backend.truncation is not None
-        or backend.padding is not None
-        or backend.encode_special_tokens
+    if (encode_kwargs.get("add_special_tokens", True) and specials_added) or getattr(
+        tokenizer, "split_special_tokens", False
     ):
         return tokenizer.encode(text, **encode_kwargs)
     chunks = split_prompt(text, pattern, npattern, intra)
@@ -506,9 +518,7 @@ def _usable_segment_encoder(tokenizer, encode_kwargs):
     if (
         encoder is None
         or (encode_kwargs.get("add_special_tokens", True) and encoder.specials_added)
-        or encoder.backend.truncation is not None
-        or encoder.backend.padding is not None
-        or encoder.backend.encode_special_tokens
+        or getattr(tokenizer, "split_special_tokens", False)
         or _samples_merges(encoder.backend)
     ):
         return None
@@ -580,6 +590,7 @@ def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None)
         encoder = _usable_segment_encoder(tokenizer, encode_kwargs)
     # Only prompts the segment encoder serves are checked: a fallback compared
     # with the whole encode would count as a pass without testing the split.
+    # The encoder gated here encodes them, so none can fall back after this.
     if encoder is None or encoder.pattern is None:
         return parallel_prompt_encode(tokenizer, text, encode_kwargs)
     segments, pos = [], 0
@@ -588,7 +599,7 @@ def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None)
         segments.append(m.group())
         pos = m.end()
     segments.append(text[pos:])
-    ids = encode_prompt_segments(tokenizer, segments, encode_kwargs, cache_salt)
+    ids = encoder.encode(segments, cache_salt)
     with _rendered_prompt_checks_lock:
         state = _rendered_checks(tokenizer)
         check = not state.failed and state.passed < _RENDERED_PROMPT_CHECKS

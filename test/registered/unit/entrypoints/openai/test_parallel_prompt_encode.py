@@ -515,27 +515,96 @@ class TestUnsafeTokenizersFallBack(_EncodeCase):
         self.assertIsNone(ppe._plan_for(unsafe))
         self._assert_original_encode(unsafe)
 
-    def test_backend_state_that_rewrites_the_ids_falls_back(self):
-        """These three live on the backend, not in the plan, so the helper has
-        to look at them per call.
+    def test_split_special_tokens_set_after_the_plan_falls_back(self):
+        """The HF encode reads it on every call, so the helper does too."""
+        tokenizer = _tokenizer()
+        self.assertIsNotNone(ppe._plan_for(tokenizer))
+        tokenizer.split_special_tokens = True
+        self._assert_original_encode(tokenizer, ({},))
 
-        The mutation is applied after the wrapper is built (it copies the
-        backend), and each case gets one call: falling back runs
-        `tokenizer.encode`, which clears the backend's truncation and padding.
-        """
-        cases = {
-            "truncation": lambda b: b.enable_truncation(50),
-            "padding": lambda b: b.enable_padding(length=64),
-            "encode_special_tokens": lambda b: setattr(
-                b, "encode_special_tokens", True
+
+_SHARED_BACKEND_SETTINGS = {
+    "truncation": lambda b: b.enable_truncation(50),
+    "padding": lambda b: b.enable_padding(length=64),
+    "padding to the longest": lambda b: b.enable_padding(),
+    "encode_special_tokens": lambda b: setattr(b, "encode_special_tokens", True),
+}
+
+
+class TestSharedBackendSettings(_EncodeCase):
+    """The HF encode sets padding, truncation and encode_special_tokens on the
+    shared backend on every call (a multimodal processor call with
+    padding=True leaves padding on), and resets them for a plain encode. The
+    pieces are encoded on a private copy, so whatever another caller leaves
+    there, or sets while a prompt is being split, cannot reach the ids."""
+
+    threshold = 4096
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, ppe, "_segment_encoders", ppe._segment_encoders)
+        ppe._segment_encoders = weakref.WeakKeyDictionary()
+        self._set_min_chars(self.threshold)
+        self.text = "the quick brown fox jumps over the lazy dog\n" * 300
+        self.segments = ["<|user|>", self.text, "<|assistant|>"]
+
+    def _assert_same_ids(self, ids, expected):
+        # Not assertEqual: its diff of two long id lists takes minutes.
+        mismatch = next(
+            (i for i, (a, b) in enumerate(zip(ids, expected)) if a != b),
+            min(len(ids), len(expected)),
+        )
+        self.assertTrue(
+            list(ids) == list(expected),
+            f"{len(ids)} vs {len(expected)} ids, first difference at {mismatch}",
+        )
+
+    def _encoders(self):
+        return {
+            "parallel_prompt_encode": lambda t: ppe.parallel_prompt_encode(
+                t, "".join(self.segments), {}
+            ),
+            "encode_prompt_segments": lambda t: list(
+                ppe.encode_prompt_segments(t, self.segments, {})
             ),
         }
-        for name, mutate in cases.items():
-            with self.subTest(name):
+
+    def test_settings_left_on_the_shared_backend_do_not_reach_the_ids(self):
+        for setting, mutate in _SHARED_BACKEND_SETTINGS.items():
+            for name, encode in self._encoders().items():
+                with self.subTest(setting=setting, path=name):
+                    tokenizer = _tokenizer()
+                    self.assertIsNotNone(ppe._plan_for(tokenizer))
+                    mutate(tokenizer._tokenizer)
+                    with unittest.mock.patch.object(
+                        ppe, "split_prompt", wraps=ppe.split_prompt
+                    ) as split:
+                        ids = encode(tokenizer)
+                    self.assertEqual(split.call_count, 1)
+                    # The HF encode resets the setting before it encodes.
+                    self._assert_same_ids(ids, tokenizer.encode("".join(self.segments)))
+
+    def test_padding_set_by_another_thread_mid_split_does_not_reach_the_ids(self):
+        """Padding turned on after the gates and before `encode_batch` (here
+        from inside `split_prompt`, standing in for a multimodal processor call
+        on the event loop) used to pad the shorter pieces with pad ids."""
+        for name, encode in self._encoders().items():
+            with self.subTest(path=name):
                 tokenizer = _tokenizer()
-                mutate(tokenizer._tokenizer)
-                self.assertIsNotNone(ppe._plan_for(tokenizer))
-                self._assert_original_encode(tokenizer, ({},))
+                expected = tokenizer.encode("".join(self.segments))
+                split = ppe.split_prompt
+
+                def split_then_pad(*args, **kwargs):
+                    tokenizer._tokenizer.enable_padding(pad_id=0)
+                    return split(*args, **kwargs)
+
+                with unittest.mock.patch.object(
+                    ppe, "split_prompt", side_effect=split_then_pad
+                ) as patched:
+                    ids = encode(tokenizer)
+                self.assertEqual(patched.call_count, 1)
+                self.assertIsNotNone(tokenizer._tokenizer.padding)
+                self._assert_same_ids(ids, expected)
 
 
 class TestGatesAndArgumentAllowlist(_EncodeCase):
@@ -822,16 +891,10 @@ class TestPromptSegments(_EncodeCase):
                 {"truncation": False},
             ),
         }
-        for name, mutate in {
-            "truncation": lambda b: b.enable_truncation(50),
-            "padding": lambda b: b.enable_padding(length=64),
-            "encode_special_tokens": lambda b: setattr(
-                b, "encode_special_tokens", True
-            ),
-        }.items():
-            tokenizer = _tokenizer()
-            mutate(tokenizer._tokenizer)
-            cases[name] = (tokenizer, {})
+        split_special = _tokenizer()
+        self.assertIsNotNone(ppe._segment_encoder_for(split_special))
+        split_special.split_special_tokens = True
+        cases["split_special_tokens"] = (split_special, {})
         for name, (tokenizer, encode_kwargs) in cases.items():
             with self.subTest(name):
                 self._assert_falls_back(tokenizer, segments, encode_kwargs)
@@ -987,35 +1050,68 @@ class TestRenderedPrompt(_EncodeCase):
         whole.assert_called_once_with(text, add_special_tokens=False)
         self.assertEqual(ids, tokenizer.encode(text, add_special_tokens=False))
 
+    def test_every_counted_check_compared_ids_of_the_segment_encoder(self):
+        """A setting another thread makes between the gate and the split (here
+        padding, as a multimodal processor call leaves it) must not turn the
+        prompt into a fallback whose whole encode is compared with itself and
+        counted as a passed check."""
+        tokenizer = _tokenizer()
+        self.assertIsNotNone(ppe._segment_encoder_for(tokenizer))
+        gate = ppe._usable_segment_encoder
+
+        def gate_then_pad(*args):
+            encoder = gate(*args)
+            tokenizer._tokenizer.enable_padding(pad_id=0)
+            return encoder
+
+        text = "<|user|>" + "hello world " * 40 + "<|assistant|>"
+        expected = tokenizer.encode(text)
+        with (
+            unittest.mock.patch.object(
+                ppe, "_usable_segment_encoder", side_effect=gate_then_pad
+            ),
+            unittest.mock.patch.object(
+                ppe._SegmentEncoder,
+                "encode",
+                autospec=True,
+                side_effect=ppe._SegmentEncoder.encode,
+            ) as split,
+        ):
+            ids = ppe.encode_rendered_prompt(tokenizer, text)
+        self.assertEqual(ids, expected)
+        state = ppe._rendered_checks(tokenizer)
+        self.assertEqual(state.passed, 1)
+        self.assertEqual(split.call_count, state.passed)
+
     def test_a_mismatch_switches_the_tokenizer_to_the_whole_encode(self):
         text = "<|user|>hello world<|assistant|>"
         expected = self.tokenizer.encode(text)
         with (
-            unittest.mock.patch.object(ppe, "encode_prompt_segments", return_value=[0]),
+            unittest.mock.patch.object(ppe._SegmentEncoder, "encode", return_value=[0]),
             self.assertLogs(ppe.logger, "ERROR"),
         ):
             self.assertEqual(ppe.encode_rendered_prompt(self.tokenizer, text), expected)
         self.assertTrue(ppe._rendered_checks(self.tokenizer).failed)
         with unittest.mock.patch.object(
-            ppe, "encode_prompt_segments", side_effect=AssertionError("split taken")
+            ppe._SegmentEncoder, "encode", side_effect=AssertionError("split taken")
         ):
             self.assertEqual(ppe.encode_rendered_prompt(self.tokenizer, text), expected)
 
     def _split_returning_wrong_ids_for(self, wrong, entered=None, proceed=None):
-        """`encode_prompt_segments` that returns [0] for the prompt `wrong`,
-        after signalling `entered` and waiting for `proceed`."""
-        split = ppe.encode_prompt_segments
+        """A segment encoder that returns [0] for the prompt `wrong`, after
+        signalling `entered` and waiting for `proceed`."""
+        split = ppe._SegmentEncoder.encode
 
-        def fake(tokenizer, segments, *args):
+        def fake(encoder, segments, *args):
             if "".join(segments) != wrong:
-                return split(tokenizer, segments, *args)
+                return split(encoder, segments, *args)
             if entered is not None:
                 entered.set()
                 self.assertTrue(proceed.wait(10))
             return [0]
 
         return unittest.mock.patch.object(
-            ppe, "encode_prompt_segments", side_effect=fake
+            ppe._SegmentEncoder, "encode", autospec=True, side_effect=fake
         )
 
     def test_a_concurrent_pass_does_not_overwrite_a_mismatch(self):
@@ -1052,7 +1148,7 @@ class TestRenderedPrompt(_EncodeCase):
         self.assertEqual(results, {"good": whole(good), "bad": whole(bad)})
         self.assertTrue(ppe._rendered_checks(self.tokenizer).failed)
         with unittest.mock.patch.object(
-            ppe, "encode_prompt_segments", side_effect=AssertionError("split taken")
+            ppe._SegmentEncoder, "encode", side_effect=AssertionError("split taken")
         ):
             self.assertEqual(
                 ppe.encode_rendered_prompt(self.tokenizer, good), whole(good)
@@ -1203,7 +1299,7 @@ class TestRenderedPrompt(_EncodeCase):
                 envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(min_chars),
                 envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(enabled),
                 unittest.mock.patch.object(
-                    ppe, "encode_prompt_segments", side_effect=AssertionError("split")
+                    ppe._SegmentEncoder, "encode", side_effect=AssertionError("split")
                 ),
                 unittest.mock.patch.object(
                     ppe, "parallel_prompt_encode", wraps=ppe.parallel_prompt_encode
@@ -1218,7 +1314,7 @@ class TestRenderedPrompt(_EncodeCase):
         text = "<|user|>" + "the quick brown fox " * 20 + "<|assistant|>"
         with (
             unittest.mock.patch.object(
-                ppe, "encode_prompt_segments", side_effect=AssertionError("split")
+                ppe._SegmentEncoder, "encode", side_effect=AssertionError("split")
             ),
             unittest.mock.patch.object(
                 ppe, "parallel_prompt_encode", wraps=ppe.parallel_prompt_encode
