@@ -54,7 +54,7 @@ def _allocator(device, chain, lazy):
         ),
         max_mamba_cache_size=8,
         model_context_len=256,
-        extra_max_context_len=1,
+        req_to_token_row_width=257,
         max_num_reqs=4,
         enable_mamba_extra_buffer=False,
         enable_mamba_extra_buffer_lazy=False,
@@ -120,6 +120,7 @@ def _several_floats(device, windows, state, lazy):
             state_slots=8 if state else 0,
             max_running_requests=4,
             context_len=64,
+            req_to_token_row_width=64,
             alignment=1,
         ),
     )
@@ -130,7 +131,6 @@ def _several_floats(device, windows, state, lazy):
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=4,
-        model_context_len=64,
         lazy_compaction=lazy,
         state_cache_params=SimpleNamespace(layers=(1,)) if state else None,
     )
