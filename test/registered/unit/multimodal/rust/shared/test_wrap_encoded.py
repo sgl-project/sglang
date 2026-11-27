@@ -130,6 +130,55 @@ class TestWrapEncoded(CustomTestCase):
             self.assertEqual(len(item.padding_values()), 4)
 
 
+class TestWrapEncodedAudio(CustomTestCase):
+    def test_wraps_audio_mask_and_token_ids_without_a_vision_spec(self):
+        import torch
+
+        feature = np.zeros((1, 128, 2), dtype=np.float32)
+        mask = np.array([[1, 0]], dtype=np.int64)
+        buffers = {
+            "mm.feature.0": feature,
+            "mm.aux.0.0": mask,
+            "mm.meta": np.frombuffer(
+                msgspec.msgpack.encode(
+                    {
+                        "items": [
+                            {
+                                "modality": "audio",
+                                "hash": 21,
+                                "identity": [21] * 32,
+                                "offsets": [[2, 3]],
+                                "model_specific_data": {},
+                                "auxiliary_tensor_names": ["feature_attention_mask"],
+                            }
+                        ],
+                        "token_ids": {
+                            "audio_start_id": 31,
+                            "audio_token_id": 32,
+                            "audio_end_id": 33,
+                        },
+                        "mrope_delta": None,
+                    }
+                ),
+                dtype=np.uint8,
+            ),
+        }
+        output = RustMmProcessor.wrap_encoded(None, buffers)
+        (item,) = output.mm_items
+        self.assertEqual(item.modality, Modality.AUDIO)
+        self.assertEqual(item.offsets, [(2, 3)])
+        self.assertEqual(tuple(item.feature.shape), (1, 128, 2))
+        self.assertEqual(tuple(item.feature_attention_mask.shape), (1, 2))
+        self.assertEqual(item.feature_attention_mask.dtype, torch.int64)
+        mask[0, 0] = 0
+        self.assertEqual(item.feature_attention_mask.tolist(), [[0, 0]])
+        self.assertEqual(
+            (output.audio_start_id, output.audio_token_id, output.audio_end_id),
+            (31, 32, 33),
+        )
+        self.assertIsNone(output.mrope_positions)
+
+
 class FakeShmBuffer:
     """The Rust extension's ``ShmBuffer`` contract: it owns the unlink until
     ``release()`` hands it to the stubs, or ``discard()`` unlinks now."""

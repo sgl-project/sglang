@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional, Tuple
 import msgspec
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
+from sglang.srt.runtime_context import get_disagg, get_mm, get_parallel, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -54,6 +54,20 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
         handed the typed ``MmSpec`` instead."""
         fields = (f for f in self.__struct_fields__ if f not in self.DRAIN_ONLY)
         return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
+
+
+class RustMmAudioSpec(msgspec.Struct, frozen=True, kw_only=True):
+    audio_token_id: int
+    audio_start_id: int
+    audio_end_id: int
+
+    def rust_json(self) -> str:
+        return msgspec.json.encode(
+            {"family": "qwen3_asr", **msgspec.structs.asdict(self)}
+        ).decode()
+
+
+RustMmModelSpec = RustMmSpec | RustMmAudioSpec
 
 
 class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
@@ -250,7 +264,7 @@ class RustMmProcessor:
             import_processors(mm_process_pkg, overwrite=True)
         self._processor = processor or get_processor_wrapper()
 
-    def resolve_spec(self) -> Optional[RustMmSpec]:
+    def resolve_spec(self) -> Optional[RustMmModelSpec]:
         """The :class:`RustMmSpec` for this model, or ``None`` when it has no
         Rust pipeline (the launch gate turns that into a hard error).
 
@@ -264,6 +278,8 @@ class RustMmProcessor:
         mm_processor_cls = get_mm_processor_cls(
             hf_config, model_config=self.model_config
         )
+        if getattr(hf_config, "model_type", None) == "qwen3_asr":
+            return self._resolve_audio_spec(mm_processor_cls)
         family = rust_mm_family_for(
             mm_processor_cls, getattr(hf_config, "model_type", None)
         )
@@ -319,6 +335,62 @@ class RustMmProcessor:
         logger.info("rust server: Rust MM pipeline enabled (family=%s)", family.name)
         return spec
 
+    def _resolve_audio_spec(self, processor_cls) -> Optional[RustMmAudioSpec]:
+        if not envs.SGLANG_EXPERIMENTAL_RUST_AUDIO.get():
+            return None
+
+        from sglang.srt.multimodal.processors.qwen3_asr import (
+            Qwen3ASRMultimodalProcessor,
+        )
+
+        parallel = get_parallel()
+        if (
+            processor_cls is not Qwen3ASRMultimodalProcessor
+            or (
+                parallel.nnodes,
+                parallel.tp_size,
+                parallel.pp_size,
+                parallel.num_dp_ranks,
+            )
+            != (1, 1, 1, 1)
+            or get_disagg().disaggregation_mode != "null"
+            or get_mm().mm_process_config
+        ):
+            return None
+
+        extractor = getattr(self._processor, "feature_extractor", None)
+        expected = {
+            "sampling_rate": 16_000,
+            "n_fft": 400,
+            "hop_length": 160,
+            "feature_size": 128,
+            "n_samples": 480_000,
+            "padding_value": 0.0,
+            "padding_side": "right",
+            "dither": 0.0,
+        }
+        if type(extractor).__name__ != "WhisperFeatureExtractor" or any(
+            getattr(extractor, name, None) != value for name, value in expected.items()
+        ):
+            return None
+        tokenizer = self._processor.tokenizer
+        tokens = ("<|audio_pad|>", "<|audio_start|>", "<|audio_end|>")
+        ids = tokenizer.convert_tokens_to_ids(list(tokens))
+        if tuple(tokenizer.convert_ids_to_tokens(ids)) != tokens:
+            return None
+        thinker = getattr(self.model_config.hf_config, "thinker_config", None)
+        configured_ids = (
+            getattr(thinker, "audio_token_id", None),
+            getattr(thinker, "audio_start_token_id", None),
+            getattr(thinker, "audio_end_token_id", None),
+        )
+        if tuple(ids) != configured_ids:
+            return None
+        logger.info("rust server: experimental Rust audio enabled (family=qwen3_asr)")
+        return RustMmAudioSpec(
+            audio_token_id=ids[0], audio_start_id=ids[1], audio_end_id=ids[2]
+        )
+
     def _use_feature_shm(self) -> bool:
         """Whether to park feature buffers in POSIX shm rather than inline.
 
@@ -344,18 +416,17 @@ class RustMmProcessor:
         )
 
     @staticmethod
-    def wrap_encoded(spec: RustMmSpec, buffers):
+    def wrap_encoded(spec: RustMmModelSpec | None, buffers):
         """Drain-time adapter: wrap one request's ``mm.*`` buffers (a
         ``{name: numpy array | ShmBuffer}`` mapping from ``recv_requests``) into
         the scheduler's ``MultimodalProcessorOutput``. Wrapping only -- load,
         resize, patchify, token expansion and M-RoPE all ran in Rust.
 
-        The buffers are ``mm.feature.{i}`` per item (shaped ``[rows,
-        feature_dim]`` f32, inline or shm), ``mm.mrope`` (``[3, seq_len]``
-        int64), and ``mm.meta``, a msgpack sidecar decoding to ``{"items":
-        [{"modality", "hash", "identity", "offsets", "model_specific_data"}, ...],
-        "token_ids", "mrope_delta"}`` with the items in buffer order. External
-        model packages receive the same layout and wrap it their own way.
+        Each item has a shaped ``mm.feature.{i}`` buffer and can also have
+        inline ``mm.aux.{i}.{j}`` tensors. The ``mm.meta`` msgpack sidecar lists
+        the names of those tensors, along with item metadata and token IDs.
+        When present, ``mm.mrope`` carries the ``[3, seq_len]`` int64 positions.
+        ``spec`` supplies legacy vision token IDs when the processor omits them.
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
         the inline numpy arrays own the Rust buffers, ``torch.from_numpy`` just
@@ -387,17 +458,20 @@ class RustMmProcessor:
             if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
                 for item in items:
                     item.set_pad_value()
-            output = MultimodalProcessorOutput(
-                mm_items=items,
-                im_token_id=spec.image_token_id,
-                im_start_id=spec.vision_start_token_id,
-                im_end_id=spec.vision_end_token_id,
-                video_token_id=spec.video_token_id,
-                mrope_positions=torch.from_numpy(buffers["mm.mrope"]),
-                mrope_position_delta=torch.tensor(
+            token_ids = meta["token_ids"]
+            if token_ids is None and isinstance(spec, RustMmSpec):
+                token_ids = {
+                    "im_token_id": spec.image_token_id,
+                    "im_start_id": spec.vision_start_token_id,
+                    "im_end_id": spec.vision_end_token_id,
+                    "video_token_id": spec.video_token_id,
+                }
+            output = MultimodalProcessorOutput(mm_items=items, **(token_ids or {}))
+            if meta["mrope_delta"] is not None:
+                output.mrope_positions = torch.from_numpy(buffers["mm.mrope"])
+                output.mrope_position_delta = torch.tensor(
                     [[meta["mrope_delta"]]], dtype=torch.long
-                ),
-            )
+                )
         except BaseException:
             for stub in stubs:
                 stub.close_and_unlink()
@@ -434,14 +508,25 @@ class RustMmProcessor:
             )
             stubs.append(stub)
             feature = stub
-        t, h, w = item["model_specific_data"]["image_grid_thw"]
+        model_data = item["model_specific_data"]
+        if "image_grid_thw" in model_data:
+            # Older image producers encode their grid as three scalar integers.
+            model_data["image_grid_thw"] = torch.tensor(
+                [model_data["image_grid_thw"]], dtype=torch.long
+            )
+        for ordinal, name in enumerate(item.get("auxiliary_tensor_names", ())):
+            array = buffers[f"mm.aux.{index}.{ordinal}"]
+            if array.dtype == np.uint16:
+                # TensorData::Bf16 crosses the numpy boundary as raw u16 bits.
+                tensor = torch.from_numpy(array.view(np.int16)).view(torch.bfloat16)
+            else:
+                tensor = torch.from_numpy(array)
+            model_data[name] = tensor
         return MultimodalDataItem(
             modality=_MODALITIES[item["modality"]],
             feature=feature,
             hash=item["hash"],
             identity=bytes(item["identity"]),
             offsets=[tuple(span) for span in item["offsets"]],
-            model_specific_data={
-                "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
-            },
+            model_specific_data=model_data,
         )
