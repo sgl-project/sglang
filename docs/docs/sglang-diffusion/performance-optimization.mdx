@@ -349,7 +349,7 @@ Warmup and breakable CUDA graph (BCG) solve different problems. `--warmup-mode r
 
 The example assignments come from single-GPU NVIDIA B300/GB300 profiles and are directional rather than an exhaustive compatibility list. A model can match more than one row as resolution, frame count, step count, parallelism, or GPU type changes; the measured bottleneck takes precedence over the model name.
 
-BCG is enabled only for model and pipeline configurations accepted by the runtime support check. It captures the default warmup shape automatically. Use `--warmup-resolutions` for additional served resolutions; for video and variable prompt lengths, set `--warmup-num-frames` and `--bcg-text-buckets` to cover the intended workload. Requests that do not match a captured signature fall back to eager execution.
+BCG has a list of validated model and pipeline configurations. On a model outside the list it stays enabled and logs a `[Diffusion BCG] not validated` warning, so compare its output against eager. It captures the default warmup shape automatically. Use `--warmup-resolutions` for additional served resolutions; for video and variable prompt lengths, set `--warmup-num-frames` and `--bcg-text-buckets` to cover the intended workload. Requests that do not match a captured signature fall back to eager execution.
 
 Warmup and BCG do not intentionally trade output quality for speed, but that is not a guarantee of byte-identical output. Different execution paths can introduce numerical differences, and some pipelines customize the scheduler or schedule used by a synthetic warmup request. Before production rollout, compare output hashes when bitwise stability is required, otherwise run the project's quality acceptance check.
 
