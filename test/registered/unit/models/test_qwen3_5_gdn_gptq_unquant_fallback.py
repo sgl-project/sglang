@@ -1494,6 +1494,7 @@ class TestQwen35GptqMoeUnquantFallback(CustomTestCase):
                     self.assertIsInstance(self._moe(cfg, prefix).quant_method, expected)
 
     def test_qwen3_5_mtp_loads_suffixless_stacked_experts_as_dense(self):
+        """Suffixless stacked MTP expert tensors load into dense parameters."""
         prefix = "mtp.layers.0.mlp.experts"
         tensors = [f"{prefix}.gate_up_proj", f"{prefix}.down_proj"]
         for name, make_cfg in (
@@ -1527,6 +1528,7 @@ class TestQwen35GptqMoeUnquantFallback(CustomTestCase):
     def test_manifest_layout_wins_over_an_exclusion_matching_only_the_runtime_alias(
         self,
     ):
+        """A rule matching only the runtime alias keeps manifest-quantized experts quantized."""
         tensors = [
             f"model.layers.0.mlp.experts.{e}.{p}.qweight"
             for e in range(2)
