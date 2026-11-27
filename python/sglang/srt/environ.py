@@ -1308,6 +1308,7 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
+    SGLANG_ENABLE_NPU_MEGAKERNEL_PLUGIN = EnvBool(False)
     SGLANG_NPU_ENABLE_STATIC_KERNEL = EnvBool(False)
     # True means an unrotated dense DSpark draft needs correction for a GLM DSA
     # ModelSlim QuaRot target: use checkpoint-local vocab and fold Q into the FC

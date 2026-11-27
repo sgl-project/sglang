@@ -1601,7 +1601,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.backend.capture_one(
                     shape_key,
                     run_once,
-                    capture_inputs=None,
+                    capture_inputs=(
+                        forward_batch
+                        if getattr(self.backend, "uses_capture_batch", False)
+                        else None
+                    ),
                     post_warmup_hook=post_warmup_hook,
                 )
 
@@ -2182,7 +2186,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+            output = self.backend.replay(
+                self._replay_graph_key,
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

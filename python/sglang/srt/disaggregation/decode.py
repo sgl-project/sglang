@@ -168,6 +168,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     get_spec,
@@ -3576,6 +3577,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ):
                 output_dsa_topk_indices = None
             decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
+            if (
+                _is_npu
+                and get_device().device == "npu"
+                and (
+                    get_exec().kernel.enable_npu_megakernel
+                    or envs.SGLANG_ENABLE_NPU_MEGAKERNEL_PLUGIN.get()
+                )
+            ):
+                queue = self.scheduler.disagg_decode_prealloc_queue
+                pool = queue.draft_token_to_kv_pool
+                draft_kv_ready = (
+                    not resumes_output
+                    and not _is_fake_transfer(decode_req.req)
+                    and actual_room == expected_room != 0
+                    and queue.draft_kv_ring is None
+                    and pool is not None
+                )
+                decode_req.req.npu_draft_kv_generation = (
+                    decode_req.req.retraction_count if draft_kv_ready else None
+                )
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
