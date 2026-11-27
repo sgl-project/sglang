@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import errno
 import ipaddress
 import logging
@@ -21,6 +22,22 @@ logger = logging.getLogger(__name__)
 # context share an authenticator. Keyed by `zmq.Context.underlying`.
 _zmq_authenticators: dict[int, ThreadAuthenticator] = {}
 _zmq_authenticators_lock = threading.Lock()
+
+
+async def await_zmq_send(future, on_sent, *, require_future: bool = False):
+    """Transfer request ownership even if cancellation follows successful enqueue."""
+    if asyncio.isfuture(future):
+        try:
+            await future
+        finally:
+            if future.done() and not future.cancelled() and future.exception() is None:
+                on_sent()
+    else:
+        # A wrapper may have lost an already-queued send's Future. Keep its
+        # resources receiver-owned even when reporting the broken contract.
+        on_sent()
+        if require_future:
+            raise TypeError("Async scheduler dispatch must return its enqueue Future")
 
 
 def get_open_port() -> int:
