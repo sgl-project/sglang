@@ -130,6 +130,9 @@ class _StageExecutor:
             moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
             tbo_parent_token_range=forward_batch.tbo_parent_token_range,
             tbo_parent_dp_offset=forward_batch.tbo_parent_dp_offset,
+            # Only a TBO child carries its range in the parent batch.
+            is_micro_batch=forward_batch.tbo_parent_token_range is not None,
+            dp_global_num_tokens_bound=forward_batch.tbo_dp_global_num_tokens_bound,
         )
         self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
         self._local_dp_buffer_len = forward_batch.tbo_padded_len

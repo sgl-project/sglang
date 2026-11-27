@@ -245,7 +245,9 @@ class BaseRunner(ABC):
             else get_server_return_hidden_states_mode()
         )
         self.attn_tp_size = get_parallel().attn_tp_size
-        self.tbo_plugin = TboCudaGraphRunnerPlugin()
+        self.tbo_plugin = TboCudaGraphRunnerPlugin(
+            is_draft_worker=model_runner.is_draft_worker
+        )
 
     def model_context(self):
         """Select the layout owned by this runner's current model."""
