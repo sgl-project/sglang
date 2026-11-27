@@ -60,6 +60,32 @@ def is_flux3_image_package(model_path: str) -> bool:
     )
 
 
+# LoRA key renames onto the native DiT modules. Adapters come with BFL/ostris
+# ``dit.`` or diffusers ``transformer.`` prefixes; diffusers and SimpleTuner
+# save ``Flux3Transformer2DModel`` module names, the inverse of diffusers'
+# ``convert_flux3_transformer_checkpoint_to_diffusers``. The norm_out lora_B
+# row swap ([scale, shift] -> [shift, scale]) happens in the LoRA loader.
+FLUX3_LORA_PARAM_NAMES_MAPPING = {
+    r"^dit\.": "",
+    r"^transformer\.": "",
+    r"^mode_blocks\.": "content_mode_blocks.",
+    r"^single_transformer_blocks\.": "single_blocks.",
+    r"^(.*)\.attn\.to_(q|k|v)\.": r"\1.\2_proj.",
+    r"^(.*)\.attn\.to_out\.0\.": r"\1.attn_out.",
+    r"^(.*)\.ff\.linear_in\.": r"\1.mlp_in.",
+    r"^(.*)\.ff\.linear_out\.": r"\1.mlp_out.",
+    r"^((?:early|single)_stream_modulations\.[^.]+)\.linear\.": r"\1.lin.",
+    r"^x_embedders\.": "emb_in.",
+    r"^context_embedder\.": "txt_in.",
+    r"^timestep_embedder\.linear_1\.": "time_in.in_layer.",
+    r"^timestep_embedder\.linear_2\.": "time_in.out_layer.",
+    r"^target_timestep_embedder\.linear_1\.": "ref_time_in.in_layer.",
+    r"^target_timestep_embedder\.linear_2\.": "ref_time_in.out_layer.",
+    r"^proj_out\.": "final_layer.image.linear.",
+    r"^norm_out\.linear\.": "final_layer.image.adaLN_modulation.1.",
+}
+
+
 def flux3_image_dit_config(**arch_overrides: Any) -> Flux3DiTConfig:
     """The FLUX 3 DiT config with image streams (defaults: FLUX.3 Image Klein)."""
     arch = {
@@ -69,8 +95,7 @@ def flux3_image_dit_config(**arch_overrides: Any) -> Flux3DiTConfig:
         "vec_in_dim": None,
         # Empty: the native DiT owns its packed-QKV checkpoint mapping.
         "param_names_mapping": {},
-        # Adapter key prefixes: BFL/ostris ``dit.`` and diffusers ``transformer.``.
-        "lora_param_names_mapping": {r"^dit\.": "", r"^transformer\.": ""},
+        "lora_param_names_mapping": dict(FLUX3_LORA_PARAM_NAMES_MAPPING),
         **arch_overrides,
     }
     return Flux3DiTConfig(arch_config=Flux3ArchConfig(**arch))

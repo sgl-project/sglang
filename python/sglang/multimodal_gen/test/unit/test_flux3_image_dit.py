@@ -25,7 +25,10 @@ from sglang.multimodal_gen.runtime.layers.flux3_fused_ops import (
     flux3_qkv_qknorm_rope,
     flux3_shared_activation,
 )
-from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
+from sglang.multimodal_gen.runtime.layers.lora.linear import (
+    BaseLayerWithLoRA,
+    LinearWithLoRA,
+)
 from sglang.multimodal_gen.runtime.layers.quantization import flux3_prims_ts
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
@@ -42,6 +45,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.models.dits import flux3_image
 from sglang.multimodal_gen.runtime.models.dits.flux3 import (
+    Flux3LastLayer,
     Flux3Transformer,
     timestep_embedding,
 )
@@ -143,6 +147,99 @@ def test_native_module_tree_matches_the_image_checkpoint():
     assert all(
         isinstance(modules[name], torch.nn.ModuleList) for name in model.layer_names
     )
+
+
+def _diffusers_lora_module_names() -> list[str]:
+    """``Flux3Transformer2DModel`` LoRA targets of the tiny DiT, as diffusers'
+    and SimpleTuner's FLUX.3 trainers save them."""
+    blocks = [
+        "mode_blocks.image.0",
+        "mode_blocks.image_cond.0",
+        "txt_mode_blocks.0",
+        "single_transformer_blocks.0",
+        "single_transformer_blocks.1",
+    ]
+    names = [
+        f"{block}.{layer}"
+        for block in blocks
+        for layer in (
+            "attn.to_q",
+            "attn.to_k",
+            "attn.to_v",
+            "attn.to_out.0",
+            "ff.linear_in",
+            "ff.linear_out",
+        )
+    ]
+    for stream in ("image", "image_cond", "txt"):
+        names += [
+            f"early_stream_modulations.{stream}.linear",
+            f"single_stream_modulations.{stream}.linear",
+        ]
+    return names + [
+        "x_embedders.image",
+        "x_embedders.image_cond",
+        "context_embedder",
+        "timestep_embedder.linear_1",
+        "timestep_embedder.linear_2",
+        "target_timestep_embedder.linear_1",
+        "target_timestep_embedder.linear_2",
+        "proj_out",
+        "norm_out.linear",
+    ]
+
+
+def test_diffusers_lora_names_reach_every_native_linear():
+    """Diffusers-format FLUX.3 LoRAs must land on the native modules (q/k/v on
+    their packed ``to_qkv`` shard) and together cover every native linear,
+    instead of matching no layer."""
+    model = _tiny_native_dit("cpu", flow_map=True)
+    lora_map = get_param_names_mapping(
+        flux3_image_dit_config().arch_config.lora_param_names_mapping
+    )
+    param_map = get_param_names_mapping(model.param_names_mapping)
+    modules = dict(model.named_modules())
+    linears = {
+        name
+        for name, module in modules.items()
+        if isinstance(module, (linear.LinearBase, torch.nn.Linear))
+    }
+
+    reached = set()
+    for name in _diffusers_lora_module_names():
+        # alpha follows A/B, so a per-section alpha_pattern scales its section.
+        for part in ("lora_A", "lora_B", "alpha"):
+            target, index, total = param_map(lora_map(f"transformer.{name}.{part}")[0])
+            assert target.endswith(f".{part}"), (name, target)
+            module = target.removesuffix(f".{part}")
+            assert module in linears, (name, target)
+            if ".attn.to_" in name and "to_out" not in name:
+                assert module.endswith(".to_qkv") and total == 3, (name, target)
+                assert index == "qkv".index(name[-1]), (name, index)
+            else:
+                assert index is None, (name, index)
+            reached.add(module)
+    assert reached == linears
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_final_layer_applies_its_adaln_lora(merged):
+    """The BF16 final layer splits the adaLN projection weight; an unmerged
+    LoRA on it must still add its delta (and a merged one is in the weight)."""
+    torch.manual_seed(0)
+    hidden, out, rank = 8, 4, 2
+    layer = Flux3LastLayer(hidden, out)
+    reference = Flux3LastLayer(hidden, out)
+    reference.load_state_dict(layer.state_dict())
+    lora_a, lora_b = torch.randn(rank, hidden), torch.randn(2 * hidden, rank)
+    with torch.no_grad():
+        reference.adaLN_modulation[1].weight += lora_b @ lora_a
+    wrapped = LinearWithLoRA(layer.adaLN_modulation[1], lora_rank=rank, lora_alpha=rank)
+    wrapped.set_lora_weights(lora_a, lora_b, merge_weights=merged)
+    layer.adaLN_modulation[1] = wrapped
+    x, vec = torch.randn(1, 3, hidden), torch.randn(1, hidden)
+    with torch.no_grad():
+        torch.testing.assert_close(layer(x.clone(), vec), reference(x.clone(), vec))
 
 
 def test_attention_backend_failure_is_not_hidden():

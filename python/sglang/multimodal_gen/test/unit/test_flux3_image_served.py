@@ -821,6 +821,68 @@ class TestFlux3Lora(unittest.TestCase):
             LoRAFormat.AI_TOOLKIT_FLUX,
         )
 
+    def test_diffusers_adapter_keys_reach_the_native_modules(self):
+        """diffusers / SimpleTuner FLUX.3 LoRAs save ``Flux3Transformer2DModel``
+        names; they must load as standard LoRA (not through a FLUX.1/2
+        converter) and map onto the native modules, norm_out rows swapped."""
+        from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
+            flux3_image_dit_config,
+        )
+        from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+        from sglang.multimodal_gen.runtime.models.dits.flux3_image import (
+            Flux3ImageDiT,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
+            LoRAFormat,
+            detect_lora_format_from_state_dict,
+            normalize_lora_state_dict,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
+            _swap_diffusers_flux3_norm_out_lora_b,
+        )
+
+        lora_map = get_param_names_mapping(
+            flux3_image_dit_config().arch_config.lora_param_names_mapping
+        )
+        param_map = get_param_names_mapping(Flux3ImageDiT.param_names_mapping)
+        # Key layout of e.g. akhaliq/flux-3-image-klein-angles-lora.
+        targets = {
+            "transformer.mode_blocks.image.0.attn.to_k.lora_A.weight": (
+                "content_mode_blocks.image.0.to_qkv.lora_A"
+            ),
+            "transformer.single_transformer_blocks.3.attn.to_out.0.lora_B.weight": (
+                "single_blocks.3.attn_out.lora_B"
+            ),
+            "transformer.txt_mode_blocks.1.ff.linear_in.lora_A.weight": (
+                "txt_mode_blocks.1.mlp_in.lora_A"
+            ),
+            "transformer.single_stream_modulations.txt.linear.lora_B.weight": (
+                "single_stream_modulations.txt.lin.lora_B"
+            ),
+            "transformer.norm_out.linear.lora_B.weight": (
+                "final_layer.image.adaLN_modulation.1.lora_B"
+            ),
+        }
+        state = {key: torch.zeros(1) for key in targets}
+        self.assertEqual(detect_lora_format_from_state_dict(state), LoRAFormat.STANDARD)
+        self.assertEqual(set(normalize_lora_state_dict(state)), set(state))
+        for key, target in targets.items():
+            name, _, _ = lora_map(key.removesuffix(".weight"))
+            self.assertEqual(param_map(name)[0], target)
+
+        scale, shift = torch.randn(4, 2), torch.randn(4, 2)
+        source = "transformer.norm_out.linear.lora_B"
+        target = "final_layer.image.adaLN_modulation.1.lora_B"
+        swapped = _swap_diffusers_flux3_norm_out_lora_b(
+            source, target, torch.cat([scale, shift])
+        )
+        self.assertTrue(torch.equal(swapped, torch.cat([shift, scale])))
+        # Native adapters already hold [shift; scale].
+        native = torch.cat([shift, scale])
+        self.assertIs(
+            _swap_diffusers_flux3_norm_out_lora_b(target, target, native), native
+        )
+
 
 class TestFlux3TextEncoder(unittest.TestCase):
     def test_batch_encodes_each_prompt_with_reference_positions(self):

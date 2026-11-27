@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 from collections import defaultdict
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable, Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any
 
@@ -99,6 +99,21 @@ def _swap_peft_swiglu_fc1_lora_b(
     return torch.cat([gate, value], dim=0)
 
 
+def _swap_diffusers_flux3_norm_out_lora_b(
+    source_name: str, target_name: str, weight: torch.Tensor
+) -> torch.Tensor:
+    # diffusers' FLUX.3 norm_out emits [scale; shift], the native final-layer
+    # adaLN [shift; scale] (convert_flux3_transformer_checkpoint_to_diffusers).
+    if (
+        weight.dim() != 2
+        or not source_name.endswith("norm_out.linear.lora_B")
+        or not target_name.endswith("final_layer.image.adaLN_modulation.1.lora_B")
+    ):
+        return weight
+    scale, shift = weight.chunk(2, dim=0)
+    return torch.cat([shift, scale], dim=0)
+
+
 def stack_or_compose_fused_lora(
     a_list: list[torch.Tensor],
     b_list: list[torch.Tensor],
@@ -127,21 +142,42 @@ def _store_fused_lora_groups(
     to_merge_params: dict[Hashable, dict[Any, Any]],
     adapter_alpha: int | None,
     device: torch.device | str,
+    fused_num_sections: Mapping[str, int] | None = None,
+    section_out_sizes: Callable[[str], list[int] | None] | None = None,
 ) -> None:
-    """Write deferred fused lora_A/B groups into the adapter dict."""
+    """Write deferred fused lora_A/B groups into the adapter dict.
+
+    A LoRA that trains only some sections of a fused layer (e.g. only `to_q` of
+    a fused QKV) gets zero A/B for the rest, so those sections keep their base
+    weights.
+    """
     for a_key, a_parts in list(to_merge_params.items()):
         if not str(a_key).endswith(".lora_A"):
             continue
         base = str(a_key)[: -len(".lora_A")]
         b_key = f"{base}.lora_B"
         b_parts = to_merge_params.get(b_key)
-        n = max(a_parts) + 1
-        if (
-            b_parts is None
-            or set(a_parts) != set(range(n))
-            or set(b_parts) != set(range(n))
-        ):
+        if b_parts is None or set(a_parts) != set(b_parts):
             continue
+        n = (fused_num_sections or {}).get(base, max(a_parts) + 1)
+        missing = [i for i in range(n) if i not in a_parts]
+        if missing:
+            out_sizes = section_out_sizes(base) if section_out_sizes else None
+            if out_sizes is None or len(out_sizes) != n:
+                logger.warning(
+                    "Skipping LoRA for fused layer %s: it covers sections %s of %d "
+                    "and the missing sections' sizes are unknown",
+                    base,
+                    sorted(a_parts),
+                    n,
+                )
+                continue
+            ref_a = next(iter(a_parts.values()))
+            ref_b = next(iter(b_parts.values()))
+            a_parts, b_parts = dict(a_parts), dict(b_parts)
+            for i in missing:
+                a_parts[i] = ref_a.new_zeros(ref_a.shape)
+                b_parts[i] = ref_b.new_zeros(out_sizes[i], ref_a.shape[0])
         a_list = [a_parts[i] for i in range(n)]
         b_list = [b_parts[i] for i in range(n)]
         scaled_b = scale_fused_sections(
@@ -167,6 +203,8 @@ def map_lora_state_dict_to_dit(
     lora_param_names_mapping_fn,
     lora_alpha: float | None,
     device: torch.device | str,
+    *,
+    section_out_sizes: Callable[[str], list[int] | None] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Rename a normalized LoRA state dict to the DiT's LoRA layer names.
 
@@ -176,9 +214,11 @@ def map_lora_state_dict_to_dit(
     """
     new_adapter: dict[str, torch.Tensor] = {}
     to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
+    fused_num_sections: dict[str, int] = {}
     for name, weight in lora_state_dict.items():
         name = name.replace("diffusion_model.", "")
         name = name.removesuffix(".weight")
+        source_name = name
         # misc-format -> HF-format
         name, _, _ = lora_param_names_mapping_fn(name)
         # HF-format (LoRA) -> SGLang-dit-format
@@ -189,6 +229,7 @@ def map_lora_state_dict_to_dit(
             to_merge_params[target_name][merge_index] = weight
             # A/B/alpha of one fused layer are laid out together (GQA B cannot stack).
             if target_name.endswith((".lora_A", ".lora_B", ".alpha")):
+                fused_num_sections[target_name.rsplit(".", 1)[0]] = num_params_to_merge
                 continue
             if len(to_merge_params[target_name]) == num_params_to_merge:
                 sorted_tensors = [
@@ -201,6 +242,7 @@ def map_lora_state_dict_to_dit(
                 continue
 
         weight = _swap_peft_swiglu_fc1_lora_b(name, target_name, weight)
+        weight = _swap_diffusers_flux3_norm_out_lora_b(source_name, target_name, weight)
         if target_name in new_adapter:
             raise ValueError(
                 f"Dit target weight name {target_name} already exists in the adapter"
@@ -212,6 +254,8 @@ def map_lora_state_dict_to_dit(
         to_merge_params,
         lora_alpha,
         device,
+        fused_num_sections=fused_num_sections,
+        section_out_sizes=section_out_sizes,
     )
     return new_adapter
 
@@ -362,6 +406,15 @@ class LoRAPipeline(ComposedPipelineBase):
         if name == "critic":
             name = "fake_score_transformer"
         return self.modules.get(name)
+
+    def _fused_section_out_sizes(self, base: str) -> list[int] | None:
+        """Full (unsharded) output size of each section of a fused DiT layer."""
+        try:
+            layer = self.modules["transformer"].get_submodule(base)
+        except AttributeError:
+            return None
+        sizes = getattr(getattr(layer, "base_layer", layer), "output_sizes", None)
+        return list(sizes) if sizes else None
 
     def _has_layerwise_offload(
         self,
@@ -1073,6 +1126,8 @@ class LoRAPipeline(ComposedPipelineBase):
                 raw_state_dict,
                 logger=logger,
                 adapter_config=adapter_config,
+                dit_class_name=type(self.modules["transformer"]).__name__,
+                lora_alpha=lora_alpha,
             )
         )
         adapter_lora_alpha = lora_alpha
@@ -1097,6 +1152,7 @@ class LoRAPipeline(ComposedPipelineBase):
             lora_param_names_mapping_fn,
             adapter_lora_alpha,
             self.device,
+            section_out_sizes=self._fused_section_out_sizes,
         )
         transformer = self.modules["transformer"]
         if isinstance(transformer, BaseDiT):
