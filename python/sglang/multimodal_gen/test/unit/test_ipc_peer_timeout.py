@@ -206,7 +206,7 @@ def test_fatal_reply_turns_health_unhealthy() -> None:
         patch.setattr(http_server, "async_scheduler_client", client)
         response = asyncio.run(http_server.health(request))
     assert response.status_code == 503
-    assert json.loads(response.body) == {"status": "unhealthy", "error": error}
+    assert json.loads(response.body) == {"status": "unhealthy"}
 
 
 if __name__ == "__main__":

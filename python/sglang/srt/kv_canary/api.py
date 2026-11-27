@@ -83,7 +83,7 @@ def install_canary(
     swa_allocator = allocator if allocator.has_window_pool else None
     launch_capacities = CanaryLaunchCapacities.from_args(
         req_to_token_pool_size=model_runner.req_to_token_pool.size,
-        max_seq_len_per_req=model_runner.req_to_token_pool.req_to_token.shape[1],
+        max_seq_len_per_req=model_runner.req_to_token_pool.row_width,
         pool_slot_count=model_runner.max_total_num_tokens,
     )
     swa_window_size = model_runner.sliding_window_size or 0
