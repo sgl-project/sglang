@@ -10,7 +10,7 @@ from sglang.srt.models.kimi_k3_amd.dense_fp8 import StaticFP8Weight
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 # (N, K): KDA fused q/k/v/g at TP8, merged MoE front at TP8
 SHAPES = [(4 * 12 * 128, 7168), (896 + 3584 + 512, 7168)]
