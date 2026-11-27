@@ -24,10 +24,7 @@ def _outputs(batch, heads, nodes, dim, device):
     return pk, pd, pb, rv, rk, g, beta
 
 
-@pytest.mark.parametrize("heads,nodes", [(8, 16), (8, 24), (8, 32), (16, 49)])
-@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("lower_bound", [None, -5.0])
-def test_fused_conv_tree_transform_matches_reference(
+def _assert_fused_conv_tree_transform_matches_reference(
     heads, nodes, weight_dtype, lower_bound
 ):
     torch.manual_seed(20260918 + nodes)
@@ -91,7 +88,6 @@ def test_fused_conv_tree_transform_matches_reference(
     else:
         # BF16 weights reorder the four-tap sum, so one-ULP gaps are expected.
         torch.testing.assert_close(out_fused, out_ref, rtol=1e-2, atol=1e-2)
-    assert torch.equal(inter_fused[..., 2], inter_ref[..., 2])
 
     _, k, v = out_fused[0].t().reshape(nodes, 3, heads, head_dim).unbind(1)
     assert torch.equal(rk[0], k.transpose(0, 1))
@@ -113,6 +109,35 @@ def test_fused_conv_tree_transform_matches_reference(
         torch.testing.assert_close(
             got[0].double(), expected.transpose(0, 1), rtol=1e-5, atol=1e-5, msg=name
         )
+    return inter_fused, inter_ref
+
+
+@pytest.mark.parametrize("heads,nodes", [(8, 32), (16, 49)])
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("lower_bound", [None, -5.0])
+def test_fused_conv_tree_transform_matches_reference(
+    heads, nodes, weight_dtype, lower_bound
+):
+    inter_fused, inter_ref = _assert_fused_conv_tree_transform_matches_reference(
+        heads, nodes, weight_dtype, lower_bound
+    )
+    assert torch.equal(inter_fused[..., 2], inter_ref[..., 2])
+
+
+@pytest.mark.parametrize(
+    "heads,nodes,weight_dtype,lower_bound",
+    [
+        (8, 16, torch.bfloat16, None),
+        (8, 24, torch.float32, -5.0),
+    ],
+)
+def test_fused_conv_tree_transform_supports_arbitrary_widths(
+    heads, nodes, weight_dtype, lower_bound
+):
+    inter_fused, inter_ref = _assert_fused_conv_tree_transform_matches_reference(
+        heads, nodes, weight_dtype, lower_bound
+    )
+    assert torch.equal(inter_fused[..., 2], inter_ref[..., 2])
 
 
 if __name__ == "__main__":

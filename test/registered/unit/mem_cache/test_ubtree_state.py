@@ -235,6 +235,24 @@ class TestUBTreeState(CustomTestCase):
                 self.assertEqual(info[4], expected_max_req)
                 self.assertEqual(info[5], expected_max_req - 5)
 
+        worker.model_runner.effective_logical_max_total_num_tokens = 106
+        worker.model_runner.logical_max_total_num_tokens = 106
+        worker.model_runner.token_to_kv_pool.size = 106
+        with get_context().override_server_args(
+            speculative_algorithm="UBTREE",
+            speculative_num_steps=15,
+            speculative_eagle_topk=2,
+            speculative_num_draft_tokens=49,
+            page_size=1,
+        ):
+            info = TpModelWorker.get_worker_info(worker)
+            self.assertEqual((info[4], info[5]), (7, 2))
+            worker.model_runner.effective_logical_max_total_num_tokens = 105
+            worker.model_runner.logical_max_total_num_tokens = 105
+            worker.model_runner.token_to_kv_pool.size = 105
+            with self.assertRaisesRegex(ValueError, "106"):
+                TpModelWorker.get_worker_info(worker)
+
 
 if __name__ == "__main__":
     unittest.main()

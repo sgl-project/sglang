@@ -13,7 +13,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.speculative.ubtree_components.config import parse_ubtree_config
+from sglang.srt.speculative.ubtree_components.config import (
+    UBTreeConfig,
+    parse_ubtree_config,
+)
 
 TokenFactorRole = Literal["predecessor", "successor"]
 
@@ -225,9 +228,9 @@ class DepthScoreConditioner(nn.Module):
 class UBTreeSelector(nn.Module):
     """S1/S3 selector for target-embedding MLP checkpoints."""
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, ubtree_config: UBTreeConfig | None = None) -> None:
         super().__init__()
-        cfg = parse_ubtree_config(config)
+        cfg = parse_ubtree_config(config) if ubtree_config is None else ubtree_config
         vocab_size = self.vocab_size = int(config.vocab_size)
         hidden_size = int(config.hidden_size)
         self.rank = cfg.rank

@@ -46,7 +46,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_page_size,
-    get_spec_decode_reach,
+    get_max_decode_ahead,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
@@ -578,14 +578,23 @@ class TpModelWorker(BaseTpWorker):
         max_req_input_len = max_req_len - 5
         spec = get_spec()
         if spec.speculative_algorithm == "UBTREE":
-            # Reserve the double-buffered speculative decode reach on the
-            # physical KV pool so admitted requests fit spec_decode_alloc_lens.
-            reserve = get_spec_decode_reach(get_alloc_page_size())
+            # Reserve the double-buffered speculative decode write-ahead on the
+            # physical KV pool so admitted requests fit decode_alloc_targets.
+            reserve = get_max_decode_ahead(get_alloc_page_size())
+            min_kv_capacity = reserve + 8
+            if kv_capacity < min_kv_capacity:
+                raise ValueError(
+                    f"UBTREE requires a KV pool of at least {min_kv_capacity} "
+                    f"tokens (decode reserve {reserve} plus prompt headroom), "
+                    f"got {kv_capacity}. Increase --max-total-tokens or "
+                    "--mem-fraction-static, or lower "
+                    "--speculative-num-draft-tokens."
+                )
             max_req_len = min(
                 self.model_config.context_len - 1,
-                max(1, kv_capacity - 1 - reserve),
+                kv_capacity - 1 - reserve,
             )
-            max_req_input_len = max(1, min(max_req_input_len, max_req_len - 5))
+            max_req_input_len = min(max_req_input_len, max_req_len - 5)
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size
         return (

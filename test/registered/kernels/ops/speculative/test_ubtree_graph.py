@@ -782,6 +782,33 @@ def test_epilogue_capture_binds_verify_checkpoint_ids_and_sanitizes_nan(monkeypa
     assert checkpoint_ids.tolist() == [-1]
     assert recorded["target_predict"].reshape(-1).tolist() == [1, 2, 3, 0]
 
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
+
+    stage_buf = torch.full((4,), -1, dtype=torch.int64)
+    stage_runner = SimpleNamespace(
+        _verify_checkpoint_ids=stage_buf,
+        _verify_checkpoint_ids_dirty=False,
+    )
+    DecodeCudaGraphRunner._stage_verify_checkpoint_ids(
+        stage_runner, SimpleNamespace(mamba_track_indices=None), 4
+    )
+    assert stage_buf.tolist() == [-1, -1, -1, -1]
+    assert stage_runner._verify_checkpoint_ids_dirty is False
+    DecodeCudaGraphRunner._stage_verify_checkpoint_ids(
+        stage_runner,
+        SimpleNamespace(mamba_track_indices=torch.tensor([7, 9], dtype=torch.int64)),
+        4,
+    )
+    assert stage_buf.tolist() == [7, 9, 0, 0]
+    assert stage_runner._verify_checkpoint_ids_dirty is True
+    DecodeCudaGraphRunner._stage_verify_checkpoint_ids(
+        stage_runner, SimpleNamespace(mamba_track_indices=None), 2
+    )
+    assert stage_buf.tolist() == [-1, -1, -1, -1]
+    assert stage_runner._verify_checkpoint_ids_dirty is False
+
 
 @pytest.mark.parametrize("overlap", [False, True])
 def test_compact_topk_capture_follows_accepted_branch(overlap):

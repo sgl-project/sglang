@@ -530,13 +530,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # A verify's commit writes checkpoint slots that have no graph input;
         # the replay prep resolves them from this stable buffer.
         self._verify_checkpoint_ids: Optional[torch.Tensor] = (
-            torch.zeros(self.max_bs, dtype=torch.int64, device=self.device)
+            torch.full((self.max_bs,), -1, dtype=torch.int64, device=self.device)
             if get_exec().mamba.enable_mamba_extra_buffer
             and not enable_mamba_track
             and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
             and not model_runner.is_draft_worker
             else None
         )
+        self._verify_checkpoint_ids_dirty = False
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
@@ -1956,7 +1957,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return
         ids = forward_batch.mamba_track_indices
         if ids is None:
-            self._verify_checkpoint_ids[:bs].fill_(-1)
+            if getattr(self, "_verify_checkpoint_ids_dirty", False):
+                self._verify_checkpoint_ids.fill_(-1)
+                self._verify_checkpoint_ids_dirty = False
             return
         n = ids.shape[0]
         assert n <= bs <= self._verify_checkpoint_ids.shape[0], (
@@ -1965,6 +1968,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._verify_checkpoint_ids[:n].copy_(ids, non_blocking=True)
         if n < bs:
             self._verify_checkpoint_ids[n:bs].zero_()
+        self._verify_checkpoint_ids_dirty = True
 
     def _wants_early_verify_metadata(self) -> bool:
         """SGLANG_OPT_DSV41_TARGET_METADATA_EARLY, from facts fixed before the buffers

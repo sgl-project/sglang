@@ -83,11 +83,22 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
         )
     if parsed.supertree_width > parsed.candidate_k:
         raise ValueError("UBTree tree_supertree_width cannot exceed candidate_k")
+    vocab_size = root.get("vocab_size")
+    if vocab_size is not None:
+        vocab_size_int = int(vocab_size)
+        if vocab_size_int <= 0 or parsed.candidate_k > vocab_size_int:
+            raise ValueError(
+                f"UBTree candidate_k ({parsed.candidate_k}) cannot exceed "
+                f"vocab_size ({vocab_size_int})"
+            )
     if parsed.tree_budget > parsed.depth_count * parsed.supertree_width:
         raise ValueError("UBTree tree_budget exceeds the generated supertree")
     if not math.isfinite(parsed.depth_bonus) or parsed.depth_bonus > 0:
         raise ValueError("UBTree tree_depth_bonus must be finite and non-positive")
-    if metadata.get("objective") != "kl" or not metadata.get("adds_unary_logits"):
+    if (
+        metadata.get("objective") != "kl"
+        or metadata.get("adds_unary_logits") is not True
+    ):
         raise ValueError("UBTree serving requires the trained S1/S3 KL selector")
     if metadata.get("token_factorizer", "target_embedding_mlp") != (
         "target_embedding_mlp"
@@ -110,8 +121,9 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
 
 def resolve_verify_width(config: UBTreeConfig, requested: int | None) -> int:
     """Select one fixed KDA verification shape for the process lifetime."""
-    # Default to 49 nodes when the checkpoint supports it, widening up to
-    # block_size for larger draft blocks while staying within tree_budget.
+    # 49 (root plus 48 draft nodes, 3x the block-16 draft width) balances
+    # verify compute against acceptance length for released exports while
+    # widening to block_size for larger draft blocks within tree_budget.
     default_width = min(max(49, config.block_size), config.verify_node_count)
     width = default_width if requested is None else requested
     if not config.block_size <= width <= config.verify_node_count:

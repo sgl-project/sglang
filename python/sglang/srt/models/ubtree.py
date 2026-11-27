@@ -18,9 +18,9 @@ class Qwen3UBTreeModel(DFlashDraftModel):
         from sglang.srt.speculative.ubtree_components.config import parse_ubtree_config
         from sglang.srt.speculative.ubtree_components.selector import UBTreeSelector
 
-        parse_ubtree_config(config)
+        ubtree_config = parse_ubtree_config(config)
         super().__init__(config, quant_config=quant_config, prefix=prefix)
-        self.ubtree_selector = UBTreeSelector(config)
+        self.ubtree_selector = UBTreeSelector(config, ubtree_config=ubtree_config)
         self._ubtree_selector_loaded = False
         self._ubtree_segment_graph_runner = None
 

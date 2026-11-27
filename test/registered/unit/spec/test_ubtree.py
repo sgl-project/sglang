@@ -301,6 +301,20 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
                 bad = _config()
                 bad.ubtree_config = dict(bad.ubtree_config, tree_depth_bonus=bonus)
                 parse_ubtree_config(bad)
+        exact_vocab = _config()
+        exact_vocab.ubtree_config = dict(exact_vocab.ubtree_config, candidate_k=17)
+        self.assertEqual(parse_ubtree_config(exact_vocab).candidate_k, 17)
+        bad_vocab = _config()
+        bad_vocab.ubtree_config = dict(bad_vocab.ubtree_config, candidate_k=18)
+        with self.assertRaisesRegex(ValueError, "candidate_k"):
+            parse_ubtree_config(bad_vocab)
+        for bad_unary in ("false", "true", 1, False, None):
+            with self.subTest(adds_unary_logits=bad_unary), self.assertRaisesRegex(
+                ValueError, "KL selector"
+            ):
+                bad = _config()
+                bad.ubtree_config = dict(bad.ubtree_config, adds_unary_logits=bad_unary)
+                parse_ubtree_config(bad)
         with self.assertRaisesRegex(ValueError, "vocab_size 17 must match"):
             _run_ubtree_hook(target_vocab_size=18)
         with self.assertRaisesRegex(ValueError, "--context-length 2048"):
