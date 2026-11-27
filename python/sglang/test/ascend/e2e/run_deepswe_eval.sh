@@ -126,36 +126,4 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 docker compose version || echo "WARNING: docker compose plugin is still unavailable"
 
-# pier's egress-proxy Dockerfile builds FROM ubuntu:24.04 and runs
-# `apt-get update && apt-get install ...`. In this pod's old dind (18.06) every
-# container it launches fails apt signature verification (NO_PUBKEY
-# 871920D1991BC93C) for both jammy and noble, while the pod-level eval
-# container is fine. Bake an apt config into the base image that tolerates
-# unsigned repos and unauthenticated packages, and clear the docker-clean
-# Post-Invoke hooks (they also fail to execute here), then retag it as
-# ubuntu:24.04 so pier's `FROM ubuntu:24.04` picks it up without touching its
-# Dockerfile. Loaded as zz-* so it wins over docker-clean.
-seed_ubuntu_base() {
-    local work
-    work="$(mktemp -d)"
-    cat > "${work}/zz-allow-insecure.conf" <<'EOF'
-Acquire::AllowInsecureRepositories "true";
-APT::Get::AllowUnauthenticated "true";
-#clear APT::Update::Post-Invoke;
-#clear DPkg::Post-Invoke;
-EOF
-    cat > "${work}/Dockerfile" <<'EOF'
-FROM ubuntu:24.04
-COPY zz-allow-insecure.conf /etc/apt/apt.conf.d/zz-allow-insecure.conf
-EOF
-    echo "Building a patched ubuntu:24.04 that tolerates unsigned apt repos ..."
-    if docker build -t ubuntu:24.04 "${work}"; then
-        echo "Patched ubuntu:24.04 base ready."
-    else
-        echo "WARNING: failed to build the patched ubuntu:24.04 base"
-    fi
-    rm -rf "${work}"
-}
-seed_ubuntu_base
-
 python3 /root/sglang/python/sglang/test/ascend/e2e/run_deepswe_eval.py
