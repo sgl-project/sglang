@@ -52,6 +52,7 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
         "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
     )
+    hy4 = architecture in ("HYV4ForCausalLM", "HYV4VLForConditionalGeneration")
     if nemotron and cfg.attn_cp_size > 1:
         raise ValueError("Nemotron-H does not support --attn-cp-size > 1")
     if longcat and cfg.enable_prefill_cp and cfg.attn_cp_size > 1:
@@ -64,6 +65,15 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
         # None of these models enters the input-scattered attention scope.
         logger.warning(
             "Disabling input-scattered attention for %s: its forward does not enter that scope",
+            architecture,
+        )
+        return {"enable_attn_tp_input_scattered": False}
+    if hy4 and cfg.enable_attn_tp_input_scattered and cfg.pp_size > 1:
+        # A later pipeline rank's stages cannot bind the input-scattered rows,
+        # so the model's own conditions come too late to turn the path off.
+        logger.warning(
+            "Disabling input-scattered attention for %s: not supported with "
+            "pipeline parallelism",
             architecture,
         )
         return {"enable_attn_tp_input_scattered": False}
