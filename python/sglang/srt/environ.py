@@ -2398,6 +2398,24 @@ class Envs:
     # localization in one kernel (DcpFusedTopK, SM100, multicast).
     SGLANG_ENABLE_DSA_DCP_FUSED_TOPK = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Warm the out-of-graph replay prep of every captured graph shape at capture time: after
+    # each decode / target-verify / draft-decode / draft-extend graph is captured, run that
+    # shape's replay metadata prep once on the capture batch, with the device idle, so every
+    # Triton specialization it launches (including per-power-of-2 tile buckets for dynamic-
+    # shape kernels) has its module loaded before serving. A first-ever replay or sampled
+    # launch while serving invokes cuModuleLoadData mid-run, which can block on a device
+    # whose cross-GPU spin-wait collectives are waiting for this rank (causing a deadlock).
+    SGLANG_WARM_REPLAY_PREP = EnvBool(False)
+    # Any Triton module that still loads after the CUDA graphs are captured synchronizes the
+    # device first (outside stream capture; a post-verify graph capture synchronizes before
+    # it begins), and is logged once per kernel name, so a missed warm-up cannot load a module
+    # while this rank's spin-wait kernels are in flight.
+    SGLANG_TRITON_LAZY_LOAD_SYNC = EnvBool(False)
+    # Server warm-up also runs the serving shapes before "ready": one sampled request, then
+    # min(max_running_requests, 8) concurrent sampled requests with staggered lengths, so the
+    # sampled post-verify graphs and every decode batch size up to that count are captured /
+    # loaded before serving (speculative decoding, non-disaggregated servers).
+    SGLANG_WARMUP_SERVING_SHAPES = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
     # Separate from the CUDA flag: that one also packs wk+weights_proj.

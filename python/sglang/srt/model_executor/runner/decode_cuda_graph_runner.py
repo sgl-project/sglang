@@ -40,6 +40,10 @@ from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_co
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner.replay_prep_warmup import (
+    log_warmed,
+    warm_replay_prep,
+)
 from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_can_run_graph,
     megakernel_tensor_graph_variants,
@@ -1355,6 +1359,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
+        self._warmed_replay_bs = set()
         # warmup() may disable torch.compile for a model whose _can_torch_compile
         # is False; recompute the compile bucket so capture matches.
         if self.enable_torch_compile and not (get_flags().capture.enable_torch_compile):
@@ -1402,6 +1407,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.stream = graph_capture_context.stream
                 with self.backend.capture_session(self.stream):
                     self._capture_one_stream()
+        log_warmed(str(self.capture_forward_mode), self._warmed_replay_bs)
 
         if self.enable_profile_cuda_graph:
             self.backend.finish_capture_profile(profile_options, prof)
@@ -1604,6 +1610,44 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+            self._warm_replay_prep(
+                forward_batch,
+                attn_backend=attn_backend,
+                bs=bs,
+                num_tokens=num_tokens,
+                attention_variant=attention_variant,
+            )
+
+    def _warm_replay_prep(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        attn_backend,
+        bs: int,
+        num_tokens: int,
+        attention_variant,
+    ) -> None:
+        """Run this captured shape's eager replay metadata prep once now (replay_prep_warmup)."""
+        if self.ragged_verify_mode:
+            return
+
+        def prep():
+            fb_view = build_replay_fb_view(
+                forward_batch=forward_batch,
+                buffers=self.buffers,
+                bs=bs,
+                raw_bs=bs,
+                num_tokens=num_tokens,
+                global_num_tokens_cpu=self._global_num_tokens_for_graph(num_tokens),
+                seq_len_fill_value=self.seq_len_fill_value,
+                capture_forward_mode=self.capture_forward_mode,
+                is_encoder_decoder=self.is_encoder_decoder,
+            )
+            with self._prep_attention_variant(attention_variant):
+                attn_backend.init_forward_metadata_out_graph(fb_view)
+
+        if warm_replay_prep(str(self.capture_forward_mode), bs, prep):
+            self._warmed_replay_bs.add(bs)
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
         # An idle DP rank replays a fabricated batch whose count may not reach
