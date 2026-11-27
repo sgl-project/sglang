@@ -14,9 +14,11 @@ from unittest.mock import MagicMock, call, patch
 
 import msgspec
 import msgspec.structs
+import torch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
+    kv_cache_hook,
     parallel_hook,
     pd_disaggregation_hook,
     serving_hook,
@@ -49,6 +51,7 @@ from sglang.srt.arg_groups.hisparse_hook import (
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
+    handle_int8_kv_cache_compatibility,
     handle_kv4_compatibility,
     handle_nvfp4_prefill_kv_dequant_dtype,
     handle_platform_kv_cache_dtype_compatibility,
@@ -3480,6 +3483,111 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertTrue(resolution_result(server_args, "enforce_shared_experts_fusion"))
 
 
+class TestInt8KvCacheCompatibility(CustomTestCase):
+    """--kv-cache-dtype int8 is the packed DSA MLA record on Ascend; anything
+    else would take it as a plain one-byte cache."""
+
+    _MLA_PREPROCESS = "sglang.srt.hardware_backend.npu.attention.mla_preprocess"
+
+    def setUp(self):
+        super().setUp()
+        # Both env readers are cached per process; patch them, not the env.
+        for name in ("is_fia_nz", "is_mla_preprocess_enabled"):
+            p = patch(f"{self._MLA_PREPROCESS}.{name}", return_value=False)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _check(
+        self,
+        arch="GlmMoeDsaForCausalLM",
+        qk_rope_head_dim=64,
+        dtype=torch.bfloat16,
+        **kwargs,
+    ):
+        server_args = ServerArgs(model_path="dummy", kv_cache_dtype="int8", **kwargs)
+        hf_config = SimpleNamespace(architectures=[arch], index_topk=2048)
+        model_config = SimpleNamespace(
+            hf_config=hf_config, qk_rope_head_dim=qk_rope_head_dim, dtype=dtype
+        )
+        with patch.object(kv_cache_hook, "model_config_of", return_value=model_config):
+            handle_int8_kv_cache_compatibility(server_args)
+
+    def test_the_launcher_pipeline_runs_the_check(self):
+        model_dir = tempfile.mkdtemp(prefix="int8_kv_cache_")
+        self.addCleanup(shutil.rmtree, model_dir, ignore_errors=True)
+        with open(os.path.join(model_dir, "config.json"), "w") as handle:
+            json.dump(
+                {
+                    "architectures": ["LlamaForCausalLM"],
+                    "model_type": "llama",
+                    "hidden_size": 64,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 4,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 128,
+                    "max_position_embeddings": 2048,
+                },
+                handle,
+            )
+        server_args = ServerArgs(
+            model_path=model_dir, device="cuda", random_seed=42, kv_cache_dtype="int8"
+        )
+        with self.assertRaisesRegex(ValueError, "Ascend NPUs only"):
+            server_args.resolve_once()
+
+    def test_hisparse_rejects_int8(self):
+        server_args = ServerArgs(
+            model_path="dummy", enable_hisparse=True, kv_cache_dtype="int8"
+        )
+        with self.assertRaisesRegex(ValueError, "int8"):
+            validate_hisparse_kv_cache_dtype(server_args)
+
+    def test_only_dsa_models_on_npu_are_accepted(self):
+        with override_platform(is_cuda=True, is_npu=False):
+            with self.assertRaisesRegex(ValueError, "Ascend NPUs only"):
+                self._check()
+        with override_platform(is_npu=True):
+            with self.assertRaisesRegex(ValueError, "not a DSA model"):
+                self._check(arch="Qwen3ForCausalLM")
+            self._check()
+
+    def test_the_reader_rope_width_and_compute_dtype_are_required(self):
+        """The sparse attention reading the INT8 record takes a 64-wide RoPE
+        and a BF16 query: a NoPE DSA model or an FP16 run fails at startup,
+        not on the first forward."""
+        with override_platform(is_npu=True):
+            with self.assertRaisesRegex(ValueError, "qk_rope_head_dim=0"):
+                self._check(arch="Glm5NextForConditionalGeneration", qk_rope_head_dim=0)
+            with self.assertRaisesRegex(ValueError, "bfloat16 model dtype"):
+                self._check(dtype=torch.float16)
+
+    def test_mlapo_is_accepted(self):
+        """MLAProlog writes the INT8 record; it checks the projection weights
+        itself once they are loaded, as it does for the FP8 record."""
+        with (
+            override_platform(is_npu=True),
+            patch(
+                f"{self._MLA_PREPROCESS}.is_mla_preprocess_enabled",
+                return_value=True,
+            ),
+        ):
+            self._check()
+
+    def test_features_the_fp8_record_supports_are_accepted(self):
+        """FIA NZ, prefill CP and the host KV pools handle the packed record
+        the same way for FP8 and INT8, so int8 adds no rejection for them."""
+        with (
+            override_platform(is_npu=True),
+            patch(f"{self._MLA_PREPROCESS}.is_fia_nz", return_value=True),
+        ):
+            self._check(
+                attn_cp_size=2,
+                enable_hierarchical_cache=True,
+                disaggregation_decode_retraction_backup="host_pool",
+            )
+
+
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.
 
@@ -3743,12 +3851,13 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
 
 
 class TestDecodeCudaGraphCeilingByMemoryTier(CustomTestCase):
-    def _resolve_decode(self, gpu_mem_mb, tp_size, max_bs=None):
+    def _resolve_decode(self, gpu_mem_mb, tp_size, max_bs=None, **overrides):
         args = ServerArgs(
             model_path="dummy",
             tp_size=tp_size,
             mem_fraction_static=0.8,
             cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(max_bs=max_bs)),
+            **overrides,
         )
         with (
             patch(
@@ -3787,6 +3896,14 @@ class TestDecodeCudaGraphCeilingByMemoryTier(CustomTestCase):
     def test_explicit_ceiling_is_kept(self):
         decode = self._resolve_decode(46068, 1, max_bs=64)
         self.assertEqual((decode.max_bs, decode.bs[-1]), (64, 64))
+
+    def test_default_ceiling_is_per_rank_running_requests(self):
+        # (max_running_requests, attn_dp_size, expected max_bs); tier default is 512
+        for running, attn_dp, expected in ((768, 1, 768), (64, 1, 64), (1536, 8, 192)):
+            decode = self._resolve_decode(
+                192 * 1024, attn_dp, max_running_requests=running, attn_dp_size=attn_dp
+            )
+            self.assertEqual((decode.max_bs, decode.bs[-1]), (expected, expected))
 
 
 class TestCudaGraphDisaggregationRoles(CustomTestCase):

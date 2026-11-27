@@ -9,6 +9,7 @@ from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
+    ascend_allgather_row_sizes_for_batch,
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -313,30 +314,11 @@ class MoeRowTransport(ComputeTransport):
 
     def _ascend_allgather_row_sizes(self) -> list[int] | None:
         """Derive the layout only when the batch describes the entire TP group."""
-        parallel = get_parallel()
-        if self._use_cp:
-            if parallel.attn_cp_size == parallel.tp_size:
-                metadata = self.batch.attn_cp_metadata
-                return getattr(metadata, "per_rank_actual_token", None)
-            return None
-
-        if parallel.attn_cp_size != 1 or parallel.attn_dp_size == 1:
-            return None
-        dp_rows = self.batch.global_num_tokens_padded_cpu
-        if dp_rows is None or len(dp_rows) != parallel.attn_dp_size:
-            return None
-        attn_tp_size = parallel.attn_tp_size
-        if attn_tp_size == 1:
-            return dp_rows
-        if not self._use_tp_attn_a2a_scatter:
-            return None
-
-        # Match tensor_split() at the point where this transport shards rows.
-        row_sizes = []
-        for rows in dp_rows:
-            base, extra = divmod(rows, attn_tp_size)
-            row_sizes.extend(base + (rank < extra) for rank in range(attn_tp_size))
-        return row_sizes
+        return ascend_allgather_row_sizes_for_batch(
+            self.batch,
+            use_cp=self._use_cp,
+            use_tp_attn_a2a_scatter=self._use_tp_attn_a2a_scatter,
+        )
 
     def release(self):
         self.input = self._shared_local = self._a2a_scatter_chunks = None
