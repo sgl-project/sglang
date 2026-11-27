@@ -484,9 +484,9 @@ _NON_GPU_WORKFLOW_HINTS = (
     "model inventory",
 )
 
-# These high-volume metadata workflows use pull_request_target/workflow_run,
-# so the short pull_request/push gate below does not skip them. Match paths,
-# not PR-controlled run titles: a GPU test can mention either workflow name.
+# These high-volume metadata workflows only run on ubuntu-latest, and not every
+# run ends within the short-run gate below. Match paths, not PR-controlled run
+# titles: a GPU test can mention either workflow name.
 _HOSTED_ONLY_WORKFLOW_PATHS = {
     ".github/workflows/pr-check-comment.yml",
     ".github/workflows/pr-title.yml",
@@ -621,15 +621,15 @@ def calculate_utilization(
     skipped_non_gpu = 0
     skipped_lookback = 0
     for r in all_runs:
-        # Skipped/unapproved runs, and PR/push first attempts that finished
+        # Skipped/unapproved runs, and first attempts of any event that finished
         # within a minute (gate jobs on ubuntu-latest), never touch a
-        # self-hosted runner. Dispatched runs (e.g. rerun-test) go straight
-        # to a GPU runner, so they are always fetched.
+        # self-hosted runner. Dispatched and scheduled runs (e.g. rerun-test)
+        # go straight to a GPU runner, so they are always fetched.
         if (
             _likely_no_gpu_jobs(r.get("name", ""), r.get("path", ""))
             or r.get("conclusion") in ("skipped", "action_required")
             or (
-                r.get("event") in ("pull_request", "push")
+                r.get("event") not in ("workflow_dispatch", "schedule")
                 and r.get("status") == "completed"
                 and r.get("run_attempt") == 1
                 and parse_time(r["updated_at"]) - parse_time(r["run_started_at"])

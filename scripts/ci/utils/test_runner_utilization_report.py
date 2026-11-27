@@ -194,6 +194,63 @@ class TestHostedOnlyWorkflows(unittest.TestCase):
         )
 
 
+class TestShortRunSkip(unittest.TestCase):
+    """Short first attempts are skipped for every event, not just
+    pull_request/push; dispatched and scheduled runs are always fetched."""
+
+    def _run(self, run_id, event, seconds, **kw):
+        started = datetime.now(timezone.utc) - timedelta(hours=1)
+        run = {
+            "id": run_id,
+            "path": ".github/workflows/pr-test.yml",
+            "name": "PR Test Base",
+            "event": event,
+            "status": "completed",
+            "conclusion": "failure",
+            "run_attempt": 1,
+            "created_at": _iso(started),
+            "run_started_at": _iso(started),
+            "updated_at": _iso(started + timedelta(seconds=seconds)),
+        }
+        run.update(kw)
+        return run
+
+    def _fetched_ids(self, runs):
+        with (
+            patch.object(rur, "get_workflow_runs", return_value=(runs, False)),
+            patch.object(rur, "get_runners", return_value=[]),
+            patch.object(rur, "get_jobs_for_run", return_value=[]) as fetch,
+            redirect_stdout(io.StringIO()),
+        ):
+            rur.calculate_utilization("o/r")
+        return {call.args[1] for call in fetch.call_args_list}
+
+    def test_short_first_attempt_skipped_for_any_trigger(self):
+        runs = [
+            self._run(1, "pull_request", 20),
+            self._run(2, "push", 20),
+            self._run(3, "pull_request_target", 20),
+            self._run(
+                4,
+                "workflow_run",
+                7,
+                path=".github/workflows/cuda-coredump-tracker.yml",
+                name="CUDA Coredump Tracker",
+            ),
+        ]
+        self.assertEqual(self._fetched_ids(runs), set())
+
+    def test_runs_that_may_hold_a_runner_are_fetched(self):
+        runs = [
+            self._run(1, "workflow_dispatch", 20),
+            self._run(2, "schedule", 20),
+            self._run(3, "pull_request_target", 5 * 60),
+            self._run(4, "pull_request_target", 20, run_attempt=2),
+            self._run(5, "pull_request_target", 20, status="in_progress"),
+        ]
+        self.assertEqual(self._fetched_ids(runs), {1, 2, 3, 4, 5})
+
+
 class TestClassifyJob(unittest.TestCase):
     def test_queued_job_counts_ongoing_wait(self):
         """The core bug: a still-queued job reports started_at == created_at
