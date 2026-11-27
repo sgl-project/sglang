@@ -30,7 +30,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.backend.lora_registry import get_backend_from_name
+from sglang.srt.lora.backend.lora_registry import (
+    get_backend_from_name,
+    routes_kv_b_lora_cached_rows,
+)
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -956,7 +959,9 @@ class LoRAManager:
         # The attention modules snapshot the chunked-prefix flag when the model
         # is built, so a kv_b_proj target that only surfaced here (inferred from
         # the adapters) can no longer be made safe: fail with the fix spelled out.
-        if "kv_b_proj" in self.target_modules:
+        if "kv_b_proj" in self.target_modules and not routes_kv_b_lora_cached_rows(
+            self.lora_backend.name, get_exec().graph.cuda_graph_config.prefill.backend
+        ):
             prefill_backend, _ = attention_backends()
             error = kv_b_lora_prefix_cache_error(
                 prefill_backend,

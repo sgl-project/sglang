@@ -23,6 +23,9 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+    is_kv_b_lora_active,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
@@ -251,10 +254,13 @@ class DeepseekMHAForwardMixin:
         q[..., self.qk_nope_head_dim :] = q_pe
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        kv_a_row_lens = None
         if (
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
+            # each request's cached prefix followed by its extend tokens
+            kv_a_row_lens = forward_batch.seq_lens_cpu.tolist()
             if (
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
@@ -285,7 +291,10 @@ class DeepseekMHAForwardMixin:
                         q.dtype,
                         forward_batch,
                     )
-        kv = self.kv_b_proj(kv_a)[0]
+        if kv_a_row_lens is None:
+            kv = self.kv_b_proj(kv_a)[0]
+        else:
+            kv = self._kv_b_proj_cached_rows(kv_a, kv_a_row_lens)
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
@@ -458,7 +467,9 @@ class DeepseekMHAForwardMixin:
         kv_a_normed, k_pe = get_mla_kv_buffer(
             forward_batch.prefix_all_kv_indices, torch.bfloat16, forward_batch
         )
-        kv = self.kv_b_proj(kv_a_normed)[0]
+        kv = self._kv_b_proj_cached_rows(
+            kv_a_normed, forward_batch.extend_prefix_lens_cpu
+        )
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         prefix_k, prefix_v = backend.pack_prefix_chunk_kv(
             kv[..., : self.qk_nope_head_dim],
@@ -506,7 +517,9 @@ class DeepseekMHAForwardMixin:
                 kv_a_dtype,
                 forward_batch,
             )
-            kv = self.kv_b_proj(kv_a_normed)[0]
+            kv = self._kv_b_proj_cached_rows(
+                kv_a_normed, forward_batch.extend_prefix_lens_cpu
+            )
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )
@@ -537,7 +550,9 @@ class DeepseekMHAForwardMixin:
                     forward_batch.prefix_chunk_seq_lens_cpu[i],
                     forward_batch.prefix_chunk_starts_cpu[i],
                 )
-                kv = self.kv_b_proj(kv_a_normed)[0]
+                kv = self._kv_b_proj_cached_rows(
+                    kv_a_normed, forward_batch.prefix_chunk_seq_lens_cpu[i].tolist()
+                )
                 kv = kv.view(
                     -1,
                     self.num_local_heads,
@@ -695,6 +710,15 @@ class DeepseekMHAForwardMixin:
         k_pe = kv_latent_bf16[:, :, self.kv_lora_rank :]
 
         return kv_a, k_pe
+
+    def _kv_b_proj_cached_rows(
+        self: DeepseekV2AttentionMLA, kv_a: torch.Tensor, row_lens: list[int]
+    ) -> torch.Tensor:
+        """``kv_b_proj`` on cached latents, request-major with ``row_lens[i]`` rows of request ``i``."""
+        # the adapter routing describes the batch's extend tokens, not these rows
+        if is_kv_b_lora_active(self):
+            return self.kv_b_proj.forward_rows(kv_a, row_lens)[0]
+        return self.kv_b_proj(kv_a)[0]
 
     def _concat_and_cast_mha_k(
         self: DeepseekV2AttentionMLA,

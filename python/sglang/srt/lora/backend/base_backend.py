@@ -9,6 +9,7 @@ from sglang.srt.lora.utils import (
     LoRABatchInfo,
     MoELoRABatchInfo,
     get_batch_token_counts,
+    merge_and_chunk_segments,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import LoRABatchLayout
@@ -37,6 +38,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     supports_dp_attention: bool = False
     # Supporting backends implement grouped_sgemm_batch_infos().
     supports_grouped_lora: bool = False
+    # Supporting backends implement build_rows_batch_info().
+    supports_rows_routing: bool = False
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
@@ -45,6 +48,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         # reset_batch_state() on DP-attention idle forwards. None means "no
         # batch prepared" — the LoRA layers read it to skip LoRA application.
         self.batch_info: Optional[LoRABatchInfo] = None
+        # Adapter weight index of each request in the prepared batch.
+        self.request_weight_indices: list[int] | None = None
         self.init_lm_head_config()
         self._is_moe_lora = False
         # Static metadata read by prefill-CUDA-graph kernels, refreshed in
@@ -65,6 +70,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         per-batch metadata. batch_info=None is the master "no batch
         prepared" signal that the layer guards (lora_active) read."""
         self.batch_info = None
+        self.request_weight_indices = None
         self.lm_head_batch_info = None
         self.lm_head_pass_batch_infos = None
         self._lm_head_pass_idx = None
@@ -117,18 +123,22 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         pruned_batch_info=None,
     ) -> torch.Tensor:
         """Run base + LoRA, retaining separate base/A reductions for legacy backends."""
-        if all_reduce is None:
+        if all_reduce is None and pruned_batch_info is None:
             return layer.apply_lora(base_fn(), x)
         output = base_fn()
-        lora_a_output = self.run_lora_a_sgemm(x, lora_a)
-        output = all_reduce(output)
-        lora_a_output = all_reduce(lora_a_output)
+        lora_a_output = self.run_lora_a_sgemm(
+            x, lora_a, pruned_batch_info=pruned_batch_info
+        )
+        if all_reduce is not None:
+            output = all_reduce(output)
+            lora_a_output = all_reduce(lora_a_output)
         return self.run_lora_b_sgemm(
             x=lora_a_output,
             weights=lora_b,
             output_offset=output_offset,
             output_offset_cpu=layer.output_offset_cpu,
             base_output=output,
+            pruned_batch_info=pruned_batch_info,
         )
 
     def run_lora_a_embedding(
@@ -454,6 +464,30 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         raise NotImplementedError(
             f"LoRA backend {type(self).__name__} does not support explicit "
             "token segments."
+        )
+
+    def build_rows_batch_info(self, row_lens: list[int]):
+        """Routing for an input whose rows are not the batch's tokens.
+
+        Rows are request-major: ``row_lens[i]`` rows of request ``i``, each
+        adapted by that request's adapter (MLA cached-prefix latents).
+        """
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} cannot route rows other than "
+            "the batch's tokens."
+        )
+
+    def _merge_request_rows(
+        self, row_lens: list[int], chunk_size: int
+    ) -> Tuple[list[int], list[int]]:
+        assert self.request_weight_indices is not None and len(row_lens) == len(
+            self.request_weight_indices
+        ), (
+            f"{len(row_lens)} row groups for a prepared batch of "
+            f"{self.request_weight_indices and len(self.request_weight_indices)} requests"
+        )
+        return merge_and_chunk_segments(
+            self.request_weight_indices, row_lens, chunk_size
         )
 
 

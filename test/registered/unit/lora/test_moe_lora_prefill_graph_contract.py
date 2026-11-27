@@ -296,7 +296,8 @@ def v2_backend(mapping_functions):
         ).get_batch_info,
         backend,
     )
-    backend.lm_head_runner = None
+    backend.rows_runner = None
+    backend.adapts_lm_head = False
     bindings = []
     backend.runner = SimpleNamespace(
         begin_batch=lambda **kwargs: bindings.append(kwargs)

@@ -39,6 +39,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
     name = "csgmv"
     supports_prefill_cuda_graph = True
+    supports_rows_routing = True
 
     def __init__(
         self,
@@ -282,6 +283,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         use_cuda_graph: bool,
         use_prefill_cuda_graph: bool = False,
     ):
+        self.request_weight_indices = weight_indices
         chunk_size = self._determine_chunk_size(forward_batch)
 
         permutation, weight_indices_reordered = ChunkedSgmvLoRABackend._get_permutation(
@@ -386,6 +388,16 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         self.batch_info = batch_info
         self.lm_head_batch_info, self.lm_head_pass_batch_infos = (
             self._prepare_lm_head_batch_info(forward_batch, weight_indices, batch_info)
+        )
+
+    def build_rows_batch_info(self, row_lens: list[int]) -> LoRABatchInfo:
+        num_rows = sum(row_lens)
+        chunk_size = self._determine_chunk_size_for_tokens(num_rows)
+        return self._build_lm_head_batch_info(
+            self._merge_request_rows(row_lens, chunk_size),
+            self.batch_info,
+            chunk_size,
+            num_rows,
         )
 
     def _prepare_lm_head_batch_info(
