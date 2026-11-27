@@ -39,6 +39,8 @@ def get_decode_ahead() -> int:
     after publish.
     """
     spec = get_spec()
+    if spec.speculative_algorithm is None:
+        return 1
     return decode_ahead(
         speculative_algorithm=spec.speculative_algorithm,
         num_steps=spec.speculative_num_steps,
