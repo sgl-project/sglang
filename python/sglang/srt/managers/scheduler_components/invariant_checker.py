@@ -451,15 +451,20 @@ class SchedulerInvariantChecker:
           B. the free pool has no duplicate pages (two owners freed the same page).
         All heavy work runs on GPU to avoid per-token device->host sync."""
         rtt = self.req_to_token_pool.req_to_token
-        row_width = rtt.shape[1]
+        req_to_token_row_width = rtt.shape[1]
 
         def _add_owner(label, kv):
-            if not 0 <= kv.kv_committed_len <= kv.kv_allocated_len <= row_width:
+            if (
+                not 0
+                <= kv.kv_committed_len
+                <= kv.kv_allocated_len
+                <= req_to_token_row_width
+            ):
                 self.reporter.report(
                     Severity.CORRUPTION,
                     f"KV length out of bounds for {label}: "
                     f"committed={kv.kv_committed_len}, "
-                    f"allocated={kv.kv_allocated_len}, row_width={row_width}",
+                    f"allocated={kv.kv_allocated_len}, req_to_token_row_width={req_to_token_row_width}",
                 )
             owners.append((label, kv.req_pool_idx, kv.kv_allocated_len))
 
@@ -478,7 +483,10 @@ class SchedulerInvariantChecker:
 
         idx = torch.as_tensor([rpi for _, rpi, _ in active], device=rtt.device)
         allocs = torch.as_tensor([al for _, _, al in active], device=rtt.device)
-        mask = torch.arange(row_width, device=rtt.device)[None, :] < allocs[:, None]
+        mask = (
+            torch.arange(req_to_token_row_width, device=rtt.device)[None, :]
+            < allocs[:, None]
+        )
         owner_locs = rtt[idx][mask]
 
         # Sub-allocators to check: a flat allocator is its own single sub; a
