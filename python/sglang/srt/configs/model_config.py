@@ -816,6 +816,7 @@ class ModelConfig:
             self.hf_config.architectures,
             is_embedding_requested=bool(is_embedding),
             is_embedding_gemma=self.is_embedding_gemma,
+            hf_config=self.hf_config,
         )
 
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
@@ -2679,6 +2680,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
     if (
         "LlamaEmbeddingModel" in model_architectures
         or "MistralModel" in model_architectures
+        or "Mistral3ForSequenceClassification" in model_architectures
         or "LlamaForSequenceClassification" in model_architectures
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
         or "InternLM2ForRewardModel" in model_architectures
@@ -2742,6 +2744,7 @@ multimodal_model_archs = [
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
+    "Mistral3ForSequenceClassification",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
     "MossVLForConditionalGeneration",
