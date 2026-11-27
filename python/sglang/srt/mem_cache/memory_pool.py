@@ -5186,6 +5186,25 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             dst_buffer, loc, cache_k_nope, cache_k_rope, self.page_size
         )
 
+    def _seg_gather_rows(self, kv_buffer: torch.Tensor, loc: torch.Tensor):
+        """Token-major ``(n, 1, kv_cache_dim)`` rows of ``loc`` in the pool's
+        storage dtype, read out of seg-packed pages."""
+        from sglang.kernels.ops.kvcache.mla_seg_buffer import seg_get_mla_kv_buffer
+
+        rows = torch.empty(
+            (loc.numel(), 1, self.kv_cache_dim),
+            dtype=kv_buffer.dtype,
+            device=kv_buffer.device,
+        )
+        seg_get_mla_kv_buffer(
+            kv_buffer,
+            loc,
+            rows[..., : self.kv_lora_rank],
+            rows[..., self.kv_lora_rank :],
+            self.page_size,
+        )
+        return rows
+
     def gather_kv_latent(
         self, layer_id: int, loc: torch.Tensor, dst_dtype: torch.dtype
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -5386,9 +5405,15 @@ class MLATokenToKVPool(KVCache, MLAKVView):
                 continue
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                kv_cpu = self.kv_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
-                )
+                if self.mla_seg_page_layout:
+                    # Token rows are not contiguous in a seg-packed page; a
+                    # row copy loses the rope segment of a partly filled page.
+                    kv_rows = self._seg_gather_rows(
+                        self.kv_buffer[layer_id], chunk_indices
+                    )
+                else:
+                    kv_rows = self.kv_buffer[layer_id][chunk_indices]
+                kv_cpu = kv_rows.to("cpu", non_blocking=True)
                 kv_cache_cpu[-1].append(kv_cpu)
         current_platform.synchronize()
         return kv_cache_cpu
@@ -5409,7 +5434,15 @@ class MLATokenToKVPool(KVCache, MLAKVView):
                 kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
                 assert kv_cpu.shape[0] == len(chunk_indices)
                 kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
-                self.kv_buffer[layer_id][chunk_indices] = kv_chunk
+                if self.mla_seg_page_layout:
+                    self._seg_write(
+                        self.kv_buffer[layer_id],
+                        chunk_indices,
+                        kv_chunk[..., : self.kv_lora_rank],
+                        kv_chunk[..., self.kv_lora_rank :],
+                    )
+                else:
+                    self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         current_platform.synchronize()
 
 
