@@ -128,13 +128,15 @@ export const AgentX = ({ data: input }) => {
   const kvTransform = (blocks, source, target, cellKv, router) => {
     if (source === target) return blocks;
     const mc = data.kvMooncake;
+    const sourceUsesStore = source === "mooncake" || blocks.some((b) =>
+      b.kind === "worker" && (b.args || []).some((a) => a[0] === "--hicache-storage-backend" && a[1] === "mooncake"));
     const out = [];
     for (const b0 of blocks) {
-      if (source === "mooncake" && (b0.kind === "mooncake-master" || b0.kind === "mooncake-store")) continue;
+      if (sourceUsesStore && (b0.kind === "mooncake-master" || b0.kind === "mooncake-store")) continue;
       const b = { ...b0, args: (b0.args || []).map((a) => [...a]), env: { ...(b0.env || {}) } };
       if (b.kind === "worker") {
         b.args = b.args.filter((a) => !isKvFlag(a[0]));
-        if (source === "mooncake") b.env = Object.fromEntries(Object.entries(b.env).filter(([k]) => !STORE_ONLY_ENV.includes(k)));
+        if (sourceUsesStore) b.env = Object.fromEntries(Object.entries(b.env).filter(([k]) => !STORE_ONLY_ENV.includes(k)));
         let add = [];
         let env = {};
         if (CACHE_ROLES.includes(b.role)) {
@@ -301,7 +303,7 @@ export const AgentX = ({ data: input }) => {
       // srt-slurm's store-infra instances (InfX #4695) run on a node with no worker, adding its DRAM to the store.
       return b.placement === "infra"
         ? `Start on ${b.count_nodes || 1} separate node(s) that run no worker${per}; they add that node's host memory to the store.`
-        : `Start on each of the ${b.count_nodes || 1} decode node(s)${per}.`;
+        : `Start on each of the ${b.count_nodes || 1} ${b.placement === "prefill" ? "prefill" : "decode"} node(s)${per}.`;
     }
     if (b.kind === "dynamo-frontend") return (b.count > 1 ? `SA ran ${b.count} frontends on separate nodes behind nginx (previous tab; port 8180 each, nginx on 8000). One frontend on port 8000 also works.` : "Start once; clients connect to port 8000.") + " It finds the workers through etcd, so it can start before them.";
     if (b.kind === "nginx") return "Optional scale-out in front of the frontends (next tab): hashes each session onto one frontend and listens on port 8000, with nginx.conf (below) in the working directory.";
@@ -513,6 +515,18 @@ export const AgentX = ({ data: input }) => {
     ...looseFiles.map((f) => ({ id: `file:${f.name}`, label: f.name, file: f })),
   ];
   tabs.forEach((t) => { t.slug = tabSlug(t); });
+  // Separate store commands can share a placement but use different NUMA bindings.
+  const tabTotals = {};
+  const tabSeen = {};
+  tabs.forEach((t) => { tabTotals[t.slug] = (tabTotals[t.slug] || 0) + 1; });
+  tabs.forEach((t) => {
+    if (tabTotals[t.slug] > 1) {
+      const n = tabSeen[t.slug] = (tabSeen[t.slug] || 0) + 1;
+      t.id += `:${n}`;
+      t.slug += `-${n}`;
+      t.label += ` ${n}`;
+    }
+  });
   const single = blocks.length === 1 && !looseFiles.length; // one process: no tab bar
   const active = (!single && tabs.find((t) => t.slug === tab)) || tabs[0];
   const activeTab = active.id;

@@ -151,6 +151,24 @@ TRANSFORM_EACH_RESPONSE_TEMPLATE = {
     },
 }
 
+REASONING_CONTENT_JOIN_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {
+        "reasoning_content": {
+            "open": "<think>",
+            "close": "</think>",
+            "repeats": True,
+            "join": "",
+        },
+        "content": {
+            "open": "<answer>",
+            "close": "</answer>",
+            "repeats": True,
+            "join": "",
+        },
+    },
+}
+
 
 def _tool(name: str = "get_weather") -> Tool:
     return Tool(
@@ -231,6 +249,8 @@ class TestResponseTemplateLoading(CustomTestCase):
         for field_name, update in (
             ("content", {"content": "json"}),
             ("thinking", {"transform": "{content}"}),
+            ("thinking", {"repeats": True, "join": "\n"}),
+            ("content", {"repeats": True, "join": "\n"}),
         ):
             with self.subTest(field=field_name, update=update):
                 template = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
@@ -262,6 +282,13 @@ class TestResponseTemplateLoading(CustomTestCase):
         self.assertEqual(
             tool_close_token_ids("response_template", tokenizer), frozenset()
         )
+
+    def test_ambiguous_reasoning_fields_are_rejected(self):
+        template = copy.deepcopy(REASONING_CONTENT_JOIN_TEMPLATE)
+        template["fields"]["thinking"] = template["fields"]["reasoning_content"]
+
+        with self.assertRaisesRegex(ValueError, "cannot declare both"):
+            validate_response_template_for_serving(template)
 
 
 class TestGemma4ResponseTemplateParity(CustomTestCase):
@@ -437,6 +464,27 @@ class TestGemma4ResponseTemplateParity(CustomTestCase):
 
 
 class TestResponseTemplateAdapters(CustomTestCase):
+    def test_repeated_regions_join_in_streaming_and_nonstreaming(self):
+        text = (
+            "<think>first</think><think>second</think>"
+            "<answer>one</answer><answer>two</answer>"
+        )
+        detector = ResponseTemplateReasoningDetector(
+            response_template=REASONING_CONTENT_JOIN_TEMPLATE,
+            prefix="<assistant>",
+        )
+        parsed = detector.detect_and_parse(text)
+        self.assertEqual(parsed.reasoning_text, "firstsecond")
+        self.assertEqual(parsed.normal_text, "onetwo")
+
+        streamed = [detector.parse_streaming_increment(char) for char in text]
+        streamed.append(detector.finish())
+
+        self.assertEqual(
+            "".join(result.reasoning_text for result in streamed), "firstsecond"
+        )
+        self.assertEqual("".join(result.normal_text for result in streamed), "onetwo")
+
     def test_parser_prefix_request_state_is_private(self):
         requests = (
             ChatCompletionRequest(messages=[]),
@@ -461,7 +509,10 @@ class TestResponseTemplateAdapters(CustomTestCase):
                 )
 
     def test_adapters_use_checkpoint_metadata(self):
-        tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
+        template = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
+        fields = template["fields"]
+        fields["reasoning_content"] = fields.pop("thinking")
+        tokenizer = SimpleNamespace(response_template=template)
         reasoning = ReasoningParser(
             model_type="response_template",
             tokenizer=tokenizer,
