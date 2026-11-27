@@ -309,24 +309,26 @@ bool is_valid_config(
       q_type == W_TYPE && s_type == S_TYPE && thread_m_blocks == THREAD_M_BLOCKS &&                                   \
       thread_n_blocks == THREAD_N_BLOCKS && thread_k_blocks == THREAD_K_BLOCKS && m_block_size_8 == M_BLOCK_SIZE_8 && \
       group_blocks == GROUP_BLOCKS && num_threads == NUM_THREADS && is_zp_float == IS_ZP_FLOAT) {                     \
-    constexpr auto kSType = S_TYPE;                                                                                   \
-    kernel = Marlin<                                                                                                  \
-        scalar_t,                                                                                                     \
-        W_TYPE.id(),                                                                                                  \
-        kSType.id(),                                                                                                  \
-        NUM_THREADS,                                                                                                  \
-        THREAD_M_BLOCKS,                                                                                              \
-        THREAD_N_BLOCKS,                                                                                              \
-        THREAD_K_BLOCKS,                                                                                              \
-        M_BLOCK_SIZE_8,                                                                                               \
-        pipe_stages,                                                                                                  \
-        GROUP_BLOCKS,                                                                                                 \
-        IS_ZP_FLOAT,                                                                                                  \
-        kIsEP,                                                                                                        \
-        kHasBias,                                                                                                     \
-        kExpertIdsAreSorted,                                                                                          \
-        kZeroInactiveOutput,                                                                                          \
-        kHasInactivePrefixCount>;                                                                                     \
+    if constexpr (W_TYPE.id() == kQTypeId) {                                                                          \
+      constexpr auto kSType = S_TYPE;                                                                                 \
+      kernel = Marlin<                                                                                                \
+          scalar_t,                                                                                                   \
+          W_TYPE.id(),                                                                                                \
+          kSType.id(),                                                                                                \
+          NUM_THREADS,                                                                                                \
+          THREAD_M_BLOCKS,                                                                                            \
+          THREAD_N_BLOCKS,                                                                                            \
+          THREAD_K_BLOCKS,                                                                                            \
+          M_BLOCK_SIZE_8,                                                                                             \
+          pipe_stages,                                                                                                \
+          GROUP_BLOCKS,                                                                                               \
+          IS_ZP_FLOAT,                                                                                                \
+          kIsEP,                                                                                                      \
+          kHasBias,                                                                                                   \
+          kExpertIdsAreSorted,                                                                                        \
+          kZeroInactiveOutput,                                                                                        \
+          kHasInactivePrefixCount>;                                                                                   \
+    }                                                                                                                 \
   }
 
 // Default scale type per weight type (the upstream rule).
@@ -504,6 +506,7 @@ bool is_valid_config(
 
 template <
     typename scalar_t,
+    host::ScalarTypeId kQTypeId,
     bool kIsEP,
     bool kHasBias,
     bool kExpertIdsAreSorted,
@@ -549,6 +552,7 @@ MarlinFuncPtr get_marlin_kernel(
 
 template <
     typename scalar_t,
+    host::ScalarTypeId kQTypeId,
     bool kIsEP,
     bool kHasBias,
     bool kExpertIdsAreSorted,
@@ -627,19 +631,25 @@ exec_config_t determine_exec_config(
       group_blocks = group_size == -1 ? -1 : (group_size / 16);
     }
 
-    auto kernel =
-        get_marlin_kernel<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput, kHasInactivePrefixCount>(
-            q_type,
-            s_type,
-            thread_m_blocks,
-            th_config.thread_n / 16,
-            th_config.thread_k / 16,
-            m_block_size_8,
-            has_act_order,
-            has_zp,
-            group_blocks,
-            th_config.num_threads,
-            is_zp_float);
+    auto kernel = get_marlin_kernel<
+        scalar_t,
+        kQTypeId,
+        kIsEP,
+        kHasBias,
+        kExpertIdsAreSorted,
+        kZeroInactiveOutput,
+        kHasInactivePrefixCount>(
+        q_type,
+        s_type,
+        thread_m_blocks,
+        th_config.thread_n / 16,
+        th_config.thread_k / 16,
+        m_block_size_8,
+        has_act_order,
+        has_zp,
+        group_blocks,
+        th_config.num_threads,
+        is_zp_float);
 
     if (kernel == MarlinDefault) continue;
 
@@ -669,6 +679,7 @@ exec_config_t determine_exec_config(
 
 template <
     typename scalar_t,
+    host::ScalarTypeId kQTypeId,
     bool kIsEP,
     bool kHasBias,
     bool kExpertIdsAreSorted,
@@ -816,6 +827,7 @@ void marlin_mm(
     // Auto config
     exec_cfg = determine_exec_config<
         scalar_t,
+        kQTypeId,
         kIsEP,
         kHasBias,
         kExpertIdsAreSorted,
@@ -893,19 +905,25 @@ void marlin_mm(
       ", max_shared_mem = ",
       max_shared_mem);
 
-  auto kernel =
-      get_marlin_kernel<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput, kHasInactivePrefixCount>(
-          q_type,
-          s_type,
-          thread_m_blocks,
-          thread_n_blocks,
-          thread_k_blocks,
-          m_block_size_8,
-          has_act_order,
-          has_zp,
-          group_blocks,
-          num_threads,
-          is_zp_float);
+  auto kernel = get_marlin_kernel<
+      scalar_t,
+      kQTypeId,
+      kIsEP,
+      kHasBias,
+      kExpertIdsAreSorted,
+      kZeroInactiveOutput,
+      kHasInactivePrefixCount>(
+      q_type,
+      s_type,
+      thread_m_blocks,
+      thread_n_blocks,
+      thread_k_blocks,
+      m_block_size_8,
+      has_act_order,
+      has_zp,
+      group_blocks,
+      num_threads,
+      is_zp_float);
 
   if (kernel == MarlinDefault) {
     host::Panic(
@@ -948,6 +966,7 @@ void marlin_mm(
 
 template <
     typename scalar_t,
+    host::ScalarTypeId kQTypeId,
     bool kIsEP,
     bool kHasBias,
     bool kExpertIdsAreSorted,
@@ -993,6 +1012,7 @@ void moe_wna16_marlin_gemm(
   static_assert(!kHasInactivePrefixCount || (kExpertIdsAreSorted && !kIsEP));
   RuntimeCheck(is_ep == kIsEP, "is_ep does not match the compiled Marlin MoE specialization");
   RuntimeCheck(has_bias == kHasBias, "has_bias does not match the compiled Marlin MoE specialization");
+  RuntimeCheck(b_q_type_id == kQTypeId, "b_q_type does not match the compiled Marlin MoE specialization");
 
   ScalarType const b_q_type = ScalarType::from_id(b_q_type_id);
   int pack_factor = 32 / b_q_type.size_bits();
@@ -1217,7 +1237,7 @@ void moe_wna16_marlin_gemm(
   if (size_m == 0) return;
 
   device::marlin_moe::
-      marlin_mm<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput, kHasInactivePrefixCount>(
+      marlin_mm<scalar_t, kQTypeId, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput, kHasInactivePrefixCount>(
           a.data_ptr(),
           b_q_weight.data_ptr(),
           c.data_ptr(),
