@@ -958,9 +958,11 @@ class MetadataBuffers:
             )
         self.output_customized_info_len[idx, 0] = len(payload)
 
-    def set_buf(self, req: Req):
+    def set_buf(self, req: Req, output_id: Optional[int] = None):
         self._set_customized_info(req)
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        self.output_ids[req.metadata_buffer_index][0] = (
+            req.output_ids[0] if output_id is None else output_id
+        )
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
         # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
@@ -1897,13 +1899,17 @@ def setup_state_kv_args(
     window_tails: Optional[Dict[str, int]] = None,
     draft_kv_ring: Optional[DFlashDraftKVRing] = None,
     empty_draft_kv_ring: bool = False,
+    empty_draft_window: bool = False,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
     window sub-pool carries (`KVStorage.retained_window_lengths`); peers agree on it.
     A DFLASH draft KV ring's rows and floor go after the storage's entries:
     readers that zip against the storage's wire entries skip them, and the wire
-    check and the checksum filter find them there."""
+    check and the checksum filter find them there. ``empty_draft_window`` is for
+    a PP stage without the draft whose peers send the draft's window as a state
+    entry after the target's: an empty entry keeps the stage's entries aligned
+    with theirs."""
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -1947,6 +1953,8 @@ def setup_state_kv_args(
         )
         if state_type == StateType.SWA:
             kv_args.swa_kv_cache_layout = region.kv_layout
+    if empty_draft_window:
+        append_state_component(kv_args, StateType.SWA, [], [], [])
     if (
         StateType.DSA in kv_args.state_types
         and isinstance(owner_view, DSATokenToKVPool)
@@ -2054,9 +2062,11 @@ def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
     if not kv_args.num_draft_entries:
         return None
     # No block size: prefill writes draft KV per token, unlike DSV4.1's SWA ring.
+    # A stage with grouped KV heads holds one entry per head group for each entry of its decode.
+    head_groups = kv_args.kv_head_groups.count if kv_args.kv_head_groups else 1
     return {
         "algorithm": algorithm.name,
-        "num_draft_entries": kv_args.num_draft_entries,
+        "num_draft_entries": kv_args.num_draft_entries // head_groups,
     }
 
 

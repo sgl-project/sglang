@@ -101,6 +101,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.model_executor.pool_configurator import dflash_pd_window_draft_reach
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
@@ -108,6 +109,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
     scheduler_stage_method,
 )
+from sglang.srt.rocm_muse_spark.kv_head_groups import build_kv_head_groups
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -420,6 +422,10 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool
             if transfer_draft_cache
             and (not _is_npu or get_parallel().pp_group.is_last_rank)
+            # A draft pool on the target's window ids goes with the window state.
+            and not getattr(
+                self.draft_token_to_kv_pool, "follows_target_swa_ids", False
+            )
             else None
         )
         num_draft_entries = 0
@@ -492,7 +498,31 @@ class PrefillBootstrapQueue:
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
             empty_draft_kv_ring=get_spec().speculative_dflash_draft_kv_ring,
+            # A stage without the draft, where the last stage and the decode
+            # carry the draft's window as a state entry.
+            empty_draft_window=self.draft_token_to_kv_pool is None
+            and not get_spec().speculative_dflash_draft_kv_ring
+            and dflash_pd_window_draft_reach() is not None,
         )
+
+        kv_args.kv_head_groups = build_kv_head_groups(
+            kv_args,
+            token_to_kv_pool=self.token_to_kv_pool,
+            draft_kv_pool=draft_kv_pool,
+            draft_window_pool=(
+                self.draft_token_to_kv_pool
+                if getattr(self.draft_token_to_kv_pool, "follows_target_swa_ids", False)
+                else None
+            ),
+            model_config=self.scheduler.model_config,
+        )
+        if (
+            kv_args.kv_head_groups is not None
+            and self.transfer_backend != TransferBackend.MORI
+        ):
+            raise NotImplementedError(
+                "SGLANG_ROCM_MUSE_PP_KV_GROUPS needs --disaggregation-transfer-backend mori"
+            )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager_kwargs = (
@@ -1266,6 +1296,7 @@ class SchedulerDisaggregationPrefillMixin:
             zip(batch.reqs, next_token_ids, strict=True)
         ):
             if req is not batch.chunked_req:
+                kv_sent, req.disagg_kv_sent = req.disagg_kv_sent, False
                 req.time_stats.set_prefill_finished_time()
 
                 # Its KV never landed: abort instead of sending it to decode.
@@ -1327,7 +1358,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.batch_result_processor._maybe_collect_customized_info(
                     i, req, logits_output
                 )
-                self.checkpoint_disagg_prefill(req)
+                if not kv_sent:
+                    self.checkpoint_disagg_prefill(req)
                 move(
                     [req],
                     self.disagg_prefill_transfer_queue,
@@ -1369,7 +1401,7 @@ class SchedulerDisaggregationPrefillMixin:
                     == "prefill_complete"
                 ):
                     req.disagg_kv_sender.mark_prefill_complete()
-                if not req.pending_bootstrap:
+                if not req.pending_bootstrap and not kv_sent:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
@@ -1750,6 +1782,48 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
+    def sends_kv_before_result(self: Scheduler, req: Req) -> bool:
+        """Whether the request's last send needs nothing from its last result
+        but the first output token. The same on every PP stage."""
+        return not (
+            req.pending_bootstrap
+            or is_aborted(req)
+            or req.discard_output_reason is not None
+            or req.return_logprob
+            or req.return_sampling_mask
+            or req.grammar is not None
+            or self.spec_algorithm.is_eagle()
+        )
+
+    def send_finished_prefill_kv(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        next_token_ids: Optional[torch.Tensor],
+        forward_done: torch.cuda.Event,
+    ) -> None:
+        """Checkpoint and send the KV of the prompts ``batch`` finished once
+        this rank's forward of it is done, ahead of its result, which still
+        finishes the requests. ``next_token_ids`` is that forward's own output
+        on the last PP stage, the one that sends the aux data, and None on the
+        others."""
+        rows = [
+            (i, req)
+            for i, req in enumerate(batch.reqs)
+            if req is not batch.chunked_req and self.sends_kv_before_result(req)
+        ]
+        if not rows:
+            return
+        forward_done.synchronize()
+        output_ids = None if next_token_ids is None else next_token_ids.tolist()
+        for i, req in rows:
+            self.checkpoint_disagg_prefill(req)
+            self.send_kv_chunk(
+                req,
+                last_chunk=True,
+                output_id=0 if output_ids is None else output_ids[i],
+            )
+            req.disagg_kv_sent = True
+
     def maybe_send_cached_prefix_chunk(
         self: Scheduler, req: Req, allow_send: bool = True
     ) -> None:
@@ -1796,6 +1870,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        output_id: Optional[int] = None,
     ) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
@@ -1816,16 +1891,20 @@ class SchedulerDisaggregationPrefillMixin:
                 digest = computer.compute(page_indices_gpu, state_indices)
                 signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
             self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        self._send_kv_chunk(
+            req, last_chunk=last_chunk, end_idx=end_idx, output_id=output_id
+        )
 
     def _send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        output_id: Optional[int] = None,
     ) -> None:
         """
-        Send a prefilled chunk to the decode server
+        Send a prefilled chunk to the decode server. ``output_id`` is the first
+        output token of a last chunk sent before the request has it.
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
@@ -1891,7 +1970,7 @@ class SchedulerDisaggregationPrefillMixin:
         state_types = ()
         if last_chunk:
             try:
-                self.disagg_metadata_buffers.set_buf(req)
+                self.disagg_metadata_buffers.set_buf(req, output_id)
             except CustomizedInfoError as exc:
                 # customized_info may be unserializable or exceed the transfer buffer.
                 req.customized_info = None
