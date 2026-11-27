@@ -6,6 +6,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
@@ -17,6 +19,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids_triton,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    _fp4_index_k_tile,
     finish_paged_indexer_topk,
     finish_prefill_indexer_topk,
     fp4_index_logits_decode,
@@ -605,6 +608,67 @@ def test_fp4_paged_logits_balanced_matches_per_row_replay(heads, ratio, masked):
         assert torch.equal(
             score(True)[visible].view(torch.int32), expected[visible].view(torch.int32)
         )
+
+
+@triton.jit
+def _decode_index_k_kernel(table, slots, valid, k_low, k_high, page_size, row_stride):
+    rows = tl.program_id(0) * 64 + tl.arange(0, 64)
+    cols = tl.arange(0, 64)
+    low, high = _fp4_index_k_tile(
+        table,
+        tl.load(slots + rows).to(tl.int64),
+        tl.load(valid + rows) != 0,
+        page_size,
+        row_stride,
+        64,
+        64,
+    )
+    tl.store(k_low + rows[:, None] * 64 + cols[None, :], low)
+    tl.store(k_high + rows[:, None] * 64 + cols[None, :], high)
+
+
+@pytest.mark.skipif(_is_xpu, reason="Paged decode decodes keys with CUDA inline PTX")
+def test_fp4_index_k_tile_decodes_every_code_and_exponent():
+    """Every payload byte against every block exponent the quantizer writes (1..254),
+    in every block position, decodes to the bits of the fp32 reference; masked rows
+    decode to +0."""
+    device = get_device()
+    exponents = torch.arange(1, 255, device=device)
+    slots_used = exponents.numel() * 4
+    pages = triton.cdiv(slots_used, PAGE_SIZE)
+    # Slot 4e + j holds bytes 64j..64j+63 (of 0..255, shuffled) and block b
+    # exponent exponents[(e + b) % 254], so each block position sees each pair.
+    payload = torch.arange(256, device=device, dtype=torch.uint8).view(4, 64)
+    payload = payload[:, torch.randperm(64, device=device)].repeat(pages * 16, 1)
+    block = torch.arange(pages * PAGE_SIZE, device=device)[:, None] // 4
+    exps = exponents[(block + torch.arange(4, device=device)) % exponents.numel()]
+    table = torch.empty(pages, PAGE_SIZE * 68, device=device, dtype=torch.uint8)
+    table[:, : PAGE_SIZE * 64] = payload.view(pages, -1)
+    table[:, PAGE_SIZE * 64 :] = exps.to(torch.uint8).view(pages, -1)
+    # Visit the pool's slots in shuffled order, with one tile of masked rows.
+    slots = torch.randperm(pages * PAGE_SIZE, device=device).to(torch.int32)
+    valid = torch.ones_like(slots)
+    valid[-64:] = 0
+    k_low = torch.empty(slots.numel(), 64, device=device, dtype=torch.bfloat16)
+    k_high = torch.empty_like(k_low)
+    _decode_index_k_kernel[(slots.numel() // 64,)](
+        table, slots, valid, k_low, k_high, PAGE_SIZE, table.stride(0)
+    )
+
+    levels = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device)
+    codes = payload[slots.long()].long()
+    scales = torch.ldexp(
+        torch.ones(codes.shape, device=device),
+        exps[slots.long()].repeat_interleave(16, dim=-1) - 127,
+    )
+
+    def reference(code):
+        value = torch.where((code & 8) != 0, -levels[code & 7], levels[code & 7])
+        value = (value * scales).to(torch.bfloat16)
+        return torch.where(valid.bool()[:, None], value, 0.0).view(torch.int16)
+
+    assert torch.equal(k_low.view(torch.int16), reference(codes & 15))
+    assert torch.equal(k_high.view(torch.int16), reference(codes >> 4))
 
 
 @pytest.mark.skipif(

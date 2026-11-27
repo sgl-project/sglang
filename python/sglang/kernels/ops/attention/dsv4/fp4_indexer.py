@@ -616,6 +616,8 @@ def fp4_index_logits_paged(
     assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
     assert table.dtype == torch.uint8 and table.ndim == 2
     assert ratio in (1, 2) and max_len <= req_table.shape[1] // ratio
+    # Each slot's four e8m0 exponents are read as one int32.
+    assert table.data_ptr() % 4 == 0 and table.stride(0) % 4 == 0
     assert req_table.stride(1) == 1
     if candidate_mask is not None:
         assert candidate_mask.shape[1] >= max_len and candidate_mask.stride(1) == 1
@@ -714,14 +716,56 @@ def fp4_index_logits_paged(
     return out
 
 
+# Exact fp4 -> bf16 decode, two elements per fma. The e2m1 code s|eem placed into a bf16
+# as s << 15 | eem << 6 reads as e2m1 * 2^-126 (e == 0 lands on bf16 subnormals); a
+# multiply by 2^126 and then by the block scale 2^(e8m0 - 127) is exact for the
+# exponents the quantizer writes (1..254), so values match _e2m1_decode * exp2 -> bf16
+# bit for bit, -0.0 included. One asm instance (pack=4) decodes one nibble of 4 payload
+# bytes ($2) into $0 = bf16x2(byte 0, byte 1) and $1 = bf16x2(byte 2, byte 3); $3 holds
+# the row's four packed e8m0 bytes and $7 the bit offset of this column's block.
+_FP4_BF16X2_PROLOGUE = """
+.reg .b32 s, a, c, z, x, m, n;
+bfe.u32 s, $3, $7, 8;
+mul.lo.u32 a, s, 0x00800080;
+mov.b32 c, 0x7E807E80;
+mov.b32 z, 0x80008000;
+"""
+_FP4_BF16X2_PAIR = """
+prmt.b32 x, $2, 0, {sel};
+and.b32 m, x, {mag};
+and.b32 n, x, {sign};
+mad.lo.u32 m, n, 64, m;
+shl.b32 m, m, {shl};
+fma.rn.bf16x2 m, m, c, z;
+fma.rn.bf16x2 {out}, m, a, z;
+"""
+
+
+def _fp4_bf16x2_asm(high: bool) -> str:
+    mag, sign, shl = (
+        ("0x00700070", "0x00800080", 2) if high else ("0x00070007", "0x00080008", 6)
+    )
+    pairs = "".join(
+        _FP4_BF16X2_PAIR.format(sel=sel, mag=mag, sign=sign, shl=shl, out=out)
+        for sel, out in (("0x4140", "$0"), ("0x4342", "$1"))
+    )
+    return "{" + _FP4_BF16X2_PROLOGUE + pairs + "}"
+
+
+_FP4_LOW_BF16_ASM = tl.constexpr(_fp4_bf16x2_asm(high=False))
+_FP4_HIGH_BF16_ASM = tl.constexpr(_fp4_bf16x2_asm(high=True))
+
+
 @triton.jit
-def _e2m1_decode_bits(code):
-    # Same values as _e2m1_decode (including -0.0), built from the fp32 bit pattern.
-    c = code.to(tl.int32)
-    e = (c >> 1) & 3
-    m = c & 1
-    bits = tl.where(e == 0, m * 0x3F000000, ((e + 126) << 23) | (m << 22))
-    return (bits | ((c >> 3) << 31)).to(tl.float32, bitcast=True)
+def _fp4_nibble_to_bf16(pay, packed_exps, shift, ASM: tl.constexpr):
+    return tl.inline_asm_elementwise(
+        ASM,
+        "=r,=r,r,r,r,r,r,r,r,r,r",
+        [pay, packed_exps, shift],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=4,
+    )
 
 
 @triton.jit
@@ -744,21 +788,18 @@ def _fp4_index_k_tile(
         table_ptr + pay_off[:, None] + offs_i[None, :], mask=valid[:, None], other=0
     )
     sc_off = row_base + page_size * INDEX_K_PAYLOAD_BYTES + off * INDEX_K_SCALE_BYTES
-    offs_s = tl.arange(0, INDEX_K_SCALE_BYTES)
-    exps = tl.load(
-        table_ptr + sc_off[:, None] + offs_s[None, :], mask=valid[:, None], other=127
+    # The four e8m0 exponents of a row as one word; masked rows get scale 1.
+    packed = tl.load(
+        (table_ptr + sc_off).to(tl.pointer_type(tl.int32)),
+        mask=valid,
+        other=0x7F7F7F7F,
     )
-    scale = tl.exp2(exps.to(tl.float32) - 127.0)
+    packed = tl.broadcast_to(packed[:, None], (BLOCK_L, HALF_D))
     # Byte i holds elements 2i and 2i+1, which use e8m0 block i // 16.
-    scale = tl.reshape(
-        tl.broadcast_to(
-            scale[:, :, None],
-            (BLOCK_L, INDEX_K_SCALE_BYTES, HALF_D // INDEX_K_SCALE_BYTES),
-        ),
-        (BLOCK_L, HALF_D),
-    )
-    k_low = (_e2m1_decode_bits(pay & 0x0F) * scale).to(tl.bfloat16)
-    k_high = (_e2m1_decode_bits(pay >> 4) * scale).to(tl.bfloat16)
+    shift = 8 * (offs_i // (HALF_D // INDEX_K_SCALE_BYTES))
+    shift = tl.broadcast_to(shift[None, :], (BLOCK_L, HALF_D))
+    k_low = _fp4_nibble_to_bf16(pay, packed, shift, _FP4_LOW_BF16_ASM)
+    k_high = _fp4_nibble_to_bf16(pay, packed, shift, _FP4_HIGH_BF16_ASM)
     return k_low, k_high
 
 
