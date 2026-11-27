@@ -959,6 +959,7 @@ class ChatCompletionRequest(PDRoutingFields):
     routed_experts_start_len: int = 0
     return_indexer_topk: bool = False
     return_outputs_via_store: bool = False
+    replay_layer_splits: Optional[List[int]] = None
     return_cached_tokens_details: bool = False
     return_spec_tokens_details: bool = False
     return_prompt_token_ids: bool = False
@@ -973,6 +974,9 @@ class ChatCompletionRequest(PDRoutingFields):
     return_flat_raw_output_top_logprobs: bool = False
     # Base64 by default on chat, unlike /generate; false returns plain JSON lists.
     return_flat_raw_top_logprobs_b64: bool = True
+    # Flat sampling masks in choices[].meta_info (requires return_meta_info); base64 by default as above.
+    return_flat_raw_sampling_mask: bool = False
+    return_flat_raw_sampling_mask_b64: bool = True
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "

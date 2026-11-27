@@ -102,6 +102,18 @@ def _quant_config_to_dict(quant_config):
     return quant_config
 
 
+def _routed_experts_quant_method(quantization_config: dict) -> Optional[str]:
+    """The routed-expert format a mixed checkpoint declares, or None if unset."""
+    method = quantization_config.get("routed_experts_quant_method")
+    if method not in (None, "mxfp4", "mxfp8"):
+        raise ValueError(
+            "quantization_config has unsupported "
+            f"routed_experts_quant_method={method!r}; expected 'mxfp4', "
+            "'mxfp8' or unset."
+        )
+    return method
+
+
 def requires_mm_token_modalities(
     model_architectures: Optional[List[str]], hf_text_config: PretrainedConfig
 ) -> bool:
@@ -563,9 +575,29 @@ def get_num_indexer_layers(config) -> int:
     if is_deepseek_dsa(config):
         return config.num_hidden_layers
     if is_deepseek_v4(config):
-        compress_ratios = getattr(config, "compress_ratios", None) or []
-        return sum(1 for r in compress_ratios if r == 4)
+        return _num_c4_layers(getattr(config, "compress_ratios", None) or [])
     return getattr(config, "num_indexer_layers", 0)
+
+
+def _num_c4_layers(compress_ratios: List[int]) -> int:
+    return sum(1 for ratio in compress_ratios if ratio == 4)
+
+
+def indexer_slots_at(config, layer_ids: List[int]) -> List[int]:
+    """The indexer-topk capturer slot at each global layer id: the slots below it are
+    those of the layers below it. Capture runs on one pipeline stage only."""
+    if is_deepseek_dsa(config):
+        return list(layer_ids)
+    if is_deepseek_v4(config):
+        # Slots are the C4 layers' compress_layer_id: the C4 layers before them
+        # (DeepSeekV4TokenToKVPool._init_compressed_layer_mapping).
+        return [
+            _num_c4_layers(config.compress_ratios[:layer_id]) for layer_id in layer_ids
+        ]
+    raise ValueError(
+        f"The indexer top-k of {_hf_arch(config)} cannot be split by layer: "
+        "its capturer slots are not mapped to layers."
+    )
 
 
 class ModelConfig:
@@ -730,12 +762,14 @@ class ModelConfig:
             or {}
         )
         self.hf_quant_config: dict = quantization_config
-        routed_experts_quant_method = quantization_config.get(
-            "routed_experts_quant_method"
-        )
+        routed_experts_quant_method = _routed_experts_quant_method(quantization_config)
         self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
         if self.is_fp4_experts:
             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
+        # Block-wise FP8 ckpts may instead serve their routed experts as MXFP8.
+        self.is_mxfp8_experts: bool = routed_experts_quant_method == "mxfp8"
+        if self.is_mxfp8_experts:
+            logger.info("Detected mixed checkpoint layout: routed experts are MXFP8.")
 
         # MiMo-V2 mxfp4 ckpts declare the routed-expert layout via store_dtype.
         if (

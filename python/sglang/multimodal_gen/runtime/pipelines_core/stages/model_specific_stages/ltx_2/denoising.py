@@ -9,6 +9,10 @@ from diffusers.utils.torch_utils import randn_tensor
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
+from sglang.multimodal_gen.configs.post_training.rl_rollout import (
+    AUDIO_STREAM,
+    PRIMARY_STREAM,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -41,7 +45,8 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
-    VISUAL_STREAM,
+    finalize_rollout_if_enabled,
+    prepare_rollout_if_enabled,
     rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.server_args import (
@@ -51,6 +56,15 @@ from sglang.multimodal_gen.runtime.server_args import (
 
 LTX23_RES2S_STEP_NOISE_SEED = -1
 LTX23_RES2S_SUBSTEP_NOISE_SEED = 9999
+
+
+def _require_replicated_audio(batch: Req, tensor: torch.Tensor) -> torch.Tensor:
+    # The audio rollout controller draws full-shape noise and records whole latents per rank.
+    if batch.did_sp_shard_audio_latents:
+        raise RuntimeError(
+            "Audio rollout requires audio latents replicated across SP ranks"
+        )
+    return tensor
 
 
 @dataclass(slots=True)
@@ -1575,12 +1589,15 @@ class LTX2DenoisingStage(DenoisingStage):
         ctx.audio_latents = batch.audio_latents
         # Video and audio keep separate scheduler state throughout the denoising loop.
         ctx.audio_scheduler = clone_scheduler_runtime(ctx.scheduler)
-        rollout_controller = batch.rollout_controllers.get(VISUAL_STREAM)
-        if rollout_controller is not None:
-            # The audio stream has no controller of its own; it follows the video
-            # stream's schedule so a requested stop ends both streams together.
-            ctx.audio_scheduler.sigmas = rollout_controller.sigmas
-            ctx.audio_scheduler.timesteps = rollout_controller.timesteps
+        prepare_rollout_if_enabled(
+            batch=batch,
+            stream=AUDIO_STREAM,
+            scheduler=ctx.audio_scheduler,
+            timesteps=ctx.audio_scheduler.timesteps,
+            latents=ctx.audio_latents,
+            shard_for_sp=_require_replicated_audio,
+            gather_for_sp=_require_replicated_audio,
+        )
 
         if ctx.use_ltx23_legacy_one_stage:
             batch.ltx23_audio_replicated_for_sp = False
@@ -1966,11 +1983,15 @@ class LTX2DenoisingStage(DenoisingStage):
                     model_video,
                     step.t_device,
                     ctx.latents,
-                    **rollout_step_kwargs(batch),
+                    **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
                     return_dict=False,
                 )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(
-                    model_audio, step.t_device, ctx.audio_latents, return_dict=False
+                    model_audio,
+                    step.t_device,
+                    ctx.audio_latents,
+                    **rollout_step_kwargs(batch, stream=AUDIO_STREAM),
+                    return_dict=False,
                 )[0]
                 if ctx.denoise_mask is not None and ctx.clean_latent is not None:
                     ctx.latents = (
@@ -2613,6 +2634,13 @@ class LTX2DenoisingStage(DenoisingStage):
         self, ctx: LTX2DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Expose audio latents before delegating to AV-aware postprocessing."""
+        finalize_rollout_if_enabled(
+            batch=batch,
+            stream=AUDIO_STREAM,
+            latents=ctx.audio_latents,
+            num_inference_steps=len(ctx.timesteps),
+            final_timestep=ctx.timesteps.new_zeros(()),
+        )
         batch.audio_latents = ctx.audio_latents
         self._post_denoising_loop(
             batch=batch,

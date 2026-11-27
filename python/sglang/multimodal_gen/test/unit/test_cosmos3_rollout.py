@@ -10,6 +10,7 @@ from unittest import mock
 
 import torch
 
+from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -207,7 +208,9 @@ class TestCosmos3ServingStep(unittest.TestCase):
         x0_pred = x_i - scheduler.sigmas[stop_step_index] * torch.tanh(x_i)
         torch.testing.assert_close(batch.latents, x0_pred, rtol=0, atol=1e-6)
         self.assertEqual(
-            batch.rollout_trajectory_data.rollout_log_probs.shape,
+            batch.rollout_trajectory_data.streams[
+                PRIMARY_STREAM
+            ].rollout_log_probs.shape,
             (1, stop_step_index + 1),
         )
         self.assertEqual(len(scheduler.timesteps), 4)

@@ -71,6 +71,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "num_items_assigned",
         "positional_embed_overrides",
         "received_time",
+        "replay_layer_splits",
         "return_bytes",
         "return_entropy",
         "return_flat_raw_output_top_logprobs",
