@@ -27,6 +27,7 @@ APPROVAL_WORKFLOWS = (
     ".github/workflows/pr-test-extra.yml",
     ".github/workflows/pr-test-mlu.yml",
     ".github/workflows/pr-test-sgl-router.yml",
+    ".github/workflows/pr-test-xpu.yml",
 )
 # pr-test.yml runs on every push to a PR, so its newest run at a commit postdates the
 # latest push. GitHub stamps created_at; a commit's own dates are the pusher's.
