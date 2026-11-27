@@ -11,7 +11,11 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
-from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
+from sglang.srt.layers.dp_attention import (
+    dp_gather_width,
+    require_mlp_tp_gather,
+    world_dp_gather_enabled,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
@@ -47,13 +51,19 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+
+# The MLP-sync gather carries each attention-DP group's listener drain state
+# (see DPDrainColumn).
+MLP_SYNC_CARRIES_DRAIN_STATE = True
+# The drain-state value of a gathered row with no listener behind it: an
+# inactive slot, or a rank that hosts no listener.
+DRAIN_STATE_NO_LISTENER = 8
 
 
 def exchange_sync_rows(
@@ -66,7 +76,9 @@ def exchange_sync_rows(
     serial hops; gather + broadcast is one hop plus a log-depth tree. At two
     ranks the ring is the single hop, so it stays."""
     world_size = torch.distributed.get_world_size(group)
-    if local_row.device.type != "cpu" or world_size <= 2:
+    # An elastic group can count fewer ranks than the buffer has slots after a fault.
+    narrowed = global_flat.numel() != world_size * local_row.numel()
+    if local_row.device.type != "cpu" or world_size <= 2 or narrowed:
         all_gather_single(global_flat, local_row, group=group)
         return
     root = torch.distributed.get_global_rank(group, 0)
@@ -161,10 +173,15 @@ class MLPSyncBatchInfo:
     is_health_check: bool = False
     # Causal (query, key) pairs this rank attends this step.
     attention_pairs: int = 0
+    # This rank honored a ShutdownReq and leaves the event loop after this step.
+    is_shutting_down: bool = False
+    # This rank's listener drain state (see DPDrainColumn).
+    drain_state: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
     any_health_check: bool = False
+    any_shutting_down: bool = False
     sync_wait_seconds: float = 0.0
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
@@ -174,6 +191,8 @@ class MLPSyncBatchInfo:
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
+        from sglang.srt.elastic_ep.elastic_ep import departure_pending
+
         return torch.tensor(
             [
                 self.num_tokens,
@@ -187,6 +206,10 @@ class MLPSyncBatchInfo:
                 int(self.can_run_draft_cuda_graph),
                 int(self.is_health_check),
                 self.attention_pairs,
+                int(self.is_shutting_down),
+                self.drain_state,
+                # Read as the last column; new fields go before it.
+                int(departure_pending()),
             ],
             device=device,
             dtype=dtype,
@@ -206,6 +229,9 @@ class MLPSyncBatchInfo:
                 1,  # can_run_draft_cuda_graph
                 0,  # is_health_check
                 0,  # attention_pairs
+                0,  # is_shutting_down
+                DRAIN_STATE_NO_LISTENER,  # drain_state
+                0,  # departure_pending: an absent slot cannot post an mlp_sync.
             ],
             device=device,
             dtype=dtype,
@@ -213,11 +239,16 @@ class MLPSyncBatchInfo:
 
     def finalize_local(self):
         """Populate gather-derived metadata from the sole attention-DP rank."""
+        from sglang.srt.elastic_ep.elastic_ep import departure_observe
+
+        # Sole rank, so there is no cohort to fall out of step with.
+        departure_observe(True)
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         self.global_attention_pairs = [self.attention_pairs]
         self.any_health_check = self.is_health_check
+        self.any_shutting_down = self.is_shutting_down
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -229,6 +260,8 @@ class MLPSyncBatchInfo:
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
     ):
+        from sglang.srt.elastic_ep.elastic_ep import departure_observe
+
         sync_start = time.perf_counter()
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
@@ -254,6 +287,8 @@ class MLPSyncBatchInfo:
                 op=torch.distributed.ReduceOp.SUM,
                 group=group,
             )
+            # No scalar sync: tick N+1's collective must wait for Mooncake to settle N,
+            # and the D2H copy below already blocks on this stream.
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
@@ -285,8 +320,16 @@ class MLPSyncBatchInfo:
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
+        # Post-normalisation, so a stale retired row cannot hold the cohort in DRAIN.
+        departure_observe(int(tp0_info_cpu[:, -1].sum()) == 0)
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        if use_all_reduce:
+            # Retiree slots can carry all-reduce garbage across a mask flip.
+            self.global_num_tokens, self.global_num_tokens_for_logprob = (
+                [t if 0 <= t <= 1 << 30 else 0 for t in col]
+                for col in (self.global_num_tokens, self.global_num_tokens_for_logprob)
+            )
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
@@ -294,6 +337,7 @@ class MLPSyncBatchInfo:
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
+        self.any_shutting_down = bool(tp0_info_cpu[:, 11].max())
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -515,6 +559,66 @@ class DPSyncWaitCarry:
         self.seconds = 0.0
 
 
+class DPShutdownVote:
+    """Carries a rank's ShutdownReq through the MLP-sync gather.
+
+    Every attention-DP rank gathers once per scheduler step, so a rank that
+    honored a ShutdownReq tells all the others in the same step, and every rank
+    leaves the event loop at the same step boundary. Without it, a ShutdownReq
+    that reaches one DP group only (local control broadcast, as the Rust
+    server's rank-0 listener sends it) stops that group, and the other groups'
+    next gather fails against the departed ranks. A paused engine runs no
+    gather, so a rank that honors a ShutdownReq while paused leaves without
+    voting; the other DP groups stop when their node's launcher stops them.
+    """
+
+    __slots__ = ("local", "any")
+
+    def __init__(self, local: bool) -> None:
+        self.local = local
+        self.any = local
+
+
+class DPDrainColumn:
+    """Carries each attention-DP group's listener drain state through the
+    MLP-sync gather.
+
+    With the Rust server, every DP group's leading rank hosts a listener that
+    drains on its own. ``local`` is this rank's ``Server.drain_state()`` bits
+    (``DRAIN_STATE_NO_LISTENER`` on a rank without a listener, 0 in Python
+    mode), and ``rows`` receives one value per DP group, from the group's
+    leading rank, whenever the gather produced metadata.
+    """
+
+    __slots__ = ("local", "rows")
+
+    def __init__(self, local: int) -> None:
+        self.local = local
+        self.rows: Optional[list[int]] = None
+
+
+class DPShutdownVoteSent:
+    """Whether a gather has carried this rank's own shutdown vote (the adapter is frozen)."""
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = False
+
+
+def _fence_world_gather(model_runner: ModelRunner) -> None:
+    """Queue the WORLD gather behind the previous forward. It runs on the device
+    backend from the scheduler's stream, and must not share the GPU with that
+    forward's a2a kernels, whose blocks wait on each other and on peers. A rank
+    with no result to read back (an idle one) reaches this gather first."""
+    forward_stream = getattr(model_runner, "forward_stream", None)
+    if forward_stream is None:
+        return
+    current = torch.get_device_module(model_runner.device).current_stream()
+    if current != forward_stream:
+        current.wait_stream(forward_stream)
+
+
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
@@ -526,6 +630,8 @@ def prepare_mlp_sync_batch_raw(
     draft_require_mlp_tp_gather: Optional[bool] = None,
     dwdp: bool = False,
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
+    shutdown_vote: Optional[DPShutdownVote] = None,
+    drain_column: Optional[DPDrainColumn] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -641,11 +747,15 @@ def prepare_mlp_sync_batch_raw(
         # Gathered unconditionally like the other columns, so a per-process
         # metrics flag cannot make ranks disagree on what the tensor holds.
         attention_pairs=_local_attention_pairs(local_batch),
+        is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
+        drain_state=drain_column.local if drain_column is not None else 0,
     )
 
     if num_dp_ranks == 1:
         mlp_sync_info.finalize_local()
     elif not skip_all_gather:
+        if use_world_group:
+            _fence_world_gather(model_runner)
         mlp_sync_info.all_gather(
             device=device,
             group=group,
@@ -653,6 +763,10 @@ def prepare_mlp_sync_batch_raw(
         )
 
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
+    if shutdown_vote is not None and metadata_ready:
+        shutdown_vote.any = mlp_sync_info.any_shutting_down
+    if drain_column is not None and metadata_ready:
+        drain_column.rows = mlp_sync_info.tp0_info_cpu[:, 12].tolist()
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -729,6 +843,34 @@ class SchedulerDPAttnAdapter:
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
     sync_wait_carry: DPSyncWaitCarry = field(default_factory=DPSyncWaitCarry)
+    # Whether this rank honored a ShutdownReq, and what to do when a peer DP
+    # rank did (see DPShutdownVote).
+    get_shutting_down: Callable[[], bool] = lambda: False
+    on_peer_shutdown: Optional[Callable[[], None]] = None
+    # This rank's listener drain state, and what to do with every DP group's
+    # after each gather that produced metadata, which can be twice an
+    # iteration (see DPDrainColumn).
+    get_drain_state: Callable[[], int] = lambda: 0
+    on_drain_rows: Optional[Callable[[list[int]], None]] = None
+    # Set once a gather carried this rank's own shutdown vote.
+    shutdown_vote_sent: DPShutdownVoteSent = field(
+        default_factory=DPShutdownVoteSent, init=False
+    )
+
+    def shutdown_vote_pending(self) -> bool:
+        """This rank honored a ShutdownReq that no MLP-sync gather has carried yet.
+
+        A loop that stops scheduling batches on shutdown still runs one batch
+        selection while this holds, so its gather tells the other DP ranks.
+        """
+        num_dp_ranks = get_parallel().num_dp_ranks
+        return (
+            self.get_shutting_down()
+            and not self.shutdown_vote_sent.value
+            and self.get_require_mlp_sync()
+            and num_dp_ranks > 1
+            and not should_skip_scheduler_all_gather(num_dp_ranks)
+        )
 
     def drop_sync_wait_carry(self) -> None:
         """The iteration produced no batch, so its gather waits have no step to land on."""
@@ -744,7 +886,9 @@ class SchedulerDPAttnAdapter:
                 moe_a2a_backend=draft_moe_a2a_backend,
             )
 
-        return prepare_mlp_sync_batch_raw(
+        shutdown_vote = DPShutdownVote(self.get_shutting_down())
+        drain_column = DPDrainColumn(self.get_drain_state())
+        batch = prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
             get_idle_batch=self.get_idle_batch,
@@ -755,7 +899,20 @@ class SchedulerDPAttnAdapter:
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
             sync_wait_carry=self.sync_wait_carry,
+            shutdown_vote=shutdown_vote,
+            drain_column=drain_column,
         )
+        if drain_column.rows is not None and self.on_drain_rows is not None:
+            self.on_drain_rows(drain_column.rows)
+        if shutdown_vote.local:
+            self.shutdown_vote_sent.value = True
+        if (
+            shutdown_vote.any
+            and not shutdown_vote.local
+            and self.on_peer_shutdown is not None
+        ):
+            self.on_peer_shutdown()
+        return batch
 
     def maybe_prepare_mlp_sync_batch(
         self,

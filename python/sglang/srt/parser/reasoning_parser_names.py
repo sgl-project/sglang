@@ -11,6 +11,7 @@ REASONING_PARSER_NAMES = [
     "deepseek-v4",
     "deepseek-v41",
     "dots",
+    "ernie55",
     "glm45",
     "ling3",
     "hunyuan",
@@ -40,5 +41,7 @@ REASONING_PARSER_NAMES = [
     "flint",
     "cohere_command4",
     "gigachat35",
+    "gigachat4",
     "response_template",
+    "xing4_0",
 ]

@@ -25,6 +25,7 @@ class LoRAFormat(str, Enum):
     XLABS_FLUX = "xlabs-ai"
     KOHYA_FLUX = "kohya-flux"
     KOHYA_MINIMAX_H3 = "kohya-minimax-h3"
+    MUSUBI_WAN = "musubi-wan"
     WAN = "wan"
     AI_TOOLKIT_FLUX = "ai-toolkit-flux"
 
@@ -126,6 +127,34 @@ def _convert_kohya_minimax_h3(
     return out
 
 
+_MUSUBI_WAN_KEY = re.compile(
+    r"^lora_unet_blocks_(\d+)_"
+    r"(self_attn_(?:q|k|v|o)|cross_attn_(?:q|k|v|o|k_img|v_img)|ffn_(?:0|2))"
+    r"\.(lora_down\.weight|lora_up\.weight|alpha)$"
+)
+
+
+def _looks_like_musubi_wan(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """musubi-tuner Wan LoRA (its default save format): lora_unet_blocks_N_*."""
+    keys = list(state_dict.keys())
+    return bool(keys) and all(_MUSUBI_WAN_KEY.match(k) for k in keys)
+
+
+def _convert_musubi_wan(
+    state_dict: Mapping[str, torch.Tensor],
+    log: logging.Logger,
+) -> Dict[str, torch.Tensor]:
+    """lora_unet_blocks_N_self_attn_q.* -> diffusion_model.blocks.N.self_attn.q.*,
+    the official Wan layout the WAN path already converts (with alpha)."""
+    renamed: Dict[str, torch.Tensor] = {}
+    for key, tensor in state_dict.items():
+        block, module, suffix = _MUSUBI_WAN_KEY.match(key).groups()
+        module = re.sub(r"^(self_attn|cross_attn|ffn)_", r"\1.", module)
+        renamed[f"diffusion_model.blocks.{block}.{module}.{suffix}"] = tensor
+    log.info("[LoRAFormatAdapter] renamed %d musubi Wan keys", len(renamed))
+    return convert_lora_state_dict_by_format(renamed, LoRAFormat.WAN, log)
+
+
 def _looks_like_kohya_flux(state_dict: Mapping[str, torch.Tensor]) -> bool:
     """Kohya FLUX LoRA (flux_lora.py) under lora_unet_double/single_blocks_ prefixes."""
     if not state_dict:
@@ -220,6 +249,8 @@ def detect_lora_format_from_state_dict(
         return LoRAFormat.KOHYA_MINIMAX_H3
     if _looks_like_kohya_flux(state_dict):
         return LoRAFormat.KOHYA_FLUX
+    if _looks_like_musubi_wan(state_dict):
+        return LoRAFormat.MUSUBI_WAN
 
     if _looks_like_wan_lora(state_dict):
         return LoRAFormat.WAN
@@ -325,7 +356,6 @@ def _convert_via_diffusers_candidates(
     state_dict: Mapping[str, torch.Tensor],
     candidate_names: tuple[str, ...],
     log: logging.Logger,
-    unavailable_warning: str,
     no_converter_warning: str,
     success_info: str,
     all_failed_warning: str,
@@ -371,9 +401,6 @@ def _convert_xlabs_ai_via_diffusers(
             "convert_xlabs_flux_lora_to_diffusers",
         ),
         log=log,
-        unavailable_warning=(
-            "[LoRAFormatAdapter] XLabs FLUX detected but diffusers is unavailable."
-        ),
         no_converter_warning=(
             "[LoRAFormatAdapter] No XLabs FLUX converter found in diffusers."
         ),
@@ -397,9 +424,6 @@ def _convert_kohya_flux_via_diffusers(
             "convert_kohya_flux_lora_to_diffusers",
         ),
         log=log,
-        unavailable_warning=(
-            "[LoRAFormatAdapter] Kohya FLUX detected but diffusers is unavailable."
-        ),
         no_converter_warning="[LoRAFormatAdapter] No Kohya FLUX converter found.",
         success_info="[LoRAFormatAdapter] Converted Kohya FLUX LoRA using {name}",
         all_failed_warning=(
@@ -601,6 +625,9 @@ def convert_lora_state_dict_by_format(
     if fmt == LoRAFormat.KOHYA_FLUX:
         converted = _convert_kohya_flux_via_diffusers(state_dict, log)
         return _convert_non_diffusers_sd_simple(converted, log)
+
+    if fmt == LoRAFormat.MUSUBI_WAN:
+        return _convert_musubi_wan(state_dict, log)
 
     if fmt == LoRAFormat.WAN:
         maybe = _convert_with_diffusers_utils_if_available(state_dict, log)

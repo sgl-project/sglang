@@ -17,8 +17,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_graph_backend import (
+    BaseGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
@@ -65,7 +65,7 @@ def _copy_output_to_buffer(
 logger = logging.getLogger(__name__)
 
 
-class FullXPUGraphBackend(BaseCudaGraphBackend):
+class FullXPUGraphBackend(BaseGraphBackend):
     """One torch.xpu.XPUGraph per shape for Intel XPU devices."""
 
     def __init__(
@@ -77,6 +77,7 @@ class FullXPUGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, torch.xpu.XPUGraph] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
@@ -175,6 +176,8 @@ class FullXPUGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        # XPU graphs retain device tensor addresses, not Python tensor lifetimes.
+        self._capture_inputs[shape_key] = capture_inputs
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -194,7 +197,10 @@ class FullXPUGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        for graph in self._graphs.values():
+            graph.reset()
         self._graphs.clear()
         self._outputs.clear()
+        self._capture_inputs.clear()
         self._output_buffer = None
         self._pool = None

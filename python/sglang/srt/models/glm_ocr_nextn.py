@@ -22,13 +22,14 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -37,8 +38,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4 import Glm4DecoderLayer
 from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -148,8 +147,6 @@ class GlmOcrForConditionalGenerationNextN(GlmOcrForConditionalGeneration):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
-
-        self.num_fused_shared_experts = 0 if is_shared_experts_fusion_disabled() else 1
 
     @torch.no_grad()
     def forward(

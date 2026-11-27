@@ -26,7 +26,6 @@ from sglang.srt.layers.attention.unlimited_dash_ops.dash_stage0 import (  # noqa
 )
 from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (  # noqa: E402
     UnlimitedOCRV2AttnBackend,
-    _uses_static_width,
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -68,26 +67,6 @@ class TestUnlimitedOCRV2Policy(CustomTestCase):
             2, 4, 2, 8, torch.float32, "cpu", alloc_chunks=4, alloc_rows=4
         )
         self.assertEqual(graph_ptrs, tuple(t.data_ptr() for t in graph_again))
-
-    def test_static_width_is_reserved_for_graph_backed_paths(self):
-        cases = (
-            (False, False, False),
-            (True, False, True),
-            (False, True, True),
-            (True, True, True),
-        )
-        for use_decode_twin, use_prefill_twin, expected in cases:
-            with self.subTest(
-                use_decode_twin=use_decode_twin,
-                use_prefill_twin=use_prefill_twin,
-            ):
-                self.assertEqual(
-                    _uses_static_width(
-                        use_decode_twin=use_decode_twin,
-                        use_prefill_twin=use_prefill_twin,
-                    ),
-                    expected,
-                )
 
     def test_eager_growth_preserves_graph_owned_routing_buffers(self):
         backend = object.__new__(UnlimitedOCRV2AttnBackend)
@@ -261,7 +240,7 @@ class TestUnlimitedOCRV2FusedDecodePaths(CustomTestCase):
         backend._coord_page_buf = torch.zeros(4, dtype=torch.int64)
         backend._allow_mask = torch.zeros(4, 8, dtype=torch.int8)
         backend.max_block_static = 8
-        backend.max_context_len = 256
+        backend.model_config = SimpleNamespace(context_len=256)
         backend.block_size = 32
         backend.image_bucket_constraint = True
         backend._cos_sin_cache = {}

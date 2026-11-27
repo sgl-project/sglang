@@ -10,8 +10,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
-from sglang.srt.utils.hf_transformers.mistral_utils import is_bare_tekken_checkpoint
-from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+from sglang.srt.hf_transformers.mistral_utils import is_bare_tekken_checkpoint
+from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 
 TEKKEN_REPO = "mistralai/Leanstral-1.5-119B-A6B"
 PROMPT = "The capital of France is"

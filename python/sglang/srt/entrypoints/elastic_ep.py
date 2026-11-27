@@ -7,13 +7,11 @@ from fastapi import APIRouter, Request
 from fastapi.responses import ORJSONResponse
 
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.auth import AuthLevel, auth_level
 
 router = APIRouter()
 
 
 @router.post("/scale_elastic_ep")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def scale_elastic_ep(raw_request: Request):
     """Request an asynchronous EP scale-up."""
     try:
@@ -41,6 +39,13 @@ async def scale_elastic_ep(raw_request: Request):
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
+    operation_id = body.get("operation_id")
+    if operation_id is not None and not isinstance(operation_id, str):
+        return ORJSONResponse(
+            {"error": "operation_id must be a string"},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
     from sglang.srt.entrypoints.http_server import _global_state
     from sglang.srt.managers.io_struct import ScaleElasticEPReqInput
 
@@ -51,7 +56,7 @@ async def scale_elastic_ep(raw_request: Request):
         )
 
     result = await _global_state.tokenizer_manager.scale_elastic_ep(
-        ScaleElasticEPReqInput(new_ep_size=new_ep_size)
+        ScaleElasticEPReqInput(new_ep_size=new_ep_size, operation_id=operation_id)
     )
 
     if not result.success:
@@ -69,12 +74,12 @@ async def scale_elastic_ep(raw_request: Request):
             "message": result.message,
             "old_ep_size": result.old_ep_size,
             "new_ep_size": result.new_ep_size,
+            "operation_id": operation_id,
         }
     )
 
 
 @router.get("/is_scaling_elastic_ep")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def is_scaling_elastic_ep(raw_request: Request):
     """Return the tokenizer's mirrored Elastic EP scale state."""
     from sglang.srt.entrypoints.http_server import _global_state

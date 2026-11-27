@@ -21,7 +21,7 @@ from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.zaya import ZayaConfig
-from sglang.srt.utils.hf_transformers.common import get_hf_text_config
+from sglang.srt.hf_transformers.common import get_hf_text_config
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -29,13 +29,6 @@ if TYPE_CHECKING:
 
 def _get_linear_attn_registry_result(model_config: ModelConfig) -> Any:
     return model_config.linear_attn_registry_result
-
-
-def qwen3_next_config(model_config: ModelConfig):
-    config = model_config.hf_config
-    if isinstance(config, Qwen3NextConfig):
-        return config
-    return None
 
 
 def hybrid_lightning_config(model_config: ModelConfig):
@@ -67,8 +60,7 @@ def mamba2_config(model_config: ModelConfig):
     if isinstance(config, NemotronHConfig) and model_config.is_draft_model:
         # NemotronH MTP draft models have no Mamba layers (pattern like "*E")
         # so they shouldn't use HybridLinearAttnBackend
-        pattern = getattr(config, "mtp_hybrid_override_pattern", None)
-        if pattern is not None and "M" not in pattern:
+        if "M" not in config.mtp_hybrid_override_pattern:
             return None
     if isinstance(
         config,
@@ -92,9 +84,7 @@ def mamba2_config(model_config: ModelConfig):
         return config.llm_config
 
     if isinstance(config, GraniteMoeHybridConfig):
-        has_mamba = any(
-            layer_type == "mamba" for layer_type in getattr(config, "layer_types", [])
-        )
+        has_mamba = any(layer_type == "mamba" for layer_type in config.layer_types)
         if not has_mamba:
             return None
         else:

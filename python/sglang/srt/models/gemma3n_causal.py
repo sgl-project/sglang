@@ -3,7 +3,7 @@ from typing import Iterable, Optional, Set, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import AutoModel, Gemma3nTextConfig, PretrainedConfig, PreTrainedModel
+from transformers import Gemma3nTextConfig, PretrainedConfig, PreTrainedModel
 
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -18,6 +18,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
@@ -26,7 +28,6 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3_causal import Gemma3TextScaledWordEmbedding
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -294,21 +295,6 @@ class Gemma3nAltUp(nn.Module):
     def scale_corrected_output(self, corrected: torch.Tensor) -> torch.Tensor:
         """Scales the provided 3D tensor."""
         return corrected * self.correct_output_scale.to(corrected.dtype)
-
-    def forward(
-        self, hidden_states: torch.Tensor, activated: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predicts, correct, and optionally scales the output of a layer using trainable maps.
-
-        hidden_states: [num_altup_inputs, num_tokens, hidden_size]
-        """
-
-        predictions = self.predict(hidden_states)
-        corrected = self.correct(predictions=predictions, activated=activated)
-        output = corrected[self.config.altup_active_idx]
-        if self.config.altup_correct_scale:
-            output = self.scale_corrected_output(output)
-        return corrected, output
 
 
 class Gemma3nAttention(nn.Module):
@@ -898,10 +884,6 @@ class Gemma3nForCausalLM(PreTrainedModel):
         ".gate_up_proj",
         ".down_proj",
     ]
-    # Gemma does not apply LoRA to the embedding layer
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = True
 
     def __init__(
         self,
@@ -1013,4 +995,3 @@ class Gemma3nForCausalLM(PreTrainedModel):
 
 
 EntryClass = Gemma3nForCausalLM
-AutoModel.register(Gemma3nTextConfig, Gemma3nForCausalLM, exist_ok=True)

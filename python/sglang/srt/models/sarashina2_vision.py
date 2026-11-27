@@ -24,17 +24,16 @@ from transformers import LlamaConfig
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.qwen2_vl import Qwen2VisionTransformer
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -86,21 +85,11 @@ class Sarashina2VisionForCausalLM(nn.Module):
                 prefix=add_prefix("llm", prefix),
             )
         else:
-            # Set vocab_size from main config if available
-            if hasattr(config, "vocab_size"):
-                config.vocab_size = config.vocab_size
             self.llm = LlamaForCausalLM(
                 config,
                 quant_config=quant_config,
                 prefix=add_prefix("llm", prefix),
             )
-
-        # Image token indices from config
-        self.image_token_index = getattr(config, "image_token_index", 14)
-        self.start_image_token_index = getattr(
-            config, "start_image_token_index", 102397
-        )
-        self.end_image_token_index = getattr(config, "end_image_token_index", 102398)
 
         # Ensure vocabulary size matches
         if hasattr(config, "vocab_size"):
@@ -176,7 +165,6 @@ class Sarashina2VisionForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights."""
         params_dict = dict(self.named_parameters())
-        loaded_params = set()
 
         # Collect weights that need to be fused
         qkv_weights = {}
@@ -194,7 +182,6 @@ class Sarashina2VisionForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    loaded_params.add(mapped_name)
                     continue
 
             # Handle Llama attention weights - need to fuse q, k, v into qkv
@@ -231,7 +218,6 @@ class Sarashina2VisionForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add(name)
 
         # Fuse QKV weights for Llama attention layers
         for base, weights_dict in qkv_weights.items():
@@ -246,7 +232,6 @@ class Sarashina2VisionForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, qkv)
-                    loaded_params.add(qkv_name)
 
         # Fuse gate and up weights for Llama MLP layers
         for base, weights_dict in gate_up_weights.items():
@@ -261,7 +246,6 @@ class Sarashina2VisionForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, gate_up)
-                    loaded_params.add(gate_up_name)
 
 
 # Register the model

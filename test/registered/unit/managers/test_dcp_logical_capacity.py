@@ -28,6 +28,7 @@ def make_configurator(*, is_hybrid_swa=False, is_draft_worker=False):
     configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
     configurator.is_hybrid_swa = is_hybrid_swa
     configurator.is_draft_worker = is_draft_worker
+    configurator.use_mla_backend = False
     configurator.model_config = NS(hf_config=NS(architectures=["LlamaForCausalLM"]))
     return configurator
 
@@ -86,7 +87,7 @@ def make_worker(dcp_size):
     runner.token_to_kv_pool_allocator = None
     runner.req_to_token_pool = ReqToTokenPool.__new__(ReqToTokenPool)
     runner.req_to_token_pool.size = 96
-    runner.req_to_token_pool.max_context_len = CONTEXT
+    runner.req_to_token_pool.req_to_token = torch.empty(0, CONTEXT, dtype=torch.int32)
     runner.req_to_token_pool._aux_cache = None
     runner.forward_stream = None
     return NS(

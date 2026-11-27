@@ -27,13 +27,13 @@ from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_token_pairs,
     pad_mm_tokens,
 )
-from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM
@@ -42,7 +42,6 @@ from sglang.srt.models.radio import RadioModel
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.evs import EVS, EVSConfig
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 

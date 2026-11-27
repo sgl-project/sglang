@@ -1,6 +1,6 @@
 import copy
 from array import array
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -8,35 +8,20 @@ from torch import nn
 
 from sglang.srt.configs.points_v15_chat import POINTSV15ChatConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen2_vl import Qwen2VisionPatchMerger, Qwen2VisionTransformer
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.utils import add_prefix
 
 
 class Qwen2VisionTransformerForNavitPOINTS(Qwen2VisionTransformer):
-    def __init__(
-        self,
-        vision_config: POINTSV15ChatConfig,
-        norm_eps: float = 1e-6,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(
-            vision_config,
-            norm_eps=norm_eps,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
-
     def forward(
         self,
         x: torch.Tensor,
@@ -145,7 +130,6 @@ class POINTSV15ChatModel(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -168,14 +152,10 @@ class POINTSV15ChatModel(nn.Module):
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

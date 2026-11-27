@@ -191,12 +191,12 @@ def attn_tp_size_of(cfg: Any):
 def attn_dp_enabled_of(cfg: Any) -> bool:
     """`attn_dp_enabled`, computed at publish.
 
-    A scale joiner's own group can be one rank wide, but it joins an
+    An offset joiner's own group can be one rank wide, but it joins an
     attention-DP deployment and runs its DP-attention paths.
     """
-    from sglang.srt.arg_groups.model_override_base import ep_scale_joiner_of
+    from sglang.srt.arg_groups.model_override_base import ep_offset_joiner_of
 
-    return cfg.attn_dp_size > 1 or ep_scale_joiner_of(cfg)
+    return cfg.attn_dp_size > 1 or ep_offset_joiner_of(cfg)
 
 
 def num_dp_ranks_of(cfg: Any) -> int:
@@ -486,6 +486,11 @@ def linear_attn_tp_size() -> int:
     return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
 
 
+def linear_attn_tp_rank() -> int:
+    """This rank's index in ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_rank")
+
+
 def draft_attn_parallel_group() -> str:
     """The group an attention-owning draft uses, resolved in the target scope.
 
@@ -501,6 +506,29 @@ def draft_attn_parallel_group() -> str:
 def draft_attn_tp_size() -> int:
     """The width of ``draft_attn_parallel_group()`` in the target scope."""
     return getattr(get_parallel(), f"{draft_attn_parallel_group()}_size")
+
+
+def is_scheduler_io_rank() -> bool:
+    """Whether this scheduler rank receives requests from the tokenizer and
+    sends outputs to the detokenizer: pipeline, attention-TP and attention-CP
+    rank 0, one per attention-DP group."""
+    parallel = get_parallel()
+    return (
+        parallel.pp_rank == 0
+        and parallel.attn_tp_rank == 0
+        and parallel.attn_cp_rank == 0
+    )
+
+
+def is_control_broadcast_local() -> bool:
+    """Whether each attention-DP group leader receives control requests from
+    the DP controller and broadcasts them within its group, instead of the
+    first leader broadcasting them over the whole TP group."""
+    parallel = get_parallel()
+    return parallel.attn_dp_enabled and (
+        parallel.enable_dp_attention_local_control_broadcast
+        or get_exec().moe.is_ep_offset_joiner
+    )
 
 
 class _FlagGroupBase(msgspec.Struct):
@@ -705,6 +733,15 @@ class ForwardFlags:
         # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
         # that slices); read by the benchmark routing override.
         "attn_tp_sequence_sharded": False,
+        # Physical token rows in TP rank order for the current Ascend MoE call.
+        "ascend_allgather_row_sizes": None,
+        # The batch of the current model forward, published by ModelRunner so
+        # the EP dispatcher can derive an Ascend allgather row layout lazily.
+        "forward_batch": None,
+        # Whether the FFN stage's MoE input is a contiguous attention-TP slice
+        # of the DP shard (True) or the gathered full shard on every rank
+        # (False). None means the stage did not declare it.
+        "moe_input_attn_tp_sliced": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -1224,9 +1261,7 @@ class _ServerArgsOverride:
         self._prev_publish_role = ctx._publish_role
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
-        from sglang.srt.arg_groups.overrides import (
-            declare_resolution,
-        )
+        from sglang.srt.arg_groups.overrides import declare_resolution
 
         server_args = ServerArgs(model_path="dummy")
         server_args.resolve_once()
@@ -1402,8 +1437,8 @@ def _validated_role_ns_mode(value: str) -> str:
 
 def _role_ns_mode_from_env() -> str:
     # Resolved once at import so the config_bag gate stays a dynamo-prunable
-    # constant; validated fail-loud here (EnvField's warn-and-default parse
-    # would silently turn a typo into "off").
+    # constant; validated fail-loud here (EnvStr accepts any string, so a typo
+    # would otherwise silently read as "off").
     from sglang.srt.environ import envs
 
     return _validated_role_ns_mode(envs.SGLANG_ROLE_NAMESPACES.get())
@@ -1829,6 +1864,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",
     "is_mps": "is_mps",
+    "is_mlu": "is_mlu",
     "is_sail": "is_sail",
     "is_sm90": "is_sm90_supported",
     "is_sm100": "is_sm100_supported",
@@ -1836,6 +1872,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_sm110": "is_sm110_supported",
     "is_sm120": "is_sm120_supported",
     "is_blackwell": "is_blackwell_supported",
+    "is_gfx95": "is_gfx95_supported",
     "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",
     "has_amx": "cpu_has_amx_support",
     "has_flashinfer": "is_flashinfer_available",
@@ -1851,7 +1888,7 @@ _PLATFORM_VALUES: Dict[str, str] = {
 class PlatformContext:
     """The machine's own facts, with one place to override them.
 
-    Every name maps to a probe in `utils.common`; the probes are
+    Every name maps to a probe in `utils.device`; the probes are
     `lru_cache`-d, so reading through here costs a call and a dict lookup
     (~26 ns) rather than a device query.
     """
@@ -1868,12 +1905,12 @@ class PlatformContext:
             raise AttributeError(
                 f"unknown platform fact {name!r}; known: {', '.join(known)}"
             )
-        overrides = object.__getattribute__(self, "_overrides")
+        overrides = self._overrides
         if name in overrides:
             return overrides[name]
-        from sglang.srt.utils import common as _common
+        from sglang.srt.utils import device as _device
 
-        return getattr(_common, probe)()
+        return getattr(_device, probe)()
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError(
@@ -2076,8 +2113,8 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     publisher, or `None` if publishing is disabled / misconfigured.
 
     This is the wire contract surfaced under the `kv_events` key on
-    `/server_info` so KV-aware routers (e.g. the SGLang model
-    gateway) can subscribe per-worker without operator-supplied port
+    `/server_info` so KV-aware routers (e.g. sgl-router) can
+    subscribe per-worker without operator-supplied port
     coordination. The router constructs the per-DP-rank SUB endpoint
     as tcp://<worker_host>:<endpoint_port_base + dp_rank> for
     every rank reported in dp_size.

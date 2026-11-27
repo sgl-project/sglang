@@ -1,4 +1,5 @@
-"""Bound diagnostic retention and check write headroom on this runner only."""
+"""Bound diagnostic retention, reclaim this runner's leftover launcher scratch,
+and check write headroom on this runner only."""
 
 import os
 import shutil
@@ -6,6 +7,9 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+
+# Written into each scratch dir by launch_mi355x.sh; keep the two in sync.
+SCRATCH_OWNER_FILE = ".runner_name"
 
 
 def prune_diagnostics(diag: Path, now: float) -> int:
@@ -27,6 +31,31 @@ def prune_diagnostics(diag: Path, now: float) -> int:
     return removed
 
 
+def prune_scratch(scratch: Path, runner_name: str, now: float) -> list[str]:
+    """Remove launcher scratch dirs left by this runner's earlier legs.
+
+    A runner runs one leg at a time, so before a leg starts nothing it owns is
+    in use. Dirs owned by another runner sharing this home are never touched;
+    unowned dirs (from launchers that predate the owner file) go after a day.
+    """
+    if scratch.is_symlink() or not scratch.is_dir():
+        return []
+    removed = []
+    for entry in scratch.iterdir():
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        owner_file = entry / SCRATCH_OWNER_FILE
+        if owner_file.is_file():
+            stale = owner_file.read_text().strip() == runner_name
+        else:
+            stale = entry.stat().st_mtime < now - 86400
+        if stale:
+            # NFS keeps files a dead process still holds as .nfsXXXX; skip them.
+            shutil.rmtree(entry, ignore_errors=True)
+            removed.append(entry.name)
+    return removed
+
+
 def main() -> None:
     temp = Path(os.environ["RUNNER_TEMP"])
     # Derive the installation from the standard runner layout, never from HOME:
@@ -43,6 +72,12 @@ def main() -> None:
         raise SystemExit(f"Unrecognized runner layout: {temp}")
     reclaimed = prune_diagnostics(root / "_diag", time.time())
     print(f"Removed {reclaimed} bytes of runner diagnostics older than seven days")
+    stale = prune_scratch(
+        scratch=Path.home() / ".mi355x_ci",
+        runner_name=os.environ["RUNNER_NAME"],
+        now=time.time(),
+    )
+    print(f"Removed leftover launcher scratch: {', '.join(stale) or 'none'}")
 
     # df/free space alone cannot detect per-user quota exhaustion. Report quota
     # where available, then actually allocate and flush a small probe file.

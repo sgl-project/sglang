@@ -161,6 +161,16 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"got '{cfg.disaggregation_transfer_backend}'."
             )
 
+        if cfg.disaggregation_enable_kv_checksum:
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            if is_deepseek_v4(model_config_of(server_args).hf_config):
+                raise ValueError(
+                    "--disaggregation-enable-kv-checksum does not support "
+                    "DeepSeek-V4 yet: the checksum has no per-request state "
+                    "indices for its KV pool."
+                )
+
         # Reject features whose role-specific state is not rebuilt on a flip.
         if cfg.enable_pd_role_switch:
             view = resolved_view(server_args)
@@ -205,8 +215,7 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         unsupported.append("transfer backends other than Mooncake")
     if cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
         unsupported.append("pipeline or attention context parallelism")
-    attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
-    if cfg.tp_size != attn_dp_size:
+    if cfg.tp_size != cfg.attn_dp_size:
         unsupported.append("attention tensor parallelism greater than one")
     if cfg.decoupled_spec_role != "null":
         unsupported.append("decoupled speculation")
@@ -298,6 +307,7 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
 def handle_encoder_disaggregation(server_args: Any):
     from sglang.srt.arg_groups.model_hook import handle_language_model_only
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
+    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
     from sglang.srt.server_args import resolve_encoder_transfer_backend
 
     cfg = resolving_view(server_args)
@@ -308,6 +318,11 @@ def handle_encoder_disaggregation(server_args: Any):
         )
     if cfg.encoder_only and cfg.language_only:
         raise ValueError("Cannot set --encoder-only and --language-only together")
+    if cfg.enable_token_space_processor and (cfg.encoder_only or cfg.language_only):
+        raise ValueError(
+            "--enable-token-space-processor does not support encoder "
+            "disaggregation (--encoder-only / --language-only) yet"
+        )
     if cfg.encoder_only and not cfg.disaggregation_mode == "null":
         raise ValueError(
             "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
@@ -364,23 +379,26 @@ def handle_encoder_disaggregation(server_args: Any):
         "KimiVLForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "MiMoV2ForCausalLM",
         "Glm5NextForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
         "MuseSparkForConditionalGeneration",
+        *INKLING2_ARCHS,
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
-            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MiniMax-M3, MuseSpark."
+            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MiniMax-M3, MuseSpark, "
+            f"Inkling2."
         )
 
     if (
-        model_arch == "MuseSparkForConditionalGeneration"
+        model_arch in ("MuseSparkForConditionalGeneration", *INKLING2_ARCHS)
         and cfg.language_only
         and cfg.enable_adaptive_dispatch_to_encoder
     ):
         raise ValueError(
-            "Muse language-only servers do not load local encoders; "
+            f"{model_arch} language-only servers do not load local encoders; "
             "--enable-adaptive-dispatch-to-encoder is not supported."
         )

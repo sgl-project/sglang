@@ -64,17 +64,6 @@ struct RMSNormTile {
   }
 };
 
-// Any inline asm earlier in the kernel (`griddepcontrol.wait` included) makes nvcc 13.2-13.4 lower
-// the vector loads after it to generic `LD.E.128` pairs; stating the address space right before the
-// access restores `LDG.E.256`.
-template <typename T>
-SGL_DEVICE T* assume_global(T* ptr) {
-#ifndef USE_ROCM
-  __builtin_assume(__isGlobal(ptr));
-#endif
-  return ptr;
-}
-
 struct RMSNormParams {
   const void* __restrict__ input;
   const void* __restrict__ weight;

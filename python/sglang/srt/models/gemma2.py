@@ -35,6 +35,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
@@ -42,7 +44,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_npu, make_layers
+from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
@@ -291,6 +293,7 @@ class Gemma2Model(nn.Module):
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
+                prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
         )
@@ -371,10 +374,6 @@ class Gemma2ForCausalLM(nn.Module):
         "gate_up_proj",
         "down_proj",
     ]
-    # Gemma does not apply LoRA to the embedding layer.
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = True
 
     def __init__(
         self,

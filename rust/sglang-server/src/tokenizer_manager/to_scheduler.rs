@@ -5,8 +5,12 @@ use std::collections::HashMap;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
-use crate::message::request::{Request, RequestKind, SchedulerRequest};
+use crate::message::request::{
+    GenerateRequest, MmCancellation, Request, RequestKind, SchedulerRequest,
+};
 use crate::message::response::ResponseItem;
+use crate::message::sampling::SamplingParams;
+use crate::message::types::OneOrMany;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
 pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
@@ -16,13 +20,13 @@ use crate::tokenizer_manager::to_scheduler_validation::{
 };
 use crate::tokenizer_manager::wiring::{AbortSource, Senders, TmEvent};
 use crate::utils::{
-    error::Error,
+    error::{Error, QueueStage},
     fsm::{Event, RequestState, ValidationOutcome},
 };
 
-/// Longest client-supplied rid accepted. It keys the detok table and travels on
-/// every chunk, so its length is a recurring cost; Python mints 32-byte uuid hex.
-pub(super) const MAX_RID_LEN: usize = 128;
+/// Longest client-supplied rid accepted, in UTF-8 bytes. Namespaced caller IDs
+/// can exceed a UUID; keep their per-step wire and detokenizer-table cost bounded.
+pub(super) const MAX_RID_LEN: usize = 256;
 
 /// Intake FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
@@ -38,6 +42,8 @@ pub struct Intake {
     mm: MmDispatch,
     /// Track request states when intake does not hold it.
     request_states: HashMap<Rid, RequestState>,
+    /// The cancellation of each request the MM pool holds, for its abort.
+    mm_cancellations: HashMap<Rid, MmCancellation>,
     shutdown: flume::Receiver<()>,
 }
 
@@ -59,6 +65,7 @@ impl Intake {
             limits,
             mm,
             request_states: HashMap::new(),
+            mm_cancellations: HashMap::new(),
             shutdown,
         }
     }
@@ -112,6 +119,10 @@ impl Runnable for Intake {
                 Some(Lane::Event(TmEvent::Tokenized(req) | TmEvent::Encoded(req))) => {
                     self.drive(req)
                 }
+                Some(Lane::Event(TmEvent::OneWay { control, queued })) => {
+                    // The caller may have stopped waiting; the push stands.
+                    let _ = queued.send(self.push_one_way(&control));
+                }
                 None => {
                     // Shutdown, or the inbox closed. Drain whatever is still queued
                     // on the abort lane first: those requests are in flight on the
@@ -137,9 +148,11 @@ impl Intake {
     /// terminal frame and a hung connection. Python cannot hit this because it
     /// validates before `rid_to_state[obj.rid] = state`.
     fn fail(&self, req: &mut Request, err: Error, registered: bool) {
-        // Expected request, capacity, and cancellation outcomes would spam.
+        // Capacity and cancellation outcomes are expected and would spam.
         if err.is_server_fault() {
             tracing::error!(rid = %req.rid, error = %err, "intake rejected request");
+        } else if let Some(reason) = err.client_fault_reason() {
+            tracing::warn!(rid = %req.rid, error = %reason, "rejected request");
         }
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(ResponseItem::Error(err)); // client may be gone
@@ -156,6 +169,7 @@ impl Intake {
     /// Each arm acts and advances the FSM; the loop re-dispatches. The arms
     /// are the design table's states, `Failed` the single reject path.
     fn drive(&mut self, mut req: Request) {
+        self.mm_cancellations.remove(&req.rid);
         // A pool return whose client left while it was out: the sink is already
         // deregistered and the scheduler never saw the rid, so nothing is
         // pushed or failed. Dropping the request releases any shm it carries.
@@ -163,6 +177,16 @@ impl Intake {
             self.request_states.remove(&req.rid),
             Some(RequestState::Aborted)
         ) {
+            // Back with its ids tokenized (and expanded, from the mm pool), its
+            // abort reports them once fitted to the context, as Python's does
+            // for a request aborted once tokenized. One still bound for the mm
+            // pool, or whose ids fail the checks, reports none.
+            if let (RequestState::PreSendValidating, RequestKind::Generate(g)) =
+                (&req.state, &mut req.kind)
+                && self.check_final_ids(g).is_ok()
+            {
+                g.report_prompt_token_ids();
+            }
             tracing::debug!(rid = %req.rid, "dropping request aborted");
             return;
         }
@@ -260,19 +284,32 @@ impl Intake {
                 // an `Encoded` event (PreSendValidating with the expanded ids and
                 // feature buffers set -- or Failed on error). Doesn't loop. The
                 // request is out of reach while there; an abort in that window
-                // is recorded in `request_states` and honored when it returns.
+                // is recorded in `request_states` and honored when it returns,
+                // and cancels the request's `MmCancellation` at once.
                 RequestState::Encoding => {
                     let rid = req.rid.clone();
+                    let mut cancellation = None;
+                    if let RequestKind::Generate(g) = &mut req.kind
+                        && let Some(mm) = g.mm.as_mut()
+                    {
+                        mm.admission.queued_at = Some(std::time::Instant::now());
+                        cancellation = Some(mm.cancellation.clone());
+                    }
                     // Full = the pool can't keep up, so back-pressure like a full
                     // to_scheduler channel. Disconnected = pool gone. Either way
                     // flume hands the request back.
                     match self.mm.tx.try_send(req) {
                         Ok(()) => {
+                            if let Some(cancellation) = cancellation {
+                                self.mm_cancellations.insert(rid.clone(), cancellation);
+                            }
                             self.request_states.insert(rid, state);
                         }
                         Err(e) => {
                             let (err, mut req) = match e {
-                                flume::TrySendError::Full(req) => (Error::QueueFull, req),
+                                flume::TrySendError::Full(req) => {
+                                    (Error::QueueFull(QueueStage::Mm), req)
+                                }
                                 flume::TrySendError::Disconnected(req) => {
                                     (Error::Internal("mm worker pool gone".into()), req)
                                 }
@@ -296,20 +333,9 @@ impl Intake {
                         continue;
                     }
                     let rid = req.rid.clone();
-                    match self.senders.tokenizer_tx.send(req) {
-                        Ok(()) => {
-                            self.request_states.insert(rid, state);
-                        }
-                        Err(err) => {
-                            // Pool gone (workers exited); flume hands the request back.
-                            let mut req = err.into_inner();
-                            // Past `Received`, so registration happened.
-                            self.fail(
-                                &mut req,
-                                Error::Internal("tokenizer pool gone".into()),
-                                true,
-                            );
-                        }
+                    // Past `Received`, so registration happened.
+                    if self.send_to_tokenizer_pool(req, true /* registered */) {
+                        self.request_states.insert(rid, state);
                     }
                     return;
                 }
@@ -320,8 +346,7 @@ impl Intake {
                 // a text request has no ids yet.
                 RequestState::PreSendValidating => {
                     if let RequestKind::Generate(g) = &mut req.kind
-                        && let Err(e) = validate_input_ids(g, self.limits.vocab_size)
-                            .and_then(|()| check_total_tokens(g, &self.limits))
+                        && let Err(e) = self.check_final_ids(g)
                     {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;
@@ -361,26 +386,36 @@ impl Intake {
         }
     }
 
+    /// Check a request's final ids, as the scheduler will get them, and fit
+    /// them to the context.
+    fn check_final_ids(&self, g: &mut GenerateRequest) -> Result<(), Error> {
+        validate_input_ids(g, self.limits.vocab_size)
+            .and_then(|()| check_total_tokens(g, &self.limits))
+    }
+
     /// Register the response sink with the owning detok shard (by id) so the response
     /// has a home. Carries the per-request detok flags — `return_text_in_logprobs`
     /// (decode logprob text on this shard) and `no_stop_trim` (keep the matched
     /// stop in the output) — so the shard needs no back-reference to the request.
     /// Returns `false` if the shard is gone.
     fn register_detok(&self, req: &Request) -> bool {
-        let (decode_logprob_text, no_stop_trim, skip_special_tokens) = match &req.kind {
-            RequestKind::Generate(g) => (
-                g.return_text_in_logprobs.unwrap_or(false),
-                g.sampling_params.no_stop_trim,
-                g.sampling_params.skip_special_tokens,
-            ),
-            RequestKind::Control(_)
-            | RequestKind::Detokenize { .. }
-            | RequestKind::Tokenize { .. } => (
-                false, /* decode_logprob_text */
-                false, /* no_stop_trim */
-                true,  /* skip_special_tokens */
-            ),
-        };
+        let (decode_logprob_text, no_stop_trim, skip_special_tokens, has_stop_strs) =
+            match &req.kind {
+                RequestKind::Generate(g) => (
+                    g.return_text_in_logprobs.unwrap_or(false),
+                    g.sampling_params.no_stop_trim,
+                    g.sampling_params.skip_special_tokens,
+                    has_stop_strings(&g.sampling_params),
+                ),
+                RequestKind::Control(_)
+                | RequestKind::Detokenize { .. }
+                | RequestKind::Tokenize { .. } => (
+                    false, /* decode_logprob_text */
+                    false, /* no_stop_trim */
+                    true,  /* skip_special_tokens */
+                    false, /* has_stop_strs */
+                ),
+            };
         self.senders
             .detok_for(&req.rid)
             .send(DetokMsg::Register {
@@ -389,6 +424,7 @@ impl Intake {
                 decode_logprob_text,
                 no_stop_trim,
                 skip_special_tokens,
+                has_stop_strs,
             })
             .is_ok()
     }
@@ -430,15 +466,27 @@ impl Intake {
     /// through the request's own sink. It was never registered with a detok
     /// shard, so a failure here has nothing to deregister.
     fn push_tokenize_to_pool(&self, req: Request) {
-        if let Err(err) = self.senders.tokenizer_tx.send(req) {
-            // Pool gone (workers exited); flume hands the request back.
-            let mut req = err.into_inner();
-            self.fail(
-                &mut req,
-                Error::Internal("tokenizer pool gone".into()),
-                false, /* registered */
-            );
-        }
+        self.send_to_tokenizer_pool(req, false /* registered */);
+    }
+
+    /// Hand a request to the tokenizer pool without waiting, as the mm hop
+    /// does: a full pool queue back-pressures like a full to_scheduler
+    /// channel (`QueueFull`). Parking this thread instead would stall every
+    /// request on the rank, and the pool returns its work to this thread's
+    /// inbox, so with both queues full the two would wait on each other.
+    /// Returns whether the pool took it; otherwise the request is failed.
+    fn send_to_tokenizer_pool(&self, req: Request, registered: bool) -> bool {
+        // Flume hands the request back on either failure.
+        let (err, mut req) = match self.senders.tokenizer_tx.try_send(req) {
+            Ok(()) => return true,
+            Err(flume::TrySendError::Full(req)) => (Error::QueueFull(QueueStage::Tokenizer), req),
+            // Pool gone (workers exited).
+            Err(flume::TrySendError::Disconnected(req)) => {
+                (Error::Internal("tokenizer pool gone".into()), req)
+            }
+        };
+        self.fail(&mut req, err, registered);
+        false
     }
 
     /// Push a bare control request (`[tag, rid, nil]`) onto the to_scheduler channel. The
@@ -463,7 +511,22 @@ impl Intake {
             header,
             buffers: Vec::new(),
         }) {
-            self.fail(&mut req, Error::QueueFull, true); // registered
+            self.fail(&mut req, Error::QueueFull(QueueStage::Scheduler), true); // registered
+        }
+    }
+
+    /// Push a control message the scheduler does not answer. Nothing would
+    /// retry it, so it takes the reserved lane: a full request ring cannot
+    /// drop it.
+    fn push_one_way(&self, control: &ControlRequest) -> Result<(), Error> {
+        let header = control.encode()?;
+        if self.to_scheduler_tx.push_priority(SchedulerRequest {
+            header,
+            buffers: Vec::new(),
+        }) {
+            Ok(())
+        } else {
+            Err(Error::Internal("to_scheduler channel closed".into()))
         }
     }
 
@@ -475,7 +538,8 @@ impl Intake {
     /// retired.
     ///
     /// A request out in a pool never reached the scheduler, so there is nothing to
-    /// abort there yet: it is marked `Aborted` and dropped when it returns.
+    /// abort there yet: it is marked `Aborted` and dropped when it returns. One
+    /// in the MM pool also has its [`MmCancellation`] cancelled.
     ///
     /// An `/abort_request` ([`AbortSource::Request`]) for a request the
     /// scheduler has keeps its sink, so the scheduler's terminal output still
@@ -498,6 +562,9 @@ impl Intake {
             .send(DetokMsg::Deregister { rid: rid.clone() });
         if let Some(state) = self.request_states.get_mut(&rid) {
             *state = RequestState::Aborted;
+            if let Some(cancellation) = self.mm_cancellations.remove(&rid) {
+                cancellation.cancel();
+            }
             tracing::debug!(rid = %rid, "abort recorded for request");
             return;
         }
@@ -521,14 +588,17 @@ impl Intake {
         // outlives a `fail(&mut req)`.
         let serialized = match &mut req.kind {
             RequestKind::Generate(g) if g.already_tokenized() => {
-                g.encode_header().map(|header| (header, g.take_buffers()))
+                // Final here, and before the buffers take them.
+                g.report_prompt_token_ids();
+                g.encode_header()
+                    .map(|header| (header, g.take_buffers(), g.dispatch_finish_time.clone()))
             }
             RequestKind::Generate(_) => Err(Error::Tokenize("empty input_ids".into())),
             _ => Err(Error::Internal(
                 "non-generate request reached push_to_channel".into(),
             )),
         };
-        let (header, buffers) = match serialized {
+        let (header, buffers, dispatch_finish_time) = match serialized {
             Ok(v) => v,
             Err(e) => {
                 self.fail(&mut req, e, true); // on the push path: registered
@@ -536,15 +606,33 @@ impl Intake {
             }
         };
 
+        // Stamped before the push: once the scheduler has the request, its
+        // response can reach the hook that reads the stamp.
+        dispatch_finish_time.set_now();
         if !self
             .to_scheduler_tx
             .try_push(SchedulerRequest { header, buffers })
         {
-            self.fail(&mut req, Error::QueueFull, true); // registered
+            dispatch_finish_time.clear();
+            self.fail(&mut req, Error::QueueFull(QueueStage::Scheduler), true); // registered
         }
         // On success the scheduler owns the request (response arrives by rid); we
         // drop our `Request` here — the detok shard holds the sink.
     }
+}
+
+/// Whether a request has stop strings or regexes, before or after `normalize`
+/// moves them from the API aliases into `stop_strs` / `stop_regex_strs`.
+fn has_stop_strings(p: &SamplingParams) -> bool {
+    let set = |v: &Option<OneOrMany<String>>| match v {
+        Some(OneOrMany::One(s)) => !s.is_empty(),
+        Some(OneOrMany::Many(v)) => v.iter().any(|s| !s.is_empty()),
+        None => false,
+    };
+    set(&p.stop)
+        || set(&p.stop_regex)
+        || p.stop_strs.iter().any(|s| !s.is_empty())
+        || p.stop_regex_strs.iter().any(|s| !s.is_empty())
 }
 
 #[cfg(test)]

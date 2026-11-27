@@ -313,7 +313,7 @@ sgl-eval run gsm8k \\
   // template parser detection (#38297) that `--*-parser auto` needs; the old
   // glm-5.3-flash dev image (2026-09-03) predates #38297 and misdetects.
   dockerImages: {
-    a3: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-glm5.3-flash",
+    a3: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051",
     gb300: "lmsysorg/sglang:latest",
     h100: "lmsysorg/sglang:latest",
     h200: "lmsysorg/sglang:latest",
@@ -512,7 +512,7 @@ sgl-eval run gsm8k \\
     const router = { port: 30000, command: config.npuRouterCommand };
     if (s.pdMode === "router") return { ...cell, pd: true, pdMode: "router",
       nnodes: 1, verified: false, env: [], flags: [], warn: undefined,
-      commands: { python: config.npuRouterCommand, docker: `docker run --network host --rm swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-glm5.3-flash ${config.npuRouterCommand}` }, router };
+      commands: { python: config.npuRouterCommand, docker: `docker run --network host --rm swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051 ${config.npuRouterCommand}` }, router };
     const recipe = config.npuPdRecipes.find((r) => r.hw === s.hw && r.pdMode === s.pdMode);
     if (!recipe) return cell;
     const flags = recipe.flags.map((flag) => flag.startsWith("--port ")
@@ -524,7 +524,7 @@ sgl-eval run gsm8k \\
       commands: { python: command } };
   },
 
-  npuRouterCommand: "python3 -m sglang_router.launch_router \\\n  --pd-disaggregation \\\n  --prefill http://<prefill-head-ip>:30000 8998 \\\n  --decode http://<decode-head-ip>:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin \\\n  --worker-startup-timeout-secs 3600 \\\n  --request-timeout-secs 7200 \\\n  --disable-retries",
+  npuRouterCommand: "sgl-router \\\n  --model-id GLM-5.3-Flash \\\n  --no-tokenizer \\\n  --worker-urls http://<prefill-head-ip>:30000 http://<decode-head-ip>:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin \\\n  --request-timeout-secs 7200 \\\n  --stale-request-timeout-secs 7200",
 
   npuPdRecipes: [
     {
@@ -555,7 +555,7 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--tp-size 4",
         "--pp-size 4",
-        "--dp-size 4",
+        "--attn-dp-size 4",
         "--quantization modelslim",
         "--device npu",
         "--attention-backend ascend",
@@ -564,7 +564,6 @@ sgl-eval run gsm8k \\
         "--disaggregation-mode prefill",
         "--disaggregation-bootstrap-port 8998",
         "--disaggregation-transfer-backend ascend",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--moe-dense-tp 1",
         "--moe-a2a-backend deepep",
@@ -609,7 +608,7 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--tp-size 16",
         "--pp-size 1",
-        "--dp-size 16",
+        "--attn-dp-size 16",
         "--quantization modelslim",
         "--device npu",
         "--attention-backend ascend",
@@ -617,7 +616,6 @@ sgl-eval run gsm8k \\
         "--served-model-name GLM-5.3-Flash",
         "--disaggregation-mode decode",
         "--disaggregation-transfer-backend ascend",
-        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--deepep-mode low_latency",
         "--load-balance-method round_robin",
@@ -651,7 +649,7 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--tp-size 8",
         "--pp-size 1",
-        "--dp-size 2",
+        "--attn-dp-size 2",
         "--quantization modelslim",
         "--load-format auto",
         "--device npu",
@@ -660,7 +658,6 @@ sgl-eval run gsm8k \\
         "--disaggregation-mode prefill",
         "--disaggregation-bootstrap-port 8998",
         "--disaggregation-transfer-backend ascend",
-        "--enable-dp-attention",
         "--chunked-prefill-size 16384",
         "--max-prefill-tokens 16384",
         "--mem-fraction-static 0.83",
@@ -695,7 +692,7 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--tp-size 8",
         "--pp-size 1",
-        "--dp-size 2",
+        "--attn-dp-size 2",
         "--quantization modelslim",
         "--load-format auto",
         "--device npu",
@@ -704,7 +701,6 @@ sgl-eval run gsm8k \\
         "--disaggregation-mode decode",
         "--disaggregation-bootstrap-port 8998",
         "--disaggregation-transfer-backend ascend",
-        "--enable-dp-attention",
         "--chunked-prefill-size 16384",
         "--max-prefill-tokens 16384",
         "--mem-fraction-static 0.83",
@@ -905,6 +901,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -985,6 +982,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1155,6 +1153,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1296,6 +1295,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1345,6 +1345,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1441,6 +1442,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

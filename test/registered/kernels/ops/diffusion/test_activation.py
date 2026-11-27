@@ -26,7 +26,7 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
@@ -218,17 +218,6 @@ def test_situ_tables_are_ready_for_other_streams(monkeypatch):
         actual = fused_situ_softcap_mul_bitexact(hidden, gate)
     consumer.synchronize()
     assert torch.equal(actual, _situ_reference(hidden, gate))
-
-
-def test_situ_rejects_unsupported_operands():
-    hidden = torch.randn(1, 8, 64, device="cuda", dtype=torch.bfloat16)
-    for gate in (hidden.float(), hidden[:, :-1], hidden.cpu()):
-        with pytest.raises(ValueError, match="matching CUDA BF16"):
-            fused_situ_softcap_mul_bitexact(hidden, gate)
-    strided = hidden[..., ::2]
-    for x in (strided, hidden[:, :0]):
-        with pytest.raises(ValueError, match="matching CUDA BF16"):
-            fused_situ_softcap_mul_bitexact(x, x)
 
 
 if __name__ == "__main__":

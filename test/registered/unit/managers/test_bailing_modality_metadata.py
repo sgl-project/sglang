@@ -8,8 +8,11 @@ import torch
 from sglang.srt.configs.model_config import requires_mm_token_modalities
 from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
 from sglang.srt.layers.multi_gate import create_multi_gate_mm_indices
-from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     _build_forward_token_modalities,
     _maybe_build_forward_token_modalities,

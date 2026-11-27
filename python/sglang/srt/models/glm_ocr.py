@@ -18,7 +18,6 @@
 """Inference-only GLM-OCR model compatible with HuggingFace weights."""
 
 import logging
-from functools import lru_cache
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -41,6 +40,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
@@ -54,12 +54,8 @@ from sglang.srt.models.glm4v import (
     glm4v_vision_reduces_over_attn_tp,
 )
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers import get_processor
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class GlmOcrRMSNorm(Glm4vRMSNorm):
@@ -205,6 +201,7 @@ class GlmOcrVisionModel(Glm4vVisionModel):
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     rms_norm_eps=vision_config.rms_norm_eps,
                     attn_qkv_bias=vision_config.attention_bias,
+                    num_dummy_heads=vision_config.num_dummy_heads,
                     use_data_parallel=use_data_parallel,
                 )
                 for layer_idx in range(depth)
@@ -431,18 +428,14 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
 
-                    if name not in params_dict:
-                        continue
+                if name not in params_dict:
+                    continue
 
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
+                param = params_dict[name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if "visual" in name:
