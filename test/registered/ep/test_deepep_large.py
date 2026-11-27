@@ -28,6 +28,9 @@ if str(TEST_ROOT) not in sys.path:
 from manual.ep.test_elastic_scale import (
     TestElasticScaleUp4To6 as _TestElasticScaleUp4To6,
 )
+from manual.ep.test_elastic_recover import (
+    TestElasticRecover4To4 as _TestElasticRecover4To4,
+)
 from manual.ep.test_nixl_ep import (
     TestNixlEPTP as _TestNixlEPTP,
 )
@@ -173,6 +176,10 @@ class TestDeepseekV32TBO(CustomTestCase):
 
 class TestNixlEPTP(_TestNixlEPTP):
     """CI entry point for the registered NIXL EP test."""
+
+
+class TestElasticRecover4To4(_TestElasticRecover4To4):
+    """CI entry point for the registered Mooncake Elastic EP recovery test."""
 
 
 @unittest.skip("Elastic EP scale test is temporarily disabled in registered CI")
