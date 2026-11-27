@@ -1,7 +1,6 @@
 ---
 title: Ling-3.1-flash
 description: "Deploy Ling-3.1-flash with SGLang — FP8 hybrid KDA + MLA MoE recipes for H200 and GB300 GPUs, measured accuracy and decode speed, and Mooncake prefix caching."
-tag: NEW
 ---
 
 ## Deployment

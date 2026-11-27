@@ -36,7 +36,6 @@ cd "$ROOT"
 python3 "$ENV_PY" check-write-access >/dev/null
 
 export HF_TOKEN=<your_hf_token>  # required for gated repos such as black-forest-labs/FLUX.*
-export FLASHINFER_DISABLE_VERSION_CHECK=1
 # Required for correctly attributed stage-level denoise/decode timings. The
 # checked-in benchmark helper sets this by default unless you explicitly set 0.
 export SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1
@@ -85,7 +84,9 @@ diffusers baseline.
 Environment notes:
 - all commands below assume you are inside the configured diffusion container shell
 - export `HF_TOKEN` before any gated Hugging Face model run
-- export `FLASHINFER_DISABLE_VERSION_CHECK=1` before any benchmark or profiler run
+- leave FlashInfer's version check on; if it reports a mismatch, align
+  `flashinfer-python`, `flashinfer-cubin`, and `flashinfer-jit-cache` to the
+  version pinned in `python/pyproject.toml` instead of disabling the check
 - keep `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` for stage-level comparisons;
   without it, asynchronous GPU work can be charged to a later stage
 - re-run `print-idle-gpus` before each perf command if GPU availability may have changed
@@ -141,7 +142,7 @@ longer required.
 
 Run one explicit quality or BCG comparator with `--quality {exact,lossless,high}` and
 `--breakable-cuda-graph`. BCG and `torch.compile` are intentionally mutually
-exclusive in this helper. An lossless/high+BCG command is only a compatibility probe:
+exclusive in this helper. A lossless/high+BCG command is only a compatibility probe:
 it is invalid if request-scoped DiT fusions mount after the lossless warmup
 graphs were captured. When a preset has explicit width and height, the helper
 declares that same `--warmup-resolutions` value automatically. Video presets
@@ -321,7 +322,7 @@ Use the preset categories this way:
 | `qwen-edit-base` | `Qwen/Qwen-Image-Edit` | No | Covers the original native `QwenImageEditPipelineConfig`, which is distinct from the 2509/2511 edit-plus paths; public SGLang edit fixture, 1024x1024. |
 | `qwen-image-layered` | `Qwen/Qwen-Image-Layered` | No | Native layered-image path using the same public reference image and four-frame request as the GPU server case, at the registered 640x640 canvas. |
 | `stable-diffusion-3.5-medium` | `stabilityai/stable-diffusion-3.5-medium` | No | Representative native `StableDiffusion3PipelineConfig` path at 1024x1024. The repository is gated, so export `HF_TOKEN`; an unauthenticated run is a recorded access blocker, not model evidence. |
-| `sana-video` | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | No | CI-sized T2V baseline: 832x480, 17 frames, 8 steps, guidance 6.0. The BCG comparator declares the same 17-frame warmup shape. Compare all three tiers; `lossless` and `high` enable the BF16-input first linear-attention GEMM while retaining FP32 output and the FP32 second GEMM. |
+| `sana-video` | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | No | CI-sized T2V baseline: 832x480, 17 frames, 8 steps, guidance 6.0. The BCG comparator declares the same 17-frame warmup shape. Compare all three tiers; `high` enables the BF16-input first linear-attention GEMM while retaining FP32 output and the FP32 second GEMM. |
 | `sana-wm-bidirectional` | `Efficient-Large-Model/SANA-WM_bidirectional` | No | Dense two-stage TI2V baseline at the native 1280x704 shape, 49 frames, 16 fps, 20 steps, guidance 4.5, and a 48-frame forward/left action program. Uses the shared cat fixture. |
 | `sana-wm-streaming` | `Efficient-Large-Model/SANA-WM_streaming` | No | Matching offline chunk-causal two-stage baseline with the streaming DiT and chunked refiner enabled; uses the same shape, fixture, seed, and camera action for comparison. |
 | `lingbot-video-moe` | `robbyant/lingbot-video-moe-30b-a3b` | No | One-GPU eager baseline using the CI structured-JSON caption, 384x640, 17 frames, 12 steps, and text-encoder CPU offload. |
@@ -672,7 +673,7 @@ nonzero process exit.
 For `quality=exact`, compare saved artifact hashes and require byte equality
 for a claimed lossless fast path or BCG change. For `quality=lossless` and
 `quality=high`, keep the
-lossless artifact as ground truth and report both aggregate and worst-frame
+`exact` artifact as ground truth and report both aggregate and worst-frame
 SSIM/PSNR. Repository defaults are SSIM 0.95 / PSNR 28 dB for images and SSIM
 0.92 / PSNR 24 dB for videos; checked-in model/hardware consistency metadata
 may override them. Always inspect the image or a start/middle/end video contact
@@ -829,7 +830,7 @@ This skill intentionally stops here. It tells you whether you are looking at:
 - [ ] `compare_perf.py` table generated
 - [ ] one representative `torch.profiler` trace saved
 - [ ] hotspot classified against `existing-fast-paths.md`
-- [ ] lossless artifact hash is exact; lossless/high aggregate and worst-frame SSIM/PSNR pass the checked-in threshold
+- [ ] `exact` artifact hash is byte-identical; lossless/high aggregate and worst-frame SSIM/PSNR pass the checked-in threshold
 - [ ] reference image or start/middle/end video contact sheet checked visually
 - [ ] any PR claim has repeated saved-request e2e improvement >= 1.5%
 - [ ] task-owned checkpoint cache cleaned and ledger shows zero residual weight files

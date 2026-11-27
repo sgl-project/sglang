@@ -58,6 +58,8 @@ The Qwen3-Next series comes in only one size but offers different thinking modes
 
 - **Xeon CPU service configuration**: Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
+- For the **A3** option, use the pinned image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Follow the [Ascend NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) to start the container, using this pinned image in place of the guide's daily image. Download the main checkpoint from ModelScope, along with the draft checkpoint if you enable speculative decoding. Use the [W8A8 main model](https://www.modelscope.cn/models/vllm-ascend/Qwen3-Next-80B-A3B-Instruct-W8A8) and the [BF16 Qwen3-Next checkpoint](https://www.modelscope.cn/models/Qwen/Qwen3-Next-80B-A3B-Instruct) as the NEXTN draft model.
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage

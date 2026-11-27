@@ -23,10 +23,11 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 
@@ -149,7 +150,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
-        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self.debug_mode = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self.use_triton_kernels = current_platform.capabilities.supports_triton
         self.supports_fused_decode_write = (
             type(self) is PagedTokenToKVPoolAllocator

@@ -25,7 +25,7 @@ import time
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import torch
@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     NetworkTransferWaiter,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    answered_by_prefill,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -67,9 +68,11 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
     record_network_transfer,
+    setup_page_row_kv_args,
     setup_state_kv_args,
     state_indices_per_entry,
 )
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
@@ -112,8 +115,9 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import is_npu, rank_consensus_checker
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.device import async_d2h
+from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
@@ -453,6 +457,25 @@ class PrefillBootstrapQueue:
             kv_args.total_kv_head_num = (
                 self.scheduler.model_config.get_total_num_kv_heads()
             )
+        draft_window_pages = 0
+        if (
+            draft_kv_pool is not None
+            and self.scheduler.spec_algorithm.is_dflash_family()
+        ):
+            from sglang.srt.speculative.dflash_utils import dflash_draft_window_pages
+
+            # A rank holding a draft pool hosts the draft runner and its config.
+            draft_window_pages = dflash_draft_window_pages(
+                self.scheduler.draft_worker.draft_model_runner.model_config.hf_config,
+                page_size=self.token_to_kv_pool.page_size,
+            )
+        setup_page_row_kv_args(
+            kv_args,
+            token_to_kv_pool=self.token_to_kv_pool,
+            transfer_backend=self.transfer_backend,
+            draft_token_to_kv_pool=draft_kv_pool,
+            draft_window_pages=draft_window_pages,
+        )
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -484,6 +507,11 @@ class PrefillBootstrapQueue:
             self.is_mla_backend,
             **kv_manager_kwargs,
         )
+        # main_kv_page_row implies the Mooncake manager, the only one that packs.
+        if kv_args.main_kv_page_row and kv_args.draft_kv_head_num:
+            kv_manager.set_draft_kv_tensors(
+                draft_kv_pool.k_buffer + draft_kv_pool.v_buffer
+            )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -512,6 +540,11 @@ class PrefillBootstrapQueue:
         backend = (
             TransferBackend.FAKE
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST
+            or answered_by_prefill(
+                req,
+                disaggregation_mode=self.scheduler.disaggregation_mode,
+                transfer_backend=self.transfer_backend,
+            )
             else self.transfer_backend
         )
         kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
@@ -623,6 +656,7 @@ class PrefillBootstrapQueue:
                 self.pp_rank,
                 self.pp_size,
                 self.pp_poll_send_window,
+                P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -679,16 +713,25 @@ class SchedulerDisaggregationPrefillMixin:
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
-        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        bootstrap_queue = self.disagg_prefill_bootstrap_queue
+        kv_mgr = bootstrap_queue.kv_manager
         prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)
         if prefetch is None:
             return
         lazy = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
         for req in batch.reqs:
-            room = getattr(req, "bootstrap_room", None)
+            if (
+                lazy
+                and req.pending_bootstrap
+                and bootstrap_queue.transfer_backend == TransferBackend.NIXL
+            ):
+                # NIXL reserves at send time if the decode prefix arrives after forward.
+                continue
+            room = req.bootstrap_room
             if room is not None and room in kv_mgr.transfer_infos:
                 if lazy and req.extend_end is not None:
-                    prefetch(room, upto_tokens=req.extend_end)
+                    upto_tokens = max(0, req.extend_end - req.disagg_decode_prefix_len)
+                    prefetch(room, upto_tokens=upto_tokens)
                 else:
                     prefetch(room)
 
@@ -1407,14 +1450,10 @@ class SchedulerDisaggregationPrefillMixin:
                     req.disagg_kv_sender.abort()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def process_disagg_prefill_transfer_queue(
-        self: Scheduler, rids_to_check: Optional[Dict[str, bool]] = None
-    ) -> List[Req]:
+    @rank_consensus(same_results=["[req.rid for req in result]"])
+    def process_disagg_prefill_transfer_queue(self: Scheduler) -> List[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
-        rids_to_check: For PP, the PP consensus of concluded transfers as {rid: failed}.
-        Only these rids are concluded, and a rid failed on any stage is concluded as
-        failed on every stage, whatever this stage's own sender reports.
         """
         if len(self.disagg_prefill_transfer_queue) == 0:
             return []
@@ -1423,41 +1462,37 @@ class SchedulerDisaggregationPrefillMixin:
 
         # The polls are reduced across ranks in this order.
         transfer_queue = list(self.disagg_prefill_transfer_queue)
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in transfer_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
+        senders = [req.disagg_kv_sender for req in transfer_queue]
+        parallel = get_parallel()
+        if parallel.pp_size > 1:
+            # PP0 decides from every stage's status and forwards the decision,
+            # so every stage releases the same requests the same way.
+            polls = poll_and_all_reduce_prefill_pp(
+                senders,
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+                self.pp_group,
+                parallel.pp_rank,
+                parallel.pp_size,
+                self.pp_transfer_poll_send_window,
+                P2PTag.DISAGG_TRANSFER_PP_SYNC,
+                release=True,
+            )
+            if parallel.pp_rank > 0:
+                for sender, poll in zip(senders, polls):
+                    if poll in (KVPoll.Success, KVPoll.Failed):
+                        # Only for the sender's conclusion side effects (trace
+                        # end, transfer latency); PP0 made the decision.
+                        sender.poll()
+        else:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                senders,
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
 
         # Check .poll() for the reqs in disagg_prefill_transfer_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(transfer_queue, polls):
-            if rids_to_check is not None:
-                if req.rid not in rids_to_check:
-                    continue
-
-                # In PP mode, the previous rank may have reached a terminal
-                # state (Success/Failed) while this rank's local poll is still
-                # in a transient state due to clock skew or propagation delay.
-                # Treat non-terminal states as undone instead of crashing.
-                if poll not in (
-                    KVPoll.Success,
-                    KVPoll.Failed,
-                ):
-                    logger.warning_once(
-                        f"PP rank {get_parallel().pp_rank}: unexpected poll state {poll} for rid {req.rid} "
-                        f"from consensus; treating as undone",
-                    )
-                    continue
-                # Conclude with the stage-consensus outcome: another stage may have
-                # failed this transfer (e.g. aborted after this stage finished).
-                if rids_to_check[req.rid]:
-                    poll = KVPoll.Failed
-                rank_consensus_checker.assert_same(
-                    "pp disagg prefill transfer concluded rid=%s failed=%s",
-                    req.rid,
-                    poll == KVPoll.Failed,
-                )
-
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
                 if self.handle_pending_bootstrap(req, poll):
@@ -1506,7 +1541,16 @@ class SchedulerDisaggregationPrefillMixin:
                 if req.return_routed_experts:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
-                    req.finish_outside_step(FINISH_LENGTH(length=0))
+                    if answered_by_prefill(
+                        req,
+                        disaggregation_mode=self.disaggregation_mode,
+                        transfer_backend=self.transfer_backend,
+                    ):
+                        # This output is the whole response, not a handoff.
+                        req.update_finish_state()
+                        assert req.finished(), f"{req.rid=} sampled no final token"
+                    else:
+                        req.finish_outside_step(FINISH_LENGTH(length=0))
                 self.request_retirer.release(req, checkpoint=True)
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
@@ -1557,9 +1601,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         return done_reqs
 
-    def handle_inflight_transfer_failure(
-        self: Scheduler, req: Req
-    ) -> Optional[Exception]:
+    def handle_inflight_transfer_failure(self: Scheduler, req: Req) -> None:
         """Conclude an inflight request whose KV transfer failed."""
         error_message = (
             f"Prefill transfer failed for request rank={get_parallel().tp_rank} "
@@ -1584,7 +1626,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.request_retirer.release(req, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
-        return exc
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""

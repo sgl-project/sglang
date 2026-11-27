@@ -40,12 +40,11 @@ from sglang.srt.arg_groups.argparse_actions import (
 from sglang.srt.arg_groups.choices import reject_removed_choice
 from sglang.srt.arg_groups.model_override_base import (
     ep_joiner_of,
-    ep_scale_joiner_of,
+    ep_offset_joiner_of,
     model_config_of,
     resolving_view,
 )
 from sglang.srt.arg_groups.overrides import (
-    remote_instance_transfer_engine_of,
     resolution_result,
 )
 from sglang.srt.arg_groups.validation_hook import (
@@ -366,8 +365,8 @@ class ServerArgs:
 
     # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in
-    # _handle_page_major_kv_layout); the model-family gate is enforced at pool
-    # construction in model_runner_kv_cache_mixin._init_pools.
+    # handle_page_major_kv_layout); the model-family gate is enforced at pool
+    # construction in mem_cache/kv_cache_configurator.py (_init_pools).
 
     def _unified_memory_pd_transfer_backends(self) -> set[str]:
         return {"mooncake", "nixl"}
@@ -516,11 +515,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.validation_hook import check_server_args
 
         check_server_args(self)
-
-    def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
-        """``load_format`` overrides the seed's: a draft runner loading under
-        ``--speculative-draft-load-format`` needs its own transfer engine."""
-        return remote_instance_transfer_engine_of(resolving_view(self), load_format)
 
 
 # Collect input fields only; field_order.py preserves positional argument order.
@@ -922,7 +916,11 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + num_dp_ranks_of(cfg)
-            if ep_scale_joiner_of(resolving_view(server_args)):
+            is_joiner = ep_joiner_of(resolving_view(server_args))
+            is_offset_joiner = ep_offset_joiner_of(resolving_view(server_args))
+            # An offset-0 recover joiner takes node 0's ports, which it only connects to.
+            reuses_primary_ports = is_joiner and not is_offset_joiner
+            if is_offset_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
@@ -946,7 +944,6 @@ class PortArgs:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
-            is_joiner = ep_joiner_of(resolving_view(server_args))
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
             # dist_init_port / nccl_port (rendezvous uses the externally-managed
             # store; see distributed/bootstrap.py:_resolve_dist_init_method), so
@@ -955,7 +952,7 @@ class PortArgs:
                 envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
             )
             try:
-                if dp_rank is None:
+                if dp_rank is None and not reuses_primary_ports:
                     if not (is_joiner or dist_init_overridden):
                         wait_port_available(dist_init_port, "dist_init_port")
                     wait_port_available(port_base, "port_base")
@@ -967,7 +964,9 @@ class PortArgs:
                         wait_port_available(load_collector_port, "load_collector_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
-                if dp_rank is None or worker_ports is None:
+                if (
+                    dp_rank is None or worker_ports is None
+                ) and not reuses_primary_ports:
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
                 logger.exception(
