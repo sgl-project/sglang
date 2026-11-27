@@ -58,8 +58,7 @@ class Pi05Int8Linear(nn.Module):
         super().__init__()
         q, scale = _quantize_weight_per_channel(weight)
         self.out_features, self.in_features = q.shape
-        # int8_scaled_mm takes the weight as a [K, N] column-major operand.
-        self.register_buffer("weight_t", q.t(), persistent=False)
+        self.register_buffer("weight", q, persistent=False)
         self.register_buffer("weight_scale", scale, persistent=False)
         self.register_buffer(
             "bias",
@@ -87,8 +86,9 @@ class Pi05Int8Linear(nn.Module):
 
         leading = x.shape[:-1]
         x_q, x_scale = per_token_quant_int8(x.reshape(-1, self.in_features).to(torch.bfloat16))
+        # int8_scaled_mm takes the weight as a [K, N] column-major operand.
         out = int8_scaled_mm(
-            x_q, self.weight_t, x_scale, self.weight_scale, torch.bfloat16, self.bias
+            x_q, self.weight.t(), x_scale, self.weight_scale, torch.bfloat16, self.bias
         )
         out = out.reshape(*leading, self.out_features).to(self.output_dtype)
         return out if self.tensor_output else (out, None)
