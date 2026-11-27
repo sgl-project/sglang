@@ -45,6 +45,7 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import (
     adjusts_logits,
     need_truncated_sampling,
@@ -61,6 +62,11 @@ from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.sharded_verify import (
+    VocabShard,
+    gather_full_logits,
+    sharded_target_tokens,
+)
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
@@ -110,6 +116,31 @@ def verify_logits_adjustments_are_noop(sampling_info, *, has_grammar: bool) -> b
     if sampling_info is None:
         return not has_grammar
     return not adjusts_logits(sampling_info, has_grammar=has_grammar)
+
+
+def full_logits_unless_kept(
+    *, logits: torch.Tensor, shard: Optional[VocabShard], keep_target_shards: bool
+) -> tuple[torch.Tensor, Optional[VocabShard]]:
+    """``logits`` (this verify's rows) and their shard; a shard the step does not
+    keep becomes the stock FP32 full-vocabulary rows, with shard None."""
+    if shard is None or keep_target_shards:
+        return logits, shard
+    gathered = gather_full_logits(
+        logits=logits, shard=shard, tp_group=get_parallel().tp_group
+    )
+    return gathered, None
+
+
+def target_greedy_tokens(
+    *, logits: torch.Tensor, vocab_shard: Optional[VocabShard] = None
+) -> torch.Tensor:
+    """The target's greedy token per verify row; a vocabulary shard takes the
+    key exchange, a collective every TP rank must enter."""
+    if vocab_shard is None:
+        return sampling_argmax(logits)
+    return sharded_target_tokens(
+        logits=logits, shard=vocab_shard, tp_group=get_parallel().tp_group
+    )
 
 
 class TargetVerifyResult(msgspec.Struct, frozen=True):
@@ -197,17 +228,21 @@ class TargetVerifyExecutor:
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         simulate_bonus_sampling_info=None,
+        target_shard: Optional[VocabShard] = None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
         Folded path: the accept/finalize/out-token kernels already ran inside
         the target-verify cuda graph (DsparkVerifyEpilogue); read its buffers.
         Eager path: run them here. Both apply the SGLANG_SIMULATE_ACC_LEN
-        override drawn by begin_simulated_step.
+        override drawn by begin_simulated_step. ``target_shard``: the vocabulary
+        shard ``target_logits`` holds, or None for full rows.
         """
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
+        # A simulated acceptance reads full target rows; the opt-in refuses it.
+        assert target_shard is None or self._simulated_correct_len is None
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
@@ -219,6 +254,7 @@ class TargetVerifyExecutor:
             cutoff_layout=layout,
             block_verification=self._block_verification,
             rejection_noise=self._rejection_noise,
+            target_shard=target_shard,
         )
         greedy_bonus = simulate_bonus_sampling_info is None and (
             sampling_info is None or sampling_info.is_all_greedy
@@ -317,6 +353,7 @@ class TargetVerifyExecutor:
         draft_input: DFlashDraftInputV2,
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
+        keep_target_shards: bool = False,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -347,12 +384,23 @@ class TargetVerifyExecutor:
                 batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
                 batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
-        return self._forward_prepared_verify(
+        result = self._forward_prepared_verify(
             batch=batch,
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
+        logits_output = result.logits_output
+        (
+            logits_output.next_token_logits,
+            logits_output.next_token_logits_vocab_shard,
+        ) = full_logits_unless_kept(
+            logits=logits_output.next_token_logits,
+            shard=logits_output.next_token_logits_vocab_shard,
+            keep_target_shards=keep_target_shards,
+        )
+
+        return result
 
     def _forward_prepared_verify(
         self,
@@ -484,6 +532,7 @@ class TargetVerifyExecutor:
         device: str,
         verify_window: VerifyWindow,
         inject_gate: bool = False,
+        keep_target_shards: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         stride = self.verify_num_draft_tokens
         full_block = layout.is_full_block(stride)
@@ -549,6 +598,13 @@ class TargetVerifyExecutor:
                     fill_value=0.0,
                     verify_num_draft_tokens=stride,
                 )
+        strided_logits, logits_output.next_token_logits_vocab_shard = (
+            full_logits_unless_kept(
+                logits=strided_logits,
+                shard=logits_output.next_token_logits_vocab_shard,
+                keep_target_shards=keep_target_shards,
+            )
+        )
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided
         return target_verify, hidden_strided
@@ -592,6 +648,8 @@ class StaticVerifyIO(msgspec.Struct, frozen=True):
     req_pool_indices: torch.Tensor
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
+    # The vocabulary shard ``logits`` holds, or None for full rows.
+    vocab_shard: Optional[VocabShard] = None
 
 
 class DsparkVerifyEpilogue:
@@ -697,8 +755,9 @@ class DsparkVerifyEpilogue:
             or out.hidden_states is None
         ):
             return
+        vocab_shard = out.next_token_logits_vocab_shard
         if not runner.ragged_verify_mode:
-            self._static_epilogue(out, forward_batch)
+            self._static_epilogue(out, forward_batch, vocab_shard=vocab_shard)
             return
         self(
             compact_logits=out.next_token_logits,
@@ -707,6 +766,7 @@ class DsparkVerifyEpilogue:
             seq_lens=forward_batch.seq_lens,
             req_pool_indices=forward_batch.req_pool_indices,
             bs=forward_batch.batch_size,
+            vocab_shard=vocab_shard,
         )
 
     def begin_step(self, verify_lens, armed: bool) -> None:
@@ -740,7 +800,9 @@ class DsparkVerifyEpilogue:
         self._sim_greedy_bs = None
         self.sim_temperatures_buf[:bs].copy_(temperatures.view(-1))
 
-    def _static_epilogue(self, out, forward_batch) -> None:
+    def _static_epilogue(
+        self, out, forward_batch, vocab_shard: Optional[VocabShard] = None
+    ) -> None:
         bs = forward_batch.batch_size
         io = StaticVerifyIO(
             candidates=forward_batch.input_ids.view(bs, self.stride),
@@ -750,6 +812,7 @@ class DsparkVerifyEpilogue:
             req_pool_indices=forward_batch.req_pool_indices,
             out_cache_loc=forward_batch.out_cache_loc,
             positions=forward_batch.positions,
+            vocab_shard=vocab_shard,
         )
         capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
@@ -832,6 +895,7 @@ class DsparkVerifyEpilogue:
                 seq_lens=io.seq_lens,
                 verify_lens=verify_lens,
                 gated=gated,
+                vocab_shard=io.vocab_shard,
             )
             block = self.read_block_accept_lens(bs)
             if block is not None:
@@ -843,6 +907,7 @@ class DsparkVerifyEpilogue:
             logits=io.logits,
             draft_tokens=io.candidates[:, 1:].contiguous(),
             seq_lens=io.seq_lens,
+            vocab_shard=io.vocab_shard,
         )
         # Same staged locations as target verify; padded and fallback rows skip KV.
         return (
@@ -863,13 +928,24 @@ class DsparkVerifyEpilogue:
         return self._fused_accept_tail and low <= bs and (high == 0 or bs <= high)
 
     def _static_accept_tail(
-        self, *, candidates, logits, seq_lens, verify_lens, gated: bool
+        self,
+        *,
+        candidates,
+        logits,
+        seq_lens,
+        verify_lens,
+        gated: bool,
+        vocab_shard: Optional[VocabShard] = None,
     ) -> Optional[torch.Tensor]:
         """The greedy ``_accept`` and gated commit lengths in one launch; under
         simulate_fold the bonus select runs in the tail."""
         bs = candidates.shape[0]
+        # A simulated acceptance reads full target rows; the opt-in refuses it.
+        assert vocab_shard is None or self.simulated_correct_len is None
         # Under simulate_fold the tail does not read the argmax; it still runs as served.
-        target_predict = sampling_argmax(logits).view(-1)
+        target_predict = target_greedy_tokens(
+            logits=logits, vocab_shard=vocab_shard
+        ).view(-1)
         bonus_parts = None
         if self.simulate_fold:
             bonus_parts = (
@@ -1035,6 +1111,7 @@ class DsparkVerifyEpilogue:
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         bs: int,
+        vocab_shard: Optional[VocabShard] = None,
     ) -> None:
         self.strided_logits = self._ensure_out(self.strided_logits, compact_logits)
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
@@ -1056,6 +1133,7 @@ class DsparkVerifyEpilogue:
             draft_tokens=self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma),
             seq_lens=seq_lens,
             cutoff_verify_lens=verify_lens,
+            vocab_shard=vocab_shard,
         )
         if self.folds_commit:
             self._commit_inject(
@@ -1080,14 +1158,29 @@ class DsparkVerifyEpilogue:
         )
 
     def _accept(
-        self, *, candidates, logits, draft_tokens, seq_lens, cutoff_verify_lens=None
+        self,
+        *,
+        candidates,
+        logits,
+        draft_tokens,
+        seq_lens,
+        cutoff_verify_lens=None,
+        vocab_shard: Optional[VocabShard] = None,
     ) -> torch.Tensor:
         bs = candidates.shape[0]
+        # A simulated acceptance reads full target rows; the opt-in refuses it.
+        assert vocab_shard is None or self.simulated_correct_len is None
+        target_predict = None
+        if vocab_shard is not None:
+            target_predict = target_greedy_tokens(
+                logits=logits, vocab_shard=vocab_shard
+            )
         correct_len, bonus, cap_trim_lens = AcceptGreedy.execute(
             candidates=candidates,
             target_logits=logits,
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=cutoff_verify_lens,
+            target_predict=target_predict,
         )
         if self.simulate_fold:
             # Before the TP broadcast in build_accept_outs: every rank commits rank 0's draw.
@@ -1288,6 +1381,24 @@ def _accepts_on_shards(
     )
 
 
+def _target_shard_column(
+    *, draft_shard, target_shard: Optional[VocabShard]
+) -> Optional[int]:
+    """The target-logits column of the draft shard's first token: None (the token
+    id, as on full rows), or 0 on a target shard over the same columns."""
+    if target_shard is None:
+        return None
+    if (
+        draft_shard.start != target_shard.start
+        or draft_shard.width != target_shard.valid
+    ):
+        raise ValueError(
+            f"DSpark: draft vocab shard {draft_shard.start}+{draft_shard.width} "
+            f"differs from the target's {target_shard.start}+{target_shard.valid}"
+        )
+    return 0
+
+
 def _whole_vocab_logits(draft_block: DraftBlockResult, vocab_size: int) -> torch.Tensor:
     logits = draft_block.corrected_logits
     shard = getattr(draft_block, "vocab_shard", None)
@@ -1354,16 +1465,27 @@ def accept_draft_tokens(
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     block_verification: bool = False,
     rejection_noise: Optional[RejectionNoise] = None,
+    target_shard: Optional[VocabShard] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``target_shard``: the vocabulary shard ``target_logits`` holds
+    (SGLANG_ENABLE_SHARDED_VERIFY), or None for full rows. Greedy rows then take
+    their target tokens from the shards' keys; sampled rows need the sharded
+    chain rule on the same shard."""
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
+    target_predict = None
+    if target_shard is not None and (all_greedy or sampling_info.is_any_greedy):
+        target_predict = target_greedy_tokens(
+            logits=target_logits, vocab_shard=target_shard
+        )
     if all_greedy:
         return AcceptGreedy.execute(
             candidates=candidates,
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            target_predict=target_predict,
         )
     if _accepts_on_shards(draft_block, sampling_info, block_verification):
         # Block-wise rejection scans the whole draft vocab. This kernel is the
@@ -1380,6 +1502,13 @@ def accept_draft_tokens(
             key=draft_block.noise.key,
             offset=draft_block.noise.offset,
             verify_lens=cutoff_verify_lens,
+            target_start=_target_shard_column(
+                draft_shard=shard, target_shard=target_shard
+            ),
+        )
+    elif target_shard is not None:
+        raise ValueError(
+            "DSpark: sampled rows on target vocab shards need the sharded draft accept"
         )
     elif _blockwise_rejection_applies(
         sampling_info=sampling_info,
@@ -1419,6 +1548,7 @@ def accept_draft_tokens(
         target_logits=target_logits,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        target_predict=target_predict,
     )
     sampling_len, sampling_bonus, sampling_trim = sampled
     selected = SelectMixedAccept.execute(

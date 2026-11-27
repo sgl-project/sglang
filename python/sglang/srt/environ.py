@@ -300,6 +300,10 @@ class Envs:
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
     # Kimi K3.1 GB300 runtime optimizations; explicitly set children win.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION = EnvBool(False)
+    # Target verify keeps its logits on the vocabulary shards (sharded_verify.py)
+    # without the rest of the runtime master above. A verify consumer still opts
+    # in: EAGLE on CUDA, and DSpark only under this switch.
+    SGLANG_ENABLE_SHARDED_VERIFY = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
