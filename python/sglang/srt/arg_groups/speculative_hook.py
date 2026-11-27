@@ -618,13 +618,23 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(model_config_of(server_args).hf_config)
 
 
-def _check_bundled_draft_revision(cfg) -> None:
-    """With ModelScope, handle_modelscope_paths has resolved --model-path to
-    one local snapshot, and a bundled draft loads from it. An unset
-    --revision is master, the default revision of modelscope-hub."""
+def _check_bundled_draft_revision(server_args: ServerArgs) -> None:
+    """With ModelScope, handle_modelscope_paths has resolved a --model-path
+    repo ID to one local snapshot, and a bundled draft loads from it. An
+    unset --revision is master, the default revision of modelscope-hub."""
+    cfg = resolving_view(server_args)
+    # The raw input, not the resolving view: the resolved path is already the
+    # local snapshot, so only the raw one tells a repo ID from a local checkpoint.
+    model_path = (getattr(server_args, "_raw_input", None) or {}).get(
+        "model_path", cfg.model_path
+    )
     revision = cfg.speculative_draft_model_revision
     target_revision = cfg.revision or "master"
-    if envs.SGLANG_USE_MODELSCOPE.get() and revision not in (None, target_revision):
+    if (
+        envs.SGLANG_USE_MODELSCOPE.get()
+        and not os.path.exists(model_path)
+        and revision not in (None, target_revision)
+    ):
         raise ValueError(
             f"--speculative-draft-model-revision {revision!r} differs from the "
             f"target revision {target_revision!r}. With ModelScope, a bundled draft "
@@ -758,7 +768,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "_handle_dspark",
                 speculative_draft_model_path=cfg.model_path,
             )
-            _check_bundled_draft_revision(cfg)
+            _check_bundled_draft_revision(server_args)
             if cfg.speculative_draft_model_revision is None:
                 declare_resolution(
                     server_args,
@@ -775,7 +785,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             cfg.speculative_draft_model_revision or cfg.revision,
             cfg.download_dir,
         ):
-            _check_bundled_draft_revision(cfg)
+            _check_bundled_draft_revision(server_args)
             declare_resolution(
                 server_args,
                 "_handle_dspark",
@@ -1358,7 +1368,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "_handle_eagle_family",
                 speculative_draft_model_path=cfg.model_path,
             )
-            _check_bundled_draft_revision(cfg)
+            _check_bundled_draft_revision(server_args)
             if cfg.speculative_draft_model_revision is None:
                 declare_resolution(
                     server_args,

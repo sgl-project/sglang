@@ -137,6 +137,23 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
                     else:
                         _handle_dspark(server_args)
 
+    def test_modelscope_accepts_another_revision_for_a_local_checkpoint(self):
+        for hf_config in (_bundled_hf_config(), _plain_hf_config()):
+            with (
+                self.subTest(bundled=hasattr(hf_config, "dspark_block_size")),
+                tempfile.TemporaryDirectory() as ckpt,
+            ):
+                os.makedirs(os.path.join(ckpt, "dspark"))
+                with open(os.path.join(ckpt, "dspark", "config.json"), "w") as f:
+                    f.write("{}")
+                server_args = _make_dspark_server_args(
+                    model_path=ckpt, hf_config=hf_config
+                )
+                server_args.revision = "target"
+                server_args.speculative_draft_model_revision = "draft"
+                with envs.SGLANG_USE_MODELSCOPE.override(True):
+                    _handle_dspark(server_args)
+
     def test_dspark_subfolder_probe_uses_the_draft_revision(self):
         for draft_revision, expected in ((None, "target"), ("draft", "draft")):
             with self.subTest(draft_revision=draft_revision):
