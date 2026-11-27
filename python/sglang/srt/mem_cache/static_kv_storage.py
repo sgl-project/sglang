@@ -742,6 +742,10 @@ class StaticKVStorage:
             )
         return tuple(usage)
 
+    def kv_bytes_usage(self, full_tokens: int, swa_tokens: int) -> None:
+        # Static pools are sized one by one, not out of one byte budget.
+        return None
+
     # -- what a PD peer registers --
 
     def view(self, sub_pool: str) -> Any:
