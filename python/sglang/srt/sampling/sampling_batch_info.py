@@ -6,6 +6,7 @@ import operator
 from functools import cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -38,6 +39,29 @@ class ProcessorEntry:
     indices: torch.Tensor
 
 
+class SamplingFacts(msgspec.Struct, frozen=True):
+    """Facts over one launch's sampler params, derived once from the host side of
+    `SamplingParamsPool` (`gather`); the fast-path gates read them here. The
+    defaults describe a sampled batch with no truncation."""
+
+    # Every row is greedy (top_k 1); `SamplingRows.empty` sets it for no rows.
+    all_greedy: bool = False
+    any_greedy: bool = False
+    # Some row truncates with top-k, top-p, or min-p.
+    need_top_k: bool = False
+    need_top_p: bool = False
+    need_min_p: bool = False
+    # Whether torch_npu.npu_top_k_top_p takes every row.
+    npu_top_k_top_p_eligible: bool = False
+    # The largest top_k, or None when some row samples from the whole vocabulary.
+    max_top_k: Optional[int] = None
+
+    @property
+    def truncates(self) -> bool:
+        """Whether some row truncates its distribution with top-k, top-p, or min-p."""
+        return self.need_top_k or self.need_top_p or self.need_min_p
+
+
 @dataclasses.dataclass
 class SamplingBatchInfo:
     vocab_size: int
@@ -47,13 +71,7 @@ class SamplingBatchInfo:
     top_ps: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     min_ps: Optional[torch.Tensor] = None
-    is_all_greedy: bool = False
-    is_any_greedy: bool = False
-    need_top_p_sampling: bool = False
-    need_top_k_sampling: bool = False
-    need_min_p_sampling: bool = False
-    npu_top_k_top_p_eligible: bool = False
-    max_top_k: Optional[int] = None
+    facts: SamplingFacts = SamplingFacts()
 
     # Hashed request ids for the KV canary's token oracle; set in ForwardBatch.
     rids_int: Optional[torch.Tensor] = None
@@ -165,13 +183,6 @@ class SamplingBatchInfo:
         else:
             new = dataclasses.replace(self)
         return new
-
-
-def need_truncated_sampling(info: SamplingBatchInfo) -> bool:
-    """Whether some row truncates its distribution with top-k, top-p, or min-p."""
-    return (
-        info.need_top_k_sampling or info.need_top_p_sampling or info.need_min_p_sampling
-    )
 
 
 @cache

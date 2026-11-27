@@ -18,6 +18,7 @@ import sglang.kernels.ops.sampling.topk as topk_ops
 from sglang.kernels.ops.speculative.dspark import dspark_accept
 from sglang.srt.layers.sampler import top_k_top_p_min_p_filter_sorted_probs_torch
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_utils
@@ -62,9 +63,7 @@ def _case(device, logits, top_ks, *, need_top_p, seed, temperature=None):
         temperatures=temperatures.view(-1, 1),
         top_ks=torch.tensor(top_ks, dtype=torch.int32, device=device),
         top_ps=0.5 + 0.5 * torch.rand((bs,), generator=g, device=device),
-        need_top_k_sampling=True,
-        need_top_p_sampling=need_top_p,
-        need_min_p_sampling=False,
+        facts=SamplingFacts(need_top_k=True, need_top_p=need_top_p),
     )
     uniform = top_ks[0] if len(set(top_ks)) == 1 else None
     return dict(
@@ -87,7 +86,7 @@ def _reference(next_token_logits, sampling_info, draft_token_num, bs, max_top_k,
     ranks = torch.arange(max_top_k, device=scaled.device)[None, :]
     top_vals = top_vals.masked_fill(ranks >= top_ks[:, None], float("-inf"))
     top_probs = F.softmax(top_vals, dim=-1)
-    if info.need_top_p_sampling:
+    if info.facts.need_top_p:
         top_ps = torch.repeat_interleave(info.top_ps, draft_token_num, dim=0)
         top_ps = _adjust_top_p_for_top_k(top_vals, scaled, top_ps[:, None])
         top_probs = _dflash_top_p_renorm_prob(top_probs, top_ps.squeeze(-1))
@@ -245,10 +244,7 @@ def test_eagle_dense_verify_applies_min_p():
     bs, width, vocab = 2, 3, 16
     probs = torch.softmax(_random_logits("cpu", bs * width, vocab, seed=31), dim=-1)
     info = SimpleNamespace(
-        is_all_greedy=False,
-        need_top_k_sampling=False,
-        need_top_p_sampling=False,
-        need_min_p_sampling=True,
+        facts=SamplingFacts(need_min_p=True),
         min_ps=torch.tensor([0.2, 0.0]),
         temperatures=torch.ones((bs, 1)),
         sampling_seed=None,
@@ -320,9 +316,7 @@ def test_dspark_accept_min_p_does_not_depend_on_the_batch():
             top_ks=torch.tensor([TOP_K_ALL, 4][:bs], dtype=torch.int32, device=device),
             top_ps=torch.ones(bs, device=device),
             min_ps=torch.tensor([0.2, 0.0][:bs], device=device),
-            need_top_k_sampling=bs == 2,
-            need_top_p_sampling=False,
-            need_min_p_sampling=True,
+            facts=SamplingFacts(need_top_k=bs == 2, need_min_p=True),
             sampling_seed=None,
         )
         seen = []

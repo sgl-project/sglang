@@ -879,7 +879,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # draft distribution, so skip building it.
         needs_draft_probs = (
             get_spec().speculative_use_rejection_sampling
-            and not forward_batch.sampling_info.is_all_greedy
+            and not forward_batch.sampling_info.facts.all_greedy
         )
         draft_probs_list: Optional[List[torch.Tensor]] = None
         if needs_draft_probs:

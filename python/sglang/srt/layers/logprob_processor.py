@@ -502,7 +502,10 @@ def compute_spec_logprobs(
         gathered_logits = next_token_logits
         accepted_token_ids = predict
 
-    if batch.sampling_info.is_all_greedy or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
+    if (
+        batch.sampling_info.facts.all_greedy
+        or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get()
+    ):
         gathered_logprobs = torch.nn.functional.log_softmax(gathered_logits, dim=-1)
     else:
         temperatures = torch.repeat_interleave(

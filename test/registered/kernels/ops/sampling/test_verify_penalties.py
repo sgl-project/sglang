@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.sampling import penalties
 from sglang.srt.sampling.penalties import PenaltyStatusPool
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingFacts
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.sampling_pipeline import _adjust_before_watermark
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -119,11 +119,7 @@ def _decode_one_token_at_a_time(logits_row, req, path, device):
         top_ps=torch.ones(1, device=device),
         top_ks=torch.ones(1, dtype=torch.int32, device=device),
         min_ps=torch.zeros(1, device=device),
-        is_all_greedy=True,
-        is_any_greedy=True,
-        need_top_p_sampling=False,
-        need_top_k_sampling=False,
-        need_min_p_sampling=False,
+        facts=SamplingFacts(all_greedy=True, any_greedy=True),
         vocab_size=VOCAB_SIZE,
         device=device,
     )

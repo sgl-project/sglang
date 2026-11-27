@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -250,9 +251,7 @@ def joint_top_k_top_p_case(request):
     )
     sampling_info = SimpleNamespace(
         temperatures=torch.ones((1, 1), device="cuda"),
-        need_top_k_sampling=True,
-        need_top_p_sampling=True,
-        need_min_p_sampling=False,
+        facts=SamplingFacts(need_top_k=True, need_top_p=True),
         top_ks=torch.tensor([4], dtype=torch.int32, device="cuda"),
         top_ps=torch.tensor([0.82], device="cuda"),
     )

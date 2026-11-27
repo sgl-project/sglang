@@ -170,7 +170,7 @@ class Sampler(nn.Module):
         _trace_e2e_sampler(
             "forward_enter",
             logits_shape=tuple(logits.shape),
-            all_greedy=sampling_info.is_all_greedy,
+            all_greedy=sampling_info.facts.all_greedy,
         )
 
         if _is_hip and logits.shape[0] == 0:
@@ -178,7 +178,7 @@ class Sampler(nn.Module):
 
         target_logprobs = None
         if logprob_logits is not None:
-            if sampling_info.is_all_greedy or SGLANG_RETURN_ORIGINAL_LOGPROB:
+            if sampling_info.facts.all_greedy or SGLANG_RETURN_ORIGINAL_LOGPROB:
                 target_logprobs = torch.nn.functional.log_softmax(
                     logprob_logits, dim=-1
                 )
@@ -194,7 +194,7 @@ class Sampler(nn.Module):
         )
         sampling_mask_capture = None
 
-        if sampling_info.is_all_greedy:
+        if sampling_info.facts.all_greedy:
             _trace_e2e_sampler("greedy_enter")
             if _use_aiter and not _disable_aiter_greedy_sample:
                 batch_next_token_ids = torch.empty(
@@ -211,11 +211,7 @@ class Sampler(nn.Module):
                     logits, dim=-1
                 )
         else:
-            simple_sampling_case = (
-                not sampling_info.need_top_p_sampling
-                and not sampling_info.need_top_k_sampling
-                and not sampling_info.need_min_p_sampling
-            )
+            simple_sampling_case = not sampling_info.facts.truncates
 
             # If requested, cache original logprobs before temperature scaling.
             if (
@@ -322,7 +318,7 @@ class Sampler(nn.Module):
 
         if return_sampling_mask:
             assert sampling_mask_batch_indices is not None
-            if sampling_info.is_all_greedy:
+            if sampling_info.facts.all_greedy:
                 logits_output.sampling_mask_output = (
                     self._build_greedy_sampling_mask_output(
                         sampling_mask_batch_indices,
@@ -392,7 +388,7 @@ class Sampler(nn.Module):
                 # the torch sampler's hash of (seed, position) does not.
                 backend = "pytorch"
             if backend in ("flashinfer", "intel_xpu"):
-                if sampling_info.need_min_p_sampling:
+                if sampling_info.facts.need_min_p:
                     # Apply top-p before top-k renormalization to preserve the original
                     # nucleus and match the other samplers' joint support.
                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
@@ -438,11 +434,11 @@ class Sampler(nn.Module):
                         capture_top_ps = select_capture_rows(sampling_info.top_ps)
                         capture_tokens = select_capture_rows(batch_next_token_ids)
                         filtered_probs = capture_probs
-                        if sampling_info.need_top_k_sampling:
+                        if sampling_info.facts.need_top_k:
                             filtered_probs = top_k_renorm_prob(
                                 capture_probs, capture_top_ks
                             )
-                        if sampling_info.need_top_p_sampling:
+                        if sampling_info.facts.need_top_p:
                             top_p_probs = top_p_renorm_prob(
                                 capture_probs, capture_top_ps
                             )
@@ -468,11 +464,11 @@ class Sampler(nn.Module):
                     sampling_info.top_ks,
                     sampling_info.top_ps,
                     sampling_info.min_ps,
-                    sampling_info.need_min_p_sampling,
+                    sampling_info.facts.need_min_p,
                     sampling_info.sampling_seed,
                     positions,
                     return_filtered_probs=return_sampling_mask,
-                    max_top_k=sampling_info.max_top_k,
+                    max_top_k=sampling_info.facts.max_top_k,
                 )
                 if return_sampling_mask:
                     (
@@ -672,10 +668,10 @@ class Sampler(nn.Module):
                     sampling_info.top_ks,
                     sampling_info.top_ps,
                     sampling_info.min_ps,
-                    sampling_info.need_min_p_sampling,
+                    sampling_info.facts.need_min_p,
                     sampling_info.sampling_seed,
                     positions,
-                    npu_top_k_top_p_eligible=sampling_info.npu_top_k_top_p_eligible,
+                    npu_top_k_top_p_eligible=sampling_info.facts.npu_top_k_top_p_eligible,
                     return_filtered_probs=return_sampling_mask,
                 )
             )

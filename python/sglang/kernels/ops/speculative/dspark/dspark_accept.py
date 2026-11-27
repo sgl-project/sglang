@@ -14,7 +14,6 @@ from sglang.kernels.ops.speculative.dflash import (
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.environ import envs
-from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -122,7 +121,7 @@ def _accept_sampling_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    plain = not need_truncated_sampling(sampling_info)
+    plain = not sampling_info.facts.truncates
     if (
         _SPLIT_ACCEPT
         and plain

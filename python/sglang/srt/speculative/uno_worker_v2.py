@@ -249,7 +249,7 @@ class UnoWorkerV2(BaseSpecWorker):
         if sampling_info is None:
             raise RuntimeError("UNO requires sampling metadata.")
 
-        if sampling_info.need_min_p_sampling:
+        if sampling_info.facts.need_min_p:
             raise NotImplementedError("UNO does not support min-p sampling.")
 
         if VerifyRoute.derive(
@@ -507,7 +507,7 @@ class UnoWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
-        if sampling_info.is_all_greedy:
+        if sampling_info.facts.all_greedy:
             clean_root_tokens = torch.argmax(
                 draft_logits[:, 0, :],
                 dim=-1,
@@ -685,7 +685,7 @@ class UnoWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
         sampling_info = batch.sampling_info
-        all_greedy = sampling_info.is_all_greedy
+        all_greedy = sampling_info.facts.all_greedy
         max_top_k = draft_state.max_top_k
         uniform_top_k_value = draft_state.uniform_top_k_value
         draft_result, candidates = self._run_draft_block(

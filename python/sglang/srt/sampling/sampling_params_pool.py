@@ -11,8 +11,8 @@ penalty index, its seed, and the watermark algorithm's per-request values.
   Under overlap a later admission may rewrite a slot before an earlier replay
   reads it; only a finished, retracted, or aborted row's slot is reused, so the
   row it changes is discarded, and the target sampler reads the launch's gather.
-- The host keeps what the batch-level flags and counts need, so a launch derives
-  them without a pass over its requests or a device sync.
+- The host keeps what the batch's `SamplingFacts` and counts need, so a launch
+  derives them without a pass over its requests or a device sync.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import torch
 
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.runtime import (
     build_watermark_rows,
@@ -46,15 +47,7 @@ class SamplingRows(NamedTuple):
     top_ps: torch.Tensor  # [bs] fp32
     top_ks: torch.Tensor  # [bs] int32
     min_ps: torch.Tensor  # [bs] fp32
-    is_all_greedy: bool
-    is_any_greedy: bool
-    need_top_p_sampling: bool
-    need_top_k_sampling: bool
-    need_min_p_sampling: bool
-    # Whether torch_npu.npu_top_k_top_p takes every row.
-    npu_top_k_top_p_eligible: bool
-    # The largest top_k, or None when some row samples from the whole vocabulary.
-    max_top_k: Optional[int]
+    facts: SamplingFacts
     # [bs] int64 seeds, or None to sample unseeded; deterministic mode seeds every row.
     sampling_seed: Optional[torch.Tensor]
     # The penalized rows, None when no row is penalized.
@@ -70,13 +63,15 @@ class SamplingRows(NamedTuple):
             top_ps=torch.empty(0, dtype=torch.float32, device=device),
             top_ks=torch.empty(0, dtype=torch.int32, device=device),
             min_ps=torch.empty(0, dtype=torch.float32, device=device),
-            is_all_greedy=True,
-            is_any_greedy=False,
-            need_top_p_sampling=False,
-            need_top_k_sampling=False,
-            need_min_p_sampling=False,
-            npu_top_k_top_p_eligible=True,
-            max_top_k=None,
+            facts=SamplingFacts(
+                all_greedy=True,
+                any_greedy=False,
+                need_top_p=False,
+                need_top_k=False,
+                need_min_p=False,
+                npu_top_k_top_p_eligible=True,
+                max_top_k=None,
+            ),
             # A deterministic idle batch still seeds, with no rows.
             sampling_seed=(
                 torch.empty(0, dtype=torch.int64, device=device)
@@ -207,13 +202,15 @@ class SamplingParamsPool:
             top_ps=floats[self.table.TOP_P],
             top_ks=values[self.table.TOP_K],
             min_ps=floats[self.table.MIN_P],
-            is_all_greedy=hi <= 1,
-            is_any_greedy=lo <= 1,
-            need_top_p_sampling=bool(self.uses_top_p_host[slots].any()),
-            need_top_k_sampling=(lo, hi) != (TOP_K_ALL, TOP_K_ALL),
-            need_min_p_sampling=bool(self.uses_min_p_host[slots].any()),
-            npu_top_k_top_p_eligible=lo >= 1 and hi <= 1024,
-            max_top_k=hi if lo >= 1 and hi < TOP_K_ALL else None,
+            facts=SamplingFacts(
+                all_greedy=hi <= 1,
+                any_greedy=lo <= 1,
+                need_top_p=bool(self.uses_top_p_host[slots].any()),
+                need_top_k=(lo, hi) != (TOP_K_ALL, TOP_K_ALL),
+                need_min_p=bool(self.uses_min_p_host[slots].any()),
+                npu_top_k_top_p_eligible=lo >= 1 and hi <= 1024,
+                max_top_k=hi if lo >= 1 and hi < TOP_K_ALL else None,
+            ),
             sampling_seed=seeds,
             step_penalties=StepPenalties.build(
                 penalty_status_pool,

@@ -77,7 +77,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
         if sampling_info is None or sampling_info.sampling_mask_batch_indices is None:
             return None
         target_probs = None
-        if not sampling_info.is_all_greedy:
+        if not sampling_info.facts.all_greedy:
             target_probs = build_speculative_verify_target_probs(
                 next_token_logits=next_token_logits,
                 sampling_info=sampling_info,

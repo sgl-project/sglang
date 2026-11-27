@@ -45,7 +45,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingFacts
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
@@ -366,7 +366,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         if (
             get_spec().speculative_use_rejection_sampling
             and forward_batch.sampling_info is not None
-            and forward_batch.sampling_info.is_all_greedy
+            and forward_batch.sampling_info.facts.all_greedy
         ):
             return _GREEDY_VARIANT
         return None
@@ -528,11 +528,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             top_ps=torch.ones((num_seqs,), dtype=torch.float),
             top_ks=self.top_ks[:num_seqs],
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
-            is_all_greedy=False,
-            is_any_greedy=False,
-            need_top_p_sampling=False,
-            need_top_k_sampling=False,
-            need_min_p_sampling=False,
             vocab_size=self.model_runner.model_config.vocab_size,
             sampling_seed=(
                 self.buffers.sampling_seed[:num_seqs]
@@ -638,7 +633,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 else (None,)
             )
             for variant in variants:
-                sampling_info.is_all_greedy = variant == _GREEDY_VARIANT
+                sampling_info.facts = SamplingFacts(
+                    all_greedy=variant == _GREEDY_VARIANT
+                )
                 self.backend.capture_one(
                     self._make_graph_key(
                         num_seqs,

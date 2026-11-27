@@ -56,7 +56,7 @@ def sampling_allows_vocab_shards(
         not (has_local_keys and envs.SGLANG_SANITIZE_NAN_LOGITS.get())
         and not return_logprob
         and not adjusts_logits
-        and (info.is_all_greedy or (has_local_keys and not need_truncated_sampling))
+        and (info.facts.all_greedy or (has_local_keys and not need_truncated_sampling))
     )
 
 

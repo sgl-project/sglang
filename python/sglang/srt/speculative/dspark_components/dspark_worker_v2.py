@@ -1125,7 +1125,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             self._simulated_correct_len is not None
             and sampling_info is not None
-            and not sampling_info.is_all_greedy
+            and not sampling_info.facts.all_greedy
         ):
             simulate_bonus_sampling_info = sampling_info
             if (
@@ -1202,7 +1202,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             # The epilogue's in-graph accept is greedy (AcceptGreedy);
             # sampling batches must take the eager accept path even when the
             # draft proposal itself folded.
-            and (sampling_info is None or sampling_info.is_all_greedy)
+            and (sampling_info is None or sampling_info.facts.all_greedy)
             # A live grammar forces the eager path: the folded epilogue accepts inside
             # the cuda graph off its own buffers, where the mask below never lands.
             and not verify.route.adjusts_logits
@@ -1443,7 +1443,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and proposal_folded
             and self._verify_planner.mode_value == "static"
             and sampling_info is not None
-            and not sampling_info.is_any_greedy
+            and not sampling_info.facts.any_greedy
             and not route.need_truncated_sampling
             and not route.adjusts_logits
             # A simulated bonus is drawn in the region from this batch's temperatures.

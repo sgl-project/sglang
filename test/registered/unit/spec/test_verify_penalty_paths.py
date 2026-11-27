@@ -5,7 +5,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.sampling.penalties import PenaltyStatusPool
-from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import (
+    ProcessorEntry,
+    SamplingBatchInfo,
+    SamplingFacts,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_utils
@@ -43,11 +47,7 @@ def _sampling_info(bs):
         top_ps=torch.ones(bs),
         top_ks=torch.ones(bs, dtype=torch.int32),
         min_ps=torch.zeros(bs),
-        is_all_greedy=True,
-        is_any_greedy=True,
-        need_top_p_sampling=False,
-        need_top_k_sampling=False,
-        need_min_p_sampling=False,
+        facts=SamplingFacts(all_greedy=True, any_greedy=True),
         vocab_size=VOCAB_SIZE,
         device="cpu",
     )

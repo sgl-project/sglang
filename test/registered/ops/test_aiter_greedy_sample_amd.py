@@ -15,6 +15,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.utils.device import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -52,11 +53,7 @@ def _make_sampling_info(batch_size, vocab_size, device="cuda"):
         top_ps=torch.ones(batch_size, device=device),
         top_ks=torch.zeros(batch_size, device=device, dtype=torch.int32),
         min_ps=torch.zeros(batch_size, device=device),
-        is_all_greedy=True,
-        is_any_greedy=True,
-        need_top_p_sampling=False,
-        need_top_k_sampling=False,
-        need_min_p_sampling=False,
+        facts=SamplingFacts(all_greedy=True, any_greedy=True),
         vocab_size=vocab_size,
         device=device,
     )

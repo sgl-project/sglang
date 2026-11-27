@@ -24,6 +24,7 @@ from sglang.srt.sampling.custom_logit_processor import (
 from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
+    SamplingFacts,
 )
 from sglang.srt.sampling.sampling_pipeline import _adjust_after_watermark
 from sglang.srt.utils import is_hip, kill_process_tree
@@ -93,13 +94,15 @@ class TestSamplingMaskCapture(CustomTestCase):
             requested_rows = range(batch_size)
         sampling_info = SimpleNamespace(
             sampling_seed=None,
-            need_top_k_sampling=True,
-            need_top_p_sampling=top_p < 1.0,
-            need_min_p_sampling=min_p > 0.0,
+            facts=SamplingFacts(
+                need_top_k=True,
+                need_top_p=top_p < 1.0,
+                need_min_p=min_p > 0.0,
+                max_top_k=top_k,
+            ),
             top_ks=torch.full((batch_size,), top_k, dtype=torch.int32, device="cuda"),
             top_ps=torch.full((batch_size,), top_p, device="cuda"),
             min_ps=torch.full((batch_size,), min_p, device="cuda"),
-            max_top_k=top_k,
             sampling_mask_batch_indices=torch.tensor(requested_rows, device="cuda"),
         )
         with patch.object(
@@ -208,11 +211,7 @@ class TestSamplingMaskCapture(CustomTestCase):
                     top_ps=torch.full((2,), 0.9, device="cuda"),
                     top_ks=torch.full((2,), 3, dtype=torch.int32, device="cuda"),
                     min_ps=torch.zeros(2, device="cuda"),
-                    is_all_greedy=False,
-                    is_any_greedy=False,
-                    need_top_p_sampling=True,
-                    need_top_k_sampling=True,
-                    need_min_p_sampling=False,
+                    facts=SamplingFacts(need_top_p=True, need_top_k=True),
                     vocab_size=5,
                     has_custom_logit_processor=True,
                     custom_params=[{"token_ids": [2]}, None],

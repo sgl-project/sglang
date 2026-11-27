@@ -20,6 +20,7 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
@@ -27,6 +28,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_pipeline import SamplingPipeline, VerifyRoute
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import (
@@ -150,10 +152,7 @@ def _round(bs, generator, vocab=VOCAB):
         seq_lens=torch.randint(16, 512, (bs,), device="cuda", generator=generator),
         req_pool_indices=torch.randperm(bs, device="cuda", generator=generator),
         sampling_info=SimpleNamespace(
-            is_all_greedy=True,
-            need_top_k_sampling=False,
-            need_top_p_sampling=False,
-            need_min_p_sampling=False,
+            facts=SamplingFacts(all_greedy=True),
             step_penalties=None,
             logit_bias=None,
             has_custom_logit_processor=False,
@@ -223,9 +222,7 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
             logit_bias=None,
             has_custom_logit_processor=False,
             watermark=None,
-            need_top_k_sampling=False,
-            need_top_p_sampling=False,
-            need_min_p_sampling=False,
+            facts=SamplingFacts(),
         ),
         return_logprob=False,
     )
@@ -333,11 +330,8 @@ class TestPostVerifyGraphs(CustomTestCase):
                 logit_bias=None,
                 has_custom_logit_processor=False,
                 sampling_seed=None,
-                need_min_p_sampling=False,
                 watermark=None,
-                is_all_greedy=False,
-                need_top_k_sampling=True,
-                need_top_p_sampling=True,
+                facts=SamplingFacts(need_top_k=True, need_top_p=True),
             )
             fields = dict(
                 has_grammar=False,
@@ -375,7 +369,9 @@ class TestPostVerifyGraphs(CustomTestCase):
             dict(logit_bias=torch.zeros(1)),
             dict(has_custom_logit_processor=True),
             dict(sampling_seed=torch.zeros(1)),
-            dict(need_min_p_sampling=True),
+            dict(
+                facts=SamplingFacts(need_top_k=True, need_top_p=True, need_min_p=True)
+            ),
         ):
             with self.subTest(change=sorted(change)):
                 self.assertIsNone(key(**change))
@@ -474,11 +470,8 @@ class TestPostVerifyGraphs(CustomTestCase):
                 logit_bias=None,
                 has_custom_logit_processor=False,
                 sampling_seed=None,
-                need_min_p_sampling=False,
+                facts=SamplingFacts(need_top_k=True),
                 watermark=None,
-                is_all_greedy=False,
-                need_top_k_sampling=True,
-                need_top_p_sampling=False,
             ),
             mamba_track_indices=None,
             has_grammar=False,
@@ -681,9 +674,9 @@ def _sampled(batch, *, generator):
     """The round's batch with T0.6 / top-k / top-p sampling on every request."""
     bs = len(batch.seq_lens)
     info = SimpleNamespace(**vars(batch.sampling_info))
-    info.is_all_greedy = False
-    info.need_top_k_sampling = True
-    info.need_top_p_sampling = True
+    info.facts = msgspec.structs.replace(
+        info.facts, all_greedy=False, need_top_k=True, need_top_p=True
+    )
     info.temperatures = torch.full((bs, 1), 0.6, device="cuda")
     info.top_ks = torch.randint(2, TOP_K + 1, (bs,), device="cuda", generator=generator)
     info.top_ps = torch.full((bs,), 0.95, device="cuda")
@@ -807,7 +800,9 @@ class TestSideStreamCommitWritesTheForwardSlots(CustomTestCase):
                         req_pool_indices=request_rows,
                         seq_lens=torch.tensor([9, 9], device=device),
                         mamba_track_indices=None,
-                        sampling_info=SimpleNamespace(is_all_greedy=True),
+                        sampling_info=SimpleNamespace(
+                            facts=SamplingFacts(all_greedy=True)
+                        ),
                         tree_cache=SimpleNamespace(page_size=4),
                     )
                     verify_input = SimpleNamespace(

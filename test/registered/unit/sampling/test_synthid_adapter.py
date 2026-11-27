@@ -9,7 +9,7 @@ from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.serving_hook import handle_watermark_config
 from sglang.srt.arg_groups.validation_hook import check_watermark_server_args
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingFacts
 from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.sampling.watermarking.config import load_watermark_config
@@ -68,11 +68,11 @@ def _info(batch_size, *, top_ks=None, top_ps=None, min_ps=None, watermark=None):
         top_ps=top_ps,
         top_ks=top_ks.to(torch.int32),
         min_ps=min_ps,
-        is_all_greedy=False,
-        is_any_greedy=False,
-        need_top_p_sampling=bool((top_ps < 1).any()),
-        need_top_k_sampling=bool((top_ks != TOP_K_ALL).any()),
-        need_min_p_sampling=bool((min_ps > 0).any()),
+        facts=SamplingFacts(
+            need_top_p=bool((top_ps < 1).any()),
+            need_top_k=bool((top_ks != TOP_K_ALL).any()),
+            need_min_p=bool((min_ps > 0).any()),
+        ),
         vocab_size=16,
         watermark=watermark,
     )
@@ -262,7 +262,7 @@ class TestSynthIDEngine(CustomTestCase):
         self.assertEqual(int(torch.isfinite(logits[0]).sum()), 3)
 
         self.assertEqual(step.sampling_info.top_ps.tolist(), [1.0, 0.5, 1.0, 1.0])
-        self.assertTrue(step.sampling_info.need_top_p_sampling)
+        self.assertTrue(step.sampling_info.facts.need_top_p)
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=6)
 
         sample.commit(torch.tensor([7, 8, 9, 10]))
