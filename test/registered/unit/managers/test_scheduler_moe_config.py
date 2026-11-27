@@ -12,6 +12,7 @@ from contextlib import ExitStack
 from unittest import mock
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     draft_model_build_scope,
@@ -23,6 +24,7 @@ from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 
 _DENSE = {
@@ -44,6 +46,7 @@ _MOE = {
     "num_experts": 4,
     "num_experts_per_tok": 2,
 }
+_SHORT_MOE = {**_MOE, "max_position_embeddings": 256}
 
 
 class TestSchedulerMoeConfig(CustomTestCase):
@@ -52,24 +55,30 @@ class TestSchedulerMoeConfig(CustomTestCase):
         self.addCleanup(tmp.cleanup)
         self.addCleanup(reset_context)
         self.paths = {}
-        for name, config in (("dense", _DENSE), ("moe", _MOE)):
+        for name, config in (
+            ("dense", _DENSE),
+            ("moe", _MOE),
+            ("short_moe", _SHORT_MOE),
+        ):
             self.paths[name] = os.path.join(tmp.name, name)
             os.makedirs(self.paths[name])
             with open(os.path.join(self.paths[name], "config.json"), "w") as f:
                 json.dump(config, f)
 
-    def _init_dense_target_with_draft(self, *, draft):
+    def _init_dense_target_with_draft(self, *, draft, algorithm="STANDALONE", **kwargs):
         reset_context()
         server_args = ServerArgs(
             model_path=self.paths["dense"],
             device="cpu",
             moe_runner_backend="flashinfer_cutlass",
-            speculative_algorithm="STANDALONE",
+            speculative_algorithm=algorithm,
             speculative_draft_model_path=self.paths[draft],
+            **kwargs,
         )
         publish(server_args, role="test")
         scheduler = object.__new__(Scheduler)
         scheduler.server_args = server_args
+        scheduler.spec_algorithm = SpeculativeAlgorithm.from_string(algorithm)
         scheduler.model_config = ModelConfig.from_server_args(server_args)
         with ExitStack() as stack:
             for name in (
@@ -107,6 +116,19 @@ class TestSchedulerMoeConfig(CustomTestCase):
         self._init_dense_target_with_draft(draft="dense")
         self.assertEqual(get_moe_runner_backend(), MoeRunnerBackend.AUTO)
         self.assertFalse(is_moe_runner_backend_explicit(backend=MoeRunnerBackend.AUTO))
+
+    def test_draft_path_without_a_speculative_algorithm_is_not_read(self):
+        """Without --speculative-algorithm the draft is never loaded, so its
+        config must not be read: a draft whose limit is below an explicit
+        --context-length stopped the startup that main completes."""
+        with (
+            envs.SGLANG_IS_IN_CI.override(False),
+            envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(False),
+        ):
+            self._init_dense_target_with_draft(
+                draft="short_moe", algorithm=None, context_length=1024
+            )
+        self.assertEqual(get_moe_runner_backend(), MoeRunnerBackend.AUTO)
 
 
 if __name__ == "__main__":

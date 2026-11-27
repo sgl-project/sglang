@@ -1082,9 +1082,14 @@ class Scheduler(
         )
         uses_moe = any(hasattr(config_to_check, attr) for attr in moe_topk_attrs)
         spec = get_spec()
-        if not uses_moe and spec.speculative_draft_model_path is not None:
+        if (
+            not uses_moe
+            and not self.spec_algorithm.is_none()
+            and spec.speculative_draft_model_path is not None
+        ):
             # A dense target can run an MoE draft (e.g. STANDALONE), whose
-            # layers read the same MoE flags.
+            # layers read the same MoE flags. Without a speculative algorithm
+            # the draft is never loaded, so its config is not read.
             draft_config = ModelConfig.from_server_args(
                 self.server_args,
                 model_path=spec.speculative_draft_model_path,
