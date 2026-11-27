@@ -171,7 +171,10 @@ class BaseFormatDetector(ABC):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
-        flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
+        # An exponent can change digits we would already have sent (1.25e2 -> 125.0).
+        flags = Allow.ALL & ~Allow.NUM
+        if not self.current_tool_name_sent:
+            flags &= ~Allow.STR
 
         try:
             try:

@@ -1216,6 +1216,33 @@ class TestBaseFormatDetector(unittest.TestCase):
             params["city"], "杭州", "Should correctly parse Chinese city name"
         )
 
+    def test_stream_number_split_before_exponent(self):
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="scale",
+                parameters={
+                    "type": "object",
+                    "properties": {"factor": {"type": "number"}},
+                },
+            ),
+        )
+        for exponent, expected in [("e2", 125.0), ("e-2", 0.0125)]:
+            with self.subTest(exponent=exponent):
+                parser = FunctionCallParser(tools=[tool], tool_call_parser="qwen")
+                chunks = [
+                    '<tool_call>\n{"name":"scale","arguments":{"factor":1.2',
+                    "5",
+                    exponent,
+                    "}}\n</tool_call>",
+                ]
+                results = [parser.parse_stream_chunk(chunk) for chunk in chunks]
+                results.append(parser.parse_stream_end())
+                arguments = "".join(
+                    call.parameters for _, calls in results for call in calls
+                )
+                self.assertEqual(json.loads(arguments), {"factor": expected})
+
     def test_chunk_stops_when_a_step_resends_its_buffer(self):
         # Several detectors' error paths send their whole buffer as text and
         # keep it, so stepping again would send it again.
