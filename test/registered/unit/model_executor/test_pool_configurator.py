@@ -2339,13 +2339,13 @@ class TestDSV4LowRatioBudget(CustomTestCase):
         ):
             planner.swa_cap_tokens = 1280
             planner.bytes_per_full_token = planner._get_bytes_per_full_token()
-            # 11 SWA pages per layer, 101 C4 pages, 7 C128 pages, and the
-            # FP32 state buffers (96 C4 rows and 640 request-scoped C128 rows).
+            # Cap-mode SWA counts 1280 logical rows per layer and 80 C4 state
+            # rows. The variable pools still count physical C4 and C128 pages.
             budget = (
-                1408 * 1024 * 2
+                1280 * 1024 * 2
                 + 3232 * (1024 + 130)
                 + 112 * 1024
-                + 96 * (512 + 128) * 4 * 4
+                + 80 * (512 + 128) * 4 * 4
                 + 640 * 512 * 2 * 4
             )
             self.assertEqual(
@@ -2371,7 +2371,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
             # All three layers own SWA; only the two sources own compressed
             # rows. Indexer storage includes the reserved FULL and index pages.
             budget = (
-                512 * 544 * 3 + (640 + 320) * 320 + (768 + 384) * 68 + 10 * 512 * 2 * 4
+                384 * 544 * 3 + (640 + 320) * 320 + (768 + 384) * 68 + 10 * 512 * 2 * 4
             )
             self.assertEqual(
                 planner.calculate_pool_sizes(budget, 128).max_total_num_tokens, 512

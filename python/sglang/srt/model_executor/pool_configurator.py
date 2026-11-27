@@ -1740,11 +1740,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _get_swa_fixed_bytes(self) -> float:
         """Bias bytes of the encoder-replay request window plus the cap-mode pool."""
-        if _is_npu and self.swa_cap_tokens is not None:
-            return self.request_window_bytes + (
-                self._npu_swa_pool_bytes(self.swa_cap_tokens) * self._spec_infl
-            )
-
         paged_bytes = (
             0
             if self.swa_cap_tokens is None
