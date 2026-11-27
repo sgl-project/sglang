@@ -647,6 +647,9 @@ class Envs:
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
+    # A retracted request keeps the routed experts captured before the retraction,
+    # and its re-prefill routes by them instead of selecting again.
+    SGLANG_ENABLE_ROUTED_EXPERTS_RETRACT_FORCING = EnvBool(False)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)

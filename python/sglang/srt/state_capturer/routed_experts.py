@@ -94,7 +94,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
             # Other ranks compute the same ids (or join the gather below) and
-            # send nothing, so they keep no rows.
+            # send nothing, so they keep no rows; unless a retracted request's
+            # re-prefill is forced, which every rank does from its own rows.
             allocate_caches=is_scheduler_io_rank(),
         )
 

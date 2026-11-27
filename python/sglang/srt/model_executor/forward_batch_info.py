@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+    from sglang.srt.state_capturer.routed_experts_forcing import ForcingBatch
 
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
 # ForwardBatch.apply_deprecated_skip_attn_backend_init.
@@ -558,6 +559,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For token embedding overrides (sparse replacement at specific positions)
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
+    # Routed-experts forcing: kept routes for the tokens this extend recomputes.
+    forced_routes: Optional[ForcingBatch] = None
 
     # For cross-encoder model
     token_type_ids: Optional[torch.Tensor] = None
@@ -1079,6 +1082,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             input_embeds=batch.input_embeds,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
+            forced_routes=batch.forced_routes,
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,

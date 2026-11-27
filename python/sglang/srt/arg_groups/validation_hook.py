@@ -106,6 +106,58 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
 
 
+# MoE runners that run select_experts' top-k; the others route inside their kernels.
+_ROUTED_EXPERTS_FORCING_MOE_RUNNERS = (
+    "triton",
+    "flashinfer_cutlass",
+    "flashinfer_trtllm_routed",
+)
+
+
+def check_routed_experts_retract_forcing(server_args: Any) -> None:
+    """Reject server options SGLANG_ENABLE_ROUTED_EXPERTS_RETRACT_FORCING does not support."""
+    if not envs.SGLANG_ENABLE_ROUTED_EXPERTS_RETRACT_FORCING.get():
+        return
+    cfg = resolving_view(server_args)
+    name = "SGLANG_ENABLE_ROUTED_EXPERTS_RETRACT_FORCING"
+    if not cfg.enable_return_routed_experts:
+        raise ValueError(f"{name} requires --enable-return-routed-experts")
+    if cfg.moe_runner_backend not in _ROUTED_EXPERTS_FORCING_MOE_RUNNERS:
+        raise ValueError(
+            f"{name} requires --moe-runner-backend in "
+            f"{', '.join(_ROUTED_EXPERTS_FORCING_MOE_RUNNERS)}, "
+            f"got {cfg.moe_runner_backend!r}"
+        )
+    conflicts = []
+    if cfg.tp_size > 1:
+        # Only the scheduler IO rank holds the rows a forced re-prefill needs.
+        conflicts.append("--tp-size > 1")
+    if attn_dp_enabled_of(cfg):
+        conflicts.append("DP attention")
+    if cfg.dp_size > 1:
+        conflicts.append("--dp-size > 1 (untested)")
+    if cfg.pp_size > 1:
+        conflicts.append("pipeline parallelism")
+    if cfg.attn_cp_size > 1:
+        conflicts.append("context parallelism")
+    if cfg.dcp_size > 1:
+        conflicts.append("decode context parallelism")
+    if cfg.speculative_algorithm is not None:
+        conflicts.append("speculative decoding (verify rows are not forced)")
+    if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+        conflicts.append("two- or single-batch overlap")
+    if cfg.disaggregation_mode != "null" or cfg.enable_pdmux:
+        conflicts.append("PD disaggregation or multiplexing")
+    if cfg.enable_hierarchical_cache:
+        conflicts.append(
+            "hierarchical cache (loaded-back KV is not rebuilt by forcing)"
+        )
+    if envs.SGLANG_RUST_SERVER.get():
+        conflicts.append("SGLANG_RUST_SERVER")
+    if conflicts:
+        raise ValueError(f"{name} is not supported with " + "; ".join(conflicts))
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -350,6 +402,8 @@ def check_server_args(server_args: Any):
 
     # Check two batch overlap backend requirement.
     check_two_batch_overlap(server_args)
+
+    check_routed_experts_retract_forcing(server_args)
 
     # Check communications compression
     if cfg.enable_quant_communications and cfg.tp_size == 1:
