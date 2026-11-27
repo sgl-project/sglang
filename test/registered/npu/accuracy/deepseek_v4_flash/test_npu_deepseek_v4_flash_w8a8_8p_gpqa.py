@@ -23,7 +23,7 @@ register_npu_ci(
 
 # TEMP (validation only): dedicated suite so the nightly workflow can run this
 # single case on the B050 image without pulling in the whole full-acc suite.
-register_npu_ci(est_time=3600, suite="temp-pr1-acc-16-npu-a3")
+register_npu_ci(est_time=3600, suite="temp-pr1-acc-16-npu-a3", nightly=True)
 
 # The PR pipeline (pr-test-npu.yml) runs on both `pull_request` and a daily
 # `schedule`, so match the workflow file instead of the event name. Every other
