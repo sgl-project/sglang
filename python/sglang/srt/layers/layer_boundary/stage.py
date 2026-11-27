@@ -31,7 +31,7 @@ from sglang.srt.layers.layer_boundary.contracts import (
     StageKind,
     StagePath,
 )
-from sglang.srt.layers.layer_boundary.layout import SumGroup
+from sglang.srt.layers.layer_boundary.layout import SumGroup, TokenAxis
 from sglang.srt.layers.layer_boundary.ops import sum_output
 from sglang.srt.layers.layer_boundary.prepare import reads_quantized
 from sglang.srt.layers.layer_boundary.residual import bind_update
@@ -421,6 +421,12 @@ class StageBoundary:
         steps = plan.path_for(forward_batch)
         if self.kind is StageKind.FFN:
             publish_ffn_lora_rows(plan._publish_lora_layout, steps.entry.input_rows)
+            # Publish the MoE input layout for the Ascend allgather dispatcher:
+            # a contiguous attention-TP slice vs. the gathered full DP shard.
+            get_forward().set(
+                "moe_input_attn_tp_sliced",
+                TokenAxis.ATTN_TP in steps.entry.input_rows.sharded,
+            )
         return hidden_states, steps
 
     def _prepare_attention(
