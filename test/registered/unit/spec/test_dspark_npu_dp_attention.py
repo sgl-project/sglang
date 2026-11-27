@@ -26,6 +26,7 @@ def _worker(*, graph=True):
     worker.device = torch.device("cpu")
     worker.verify_num_draft_tokens = 9
     worker._compact_attention_dp = True
+    worker._draft_is_moe = False
     worker.model_runner = SimpleNamespace(
         device=worker.device,
         attn_backend=SimpleNamespace(needs_cpu_seq_lens=True),
@@ -76,7 +77,10 @@ def _sync_info(bs, *, counts=None, prefill=False):
 
 
 def _sync_batch(info, *, require_mlp_tp_gather=True, skip_global_metadata=False):
-    batch = SimpleNamespace(forward_mode=fbi.ForwardMode(info.local_forward_mode))
+    batch = SimpleNamespace(
+        forward_mode=fbi.ForwardMode(info.local_forward_mode),
+        global_spec_verify_tier_num_tokens=None,
+    )
     with envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(False):
         dp_attn._update_gather_batch(
             batch,
@@ -165,6 +169,38 @@ def test_busy_and_idle_reuse_dp_scheduler_exchange(tmp_path):
     mp.spawn(
         _busy_idle_worker, args=(str(tmp_path / "gloo_init"),), nprocs=4, join=True
     )
+
+
+@pytest.mark.parametrize(
+    ("global_tier_num_tokens", "expected"), [([16, 7, 0], 18), ([16, -1, 0], 36)]
+)
+def test_busy_and_idle_use_the_same_dp_verify_budget(global_tier_num_tokens, expected):
+    worker = _worker()
+    worker.model_runner.decode_cuda_graph_runner.capture_num_tokens = [9, 18, 36]
+    counts = [4, 2, 0]
+    busy_batch = _sync_batch(_sync_info(4, counts=counts))
+    idle_batch = _sync_batch(_sync_info(0, counts=counts))
+    busy_batch.global_spec_verify_tier_num_tokens = global_tier_num_tokens
+    idle_batch.global_spec_verify_tier_num_tokens = global_tier_num_tokens
+    planner = worker._verify_planner
+    dp_tier_num_tokens = worker._dp_verify_tier_num_tokens(busy_batch)
+    lens = torch.full((4,), 4, dtype=torch.int32)
+    with patch.object(planner, "_schedule_verify_lens", return_value=lens):
+        busy_layout = planner.schedule_layout(
+            req_pool_indices=torch.arange(4),
+            prefix_lens=torch.full((4,), 32),
+            device=worker.device,
+            confidence=None,
+            budget=12,
+            global_num_reqs=worker._compact_dp_verify_num_reqs(
+                busy_batch, dp_tier_num_tokens=dp_tier_num_tokens
+            ),
+            dp_tier_num_tokens=dp_tier_num_tokens,
+        )
+    idle_layout = worker._idle_verify_ragged_layout(idle_batch)
+    assert busy_layout.graph_num_tokens == idle_layout.graph_num_tokens == expected
+    assert busy_layout.verify_lens.tolist() == [4, 4, 4, 4]
+    assert idle_layout.verify_lens.tolist() == [0]
 
 
 @pytest.mark.parametrize("bs", [0, 2])

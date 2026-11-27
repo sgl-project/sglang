@@ -74,6 +74,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     idle_ragged_layout,
     ragged_capture_num_tokens,
     ragged_layout_exceeds_captured_grid,
+    verify_layout_graph_num_tokens_floor,
 )
 from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
     DsparkSamplingAcceptGraph,
@@ -402,7 +403,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
             online_confidence=self._acceptance_estimator is not None,
-            use_dp_tier_hints=not self._uses_ascend_glm_dsa,
         )
         self._compact_attention_dp = (
             self._uses_ascend_glm_dsa
@@ -732,8 +732,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             if self._compact_attention_dp and get_parallel().tp_rank == 0:
                 logger.info(
-                    "GLM DSpark compact attention DP enabled (attn_dp=%d, attn_tp=%d, "
-                    "target_tier=global-full-window).",
+                    "GLM DSpark compact attention DP enabled (attn_dp=%d, attn_tp=%d).",
                     get_parallel().attn_dp_size,
                     get_parallel().attn_tp_size,
                 )
@@ -998,15 +997,25 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if self._compact_attention_dp:
-            num_reqs = self._compact_dp_verify_num_reqs(batch)
+            dp_tier_num_tokens = self._dp_verify_tier_num_tokens(batch)
+            num_reqs = self._compact_dp_verify_num_reqs(
+                batch, dp_tier_num_tokens=dp_tier_num_tokens
+            )
             if num_reqs is None:
                 return None
+            graph_num_tokens_floor = verify_layout_graph_num_tokens_floor(
+                num_reqs=num_reqs,
+                ragged_verify_mode=RaggedVerifyMode.COMPACT,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                model_runner=self.model_runner,
+                tier_num_tokens=dp_tier_num_tokens,
+            )
             # GLM directs all padding to the sink KV row. The placeholder slot
             # has no real query rows.
             return RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=torch.zeros(1, dtype=torch.int32, device=self.device),
                 graph_num_tokens=round_up_grid(
-                    num_reqs * self.verify_num_draft_tokens,
+                    graph_num_tokens_floor,
                     ragged_capture_num_tokens(model_runner=self.model_runner),
                 ),
             )
@@ -1024,19 +1033,23 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _dp_verify_tier_num_tokens(self, batch: ScheduleBatch) -> Optional[int]:
-        if not (
-            self._draft_is_moe
-            and get_parallel().attn_dp_enabled
-            and batch.global_num_tokens is not None
-            and self._verify_planner.is_compact_mode
+        if batch.global_num_tokens is None or not (
+            self._compact_attention_dp
+            or (
+                self._draft_is_moe
+                and get_parallel().attn_dp_enabled
+                and self._verify_planner.is_compact_mode
+            )
         ):
             return None
         return dp_global_verify_tier_num_tokens(
             global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
         )
 
-    def _compact_dp_verify_num_reqs(self, batch: ScheduleBatch) -> Optional[int]:
-        """Return the common request count only when its full window fits a graph."""
+    def _compact_dp_verify_num_reqs(
+        self, batch: ScheduleBatch, *, dp_tier_num_tokens: Optional[int] = None
+    ) -> Optional[int]:
+        """Return the common request count when target verify can replay a graph."""
         counts = batch.global_num_tokens
         runner = self.model_runner.decode_cuda_graph_runner
         if (
@@ -1055,6 +1068,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 num_reqs=num_reqs,
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 model_runner=self.model_runner,
+                tier_tokens_hint=dp_tier_num_tokens,
             ):
                 return num_reqs
         # Without a common tier, IDLE must not replay a graph while busy
@@ -1241,8 +1255,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
 
+        dp_tier_num_tokens = self._dp_verify_tier_num_tokens(batch)
         if self._compact_attention_dp:
-            global_num_reqs = self._compact_dp_verify_num_reqs(batch)
+            global_num_reqs = self._compact_dp_verify_num_reqs(
+                batch, dp_tier_num_tokens=dp_tier_num_tokens
+            )
         layout = None
         if not self._compact_attention_dp or global_num_reqs is not None:
             layout = self._verify_planner.schedule_layout(
@@ -1252,7 +1269,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 confidence=confidence,
                 budget=verify_token_budget,
                 global_num_reqs=global_num_reqs,
-                dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+                dp_tier_num_tokens=dp_tier_num_tokens,
             )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
