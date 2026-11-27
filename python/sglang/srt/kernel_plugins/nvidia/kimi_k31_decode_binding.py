@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.kernels.plugin_kernels.nvidia.spec import Step
+from sglang.kernels.plugin_kernels.megakernel.spec import Step
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,

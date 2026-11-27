@@ -216,6 +216,9 @@ def init_tokenizer_manager(
     port_args: PortArgs,
     TokenizerManagerClass: Optional[TokenizerManager] = None,
 ) -> Tuple[TokenizerManager, TemplateManager]:
+    from sglang.srt.kernel_plugins.megakernel import load_selected_oot_megakernel
+
+    load_selected_oot_megakernel(server_args)
     # Launch tokenizer process
     TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
     tokenizer_manager = TokenizerManagerClass(server_args, port_args)

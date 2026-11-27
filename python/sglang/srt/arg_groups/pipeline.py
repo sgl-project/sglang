@@ -255,6 +255,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(handle_model_specific_adjustments, server_args)
+
+    from sglang.srt.kernel_plugins.megakernel import (
+        select_oot_megakernel,
+        validate_oot_megakernel,
+    )
+
+    run_hook(select_oot_megakernel, server_args)
     run_hook(default_unset_prefill_decode_interval, server_args)
     # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     run_hook(handle_offload_compatibility, server_args)
@@ -410,5 +417,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
+    run_hook(validate_oot_megakernel, server_args)
 
     server_args._resolution_finished = True

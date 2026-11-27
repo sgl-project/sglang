@@ -14,8 +14,8 @@ from unittest.mock import patch
 import torch
 from msgspec.structs import replace
 
-from sglang.kernels.plugin_kernels.nvidia import spec as registry
-from sglang.kernels.plugin_kernels.nvidia.spec import Step
+from sglang.kernels.plugin_kernels.megakernel import spec as registry
+from sglang.kernels.plugin_kernels.megakernel.spec import Step
 from sglang.srt.kernel_plugins.nvidia import binding
 from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
 from sglang.srt.model_executor.forward_context import get_attn_backend

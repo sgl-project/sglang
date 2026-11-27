@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.plugin_kernels.nvidia.spec import Step
+from sglang.kernels.plugin_kernels.megakernel.spec import Step
 from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )

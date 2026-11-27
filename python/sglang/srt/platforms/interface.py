@@ -69,6 +69,9 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     ``supports_pynccl``: model-parallel groups create a PyNccl communicator
     when the caller does not choose. Read for out-of-tree platforms; in-tree
     devices decide in ``parallel_state``.
+    ``supports_megakernel``: enable target-specific megakernel selection on
+    this out-of-tree platform. ``accepts_legacy_megakernel_flag`` also accepts
+    the old NVIDIA flag as a deprecated explicit request on that platform.
     """
 
     supports_triton: bool = False
@@ -76,6 +79,8 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     piecewise_graph: bool = False
     hicache_device_kernels: bool = False
     supports_pynccl: bool = False
+    supports_megakernel: bool = False
+    accepts_legacy_megakernel_flag: bool = False
 
 
 class SRTPlatform(DeviceMixin):
@@ -104,6 +109,21 @@ class SRTPlatform(DeviceMixin):
         Called after ServerArgs is parsed.
         """
         pass
+
+    def get_megakernel_target(self) -> str | None:
+        """Return the registration target, identically in launcher and workers.
+
+        An opted-in platform must provide a target without initializing its
+        device runtime. This is also called from the tokenizer process.
+        """
+        return None
+
+    def requires_megakernel(self, server_args, hf_config: Any) -> bool:
+        """Whether this resolved checkpoint or launch requires a provider.
+
+        The answer must be independent of whether a provider registered.
+        """
+        return False
 
     def apply_profile_request_defaults(self, req: ProfileReq) -> None:
         """Fill platform defaults for fields a profile request leaves unset.

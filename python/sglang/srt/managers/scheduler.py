@@ -547,6 +547,9 @@ class Scheduler(
         # Keep __init__ as an orchestrator: sequence init_* and maybe_init_* calls
         # with minimal glue. Move substantial component-specific logic into
         # dedicated methods instead of adding inline blocks here.
+        from sglang.srt.kernel_plugins.megakernel import check_oot_megakernel_worker
+
+        check_oot_megakernel_worker(server_args)
         self.init_startup_timing_begin()
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.

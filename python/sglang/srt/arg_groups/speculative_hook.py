@@ -24,6 +24,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.megakernel import get_oot_megakernel_selection
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
@@ -1085,7 +1086,10 @@ def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
         window_size=window_size,
         dcp_size=cfg.dcp_size,
         page_size=cfg.page_size,
-        megakernel=bool(cfg.enable_nvidia_megakernel),
+        megakernel=(
+            bool(cfg.enable_nvidia_megakernel)
+            or get_oot_megakernel_selection(server_args) is not None
+        ),
     )
     if kept is None:
         logger.warning(
