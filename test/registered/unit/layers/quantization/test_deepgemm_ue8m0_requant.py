@@ -299,6 +299,55 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         self.assertTrue(layer.w13_weight_scale_inv.format_ue8m0)
         self.assertTrue(layer.w2_weight_scale_inv.format_ue8m0)
 
+    def test_fp8_moe_cast_fp4_experts_report_their_128x128_blocks(self):
+        """FP4 experts cast to FP8 at load carry 128x128 scales under a 32x32 config;
+        the requant and the MoE runners must read the cast's block, not the config's."""
+        quant_config = fp8_quant.Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[32, 32],
+            is_fp4_experts=True,
+        )
+        quant_config.dequant_fp4_to_fp8 = True
+        method = fp8_quant.Fp8MoEMethod(quant_config)
+
+        layer = torch.nn.Module()
+        for name, (n, k) in (("w13", (256, 128)), ("w2", (128, 256))):
+            packed = torch.randint(-128, 128, (1, n, k // 2), dtype=torch.int8)
+            scale = torch.full((1, n, k // 32), 2.0**-8)
+            setattr(
+                layer, f"{name}_weight", torch.nn.Parameter(packed, requires_grad=False)
+            )
+            setattr(
+                layer,
+                f"{name}_weight_scale_inv",
+                torch.nn.Parameter(scale, requires_grad=False),
+            )
+        layer.w13_input_scale = layer.w2_input_scale = None
+
+        with (
+            patch.multiple(
+                fp8_quant,
+                _is_cpu=False,
+                _is_fp8_fnuz=False,
+                _use_aiter=False,
+                get_moe_a2a_backend=unittest.mock.Mock(),
+            ),
+            patch.object(
+                method, "is_deepgemm_moe_runner_backend_enabled", return_value=True
+            ),
+            patch.object(
+                fp8_quant, "requant_block_scale_ue8m0_for_deepgemm"
+            ) as requant,
+        ):
+            fp8_quant.get_moe_a2a_backend.return_value.is_megamoe.return_value = False
+            method.process_weights_after_loading_block_quant(layer)
+
+        self.assertEqual(layer.w13_weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(tuple(layer.w13_weight_scale_inv.shape), (1, 2, 1))
+        self.assertEqual(method.weight_block_size, [128, 128])
+        self.assertEqual(method.get_triton_quant_info(layer).block_shape, [128, 128])
+        self.assertEqual([c.args[2] for c in requant.call_args_list], [[128, 128]] * 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)
