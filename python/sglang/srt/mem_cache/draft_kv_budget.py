@@ -43,6 +43,7 @@ def resolve_dflash_draft_cell_size(
             speculative_draft_attention_backend=(
                 resolve_draft_worker_attention_backend(algo_label=algo_label)
             ),
+            model_config=draft_model_config,
         )
         return dflash_draft_cell_size_per_token(
             draft_model_config=draft_model_config,

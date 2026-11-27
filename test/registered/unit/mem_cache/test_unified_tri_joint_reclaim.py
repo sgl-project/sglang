@@ -472,7 +472,10 @@ class TestTriJointReclaim(CustomTestCase):
         batch.tree_cache = c
         batch.spec_algorithm = SpeculativeAlgorithm.NONE
         batch.reqs = [
-            SimpleNamespace(kv=SimpleNamespace(kv_committed_len=8), beam_group=None)
+            SimpleNamespace(
+                kv=SimpleNamespace(kv_committed_len=8, kv_allocated_len=8),
+                beam_group=None,
+            )
             for _ in range(4)
         ]
         self.assertTrue(batch.check_decode_mem())
@@ -541,7 +544,7 @@ class TestTriJointReclaim(CustomTestCase):
                         mamba2_cache_params=state_config,
                         max_mamba_cache_size=8,
                         model_context_len=256,
-                        req_to_token_headroom=1,
+                        req_to_token_row_width=257,
                         max_num_reqs=4,
                         enable_mamba_extra_buffer=False,
                         enable_mamba_extra_buffer_lazy=False,

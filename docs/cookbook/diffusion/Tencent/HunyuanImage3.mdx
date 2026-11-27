@@ -1,7 +1,6 @@
 ---
 title: HunyuanImage-3.0-Instruct
 description: Deploy HunyuanImage-3.0-Instruct for text-to-image generation and reference-image editing.
-tag: NEW
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';

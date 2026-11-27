@@ -976,7 +976,20 @@ def get_cpu_memory_capacity():
 def get_xpu_memory_capacity():
     try:
         if torch.xpu.is_available():
-            return torch.xpu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+            try:
+                return torch.xpu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+            except RuntimeError:
+                # mem_get_info() relies on Level Zero Sysman, which is unavailable
+                # in some environments (e.g. WSL2 GPU-PV). Fall back to the Level
+                # Zero core API, mirroring get_available_gpu_memory().
+                logger.warning(
+                    "torch.xpu.mem_get_info() failed; falling back to "
+                    "get_device_properties().total_memory for XPU memory capacity."
+                )
+                device_props = torch.xpu.get_device_properties(
+                    torch.xpu.current_device()
+                )
+                return device_props.total_memory // 1024 // 1024  # unit: MB
         raise ValueError("No GPU memory values found.")
     except AttributeError:
         raise RuntimeError("torch.xpu is not available.")

@@ -126,6 +126,7 @@ jobs:
               - ".github/workflows/_diffusion-pr-test-stage.yml"
               - "scripts/ci/cuda/ci_install_dependency.sh"
               - "scripts/ci/cuda/ci_install_dependency_diffusion.sh"
+              - "scripts/ci/utils/diffusion/{compute_diffusion_partitions,diffusion_case_parser,verify_diffusion_coverage}.py"
               - "scripts/ci/runner_configs.yml"
               - "python/pyproject.toml"
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
@@ -138,7 +139,7 @@ jobs:
               - "test/registered/unit/diffusion/**"
               - "test/registered/e2e/diffusion/**"
               - "python/sglang/cli/**"
-            # multimodal_gen minus the ComfyUI plugin: no server, runtime or GPU suite imports it.
+            # the server suites do not import agent skills or the ComfyUI plugin
             multimodal_gen_server:
               - ".github/actions/**"
               - ".github/workflows/pr-test.yml"
@@ -148,10 +149,11 @@ jobs:
               - ".github/workflows/_diffusion-pr-test-stage.yml"
               - "scripts/ci/cuda/ci_install_dependency.sh"
               - "scripts/ci/cuda/ci_install_dependency_diffusion.sh"
+              - "scripts/ci/utils/diffusion/{compute_diffusion_partitions,diffusion_case_parser,verify_diffusion_coverage}.py"
               - "scripts/ci/runner_configs.yml"
               - "python/pyproject.toml"
               - "python/sglang/multimodal_gen/!(*.md|*.ipynb)"
-              - "python/sglang/multimodal_gen/!(apps|test|*.md|*.ipynb)/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/(?![.](agents|claude)/)!(apps|test|*.md|*.ipynb)/**/!(*.md|*.ipynb)"
               - "python/sglang/multimodal_gen/{apps,test}/!(*.md|*.ipynb)"
               - "python/sglang/multimodal_gen/apps/!(ComfyUI_SGLDiffusion)/**/!(*.md|*.ipynb)"
               - "python/sglang/multimodal_gen/test/!(unit)/**/!(*.md|*.ipynb)"

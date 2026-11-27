@@ -7,6 +7,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.kv_shard_hook import handle_kv_cache_sharding
+from sglang.srt.arg_groups.memory_hook import finalize_prefill_token_budget
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import (
     _page_size_default,
@@ -127,6 +128,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 
         run_post_process_pass(server_args, resolve_boundary_reduction)
+        finalize_prefill_token_budget(server_args)
         return
 
     from sglang.srt.arg_groups.model_path_hook import (
@@ -168,6 +170,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.kv_cache_hook import (
         handle_cache_compatibility,
         handle_indexer_kv_cache_compatibility,
+        handle_int8_kv_cache_compatibility,
         handle_kv4_compatibility,
         handle_mxfp8_kv_cache_compatibility,
         handle_nvfp4_prefill_kv_dequant_dtype,
@@ -284,6 +287,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_linear_attn_backend, server_args)
     run_hook(handle_kv4_compatibility, server_args)
     run_hook(handle_mxfp8_kv_cache_compatibility, server_args)
+    run_hook(handle_int8_kv_cache_compatibility, server_args)
     run_hook(handle_indexer_kv_cache_compatibility, server_args)
     run_hook(handle_platform_kv_cache_dtype_compatibility, server_args)
     run_post_process_pass(server_args, _page_size_default)
@@ -404,6 +408,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # disable chunked prefill. Re-run the idempotent sharding gate over the
     # final resolving view.
     run_hook(handle_kv_cache_sharding, server_args)
+
+    # The chunk size is final here, after attention-DP division and alignment.
+    finalize_prefill_token_budget(server_args)
 
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
