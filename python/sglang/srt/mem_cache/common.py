@@ -234,6 +234,8 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
+    if req.kv_load_recovery is not None:
+        req.kv_load_recovery.commit(req, tree_cache)
     if not req.skip_radix_cache_insert:
         tree_cache.checkpoint(req, up_to=req.extend_end)
     # The next extend resumes after this one, published or not.

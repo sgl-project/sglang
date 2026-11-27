@@ -119,6 +119,7 @@ from sglang.srt.mem_cache.allocation import (
 )
 from sglang.srt.mem_cache.allocation_sizing import spec_decode_alloc_lens
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_load_recovery import KVLoadRecovery
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
@@ -518,6 +519,8 @@ class Req(ReqDllmMixin):
         self.full_untruncated_fill_ids = array("q")
         # This round extends fill ids [prefix_len, extend_end).
         self.extend_end: Optional[int] = None
+        # Engine-owned; external storage providers supply evidence, not execution.
+        self.kv_load_recovery: KVLoadRecovery | None = None
         self.dllm_initialized: bool = False
 
         self.session = session

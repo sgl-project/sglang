@@ -57,6 +57,7 @@ POSITIONAL_FIELD_ORDER = (
     "c128_page_size",
     "swa_full_tokens_ratio",
     "disable_hybrid_swa_memory",
+    "kv_load_failure_policy",
     "radix_eviction_policy",
     "radix_eviction_policy_config",
     "prefill_only_disable_kv_cache",

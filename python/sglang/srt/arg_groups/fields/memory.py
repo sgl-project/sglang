@@ -22,6 +22,12 @@ class Memory(msgspec.Struct):
     """Namespace ``memory``."""
 
     _NS_PATH = "memory"
+    kv_load_failure_policy: A[
+        str, Arg(choices=["recompute", "repair"], help=(
+            "Recover a partial external KV load by recomputing its suffix or "
+            "repairing one missing attention-only span with ordinary prefill."
+        )),
+    ] = "recompute"
     radix_eviction_policy: A[
         str,
         Arg(

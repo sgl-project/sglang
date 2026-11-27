@@ -32,6 +32,8 @@ from sglang.srt.mem_cache.capacity import reclaim_for_load_back, shares_memory
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.kv_load_recovery import prepare_partial_kv_load
+from sglang.srt.runtime_context import get_disagg, get_memory, get_schedule, get_spec
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -78,6 +80,17 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             mamba_component=self._mamba_component,
             sliding_window_size=self.sliding_window_size,
         )
+        if get_memory().kv_load_failure_policy == "repair" and (
+            self._mamba_component is not None or self.is_swa_enabled
+            or tp_size != 1 or params.pp_size != 1
+            or not get_schedule().disable_overlap_schedule
+            or get_spec().speculative_algorithm is not None
+            or get_disagg().disaggregation_mode != "null"
+        ):
+            raise ValueError(
+                "KV hole repair requires a full-attention-only model, one GPU, "
+                "and --disable-overlap-schedule"
+            )
         self._external_flows: dict[str, LMCacheExternalFlow] = {}
         self._forward_stream = forward_stream
         self._pending_stores: list[LMCachePendingStore] = []
@@ -89,6 +102,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def is_backuped(self, node_id: NodeId) -> bool:
         # LMCache rebuilds lookup keys from tokens, so any L1 node is valid.
         return True
+
+    def supports_partial_load_recovery(self) -> bool:
+        return (
+            self._mamba_component is None and not self.is_swa_enabled
+            and self.lmcache_connector.kv_world_size == 1
+        )
 
     def prefix_device_indices(self, req: Req) -> torch.Tensor:
         # match_prefix may append loaded slots not yet published to the tree,
@@ -140,6 +159,16 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             flow.loaded_skip_tokens = max(flow.loaded_skip_tokens, skip)
             if flow.load.result:
                 self._release_unused_loaded_slots(flow)
+        if req.kv_load_recovery is not None and local_hit > req.kv_load_recovery.span_start:
+            # Another request published a longer valid prefix while this load
+            # waited for admission. Use its canonical slots, not a stale plan.
+            req.kv_load_recovery.abort(self.token_to_kv_pool_allocator)
+            req.kv_load_recovery = None
+            if flow.released_skip_tokens != len(flow.load.device_indices):
+                raise RuntimeError("Superseded repair still owns a private prefix")
+            flow.prefix_published = True
+            self._retire_loaded_flow(req.rid)
+            return result
         if total_hit <= local_hit:
             return result
 
@@ -638,9 +667,37 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 producer_stream=self._forward_stream,
             )
             if not self.lmcache_connector.prepare_load_on_stream(
-                flow.load, self._forward_stream
+                flow.load, self._forward_stream,
+                allow_partial=(self.supports_partial_load_recovery() and local_hit % self.lmcache_connector.chunk_size == 0),
             ):
                 raise RuntimeError("LMCache server rejected the retrieve request")
+            coverage = flow.load.coverage
+            if coverage is not None and coverage.failed_chunks:
+                chunk = self.lmcache_connector.chunk_size
+                if coverage.total_chunks * chunk != total_hit - load_start:
+                    raise ValueError("Partial retrieve coverage has the wrong extent")
+                missing_span = (
+                    load_start + min(coverage.failed_chunks) * chunk,
+                    load_start + (max(coverage.failed_chunks) + 1) * chunk,
+                )
+                policy = get_memory().kv_load_failure_policy
+                if (
+                    req.session is not None or req.return_logprob or req.multimodal_inputs is not None
+                    or req.skip_radix_cache_insert or req.input_embeds is not None
+                    or req.positional_embed_overrides is not None
+                ):
+                    policy = "recompute"
+                device_indices, req.kv_load_recovery = prepare_partial_kv_load(
+                    loaded_start=local_hit, loaded_indices=device_indices,
+                    missing_span=missing_span, page_size=self.page_size,
+                    allocator=self.token_to_kv_pool_allocator, policy=policy,
+                )
+                flow.load.device_indices = device_indices
+                flow.total_hit = missing_span[0]
+                logger.info(
+                    "Partial KV load req=%s policy=%s span=%s restored_extent=%d",
+                    req.rid, policy, missing_span, total_hit,
+                )
             if mamba_value is not None:
                 # Forward waits for H2D before deferred Mamba COW runs.
                 self._arm_external_mamba_cow(flow, req)

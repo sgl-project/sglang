@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.kv_load_recovery import abort_kv_load_recovery
 from sglang.srt.runtime_context import get_disagg
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,7 @@ class RequestRetirer:
 
     def release(self, req: Req, *, checkpoint: bool) -> None:
         """Give back what an ended request holds; the caller finishes and streams it."""
+        abort_kv_load_recovery(req, self.tree_cache)
         _leave_owner_list(req)
         record_exit(req, "release")
         if self.release_observer is not None:
@@ -116,6 +118,7 @@ class RequestRetirer:
 
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""
+        abort_kv_load_recovery(req, self.tree_cache)
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             self.hisparse_coordinator.release_request(req)
 

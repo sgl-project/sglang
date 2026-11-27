@@ -778,6 +778,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         auxiliary-only load or a recompute fallback."""
         raise NotImplementedError()
 
+    def supports_partial_load_recovery(self) -> bool:
+        """Whether load-back may return a validated shorter contiguous prefix."""
+        return False
+
     def load_back_is_cache_owned(self) -> bool:
         """Whether the slots loaded by ``init_load_back`` belong to this cache.
 

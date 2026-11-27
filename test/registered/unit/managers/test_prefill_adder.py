@@ -107,6 +107,7 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.window_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
         tree_cache.disable = False
+        tree_cache.supports_partial_load_recovery.return_value = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
         # Route lock/unlock through inc/dec_lock_ref so tests can hook those.
@@ -163,6 +164,7 @@ class TestPrefillAdder(CustomTestCase):
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
         req.kv = ReqKvInfo()
+        req.kv_load_recovery = None
         req.rid = str(rid)
         req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = priority
@@ -267,6 +269,29 @@ class TestPrefillAdder(CustomTestCase):
         return self.create_adder(
             self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
         )
+
+    def test_short_repair_reserves_the_single_chunked_slot_but_allows_complete_prefill(self):
+        from sglang.srt.mem_cache.kv_load_recovery import KVLoadRecovery
+
+        self.mock_token_allocator.available_size.return_value = 100000
+        repair = self.create_mock_req("repair", priority=0, max_new_tokens=1)
+        repair.full_untruncated_fill_ids = list(range(16))
+        repair.kv_load_recovery = KVLoadRecovery(0, 4, 12, torch.arange(8))
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=8)
+        adder.add_one_req(repair, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(repair.extend_end, 4)
+        self.assertIs(adder.new_chunked_req, repair)
+        long = self.create_mock_req("long", priority=0, max_new_tokens=1)
+        long.full_untruncated_fill_ids = list(range(20))
+        self.assertEqual(
+            adder.add_one_req(long, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        short = self.create_mock_req("short", priority=0, max_new_tokens=1)
+        short.full_untruncated_fill_ids = list(range(2))
+        adder.add_one_req(short, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [repair, short])
+        self.assertIs(adder.new_chunked_req, repair)
 
     def test_capped_chunk_holds_its_rest_from_later_requests(self):
         """A request admitted beside a capped chunk may not take the KV the
