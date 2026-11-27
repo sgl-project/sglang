@@ -88,6 +88,8 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Loop options.** On a variable-loop checkpoint, the Playground's **Loop Passes** card sets `--inkling2-loop-num-passes` and the **Loop KV Cache** card sets `--inkling2-loop-share-cache`. Fewer passes trade accuracy for speed: on gsm8k, 1 pass scored 84.0% against 88.5% at the default 3. Sharing one K/V cache across passes about doubles the KV pool and scored 90.0%. DSpark accepts shared KV but refuses a non-default pass count at startup.
 
+**Tool-call header.** TML-d24-varloop-research reads and writes tool calls with an empty message header, where Inkling-2-Mini writes the tool's name. Serve it with `--inkling2-tool-call-author-name-mode drop_name` (or `independent`, which writes assistant message names instead of dropping them), so past tool calls in a conversation render the way the model writes them. A checkpoint can also name its mode in `config.json` as `text_config.tool_call_author_name_mode`, which the flag overrides; with the default `tool_name`, the model often ends a turn without a tool call once earlier calls are in the history.
+
 **Parallelism.** The data-center GPU recipes run TP4 / EP4: one GB300 tray, or half of an 8-GPU H200 or MI350X / MI355X node. RTX PRO 6000, RTX 5090 and DGX Spark run TP1 / EP1 on a single GPU. TPU7x runs TP8 / EP8 on one host. Keep EP equal to TP: the NVFP4 experts cannot be TP-sharded, because their activation scales must cover each expert's full input width.
 
 **Batch-size-1 decode.** Decode at batch size 1 takes about as long per token as on Inkling-2-Small, because both models make 48 layer visits per token.

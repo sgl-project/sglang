@@ -13,12 +13,41 @@ from sglang.test.performance_test_runner import (
     PerformanceTestResult,
     run_performance_test,
 )
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings, is_in_ci
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    ModelLaunchSettings,
+    is_in_ci,
+    popen_launch_server,
+    terminate_and_kill_process_tree,
+    write_github_step_summary,
+)
 from sglang.test.tool_call_test_runner import (
     ToolCallTestParams,
     ToolCallTestResult,
     run_tool_call_test,
 )
+
+
+def _write_combined_github_summary(test_name: str, results: list) -> None:
+    def status(result):
+        return "SKIP" if result is None else "PASS" if result.passed else "FAIL"
+
+    summary = f"### {test_name} - Results\n\n"
+    summary += "| Model | Performance | Accuracy | Tool call | Errors |\n"
+    summary += "| --- | --- | --- | --- | --- |\n"
+    for result in results:
+        errors = "<br>".join(
+            str(error).replace("|", r"\|").replace("\n", "<br>")
+            for error in result["errors"]
+            if error
+        )
+        summary += (
+            f"| {result['model']} | {status(result['perf_result'])} | "
+            f"{status(result['accuracy_result'])} | "
+            f"{status(result['tool_call_result'])} | {errors or '-'} |\n"
+        )
+    write_github_step_summary(summary + "\n")
 
 
 def run_combined_tests(
@@ -29,6 +58,7 @@ def run_combined_tests(
     accuracy_params: Optional[AccuracyTestParams] = None,
     performance_params: Optional[PerformanceTestParams] = None,
     tool_call_params: Optional[ToolCallTestParams] = None,
+    share_server: bool = False,
 ) -> dict:
     """Run performance, accuracy, and/or tool call tests for a list of models.
 
@@ -40,6 +70,10 @@ def run_combined_tests(
         accuracy_params: Parameters for accuracy tests (None to skip accuracy)
         performance_params: Parameters for performance tests (None to skip perf)
         tool_call_params: Parameters for tool call tests (None to skip tool call)
+        share_server: When True, launch one server per model and reuse it for
+            all enabled test types (perf + accuracy + tool-call), saving one
+            server startup per model.  Disabled by default so existing callers
+            are unaffected.
 
     Returns:
         dict with test results:
@@ -109,57 +143,109 @@ def run_combined_tests(
             "errors": [],
         }
 
-        # Run performance test
-        if run_perf:
-            perf_result: PerformanceTestResult = run_performance_test(
-                model=model,
-                perf_runner=perf_runner,
-                batch_sizes=performance_params.batch_sizes,
-                input_lens=performance_params.input_lens,
-                output_lens=performance_params.output_lens,
-                is_vlm=is_vlm,
-                dataset_name=performance_params.dataset_name,
-                spec_accept_length_threshold=performance_params.spec_accept_length_threshold,
-            )
-            model_result["perf_result"] = perf_result
-            if not perf_result.passed:
-                all_passed = False
-                model_result["errors"].append(perf_result.error)
+        # Optionally launch one shared server for this model that all test
+        # types (perf / accuracy / tool-call) reuse.
+        shared_proc = None
+        try:
+            if share_server and (run_perf or run_accuracy or run_tool_call):
+                print(f"\nLaunching shared server for {model.model_path} ...")
+                shared_proc = popen_launch_server(
+                    model.model_path,
+                    base_url,
+                    other_args=model.extra_args,
+                    timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    env=model.env,
+                )
 
-            # Wait for GPU memory and port cleanup
-            print("\nWaiting 20 seconds for resource cleanup...")
-            time.sleep(20)
+            # Run performance test
+            if run_perf:
+                perf_result: PerformanceTestResult = run_performance_test(
+                    model=model,
+                    perf_runner=perf_runner,
+                    batch_sizes=performance_params.batch_sizes,
+                    input_lens=performance_params.input_lens,
+                    output_lens=performance_params.output_lens,
+                    is_vlm=is_vlm,
+                    dataset_name=performance_params.dataset_name,
+                    spec_accept_length_threshold=performance_params.spec_accept_length_threshold,
+                    skip_server_launch=share_server,
+                    baseline_output_throughput=performance_params.baseline_output_throughput,
+                    baseline_ftl_s=performance_params.baseline_ftl_s,
+                    baseline_itl_ms=performance_params.baseline_itl_ms,
+                    emit_report=not performance_params.include_latency_breakdown,
+                )
+                model_result["perf_result"] = perf_result
+                if not perf_result.passed:
+                    all_passed = False
+                    model_result["errors"].append(perf_result.error)
 
-        # Run accuracy test
-        if run_accuracy:
-            acc_result: AccuracyTestResult = run_accuracy_test(
-                model=model,
-                params=accuracy_params,
-                base_url=base_url,
-            )
-            model_result["accuracy_result"] = acc_result
-            if not acc_result.passed:
-                all_passed = False
-                model_result["errors"].append(acc_result.error)
+                if not share_server:
+                    # Wait for GPU memory and port cleanup
+                    print("\nWaiting 20 seconds for resource cleanup...")
+                    time.sleep(20)
 
-            # Wait for GPU memory and port cleanup
-            print("\nWaiting 20 seconds for resource cleanup...")
-            time.sleep(20)
+            # Run accuracy test
+            if run_accuracy:
+                acc_result: AccuracyTestResult = run_accuracy_test(
+                    model=model,
+                    params=accuracy_params,
+                    base_url=base_url,
+                    skip_server_launch=share_server,
+                )
+                model_result["accuracy_result"] = acc_result
+                if not acc_result.passed:
+                    all_passed = False
+                    model_result["errors"].append(acc_result.error)
 
-        # Run tool call test
-        if run_tool_call:
-            tc_result: ToolCallTestResult = run_tool_call_test(
-                model=model,
-                params=tool_call_params,
-                base_url=base_url,
-            )
-            model_result["tool_call_result"] = tc_result
-            if not tc_result.passed:
-                all_passed = False
-                model_result["errors"].extend(tc_result.failures)
+                if not share_server:
+                    # Wait for GPU memory and port cleanup
+                    print("\nWaiting 20 seconds for resource cleanup...")
+                    time.sleep(20)
 
-            print("\nWaiting 20 seconds for resource cleanup...")
-            time.sleep(20)
+            if (
+                run_perf
+                and perf_runner
+                and performance_params.include_latency_breakdown
+                and model_result["perf_result"]
+            ):
+                benchmark_results = model_result["perf_result"].benchmark_results
+                acc_latency = (
+                    model_result["accuracy_result"].latency
+                    if model_result["accuracy_result"]
+                    else None
+                )
+                perf_runner.add_report(
+                    benchmark_results,
+                    variant=model.variant,
+                    acc_latency=acc_latency,
+                    include_latency_breakdown=True,
+                )
+
+            # Run tool call test
+            if run_tool_call:
+                tc_result: ToolCallTestResult = run_tool_call_test(
+                    model=model,
+                    params=tool_call_params,
+                    base_url=base_url,
+                    skip_server_launch=share_server,
+                )
+                model_result["tool_call_result"] = tc_result
+                if not tc_result.passed:
+                    all_passed = False
+                    model_result["errors"].extend(tc_result.failures)
+
+                if not share_server:
+                    print("\nWaiting 20 seconds for resource cleanup...")
+                    time.sleep(20)
+
+        except Exception as exc:
+            if not share_server:
+                raise
+            all_passed = False
+            model_result["errors"].append(f"Model test exception: {exc}")
+        finally:
+            if shared_proc is not None:
+                terminate_and_kill_process_tree(shared_proc)
 
         all_results.append(model_result)
 
@@ -175,6 +261,9 @@ def run_combined_tests(
         write_accuracy_github_summary(
             test_name, accuracy_params.dataset, accuracy_results
         )
+
+    if share_server and is_in_ci():
+        _write_combined_github_summary(test_name, all_results)
 
     # Print summary
     print("\n" + "=" * 60)

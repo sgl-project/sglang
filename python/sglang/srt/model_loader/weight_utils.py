@@ -577,6 +577,8 @@ def get_quant_config(
 
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path
+        elif model_config.quantization == "modelslim":
+            config["hf_config"] = model_config.hf_config
         elif model_config.quantization.startswith("modelopt") and (
             config.get("producer", {}).get("name", "").startswith("modelopt")
         ):

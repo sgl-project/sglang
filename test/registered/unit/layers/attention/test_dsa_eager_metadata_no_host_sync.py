@@ -31,9 +31,11 @@ class TestDsaEagerMetadataNoHostSync(unittest.TestCase):
             seq_lens_sum=12 if host_mirror else 0,
         )
         backend = SimpleNamespace(
+            draft_decode_len=0,
             speculative_num_draft_tokens=3,
             req_to_token=table,
             req_to_token_pool=SimpleNamespace(req_to_token=table),
+            max_kv_len=table.shape[1],
             _kv_shard_pool=None,
             set_dsa_prefill_impl=lambda _: None,
             dsa_decode_impl="triton",
