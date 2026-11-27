@@ -15,8 +15,6 @@ def _parse_config(config: str | None) -> dict:
     if not isinstance(options, dict):
         raise ValueError("--hi-engram-config must be a JSON object")
     backend = options.get("backend", "local")
-    if backend == "remote":
-        raise NotImplementedError("Remote backend name is reserved; select deepep_rdma")
     if backend not in ("local", "deepep_rdma"):
         raise ValueError(f"Unknown Engram storage backend: {backend!r}")
     allowed = (

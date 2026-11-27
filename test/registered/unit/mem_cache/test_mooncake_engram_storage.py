@@ -69,14 +69,13 @@ class TestEngramStorageConfig(CustomTestCase):
             ('{"local_dir":42}', "nonempty string"),
             ('{"unknown_option":true}', "Unknown.*options"),
             ('{"backend":"typo"}', "Unknown Engram storage backend"),
+            ('{"backend":"remote"}', "Unknown Engram storage backend"),
         ):
             with (
                 self.subTest(config=config),
                 self.assertRaisesRegex(ValueError, message),
             ):
                 create_storage(config)
-        with self.assertRaisesRegex(NotImplementedError, "Remote"):
-            create_storage('{"backend":"remote"}')
 
 
 class TestMooncakeEngramStorage(CustomTestCase):

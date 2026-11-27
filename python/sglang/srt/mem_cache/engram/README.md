@@ -12,7 +12,7 @@ local host snapshots and read rows on the caller's CUDA stream. Enable it with
 `--enable-hi-engram`. This boolean flag defaults to disabled. Select the backend
 through `--hi-engram-config`; `backend` defaults to `local`. Omitting the flag
 preserves each model's native implementation. Use `deepep_rdma` for remote
-storage; the generic name `remote` remains reserved and is rejected.
+storage.
 
 ## Model integration
 
