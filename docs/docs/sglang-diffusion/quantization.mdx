@@ -969,7 +969,8 @@ does, and the 6× slower decode is the price of fitting.
 | No `--use-fsdp-inference` | FSDP does not preserve the GGUF packed-block layout |
 | CUDA only | The reused SRT GGML dequantization kernel currently ships for CUDA |
 | Native byte order only | A quantized block embeds its scales, so a non-native file cannot be byte-swapped as a whole |
-| No LoRA, and none of the H3 AdaLN cache flags | An adapter cannot be merged into packed blocks, and the AdaLN paths read the transformer's safetensors |
+| LoRA requires TP=1 and `--lora-merge-mode dynamic` or `auto` | One dynamic adapter per transformer adds a separate output delta; merging into packed GGML blocks is unsupported. Layerwise offload remains available |
+| None of the H3 AdaLN cache flags | The AdaLN paths read the transformer's safetensors |
 | No `--quantization` | The checkpoint fixes the quantization; the flag would be a second, conflicting selector |
 
 Every constraint above fails at startup with an explanatory error rather than
