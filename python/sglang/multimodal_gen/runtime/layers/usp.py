@@ -463,7 +463,7 @@ def _usp_input_all_to_all_packed_qkv(
             ),
         )
     elif (
-        q.device.type == "cpu"
+        current_platform.is_cpu()
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.dtype == k.dtype == v.dtype
         and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
@@ -578,7 +578,7 @@ def _can_use_packed_qkv_a2a_4d(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
 ) -> bool:
     return (
-        (q.device.type == "cpu" or q.device.type in _A2A_DEVICE_TYPES)
+        (current_platform.is_cpu() or q.device.type in _A2A_DEVICE_TYPES)
         and q.ndim == 4
         and q.shape == k.shape == v.shape
         and q.dtype == k.dtype == v.dtype
@@ -624,7 +624,7 @@ def _usp_input_all_to_all_qkv(
     b, s_local, h_global, d = q.shape
     h_local = h_global // world_size
     rows = b * s_local
-    if q.device.type == "cpu":
+    if current_platform.is_cpu():
         pack_fn = pack_qkv_destination_major_cpu
     else:
         pack_fn = pack_qkv_destination_major
