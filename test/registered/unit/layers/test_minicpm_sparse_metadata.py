@@ -995,7 +995,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
                 metadata,
                 torch.empty(0),
                 torch.empty(0),
-                max_context_length=256,
+                max_kv_len=256,
                 k1_kernel_size=5,
                 k1_kernel_stride=3,
                 k2_kernel_size=13,

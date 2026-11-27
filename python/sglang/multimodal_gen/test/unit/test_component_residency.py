@@ -94,6 +94,8 @@ def test_component_offload_releases_preferred_component_after_request():
 def test_snapshot_offload_preserves_host_storage_and_live_buffers(
     tmp_path, monkeypatch, host_storage, residency, prefetch
 ):
+    if residency == "component-offload" and not current_platform.is_cuda():
+        pytest.skip("the mapped-weight snapshot in component-offload is CUDA-only")
     monkeypatch.setattr(host_memory_budget, "host_memory_available_bytes", lambda: 0)
     module = torch.nn.Linear(16, 16, bias=False)
     if host_storage == "pinned":
@@ -217,7 +219,10 @@ def test_component_offload_does_not_retain_unbudgeted_host_weights(
             assert not module.weight.is_pinned()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and current_platform.is_cuda()),
+    reason="the mapped-weight snapshot in component-offload is CUDA-only",
+)
 def test_mapped_component_reuses_snapshot_mutation_and_sleep_boundaries(
     tmp_path, monkeypatch
 ):
