@@ -315,6 +315,11 @@ class Memory(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Hierarchical engram
     # -------------------------------------------------------------------------
+    enable_ple_nvlink: A[
+        bool,
+        "Read PLE embedding rows directly from peer GPUs over NVLink. "
+        "Currently supported by Qwen4-Exp with or without DP attention.",
+    ] = False
     enable_hi_engram: A[
         bool,
         "Enable HiCache Engram storage. Configure the backend through --hi-engram-config.",

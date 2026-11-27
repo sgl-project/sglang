@@ -12,7 +12,6 @@ import sympy
 import torch
 import torch.nn.functional as F
 import triton
-import triton.language as tl
 from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
@@ -67,6 +66,10 @@ from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.engram.embedding import HiCacheVocabParallelEmbedding
+from sglang.srt.mem_cache.engram.peer_embedding import (
+    PeerVocabParallelEmbedding,
+    gather_ple_embedding_kernel,
+)
 from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
@@ -696,21 +699,37 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             (total_vocab_size + self.make_ngram_vocab_size_divisible_by - 1)
             // self.make_ngram_vocab_size_divisible_by
         ) * self.make_ngram_vocab_size_divisible_by
-        self.use_attn_tp_ngram = _use_attn_tp_ngram()
+        memory = get_memory()
+        peer_lookup = memory.enable_ple_nvlink
+        if peer_lookup:
+            if memory.enable_hi_engram:
+                raise ValueError(
+                    "Select either --enable-ple-nvlink or --enable-hi-engram"
+                )
+            parallel = get_parallel()
+            if not _is_cuda or parallel.attn_tp_size < 2 or parallel.attn_cp_size != 1:
+                raise ValueError(
+                    "Qwen PLE NVLink lookup requires CUDA with attention TP > 1 and attention CP = 1"
+                )
+            embedding_cls = PeerVocabParallelEmbedding
+        elif memory.enable_hi_engram:
+            embedding_cls = HiCacheVocabParallelEmbedding
+        else:
+            embedding_cls = VocabParallelEmbedding
+
+        self.use_attn_tp_ngram = peer_lookup or _use_attn_tp_ngram()
         self.gather_dp_tokens = (
             is_dp_attention_enabled()
             and get_parallel().attn_dp_size > 1
             and not self.use_attn_tp_ngram
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
-        offload_embedding = bool(config.ple_offload_embedding)
-        if get_memory().enable_hi_engram:
-            embedding_cls = HiCacheVocabParallelEmbedding
-        else:
-            embedding_cls = VocabParallelEmbedding
+        native_host_offload = (
+            config.ple_offload_embedding and embedding_cls is VocabParallelEmbedding
+        )
         # Offload only needs this embedding's metadata: build it on meta so the
         # shard is never allocated on the device.
-        with torch.device("meta") if offload_embedding else nullcontext():
+        with torch.device("meta") if native_host_offload else nullcontext():
             ngram_embedding = embedding_cls(
                 padded_vocab_size,
                 self.head_dim_per_ngram,
@@ -726,7 +745,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_embedding.register_buffer(
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )
-        if offload_embedding and not get_memory().enable_hi_engram:
+        if native_host_offload:
             ngram_embedding = Qwen4ExpPinnedHostEmbedding(
                 ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),
@@ -944,39 +963,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
 
 
-@triton.jit
-def _gather_ple_embedding_from_pinned_kernel(
-    weight_ptr,
-    ids_ptr,
-    output_ptr,
-    embedding_dim,
-    tp_vocab_start,
-    tp_vocab_end,
-    is_fp8: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    row_id = tl.program_id(0)
-    global_idx = tl.load(ids_ptr + row_id)
-    in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
-    local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
-    offsets = tl.arange(0, BLOCK_D)
-    mask = offsets < embedding_dim
-    if is_fp8:
-        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
-    else:
-        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
-    values = tl.load(
-        weight_ptr + local_idx * embedding_dim + offsets,
-        mask=mask,
-        other=0.0,
-    ).to(tl.bfloat16)
-    tl.store(
-        output_ptr + row_id * embedding_dim + offsets,
-        tl.where(in_range, values, 0.0),
-        mask=mask,
-    )
-
-
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """PLE table read directly from host memory (pinned, or a file-backed mmap).
 
@@ -1114,7 +1100,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 self._file_prefetcher.enqueue(
                     flat_ids, vocab_start=vocab_start, vocab_end=vocab_end
                 )
-            _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+            gather_ple_embedding_kernel[(flat_ids.numel(),)](
                 table.data_ptr(),
                 ids,
                 output,
@@ -1245,7 +1231,12 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         nn.init.zeros_(self.conv1d.weight)
         self._prefetch_stream = (
-            torch.get_device_module().Stream() if config.ple_offload_embedding else None
+            torch.get_device_module().Stream()
+            if config.ple_offload_embedding
+            or isinstance(
+                self.ple_embedding.ngram_embedding, PeerVocabParallelEmbedding
+            )
+            else None
         )
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
@@ -2714,12 +2705,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 loaded_weight.dtype == torch.float8_e4m3fn
                 and emb.weight.dtype != torch.float8_e4m3fn
             ):
-                if isinstance(emb, Qwen4ExpPinnedHostEmbedding):
-                    # offload gathers from pinned host memory; a swapped-in
-                    # pageable tensor would fault in the Triton kernel.
+                if isinstance(
+                    emb, (Qwen4ExpPinnedHostEmbedding, PeerVocabParallelEmbedding)
+                ):
+                    # The table must retain its pinned or symmetric allocation.
                     raise ValueError(
                         "fp8 PLE auto-switch is unsupported with "
-                        "ple_offload_embedding; set "
+                        "ple_offload_embedding or NVLink lookup; set "
                         'text_config.ple_embedding_dtype="float8_e4m3fn" instead'
                     )
                 logger.info(
@@ -2968,7 +2960,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
 
+        self.post_load_weights()
         return loaded_params
+
+    def post_load_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, PeerVocabParallelEmbedding):
+                module.finish_loading()
 
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.quantization.unquant import precompile_splitk_tactics
