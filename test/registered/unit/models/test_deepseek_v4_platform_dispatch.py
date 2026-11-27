@@ -284,7 +284,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         state = mhc.HcState(x, pre_prev)
         seen = {}
 
-        def fake_pre_sinkhorn_v2(*args, **kwargs):
+        def fake_pre_dpskv4(*args, **kwargs):
             seen["args"] = args
             seen["kwargs"] = kwargs
             return (
@@ -295,7 +295,7 @@ class TestNpuMhcSeam(unittest.TestCase):
             )
 
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
-        stub.mhc_pre_sinkhorn_v2 = fake_pre_sinkhorn_v2
+        stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
             patch.object(mhc, "is_npu_arch35", return_value=False),
@@ -317,7 +317,8 @@ class TestNpuMhcSeam(unittest.TestCase):
         self.assertEqual(args[6], 1e-6)
         self.assertEqual(args[7], 1e-6)
         # V2 receives the previous pre-mix and returns the current triplet.
-        self.assertEqual(set(seen["kwargs"]), {"pre_mix"})
+        self.assertEqual(set(seen["kwargs"]), {"pre_mix", "return_pre"})
+        self.assertIs(seen["kwargs"]["return_pre"], True)
         self.assertIs(seen["kwargs"]["pre_mix"], pre_prev)
         # ``mix_stats`` is skipped: the post reads the stashed coefficients.
         pre, post_mix, comb = state.stats
@@ -331,7 +332,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         state = mhc.HcState(x)  # no previous pre-mix
         seen = {}
 
-        def fake_pre_sinkhorn_v2(*args, **kwargs):
+        def fake_pre_dpskv4(*args, **kwargs):
             seen["args"] = args
             seen["kwargs"] = kwargs
             return (
@@ -342,7 +343,7 @@ class TestNpuMhcSeam(unittest.TestCase):
             )
 
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
-        stub.mhc_pre_sinkhorn_v2 = fake_pre_sinkhorn_v2
+        stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
             patch.object(mhc, "is_npu_arch35", return_value=True),
@@ -358,7 +359,8 @@ class TestNpuMhcSeam(unittest.TestCase):
         pre_mix = seen["kwargs"]["pre_mix"]
         self.assertEqual(pre_mix.dtype, torch.float32)
         torch.testing.assert_close(pre_mix, expected)
-        self.assertEqual(set(seen["kwargs"]), {"pre_mix"})
+        self.assertEqual(set(seen["kwargs"]), {"pre_mix", "return_pre"})
+        self.assertIs(seen["kwargs"]["return_pre"], True)
 
     def test_npu_empty_batch_skips_the_kernel(self):
         hc = self._sub_layer()
@@ -369,7 +371,7 @@ class TestNpuMhcSeam(unittest.TestCase):
             raise AssertionError("the kernel must not run without rows")
 
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
-        stub.mhc_pre_sinkhorn_v2 = boom
+        stub.mhc_pre_dpskv4 = boom
         with (
             patch.object(mhc, "_is_npu", True),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),

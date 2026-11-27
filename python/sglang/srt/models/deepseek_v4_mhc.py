@@ -367,7 +367,7 @@ def mix_stats_from_state(
 ) -> HcTriplet:
     """``mix_stats``, unless the combine already stashed the triplet.
 
-    The NPU combine (``mhc_pre_sinkhorn_v2``, see ``_npu_combine_premix``) predicts
+    The NPU combine (``mhc_pre_dpskv4``, see ``_npu_combine_premix``) predicts
     this sublayer's ``(pre, post, comb)`` as a by-product and parks it on
     ``state.stats``.  This consumes the fused operator's coefficients exactly
     like the target model does (``precomputed=state.stats`` through
@@ -566,9 +566,9 @@ def _npu_combine_premix(
         # one-hot (stream 0 on its own).
         apply_pre = x.new_zeros((x.shape[0], cfg.mult), dtype=torch.float32)
         apply_pre[:, 0] = 1.0
-    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn_v2
+    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
 
-    y, post_mix, comb, pre = mhc_pre_sinkhorn_v2(
+    y, post_mix, comb, pre = mhc_pre_dpskv4(
         x,
         hc.fn,
         hc.scale,
@@ -578,6 +578,7 @@ def _npu_combine_premix(
         cfg.eps,
         cfg.rms_eps,
         pre_mix=apply_pre,
+        return_pre=True,
     )
     state.stats = (pre, post_mix, comb)
     return hc.norm(y)
