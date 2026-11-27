@@ -169,14 +169,17 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
         self,
         base_url: str,
         backend: str,
-        extra_cfg: dict,
+        extra_cfg: dict | str,
         prefetch_policy: str = "timeout",
         write_policy: str = "write_through",
         headers: dict | None = None,
     ):
+        extra_cfg_json = (
+            extra_cfg if isinstance(extra_cfg, str) else json.dumps(extra_cfg)
+        )
         payload = {
             "hicache_storage_backend": backend,
-            "hicache_storage_backend_extra_config_json": json.dumps(extra_cfg),
+            "hicache_storage_backend_extra_config_json": extra_cfg_json,
             "hicache_storage_prefetch_policy": prefetch_policy,
             "hicache_write_policy": write_policy,
         }
@@ -308,6 +311,29 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             self.assertEqual(
                 status2.get("hicache_write_policy"), "write_through_selective"
             )
+
+            # A malformed same-backend update must not change config or policies.
+            code_attach_invalid, body_attach_invalid = self._attach_backend(
+                base_url=base_url2,
+                backend="file",
+                extra_cfg="{",
+                prefetch_policy="timeout",
+                write_policy="write_back",
+                headers=admin_headers,
+            )
+            self.assertEqual(
+                code_attach_invalid,
+                400,
+                f"{code_attach_invalid} - {body_attach_invalid}",
+            )
+            self.assertIn(
+                "Failed to parse storage_backend_extra_config_json",
+                body_attach_invalid,
+            )
+            status_after_invalid = self._get_backend_status(
+                base_url2, headers=admin_headers
+            )
+            self.assertEqual(status_after_invalid, status2)
 
             # 4) Attach again with different backend should be rejected
             code_attach_again, body_attach_again = self._attach_backend(
