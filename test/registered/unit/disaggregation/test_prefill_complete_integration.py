@@ -35,7 +35,10 @@ from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_prefill_pp_sections
+from sglang.srt.disaggregation.utils import (
+    TransferBackend,
+    poll_and_all_reduce_prefill_pp_sections,
+)
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.managers.schedule_batch import Req
@@ -683,6 +686,8 @@ class TestAllocationIntegration(CustomTestCase):
 
     def inflight_scheduler(self, reqs):
         scheduler = SchedulerDisaggregationPrefillMixin()
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.transfer_backend = TransferBackend.MOONCAKE
         scheduler.tree_cache = Mock()
         scheduler.scheduler_stage_metrics = None
         scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
