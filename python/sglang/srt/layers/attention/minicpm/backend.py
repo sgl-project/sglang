@@ -428,7 +428,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             metadata=metadata,
             full_compressed_k1=compressed_k,
             full_compressed_k2=compressed_k2,
-            max_context_length=self.max_kv_len,
+            max_kv_len=self.max_kv_len,
             k1_kernel_size=self.k1_kernel_size,
             k1_kernel_stride=self.k1_kernel_stride,
             k2_kernel_size=self.k2_kernel_size,
@@ -459,7 +459,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 k2_kernel_stride=self.k2_kernel_stride,
                 dtype=key_states.dtype,
                 device=key_states.device,
-                max_context_length=self.max_kv_len,
+                max_kv_len=self.max_kv_len,
             )
 
             compressed = []
@@ -704,7 +704,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 k2_kernel_stride=self.k2_kernel_stride,
                 dtype=k.dtype,
                 device=k.device,
-                max_context_length=self.max_kv_len,
+                max_kv_len=self.max_kv_len,
             )
 
         dense_layout_spans = [
