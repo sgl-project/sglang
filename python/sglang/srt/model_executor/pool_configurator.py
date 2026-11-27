@@ -1533,7 +1533,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"sparse-attention operator, got {self._npu_c128_page_size}"
             )
 
-    def _npu_swa_pool_bytes(self, swa_tokens: int, *, padding_only: bool = False) -> int:
+    def _npu_swa_pool_bytes(
+        self, swa_tokens: int, *, padding_only: bool = False
+    ) -> int:
         # Same reserved-page rule as NPUDeepSeekV4SingleKVPool.create_buffer.
         swa_pages = (swa_tokens + self.page_size + 1) // self.page_size
         swa_rows = swa_pages * self.page_size
@@ -1691,10 +1693,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 logical_swa_bytes = (
                     full_tokens * self.swa_ratio * self._get_bytes_per_swa_token()
                 )
-                padding_bytes += self._npu_swa_pool_bytes(swa_tokens) - logical_swa_bytes
+                padding_bytes += (
+                    self._npu_swa_pool_bytes(swa_tokens) - logical_swa_bytes
+                )
             for ratio, layers in self.stage_owner_layers.items():
                 size = full_tokens // ratio
-                page = self._npu_c128_page_size if ratio == 128 else self.page_size // ratio
+                page = (
+                    self._npu_c128_page_size
+                    if ratio == 128
+                    else self.page_size // ratio
+                )
                 rows = ((size + page + 1) // page) * page
                 layer_bytes = rows * self._npu_kv_row_bytes[ratio]
                 if ratio == 4:
@@ -1702,7 +1710,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 elif ratio in (1, 2):
                     index_size = (full_tokens + self.page_size) // ratio
                     index_page = DSV41_INDEX_PAGE_SIZE
-                    index_rows = ((index_size + index_page + 1) // index_page) * index_page
+                    index_rows = (
+                        (index_size + index_page + 1) // index_page
+                    ) * index_page
                     layer_bytes += index_rows * self.low_ratio_index_bytes
                 logical_layer_bytes = (
                     full_tokens * self._compressed_bytes_per_full_token(ratio)
