@@ -65,14 +65,20 @@ def _create_linear_attention_backend(runner, fallback):
     from sglang.srt.platforms import current_platform
 
     factory = fallback
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.attention.kda_backend import (
+            get_linear_attention_backend,
+        )
+
+        factory = get_linear_attention_backend(fallback)
     if current_platform.is_out_of_tree():
-        backend_class_name = f"{fallback.__module__}.{fallback.__qualname__}"
+        backend_class_name = f"{factory.__module__}.{factory.__qualname__}"
         factory = OOT_LINEAR_ATTENTION_BACKENDS.get(
             current_platform.get_dispatch_key_name(), {}
-        ).get(backend_class_name, fallback)
+        ).get(backend_class_name, factory)
     backend = factory(runner)
     if factory is not fallback:
-        logger.info("Using OOT linear attention backend: %s", type(backend).__name__)
+        logger.info("Using linear attention backend: %s", type(backend).__name__)
     return backend
 
 
@@ -498,7 +504,15 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
             prefill_default = flashinfer_gdn_prefill_default(runner)
         elif hybrid_kda_config(runner.model_config) is not None and not is_npu():
-            prefill_default = flashinfer_kda_prefill_default(runner)
+            if _is_sail:
+                from sglang.srt.hardware_backend.sail.attention.kda_backend import (
+                    sail_pla_prefill_default,
+                )
+
+                # PPU must not inherit the CUDA Blackwell KDA prefill default.
+                prefill_default = sail_pla_prefill_default(runner.model_config)
+            else:
+                prefill_default = flashinfer_kda_prefill_default(runner)
         runner.linear_attn_backends = resolve_linear_attn_backends(
             prefill_default=prefill_default
         )

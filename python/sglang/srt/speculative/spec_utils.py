@@ -52,6 +52,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_sail,
     is_xpu,
     next_power_of_2,
 )
@@ -1417,13 +1418,18 @@ def commit_mamba_states_after_verify(
             commit_kda_replayssm_after_verify,
         )
 
+        if is_sail():
+            from sglang.srt.hardware_backend.sail.kernels.kda import (
+                commit_after_verify_or_fallback as commit_kda_replayssm_after_verify,
+            )
+
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         ring_indices = None
         if mamba_pool.replayssm_request_ring:
             # The ring rows the forward resolved, never the live request table.
             assert state_slots.ring is not None, "request-scoped ring without rows"
             ring_indices = state_slots.ring[: replay_state_indices.shape[0]]
-        commit_kda_replayssm_after_verify(
+        commit_kwargs = dict(
             spec_state=spec_state,
             state_batch_indices=replay_state_indices,
             accept_lens=accept_lens,  # incl. bonus token
@@ -1434,6 +1440,7 @@ def commit_mamba_states_after_verify(
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
             ring_indices=ring_indices,
         )
+        commit_kda_replayssm_after_verify(**commit_kwargs)
         return
 
     attn_backend = model_runner.attn_backend

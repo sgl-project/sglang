@@ -109,13 +109,17 @@ SGL_DEVICE void fence_proxy_async_shared() {
 namespace sglang::host::tma {
 
 /// The driver's `cuTensorMapEncodeTiled`, resolved once through the runtime.
-inline PFN_cuTensorMapEncodeTiled_v12000 encode_tiled_fn() {
+/// Spell the function-pointer type as decltype(&cuTensorMapEncodeTiled) instead of the
+/// PFN_cuTensorMapEncodeTiled_v12000 typedef: on SAIL, sailify rewrites the function name to
+/// hgTensorMapEncodeTiled but leaves the PFN_ typedef unmapped, so the typedef name does not
+/// compile under hgcc. decltype is type-identical on CUDA and maps cleanly on SAIL.
+inline decltype(&cuTensorMapEncodeTiled) encode_tiled_fn() {
   static const auto fn = [] {
     void* sym = nullptr;
     cudaDriverEntryPointQueryResult status;
     CHECK_CUDA(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &sym, 12000, cudaEnableDefault, &status));
     CHECK_HOST(status == cudaDriverEntryPointSuccess && sym != nullptr) << "cuTensorMapEncodeTiled unavailable";
-    return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(sym);
+    return reinterpret_cast<decltype(&cuTensorMapEncodeTiled)>(sym);
   }();
   return fn;
 }

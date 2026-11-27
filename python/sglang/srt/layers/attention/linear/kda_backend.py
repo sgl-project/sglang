@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
 )
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
+    LinearAttnBackends,
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
     select_verify_intermediate_state_indices,
@@ -489,8 +490,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # gfx950's one-kernel chain verify (kda_backend_hip), set in __init__.
     _hip_chain_verify_fn = None
 
+    @staticmethod
+    def _effective_backends(backends: LinearAttnBackends) -> LinearAttnBackends:
+        """The kernel choice the dispatcher binds; every backend-keyed check reads it."""
+        return backends
+
     def _create_kernel_dispatcher(self, backends):
         return KDAKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+
+    def _needs_intermediate_states(self, track_ssm: bool) -> bool:
+        """Keep the default tracking schedule; platforms may specialize it."""
+        return track_ssm
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -502,7 +512,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.conv_states_shape = (
             self.state_pool.mamba_cache.conv[0].transpose(-1, -2).shape
         )
-        backends = model_runner.linear_attn_backends
+        backends = self._effective_backends(model_runner.linear_attn_backends)
         decode_backend = backends.decode
         prefill_backend = backends.prefill
         verify_backend = backends.verify
@@ -927,7 +937,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 and onorm_gate is not None
                 and mixed_qkv.shape[0] == cache_indices.shape[0]
                 and b.ndim == 3
-                and kda_fused_decode.covered(
+                and self._fused_decode_covered(
                     mixed_qkv,
                     a,
                     b[0],
@@ -940,25 +950,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 if self._fused_override_notice is not None:
                     rank0_log(self._fused_override_notice)
                     self._fused_override_notice = None
-                w_q_t, w_k_t, w_v_t, conv_bias, a_log, onorm_w, onorm_eps = fused_static
-                core_attn_out = kda_fused_decode.kda_fused_decode(
-                    mixed_qkv,
-                    a,
-                    b[0],
-                    conv_states,
-                    w_q_t,
-                    w_k_t,
-                    w_v_t,
-                    conv_bias,
-                    a_log,
-                    layer.dt_bias,
-                    onorm_gate,
-                    onorm_w,
-                    ssm_states,
-                    cache_indices,
-                    scale=layer.head_k_dim**-0.5,
-                    onorm_eps=onorm_eps,
-                    lower_bound=layer.lower_bound,
+                core_attn_out = self._run_fused_decode(
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b[0],
+                    conv_states=conv_states,
+                    fused_static=fused_static,
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    onorm_gate=onorm_gate,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
                 )
                 layer._k3_onorm_consumed = True
                 self._track_mamba_state_decode(
@@ -1050,6 +1052,57 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
         return core_attn_out
+
+    def _fused_decode_covered(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        onorm_gate: torch.Tensor,
+    ) -> bool:
+        """Whether the fused decode kernel covers this decode batch."""
+        return kda_fused_decode.covered(
+            mixed_qkv, a, b, conv_states, ssm_states, cache_indices, onorm_gate
+        )
+
+    def _run_fused_decode(
+        self,
+        *,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        fused_static: tuple,
+        layer: RadixLinearAttention,
+        forward_batch,
+        onorm_gate: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fused decode step: conv update, recurrence and gated RMSNorm."""
+        w_q_t, w_k_t, w_v_t, conv_bias, a_log, onorm_w, onorm_eps = fused_static
+        return kda_fused_decode.kda_fused_decode(
+            mixed_qkv,
+            a,
+            b,
+            conv_states,
+            w_q_t,
+            w_k_t,
+            w_v_t,
+            conv_bias,
+            a_log,
+            layer.dt_bias,
+            onorm_gate,
+            onorm_w,
+            ssm_states,
+            cache_indices,
+            scale=layer.head_k_dim**-0.5,
+            onorm_eps=onorm_eps,
+            lower_bound=layer.lower_bound,
+        )
 
     def _convolve_prefill(
         self,
@@ -1213,7 +1266,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.float32,
                 device=ssm_states.device,
             )
-        core_attn_out = self.kernel_dispatcher.extend(
+        need_intermediate_states = self._needs_intermediate_states(track_ssm)
+        result = self.kernel_dispatcher.extend(
             q=q,
             k=k,
             v=v,
@@ -1233,7 +1287,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
-            return_intermediate_states=track_ssm,
+            return_intermediate_states=need_intermediate_states,
             # Which global chunk rows of h the track snapshot will read; lets
             # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
             # fast path when the snapshot only needs the final state.
@@ -1250,14 +1304,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
             track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
         )
+        # Kernels that emit per-chunk states return (out, h); the rest return a
+        # bare output tensor.
+        core_attn_out, h = result if isinstance(result, tuple) else (result, None)
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
             # ping-pong track slots (see _init_track_ssm_indices).
-            core_attn_out, h = core_attn_out
             self._track_mamba_state_extend(
                 forward_batch,
-                h,
+                h if need_intermediate_states else None,
                 ssm_states,
                 self.forward_metadata,
                 h_track_buf=h_track_buf,
