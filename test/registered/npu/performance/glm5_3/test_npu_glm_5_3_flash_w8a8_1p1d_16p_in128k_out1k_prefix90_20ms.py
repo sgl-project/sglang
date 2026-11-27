@@ -1,3 +1,4 @@
+import importlib.util
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
@@ -6,6 +7,10 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     BENCHMARK_TOOL_DEFAULT,
     GLM_5_3_FLASH_W8A8_MODEL_PATH,
     TestNpuPerfMultiNodePdSepTestCaseBase,
+)
+from sglang.test.ascend.test_ascend_utils import (
+    append_ld_library_path,
+    write_memfabric_tent_conf,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -16,7 +21,20 @@ register_npu_ci(
     disabled="performance testcase",
 )
 
-GLM_5_3_FLASH_PD_SEP_PREFILL_ENVS = {
+MOONCAKE_INSTALLED = importlib.util.find_spec("mooncake") is not None
+DISAGGREGATION_TRANSFER_BACKEND = "mooncake" if MOONCAKE_INSTALLED else "ascend"
+
+# Mooncake + TENT + MemFabric, only used when the Mooncake package is present.
+MOONCAKE_ENVS = {
+    "MC_USE_TENT": "1",
+    "MF_PROTOCOL": "device_sdma",
+    "MF_TRANSFER_TIMEOUT": "10000",
+    "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
+}
+
+# Common environment variables for GLM-5.3-Flash PD-Sep 128k1k deployment,
+# aligned with the Wiki launch script (GLM5.3-FLASH-1P1D).
+GLM_5_3_FLASH_PD_SEP_COMMON_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
@@ -27,37 +45,48 @@ GLM_5_3_FLASH_PD_SEP_PREFILL_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1200",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1200",
+    "HCCL_SOCKET_IFNAME": NIC_NAME,
+    "GLOO_SOCKET_IFNAME": NIC_NAME,
+}
+
+GLM_5_3_FLASH_PD_SEP_PREFILL_ENVS = {
+    **GLM_5_3_FLASH_PD_SEP_COMMON_ENVS,
     "HCCL_BUFFSIZE": "1200",
     "DEEPEP_HCCL_BUFFSIZE": "1200",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "128",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "1024",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "TASK_QUEUE_ENABLE": "2",
     "HCCL_IF_BASE_PORT": "61000",
-    "HCCL_SOCKET_IFNAME": NIC_NAME,
-    "GLOO_SOCKET_IFNAME": NIC_NAME,
 }
 
 GLM_5_3_FLASH_PD_SEP_DECODE_ENVS = {
-    "SGLANG_SET_CPU_AFFINITY": "1",
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-    "STREAMS_PER_DEVICE": "32",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_ENABLE_JIT_DEEPGEMM": "False",
-    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
-    "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
-    "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
-    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1200",
-    "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1200",
+    **GLM_5_3_FLASH_PD_SEP_COMMON_ENVS,
     "HCCL_BUFFSIZE": "512",
     "DEEPEP_HCCL_BUFFSIZE": "512",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
+    "SGLANG_ENABLE_SPEC_V2": "1",
+    "SGLANG_SPEC_ENABLE_OVERLAP_REFLOW": "1",
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
     "TASK_QUEUE_ENABLE": "0",
     "HCCL_IF_BASE_PORT": "61010",
-    "HCCL_SOCKET_IFNAME": NIC_NAME,
-    "GLOO_SOCKET_IFNAME": NIC_NAME,
 }
+
+# NEXTN (MTP) speculative arguments shared by the prefill and decode nodes,
+# aligned with the Wiki launch script. The MTP draft layer is W8A8_DYNAMIC in
+# the checkpoint; do NOT set --speculative-draft-model-quantization unquant —
+# the draft inherits --quantization modelslim by default.
+GLM_5_3_FLASH_PD_SEP_SPECULATIVE_ARGS = [
+    "--speculative-draft-model-path",
+    GLM_5_3_FLASH_W8A8_MODEL_PATH,
+    "--speculative-algorithm",
+    "NEXTN",
+    "--speculative-num-steps",
+    4,
+    "--speculative-eagle-topk",
+    1,
+    "--speculative-num-draft-tokens",
+    5,
+]
 
 GLM_5_3_FLASH_PD_SEP_PREFILL_ARGS = [
     "--quantization",
@@ -67,7 +96,7 @@ GLM_5_3_FLASH_PD_SEP_PREFILL_ARGS = [
     "--disaggregation-mode",
     "prefill",
     "--disaggregation-transfer-backend",
-    "ascend",
+    DISAGGREGATION_TRANSFER_BACKEND,
     "--attention-backend",
     "ascend",
     "--trust-remote-code",
@@ -77,10 +106,6 @@ GLM_5_3_FLASH_PD_SEP_PREFILL_ARGS = [
     "--tp-size",
     16,
     "--pp-size",
-    1,
-    "--attn-dp-size",
-    1,
-    "--moe-dense-tp",
     1,
     "--nnodes",
     1,
@@ -93,33 +118,24 @@ GLM_5_3_FLASH_PD_SEP_PREFILL_ARGS = [
     "--mem-fraction-static",
     0.78,
     "--page-size",
-    64,
+    128,
     "--max-running-requests",
-    16,
+    32,
     "--chunked-prefill-size",
-    8192,
+    16384,
     "--max-prefill-tokens",
-    300000,
+    16384,
     "--watchdog-timeout",
     9000,
     # NPU DSA KPool widens the logical page to 512, so the mamba track
     # interval must be a multiple of 512 to land on the radix grid.
     "--mamba-track-interval",
     512,
+    "--disable-radix-cache",
+    *GLM_5_3_FLASH_PD_SEP_SPECULATIVE_ARGS,
 ]
 
 GLM_5_3_FLASH_PD_SEP_DECODE_ARGS = [
-    "--speculative-algorithm",
-    "NEXTN",
-    "--speculative-num-steps",
-    3,
-    "--speculative-eagle-topk",
-    1,
-    "--speculative-num-draft-tokens",
-    4,
-    # Flash MTP block has no ModelSlim description; keep the draft unquantized.
-    "--speculative-draft-model-quantization",
-    "unquant",
     "--quantization",
     "modelslim",
     "--device",
@@ -127,7 +143,8 @@ GLM_5_3_FLASH_PD_SEP_DECODE_ARGS = [
     "--disaggregation-mode",
     "decode",
     "--disaggregation-transfer-backend",
-    "ascend",
+    DISAGGREGATION_TRANSFER_BACKEND,
+    "--disaggregation-decode-enable-radix-cache",
     "--attention-backend",
     "ascend",
     "--trust-remote-code",
@@ -149,24 +166,28 @@ GLM_5_3_FLASH_PD_SEP_DECODE_ARGS = [
     "--load-balance-method",
     "round_robin",
     "--mem-fraction-static",
-    0.75,
+    0.80,
     "--page-size",
-    64,
-    "--max-running-requests",
     128,
-    "--context-length",
-    180000,
+    "--max-running-requests",
+    64,
     "--cuda-graph-bs-decode",
     1,
     2,
+    3,
     4,
-    8,
     "--watchdog-timeout",
     9000,
     # NPU DSA KPool widens the logical page to 512, so the mamba track
     # interval must be a multiple of 512 to land on the radix grid.
     "--mamba-track-interval",
     512,
+    "--enable-hierarchical-cache",
+    "--hicache-io-backend",
+    "kernel_ascend",
+    "--hicache-mem-layout",
+    "page_first",
+    *GLM_5_3_FLASH_PD_SEP_SPECULATIVE_ARGS,
 ]
 
 GLM_5_3_FLASH_PD_SEP_MODEL_CONFIG = {
@@ -199,6 +220,30 @@ class TestNPUGLM5_3_FLASH_W8A8_1P1D_16P_In128k_Out1k_Prefix90_20ms(
     tpot = None
     output_token_throughput = None
     pop_sglang_is_in_ci_for_gsp = True
+
+    @classmethod
+    def setUpClass(cls):
+        common_envs = dict(GLM_5_3_FLASH_PD_SEP_COMMON_ENVS)
+        if MOONCAKE_INSTALLED:
+            common_envs.update(MOONCAKE_ENVS)
+            common_envs["MC_TENT_CONF"] = write_memfabric_tent_conf()
+            common_envs["LD_LIBRARY_PATH"] = append_ld_library_path(
+                ("memfabric_hybrid", "lib"), ("mooncake", None)
+            )
+        cls.model_config = {
+            **GLM_5_3_FLASH_PD_SEP_MODEL_CONFIG,
+            "prefill_args": list(GLM_5_3_FLASH_PD_SEP_PREFILL_ARGS),
+            "decode_args": list(GLM_5_3_FLASH_PD_SEP_DECODE_ARGS),
+            "prefill_envs": {
+                **common_envs,
+                **GLM_5_3_FLASH_PD_SEP_PREFILL_ENVS,
+            },
+            "decode_envs": {
+                **common_envs,
+                **GLM_5_3_FLASH_PD_SEP_DECODE_ENVS,
+            },
+        }
+        super().setUpClass()
 
     def test_npu_glm_5_3_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms(self):
         """Run NPU performance test for GLM-5.3-Flash-w8a8 PD separation 1p1d 16p"""

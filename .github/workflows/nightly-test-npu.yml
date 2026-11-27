@@ -94,10 +94,10 @@ jobs:
           fi
           JOB_FILTER="$(echo "${JOB_FILTER}" | tr -d '[:space:]')"
           # TEMP: pull_request runs carry no inputs, so pin the PR rerun to the
-          # qwen3.6-27b W8A8 GPQA accuracy case, the qwen3.6-27b 2P
-          # in16k/out1k perf case, and the GLM-5.3-Flash 1P1D 16P perf case.
+          # GLM-5.3-Flash 1P1D 16P perf case only; the qwen3.6-27b single-node
+          # cases are disabled in this temporary pipeline.
           if [ -z "${JOB_FILTER}" ] && [ "${{ github.event_name }}" = "pull_request" ]; then
-            JOB_FILTER="nightly-acc-test-2-npu-a3,nightly-perf-test-4-npu-a3,nightly-poc-multi-node-specified-tests"
+            JOB_FILTER="nightly-poc-multi-node-specified-tests"
           fi
           echo "job_filter=${JOB_FILTER:-all}" | tee -a $GITHUB_OUTPUT
           if [ -z "${{ inputs.image_a3 }}" ]; then
@@ -261,9 +261,11 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
+  # Disabled for the temporary PR rerun pipeline: the qwen3.6-27b 2P perf case
+  # is replaced by the GLM-5.3-Flash 1P1D 16P case in the multi-node job below.
   nightly-perf-test-4-npu-a3:
     name: nightly-perf-test-4-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-4-npu-a3,')) }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -271,7 +273,6 @@ jobs:
       runner: linux-aarch64-a3-800t-4
       test_type: 'perf'
       test_suite: nightly-perf-test-4-npu-a3
-      # Temporary PR rerun pipeline: run only the qwen3.6-27b 2P in16k/out1k case.
       only_tests: |
         test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_2p_in16k_out1k_50ms.py
       is_nightly_pipeline_job: true
@@ -300,13 +301,14 @@ jobs:
       test_timeout_minutes: '180'
 
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
-  # Temporary PR rerun pipeline: only the qwen3.6-27b 1P in3k5/out1k5 GPQA case runs,
-  # via only_tests, so the suite is no longer partitioned here.
-  # The case runs with HCCL_DETERMINISTIC=true (see the test file) to remove the
-  # run-to-run drift observed at temperature=0.
+  # Disabled for the temporary PR rerun pipeline: the qwen3.6-27b 1P in3k5/out1k5
+  # GPQA case is replaced by the GLM-5.3-Flash 1P1D 16P case in the multi-node
+  # job below, so the suite is no longer partitioned here.
+  # The qwen case runs with HCCL_DETERMINISTIC=true (see the test file) to remove
+  # the run-to-run drift observed at temperature=0.
   nightly-acc-test-2-npu-a3:
     name: nightly-acc-test-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-2-npu-a3,')) }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
