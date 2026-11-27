@@ -486,7 +486,7 @@ class TestFusedExperts:
         atol = rtol = precision[torch_output.dtype]
         torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
 
-    @pytest.mark.parametrize("M", [1, 6])
+    @pytest.mark.parametrize("M", [1, 6, 1024])
     @pytest.mark.parametrize("N", [512])
     @pytest.mark.parametrize("K", [256])
     @pytest.mark.parametrize("E", [8])
@@ -522,6 +522,9 @@ class TestFusedExperts:
         bf16_w2_weight = torch.stack(bf16_w2_weight).detach()
 
         score = torch.rand((M, E), dtype=dtype)
+        if M > 128:
+            score.fill_(-1)
+            score[:, :topk] = torch.arange(topk, 0, -1, dtype=dtype)
 
         ref_out = torch_naive_fused_moe(
             a, bf16_w13_weight, bf16_w2_weight, score, topk, False

@@ -926,8 +926,11 @@ at::Tensor fused_experts_cpu(
     buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N) * 2;
   }
   if (moe_comp_method == CPUQuantMethod::INT4_W4A8) {
+    const int64_t cache_size_per_thread = std::max(
+        int64_t(get_cache_blocks<int8_t>(2 * BLOCK_N * K)) * 2 * BLOCK_N * K,
+        int64_t(get_cache_blocks<int8_t>(BLOCK_N * N)) * BLOCK_N * N);
     buffer_size_nbytes += M * topk * 2 * N * 2 + std::max(M * K, M * topk * N) + M * topk * sizeof(float) +
-                          num_threads * 2 * get_4bit_block_k_size(K / w1_scale.value().size(2)) * BLOCK_N;
+                          num_threads * cache_size_per_thread;
   }
   auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
 

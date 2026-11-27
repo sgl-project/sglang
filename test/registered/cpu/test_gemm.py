@@ -249,7 +249,7 @@ class TestGemm(CustomTestCase):
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     @parametrize(
-        M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
+        M=[1, 32, 129], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
     )
     def test_int4_awq_gemm(self, M, N, K, group_size, has_bias):
         awq_weight = torch.randint(-128, 128, (K, N // 8)).to(torch.int)
@@ -284,7 +284,7 @@ class TestGemm(CustomTestCase):
         torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
 
     @parametrize(
-        M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
+        M=[1, 32, 129], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
     )
     def test_int4_gptq_gemm(self, M, N, K, group_size, has_bias):
         torch.manual_seed(127)

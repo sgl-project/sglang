@@ -373,7 +373,8 @@ void tinygemm_kernel(
     int64_t ldc_f,
     int64_t ldc_s,
     bool store_out,
-    bool use_brgemm);
+    bool use_brgemm,
+    bool do_dequant = true);
 
 // mxfp4
 template <typename scalar_t>

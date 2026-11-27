@@ -86,24 +86,24 @@ void fused_experts_int4_w4a8_kernel_impl(
   int64_t num_groups = K / group_size;
 
   const int64_t stride_e = 2 * NB * Kc * (BLOCK_N * (_block_k / 2 + sizeof(int32_t)));
+  const int64_t cache_size_per_thread = std::max(
+      int64_t(get_cache_blocks<int8_t>(2 * BLOCK_N * K)) * 2 * BLOCK_N * K,
+      int64_t(get_cache_blocks<int8_t>(BLOCK_N * N)) * BLOCK_N * N);
   const bool sym_quant_act = false;
   // weight + compensation shape = [E, Nc, Kc, block_n * _block_k / 2 + block_n*sizeof(int32_t)]
   // scales/qzeros shape = [E, Nc, G, block_n]
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
-  at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
+  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb_end, int64_t nb0, int64_t nb_end) {
     // get local pointers
-    int tid = at::get_thread_num();
-    int8_t* dqB_tmp1 = dqB_tmp + tid * 2 * _block_k * BLOCK_N;
-    int8_t* dqB_tmp2 = dqB_tmp1 + _block_k * BLOCK_N;
+    int tid = get_thread_num();
+    int8_t* thread_weight_cache = dqB_tmp + tid * cache_size_per_thread;
     alignas(64) float As[BLOCK_M];
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
     float* __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     float* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
     bool is_brgemm_used = false;
-    for (int64_t i = begin; i < end; ++i) {
-      int64_t mb = i / NB;
-      int64_t nb = i % NB;
+    loop_2d<int8_t>(mb0, mb_end, nb0, nb_end, 2 * BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t nb1 = nb + NB;
       int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
       // B shape [K, n_size] in vnni format
@@ -118,6 +118,9 @@ void fused_experts_int4_w4a8_kernel_impl(
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       const bool use_brgemm = can_use_brgemm<int8_t>(m_size);
       is_brgemm_used = is_brgemm_used || use_brgemm;
+      const bool do_dequant = mb == mb0 || expert_id != expert_ids[mb - 1];
+      int8_t* dqB_tmp1 = thread_weight_cache + nb_offset * 2 * K * BLOCK_N;
+      int8_t* dqB_tmp2 = dqB_tmp1 + K * BLOCK_N;
       // copy to A [BLOCK_M, K]
       for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m] / topk;
@@ -142,14 +145,15 @@ void fused_experts_int4_w4a8_kernel_impl(
             Bs + nb * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*scales_b*/,
             Bz + nb * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*qzeros_b*/,
             compensation_ptr,
-            dqB_tmp1,
+            dqB_tmp1 + kci * _block_k * BLOCK_N,
             m_size,
             _block_k,
             K,
             BLOCK_N,
             2 * N,
             kci == Kc - 1,
-            use_brgemm);
+            use_brgemm,
+            do_dequant);
       }
 
       for (int kci = 0; kci < Kc; ++kci) {
@@ -167,16 +171,17 @@ void fused_experts_int4_w4a8_kernel_impl(
             Bs + nb1 * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*scales_b*/,
             Bz + nb1 * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*qzeros_b*/,
             compensation_ptr,
-            dqB_tmp2,
+            dqB_tmp2 + kci * _block_k * BLOCK_N,
             m_size,
             _block_k,
             K,
             BLOCK_N,
             2 * N,
             kci == Kc - 1,
-            use_brgemm);
+            use_brgemm,
+            do_dequant);
       }
-    }
+    });
 
     if (is_brgemm_used) {
       at::native::cpublas::brgemm_release();
@@ -207,15 +212,12 @@ void fused_experts_int4_w4a8_kernel_impl(
   Kc = IC / _block_k;
   const int64_t stride_e2 = NB2 * Kc * (BLOCK_N * (_block_k / 2 + sizeof(int32_t)));
   // parallel on [MB2, NB2]
-  at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
-    int tid = at::get_thread_num();
-    int8_t* dqB_tmp1 = dqB_tmp + tid * 2 * _block_k * BLOCK_N;
+  parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb_end, int64_t nb0, int64_t nb_end) {
+    int tid = get_thread_num();
+    int8_t* thread_weight_cache = dqB_tmp + tid * cache_size_per_thread;
     float* __restrict__ C2 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     bool is_brgemm_used = false;
-    for (int64_t i = begin; i < end; ++i) {
-      int64_t mb = i / NB2;
-      int64_t nb = i % NB2;
-
+    loop_2d<int8_t>(mb0, mb_end, nb0, nb_end, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
       const bool use_brgemm = can_use_brgemm<int8_t>(m_size);
@@ -224,6 +226,8 @@ void fused_experts_int4_w4a8_kernel_impl(
 
       // B shape [IC, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
+      const bool do_dequant = mb == mb0 || expert_id != expert_ids[mb - 1];
+      int8_t* dqB_tmp1 = thread_weight_cache + nb_offset * IC * BLOCK_N;
       const uint8_t* __restrict__ B = packed_w2 + expert_id * stride_e2;
 
       // Bz and Bs: [E, IC/gs, OC]
@@ -250,14 +254,15 @@ void fused_experts_int4_w4a8_kernel_impl(
             Bs + nb * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*scales_b*/,
             Bz + nb * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*zeros_b*/,
             compensation_ptr,
-            dqB_tmp1,
+            dqB_tmp1 + kci * _block_k * BLOCK_N,
             m_size,
             _block_k,
             IC,
             BLOCK_N,
             BLOCK_N,
             false,
-            use_brgemm);
+            use_brgemm,
+            do_dequant);
       }
 
       // 2.b copy from C to ic2 in original order
@@ -267,7 +272,7 @@ void fused_experts_int4_w4a8_kernel_impl(
         float weight = topk_weights[index];
         copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C2 + m * BLOCK_N, weight, n_size);
       }
-    }
+    });
 
     if (is_brgemm_used) {
       at::native::cpublas::brgemm_release();

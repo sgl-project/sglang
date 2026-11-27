@@ -5,8 +5,8 @@
 
 namespace {
 
+constexpr int64_t BLOCK_M = block_size_m();
 #define BLOCK_N block_size_n()
-#define BLOCK_M 128
 
 template <bool sym_quant_act>
 struct ActDtype;
@@ -278,7 +278,8 @@ void _dequant_gemm_accum(
     int64_t K,
     int64_t lda,
     int64_t ldc,
-    bool use_brgemm) {
+    bool use_brgemm,
+    bool do_dequant) {
   // Compute GEMM int8 * int8 -> int32
   // dequant result to float by applying scales/qzeros
 #if defined(CPU_CAPABILITY_AVX512)
@@ -302,7 +303,9 @@ void _dequant_gemm_accum(
     return;
   }
 
-  _dequant_weight_zp_only<N, ldb>(B, dqB, qzeros_b, K);
+  if (do_dequant) {
+    _dequant_weight_zp_only<N, ldb>(B, dqB, qzeros_b, K);
+  }
   using Tin = typename ActDtype<sym_quant_act>::type;
   Tin* A_ptr = (Tin*)A;
   if (use_brgemm) {
@@ -431,66 +434,56 @@ void _da8w4_linear_impl(
   // weight + compensation shape = [Nc, Kc, BLOCK_N * _block_k / 2 + BLOCK_N*sizeof(int32_t)]
   // scales/qzeros shape = [Nc, G, BLOCK_N]
   const bool use_brgemm = can_use_brgemm<int8_t>(M);
-  int64_t block_m = [&]() -> long {
-    if (M <= 48) {
-      return M;
-    } else if (M < 64) {
-      return 32;
-    } else if (M < 96) {
-      return 64;
-    } else {
-      return 128;
-    }
-  }();
-  int64_t Mc = div_up(M, block_m);
-  bool parallel_on_M = M > 128;
-  int64_t Nc = N / BLOCK_N;
-  int64_t num_blocks = parallel_on_M ? Mc * Nc : Nc;
-  int64_t group_size = div_up(K, num_groups);
-  int64_t _block_k = get_4bit_block_k_size(group_size);
-  int64_t Kc = K / _block_k;
-  int64_t block_per_group = group_size / _block_k;
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = N / BLOCK_N;
+  const int64_t group_size = div_up(K, num_groups);
+  const int64_t _block_k = get_4bit_block_k_size(group_size);
+  const int64_t Kc = K / _block_k;
+  const int64_t block_per_group = group_size / _block_k;
+  const bool cache_dqB = use_brgemm && (MB > 1);
+  const int64_t cache_blocks_nb = get_cache_blocks<int8_t>(BLOCK_N * K);
+  const int64_t dqB_size_per_thread = cache_dqB ? cache_blocks_nb * BLOCK_N * K : _block_k * BLOCK_N;
 
-  at::parallel_for(0, num_blocks, 1, [&](int64_t begin, int64_t end) {
+  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     int tid = get_thread_num();
-    float* C_tmp = output_temp + tid * block_m * BLOCK_N;
-    int8_t* dqB_tmp = dequant_weight_temp + tid * _block_k * BLOCK_N;
-    for (const auto i : c10::irange(begin, end)) {
-      int64_t mc = parallel_on_M ? i / Nc : 0;
-      int64_t nc = parallel_on_M ? i % Nc : i;
-      int64_t mc_end = parallel_on_M ? mc + 1 : Mc;
+    float* C_tmp = output_temp + tid * BLOCK_M * BLOCK_N;
+    int8_t* dqB_thread = dequant_weight_temp + tid * dqB_size_per_thread;
 
-      for (int mci = mc; mci < mc_end; ++mci) {
-        int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
-        // copy bias to y_buf if bias is not None
-        auto bias_data = bias ? bias + nc * BLOCK_N : nullptr;
-        copy_bias<BLOCK_N>(bias_data, C_tmp, m_size);
-        for (int kci = 0; kci < Kc; ++kci) {
-          int32_t* compensation_ptr =
-              sym_quant_act
-                  ? nullptr
-                  : (int32_t*)(void*)(weight + (nc * Kc + kci) * (BLOCK_N * (_block_k / 2 + sizeof(int32_t))) +
-                                      _block_k * BLOCK_N / 2) /*Bcomp*/;
-          _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2, sym_quant_act>(
-              /*C*/ C_tmp,
-              /*A*/ (uint8_t*)input + mci * block_m * K + kci * _block_k,
-              /*scales_a*/ input_scales + mci * block_m,
-              /*qzeros_a*/ input_qzeros + mci * block_m,
-              /*B*/ weight + (nc * Kc + kci) * (BLOCK_N * (_block_k / 2 + sizeof(int32_t))),
-              /*scales_b*/ weight_scales + nc * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N,
-              /*qzeros_b*/ weight_qzeros + nc * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N,
-              /*Bcomp*/ compensation_ptr,
-              /*dqB_tmp*/ dqB_tmp,
-              /*M*/ m_size,
-              /*K*/ _block_k,
-              /*lda*/ K,
-              /*ldc*/ BLOCK_N,
-              /*use_brgemm*/ use_brgemm);
-        }
-        // store y_buf to output with dtype conversion
-        store_out<out_dtype, BLOCK_N>(C_tmp, output + mci * block_m * N + nc * BLOCK_N, m_size, N /*lda*/);
+    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      int64_t m_start = mb * BLOCK_M;
+      int64_t m_size = std::min(M - m_start, BLOCK_M);
+      // copy bias to y_buf if bias is not None
+      auto bias_data = bias ? bias + nb * BLOCK_N : nullptr;
+      copy_bias<BLOCK_N>(bias_data, C_tmp, m_size);
+      const bool do_dequant = !cache_dqB || (mb == mb0);
+      int8_t* dqB_nb = cache_dqB ? (dqB_thread + nb_offset * BLOCK_N * K) : dqB_thread;
+      for (int kci = 0; kci < Kc; ++kci) {
+        int32_t* compensation_ptr =
+            sym_quant_act ? nullptr
+                          : (int32_t*)(void*)(weight + (nb * Kc + kci) * (BLOCK_N * (_block_k / 2 + sizeof(int32_t))) +
+                                              _block_k * BLOCK_N / 2) /*Bcomp*/;
+        int8_t* dqB_tmp = cache_dqB ? (dqB_nb + kci * _block_k * BLOCK_N) : dqB_nb;
+        _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2, sym_quant_act>(
+            /*C*/ C_tmp,
+            /*A*/ (uint8_t*)input + m_start * K + kci * _block_k,
+            /*scales_a*/ input_scales + m_start,
+            /*qzeros_a*/ input_qzeros + m_start,
+            /*B*/ weight + (nb * Kc + kci) * (BLOCK_N * (_block_k / 2 + sizeof(int32_t))),
+            /*scales_b*/ weight_scales + nb * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N,
+            /*qzeros_b*/ weight_qzeros + nb * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N,
+            /*Bcomp*/ compensation_ptr,
+            /*dqB_tmp*/ dqB_tmp,
+            /*M*/ m_size,
+            /*K*/ _block_k,
+            /*lda*/ K,
+            /*ldc*/ BLOCK_N,
+            /*use_brgemm*/ use_brgemm,
+            /*do_dequant*/ do_dequant);
       }
-    }
+      // store y_buf to output with dtype conversion
+      store_out<out_dtype, BLOCK_N>(C_tmp, output + m_start * N + nb * BLOCK_N, m_size, N /*lda*/);
+    });
+
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();
     }
@@ -778,8 +771,13 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
   const int8_t* b_qzeros_ptr = weight_qzeros.data_ptr<int8_t>();
   const float* bias_ptr = bias.has_value() ? bias.value().data_ptr<float>() : nullptr;
   int num_threads = at::get_num_threads();
+  const bool use_brgemm = can_use_brgemm<int8_t>(M_a);
+  const int64_t MB = div_up(M_a, BLOCK_M);
+  const bool cache_dqB = use_brgemm && (MB > 1);
+  const int64_t dqB_size_per_thread =
+      cache_dqB ? int64_t(get_cache_blocks<int8_t>(BLOCK_N * K_a)) * BLOCK_N * K_a : _block_k * BLOCK_N;
   int64_t temp_buffer_size = /* output temp */ num_threads * BLOCK_M * BLOCK_N * sizeof(float) +
-                             /*  weight dequant temp */ num_threads * _block_k * BLOCK_N;
+                             /*  weight dequant temp */ num_threads * dqB_size_per_thread;
   auto c_temp_buffer = at::empty({temp_buffer_size}, input.options().dtype(at::kChar));
   float* c_temp_ptr = (float*)((void*)(c_temp_buffer.data_ptr<int8_t>()));
   int8_t* dqB_temp_ptr = (int8_t*)((void*)(c_temp_ptr + num_threads * BLOCK_M * BLOCK_N));
@@ -847,10 +845,25 @@ void tinygemm_kernel(
     int64_t ldc_f,
     int64_t ldc_s,
     bool store_out,
-    bool use_brgemm) {
+    bool use_brgemm,
+    bool do_dequant) {
   // TODO: add sym quant act, now only asym
   _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2, false>(
-      C_temp, A, scales_a, qzeros_a, B, scales_b, qzeros_b, compensation, dqB_tmp, M, K, lda, ldc_f, use_brgemm);
+      C_temp,
+      A,
+      scales_a,
+      qzeros_a,
+      B,
+      scales_b,
+      qzeros_b,
+      compensation,
+      dqB_tmp,
+      M,
+      K,
+      lda,
+      ldc_f,
+      use_brgemm,
+      do_dequant);
   if (store_out) {
     // copy from Ctmp to C
     for (int64_t m = 0; m < M; ++m) {
@@ -877,7 +890,8 @@ void tinygemm_kernel(
       int64_t ldc_f,                        \
       int64_t ldc_s,                        \
       bool store_out,                       \
-      bool use_brgemm)
+      bool use_brgemm,                      \
+      bool do_dequant)
 
 INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
 INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
