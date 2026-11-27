@@ -118,75 +118,71 @@ def _qwen3_rerank_score(p_yes: float, p_no: float) -> float:
     return p_yes / denom
 
 
-def _get_jinja_env():
-    try:
-        import jinja2  # Lazy import: server env should provide this dependency.
-        from jinja2.sandbox import ImmutableSandboxedEnvironment
-    except ModuleNotFoundError as e:
-        raise ValueError(
-            "Rendering Qwen3 reranker prompts requires `jinja2`. "
-            "Please install it in your runtime environment (e.g., `pip install jinja2`)."
-        ) from e
-    # Using a sandboxed environment to stop malicious execution during model loading.
-    return ImmutableSandboxedEnvironment(
-        loader=jinja2.BaseLoader(),
-        autoescape=False,
-        undefined=jinja2.Undefined,
-    )
-
-
 def _render_jinja_chat_template(
     chat_template: str,
     *,
+    tokenizer,
     query: RerankContent,
     document: RerankContent,
     instruct: Optional[str],
 ) -> str:
-    """Render a loaded Jinja chat template for Qwen3 reranker prompts (text-only)."""
-    env = _get_jinja_env()
-    template = env.from_string(chat_template)
-
+    """Render text-only reranker prompts with the tokenizer's template cache."""
     # For text-only template, extract text content
     query_text = query if isinstance(query, str) else _extract_text_from_content(query)
     doc_text = (
         document if isinstance(document, str) else _extract_text_from_content(document)
     )
 
-    render_kwargs = {
-        "messages": [
-            {"role": "user", "content": query_text},
-            {"role": "user", "content": doc_text},
-        ]
-    }
+    messages = [
+        {"role": "user", "content": query_text},
+        {"role": "user", "content": doc_text},
+    ]
+    render_kwargs = {}
     # Only pass instruct when explicitly provided; template uses `default(...)`
     # which works only when the variable is undefined (not None).
     if instruct:
         render_kwargs["instruct"] = instruct
-    return template.render(**render_kwargs)
+    return tokenizer.apply_chat_template(
+        messages,
+        chat_template=chat_template,
+        tokenize=False,
+        add_generation_prompt=False,
+        return_dict=False,
+        **render_kwargs,
+    )
 
 
 def _render_vl_jinja_template(
     chat_template: str,
     *,
+    tokenizer,
     query: List[Dict[str, Any]],
     document: List[Dict[str, Any]],
     instruct: Optional[str],
 ) -> str:
-    """Render a loaded Jinja chat template for Qwen3-VL reranker prompts (multimodal).
+    """Render multimodal reranker prompts with the tokenizer's template cache.
 
     The template expects `query` and `document` as lists of content parts,
     where each part has a `type` field (text, image, video) and corresponding data.
     """
-    env = _get_jinja_env()
-    template = env.from_string(chat_template)
-
+    messages = [
+        {"role": "user", "content": query},
+        {"role": "user", "content": document},
+    ]
     render_kwargs = {
         "query": query,
         "document": document,
     }
     if instruct:
         render_kwargs["instruct"] = instruct
-    return template.render(**render_kwargs)
+    return tokenizer.apply_chat_template(
+        messages,
+        chat_template=chat_template,
+        tokenize=False,
+        add_generation_prompt=False,
+        return_dict=False,
+        **render_kwargs,
+    )
 
 
 def _extract_text_from_content(content: RerankContent) -> str:
@@ -372,6 +368,7 @@ class OpenAIServingRerank(OpenAIServingBase):
             prompts = [
                 _render_jinja_chat_template(
                     chat_template,
+                    tokenizer=self.tokenizer_manager.tokenizer,
                     query=request.query,
                     document=doc,
                     instruct=getattr(request, "instruct", None),
@@ -424,6 +421,7 @@ class OpenAIServingRerank(OpenAIServingBase):
                 # Render the chat template directly with query/document variables
                 prompt = _render_vl_jinja_template(
                     chat_template=_chat_template,
+                    tokenizer=self.tokenizer_manager.tokenizer,
                     query=query_content,
                     document=doc_content,
                     instruct=instruct,

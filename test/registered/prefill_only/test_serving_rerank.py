@@ -1,6 +1,12 @@
 import asyncio
+import copy
 import unittest
-from unittest.mock import Mock
+import uuid
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tokenizers import Tokenizer, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai.protocol import V1RerankReqInput
 from sglang.srt.managers.tokenizer_manager_score_mixin import ScoreResult
@@ -16,6 +22,7 @@ try:
         _is_qwen3_reranker_template,
         _qwen3_rerank_score,
         _render_jinja_chat_template,
+        _render_vl_jinja_template,
     )
 except ModuleNotFoundError as e:
     # Some minimal environments used for unit tests may not have FastAPI/torch installed.
@@ -24,6 +31,22 @@ except ModuleNotFoundError as e:
         OpenAIServingRerank = None  # type: ignore[assignment]
     else:
         raise
+
+
+def _text_tokenizer():
+    backend = Tokenizer(
+        models.WordLevel({"[UNK]": 0, "yes": 1, "no": 2}, unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    return PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+
+
+def _vl_template():
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "examples/chat_template/qwen3_vl_reranker.jinja"
+    )
+    return path.read_text().strip("\n").replace("\\n", "\n")
 
 
 class _DummyModelConfig:
@@ -135,15 +158,92 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
         except ModuleNotFoundError:
             self.skipTest("jinja2 is not installed")
 
+        tokenizer = _text_tokenizer()
         tpl = "{{ instruct | default('DEF') }}|{{ messages[0]['content'] }}|{{ messages[1]['content'] }}"
         self.assertEqual(
-            _render_jinja_chat_template(tpl, query="Q", document="D", instruct=None),
+            _render_jinja_chat_template(
+                tpl, tokenizer=tokenizer, query="Q", document="D", instruct=None
+            ),
             "DEF|Q|D",
         )
         self.assertEqual(
-            _render_jinja_chat_template(tpl, query="Q", document="D", instruct="I"),
+            _render_jinja_chat_template(
+                tpl, tokenizer=tokenizer, query="Q", document="D", instruct="I"
+            ),
             "I|Q|D",
         )
+
+    def test_helper_render_vl_template_preserves_media_and_defaults(self):
+        """Changing renderers must preserve prompt bytes and media alignment."""
+        from jinja2 import BaseLoader, Undefined
+        from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+        tokenizer = _text_tokenizer()
+        tokenizer.chat_template = "unrelated template"
+        template = _vl_template()
+        query = [
+            {"type": "text", "text": "Query\n问题"},
+            {"type": "image"},
+            {"type": "video"},
+        ]
+        document = [
+            {"type": "video"},
+            {"type": "text", "text": "Document <|im_end|>"},
+            {"type": "image"},
+        ]
+        before = copy.deepcopy((query, document))
+        legacy = ImmutableSandboxedEnvironment(
+            loader=BaseLoader(), autoescape=False, undefined=Undefined
+        ).from_string(template)
+        for instruct in (None, "", "Find relevant candidates."):
+            with self.subTest(instruct=instruct):
+                kwargs = {"query": query, "document": document}
+                if instruct:
+                    kwargs["instruct"] = instruct
+                actual = _render_vl_jinja_template(
+                    template,
+                    tokenizer=tokenizer,
+                    query=query,
+                    document=document,
+                    instruct=instruct,
+                )
+                self.assertEqual(actual.encode(), legacy.render(**kwargs).encode())
+                self.assertEqual(actual.count("<|image_pad|>"), 2)
+                self.assertEqual(actual.count("<|video_pad|>"), 2)
+                self.assertEqual((query, document), before)
+                self.assertEqual(tokenizer.chat_template, "unrelated template")
+
+    def test_helper_render_vl_template_reuses_compilation(self):
+        """Compile once without caching request-specific content or instructions."""
+        from jinja2 import Environment
+
+        tokenizer = _text_tokenizer()
+        template = _vl_template() + "{# " + uuid.uuid4().hex + " #}"
+        original = Environment.from_string
+        compiled = []
+
+        def observe(env, source, *args, **kwargs):
+            if source == template:
+                compiled.append(source)
+            return original(env, source, *args, **kwargs)
+
+        with patch.object(Environment, "from_string", new=observe):
+            prompts = [
+                _render_vl_jinja_template(
+                    template,
+                    tokenizer=tokenizer,
+                    query=[{"type": "text", "text": f"q{i}"}],
+                    document=[{"type": "text", "text": f"d{i}"}],
+                    instruct=f"instruction{i}",
+                )
+                for i in range(3)
+            ]
+        self.assertEqual(len(compiled), 1)
+        self.assertEqual(len(set(prompts)), 3)
+        for i, prompt in enumerate(prompts):
+            self.assertIn(f"<Instruct>: instruction{i}", prompt)
+            self.assertIn(f"<Query>:q{i}", prompt)
+            self.assertIn(f"<Document>:d{i}", prompt)
 
     def test_handle_non_streaming_request_qwen3_path_uses_score_prompts(self):
         class _TM(_DummyTokenizerManager):
@@ -152,7 +252,7 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
                 self.model_config = Mock()
                 self.model_config.is_generation = True
                 self.model_config.model_path = "qwen/qwen3"
-                self.tokenizer = Mock()
+                self.tokenizer = _text_tokenizer()
                 self.tokenizer.chat_template = (
                     'Note that the answer can only be "yes" or "no". '
                     "{{ messages[0]['content'] }} {{ messages[1]['content'] }}"
@@ -162,8 +262,12 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
                 self, prompts, label_token_ids, apply_softmax, request
             ):
                 # Return [p_yes, p_no] for each prompt
-                assert len(prompts) == 2
-                assert label_token_ids and len(label_token_ids) == 2
+                assert prompts == [
+                    'Note that the answer can only be "yes" or "no". q d1',
+                    'Note that the answer can only be "yes" or "no". q d2',
+                ]
+                assert label_token_ids == [1, 2]
+                assert apply_softmax is False
                 return ScoreResult(scores=[[0.9, 0.1], [0.2, 0.8]], prompt_tokens=42)
 
         handler = OpenAIServingRerank(_TM())
@@ -264,20 +368,25 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
                 self.model_config = Mock()
                 self.model_config.is_generation = True
                 self.model_config.model_path = "qwen/qwen3-vl"
-                self.tokenizer = Mock()
-                # Mock VL template detection
-                self.tokenizer.chat_template = (
-                    "{% for x in query %}{{ x.text }}{% endfor %}"
-                    "{% for x in document %}{{ x.text }}{% endfor %}"
-                    'answer can only be "yes" or "no" <|vision_start|>'
-                )
+                self.tokenizer = _text_tokenizer()
+                self.tokenizer.chat_template = _vl_template()
+                self.call_count = 0
 
             async def generate_request(self, req, _raw):
                 # Return logprobs for yes/no
                 # Mock logprobs: P(yes) > P(no) for first doc, P(no) > P(yes) for second
 
-                if not hasattr(self, "call_count"):
-                    self.call_count = 0
+                image = "<|vision_start|><|image_pad|><|vision_end|>"
+                video = "<|vision_start|><|video_pad|><|vision_end|>"
+                assert f"<Query>:query{image}{video}" in req.text
+                if self.call_count == 0:
+                    assert f"<Document>:doc1{video}{image}<|im_end|>" in req.text
+                    assert req.image_data == ["query.png", "doc1.png"]
+                    assert req.video_data == ["query.mp4", "doc1.mp4"]
+                else:
+                    assert "<Document>:doc2<|im_end|>" in req.text
+                    assert req.image_data == ["query.png"]
+                    assert req.video_data == ["query.mp4"]
 
                 if self.call_count == 0:
                     # First doc: yes is likely
@@ -290,10 +399,9 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
 
                 self.call_count += 1
 
-                # Qwen3 token IDs: YES=9693, NO=2152
                 top_logprobs = [
-                    (yes_logprob, 9693, "yes"),
-                    (no_logprob, 2152, "no"),
+                    (yes_logprob, 1, "yes"),
+                    (no_logprob, 2, "no"),
                 ]
 
                 # The rerank handler checks output_top_logprobs[0] for the first generated token
@@ -301,19 +409,29 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
 
                 yield {"meta_info": meta_info, "embedding": None}
 
-        handler = OpenAIServingRerank(_TM())
+        tm = _TM()
+        handler = OpenAIServingRerank(tm)
+        query = [
+            {"type": "text", "text": "query"},
+            {"type": "image_url", "image_url": {"url": "query.png"}},
+            {"type": "video_url", "video_url": {"url": "query.mp4"}},
+        ]
+        doc1 = [
+            {"type": "text", "text": "doc1"},
+            {"type": "video_url", "video_url": {"url": "doc1.mp4"}},
+            {"type": "image_url", "image_url": {"url": "doc1.png"}},
+        ]
         req = V1RerankReqInput(
-            query="query", documents=["doc1", "doc2"], return_documents=True
+            query=query, documents=[doc1, "doc2"], return_documents=True
         )
-        # Force VL path is handled by detection logic inside handler
-        # We mocked chat_template to satisfy _is_qwen3_vl_reranker_template
 
         raw_request = Mock()
         res = asyncio.run(handler._handle_non_streaming_request(req, req, raw_request))
 
+        self.assertEqual(tm.call_count, 2)
         self.assertEqual(len(res), 2)
         # First doc should have higher score
-        self.assertEqual(res[0].document, "doc1")
+        self.assertEqual(res[0].document, req.documents[0])
         self.assertAlmostEqual(res[0].score, 0.8)  # 0.8 / (0.8+0.2) = 0.8
 
         self.assertEqual(res[1].document, "doc2")
