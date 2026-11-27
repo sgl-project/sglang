@@ -50,7 +50,7 @@ def _make_backend(*, block_size, device, is_dspark_draft=True, low_ratios=()):
     )
     backend.req_to_token = req_to_token.to(device=device, dtype=torch.int32)
     backend.req_to_token_pool = SimpleNamespace(req_to_token=backend.req_to_token)
-    backend.MAX_SEQ_LEN_FOR_CAPTURE = MAX_CONTEXT
+    backend.max_kv_len = MAX_CONTEXT
     backend.model_runner = SimpleNamespace(
         model_config=SimpleNamespace(context_len=MAX_CONTEXT)
     )
@@ -492,7 +492,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         backend.low_ratios = ()
         backend.has_c4 = True
         backend.has_c128 = True
-        backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        backend.max_kv_len = 4096
         backend._build_forward_metadata = mock.Mock(return_value=capture_metadata)
         backend.init_forward_metadata_in_graph = mock.Mock()
         backend._refresh_fp4_prefill_workspace = mock.Mock()
@@ -504,7 +504,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         backend._build_forward_metadata.assert_called_once_with(
             forward_batch,
-            max_seq_len_override=backend.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len_override=backend.max_kv_len,
             use_prefill_cuda_graph=True,
         )
         backend.init_forward_metadata_in_graph.assert_called_once_with(forward_batch)
@@ -621,7 +621,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         backend.low_ratios = ()
         backend.has_c4 = True
         backend.has_c128 = True
-        backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        backend.max_kv_len = 4096
         backend._build_forward_metadata = mock.Mock(return_value=replay_metadata)
         backend.init_forward_metadata_in_graph = mock.Mock()
         backend._refresh_fp4_prefill_workspace = mock.Mock()
@@ -636,7 +636,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         backend._build_forward_metadata.assert_called_once_with(
             static_forward_batch,
-            max_seq_len_override=backend.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len_override=backend.max_kv_len,
             use_prefill_cuda_graph=True,
         )
         backend.init_forward_metadata_in_graph.assert_called_once_with(
