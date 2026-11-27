@@ -2011,6 +2011,14 @@ class Envs:
     # to the gather when the TP all-reduce would go to NCCL or the LM head layout
     # is not plain vocab-parallel.
     SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE = EnvBool(False)
+    # With the argmax exchange: the EAGLE top-1 draft loop hands each draft-decode forward a
+    # DraftTopk1Sink (topk_p / topk_index outputs, the positions to advance, the draft-token
+    # column to write); a draft LM-head path that fills it (e.g. a fused distributed argmax)
+    # replaces the partials finalize. Unfilled sinks keep the partials path.
+    SGLANG_SPEC_DRAFT_TOPK1_SINK = EnvBool(False)
+    # With the sink: also skip the per-step eager input copy inside the draft-decode graph
+    # (the forward reads the loop's own input tensors in place).
+    SGLANG_SPEC_DRAFT_INPUT_NO_COPY = EnvBool(False)
     # The multimem (NVLS) logits all-gather also when the TP group spans the trays of
     # one multi-node NVLink domain (MNNVL, e.g. GB300 / Rubin NVL72 racks): the
     # symmetric buffer's multicast object then spans the nodes. Without it a TP group

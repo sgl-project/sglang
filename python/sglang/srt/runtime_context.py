@@ -750,6 +750,9 @@ class ForwardFlags:
         # vocab-shard argmax partials instead of logits. Eager-only: the
         # processor never reads it under torch.compile.
         "draft_argmax_only": False,
+        # SGLANG_SPEC_DRAFT_TOPK1_SINK: the draft-decode loop step's DraftTopk1Sink
+        # (kernels/ops/speculative/topk1.py), or None. Eager-only, like draft_argmax_only.
+        "draft_topk1_sink": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,

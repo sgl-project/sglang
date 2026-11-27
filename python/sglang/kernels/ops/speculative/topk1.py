@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import triton
 import triton.language as tl
@@ -387,6 +389,24 @@ def _launch_partials_finalize(
         **({"launch_pdl": True} if use_pdl else {}),
     )
     return topk_p, topk_index
+
+
+@dataclass
+class DraftTopk1Sink:
+    """One EAGLE draft-decode step's top-1 outputs, for a draft LM-head path that writes
+    them itself (SGLANG_SPEC_DRAFT_TOPK1_SINK): the writes of
+    ``draft_topk1_postprocess_from_partials`` -- ``topk_index`` [bs, 1] int64,
+    ``topk_p`` [bs, 1] fp32 (1.0), ``draft_tokens[:, column]`` and ``positions += 1``
+    (contiguous int64 [bs]). The filler sets ``filled`` when it launches them (host
+    side, the same on every rank); an unfilled sink leaves the caller on the partials
+    or logits path."""
+
+    topk_p: torch.Tensor
+    topk_index: torch.Tensor
+    positions: torch.Tensor
+    draft_tokens: torch.Tensor
+    column: int
+    filled: bool = False
 
 
 def draft_topk1_postprocess_from_partials(

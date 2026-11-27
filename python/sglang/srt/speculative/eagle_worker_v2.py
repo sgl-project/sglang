@@ -6,6 +6,7 @@ from typing import Callable, List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import (
+    DraftTopk1Sink,
     draft_topk1_argmax_from_partials,
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
@@ -986,6 +987,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         argmax_only = (
             self.draft_argmax_exchange and not needs_draft_probs and fold is None
         )
+        # SGLANG_SPEC_DRAFT_TOPK1_SINK: each step's forward may write the top-1 outputs
+        # itself (DraftTopk1Sink); an unfilled sink keeps the partials finalize below.
+        use_topk1_sink = (
+            argmax_only
+            and draft_tokens_topk1 is not None
+            and envs.SGLANG_SPEC_DRAFT_TOPK1_SINK.get()
+            and not self.draft_runner.model_config.model_is_mrope
+        )
         mrope = None
         if fold is not None and self.draft_runner.model_config.model_is_mrope:
             mrope = forward_batch.mrope_positions
@@ -1022,6 +1031,34 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 forward_batch.input_ids = input_ids
                 forward_batch.out_cache_loc = out_cache_loc[i]
                 spec_info.hidden_states = hidden_states
+                topk1_sink = None
+                if use_topk1_sink:
+                    # The forward reads this step's slots in place (no eager input copy):
+                    # give them a unit stride. At one row the permuted per-step view keeps
+                    # the steps stride on its size-1 dim (contiguous to torch, not to a
+                    # kernel that checks the stride); the value is unchanged.
+                    step_loc = forward_batch.out_cache_loc
+                    if step_loc.dim() == 1 and step_loc.stride(0) != 1:
+                        forward_batch.out_cache_loc = (
+                            step_loc.as_strided((1,), (1,))
+                            if step_loc.numel() == 1
+                            else step_loc.clone(memory_format=torch.contiguous_format)
+                        )
+                    topk1_sink = DraftTopk1Sink(
+                        topk_p=torch.empty(
+                            (topk_index.shape[0], 1),
+                            dtype=torch.float32,
+                            device=topk_index.device,
+                        ),
+                        topk_index=torch.empty(
+                            (topk_index.shape[0], 1),
+                            dtype=torch.int64,
+                            device=topk_index.device,
+                        ),
+                        positions=forward_batch.positions,
+                        draft_tokens=draft_tokens_topk1,
+                        column=i + 1,
+                    )
 
                 canary_index_ctx = (
                     c.with_active_single_forward_manager(i)
@@ -1036,7 +1073,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         forward_batch=forward_batch,
                     ),
                     canary_index_ctx,
-                    get_forward().scoped(draft_argmax_only=argmax_only),
+                    get_forward().scoped(
+                        draft_argmax_only=argmax_only, draft_topk1_sink=topk1_sink
+                    ),
                 ):
                     logits_output = self.draft_runner.forward(
                         forward_batch
@@ -1048,7 +1087,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
                 argmax_partials = logits_output.next_token_argmax_partials
-                if argmax_partials is not None:
+                sink_filled = topk1_sink is not None and topk1_sink.filled
+                if sink_filled:
+                    # the forward wrote topk_index / topk_p, the draft-token column and
+                    # the advanced positions (draft_topk1_postprocess_from_partials' writes)
+                    topk_p, topk_index = topk1_sink.topk_p, topk1_sink.topk_index
+                elif argmax_partials is not None:
                     topk_p, topk_index = draft_topk1_postprocess_from_partials(
                         argmax_partials,
                         forward_batch.positions,
@@ -1101,7 +1145,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch.mrope_positions.add_(1)
                 vocab_size = (
                     logits_output.next_token_logits.shape[-1]
-                    if argmax_partials is None
+                    if argmax_partials is None and not sink_filled
                     else self.draft_argmax_vocab_size
                 )
                 maybe_detect_oob(
