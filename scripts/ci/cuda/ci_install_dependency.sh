@@ -876,7 +876,11 @@ install_extra_deps() {
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
-    if [ "$IS_BLACKWELL" != "1" ]; then
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        # The media client uses httpcore's sni_hostname when dialing a validated IP.
+        # Resolve both packages for runners that retained the older evaluation stack.
+        $PIP_CMD install httpx "httpcore>=0.17.2" $PIP_INSTALL_SUFFIX
+    elif [ "$IS_BLACKWELL" != "1" ]; then
         # pyarrow 26 and ml-dtypes 0.6 need NumPy 2 at import, but lmms_eval pins
         # numpy 1.26.4; drop the caps once lmms_eval allows NumPy 2.
         $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" "ml-dtypes<0.6" $PIP_INSTALL_SUFFIX
