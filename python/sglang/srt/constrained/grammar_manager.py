@@ -245,6 +245,9 @@ class GrammarManager:
         grammar_queue = list(self.grammar_queue)
         ready_req_idxs: set[int] = set()
         failed_req_idxs: set[int] = set()
+        local_results: dict[int, object] = {}
+        compile_error_msgs: dict[int, str] = {}
+        cacheable_invalid_idxs: set[int] = set()
 
         if self.pp_rank == 0:
             # Poll for ready requests
@@ -269,6 +272,30 @@ class GrammarManager:
 
                 # Sleep a bit to avoid busy waiting
                 time.sleep(self.SGLANG_GRAMMAR_POLL_INTERVAL / 10)
+
+            # Resolve completed futures before syncing so peers agree on any
+            # compilation error before caching or releasing a request.
+            for i in sorted(ready_req_idxs):
+                req = grammar_queue[i]
+                if req.finished() or req.grammar is None:
+                    continue
+                assert isinstance(req.grammar, futures.Future) and req.grammar_key
+                try:
+                    grammar_obj = req.grammar.result()
+                except Exception as e:
+                    logger.error(
+                        f"Grammar compilation raised an exception: {e}, "
+                        f"grammar_key={req.grammar_key}"
+                    )
+                    grammar_obj = InvalidGrammarObject(
+                        f"Grammar compilation failed: {e}"
+                    )
+                    compile_error_msgs[i] = grammar_obj.error_message
+                else:
+                    if isinstance(grammar_obj, InvalidGrammarObject):
+                        compile_error_msgs[i] = grammar_obj.error_message
+                        cacheable_invalid_idxs.add(i)
+                local_results[i] = grammar_obj
 
             # Check failed requests
             for i, req in enumerate(grammar_queue):
@@ -295,23 +322,50 @@ class GrammarManager:
                 )
             synced_ready_req_idxs = ready_req_idxs
             synced_failed_req_idxs = failed_req_idxs
+            synced_compile_errors = compile_error_msgs
+            synced_cacheable_invalid = cacheable_invalid_idxs
             for sync_group, sync_size in sync_groups:
                 if sync_size == 1:
                     continue
                 all_gather_output = [None] * sync_size
                 torch.distributed.all_gather_object(
                     all_gather_output,
-                    (synced_ready_req_idxs, synced_failed_req_idxs),
+                    (
+                        synced_ready_req_idxs,
+                        synced_failed_req_idxs,
+                        synced_compile_errors,
+                        synced_cacheable_invalid,
+                    ),
                     group=sync_group,
                 )
                 synced_ready_req_idxs = set.intersection(
                     *[x[0] for x in all_gather_output]
                 )
                 synced_failed_req_idxs = set.union(*[x[1] for x in all_gather_output])
+                merged_compile_errors: dict[int, str] = {}
+                for x in all_gather_output:
+                    if len(x) > 2:
+                        for idx, msg in x[2].items():
+                            merged_compile_errors.setdefault(idx, msg)
+                synced_compile_errors = merged_compile_errors
+                if all(len(x) > 3 for x in all_gather_output):
+                    synced_cacheable_invalid = set.intersection(
+                        *[x[3] for x in all_gather_output]
+                    )
+                else:
+                    synced_cacheable_invalid = set()
                 synced_ready_req_idxs -= synced_failed_req_idxs
+
+            # Route exceptions and rank-divergent failures through the failed
+            # path so every rank (including PP peers) aborts in lockstep without
+            # polluting the grammar cache.
+            non_cacheable_errors = set(synced_compile_errors) - synced_cacheable_invalid
+            synced_failed_req_idxs |= non_cacheable_errors
+            synced_ready_req_idxs -= synced_failed_req_idxs
         else:
             synced_ready_req_idxs = ready_req_idxs
             synced_failed_req_idxs = failed_req_idxs
+            synced_compile_errors = {}
 
         # Propagate PP0's grammar queue decision to later PP ranks.
         (
@@ -331,14 +385,19 @@ class GrammarManager:
                 continue
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
-            try:
-                req.grammar = req.grammar.result()
-            except Exception as e:
-                logger.error(
-                    f"Grammar compilation raised an exception: {e}, "
-                    f"grammar_key={req.grammar_key}"
-                )
-                req.grammar = InvalidGrammarObject(f"Grammar compilation failed: {e}")
+            if i in local_results:
+                req.grammar = local_results[i]
+            else:
+                try:
+                    req.grammar = req.grammar.result()
+                except Exception as e:
+                    logger.error(
+                        f"Grammar compilation raised an exception: {e}, "
+                        f"grammar_key={req.grammar_key}"
+                    )
+                    req.grammar = InvalidGrammarObject(
+                        f"Grammar compilation failed: {e}"
+                    )
             self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
             self._apply_request_reasoning_config(req)
             if isinstance(req.grammar, InvalidGrammarObject):
@@ -349,12 +408,23 @@ class GrammarManager:
         for i in sorted(synced_failed_req_idxs):
             req = grammar_queue[i]
             return_reqs.append(req)
+            if req.finished() or req.grammar is None:  # It is aborted by AbortReq
+                continue
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
             req.grammar.cancel()
-            # Not cached: the poll budget includes executor queueing,
-            # so a timeout does not prove the grammar invalid.
-            error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
+            # Not cached: timeouts and rank-local exceptions do not prove the
+            # grammar is deterministically invalid across peers.
+            if i in synced_compile_errors:
+                local_obj = local_results.get(i)
+                req.grammar = (
+                    local_obj
+                    if isinstance(local_obj, InvalidGrammarObject)
+                    else InvalidGrammarObject(synced_compile_errors[i])
+                )
+                error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
+            else:
+                error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
 
         return return_reqs

@@ -121,6 +121,20 @@ def _worker(rank, rendezvous):
             for i in local_ready:
                 requests[i].grammar.set_result(BaseGrammarObject())
             requests[25].grammar.set_result(InvalidGrammarObject("bad schema"))
+            # One replica raises while peers succeed; all replicas must abort
+            # in lockstep without caching a split outcome.
+            if rank % 4 == 3:
+                requests[27].grammar.set_exception(
+                    RuntimeError("rank-local compiler failure")
+                )
+            else:
+                requests[27].grammar.set_result(BaseGrammarObject())
+            # One replica raises while peers are still compiling; all replicas
+            # must cancel and abort in lockstep without caching.
+            if rank % 4 == 2:
+                requests[28].grammar.set_exception(
+                    RuntimeError("early rank-local failure")
+                )
             requests[29].grammar.set_exception(ValueError("compiler error"))
             requests[35].abort_reason = "cancelled"
             requests[35].grammar = None
@@ -129,11 +143,22 @@ def _worker(rank, rendezvous):
                 requests[32].grammar_wait_ct = 99
             manager.grammar_queue = requests[:]
             first = manager.get_ready_grammar_requests()
-            expected = sorted(common | {0, 25, 29, 35}) + [32]
+            expected = sorted(common | {0, 25, 35}) + [27, 28, 29, 32]
             # Every local_ready includes 0 and 1. Other extras differ by rank.
             assert [r.rid for r in first] == [requests[i].rid for i in expected]
-            assert all(requests[i].finished() for i in (25, 29, 32, 35))
+            assert all(requests[i].finished() for i in (25, 27, 28, 29, 32, 35))
+            assert all(
+                isinstance(requests[i].grammar, InvalidGrammarObject)
+                for i in (25, 27, 28, 29)
+            )
+            assert "rank-local compiler failure" in requests[27].abort_reason
+            assert "early rank-local failure" in requests[28].abort_reason
             assert "timed out" in requests[32].abort_reason
+            # Deterministic InvalidGrammarObject across all peers is cached;
+            # rank-local exceptions and timeouts are never cached on any peer.
+            assert requests[25].grammar_key in manager.grammar_backend.cache
+            for idx in (27, 28, 29, 32):
+                assert requests[idx].grammar_key not in manager.grammar_backend.cache
 
             # The actual next bootstrap operation requires matching ordered IDs
             # and same-length poll arrays. Check both without mocking Gloo.
