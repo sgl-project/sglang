@@ -5,7 +5,7 @@ import os
 import warnings
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 
 
 @functools.lru_cache(maxsize=1)
@@ -44,6 +44,9 @@ def _default_on_in_ci() -> bool:
 
 class EnvField:
     _allow_set_name = True
+    # An empty value reads as unset for a type where "" cannot parse; a string
+    # or list field keeps "" as its value.
+    _empty_is_unset = True
 
     def __init__(self, default: Any, secret: bool = False):
         self.default = default
@@ -72,21 +75,17 @@ class EnvField:
             assert value == str(None)
             return None
 
-        # Not set, return default
-        if value is None:
+        if not self.is_set():
             return self._resolve_default()
 
         try:
             return self.parse(value)
         except ValueError as e:
-            default = self._resolve_default()
-            warnings.warn(
-                f'Invalid value for {self.name}: {e}, using default "{default}"'
-            )
-            return default
+            raise ValueError(f"Invalid value for {self.name}: {e}") from None
 
     def is_set(self):
-        return self.name in os.environ
+        value = os.environ.get(self.name)
+        return value is not None and not (value == "" and self._empty_is_unset)
 
     def set(self, value: Any):
         self._set_to_none = value is None
@@ -123,31 +122,38 @@ class EnvField:
 
 
 class EnvTuple(EnvField):
+    _empty_is_unset = False
+
     def parse(self, value: str) -> tuple[str, ...]:
         return tuple(s.strip() for s in value.split(",") if s.strip())
 
 
 class EnvStr(EnvField):
+    _empty_is_unset = False
+
     def parse(self, value: str) -> str:
         return value
 
 
 class EnvJSON(EnvField):
-    def parse(self, value: str | None) -> list | dict | None:
-        if not value:
-            return None
-        if os.path.exists(value):
-            with open(value) as f:
-                return json.load(f)
-        return json.loads(value)
+    def parse(self, value: str) -> list | dict:
+        try:
+            if os.path.exists(value):
+                with open(value) as f:
+                    return json.load(f)
+            return json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f'"{value}" is not valid JSON, inline or in the file it names ({e})'
+            )
 
 
 class EnvBool(EnvField):
     def parse(self, value: str) -> bool:
         value = value.lower()
-        if value in ["true", "1", "yes", "y"]:
+        if value in ["true", "1", "yes", "y", "on"]:
             return True
-        if value in ["false", "0", "no", "n"]:
+        if value in ["false", "0", "no", "n", "off"]:
             return False
         raise ValueError(f'"{value}" is not a valid boolean value')
 
@@ -173,7 +179,7 @@ class _DeprecatedEnvFallback:
         self.deprecated_name = deprecated_name
 
     def get(self) -> Any:
-        if os.getenv(self.name) is None:
+        if not self.is_set():
             fallback = os.getenv(self.deprecated_name)
             if fallback is not None:
                 warnings.warn(
@@ -675,10 +681,10 @@ class Envs:
     # gather stays an NCCL allgather.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
-    # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
-    # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
-    # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
-    # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
+    # Attention (aiter, ROCm): route NEXTN/EAGLE draft_extend through aiter
+    # unified_attention instead of mha_batch_prefill. On by default for non-MLA
+    # topk<=1 even when prefill/target verify keep their default kernels; set 0
+    # for the CK fallback. Target verify still requires SGLANG_USE_AITER_UNIFIED_ATTN.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
     # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
     SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
@@ -1012,6 +1018,8 @@ class Envs:
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
+    MOONCAKE_ENABLE_EGM_STORE_POOL = EnvBool(False)
+    MOONCAKE_EGM_NUMA_NODES = EnvStr(None)
 
     # ===================================================================
     # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
@@ -1301,6 +1309,10 @@ class Envs:
     # Ascend NPU
     # ===================================================================
     SGLANG_NPU_ENABLE_STATIC_KERNEL = EnvBool(False)
+    # True means an unrotated dense DSpark draft needs correction for a GLM DSA
+    # ModelSlim QuaRot target: use checkpoint-local vocab and fold Q into the FC
+    # weights at load time. False preserves the existing loading behavior.
+    SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
     # time for arch35 (Ascend 950) Linear and MoE MXFP8 GEMMs. Disabled keeps
@@ -1532,6 +1544,8 @@ class Envs:
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvInt(32)
+    # Reshuffle experts in the elastic scale finalizer, not the next EPLB tick.
+    SGLANG_ENABLE_ELASTIC_SCALE_REBALANCE = EnvBool(True)
 
     # ===================================================================
     # DeepGEMM
@@ -1671,6 +1685,8 @@ class Envs:
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
+    # Unset, mooncake sends fp8, which cannot feed a deep_gemm runner on BF16 weights.
+    SGLANG_MOONCAKE_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
@@ -2727,15 +2743,24 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
+def _registered_fields() -> Iterator[EnvField]:
+    return (value for value in vars(Envs).values() if isinstance(value, EnvField))
+
+
 def exportable_env_vars() -> dict[str, str]:
     return {
         field.name: _exportable_value(os.environ[field.name])
-        for field in sorted(
-            (value for value in vars(Envs).values() if isinstance(value, EnvField)),
-            key=lambda field: field.name,
-        )
+        for field in sorted(_registered_fields(), key=lambda field: field.name)
         if not field.secret and field.name in os.environ
     }
+
+
+def validate_env_values() -> None:
+    """Parse every registered variable that is set, so a malformed value stops
+    startup instead of failing at its first read, which may be mid-serving."""
+    for field in _registered_fields():
+        if field.is_set():
+            field.get()
 
 
 def _exportable_value(value: str) -> str:

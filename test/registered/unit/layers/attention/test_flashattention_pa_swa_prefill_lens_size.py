@@ -53,6 +53,7 @@ def _make_prefill_aware_swa_runner(
     device = "cuda"
     req_to_token_pool = SimpleNamespace(
         size=pool_size,
+        row_width=max_context_len,
         req_to_token=torch.zeros(
             pool_size + 1, max_context_len, dtype=torch.int32, device=device
         ),
