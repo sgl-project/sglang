@@ -228,6 +228,13 @@ void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optiona
     TORCH_CHECK(logits_shape.first == bitmask_shape.first, "logits and bitmask must have the same batch size.");
   }
 
+  // The dispatch below divides by num_rows to pick the grid layout. An empty
+  // batch (or an empty vocab) has nothing to mask, so return before that
+  // division instead of raising SIGFPE on the host.
+  if (num_rows == 0 || vocab_size == 0) {
+    return;
+  }
+
   switch (logits.scalar_type()) {
     case torch::kFloat32: {
       ApplyTokenBitmaskInplaceDispatchToPackedT(
