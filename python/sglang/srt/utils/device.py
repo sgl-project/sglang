@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import builtins
 import importlib
 import logging
 import os
@@ -42,7 +41,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "is_hip",
     "FP8_E4M3_MAX",
-    "FP8_E4M3_MIN",
     "is_cuda",
     "is_cuda_alike",
     "is_hpu",
@@ -145,15 +143,6 @@ if is_hip():
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
 else:
     FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-
-
-FP8_E4M3_MIN = -FP8_E4M3_MAX
-
-
-builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
-
-
-builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
 @lru_cache(maxsize=1)
@@ -987,7 +976,20 @@ def get_cpu_memory_capacity():
 def get_xpu_memory_capacity():
     try:
         if torch.xpu.is_available():
-            return torch.xpu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+            try:
+                return torch.xpu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+            except RuntimeError:
+                # mem_get_info() relies on Level Zero Sysman, which is unavailable
+                # in some environments (e.g. WSL2 GPU-PV). Fall back to the Level
+                # Zero core API, mirroring get_available_gpu_memory().
+                logger.warning(
+                    "torch.xpu.mem_get_info() failed; falling back to "
+                    "get_device_properties().total_memory for XPU memory capacity."
+                )
+                device_props = torch.xpu.get_device_properties(
+                    torch.xpu.current_device()
+                )
+                return device_props.total_memory // 1024 // 1024  # unit: MB
         raise ValueError("No GPU memory values found.")
     except AttributeError:
         raise RuntimeError("torch.xpu is not available.")
@@ -1236,6 +1238,8 @@ def get_device_core_count(device_id: int = 0) -> int:
         return torch.cuda.get_device_properties(device_id).multi_processor_count
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_properties(device_id).gpu_eu_count
+    elif is_mlu():
+        return torch.mlu.get_device_properties(device_id).multi_processor_count
 
     return 0
 

@@ -34,6 +34,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampler_params import SamplerParamsPool
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.scheduler_test_utils import empty_request_lists, leaving_retirer
@@ -328,6 +329,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.forward_sleep_time = None
         s.enable_overlap = True
         s.penalty_status_pool = None  # no request uses a penalty
+        s.sampler_params_pool = SamplerParamsPool(num_rows=8, device="cpu")
         s.future_map = Mock()
         s.future_map.resolve_seq_lens_cpu.side_effect = _ForwardLaunched
         # Each launch's rows, and whether each has an earlier step unprocessed.
