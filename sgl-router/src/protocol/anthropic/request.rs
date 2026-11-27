@@ -27,6 +27,7 @@ const FORWARDED: &[&str] = &[
     "top_k",
     "chat_template_kwargs",
     "continue_final_message",
+    "cache_salt",
 ];
 
 /// `count_only`: `count_tokens` shape, no `max_tokens` required.
@@ -1112,5 +1113,17 @@ mod tests {
             chat(r)["messages"],
             json!([{"role": "user", "content": "q"}])
         );
+    }
+
+    #[test]
+    fn cache_salt_is_forwarded() {
+        let mut r = req(json!([{"role": "user", "content": "q"}]));
+        assert!(chat(r.clone()).get("cache_salt").is_none());
+
+        r["cache_salt"] = json!("tenant-a");
+        assert_eq!(chat(r.clone())["cache_salt"], "tenant-a");
+
+        r["cache_salt"] = Value::Null;
+        assert_eq!(chat(r)["cache_salt"], Value::Null);
     }
 }
