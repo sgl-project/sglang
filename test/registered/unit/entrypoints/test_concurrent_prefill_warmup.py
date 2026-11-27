@@ -379,6 +379,81 @@ class TestConcurrentPrefillRequests(CustomTestCase):
         self.assertGreater(sent[1], 2)  # a round plus the two logprob probes
         self.assertEqual(peak[0], 1)
 
+    def test_other_tokenizer_workers_wait_for_the_elected_warmup(self):
+        """Two tokenizer workers start together with --max-queued-requests 1:
+        the worker that loses the election goes on to serve and to its default
+        warmup only after the elected worker's last request has finished, or
+        that request could get a 503 and the server look ready too early."""
+        in_flight = []
+
+        class _Worker(_RecordingTokenizerManager):
+            def generate_request(self, req, request):
+                self.requests.append(req)
+                in_flight.append(req)
+
+                async def finished():
+                    await asyncio.sleep(0)
+                    in_flight.remove(req)
+                    yield {}
+
+                return finished()
+
+        workers = [_Worker(max_queued_requests=1, tokenizer_worker_num=2) for _ in "ab"]
+        # (requests sent so far, requests in flight) when each worker went on.
+        went_on = {}
+
+        async def start(tm):
+            await concurrent_prefill("null", tm)
+            went_on[id(tm)] = (sum(len(w.requests) for w in workers), len(in_flight))
+
+        async def start_all():
+            await asyncio.gather(*(start(tm) for tm in workers))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            claims = []
+
+            def claim():
+                fd = warmup_mod._try_lock(os.path.join(tmp, "elected.lock"))
+                claims.append(fd)
+                return fd is not None
+
+            with (
+                mock.patch.object(warmup_mod, "_claim_tokenizer_worker_warmup", claim),
+                mock.patch.object(warmup_mod.tempfile, "gettempdir", return_value=tmp),
+                mock.patch.object(
+                    warmup_mod, "_TOKENIZER_WORKER_POLL_S", 0.001, create=True
+                ),
+            ):
+                asyncio.run(start_all())
+            for fd in claims:
+                if fd is not None:
+                    os.close(fd)
+        elected, other = sorted(workers, key=lambda tm: -len(tm.requests))
+        self.assertGreater(len(elected.requests), 2)
+        self.assertEqual(other.requests, [])
+        self.assertEqual(went_on[id(other)], (len(elected.requests), 0))
+
+    def test_waiting_for_the_elected_warmup_is_bounded(self):
+        """An elected worker whose warmup never ends must not hold the other
+        workers' startup forever: they give up after the wait limit."""
+        tm = _RecordingTokenizerManager(max_queued_requests=1, tokenizer_worker_num=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(warmup_mod.tempfile, "gettempdir", return_value=tmp),
+                mock.patch.object(warmup_mod, "_TOKENIZER_WORKER_WAIT_S", 0.05),
+                mock.patch.object(warmup_mod, "_TOKENIZER_WORKER_POLL_S", 0.001),
+                mock.patch.object(
+                    warmup_mod, "_claim_tokenizer_worker_warmup", return_value=False
+                ),
+            ):
+                held = warmup_mod._try_lock(
+                    warmup_mod._tokenizer_worker_lock_path(".turn")
+                )
+                with self.assertLogs(warmup_mod.logger, "WARNING"):
+                    asyncio.run(concurrent_prefill("null", tm))
+                os.close(held)
+        self.assertEqual(tm.requests, [])
+
     def test_worker_lock_is_exclusive_until_its_holder_exits(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "warmup.lock")

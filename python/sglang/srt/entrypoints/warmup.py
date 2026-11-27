@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import tempfile
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import msgspec
@@ -339,6 +340,20 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
 # Held until the worker exits, so no other tokenizer worker of this server runs
 # the warmup after this one finishes.
 _tokenizer_worker_warmup_lock: Optional[int] = None
+# How long a worker waits for the elected worker's warmup before going on.
+_TOKENIZER_WORKER_WAIT_S = 1800.0
+_TOKENIZER_WORKER_POLL_S = 0.1
+
+
+def _tokenizer_worker_lock_path(suffix: str = "") -> str:
+    """A lock file shared by the tokenizer workers of this server only: named
+    after its main process, the same id the workers use for their shared args."""
+    from sglang.srt.managers.multi_tokenizer_mixin import get_main_process_id
+
+    return os.path.join(
+        tempfile.gettempdir(),
+        f"sglang_concurrent_prefill_{get_main_process_id()}{suffix}.lock",
+    )
 
 
 def _try_lock(path: str) -> Optional[int]:
@@ -353,20 +368,24 @@ def _try_lock(path: str) -> Optional[int]:
     return fd
 
 
+async def _wait_for_lock(path: str, timeout: float) -> Optional[int]:
+    """`_try_lock` retried without blocking the event loop; None once
+    `timeout` seconds pass."""
+    deadline = time.monotonic() + timeout
+    while (fd := _try_lock(path)) is None:
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(_TOKENIZER_WORKER_POLL_S)
+    return fd
+
+
 def _claim_tokenizer_worker_warmup() -> bool:
     """True in exactly one tokenizer worker of this server: the first to lock
-    a file named after the server's main process. The lock goes away with the
-    worker, so a later server reusing the process id can claim it again."""
-    from sglang.srt.managers.multi_tokenizer_mixin import get_main_process_id
-
+    the server's lock file. The lock goes away with the worker, so a later
+    server reusing the process id can claim it again."""
     global _tokenizer_worker_warmup_lock
     if _tokenizer_worker_warmup_lock is None:
-        _tokenizer_worker_warmup_lock = _try_lock(
-            os.path.join(
-                tempfile.gettempdir(),
-                f"sglang_concurrent_prefill_{get_main_process_id()}.lock",
-            )
-        )
+        _tokenizer_worker_warmup_lock = _try_lock(_tokenizer_worker_lock_path())
     return _tokenizer_worker_warmup_lock is not None
 
 
@@ -414,24 +433,36 @@ async def concurrent_prefill(
         if plan.skip_reason is not None:
             logger.info(f"Skipping concurrent_prefill: {plan.skip_reason}")
             return
-        if (
-            limits.max_queued_requests is not None
-            and limits.tokenizer_workers > 1
-            and not _claim_tokenizer_worker_warmup()
-        ):
-            # The plan bounds one sender's requests per rank queue; the
-            # workers' requests would add up in the same queues.
+        turn = None
+        try:
+            if limits.max_queued_requests is not None and limits.tokenizer_workers > 1:
+                # The plan bounds one sender's requests per rank queue, so one
+                # worker sends it. The workers take this lock in turn and the
+                # elected one keeps it until its warmup ends (or it exits), so
+                # no worker serves or sends its default warmup before then.
+                turn = await _wait_for_lock(
+                    _tokenizer_worker_lock_path(".turn"), _TOKENIZER_WORKER_WAIT_S
+                )
+                if not _claim_tokenizer_worker_warmup():
+                    if turn is None:
+                        logger.warning(
+                            "concurrent_prefill: another tokenizer worker's warmup "
+                            f"is still running after {_TOKENIZER_WORKER_WAIT_S:.0f}s"
+                        )
+                    logger.info(
+                        "Skipping concurrent_prefill: another tokenizer worker runs "
+                        "it under the request queue limit"
+                    )
+                    return
             logger.info(
-                "Skipping concurrent_prefill: another tokenizer worker runs it "
-                "under the request queue limit"
+                f"concurrent_prefill: {limits=}, round sizes {[len(r) for r in plan.rounds]}"
             )
-            return
-        logger.info(
-            f"concurrent_prefill: {limits=}, round sizes {[len(r) for r in plan.rounds]}"
-        )
-        for sizes in plan.rounds:
-            await asyncio.gather(*(one(size) for size in sizes))
-        for size in plan.logprob_sizes:
-            await one(size, return_logprob=True, logprob_start_len=0)
+            for sizes in plan.rounds:
+                await asyncio.gather(*(one(size) for size in sizes))
+            for size in plan.logprob_sizes:
+                await one(size, return_logprob=True, logprob_start_len=0)
+        finally:
+            if turn is not None:
+                os.close(turn)
     except Exception as e:
         logger.warning(f"concurrent_prefill warmup stopped early: {e!r}")
