@@ -260,7 +260,7 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
-    # The OpenAI location of reasoning_tokens; set only when there are some.
+    # The OpenAI location of reasoning_tokens; always set, so 0 means no reasoning.
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
@@ -369,20 +369,6 @@ class BatchResponse(BaseModel):
     metadata: Optional[dict] = None
 
 
-def _migrate_deprecated_dp_rank(values: dict) -> dict:
-    if isinstance(values, dict) and values.get("data_parallel_rank") is not None:
-        import warnings
-
-        warnings.warn(
-            "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if values.get("routed_dp_rank") is None:
-            values["routed_dp_rank"] = values["data_parallel_rank"]
-    return values
-
-
 class PDRoutingFields(BaseModel):
     """PD and DP routing fields a router may inject into a request."""
 
@@ -464,9 +450,6 @@ class CompletionRequest(PDRoutingFields):
     # Unlimited-OCR v2 reads them as defaults under images_config.
     mm_processor_kwargs: Optional[Dict] = None
 
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
-
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for caller-defined request classification
@@ -478,11 +461,6 @@ class CompletionRequest(PDRoutingFields):
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _handle_deprecated_dp_rank(cls, values):
-        return _migrate_deprecated_dp_rank(values)
 
     @field_validator("max_tokens")
     @classmethod
@@ -626,20 +604,6 @@ class ChatCompletionMessageContentTextPart(BaseModel):
     text: str
 
 
-class ChatCompletionMessageContentThinkingPart(BaseModel):
-    type: Literal["thinking", "reasoning"]
-    thinking: Optional[str] = None
-    text: Optional[str] = None
-
-    @model_validator(mode="after")
-    def validate_payload(self):
-        if (self.thinking is None) == (self.text is None):
-            raise ValueError(
-                "thinking parts require exactly one of 'thinking' or 'text'"
-            )
-        return self
-
-
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
@@ -756,7 +720,6 @@ class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
 
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
-    ChatCompletionMessageContentThinkingPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
@@ -868,30 +831,10 @@ class ChatCompletionMessageGenericParam(BaseModel):
             return v_lower
         raise ValueError("'role' must be a string")
 
-    @model_validator(mode="after")
-    def validate_thinking_parts_role(self):
-        if self.role != "assistant" and isinstance(self.content, list):
-            for part in self.content:
-                if isinstance(part, ChatCompletionMessageContentThinkingPart):
-                    raise ValueError(
-                        "thinking content parts are only valid in assistant messages"
-                    )
-        return self
-
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
-
-    @model_validator(mode="after")
-    def validate_thinking_parts_role(self):
-        if isinstance(self.content, list):
-            for part in self.content:
-                if isinstance(part, ChatCompletionMessageContentThinkingPart):
-                    raise ValueError(
-                        "thinking content parts are only valid in assistant messages"
-                    )
-        return self
 
 
 ChatCompletionMessageParam = Union[
@@ -1079,6 +1022,12 @@ class ChatCompletionRequest(PDRoutingFields):
     # renders these, while ``tools`` (flattened to ``<namespace>.<function>``) still
     # drives tool-call parsing.
     _template_tools: Optional[List[Dict[str, Any]]] = PrivateAttr(default=None)
+    # Set with ``input_ids`` by a caller that rendered them itself: the images the
+    # prompt's placeholders stand for, in order.
+    _input_image_data: Optional[List[Any]] = PrivateAttr(default=None)
+    # Whether ``tools`` are the only tools the rendered prompt shows, so a call
+    # to any other tool is dropped rather than returned.
+    _drops_unlisted_tool_calls: bool = PrivateAttr(default=False)
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
@@ -1106,6 +1055,9 @@ class ChatCompletionRequest(PDRoutingFields):
     return_flat_raw_output_top_logprobs: bool = False
     # Base64 by default on chat, unlike /generate; false returns plain JSON lists.
     return_flat_raw_top_logprobs_b64: bool = True
+    # Flat sampling masks in choices[].meta_info (requires return_meta_info); base64 by default as above.
+    return_flat_raw_sampling_mask: bool = False
+    return_flat_raw_sampling_mask_b64: bool = True
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -1194,9 +1146,6 @@ class ChatCompletionRequest(PDRoutingFields):
     # Priority for the request
     priority: Optional[int] = None
 
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
-
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -1205,11 +1154,6 @@ class ChatCompletionRequest(PDRoutingFields):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
-
-    @model_validator(mode="before")
-    @classmethod
-    def _handle_deprecated_dp_rank(cls, values):
-        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="wrap")
     @classmethod
@@ -1929,7 +1873,7 @@ class V1RerankReqInput(BaseModel):
 
 class RerankResponse(BaseModel):
     score: float
-    document: Optional[str] = None
+    document: Optional[RerankContent] = None
     index: int
     meta_info: Optional[dict] = None
 
@@ -2097,6 +2041,32 @@ class ResponseToolState(msgspec.Struct, frozen=True):
     public_tools: list[ResponseTool] | None = None
     public_choice: str | dict[str, Any] | None = None
     names: dict[str, dict[str, str]] = {}
+    # The tools the model can call after the history, from a request rendered in
+    # its own wire form; None when `tools` alone declares them.
+    chat_tools: list[Tool] | None = None
+    # ``custom`` tools a ``tool_search_output`` loaded, beside the declared ones.
+    discovered_custom_names: frozenset[str] = frozenset()
+
+
+class ResponseToolSearchCall(BaseModel):
+    """A client-executed ``tool_search`` call; the pinned openai SDK has no type."""
+
+    id: str
+    type: Literal["tool_search_call"] = "tool_search_call"
+    call_id: str
+    execution: Literal["client"] = "client"
+    arguments: Dict[str, Any]
+    status: Literal["in_progress", "completed", "incomplete"]
+
+
+class ResponseToolSearchCallEvent(BaseModel):
+    """``response.output_item.added`` / ``.done`` for a tool search call, which the
+    SDK's event types reject."""
+
+    type: Literal["response.output_item.added", "response.output_item.done"]
+    sequence_number: int
+    output_index: int
+    item: ResponseToolSearchCall
 
 
 class ResponseInputMessageParam(EasyInputMessageParam, total=False):
@@ -2126,6 +2096,11 @@ class ResponsesRequest(PDRoutingFields):
     """Request body for v1/responses endpoint."""
 
     _tool_state: ResponseToolState = PrivateAttr(default_factory=ResponseToolState)
+    # By call_id, the name the model called a tool by when the output item
+    # reports another; the stored history replays the call under it.
+    _called_tool_names: Dict[str, str] = PrivateAttr(default_factory=dict)
+    # The history and stored namespace calls the request continues, as first read.
+    _continued: Optional[Tuple[list, Dict[str, Any]]] = PrivateAttr(default=None)
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
@@ -2185,9 +2160,6 @@ class ResponsesRequest(PDRoutingFields):
         default=None, description="Cache salt for request caching"
     )
 
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
-
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -2204,11 +2176,6 @@ class ResponsesRequest(PDRoutingFields):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
-
-    @model_validator(mode="before")
-    @classmethod
-    def _handle_deprecated_dp_rank(cls, values):
-        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="before")
     @classmethod
@@ -2355,10 +2322,6 @@ class ResponsesRequest(PDRoutingFields):
         else:
             max_tokens = default_max_tokens
 
-        # Headroom for BOS/EOS the engine appends on top of prompt+budget.
-        if max_tokens is not None:
-            max_tokens -= 2
-
         temperature = self.temperature
         if temperature is None:
             temperature = default_params.get(
@@ -2451,6 +2414,7 @@ class ResponsesResponse(BaseModel):
             ResponseOutputItem,
             ResponseReasoningItem,
             ResponseFunctionToolCall,
+            ResponseToolSearchCall,
         ]
     ] = Field(default_factory=list)
     status: Literal[
@@ -2516,6 +2480,7 @@ class ResponsesResponse(BaseModel):
                 ResponseOutputItem,
                 ResponseReasoningItem,
                 ResponseFunctionToolCall,
+                ResponseToolSearchCall,
             ]
         ],
         status: str,

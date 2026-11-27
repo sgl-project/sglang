@@ -77,7 +77,6 @@ if TYPE_CHECKING:
 
 _is_hip = current_platform.is_hip()
 _is_cuda = current_platform.is_cuda()
-_is_npu = current_platform.is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = current_platform.is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -132,6 +131,17 @@ def _quantize_block_fp8_activation(x, block_size=(128, 128), scale_min=1e-4):
     block_m, block_k = block_size
     if k % block_k:
         raise ValueError("FP8 activation channels must align to the block size")
+    if (
+        _is_cuda
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and (block_m, block_k) == (128, 128)
+        and x.numel() > 0
+        and torch.cuda.get_device_capability(x.device) == (10, 3)
+    ):
+        from sglang.kernels.ops.diffusion import quantize_block_fp8_activation
+
+        return quantize_block_fp8_activation(x, scale_min)
     blocks = (
         F.pad(x, (0, 0, 0, (-m) % block_m))
         .float()

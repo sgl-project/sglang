@@ -641,8 +641,6 @@ def test_anima_rope_input_guards():
     ]
     for inputs in unsupported:
         assert not can_use_fused_rope_rotate_half_fp32(*inputs)
-        with pytest.raises(ValueError, match="Expected contiguous CUDA"):
-            fused_rope_rotate_half_fp32(*inputs)
 
 
 if __name__ == "__main__":

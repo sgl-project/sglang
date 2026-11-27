@@ -90,10 +90,12 @@ from sglang.srt.disaggregation.utils import (
     pre_alloc_fill_len,
     prepare_abort,
     record_network_transfer,
+    setup_page_row_kv_args,
     setup_state_kv_args,
     state_indices_per_entry,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
@@ -168,6 +170,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_h2d
@@ -242,7 +245,7 @@ class DecodeReqToTokenPool:
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
         pre_alloc_size: int,
@@ -254,12 +257,11 @@ class DecodeReqToTokenPool:
         self.size = size
         # +1 padding row at index 0; see ReqToTokenPool for rationale.
         self._alloc_size = size + pre_alloc_size + 1
-        self.max_context_len = max_context_len
         self.device = device
         self.pre_alloc_size = pre_alloc_size
         with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
-                (self._alloc_size, max_context_len),
+                (self._alloc_size, row_width),
                 dtype=torch.int32,
                 device=device,
             )
@@ -270,6 +272,11 @@ class DecodeReqToTokenPool:
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
+
+    @property
+    def row_width(self) -> int:
+        """See ReqToTokenPool.row_width."""
+        return self.req_to_token.shape[1]
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -332,7 +339,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
         cache_params: Mamba2CacheParams,
@@ -353,11 +360,12 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
         replayssm_request_ring: bool = False,
+        max_verify_batch_size: Optional[int] = None,
     ):
         DecodeReqToTokenPool.__init__(
             self,
             size=size,
-            max_context_len=max_context_len,
+            row_width=row_width,
             device=device,
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
@@ -392,9 +400,16 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         else:
             effective_mamba_size = max_slots_needed
         self.start_layer = start_layer if start_layer is not None else 0
+        # In-transfer reqs never verify, so the scratch only needs padded verify rows;
+        # ReplaySSM-spec rings and PP-spec stable rows index it by req_pool_idx.
+        mamba_spec_state_size = (
+            size if max_verify_batch_size is None else max_verify_batch_size
+        )
+        if enable_linear_replayssm_spec or pp_spec_stable_rows_enabled():
+            mamba_spec_state_size = max(mamba_spec_state_size, size + pre_alloc_size)
         self._init_mamba_pool(
             mamba_size=effective_mamba_size,
-            mamba_spec_state_size=size + pre_alloc_size,
+            mamba_spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             device=device,
@@ -498,6 +513,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.draft_kv_ring = draft_kv_ring
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
+        # Whether the last move_preallocated stopped on a full host staging pool.
+        self.host_pool_blocked = False
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
@@ -903,6 +920,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
+        setup_page_row_kv_args(
+            kv_args,
+            token_to_kv_pool=self.token_to_kv_pool,
+            transfer_backend=self.transfer_backend,
+        )
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -916,6 +938,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
+            empty_draft_kv_ring=get_spec().speculative_dflash_draft_kv_ring,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -1752,6 +1775,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
         # Then, preallocate the remaining requests if possible
+        self.host_pool_blocked = False
         for i, decode_req in enumerate(queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1779,6 +1803,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 >= get_disagg().disaggregation_decode_host_receive_threshold
             ):
                 if not self._pre_alloc_host(decode_req):
+                    self.host_pool_blocked = True
                     break
                 preallocated_reqs.append(decode_req)
                 indices_to_remove.add(i)
@@ -3313,6 +3338,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             abort=self._abort_receiving,
             req_of=lambda x: x.req,
         )
+        # Host-staged transfers whose KV landed but wait for device admission,
+        # as of the last move_transferred.
+        self.num_host_staged_landed = 0
         self.gloo_group = get_parallel().attn_tp_group.cpu_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = get_parallel().tp_rank
@@ -3644,6 +3672,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         these rids are concluded, and a rid failed on any stage is concluded as
         failed on every stage, whatever this stage's own receiver reports."""
         if not self.queue:
+            self.num_host_staged_landed = 0
             return [], {}
 
         if self.scheduler.enable_decode_hicache:
@@ -3668,6 +3697,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         failed: List[Tuple[int, DecodeRequest, bool]] = []
         outcomes: Dict[str, bool] = {}
         admission_stats = None
+        num_host_staged_landed = 0
         queue = list(self.queue.items())
         for i, (decode_req, poll) in enumerate(zip(queue, polls)):
             if rids_to_check is not None:
@@ -3764,6 +3794,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         admission_stats
                     ):
                         if not prealloc_queue.allocate_host_staged(decode_req):
+                            num_host_staged_landed += 1
                             continue
                 self._commit_transfer_to_req(decode_req)
                 # The peer wrote its last byte.
@@ -3857,6 +3888,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     rid,
                     rid_failed,
                 )
+        self.num_host_staged_landed = num_host_staged_landed
         return transferred_reqs, outcomes
 
     def _defer_release(self, decode_req: DecodeRequest) -> None:
@@ -4443,6 +4475,10 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
+        self.sampler_params_pool.write(new_batch.reqs)
+        # Replays the prefill node's output token into the penalty history.
+        self.penalty_status_pool.alloc(new_batch.reqs)
+        self.penalty_status_pool.reset_history(new_batch.reqs)
         return new_batch
 
     def _start_host_restores(self: Scheduler) -> None:
@@ -4543,9 +4579,9 @@ class SchedulerDisaggregationDecodeMixin:
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         self.disagg_decode_prealloc_queue.move_resumed(self.waiting_queue)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
-            return False
+        # if there are still retracted requests, we do not allocate new requests;
+        # transfers already hold their pages and are still polled, so they can finish
+        has_retracted = len(self.disagg_decode_prealloc_queue.retracted_queue) > 0
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -4555,7 +4591,10 @@ class SchedulerDisaggregationDecodeMixin:
 
         prealloc_deferred = False
         if self.polling_count % self.polling_interval == 0:
-            if get_disagg().disaggregation_decode_host_receive_threshold == 1:
+            if (
+                not has_retracted
+                and get_disagg().disaggregation_decode_host_receive_threshold == 1
+            ):
                 if defer_prealloc:
                     prealloc_deferred = True
                 else:
@@ -4568,7 +4607,10 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
-            if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+            if (
+                not has_retracted
+                and get_disagg().disaggregation_decode_host_receive_threshold < 1
+            ):
                 # Give completed host transfers device space before new arrivals.
                 self._preallocate_new_requests()
         return prealloc_deferred

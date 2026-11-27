@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-test-1-npu-a3", nightly=True)
 
 
 class TestLogLevel(CustomTestCase):
@@ -68,7 +68,8 @@ class TestLogLevel(CustomTestCase):
             "warning",
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
         ]
         log_content = self._launch_server_and_run_infer(other_args)
         self.assertNotIn("POST /generate HTTP/1.1", log_content)
@@ -82,7 +83,8 @@ class TestLogLevel(CustomTestCase):
             "info",
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
         ]
         log_content = self._launch_server_and_run_infer(other_args)
         self.assertIn("POST /generate HTTP/1.1", log_content)

@@ -69,6 +69,13 @@ from .custom_all_reduce_utils import (
     is_weak_contiguous,
 )
 from .dpx_hier_all_reduce import DpxHierAllReduce
+from .gfx1250_fabric import probe_spx
+from .ring_simple_all_reduce import (
+    HIER_RING_SIMPLE_BUFFER_SIZE,
+    RING_SIMPLE_BUFFER_SIZE,
+    HierRingSimpleAllReduce,
+    RingSimpleAllReduce,
+)
 from .symm_workspace import (
     WorkspaceRequest,
     register_v2_push_slot_bytes,
@@ -98,17 +105,27 @@ def _ceil_align(nbytes: int, align: int) -> int:
     return (nbytes + align - 1) // align * align
 
 
+def _is_gfx1250(device: torch.device) -> bool:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return torch.cuda.get_device_properties(index).gcnArchName.startswith("gfx1250")
+
+
 # (JIT module, algorithm name, multicast) of one eager launch
 _EagerPlan = Tuple["Module", str, bool]
 
 
 class AllReduceChoice(NamedTuple):
-    algo: AllReduceAlgo
+    # None when ``use_ring``: ring_simple is not a kernel algo of the communicator
+    algo: Optional[AllReduceAlgo]
     use_graph: bool = False
     use_multicast: bool = False
     # hier_2shot_push (ROCm gfx1250 DPX): a 2shot_push split into pair and cross
     # stages; ``algo`` is TWO_SHOT_PUSH
     use_hier: bool = False
+    # ring_simple (ROCm gfx1250): RingSimpleAllReduce, not a kernel algo of the
+    # shared communicator; ``algo`` is None. With ``use_hier`` too, it is
+    # hier_ring_simple (partition pairs): HierRingSimpleAllReduce
+    use_ring: bool = False
 
 
 def choose_algo(
@@ -123,6 +140,8 @@ def choose_algo(
     # the pair halves must stay whole 16 B vectors
     if nbytes % 32 == 0 and heuristic.hier_2shot_push.contains(nbytes):
         return AllReduceChoice(AllReduceAlgo.TWO_SHOT_PUSH, use_hier=True)
+    if heuristic.hier_ring_simple.contains(nbytes):
+        return AllReduceChoice(None, use_hier=True, use_ring=True)
     if nbytes <= heuristic.two_shot_push_threshold:
         return AllReduceChoice(AllReduceAlgo.TWO_SHOT_PUSH)
     if nbytes <= heuristic.one_shot_pull_threshold:
@@ -131,6 +150,8 @@ def choose_algo(
         return AllReduceChoice(AllReduceAlgo.TWO_SHOT_PULL, use_multicast=True)
     if nbytes <= heuristic.two_shot_pull_threshold:
         return AllReduceChoice(AllReduceAlgo.TWO_SHOT_PULL, use_graph=can_use_graph)
+    if heuristic.ring_simple.contains(nbytes):
+        return AllReduceChoice(None, use_ring=True)
     return None
 
 
@@ -139,18 +160,22 @@ class CustomAllReduceV2:
         self,
         group: ProcessGroup,
         device: torch.device,
-        max_size: int = _DEFAULT_MAX_SIZE,
+        max_size: Optional[int] = None,
         *,
         max_pull_size: Optional[int] = None,
         max_push_size: Optional[int] = None,
         max_pull_blocks: Optional[int] = None,
         max_push_blocks: Optional[int] = None,
+        ring_simple_buffer_size: Optional[int] = None,
+        hier_ring_simple_buffer_size: int = HIER_RING_SIMPLE_BUFFER_SIZE,
     ) -> None:
         """
         :param max_size: direction-agnostic memory cap. Each workspace is
                          sized to what the tuned config wants, clipped to
                          this bound. Defaults to
-                         ``SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB`` (16 MB).
+                         ``SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB`` (16 MB),
+                         or the tuned config's ``default_max_size`` when that
+                         is larger and the variable is unset.
         :param max_pull_size: explicit pull buffer size; overrides both
                               the tuned size and ``max_size``. ``0`` builds a
                               push-only instance.
@@ -159,6 +184,17 @@ class CustomAllReduceV2:
         :param max_pull_blocks: cap on the pull kernels' default launch width;
                                 ``0`` builds a push-only instance.
         :param max_push_blocks: the push kernels' default launch width.
+        :param ring_simple_buffer_size: FIFO bytes per channel of the ring
+                                 all-reduce (``ring_simple``, where the tuned
+                                 config enables it: ROCm gfx1250): two
+                                 chunk-sized slices. Defaults to the tuned
+                                 config's ``ring_simple_buffer_size``, else
+                                 ``RING_SIMPLE_BUFFER_SIZE``.
+        :param hier_ring_simple_buffer_size: bytes per FIFO (cross, pair-in,
+                                 pair-out) of each channel of the ring
+                                 all-reduce (``hier_ring_simple``, where the
+                                 tuned config enables it and the group is
+                                 made of partition pairs): two chunk-sized slices.
 
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB`` /
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB`` take the highest
@@ -172,8 +208,18 @@ class CustomAllReduceV2:
         self.device = device
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
-        base_config = get_all_reduce_config(self.world_size)
+        spx = _is_hip and _is_gfx1250(device) and probe_spx(group, device)
+        base_config = get_all_reduce_config(self.world_size, spx=spx)
+        if max_size is None:
+            max_size = _DEFAULT_MAX_SIZE
+            if not envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.is_set():
+                max_size = max(max_size, base_config.default_max_size)
+        if ring_simple_buffer_size is None:
+            ring_simple_buffer_size = (
+                base_config.ring_simple_buffer_size or RING_SIMPLE_BUFFER_SIZE
+            )
         dpx_pairs, hier_max_bytes = None, 0
+        hier_ring_pairs, hier_ring_slot_bytes = None, 0
         if _is_hip:
             base_config, dpx_pairs, hier_max_bytes = DpxHierAllReduce.plan(
                 group=group,
@@ -183,6 +229,14 @@ class CustomAllReduceV2:
                 sizes_own_push=max_push_size is not None
                 or max_pull_blocks == 0
                 or _FORCE_PUSH_SIZE_KB is not None,
+            )
+            base_config, hier_ring_pairs, hier_ring_slot_bytes = (
+                HierRingSimpleAllReduce.plan(
+                    group=group,
+                    device=device,
+                    config=base_config,
+                    buffer_size=hier_ring_simple_buffer_size,
+                )
             )
         if max_pull_size is None:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
@@ -234,6 +288,9 @@ class CustomAllReduceV2:
             max_pull_bytes=self._max_pull_size,
             world_size=self.world_size,
         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
+        self.config, self._ring_slot_bytes = RingSimpleAllReduce.plan(
+            self.config, ring_simple_buffer_size
+        )
         self.forced_algo: Optional[AllReduceAlgo] = None
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
         # across nodes, but graph zero-copy input registration (cudaIpc /
@@ -277,6 +334,27 @@ class CustomAllReduceV2:
                 pairs=dpx_pairs,
                 max_bytes=hier_max_bytes,
                 push_blocks=self.config.num_push_blocks,
+            )
+        self._ring: Optional[RingSimpleAllReduce] = None
+        if self._ring_slot_bytes:
+            self._ring = RingSimpleAllReduce(
+                group=group,
+                device=device,
+                rank=self.rank,
+                world_size=self.world_size,
+                num_channels=self.config.num_ring_simple_channels,
+                slot_bytes=self._ring_slot_bytes,
+            )
+        self._hier_ring: Optional[HierRingSimpleAllReduce] = None
+        if hier_ring_slot_bytes:
+            self._hier_ring = HierRingSimpleAllReduce(
+                group=group,
+                device=device,
+                rank=self.rank,
+                world_size=self.world_size,
+                pairs=hier_ring_pairs,
+                num_channels=self.config.num_ring_simple_channels,
+                slot_bytes=hier_ring_slot_bytes,
             )
         # only graph-input registration opens IPC handles
         self._ipc_manager: Optional[IPCManager] = (
@@ -381,9 +459,15 @@ class CustomAllReduceV2:
             choice = choose_algo(self.config, nbytes, can_use_graph=False)
             if choice is None:
                 self._eager_plan_cache[key] = None
+            elif choice.use_hier and choice.use_ring:
+                # runs over its own hier ring plane
+                self._eager_plan_cache[key] = (None, "hier_ring_simple", False)
             elif choice.use_hier:
                 # runs over the pair and cross planes, not one module
                 self._eager_plan_cache[key] = (None, "hier_2shot_push", False)
+            elif choice.use_ring:
+                # runs over its own ring plane
+                self._eager_plan_cache[key] = (None, "ring_simple", False)
             else:
                 self._eager_plan_cache[key] = (
                     get_all_reduce_module(dtype, self.world_size),
@@ -424,22 +508,30 @@ class CustomAllReduceV2:
             assert plan is not None, f"No config for {nbytes = }"
             module, algo_name, use_multicast = plan
             if module is None:
-                return self._hier.all_reduce(input)
+                staged = {
+                    "ring_simple": self._ring,
+                    "hier_ring_simple": self._hier_ring,
+                }.get(algo_name, self._hier)
+                return staged.all_reduce(input)
             out = module.all_reduce(self.obj, input, algo_name, None, use_multicast)
             return out if isinstance(out, torch.Tensor) else torch.from_dlpack(out)
         if self.forced_algo is not None:
             # TODO: enhance this override pattern
             algo = self.forced_algo
             use_graph = self._can_use_graph() and not algo.is_push()
-            use_multicast = use_hier = False
+            use_multicast = use_hier = use_ring = False
         else:
             choice = choose_algo(
                 self.config, nbytes, can_use_graph=self._can_use_graph()
             )
             assert choice is not None, f"No algorithm for {nbytes = }"
-            algo, use_graph, use_multicast, use_hier = choice
+            algo, use_graph, use_multicast, use_hier, use_ring = choice
+        if use_hier and use_ring:
+            return self._hier_ring.all_reduce(input)
         if use_hier:
             return self._hier.all_reduce(input)
+        if use_ring:
+            return self._ring.all_reduce(input)
         graph_row = self._allocate_graph_row(input, nbytes) if use_graph else None
         return custom_all_reduce(
             self.obj,
@@ -539,6 +631,12 @@ class CustomAllReduceV2:
         if not self.disabled and self._hier is not None:
             self._hier.close()
             self._hier = None
+        if not self.disabled and self._ring is not None:
+            self._ring.close()
+            self._ring = None
+        if not self.disabled and self._hier_ring is not None:
+            self._hier_ring.close()
+            self._hier_ring = None
         if hasattr(self, "_vmm_graph_input_manager"):
             self._vmm_graph_input_manager.close()
 
