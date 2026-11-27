@@ -793,6 +793,9 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
     def available_size(self):
+        regions = getattr(self, "_uocr_ring_regions", None)
+        if regions is not None:
+            return regions.available_tokens()
         return self.swa_attn_allocator.available_size()
 
     def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
@@ -860,6 +863,12 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        regions = getattr(self, "_uocr_ring_regions", None)
+        if regions is not None:
+            # The ring mode hands out per-request runs and never pops the page
+            # free list, so release the run instead of individual slots.
+            regions.free_run(int(free_index.min()))
+            return
         if self.free_group is None:
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
@@ -868,6 +877,10 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
+            return
+        regions = getattr(self, "_uocr_ring_regions", None)
+        if regions is not None:
+            regions.free_run(int(free_index.min()))
             return
         if self.free_group is None:
             self.swa_attn_allocator.free(free_index[free_index > 0])

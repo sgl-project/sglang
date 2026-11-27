@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
@@ -84,6 +85,24 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         # Event of the last replay; the next rebind waits on it so the device is
         # done reading the host-side seq_lens array before we rewrite it.
         self._rebind_fence = None
+        # Update submitted by the previous replay, drained at the start of the
+        # next one rather than right after its own launch, so the main thread
+        # can run the step's CPU work while the update thread is still busy.
+        self._pending_update = None
+
+        # SGLANG_NPU_STEP_TIMING=1 splits a decode step into metadata /
+        # drain-prev-update / fence / replay. Measurement scaffolding, not a
+        # serving path.
+        self._step_timing = os.getenv("SGLANG_NPU_STEP_TIMING") == "1"
+        self._timing_prep_start = None
+        self._timing_acc = [0.0, 0.0, 0.0, 0.0]
+        self._timing_n = 0
+        # Last graph.update duration on the update thread, which is where the
+        # per-step cost either lands on the host or waits for the device.
+        self._update_worker_ms = 0.0
+        # TEMPORARY experiment knob: keep the update payload constant.
+        self._update_const = os.getenv("SGLANG_NPU_UPDATE_CONST") == "1"
+        self._const_payload = None
 
     @property
     def supports_shared_read_events(self) -> bool:
@@ -201,12 +220,36 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     runner.bs - runner.raw_bs
                 )
-        return seq_lens
+        return self._clamp_ring_swa_lengths(seq_lens, forward_batch, runner)
+
+    def _clamp_ring_swa_lengths(self, seq_lens, forward_batch, runner):
+        """Ring layout: FIA must see prompt + one window, not the full history."""
+        attn = getattr(runner, "attn_backend", None)
+        if not getattr(attn, "ring_swa", False):
+            return seq_lens
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return seq_lens
+        references = attn.reference_lens
+        # The metadata pass already paid this D2H; reuse its host copy as long
+        # as it came from this step's row buffer.
+        indices = None
+        rows_ptr = getattr(attn, "_ring_rows_src", None)
+        if rows_ptr == forward_batch.req_pool_indices.data_ptr():
+            indices = getattr(attn, "ring_rows_host", None)
+        if indices is None:
+            indices = forward_batch.req_pool_indices.cpu().tolist()
+        window = attn.sliding_window_size
+        out = list(seq_lens)
+        for i in range(min(len(indices), len(out))):
+            out[i] = min(out[i], int(references[indices[i]]) + window)
+        return out
 
     def prepare_replay(self, forward_batch):
         runner = self._decode_runner
         if runner is None or forward_batch.needs_forward_metadata_init():
             return False
+        if self._step_timing:
+            self._timing_prep_start = time.perf_counter()
         if not runner.model_runner.spec_algorithm.is_dflash():
             # Preserve the NPU pre-planned path without refreshing metadata
             # or running the common load_batch preparation.
@@ -554,9 +597,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     ) -> Any:
         """Rebind seq_lens on the recorded NPU graph, then replay.
 
-        NPUGraph.update must complete before replay can consume the updated
-        KV lengths. Used when the model is not deepseek-nsa.
-
         Two calling conventions:
         1. (legacy) seq_lens + attr_name + attr_type:
            Constructs cpu_update_input=[{attr_name: seq_lens}] internally.
@@ -570,22 +610,83 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         graph = self._graphs[shape_key]
 
+        t_step0 = time.perf_counter() if self._step_timing else 0.0
+        # Enqueue order, not a host wait, keeps the new KV lengths ahead of the
+        # replay's attention reads: the update is submitted before graph.replay
+        # below. The host wait is deferred to the next step so it overlaps that
+        # step's CPU work; draining it here also serializes the update thread
+        # and raises an update failure before this replay consumes its result.
+        if self._pending_update is not None:
+            self._pending_update.result()
+            self._pending_update = None
+        t_drain = time.perf_counter() if self._step_timing else 0.0
         if self._rebind_fence is not None:
             self._rebind_fence.synchronize()
+            # The copies this fence guarded are now visible and nothing writes
+            # them again until the next real update.
+            self._rebind_fence = None
+        t_fence1 = time.perf_counter() if self._step_timing else 0.0
 
+        # TEMPORARY experiment (remove before commit): keep handing the graph
+        # the first step's KV lengths instead of the live ones, so the update
+        # payload never changes. Decode lengths only grow, so the frozen value
+        # is always smaller than the live one -- wrong tokens but in bounds --
+        # and it tests whether a constant payload lets CANN skip its per-call
+        # tiling.
+        if self._update_const and self._const_payload is None:
+            self._const_payload = cpu_update_input
+        elif self._update_const:
+            cpu_update_input = self._const_payload
         update_future = self._update_executor.submit(
-            graph.update, cpu_update_input=cpu_update_input
+            self._run_update, graph, cpu_update_input
         )
+        # Track it before the launch so a replay failure still leaves the
+        # update observable to the next drain / cleanup instead of dropped.
+        self._pending_update = update_future
         graph.replay()
-        update_future.result()
+        t_replay1 = time.perf_counter() if self._step_timing else 0.0
 
         fence = self._device_module.Event()
         fence.record()
         self._rebind_fence = fence
+        if self._step_timing:
+            self._record_step_timing(t_step0, t_drain, t_fence1, t_replay1)
         return self._outputs[shape_key]
+
+    def _run_update(self, graph, cpu_update_input):
+        if not self._step_timing:
+            graph.update(cpu_update_input=cpu_update_input)
+            return
+        t0 = time.perf_counter()
+        graph.update(cpu_update_input=cpu_update_input)
+        self._update_worker_ms = (time.perf_counter() - t0) * 1e3
+
+    def _record_step_timing(self, t_step0, t_drain, t_fence1, t_replay1):
+        acc = self._timing_acc
+        if self._timing_prep_start is not None:
+            acc[0] += (t_step0 - self._timing_prep_start) * 1e3
+            self._timing_prep_start = None
+        acc[1] += (t_drain - t_step0) * 1e3
+        acc[2] += (t_fence1 - t_drain) * 1e3
+        acc[3] += (t_replay1 - t_fence1) * 1e3
+        self._timing_n += 1
+        if self._timing_n % 50 == 0:
+            logger.info(
+                "npu step timing (mean of %d): meta %.2f ms, "
+                "drain-prev-update %.2f ms, fence %.2f ms, "
+                "replay+update-submit %.2f ms, update-thread %.2f ms",
+                self._timing_n,
+                *[value / self._timing_n for value in acc[:4]],
+                self._update_worker_ms,
+            )
+            self._timing_acc = [0.0, 0.0, 0.0, 0.0]
+            self._timing_n = 0
 
     def cleanup(self) -> None:
         self._update_executor.shutdown(wait=True, cancel_futures=True)
+        if self._pending_update is not None:
+            self._pending_update.result()
+            self._pending_update = None
         if self._rebind_fence is not None:
             self._rebind_fence.synchronize()
             self._rebind_fence = None

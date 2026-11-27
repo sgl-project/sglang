@@ -31,6 +31,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.ring_swa import ring_swa_requested
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -424,6 +425,14 @@ class AscendAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_aware_swa = getattr(model_runner, "prefill_aware_swa", False)
+        # Ring layout: prompt and the fixed window ring share one per-request
+        # region, so decode needs no mask and no moving page-table bound.
+        self.ring_swa = self.prefill_aware_swa and ring_swa_requested()
+        # Per-bs batch signature of the last block-table fill, and the request
+        # rows of the last replay (host side, shared with the graph runner).
+        self._ring_block_key = {}
+        self.ring_rows_host = None
+        self._ring_rows_src = None
         if self.prefill_aware_swa:
             if self.use_mla:
                 raise ValueError("Ascend reference SWA requires MHA KV storage.")
@@ -761,6 +770,23 @@ class AscendAttnBackend(AttentionBackend):
         if forward_batch.seq_lens_cpu is not None:
             self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
 
+        if self.ring_swa and forward_batch.forward_mode.is_decode_or_idle():
+            # Ring layout: attention never reads past prompt + window, and the
+            # skipped mask is what used to encode that bound.
+            prompt_lens = self.reference_lens[
+                forward_batch.req_pool_indices.cpu().long()
+            ]
+            if self.forward_metadata.seq_lens_cpu_int is not None:
+                self.forward_metadata.seq_lens_cpu_int = torch.minimum(
+                    self.forward_metadata.seq_lens_cpu_int,
+                    prompt_lens.int() + self.sliding_window_size,
+                )
+            if self.forward_metadata.seq_lens is not None:
+                self.forward_metadata.seq_lens = torch.minimum(
+                    self.forward_metadata.seq_lens,
+                    prompt_lens.to(self.device).int() + self.sliding_window_size,
+                )
+
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
@@ -940,11 +966,19 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            self.forward_metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            swa_loc = None
+            if self.ring_swa and forward_batch.forward_mode.is_decode_or_idle():
+                rows_host = forward_batch.req_pool_indices.cpu().tolist()
+                swa_loc = self._ring_write_slots(
+                    rows_host,
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.out_cache_loc.shape[0],
+                )
+            if swa_loc is None:
+                swa_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
-            )
+            self.forward_metadata.swa_out_cache_loc = swa_loc
 
         if self.use_flash_mla and (
             forward_batch.forward_mode.is_target_verify()
@@ -959,7 +993,11 @@ class AscendAttnBackend(AttentionBackend):
             )
         self.graph_mode = False
 
-        if self.prefill_aware_swa and forward_batch.forward_mode.is_decode_or_idle():
+        if (
+            self.prefill_aware_swa
+            and not self.ring_swa
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
             positions = torch.arange(
                 self.forward_metadata.block_tables.shape[1] * self.page_size,
                 device=self.device,
@@ -1257,6 +1295,59 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_metadata[bs] = metadata
         return metadata
 
+    def _ring_block_table_valid(self, bs, ring_rows, pages):
+        """Ring regions are fixed, so the table only changes with the batch."""
+        if ring_rows is None:
+            return False
+        return self._ring_block_key.get(bs) == self._ring_block_signature(
+            ring_rows, pages
+        )
+
+    def _ring_block_table_mark(self, bs, ring_rows, pages):
+        if ring_rows is not None:
+            self._ring_block_key[bs] = self._ring_block_signature(ring_rows, pages)
+
+    def _ring_block_signature(self, ring_rows, pages):
+        regions = getattr(self.token_to_kv_pool, "_uocr_ring_regions", None)
+        bases = (
+            tuple(regions.base_by_row.get(int(row), -1) for row in ring_rows)
+            if regions is not None
+            else ()
+        )
+        return (tuple(ring_rows), bases, pages)
+
+    def _ring_write_slots(self, rows_host, seq_lens_cpu, n):
+        """Ring write slot per decode token, straight from the host mirrors.
+
+        ``rows_host`` and ``seq_lens_cpu`` are already on the host each step, so
+        this costs one small H2D and no device arithmetic. Returns None when the
+        region bookkeeping is unavailable, leaving the caller on the legacy path.
+        """
+        regions = getattr(self.token_to_kv_pool, "_uocr_ring_regions", None)
+        if regions is None or seq_lens_cpu is None:
+            return None
+        window = self.sliding_window_size
+        lens = seq_lens_cpu.tolist()
+        rows = min(n, len(rows_host), len(lens))
+        if rows == 0:
+            return None
+        slots = []
+        for i in range(rows):
+            row = int(rows_host[i])
+            base = regions.base_by_row.get(row)
+            if base is None:
+                return None
+            prompt = int(self.reference_lens[row])
+            # out_cache_loc is base + position; the position of this step's
+            # token is the length before the increment.
+            slots.append(base + prompt + (int(lens[i]) - 1 - prompt) % window)
+        out = torch.tensor(
+            slots, dtype=torch.int64, device=self.cuda_graph_swa_out_cache_loc.device
+        )
+        if n > rows:
+            out = torch.cat([out, out.new_zeros(n - rows)])
+        return out.to(self.cuda_graph_swa_out_cache_loc.dtype)
+
     def _apply_cuda_graph_metadata(
         self,
         bs: int,
@@ -1275,13 +1366,27 @@ class AscendAttnBackend(AttentionBackend):
         """
         metadata = self.graph_metadata[bs]
 
+        # One host round trip per step: the ring write target, the visibility
+        # bound and the block-table reuse test all key off the request rows.
+        ring_rows = None
+        if self.ring_swa and forward_mode.is_decode_or_idle():
+            ring_rows = req_pool_indices[:bs].cpu().tolist()
+            self.ring_rows_host = ring_rows
+            self._ring_rows_src = req_pool_indices.data_ptr()
+
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
-            self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
-            )
+            swa_loc = None
+            if ring_rows is not None:
+                swa_loc = self._ring_write_slots(ring_rows, seq_lens_cpu, n)
+            if swa_loc is None:
+                swa_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    out_cache_loc
+                )
+            if n < self.cuda_graph_swa_out_cache_loc.numel():
+                self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(swa_loc)
         if seq_lens_cpu is not None:
             # Compute the host-side KV lengths visible to this attention step. Target
             # verify adds the draft block except for DFlash, whose seq_lens_cpu already
@@ -1333,7 +1438,9 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.swa_mask[:bs, 0, :].copy_(mask)
                 metadata.swa_mask[bs:, :, :].fill_(True)
 
-            if not self.dense_mla_dcp_target:
+            if not self.dense_mla_dcp_target and not self._ring_block_table_valid(
+                bs, ring_rows, max_seq_pages
+            ):
                 metadata.block_tables[:bs, :max_seq_pages].copy_(
                     self.req_to_token[
                         req_pool_indices[:bs], 0 : max_len : self.page_size
@@ -1341,6 +1448,7 @@ class AscendAttnBackend(AttentionBackend):
                     // self.page_size
                 )
                 metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+                self._ring_block_table_mark(bs, ring_rows, max_seq_pages)
         elif max_seq_len_host is not None and not self.dense_mla_dcp_target:
             # Mirrorless replay (e.g. DSA models): the scheduler publishes the
             # host-side max of the page-aligned allocated seq lens (>= committed
@@ -1364,16 +1472,18 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.block_tables.shape[1],
                 (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
             )
-            metadata.block_tables[:bs, :total_pages].copy_(
-                self.req_to_token[
-                    req_pool_indices[:bs],
-                    0 : total_pages * self.page_size : self.page_size,
-                ]
-                // self.page_size
-            )
-            metadata.block_tables[:bs, total_pages:].fill_(0)
+            if not self._ring_block_table_valid(bs, ring_rows, total_pages):
+                metadata.block_tables[:bs, :total_pages].copy_(
+                    self.req_to_token[
+                        req_pool_indices[:bs],
+                        0 : total_pages * self.page_size : self.page_size,
+                    ]
+                    // self.page_size
+                )
+                metadata.block_tables[:bs, total_pages:].fill_(0)
+                self._ring_block_table_mark(bs, ring_rows, total_pages)
 
-        if self.prefill_aware_swa:
+        if self.prefill_aware_swa and not self.ring_swa:
             references = self.reference_lens[req_pool_indices[:bs].cpu().long()].to(
                 self.device
             )
@@ -1470,6 +1580,24 @@ class AscendAttnBackend(AttentionBackend):
             device_kv_lens = seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             device_kv_lens = seq_lens + self.speculative_step_offset_npu
+
+        if ring_rows is not None:
+            # Visibility stops at prompt + window; the ring slots past it hold
+            # older generations and must not be read as a growing sequence.
+            caps = torch.tensor(
+                [
+                    int(self.reference_lens[int(row)]) + self.sliding_window_size
+                    for row in ring_rows
+                ],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            capped = torch.minimum(device_kv_lens[:bs], caps)
+            device_kv_lens = (
+                capped
+                if device_kv_lens.shape[0] == bs
+                else torch.cat([capped, device_kv_lens[bs:]])
+            )
 
         if self.dense_mla_dcp_target:
             if forward_mode.is_target_verify():
@@ -2367,11 +2495,15 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 return attn_output
 
-            if self.prefill_aware_swa and any(
-                seq_len > prompt_len
-                for seq_len, prompt_len in zip(
-                    forward_batch.seq_lens_cpu.tolist(),
-                    forward_batch.reference_lens_cpu,
+            if (
+                self.prefill_aware_swa
+                and not self.ring_swa
+                and any(
+                    seq_len > prompt_len
+                    for seq_len, prompt_len in zip(
+                        forward_batch.seq_lens_cpu.tolist(),
+                        forward_batch.reference_lens_cpu,
+                    )
                 )
             ):
                 query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -3926,7 +4058,7 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_cpu_list = self.forward_metadata.seq_lens_cpu_list
             if self.prefill_aware_swa:
                 block_tables = self.forward_metadata.block_tables
-                attn_mask = self.forward_metadata.swa_mask
+                attn_mask = None if self.ring_swa else self.forward_metadata.swa_mask
             elif self._is_swa_layer(layer):
                 # CUDA/NPU graph capture uses seq_len fill value 0 on Ascend.
                 # Avoid dynamic window block-table construction during capture,
@@ -4264,7 +4396,7 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 return attn_output
 
-            if self.prefill_aware_swa:
+            if self.prefill_aware_swa and not self.ring_swa:
                 query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 output = q.new_empty(
                     (num_tokens, layer.tp_q_head_num, layer.v_head_dim)

@@ -19,6 +19,8 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
+from sglang.srt.hardware_backend.npu.ring_swa import extend_locs as ring_extend_locs
+from sglang.srt.hardware_backend.npu.ring_swa import ring_swa_requested
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
     _ceil_group_count,
@@ -35,7 +37,12 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-from sglang.srt.runtime_context import attention_backends, get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_memory,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -342,6 +349,72 @@ def _prefix_kv_indices(batch: ScheduleBatch, req: Req) -> torch.Tensor:
     return batch.tree_cache.prefix_device_indices(req)
 
 
+_UOCR_RING_MODEL_TYPES = ("unlimited-ocr", "unlimited_ocr")
+
+
+def _ring_window(batch: ScheduleBatch) -> Optional[int]:
+    """Sliding window when per-request prompt+ring regions are in play."""
+    if not ring_swa_requested():
+        return None
+    if not get_memory().disable_radix_cache:
+        # Prefix sharing would put prompt pages outside the private region.
+        return None
+    hf_config = batch.model_config.hf_config
+    if hf_config.model_type not in _UOCR_RING_MODEL_TYPES:
+        return None
+    return getattr(hf_config, "sliding_window_size", None)
+
+
+def _ring_regions(allocator):
+    """The pool-wide run allocator, created once by the KV configurator."""
+    regions = getattr(allocator, "_uocr_ring_regions", None)
+    if regions is None:
+        raise RuntimeError(
+            "ring SWA is enabled but no KV region allocator was installed; "
+            "check that --uocr-ring-swa reached the memory pool configurator"
+        )
+    return regions
+
+
+def _ring_bases(batch: ScheduleBatch, req_pool_indices) -> torch.Tensor:
+    """Region base per request: allocate for a fresh prompt, otherwise reuse."""
+    regions = _ring_regions(batch.token_to_kv_pool_allocator)
+    if batch.req_to_token_pool is None:
+        raise RuntimeError("ring SWA needs the request page table")
+    bases = []
+    fresh = []
+    try:
+        for row, req, prefix_len, seq_len in zip(
+            req_pool_indices.tolist(),
+            batch.reqs,
+            batch.prefix_lens,
+            batch.seq_lens_cpu.tolist(),
+        ):
+            prompt_len = len(req.origin_input_ids)
+            if prefix_len == 0:
+                if seq_len > prompt_len + regions.window:
+                    raise RuntimeError(
+                        "ring SWA does not support re-prefilling generated tokens"
+                    )
+                base = regions.alloc(prompt_len)
+                if base is None:
+                    raise RuntimeError(
+                        f"ring SWA out of KV regions: need "
+                        f"{regions.pages_for(prompt_len)} pages for a "
+                        f"{prompt_len}-token prompt"
+                    )
+                regions.base_by_row[row] = base
+                fresh.append(base)
+                bases.append(base)
+            else:
+                bases.append(int(batch.req_to_token_pool.req_to_token[row, 0]))
+    except Exception:
+        for base in fresh:
+            regions.free_run(base)
+        raise
+    return torch.tensor(bases, dtype=torch.int64, device=batch.device)
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -353,7 +426,9 @@ def alloc_for_extend(
     if the pool can't satisfy the batch (fail-loud — see its docstring).
     """
     # free out-of-window swa tokens
-    batch.maybe_evict_swa()
+    ring_window = _ring_window(batch)
+    if ring_window is None:
+        batch.maybe_evict_swa()
 
     prefix_tensors = [_prefix_kv_indices(batch, r) for r in batch.reqs]
 
@@ -392,7 +467,18 @@ def alloc_for_extend(
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)
-    if reuse_kv is not None and any(reuse_kv):
+    if ring_window is not None:
+        # Every request owns a prompt-sized region; prompt tokens fill it linearly.
+        if reuse_kv is not None and any(reuse_kv):
+            raise RuntimeError("ring SWA does not support KV reuse")
+        out_cache_loc = ring_extend_locs(
+            bases=_ring_bases(batch, req_pool_indices_device),
+            prefix_lens=prefix_lens_device,
+            seq_lens=batch.seq_lens,
+            page_size=get_schedule().page_size,
+            device=batch.device,
+        )
+    elif reuse_kv is not None and any(reuse_kv):
         out_cache_loc = _alloc_extend_loc_with_kv_reuse(
             batch,
             reuse_kv,
@@ -466,7 +552,7 @@ def alloc_for_extend(
         )
 
     # Write to req_to_token_pool
-    if is_cp_sharded_padded():
+    if is_cp_sharded_padded() and ring_window is None:
         # Rollback owns physical rows; the request table and caller need cache ids.
         physical_out_cache_loc = out_cache_loc
         strategy = get_cp_strategy()
@@ -666,12 +752,23 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
         out_cache_loc: allocated cache locations
     """
 
-    batch.maybe_evict_swa()
+    ring_window = _ring_window(batch)
+    if ring_window is None:
+        batch.maybe_evict_swa()
 
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
-    if _alloc_page_size(batch) == 1:
+    if ring_window is not None:
+        # The new token's logical position is the length before the increment;
+        # base + position keeps req_to_token and the block table linear.
+        if token_per_req != 1:
+            raise RuntimeError("ring SWA decode supports one token per request")
+        bases = batch.req_to_token_pool.req_to_token[batch.req_pool_indices, 0].to(
+            torch.int64
+        )
+        out_cache_loc = bases + seq_lens_gpu
+    elif _alloc_page_size(batch) == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:

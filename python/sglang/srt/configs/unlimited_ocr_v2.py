@@ -29,6 +29,13 @@ class UocrDocumentConfig(msgspec.Struct, frozen=True):
         "enforces it without --enable-custom-logit-processor. Also sizes the "
         "default context of a split server. 0 disables the length limit.",
     ] = 0
+    uocr_ring_swa: A[
+        bool,
+        "Unlimited-OCR v1 on Ascend: keep the prompt and a fixed sliding-window "
+        "ring in one contiguous per-request KV region, so decode needs no mask "
+        "and no per-step page-table rebuild. Requires --disable-radix-cache and "
+        "a page size greater than 1. Experimental.",
+    ] = False
 
     def __post_init__(self):
         if self.uocr_doc_page_window < 1:
@@ -42,6 +49,7 @@ class UocrDocumentConfig(msgspec.Struct, frozen=True):
             uocr_doc_split=args.uocr_doc_split,
             uocr_doc_page_window=args.uocr_doc_page_window,
             uocr_max_page_tokens=args.uocr_max_page_tokens,
+            uocr_ring_swa=args.uocr_ring_swa,
         )
 
     def default_context_length(self) -> int:

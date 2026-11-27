@@ -601,6 +601,10 @@ class KVCacheConfigurator:
                 # the target's state.
                 pools.token_to_kv_pool_allocator.state = state
 
+        self._install_ring_swa_regions(
+            pools.token_to_kv_pool_allocator, pools.token_to_kv_pool
+        )
+
         swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
         alloc = pools.token_to_kv_pool_allocator
         if not self.is_draft_worker and is_swa_req_ring(alloc):
@@ -647,6 +651,41 @@ class KVCacheConfigurator:
     @property
     def pool_page_size(self) -> int:
         return get_schedule().page_size * self.loc_space_scale
+
+    def _install_ring_swa_regions(self, allocator, pool) -> None:
+        """Attach the per-request prompt+ring region allocator to the SWA pool.
+
+        Generated tokens past the window never occupy KV, so a region is sized
+        by its own prompt, not by the context length.
+        """
+        from sglang.srt.hardware_backend.npu.ring_swa import (
+            RingRegionAllocator,
+            ring_swa_requested,
+        )
+
+        if self.is_draft_worker or not ring_swa_requested():
+            return
+        hf_config = self.model_config.hf_config
+        window = getattr(hf_config, "sliding_window_size", None)
+        if hf_config.model_type not in ("unlimited-ocr", "unlimited_ocr") or not window:
+            return
+        if not get_memory().disable_radix_cache:
+            raise ValueError("--uocr-ring-swa requires --disable-radix-cache")
+        page_size = get_schedule().page_size
+        regions = RingRegionAllocator(
+            page_size=page_size,
+            window=window,
+            total_pages=allocator.size_swa // page_size,
+        )
+        allocator._uocr_ring_regions = regions
+        pool._uocr_ring_regions = regions
+        logger.info(
+            "uocr ring SWA: prompt-sized KV regions over %d tokens "
+            "(window=%d, page=%d)",
+            regions.available_tokens(),
+            window,
+            page_size,
+        )
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens

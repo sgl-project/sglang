@@ -903,6 +903,12 @@ class Req(ReqDllmMixin):
     def resumable_by_reprefill(self) -> bool:
         """input_embeds cover only the prompt, so a re-prefill restarts the
         generation; that is invisible until output has been sent."""
+        from sglang.srt.hardware_backend.npu.ring_swa import ring_swa_requested
+
+        if ring_swa_requested():
+            # The ring keeps only the window, so a re-prefill would have to
+            # rebuild it; stage 1 aborts instead of resuming with stale KV.
+            return False
         return self.input_embeds is None or self.send_token_offset == 0
 
     @property
