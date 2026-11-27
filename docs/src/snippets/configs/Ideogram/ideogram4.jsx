@@ -55,7 +55,7 @@ export const config = (() => {
         options: [
           { id: "nf4", label: "ideogram-4-nf4" },
           { id: "fp8", label: "ideogram-4-fp8" },
-          { id: "nvfp4", label: "Ideogram-4" },
+          { id: "nvfp4", label: "Ideogram-4", disabled: (s) => s.hw === "xeon", disableReason: "NVFP4 requires a Blackwell GPU." },
           { id: "fast", label: "ideogram-v4-fast" },
           { id: "instant", label: "ideogram-v4-instant" },
         ],

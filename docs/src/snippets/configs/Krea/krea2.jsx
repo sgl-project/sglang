@@ -62,6 +62,7 @@ export const config = (() => {
         title: "Parallelism",
         scope: "serve",
         default: "sp",
+        showWhen: (s) => s.hw !== "xeon",
         options: [
           { id: "sp", label: "Ulysses" },
           { id: "tp", label: "Tensor parallel" },

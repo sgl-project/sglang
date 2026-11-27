@@ -10,7 +10,8 @@ export const config = (() => {
     const env = s.hw === "xeon" ? ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"] : [];
     const warnings = [];
     const errors = [];
-    if (s.placement === "offload") flags.push("--dit-cpu-offload", "--text-encoder-cpu-offload", "--vae-cpu-offload");
+    if (s.placement === "offload" && s.hw !== "xeon")
+      flags.push("--dit-cpu-offload", "--text-encoder-cpu-offload", "--vae-cpu-offload");
     return { flags, gpus, topology: t, env, warnings, errors };
   };
   const defaults = {
@@ -40,7 +41,7 @@ export const config = (() => {
         default: "auto",
         options: [
           { id: "auto", label: "Auto" },
-          { id: "offload", label: "Component offload" },
+          { id: "offload", label: "Component offload", disabled: (s) => s.hw === "xeon", disableReason: "Not applicable on Intel Xeon CPUs." },
         ],
       },
     ],
