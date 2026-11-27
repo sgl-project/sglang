@@ -4306,6 +4306,11 @@ class Scheduler(
             self._embedding_preserve_last_token_id,
         )
         if error_msg:
+            # Keep embedding requests with invalid input lengths out of the
+            # admission queue.  Without a terminal abort, an overlong request
+            # is retried by the scheduler indefinitely and can block later
+            # requests behind it.
+            req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
 
