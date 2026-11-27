@@ -83,6 +83,7 @@ from sglang.multimodal_gen.test.test_utils import (
     load_consistency_gt,
     save_audio_gt_artifact,
     save_consistency_failure_artifact,
+    save_generated_artifact_images,
     save_missing_consistency_gt_artifact,
     wait_for_req_perf_record,
 )
@@ -945,12 +946,29 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         else:
             output_frames = [image_bytes_to_numpy(content)]
 
-        result = compare_with_gt(
-            output_frames=output_frames,
-            gt_data=gt_data,
-            thresholds=thresholds,
-            case_id=case.id,
-        )
+        try:
+            result = compare_with_gt(
+                output_frames=output_frames,
+                gt_data=gt_data,
+                thresholds=thresholds,
+                case_id=case.id,
+            )
+        except ValueError:
+            # A shape or frame count mismatch can fail before metrics exist.
+            artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
+            if artifact_dir:
+                try:
+                    save_generated_artifact_images(
+                        out_dir=Path(artifact_dir) / "consistency_failures",
+                        case_id=case.id,
+                        num_gpus=num_gpus,
+                        output_frames=output_frames,
+                        is_video=is_video,
+                        output_format="png",
+                    )
+                except (OSError, ValueError):
+                    logger.exception("Could not save generated frames for %s", case.id)
+            raise
 
         if not result.passed:
             failed_frames = []
