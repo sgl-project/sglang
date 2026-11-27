@@ -12,6 +12,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored, StorageMedium
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache import unified_radix_cache
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -61,6 +63,7 @@ class _FencedController(InstantWriteBackController):
         super().__init__(controller.mem_pool_host, controller.mem_pool_device_allocator)
         self.log = []
         self.submitted = []
+        self.copies_done = True
         self._pool_names = pool_names
         forward = SimpleNamespace(
             wait_event=lambda event: self.log.append(("wait", "forward", event.n))
@@ -94,7 +97,9 @@ class _FencedController(InstantWriteBackController):
         self.submitted.append(pages)
         self.log.append(("submit", n))
         finish = SimpleNamespace(
-            n=n, synchronize=lambda: self.log.append(("sync", n)), query=lambda: True
+            n=n,
+            synchronize=lambda: self.log.append(("sync", n)),
+            query=lambda: self.copies_done,
         )
         return SimpleNamespace(
             start_event=None, finish_event=finish, timing_enabled=False
@@ -286,6 +291,42 @@ class _WriteBackBatchingSuite:
                 self.assertTrue(freed)
                 self.assertEqual({e[1] for e in cc.log if e[0] == "wait"}, streams)
                 cache.sanity_check()
+
+    def test_idle_waits_for_the_stream_fenced_copies(self):
+        setup_allocator_context()
+        cache, allocator, host_pool = self._fill_host_with_one_batch()
+        for seq in batch_seqs(1):
+            insert_seq(cache, allocator, seq)
+        cc = _FencedController(cache.cache_controller, {id(host_pool): "kv"})
+        cc.load_fence_stream = cc.write_fence_stream
+        cc.forward_on_fence_stream = True
+        cc.copies_done = False
+        cache.cache_controller = cc
+        cache.evict(EvictParams(num_tokens=BATCH_TOKENS))
+        self.assertEqual(cache.ongoing_write_through, {})
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.running_batch = SimpleNamespace(is_empty=lambda: False)
+        scheduler.last_batch = None
+        scheduler.enable_overlap = False
+        scheduler._pp_microbatches_drained = lambda: True
+        scheduler.pause_state = SimpleNamespace(paused=False)
+        scheduler.request_receiver = SimpleNamespace(has_pending=lambda: False)
+        scheduler.uocr_runtime = None
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.decode_offload_manager = None
+        scheduler.enable_hierarchical_cache = True
+        scheduler.enable_lmcache = False
+        scheduler.enable_unified_cache_external_linker = False
+        scheduler.tree_cache = cache
+        with mock.patch.object(Scheduler, "request_lists", return_value={}):
+            self.assertFalse(scheduler.is_fully_idle())
+            self.assertNotIn(("sync", 0), cc.log)
+            scheduler.running_batch = SimpleNamespace(is_empty=lambda: True)
+            self.assertTrue(scheduler.is_fully_idle())
+        self.assertIn(("sync", 0), cc.log)
+        self.assertEqual(len(cache._fenced_write_acks), 0)
+        cache.sanity_check()
 
     def test_allocation_reclaim_on_a_token_chain_batches_its_copies(self):
         """Regression: on a token-only chain, an allocation reclaim's write-back

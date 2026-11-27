@@ -76,7 +76,7 @@ class GPT2Attention(nn.Module):
             self.num_heads,
             self.head_dim,
             scaling=self.scale,
-            num_kv_heads=total_num_heads,
+            num_kv_heads=self.num_heads,
             layer_id=layer_id,
             quant_config=quant_config,
         )

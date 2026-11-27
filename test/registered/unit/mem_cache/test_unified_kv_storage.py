@@ -438,7 +438,7 @@ def _table(rows: int) -> HybridReqToTokenPool:
     request (the extra buffer, not lazy)."""
     table = object.__new__(HybridReqToTokenPool)
     ReqToTokenPool.__init__(
-        table, size=rows, max_context_len=8, device="cpu", enable_memory_saver=False
+        table, size=rows, row_width=8, device="cpu", enable_memory_saver=False
     )
     table.enable_mamba_extra_buffer = True
     table.enable_mamba_extra_buffer_lazy = False

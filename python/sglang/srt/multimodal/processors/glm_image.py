@@ -22,8 +22,6 @@ class GlmImageProcessor(SGLangBaseProcessor):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         self.IMAGE_TOKEN = "<|image|>"
-        self.IMAGE_START_TOKEN = "<|begin_of_image|>"
-        self.IMAGE_END_TOKEN = "<|end_of_image|>"
 
         self.IM_TOKEN_ID = hf_config.image_token_id
         self.IMAGE_START_TOKEN_ID = hf_config.image_start_token_id

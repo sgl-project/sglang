@@ -54,6 +54,8 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
 )
 
+from ..constants import MINIMAX_H3_DWD_PIXELS_EXTRA_KEY
+
 logger = init_logger(__name__)
 
 
@@ -760,7 +762,19 @@ class MiniMaxH3DecodingStage(DecodingStage):
                         ),
                         set_forward_context(current_timestep=0, attn_metadata=None),
                     ):
-                        decoded = video_decode(visual_decode_latent, **decode_kwargs)
+                        dwd_pixels = batch.extra.pop(
+                            MINIMAX_H3_DWD_PIXELS_EXTRA_KEY, None
+                        )
+                        if dwd_pixels is not None:
+                            # DWD release: the DiT's pixel head already decoded
+                            # the frames; the VAE stays idle
+                            decoded = dwd_pixels.float()
+                            if stream is not None:
+                                stream(decoded)
+                        else:
+                            decoded = video_decode(
+                                visual_decode_latent, **decode_kwargs
+                            )
                     # before closing the encoder, whose x264 and mux tail it overlaps
                     if overlap_audio:
                         owner_audio, output_audio_waveform, owner_exception = (
