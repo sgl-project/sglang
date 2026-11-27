@@ -251,25 +251,30 @@ class TestConcurrentPrefillPlan(CustomTestCase):
         charged = -(-longest // page) * page + page + 8
         self.assertLessEqual(charged, 32768)
 
-    def test_unchunked_prompts_stay_inside_one_forward_budget(self):
-        """Chunking off on a 128K context with --max-prefill-tokens 4096 (an
-        Ascend fused MoE prefill takes 4,096 rows): the scheduler admits a
-        40,001-token prompt alone in one forward, which overflows the backend's
-        buffer, so every prompt must fit the per-forward budget."""
-        limits = concurrent_prefill_limits(
-            [
-                _internal_state(
-                    effective_chunked_prefill_size=None, max_prefill_tokens=4096
-                )
-            ],
-            context_len=131072,
-            max_req_input_len=131066,
-            num_reserved_tokens=0,
-        )
-        plan = concurrent_prefill_plan(limits)
-        self.assertEqual([len(r) for r in plan.rounds], [1, 4, 32])
-        self.assertLessEqual(max(max(r) for r in plan.rounds), 4096)
-        self.assertEqual(plan.logprob_sizes, [513, 512])
+    def test_unchunked_server_gets_only_the_probes(self):
+        """Chunking off on a 128K context: the scheduler admits a 40,001-token
+        prompt alone, and packs a round up to --max-prefill-tokens (65536) into
+        one forward, past the 4,096 rows an Ascend arch22 fused MoE prefill
+        takes. Only the two short logprob probes run, inside the budget."""
+
+        def plan(max_prefill_tokens):
+            limits = concurrent_prefill_limits(
+                [
+                    _internal_state(
+                        effective_chunked_prefill_size=None,
+                        max_prefill_tokens=max_prefill_tokens,
+                    )
+                ],
+                context_len=131072,
+                max_req_input_len=131066,
+                num_reserved_tokens=0,
+            )
+            return concurrent_prefill_plan(limits)
+
+        for budget in (65536, 4096):
+            self.assertEqual(plan(budget).rounds, [], budget)
+            self.assertEqual(plan(budget).logprob_sizes, [513, 512], budget)
+        self.assertEqual(plan(300).logprob_sizes, [300, 300])
         # With chunking the scheduler splits prompts itself: plan unchanged.
         self.assertEqual(
             concurrent_prefill_plan(_limits(max_prefill_tokens=4096)),
@@ -330,14 +335,12 @@ class TestConcurrentPrefillRequests(CustomTestCase):
         asyncio.run(concurrent_prefill("null", tm))
         self.assertEqual(tm.requests, [])
 
-    def test_full_attention_model_without_chunking_runs_bounded(self):
-        """With chunking off but only the full KV pool, every prompt fits it in
-        one piece, so the rounds and the logprob probes still run."""
+    def test_full_attention_model_without_chunking_runs_the_probes(self):
+        """With chunking off but only the full KV pool, the 513- and 512-token
+        logprob probes still run."""
         tm = _RecordingTokenizerManager(effective_chunked_prefill_size=None)
         asyncio.run(concurrent_prefill("null", tm))
-        lens = [len(r.input_ids) for r in tm.requests]
-        self.assertTrue(lens)
-        self.assertLessEqual(max(lens), _RecordingTokenizerManager.max_req_input_len)
+        self.assertEqual([len(r.input_ids) for r in tm.requests], [513, 512])
 
     def test_one_tokenizer_worker_runs_serially_under_a_queue_limit_of_one(self):
         """Two tokenizer workers and --max-queued-requests 1: one worker sends
@@ -433,10 +436,19 @@ class TestConcurrentPrefillRequests(CustomTestCase):
         self.assertEqual(other.requests, [])
         self.assertEqual(went_on[id(other)], (len(elected.requests), 0))
 
-    def test_waiting_for_the_elected_warmup_is_bounded(self):
-        """An elected worker whose warmup never ends must not hold the other
-        workers' startup forever: they give up after the wait limit."""
+    def test_a_long_elected_warmup_warns_and_is_still_waited_for(self):
+        """Past the wait limit the other workers warn but keep waiting: going on
+        would start their default warmup against the same single queue slot."""
         tm = _RecordingTokenizerManager(max_queued_requests=1, tokenizer_worker_num=2)
+
+        async def run(held):
+            waiter = asyncio.create_task(concurrent_prefill("null", tm))
+            await asyncio.sleep(0.2)  # four times the wait limit
+            still_waiting = not waiter.done()
+            os.close(held)  # the elected warmup ends
+            await asyncio.wait_for(waiter, timeout=5)
+            return still_waiting
+
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(warmup_mod.tempfile, "gettempdir", return_value=tmp),
@@ -449,9 +461,9 @@ class TestConcurrentPrefillRequests(CustomTestCase):
                 held = warmup_mod._try_lock(
                     warmup_mod._tokenizer_worker_lock_path(".turn")
                 )
-                with self.assertLogs(warmup_mod.logger, "WARNING"):
-                    asyncio.run(concurrent_prefill("null", tm))
-                os.close(held)
+                with self.assertLogs(warmup_mod.logger, "WARNING") as logs:
+                    self.assertTrue(asyncio.run(run(held)))
+        self.assertEqual(len(logs.records), 1)
         self.assertEqual(tm.requests, [])
 
     def test_worker_lock_is_exclusive_until_its_holder_exits(self):

@@ -276,6 +276,7 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
 
     The plan only covers configs where it can show that every request is
     admitted; for any other config it sends nothing and says why.
+    Without chunking only the probes run.
 
     Each DP rank gets at least one round budget (two prefill chunks, at least
     `_CONCURRENT_PREFILL_TOKENS`) per round and less than two: each prompt gets
@@ -317,11 +318,20 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
             rounds=[], logprob_sizes=[], skip_reason=skip_reason
         )
 
+    logprob_sizes = []
+    if limits.serves_input_logprobs:
+        logprob_sizes = [min(max_prompt, s) for s in _CONCURRENT_PREFILL_LOGPROB_SIZES]
+    if chunk is None:
+        # The rounds warm prefills that cross chunk boundaries; without
+        # chunking a round would pack up to max_prefill_tokens into one forward,
+        # past a backend's own per-forward limit, so only the probes run.
+        return ConcurrentPrefillPlan(rounds=[], logprob_sizes=logprob_sizes)
+
     slots = limits.max_running_requests
     if queue is not None:
         # A rank's share of a round can arrive in one scheduler poll.
         slots = min(slots, queue)
-    budget = max(_CONCURRENT_PREFILL_TOKENS, 2 * (chunk or 0))
+    budget = max(_CONCURRENT_PREFILL_TOKENS, 2 * chunk)
     rounds = []
     for n in sorted({1, slots // 8 or 1, slots}):
         share = max(1, budget // n)
@@ -331,16 +341,14 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
                 for i in range(n * limits.dp_ranks)
             ]
         )
-    logprob_sizes = []
-    if limits.serves_input_logprobs:
-        logprob_sizes = [min(max_prompt, s) for s in _CONCURRENT_PREFILL_LOGPROB_SIZES]
     return ConcurrentPrefillPlan(rounds=rounds, logprob_sizes=logprob_sizes)
 
 
 # Held until the worker exits, so no other tokenizer worker of this server runs
 # the warmup after this one finishes.
 _tokenizer_worker_warmup_lock: Optional[int] = None
-# How long a worker waits for the elected worker's warmup before going on.
+# How long a worker waits for the elected worker's warmup before it warns (it
+# keeps waiting: going on would let its default warmup compete for the queue).
 _TOKENIZER_WORKER_WAIT_S = 1800.0
 _TOKENIZER_WORKER_POLL_S = 0.1
 
@@ -368,13 +376,17 @@ def _try_lock(path: str) -> Optional[int]:
     return fd
 
 
-async def _wait_for_lock(path: str, timeout: float) -> Optional[int]:
-    """`_try_lock` retried without blocking the event loop; None once
-    `timeout` seconds pass."""
-    deadline = time.monotonic() + timeout
+async def _wait_for_lock(path: str, warn_after: float) -> int:
+    """`_try_lock` retried without blocking the event loop, with one warning
+    once `warn_after` seconds pass."""
+    deadline = time.monotonic() + warn_after
     while (fd := _try_lock(path)) is None:
-        if time.monotonic() >= deadline:
-            return None
+        if deadline is not None and time.monotonic() >= deadline:
+            logger.warning(
+                "concurrent_prefill: another tokenizer worker's warmup is still "
+                f"running after {warn_after:.0f}s; still waiting for it"
+            )
+            deadline = None
         await asyncio.sleep(_TOKENIZER_WORKER_POLL_S)
     return fd
 
@@ -444,11 +456,6 @@ async def concurrent_prefill(
                     _tokenizer_worker_lock_path(".turn"), _TOKENIZER_WORKER_WAIT_S
                 )
                 if not _claim_tokenizer_worker_warmup():
-                    if turn is None:
-                        logger.warning(
-                            "concurrent_prefill: another tokenizer worker's warmup "
-                            f"is still running after {_TOKENIZER_WORKER_WAIT_S:.0f}s"
-                        )
                     logger.info(
                         "Skipping concurrent_prefill: another tokenizer worker runs "
                         "it under the request queue limit"
