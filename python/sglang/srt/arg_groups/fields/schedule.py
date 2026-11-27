@@ -138,7 +138,7 @@ class Schedule(msgspec.Struct):
     ] = None
     enable_priority_scheduling: A[
         bool,
-        "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
+        "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default. Supported with --schedule-policy fcfs, lof and lpm.",
     ] = False
     disable_priority_preemption: A[
         bool,
