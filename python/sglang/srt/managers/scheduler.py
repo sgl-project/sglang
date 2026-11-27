@@ -2997,6 +2997,9 @@ class Scheduler(
             get_total_prefill_busy_us=lambda: self._get_total_prefill_busy_us(),
             get_decode_moment_totals=lambda: self.decode_moment_totals,
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
+            get_storage_metrics_collector=lambda: (
+                self.tree_cache.storage_metrics_collector
+            ),
         )
 
     def _get_total_prefill_busy_us(self) -> int:
