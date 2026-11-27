@@ -87,10 +87,10 @@ class SystemOneServing(OpenAIServingDecisions):
             error = self.question_encoder.validate_request(request)
             if error is not None:
                 return error
-            if request.packing not in (None, False, "none", "shared"):
-                return "Nemotron Decision packing must be 'none' or 'shared'."
+            if request.packing is not None:
+                return "Packing is selected by decision_attention_layout in the checkpoint or server model override, not by a request field."
             if request.long_mode not in (None, "full"):
-                return "Nemotron Decision reads the full prompt; compaction is not supported."
+                return "This model reads the full prompt; compaction is not supported."
         return (
             self._validate_server(request.model)
             or self._validate_images(request.images)
@@ -442,15 +442,9 @@ class SystemOneServing(OpenAIServingDecisions):
             if self.question_encoder is not None
             else None
         )
-        shared_prefix = (
-            await asyncio.to_thread(self.question_encoder.packing_prefix, request.state)
-            if self.question_encoder is not None and request.packing == "shared"
-            else None
-        )
         _, _, result = await self._score(
             adapted_request=adapted_request,
             raw_request=raw_request,
-            shared_prefix=shared_prefix,
             temperature=(
                 1.0
                 if self.decision_config is None

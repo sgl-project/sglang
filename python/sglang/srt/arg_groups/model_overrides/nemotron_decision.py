@@ -4,7 +4,10 @@ from sglang.srt.arg_groups.model_override_base import (
     register_model_override,
     resolving_view,
 )
-from sglang.srt.configs.nemotron_decision import is_nemotron_decision
+from sglang.srt.configs.nemotron_decision import (
+    is_nemotron_decision,
+    nemotron_decision_attention_layout,
+)
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.device import get_device_memory_capacity
 
@@ -22,8 +25,12 @@ def apply_nemotron_decision_prefill_defaults(
     updates = {"chunked_prefill_size": -1}
     if server_args.max_prefill_tokens is None:
         gpu_mem = get_device_memory_capacity(resolving_view(server_args).device)
-        # Smaller GPUs need a smaller activation reserve for a complete read.
-        if gpu_mem is not None and gpu_mem >= 60 * 1024:
+        # Only automatic memory sizing reserves room for a 128K read.
+        if (
+            gpu_mem is not None
+            and gpu_mem >= 60 * 1024
+            and server_args.mem_fraction_static is None
+        ):
             budget = 131072
         else:
             budget = 16384
@@ -55,6 +62,7 @@ def nemotron_decision_activation_reserve_mb(
 @register_model_override("NemotronForDecision")
 def _nemotron_decision_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
+    nemotron_decision_attention_layout(hf_config)
     if get_platform().is_hip:
         # The default ROCm backend ignores encoder-only attention.
         raise ValueError("Nemotron Decision is not supported on ROCm.")

@@ -27,13 +27,12 @@ class DSV4ReqToTokenTablesMixin:
     (:class:`DSV4NPUDecodeReqToTokenPool`), which differ only in their base.
 
     Host class must call ``super().__init__(...)`` first (so ``_alloc_size``
-    exists) then ``self._init_dsv4_tables(...)``; ``free`` should call
+    and ``row_width`` exist) then ``self._init_dsv4_tables(...)``; ``free`` should call
     ``self._dsv4_free(req)`` before delegating to the base ``free``.
     """
 
     def _init_dsv4_tables(
         self,
-        max_context_len: int,
         device: str,
         enable_memory_saver: bool,
         c128_page_size: int,
@@ -53,7 +52,7 @@ class DSV4ReqToTokenTablesMixin:
             self.req_to_c128_sidecar = torch.zeros(
                 (
                     self._alloc_size,
-                    max(1, (max_context_len + group_tokens - 1) // group_tokens),
+                    max(1, (self.row_width + group_tokens - 1) // group_tokens),
                 ),
                 dtype=torch.int32,
                 device=device,
@@ -161,13 +160,12 @@ class DSV4NPUReqToTokenPool(DSV4ReqToTokenTablesMixin, ReqToTokenPool):
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
     ):
-        super().__init__(size, max_context_len, device, enable_memory_saver)
+        super().__init__(size, row_width, device, enable_memory_saver)
         self._init_dsv4_tables(
-            max_context_len,
             device,
             enable_memory_saver,
             get_schedule().c128_page_size,
@@ -188,20 +186,19 @@ class DSV4NPUDecodeReqToTokenPool(DSV4ReqToTokenTablesMixin, DecodeReqToTokenPoo
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
         pre_alloc_size: int,
     ):
         super().__init__(
             size=size,
-            max_context_len=max_context_len,
+            row_width=row_width,
             device=device,
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
         self._init_dsv4_tables(
-            max_context_len,
             device,
             enable_memory_saver,
             get_schedule().c128_page_size,

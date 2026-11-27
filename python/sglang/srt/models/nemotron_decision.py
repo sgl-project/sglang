@@ -6,6 +6,10 @@
 import msgspec
 import torch
 
+from sglang.srt.configs.nemotron_decision import (
+    PACKED_ATTENTION_LAYOUT,
+    nemotron_decision_attention_layout,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.utils.common import add_prefix
@@ -241,9 +245,17 @@ class NemotronForDecision(Ministral3ForCausalLM):
     def _init_model(self, config, quant_config=None, prefix=""):
         if config.is_causal or config.sliding_window is not None:
             raise ValueError("Nemotron Decision requires full bidirectional attention")
-        return NemotronDecisionModel(
-            config=config, quant_config=quant_config, prefix=prefix
-        )
+        model_class = Ministral3Model
+        if nemotron_decision_attention_layout(config) == PACKED_ATTENTION_LAYOUT:
+            model_class = NemotronDecisionModel
+        model = model_class(config=config, quant_config=quant_config, prefix=prefix)
+        for layer in model.layers[model.start_layer : model.end_layer]:
+            layer.self_attn.attn.attn_type = AttentionType.ENCODER_ONLY
+            # Query scaling uses the training window, not the extended context limit.
+            layer.self_attn.max_position_embeddings = config.rope_parameters.get(
+                "original_max_position_embeddings", config.max_position_embeddings
+            )
+        return model
 
     def load_weights(self, weights):
         return super().load_weights(self.hf_to_sglang_mapper.apply(weights))
@@ -278,10 +290,6 @@ class NemotronDecisionModel(Ministral3Model):
                 attn_type=AttentionType.ENCODER_ONLY,
                 quant_config=quant_config,
                 prefix=add_prefix(f"layers.{old.layer_id}.self_attn.attn", prefix),
-            )
-            # Query scaling uses the training window, not the extended context limit.
-            attention.max_position_embeddings = config.rope_parameters.get(
-                "original_max_position_embeddings", config.max_position_embeddings
             )
 
     def forward(

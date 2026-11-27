@@ -24,10 +24,11 @@ For deployment and request examples, see the [Nemotron Decision cookbook](/cookb
 
 [NVIDIA-Nemotron-3.5-Decision-8B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16)
 uses a trained prompt and fully bidirectional attention. Serve it through
-`/v1/systemone` or `/v1/decisions`. The default prefill budget is 128K tokens on GPUs with at least 60 GiB
-of memory, or 16K when memory is smaller or unknown, bounded by the configured context and
-checkpoint input limit. Set `--max-prefill-tokens` to
-change that budget.
+`/v1/systemone` or `/v1/decisions`. With automatic memory sizing, the default prefill budget is
+128K tokens on GPUs with at least 60 GiB of memory, or 16K when memory is smaller or unknown.
+Setting `--mem-fraction-static` makes the default 16K because automatic activation-memory sizing
+is skipped. An explicit `--max-prefill-tokens` overrides this default. Requests are still bounded
+by the configured context and checkpoint input limit.
 
 ```bash Command
 sglang serve \
@@ -70,6 +71,15 @@ for this checkpoint. The BF16 checkpoint allows up to
 available KV capacity can impose a smaller limit. Longer inputs are rejected
 without truncation or compaction.
 
+For Nemotron Decision, `config.json` supplies `state_end_token_id` for the prompt
+separator and `decision_attention_layout` for the server's attention pattern.
+`state_sees_own_question` is the default; `state_sees_all_questions` is unsupported.
+Use `--json-model-override-args '{"decision_attention_layout":"state_sees_no_questions"}'`
+to enable shared-state packing. This changes attention for one-question requests
+as well as requests with several questions. Request-level packing switches are
+not supported.
+
+
 Each question gets a separate complete read by default, including its state.
 Prefix caching and chunked prefill are disabled for this model. No output tokens
 are generated. Images, speculative decoding and multi-token generation are unsupported.
@@ -108,8 +118,8 @@ response.raise_for_status()
 print(response.json())
 ```
 
-Set `"packing": "shared"` on either API to share state tokens within each packed
-group. State tokens attend only to the state; each question attends to the state
+Set `decision_attention_layout="state_sees_no_questions"` in the checkpoint or a
+server model override to share state tokens within each packed group on either API. State tokens attend only to the state; each question attends to the state
 and itself, with positions restarting after the state. This can change probabilities
 compared with separate full-attention reads. Groups must fit the complete-read
 budget. Input usage counts physical packed tokens. Packing also supports LoRA

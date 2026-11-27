@@ -1,27 +1,26 @@
 """Compare packed Decision reads and adapter routing with an explicit masked reference."""
 
 import gc
-import json
+import math
 import os
-import re
+import runpy
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from test.manual.prefill_only.test_nemotron_decision_lora import (
     MODEL,
-    REVISION,
     make_adapter,
     merge_adapter,
 )
-from types import SimpleNamespace
 
 import requests
 import torch
-from transformers import AutoTokenizer, Ministral3Config, Ministral3ForCausalLM
+from huggingface_hub import snapshot_download
+from transformers.utils import cached_file
 
 from sglang.srt.configs.nemotron_decision import load_nemotron_decision_config
-from sglang.srt.entrypoints.systemone.nemotron_decide import NemotronDecideEncoder
+from sglang.srt.entrypoints.openai.serving_decisions import label_mass
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -30,32 +29,24 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+REVISION = os.environ.get("NEMOTRON_DECISION_REVISION")
+
 
 @torch.inference_mode()
 def make_packed_fixtures(model_path, directory):
-    config = Ministral3Config.from_pretrained(model_path, revision=REVISION)
-    model = (
-        Ministral3ForCausalLM.from_pretrained(
-            model_path,
-            revision=REVISION,
-            config=config,
-            key_mapping={r"^encoder\.": "model.", r"^diffusion_head\.": "lm_head."},
-            dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-        )
-        .eval()
-        .cuda()
+    model_path = (
+        model_path
+        if Path(model_path).is_dir()
+        else snapshot_download(model_path, revision=REVISION)
     )
-    for layer in model.model.layers:
-        layer.self_attn.is_causal = False
-    tokenizer = AutoTokenizer.from_pretrained(model_path, revision=REVISION)
-    metadata = load_nemotron_decision_config(model_path, REVISION)
-    encoder = NemotronDecideEncoder(
-        config=config,
-        metadata=metadata,
-        tokenizer=tokenizer,
-        max_prompt_tokens=4096,
+    checkpoint = runpy.run_path(cached_file(model_path, "decide_hf.py"))["Decider"](
+        model_path
     )
+    model, tokenizer = checkpoint.model, checkpoint.tok
+    config = model.config
+    metadata = load_nemotron_decision_config(model_path, None)
+    reference = runpy.run_path(cached_file(model_path, "packed_layout.py"))
+    assert config.state_end_token_id is not None
     groups = []
     for state in (
         {"city": "Paris", "note": "Montréal – café"},
@@ -89,44 +80,43 @@ def make_packed_fixtures(model_path, directory):
         }
         prompts, labels = [], []
         for question in questions.values():
-            ids, codes, _ = encoder.encode(state, SimpleNamespace(**question), {})
-            prompts.append(ids)
-            labels.append(codes)
-        first_question = next(iter(questions.values()))
-        body = json.dumps(
-            dict(
-                state=state,
-                question=first_question["instructions"],
-                options=[
-                    dict(code=code, label=name, meaning=description)
-                    for code, (name, description) in zip(
-                        metadata["labels"]["choice"], first_question["criteria"].items()
+            kind = question["type"]
+            if kind == "noul":
+                entries = [
+                    ("false", "No, the condition does not hold."),
+                    ("true", "Yes, the condition holds."),
+                ]
+            elif kind == "score":
+                entries = list(
+                    zip(
+                        map(str, range(len(question["criteria"]))), question["criteria"]
                     )
-                ],
-            ),
-            ensure_ascii=False,
-        )
-        rendered = tokenizer.apply_chat_template(
-            [{"role": "user", "content": ""}],
-            chat_template=metadata["chat_template"],
-            decision_content=body,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        assert rendered.count(body) == 1
-        state_start = re.match(r'\{\s*"state"\s*:\s*', body).end()
-        _, state_end = json.JSONDecoder().raw_decode(body, state_start)
-        field = re.match(r',\s*"question"\s*:\s*"', body[state_end:])
-        boundary = rendered.index(body) + state_end + field.end()
-        prefix = tokenizer.encode(rendered[:boundary], add_special_tokens=False)
-        assert tokenizer.encode(rendered, add_special_tokens=False) == prompts[0]
-        shared = next(
-            (
-                i
-                for i, values in enumerate(zip(prefix, *prompts))
-                if len(set(values)) != 1
-            ),
-            len(prefix),
+                )
+            else:
+                entries = list(question["criteria"].items())
+            codes = metadata["labels"][kind][: len(entries)]
+            options = [
+                dict(code=code, label=name, meaning=description)
+                for code, (name, description) in zip(codes, entries)
+            ]
+            text = reference["render"](
+                tokenizer,
+                state,
+                question["instructions"],
+                options,
+                config.state_end_token_id,
+            )
+            ids = tokenizer.encode(text, add_special_tokens=False) + [
+                config.mask_token_id
+            ]
+            prompts.append(ids)
+            code_ids = tokenizer.convert_tokens_to_ids(codes)
+            labels.append(code_ids[::-1] if kind == "noul" else code_ids)
+        shared = prompts[0].index(config.state_end_token_id) + 1
+        assert all(
+            ids[:shared] == prompts[0][:shared]
+            and ids.count(config.state_end_token_id) == 1
+            for ids in prompts
         )
         tails = [ids[shared:] for ids in prompts]
         ids = prompts[0][:shared] + [token for tail in tails for token in tail]
@@ -158,12 +148,27 @@ def make_packed_fixtures(model_path, directory):
                 state=state,
                 questions=questions,
                 labels=labels,
+                layout=lengths,
                 input_ids=torch.tensor([ids], device="cuda"),
                 mask=mask,
                 positions=positions,
                 slots=slots,
             )
         )
+    group = groups[0]
+    n = sum(group["layout"][:2])
+    groups.append(
+        dict(
+            group,
+            questions={"city": group["questions"]["city"]},
+            labels=group["labels"][:1],
+            layout=group["layout"][:2],
+            input_ids=group["input_ids"][:, :n],
+            mask=group["mask"][:, :, :n, :n],
+            positions=group["positions"][:, :n],
+            slots=group["slots"][:1],
+        )
+    )
     anchor = (
         model.model(
             input_ids=groups[0]["input_ids"],
@@ -192,7 +197,7 @@ def make_packed_fixtures(model_path, directory):
                 use_cache=False,
             ).last_hidden_state[0, group["slots"]]
             logits = model.lm_head(hidden).float()
-            probabilities, masses = {}, {}
+            probabilities = {}
             for row, (name, question), labels in zip(
                 logits, group["questions"].items(), group["labels"]
             ):
@@ -209,17 +214,19 @@ def make_packed_fixtures(model_path, directory):
                 else:
                     names = list(question["criteria"])
                 probabilities[name] = dict(zip(names, values))
-                masses[name] = row.log_softmax(-1)[labels].exp().sum().item()
             cases.append(
                 dict(
                     payload=dict(
                         model="decision-test" + (":" + adapter if adapter else ""),
                         state=group["state"],
                         questions=group["questions"],
-                        packing="shared",
                     ),
                     probabilities=probabilities,
-                    label_masses=masses,
+                    native_input_ids=group["input_ids"][0].tolist(),
+                    layout=group["layout"],
+                    slots=group["slots"].tolist(),
+                    labels=dict(zip(group["questions"], group["labels"])),
+                    adapter_name=adapter,
                     prompt_tokens=group["input_ids"].shape[1],
                 )
             )
@@ -236,6 +243,7 @@ class TestNemotronDecisionPacking(CustomTestCase):
         cls.addClassCleanup(temporary.cleanup)
         directory = Path(temporary.name)
         model_path = os.environ.get("NEMOTRON_DECISION_MODEL_PATH", MODEL)
+        cls.metadata = load_nemotron_decision_config(model_path, REVISION)
         cls.cases = make_packed_fixtures(model_path, directory)
         gc.collect()
         torch.cuda.empty_cache()
@@ -244,9 +252,13 @@ class TestNemotronDecisionPacking(CustomTestCase):
             model_path,
             cls.url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--revision",
-                REVISION,
+            other_args=(["--revision", REVISION] if REVISION else [])
+            + [
+                "--json-model-override-args",
+                '{"decision_attention_layout":"state_sees_no_questions"}',
+                # Fix the GPU batch shape for exact API/native score comparisons.
+                "--max-running-requests",
+                "1",
                 "--served-model-name",
                 "decision-test",
                 "--lora-paths",
@@ -255,8 +267,14 @@ class TestNemotronDecisionPacking(CustomTestCase):
             ],
         )
         cls.addClassCleanup(kill_process_tree, server.pid)
+        # The first packed request can compile kernels after server startup.
+        requests.post(
+            cls.url + "/v1/systemone",
+            json=cls.cases[0]["payload"],
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        ).raise_for_status()
 
-    def check_case(self, case, route):
+    def check_case(self, case, route, return_prompt_token_ids=False):
         payload = case["payload"]
         if route == "/v1/decisions":
             questions = []
@@ -278,13 +296,33 @@ class TestNemotronDecisionPacking(CustomTestCase):
             payload = dict(
                 model=payload["model"],
                 input=payload["state"],
-                packing="shared",
                 questions=questions,
             )
+        if return_prompt_token_ids:
+            payload = {**payload, "return_prompt_token_ids": True}
         response = requests.post(self.url + route, json=payload, timeout=120)
         response.raise_for_status()
         data = response.json()
         self.assertEqual(set(data["answers"]), set(case["probabilities"]))
+        native = requests.post(
+            self.url + "/generate",
+            json=dict(
+                input_ids=case["native_input_ids"],
+                decision_layout=case["layout"],
+                token_indices_to_pool=case["slots"],
+                lora_path=case["adapter_name"],
+                token_ids_logprob=sorted(
+                    {token for labels in case["labels"].values() for token in labels}
+                ),
+                sampling_params={"max_new_tokens": 0},
+                return_logprob=True,
+                logprob_start_len=0,
+            ),
+            timeout=120,
+        )
+        native.raise_for_status()
+        rows = native.json()["meta_info"]["input_token_ids_logprobs"]
+        native_scores = dict(zip(case["probabilities"], rows))
         for name, expected in case["probabilities"].items():
             answer = data["answers"][name]
             kind = case["payload"]["questions"][name]["type"]
@@ -294,23 +332,32 @@ class TestNemotronDecisionPacking(CustomTestCase):
                 else answer["probabilities"]
             )
             self.assertEqual(set(actual), set(expected))
-            for label, probability in expected.items():
-                self.assertAlmostEqual(actual[label], probability, delta=0.02)
-            mass_key = "x_label_mass" if route == "/v1/systemone" else "label_mass"
-            self.assertAlmostEqual(
-                answer[mass_key], case["label_masses"][name], delta=0.02
+            row = {token: value for value, token, *_ in native_scores[name]}
+            logprobs = [row[token] for token in case["labels"][name]]
+            temperature = self.metadata.get("temperature", {}).get(kind, 1.0)
+            weights = [math.exp((v - max(logprobs)) / temperature) for v in logprobs]
+            total = math.fsum(weights)
+            native_probabilities = dict(zip(expected, [v / total for v in weights]))
+            if route == "/v1/systemone" and kind == "noul":
+                self.assertEqual(answer["noul"], native_probabilities["yes"])
+            else:
+                self.assertEqual(actual, native_probabilities)
+            self.assertEqual(
+                max(actual, key=actual.get), max(expected, key=expected.get)
             )
-            if kind == "score":
-                expected_score = sum(
-                    int(level) * value for level, value in expected.items()
-                )
-                self.assertAlmostEqual(answer["score"], expected_score, delta=0.04)
+            mass_key = "x_label_mass" if route == "/v1/systemone" else "label_mass"
+            self.assertEqual(answer[mass_key], label_mass(logprobs))
         token_key = "input_tokens" if route == "/v1/systemone" else "prompt_tokens"
         self.assertEqual(data["usage"][token_key], case["prompt_tokens"])
         return data
 
     def test_packed_masks_and_adapter_readouts_match_reference_under_concurrency(self):
-        red, blue = self.cases[2], self.cases[4]
+        red = next(
+            case for case in self.cases if case["payload"]["model"].endswith(":red")
+        )
+        blue = next(
+            case for case in self.cases if case["payload"]["model"].endswith(":blue")
+        )
         self.assertGreater(
             max(
                 abs(
@@ -339,6 +386,12 @@ class TestNemotronDecisionPacking(CustomTestCase):
                 self.check_case(invalid, route)
             self.assertEqual(error.exception.response.status_code, 400)
             self.check_case(self.cases[0], route)
+            if route == "/v1/decisions":
+                with self.assertRaises(requests.HTTPError) as error:
+                    self.check_case(self.cases[0], route, return_prompt_token_ids=True)
+                self.assertEqual(error.exception.response.status_code, 400)
+                self.assertIn("return_prompt_token_ids", error.exception.response.text)
+                self.check_case(self.cases[0], route)
 
 
 if __name__ == "__main__":
