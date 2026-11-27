@@ -1299,7 +1299,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     f"kv_cache_dtype=fp8_e4m3, got {dtype}"
                 )
                 kv_pool_cls = DeepSeekV4UniformFP8KVPool
-            self.swa_kv_pool = self._make_kv_pool(
+            self.swa_kv_pool = self._make_paged_swa_pool(
                 size=swa_size,
                 page_size=swa_kv_page_size,
                 dtype=dtype,
@@ -1836,6 +1836,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_kv_pool = self.kv_pools.get(4)
         self.c128_kv_pool = self.kv_pools.get(128)
         self.c4_indexer_kv_pool = self.index_pools.get(4)
+
+    def _make_paged_swa_pool(self, **kwargs):
+        return self._make_kv_pool(**kwargs)
 
     def _make_kv_pool(
         self,

@@ -2180,12 +2180,16 @@ class KVCacheConfigurator:
             )
 
             pool_cls = DSV4NPUTokenToKVPool
-            kv_layout_kwargs = {}
+            kv_layout_kwargs = {
+                "dsv41_int8_kv": not self.is_draft_worker
+                and self.kv_cache_dtype_str == "int8"
+                and self.model_config.hf_config.model_type == "deepseek_v41"
+            }
             if self.is_draft_worker:
                 # Draft rows are read by the V4 sparse-attention op, so pin the
                 # pool generation instead of relying on ``compression_ratios``
                 # having been emptied to ``[0] * layers`` above.
-                kv_layout_kwargs = {"npu_window_generation": "v4"}
+                kv_layout_kwargs["npu_window_generation"] = "v4"
         else:
             pool_cls = DeepSeekV4TokenToKVPool
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()

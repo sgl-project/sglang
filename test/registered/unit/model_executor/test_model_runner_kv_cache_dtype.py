@@ -32,12 +32,15 @@ def _resolve(
     algorithm="EAGLE",
     draft_backend="fa3",
     arch=None,
+    model_type=None,
 ):
     """The (label, dtype) a runner stamps from the given flags."""
     runner = ModelRunner.__new__(ModelRunner)
     if arch is not None:
         runner.model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=[arch], index_topk=2048)
+            hf_config=SimpleNamespace(
+                architectures=[arch], index_topk=2048, model_type=model_type
+            )
         )
     runner.model = SimpleNamespace(quant_config=quant_config)
     runner.dtype = torch.bfloat16
@@ -61,6 +64,18 @@ def _resolve(
 
 
 class TestRunnerKvCacheDtypeLabel(CustomTestCase):
+    def test_v41_int8_is_a_target_layout_selection(self):
+        args = dict(
+            flag="int8",
+            arch="DeepseekV4ForCausalLM",
+            model_type="deepseek_v41",
+            algorithm="DSPARK",
+        )
+        self.assertEqual(_resolve(**args), ("int8", torch.bfloat16))
+        self.assertEqual(
+            _resolve(**args, is_draft_worker=True), ("bfloat16", torch.bfloat16)
+        )
+
     def test_the_target_label_follows_its_flag_and_quant_config(self):
         for flag, quant_config, expected in (
             ("auto", None, ("auto", torch.bfloat16)),

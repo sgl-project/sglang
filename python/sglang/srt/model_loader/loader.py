@@ -217,6 +217,13 @@ def _get_quantization_config(
                 else get_model().kv_cache_dtype
             )
             if (
+                requested_dtype == "int8"
+                and getattr(model_config.hf_config, "model_type", None)
+                == "deepseek_v41"
+            ):
+                # CSA quantizes the post-RoPE latent at page write time.
+                requested_dtype = "bfloat16"
+            if (
                 model_config.is_draft_model
                 and requested_dtype == "int8"
                 and not draft_reads_packed_dsa_kv(

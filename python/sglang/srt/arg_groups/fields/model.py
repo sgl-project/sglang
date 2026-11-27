@@ -243,7 +243,8 @@ class Model(msgspec.Struct):
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
                 "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "
                 '"int8" stores the DSA MLA KV as a packed INT8 record and is '
-                "supported for DSA models on Ascend A2 NPUs only. Out-of-tree "
+                "supported for DSA models on Ascend A2 NPUs. For DeepSeek-V4.1 "
+                "on Ascend A3 it selects the native INT8 CSA KV layout. Out-of-tree "
                 "platform plugins can register further values for KV cache formats "
                 "that only their KV pool implements; in-tree platforms reject them."
             ),

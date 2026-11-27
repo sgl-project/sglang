@@ -52,6 +52,14 @@ def configure_kv_cache_dtype(
 
     ``model_config`` is the runner's own model, which decides whether a draft
     can keep an INT8 target's packed DSA record."""
+    if (
+        server_args_kv_cache_dtype == "int8"
+        and getattr(getattr(model_config, "hf_config", None), "model_type", None)
+        == "deepseek_v41"
+    ):
+        # Target CSA pools choose their storage type per layer. Auxiliary pools
+        # and the V4-layout draft retain the model's BF16 dtype.
+        return ("bfloat16" if is_draft_worker else "int8"), torch.bfloat16
     if is_draft_worker and speculative_draft_kv_cache_dtype is not None:
         server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
     kv_cache_dtype_str = server_args_kv_cache_dtype

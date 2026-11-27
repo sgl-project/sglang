@@ -161,10 +161,7 @@ def handle_platform_kv_cache_dtype_compatibility(server_args: Any) -> None:
 
 
 def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
-    """``--kv-cache-dtype int8`` stores the DSA MLA KV as the packed record
-    (INT8 latent | BF16 rope | per-tile scales) that arch35 stores in FP8.
-    Readers without a packed path are rejected when the pool is built, for
-    either dtype; this rejects what is specific to INT8."""
+    """Validate the packed DSA and DeepSeek-V4.1 CSA INT8 KV paths."""
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype != "int8":
         return
@@ -179,6 +176,28 @@ def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
 
     model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
+    if getattr(hf_config, "model_type", None) == "deepseek_v41":
+        if model_config.dtype != torch.bfloat16 or (
+            model_config.qk_nope_head_dim,
+            model_config.qk_rope_head_dim,
+        ) != (448, 64):
+            raise ValueError(
+                "DeepSeek-V4.1 INT8 KV requires BF16 and 448+64 KV dimensions."
+            )
+        for flag in (
+            "enable_deterministic_inference",
+            "enable_encoder_swa_bounded_replay",
+            "enable_decoder_swa_bounded_replay",
+            "enable_hierarchical_cache",
+            "enable_unified_cache_external_linker",
+        ):
+            if getattr(cfg, flag, False):
+                raise ValueError(f"DeepSeek-V4.1 INT8 KV does not support {flag}.")
+        if cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "DeepSeek-V4.1 INT8 KV requires a non-disaggregated server."
+            )
+        return
     if not is_deepseek_dsa(hf_config):
         raise ValueError(
             "--kv-cache-dtype int8 stores the packed DSA MLA record, which only "
