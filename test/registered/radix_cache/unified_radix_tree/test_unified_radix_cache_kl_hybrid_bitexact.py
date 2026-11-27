@@ -301,6 +301,11 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = _base_args() + [
+            # Later siblings reuse an earlier turn after the first sibling has
+            # extended it. Level 2 can prune that checkpoint from both device
+            # and host before the later sibling establishes the fork.
+            "--hybrid-cache-checkpoints-level",
+            "3",
             "--enable-metrics",
             "--enable-hierarchical-cache",
             "--hicache-ratio",
