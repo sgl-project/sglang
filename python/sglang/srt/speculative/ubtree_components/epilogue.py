@@ -19,9 +19,12 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
 )
 from sglang.kernels.ops.speculative.spec_tree import verify_tree_greedy_func
 from sglang.kernels.ops.speculative.ubtree import prepare_unified_commit_metadata
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
+from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 
 
 class UBTreeVerifyResult(msgspec.Struct, frozen=True):
@@ -221,11 +224,16 @@ class UBTreeVerifyEpilogue:
         bs = int(forward_batch.batch_size)
         if num_tokens != bs * self.node_count:
             return
+        track_ids = forward_batch.mamba_track_indices
+        if track_ids is None and runner._verify_checkpoint_ids is not None:
+            track_ids = runner._verify_checkpoint_ids[:bs]
+            if not (track_ids.is_cuda and torch.cuda.is_current_stream_capturing()):
+                track_ids.fill_(-1)
         self._graph_metadata[bs] = (
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             forward_batch.out_cache_loc,
-            forward_batch.mamba_track_indices,
+            track_ids,
         )
         self(
             logits=out.next_token_logits,
@@ -234,9 +242,9 @@ class UBTreeVerifyEpilogue:
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             out_cache_loc=forward_batch.out_cache_loc,
-            mamba_track_indices=forward_batch.mamba_track_indices,
+            mamba_track_indices=track_ids,
         )
-        if torch.cuda.is_current_stream_capturing():
+        if out.next_token_logits.is_cuda and torch.cuda.is_current_stream_capturing():
             # The folded target Graph keeps using these addresses after prefill
             # grows the materializer's workspace. Retain only captured buffers;
             # eager warmups and ordinary prefill growth need no extra ownership.
@@ -267,7 +275,7 @@ class UBTreeVerifyEpilogue:
             and buf.dtype == hidden.dtype
         ):
             return buf
-        assert not torch.cuda.is_current_stream_capturing(), (
+        assert not (hidden.is_cuda and torch.cuda.is_current_stream_capturing()), (
             "UBTree epilogue hidden buffer must be allocated during graph warmup"
         )
         self.compact_hidden_buf = torch.empty(
@@ -336,8 +344,15 @@ class UBTreeVerifyEpilogue:
         mamba_track_indices: Optional[torch.Tensor] = None,
     ) -> None:
         rows = bs * self.node_count
+        target_logits = logits[:rows]
+        if target_logits.is_cuda and torch.cuda.is_current_stream_capturing():
+            maybe_detect_nan(target_logits, "UBTree verify: target model logits")
+            if envs.SGLANG_SANITIZE_NAN_LOGITS.get():
+                torch.nan_to_num_(target_logits, nan=-1e30, posinf=1e30, neginf=-1e30)
+        else:
+            sanitize_nan_logits(target_logits, "UBTree verify: target model logits")
         target_predict = self.target_predict_buf[:bs]
-        torch.argmax(logits[:rows], dim=-1, out=target_predict.reshape(-1))
+        torch.argmax(target_logits, dim=-1, out=target_predict.reshape(-1))
         self.run_from_target_predict(
             target_predict=target_predict,
             hidden=hidden,
@@ -478,7 +493,9 @@ class UBTreeVerifyEpilogue:
                 req_pool_indices[:bs],
                 out=state_batch_indices,
             )
-            has_track = mamba_track_indices is not None
+            has_track = (
+                mamba_track_indices is not None and self.mamba_track_interval > 0
+            )
             mamba_steps_to_track = None
             if has_track:
                 _, mamba_steps_to_track = fused_commit_track_indices(
@@ -493,10 +510,15 @@ class UBTreeVerifyEpilogue:
                     last_correct_out=self.last_correct_step_buf,
                     track_steps_out=self.mamba_steps_to_track_buf,
                 )
+            factor_cache_indices = (
+                req_pool_indices[:bs]
+                if pp_spec_stable_rows_enabled()
+                else self.factor_cache_indices_buf[:bs]
+            )
             commit_kda_tree_after_verify(
                 spec_state=self.kda_spec_state,
                 state_batch_indices=state_batch_indices,
-                factor_cache_indices=self.factor_cache_indices_buf[:bs],
+                factor_cache_indices=factor_cache_indices,
                 accept_index=accept_index,
                 accept_lens=commit_lens,
                 tree_width=self.node_count,

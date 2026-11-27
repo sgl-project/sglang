@@ -47,6 +47,9 @@ from sglang.srt.speculative.ubtree_components.tree import UBTreeBatch
 from sglang.srt.speculative.ubtree_components.tree_graph import build_ubtree_proposal
 from sglang.srt.speculative.ubtree_components.vocab import validate_ubtree_lm_head
 from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
+from sglang.srt.state_capturer.base import TopkCaptureOutput
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 logger = logging.getLogger(__name__)
 
@@ -413,6 +416,35 @@ class UBTreeWorkerV2(DFlashWorkerV2):
 
         return SIMULATE_ACC_LEN <= 0
 
+    @staticmethod
+    def _compact_topk_capture(
+        capture_output: TopkCaptureOutput | None,
+        capturer,
+        epilogue: UBTreeVerifyEpilogue,
+        bs: int,
+        accept_lens: torch.Tensor,
+    ) -> TopkCaptureOutput | None:
+        if not epilogue.folds_kv:
+            return capture_output
+        if capture_output is not None:
+            safe_index = epilogue.safe_accept_index_buf[:bs].reshape(-1)
+            dst_locs = epilogue.target_cache_loc_buf[:bs].reshape(-1).clone()
+            return TopkCaptureOutput(
+                out_cache_loc=dst_locs,
+                topk=capture_output.topk.index_select(0, safe_index),
+                host_cache=capture_output.host_cache,
+                valid_len=accept_lens.clone(),
+            )
+        if capturer is not None and capturer.has_host_cache:
+            n = int(accept_lens[0].item())
+            if n > 0:
+                src = epilogue.source_cache_loc_buf[0, :n].cpu()
+                dst = epilogue.target_cache_loc_buf[0, :n].cpu()
+                capturer.host_cache.buffer[dst] = capturer.host_cache.buffer[
+                    src
+                ].clone()
+        return None
+
     def forward_batch_generation(
         self,
         batch,
@@ -491,6 +523,10 @@ class UBTreeWorkerV2(DFlashWorkerV2):
             forward_batch=verify_forward_batch,
             is_verify=True,
         )
+        # UBTree's verify epilogue and sampling tail read shared pool tables
+        # after the target model's metadata-prep event. Clearing the early
+        # marker forces the scheduler WAR barrier to wait for forward_stream.
+        self.target_worker.model_runner.shared_read_done_event = None
         logits_output = target_output.logits_output
         node_count = tree.node_count
         if is_greedy:
@@ -522,6 +558,20 @@ class UBTreeWorkerV2(DFlashWorkerV2):
             on_publish(new_seq_lens)
         predict = folded.predict.clone()
         accept_lens = folded.accept_lens.clone()
+        routed_experts_output = self._compact_topk_capture(
+            target_output.routed_experts_output,
+            get_global_experts_capturer(),
+            verify_epilogue,
+            batch_size,
+            accept_lens,
+        )
+        indexer_topk_output = self._compact_topk_capture(
+            target_output.indexer_topk_output,
+            get_global_indexer_capturer(),
+            verify_epilogue,
+            batch_size,
+            accept_lens,
+        )
         logits_output.hidden_states = None
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus_tokens,
@@ -535,8 +585,8 @@ class UBTreeWorkerV2(DFlashWorkerV2):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=node_count,
             new_seq_lens=new_seq_lens,
-            routed_experts_output=target_output.routed_experts_output,
-            indexer_topk_output=target_output.indexer_topk_output,
+            routed_experts_output=routed_experts_output,
+            indexer_topk_output=indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],
         )
 

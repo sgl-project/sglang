@@ -107,14 +107,21 @@ class TopkCaptureOutput:
     out_cache_loc: torch.Tensor
     topk: torch.Tensor
     host_cache: Optional[BaseHostCache]
+    valid_len: Optional[torch.Tensor] = None
 
     def map_device_tensors(self, fn):
         # Device-tensor fields only; caller injects the copy+safety primitive
         # (see GenerationBatchResult.copy_to_cpu).
         self.out_cache_loc = fn(self.out_cache_loc)
         self.topk = fn(self.topk)
+        if self.valid_len is not None:
+            self.valid_len = fn(self.valid_len)
 
     def finalize(self):
+        if self.valid_len is not None:
+            n = int(self.valid_len.item())
+            self.host_cache.buffer[self.out_cache_loc[:n]] = self.topk[:n]
+            return
         self.host_cache.buffer[self.out_cache_loc] = self.topk
 
 

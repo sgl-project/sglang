@@ -575,6 +575,7 @@ def test_verify_epilogue_folds_factorized_kda_commit(monkeypatch, track):
     )
 
     assert epilogue.folds_kda_commit
+    assert epilogue.read_result(2).bonus_tokens.tolist() == [2, 8]
     assert torch.equal(
         committed["state_batch_indices"], torch.tensor([13, 7], dtype=torch.int32)
     )
@@ -590,6 +591,17 @@ def test_verify_epilogue_folds_factorized_kda_commit(monkeypatch, track):
     else:
         assert committed["mamba_track_indices"] is None
         assert committed["mamba_steps_to_track"] is None
+
+    monkeypatch.setenv("SGLANG_ENABLE_PP_SPEC", "1")
+    epilogue(
+        logits=logits,
+        hidden=hidden,
+        bs=2,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        mamba_track_indices=track_indices,
+    )
+    assert torch.equal(committed["factor_cache_indices"], req_pool_indices)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -670,7 +682,10 @@ def test_worker_commits_once_and_keeps_scheduler_outputs_alive(
             indexer_topk_output=None,
         )
 
-    worker._target_worker = SimpleNamespace(forward_batch_generation=target_forward)
+    worker._target_worker = SimpleNamespace(
+        forward_batch_generation=target_forward,
+        model_runner=SimpleNamespace(shared_read_done_event=object()),
+    )
     worker._make_next_draft_input_decode = lambda **kwargs: SimpleNamespace(**kwargs)
     monkeypatch.setattr(
         worker_module, "eagle_prepare_for_verify", lambda *args: (forward, graph_replay)
@@ -679,6 +694,7 @@ def test_worker_commits_once_and_keeps_scheduler_outputs_alive(
     result = worker.forward_batch_generation(
         batch, on_publish=lambda lens: published.append(lens.clone())
     )
+    assert worker._target_worker.model_runner.shared_read_done_event is None
     assert epilogue.calls == 1
     assert result.accept_lens.tolist() == [1]
     assert result.next_token_ids[0].item() == 11
@@ -711,6 +727,89 @@ def test_worker_rejects_penalties_before_prefill():
     )
     with pytest.raises(ValueError, match="without penalties"):
         worker.forward_batch_generation(batch)
+
+
+def test_epilogue_capture_binds_verify_checkpoint_ids_and_sanitizes_nan(monkeypatch):
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+    epilogue = UBTreeVerifyEpilogue(max_bs=1, node_count=4, max_depth=3, device="cpu")
+    recorded = {}
+
+    def fake_verify(**kwargs):
+        recorded["target_predict"] = kwargs["target_predict"].clone()
+        kwargs["predicts"].copy_(kwargs["target_predict"].reshape(-1))
+        kwargs["accept_index"].copy_(torch.tensor([[0, -1, -1]], dtype=torch.int32))
+        kwargs["accept_token_num"].copy_(torch.tensor([0], dtype=torch.int32))
+
+    monkeypatch.setattr(
+        "sglang.srt.speculative.ubtree_components.epilogue.verify_tree_greedy_func",
+        fake_verify,
+    )
+    monkeypatch.setenv("SGLANG_SANITIZE_NAN_LOGITS", "1")
+    checkpoint_ids = torch.tensor([37], dtype=torch.int64)
+    runner = SimpleNamespace(
+        model_runner=SimpleNamespace(is_draft_worker=False),
+        _verify_checkpoint_ids=checkpoint_ids,
+    )
+    logits = torch.tensor(
+        [
+            [float("nan"), 1.0, 0.5, 0.0],
+            [0.0, float("nan"), 2.0, 0.0],
+            [0.0, 0.0, 0.0, 3.0],
+            [4.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    out = LogitsProcessorOutput(
+        next_token_logits=logits, hidden_states=torch.zeros((4, 2))
+    )
+    fb = SimpleNamespace(
+        batch_size=1,
+        req_pool_indices=torch.tensor([1], dtype=torch.int64),
+        seq_lens=torch.tensor([10], dtype=torch.int64),
+        out_cache_loc=torch.arange(4, dtype=torch.int64),
+        mamba_track_indices=None,
+    )
+    epilogue.capture_hook(runner, out, fb, num_tokens=4)
+    assert epilogue.graph_metadata(1)[3] is not None
+    assert epilogue.graph_metadata(1)[3].data_ptr() == checkpoint_ids.data_ptr()
+    assert checkpoint_ids.tolist() == [-1]
+    assert recorded["target_predict"].reshape(-1).tolist() == [1, 2, 3, 0]
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_compact_topk_capture_follows_accepted_branch(overlap):
+    from sglang.srt.speculative.ubtree_worker_v2 import UBTreeWorkerV2
+    from sglang.srt.state_capturer.base import BaseTopkCapturer, TopkCaptureOutput
+
+    epilogue = UBTreeVerifyEpilogue(max_bs=1, node_count=3, max_depth=2, device="cpu")
+    epilogue.target_kvcache = object()
+    epilogue.safe_accept_index_buf[0].copy_(torch.tensor([0, 2], dtype=torch.int64))
+    epilogue.source_cache_loc_buf[0].copy_(torch.tensor([10, 14], dtype=torch.int64))
+    epilogue.target_cache_loc_buf[0].copy_(torch.tensor([10, 17], dtype=torch.int64))
+    accept_lens = torch.tensor([2], dtype=torch.int32)
+
+    cap = BaseTopkCapturer.__new__(BaseTopkCapturer)
+    cap.topk_size = 1
+    cap.host_cache = SimpleNamespace(buffer=torch.zeros((20, 1, 1), dtype=torch.int32))
+    locs = torch.tensor([10, 17, 14], dtype=torch.int64)
+    rows = torch.tensor([101, 202, 303], dtype=torch.int32).view(3, 1, 1)
+    if overlap:
+        out = TopkCaptureOutput(
+            out_cache_loc=locs.clone(), topk=rows.clone(), host_cache=cap.host_cache
+        )
+        compacted = UBTreeWorkerV2._compact_topk_capture(
+            out, cap, epilogue, 1, accept_lens
+        )
+        assert compacted is not None
+        compacted.finalize()
+    else:
+        cap.host_cache.buffer[locs] = rows
+        compacted = UBTreeWorkerV2._compact_topk_capture(
+            None, cap, epilogue, 1, accept_lens
+        )
+        assert compacted is None
+    req_pool = SimpleNamespace(req_to_token=locs[None, :])
+    assert cap.get_topk(0, 3, req_pool).flatten().tolist() == [101, 303]
 
 
 def _reference_tree_metadata(parent_ids):

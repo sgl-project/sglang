@@ -1956,6 +1956,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return
         ids = forward_batch.mamba_track_indices
         if ids is None:
+            self._verify_checkpoint_ids[:bs].fill_(-1)
             return
         n = ids.shape[0]
         assert n <= bs <= self._verify_checkpoint_ids.shape[0], (
