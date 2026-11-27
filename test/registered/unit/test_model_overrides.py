@@ -194,6 +194,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "attention_backend",
                     "prefill_kv_cache_dequant_dtype",
                     "page_size",
+                    "max_prefill_tokens",
                     "moe_runner_backend",
                     "quantization",
                     "dp_size",
