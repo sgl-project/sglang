@@ -12,6 +12,11 @@ inputs:
     required: false
     default: ''
 
+  max-quota-wait-minutes:
+    description: 'Maximum time to wait once for the GitHub installation quota to reset'
+    required: false
+    default: '2'
+
 runs:
   using: composite
   steps:
@@ -20,6 +25,7 @@ runs:
       env:
         SKIP_PR_TEST_HEALTH_CHECK: ${{ env.SKIP_PR_TEST_HEALTH_CHECK }}
         INDEPENDENT_TEST_JOB_PREFIX: ${{ inputs.independent-test-job-prefix }}
+        MAX_QUOTA_WAIT_MINUTES: ${{ inputs.max-quota-wait-minutes }}
       with:
         github-token: ${{ inputs.github-token }}
         retries: 3
@@ -48,9 +54,11 @@ runs:
               const headers = error.response?.headers;
               const reset = Number(headers?.['x-ratelimit-reset']);
               const waitMs = Math.max(0, reset * 1000 - Date.now()) + 1000;
+              const maxWaitMinutes = Number(process.env.MAX_QUOTA_WAIT_MINUTES);
               if (waitedForQuota || ![403, 429].includes(error.status) ||
                   headers?.['x-ratelimit-remaining'] !== '0' ||
-                  !Number.isSafeInteger(reset) || reset <= 0 || waitMs > 120_000) {
+                  !Number.isSafeInteger(reset) || reset <= 0 ||
+                  !Number.isSafeInteger(maxWaitMinutes) || waitMs > maxWaitMinutes * 60_000) {
                 throw error;
               }
               waitedForQuota = true;
@@ -91,12 +99,20 @@ runs:
             return;
           }
 
-          const jobs = await readWithQuotaReset(() => github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+          const listJobs = perPage => readWithQuotaReset(() => github.paginate(github.rest.actions.listJobsForWorkflowRun, {
             owner: context.repo.owner,
             repo: context.repo.repo,
             run_id: context.runId,
-            per_page: 100,
+            per_page: perPage,
           }));
+          let jobs;
+          try {
+            jobs = await listJobs(100);
+          } catch (error) {
+            if (![502, 504].includes(error.status)) throw error;
+            core.info('[health-check] Jobs listing hit a gateway error. Retrying with 30 jobs per page.');
+            jobs = await listJobs(30);
+          }
           core.info(`[health-check] Total jobs in run: ${jobs.length}`);
           const failedJobs = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
           core.info(`[health-check] Failed jobs (before filtering): ${failedJobs.map(j => `${j.name}(${j.conclusion})`).join(', ') || 'none'}`);
