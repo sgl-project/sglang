@@ -1758,6 +1758,9 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
         assert index_kpool == 1, (
             "The Ascend hybrid DSA pool does not support index_kpool > 1 yet"
         )
+        # Hybrid PD registration also queries the optional compressed-tail state.
+        # Ascend currently only supports the uncompressed index layout above.
+        self.kpool_use_compress = False
         if skip_topk_layers is None:
             # Default (and draft-worker) pools index every full-attention layer.
             indexer_layer_ids = None

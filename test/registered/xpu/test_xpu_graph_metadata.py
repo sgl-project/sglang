@@ -223,6 +223,7 @@ class TestXPUGraphMetadata(CustomTestCase):
                     req_to_token_pool = SimpleNamespace(
                         size=16,
                         req_to_token=torch.zeros((16, 64), dtype=torch.int32),
+                        row_width=64,
                     )
                     model_config = SimpleNamespace(
                         is_multimodal=False,
