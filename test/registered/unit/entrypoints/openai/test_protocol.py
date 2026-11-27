@@ -454,6 +454,35 @@ class TestChatCompletionRequest(CustomTestCase):
         self.assertEqual(name, "VoiceNote")
         self.assertEqual(strict, True)
 
+    def test_json_schema_legacy_shortcut_rejects_non_object_schema(self):
+        messages = [{"role": "user", "content": "hi"}]
+        for bad_schema in (True, False, "{}", [1], 1):
+            with self.subTest(schema=bad_schema), self.assertRaises(ValidationError):
+                ChatCompletionRequest(
+                    model="test-model",
+                    messages=messages,
+                    response_format={"type": "json_schema", "schema": bad_schema},
+                )
+
+    def test_json_schema_legacy_shortcut_keeps_non_subschema_strict(self):
+        # A `strict` property that is not a model-field subschema (for example a
+        # boolean JSON Schema, a list, or a string) must be left in the schema
+        # instead of making the request fail with an unhandled exception.
+        messages = [{"role": "user", "content": "hi"}]
+        for properties in ({"strict": True}, ["strict"], "strict"):
+            with self.subTest(properties=properties):
+                request = ChatCompletionRequest(
+                    model="test-model",
+                    messages=messages,
+                    response_format={
+                        "type": "json_schema",
+                        "schema": {"type": "object", "properties": properties},
+                    },
+                )
+                json_format = request.response_format.json_schema
+                self.assertIsNone(json_format.strict)
+                self.assertEqual(json_format.schema_["properties"], properties)
+
     def test_schema_derived_strict_false_constraint_gated_on_renderer(self):
         """A `strict` field on the user's model doubles as the protocol switch.
 
