@@ -677,15 +677,17 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
             draft_attention_backend = resolve_draft_worker_attention_backend(
                 algo_label="DFLASH" if is_dflash else None
             )
-            # The other MLA backends ignore a layer's sliding window.
+            # triton and ascend honor the per-layer window (ascend via the FIA
+            # band in forward_mtp); the other MLA backends ignore it.
             if sliding_window_size > -1 and draft_attention_backend not in (
                 "triton",
+                "ascend",
                 *DFLASH_MLA_ONLY_DRAFT_BACKENDS,
             ):
                 raise ValueError(
                     "DFLASH mla sliding_attention layers require "
-                    "--speculative-draft-attention-backend triton, trtllm_mla or "
-                    f"cutedsl_mla, got {draft_attention_backend!r}."
+                    "--speculative-draft-attention-backend triton, ascend, "
+                    f"trtllm_mla or cutedsl_mla, got {draft_attention_backend!r}."
                 )
             if attn_type != AttentionType.DECODER and (
                 draft_attention_backend == "trtllm_mla"
