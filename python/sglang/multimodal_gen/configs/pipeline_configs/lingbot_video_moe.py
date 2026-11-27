@@ -36,6 +36,19 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
     vae_tiling: bool = False
     vae_sp: bool = False
     flow_shift: float | None = 3.0
+    # Prompt rewriter, off unless a URL or a local base model is configured.
+    rewriter_url: str | None = None
+    # Falls back to rewriter_url when the mapping turn shares the endpoint.
+    rewriter_map_url: str | None = None
+    rewriter_expand_model: str = "lingbot-rewriter-base"
+    rewriter_map_model: str = "lingbot-rewriter-lora"
+    rewriter_timeout: float = 300.0
+    rewriter_model_path: str | None = None
+    rewriter_adapter_path: str | None = None
+    rewriter_device_map: str = "auto"
+    rewriter_max_new_tokens: int = 6144
+    rewriter_auto_negative: bool = False
+
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Qwen3VLConfig(),)
     )
@@ -54,6 +67,22 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
     def __post_init__(self):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
+
+    def check_pipeline_config(self) -> None:
+        super().check_pipeline_config()
+        if self.rewriter_auto_negative and not self._has_rewriter():
+            raise ValueError(
+                "rewriter_auto_negative needs a rewriter backend: set rewriter_url "
+                "to serve one, or rewriter_model_path and rewriter_adapter_path to "
+                "load it in this process."
+            )
+
+    def _has_rewriter(self) -> bool:
+        return self.rewriter_url is not None or self.rewriter_model_path is not None
+
+    def supports_dynamic_batching(self) -> bool:
+        # A merged request carries one negative prompt for several captions.
+        return not self.rewriter_auto_negative
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(dit_layerwise_offload_modes=("memory",))

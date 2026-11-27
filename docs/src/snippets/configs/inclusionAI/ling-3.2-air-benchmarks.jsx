@@ -1,20 +1,5 @@
 export const benchmarks = [
   {
-    match: { hw: "b200", mtp: "nextn" },
-    sglang_version: "14290c76749e7c878cb95e01a8479ad407009979",
-    latencyPercentile: "Mean",
-    notes: "2× B200, TP2, MTP (NEXTN: 3 steps, top-k 1, 4 draft tokens), native 256K-token RoPE configuration. Random prompts with fixed lengths, --flush-cache, 32 requests at concurrency 1 and 64 at concurrency 16. Output throughput: 235.89 tok/s (2048/512, c1), 238.62 tok/s (8192/1024, c1), 1451.78 tok/s (8192/1024, c16); no gain over standard decoding on random prompts. GSM8K: one full run, 1317 stop / 2 length / 0 error, accept length 2.81.",
-    speed: [
-      { workload: { dataset: "random", isl: 2048, osl: 512, max_concurrency: 1, num_prompts: 32 },
-        ttft_ms: 113.48, tpot_ms: 4.02, tokens_per_sec_per_gpu: 589.72 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1, num_prompts: 32 },
-        ttft_ms: 226.17, tpot_ms: 3.97, tokens_per_sec_per_gpu: 1073.81 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 64 },
-        ttft_ms: 814.46, tpot_ms: 9.65, tokens_per_sec_per_gpu: 6532.99 },
-    ],
-    accuracy: { gsm8k_pct: 97.04, stop_rate_pct: 99.85 },
-  },
-  {
     match: { hw: "b200", mtp: "off" },
     sglang_version: "79a90bb075d916218cc7e3bd493e676563f1d77f",
     latencyPercentile: "Mean",
@@ -31,18 +16,18 @@ export const benchmarks = [
   },
   {
     match: { hw: "gb300", mtp: "nextn" },
-    sglang_version: "65f5caefddaa0f38ec3c778f5a78f2f815a20545",
+    sglang_version: "35302de9ee76e6be84fc4d6fa55a8be32da2bd44",
     latencyPercentile: "P50",
-    notes: "4× GB300, TP4, MTP (NEXTN: 3 steps, top-k 1, 4 draft tokens), 1,048,576-token YaRN context. Random prompts with fixed lengths, --flush-cache, 32 requests at concurrency 1 and 64 at concurrency 16, after a discarded warm-up run; the 8192/1024 c16 row is a repeat run because the first run had a 6.8 s p99 TTFT outlier. Output throughput: 209.14 tok/s (2048/512, c1), 221.39 tok/s (8192/1024, c1), 1656.12 tok/s (8192/1024, c16); no gain over standard decoding on random prompts. GSM8K: one full run, 1312 stop / 7 length / 0 error, accept length 2.79; all 7 length cases ran out of the 65,536-token budget while reasoning.",
+    notes: "4× GB300, TP4, MTP (NEXTN: 3 steps, top-k 1, 4 draft tokens; trtllm_mla draft backend, page size 64), native 256K-token RoPE configuration. Random prompts with fixed lengths, --flush-cache, 32 requests at concurrency 1 and 64 at concurrency 16, after a discarded warm-up run. Output throughput: 433.44 tok/s (2048/512, c1), 442.50 tok/s (8192/1024, c1), 1963.63 tok/s (8192/1024, c16). GSM8K: one full run, 1316 stop / 3 length / 0 error, accept length 2.86.",
     speed: [
       { workload: { dataset: "random", isl: 2048, osl: 512, max_concurrency: 1, num_prompts: 32 },
-        ttft_ms: 74.95, tpot_ms: 4.53, tokens_per_sec_per_gpu: 261.42 },
+        ttft_ms: 60.72, tpot_ms: 2.19, tokens_per_sec_per_gpu: 541.80 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1, num_prompts: 32 },
-        ttft_ms: 155.74, tpot_ms: 4.38, tokens_per_sec_per_gpu: 498.14 },
+        ttft_ms: 147.52, tpot_ms: 2.08, tokens_per_sec_per_gpu: 995.62 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 64 },
-        ttft_ms: 266.59, tpot_ms: 8.81, tokens_per_sec_per_gpu: 3726.27 },
+        ttft_ms: 364.58, tpot_ms: 6.42, tokens_per_sec_per_gpu: 4418.17 },
     ],
-    accuracy: { gsm8k_pct: 96.97, stop_rate_pct: 99.47 },
+    accuracy: { gsm8k_pct: 97.12, stop_rate_pct: 99.77 },
   },
   {
     match: { hw: "gb300", mtp: "off" },

@@ -143,6 +143,32 @@ jobs:
           # commit first and the checkout keeps no credentials (persist-credentials: false).
           allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
+      # HF_TOKEN reaches only the prefetch action, run from this checkout of the
+      # workflow's own commit before any step runs PR code: the tests hold no token.
+      - name: Check out the prefetch scripts
+        id: prefetch_scripts
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .ci-prefetch
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            .github/actions/prefetch-hf-models/
+            scripts/ci/utils/prefetch_hf_models.py
+            scripts/ci/utils/prefetch_policy.json
+            scripts/ci/utils/prefetch_requirements.txt
+
+      - name: Prefetch Hugging Face models
+        if: steps.prefetch_scripts.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 30
+        uses: ./.ci-prefetch/.github/actions/prefetch-hf-models
+        with:
+          hf-token: ${{ secrets.HF_TOKEN }}
+          repo-ids: ${{ join(fromJson(fromJson(inputs.check_changes).prefetch_repos || '{}')[inputs.self_name][matrix.partition], ' ') }}
+
       - name: Resolve runner_config
         id: rc
         env:
