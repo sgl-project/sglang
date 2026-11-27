@@ -84,6 +84,15 @@ from sglang.srt.entrypoints.anthropic.protocol import (
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.api_contract import generate_contract_error
+from sglang.srt.entrypoints.cohere.protocol import (
+    CohereEmbedRequest,
+    CohereEmbedResponse,
+    CohereErrorResponse,
+)
+from sglang.srt.entrypoints.cohere.serving_embedding import (
+    CohereServingEmbedding,
+    render_request_errors,
+)
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -355,6 +364,9 @@ async def lifespan(fast_api_app: FastAPI):
         )
     )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.cohere_serving_embedding = CohereServingEmbedding(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
@@ -1922,6 +1934,37 @@ async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
             request, raw_request
         )
     )
+
+
+class CohereRoute(ORJSONRoute):
+    """Keeps /v2/embed failures in the Cohere error envelope at the route itself,
+    so the app-wide exception handlers need no knowledge of this endpoint."""
+
+    def get_route_handler(self):
+        return render_request_errors(super().get_route_handler())
+
+
+async def cohere_v2_embed(request: CohereEmbedRequest, raw_request: Request):
+    """Cohere-compatible embeddings endpoint."""
+    return await raw_request.app.state.cohere_serving_embedding.handle_request(
+        request, raw_request
+    )
+
+
+app.router.add_api_route(
+    "/v2/embed",
+    cohere_v2_embed,
+    methods=["POST"],
+    route_class_override=CohereRoute,
+    dependencies=[Depends(validate_json_request)],
+    response_model=CohereEmbedResponse,
+    response_model_exclude_none=True,
+    responses={
+        400: {"model": CohereErrorResponse},
+        404: {"model": CohereErrorResponse},
+        500: {"model": CohereErrorResponse},
+    },
+)
 
 
 @app.post(

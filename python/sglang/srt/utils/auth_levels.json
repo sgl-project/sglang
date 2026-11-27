@@ -122,6 +122,7 @@
   "/v1/videos": "normal",
   "/v1/videos/{video_id}": "normal",
   "/v1/videos/{video_id}/content": "normal",
+  "/v2/embed": "normal",
   "/vertex_generate": "normal",
   "/weights_checker": "admin_force"
 }
