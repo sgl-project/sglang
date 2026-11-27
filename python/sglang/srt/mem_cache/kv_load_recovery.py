@@ -12,8 +12,58 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class HybridReplay:
+    """Private healthy attention rows and a borrowed, healthy resume checkpoint.
+
+    The provider retains checkpoint ownership until recovery commits or aborts.
+    Normal request state slots hold the replay's recurrent/conv scratch state.
+    """
+
+    missing_start: int
+    healthy_replay_indices: torch.Tensor
+    resume_checkpoint: torch.Tensor
+
+    def restore(
+        self,
+        req: Req,
+        cache: UnifiedRadixCache,
+        replay_start: int,
+    ) -> None:
+        """Restore healthy state and mappings after the final replay forward."""
+        state = req.kv
+        if state.mamba_pool_idx is None:
+            raise RuntimeError("Hybrid repair lost its private recurrent state")
+        cache.kv_storage().copy_state(
+            cache.req_to_token_pool.state_sub_pool,
+            self.resume_checkpoint.reshape(-1),
+            state.mamba_pool_idx.reshape(-1),
+        )
+        state.mamba_cow_src_index = None
+        state.mamba_needs_clear = False
+        # Replay tracking buffers contain scratch checkpoints. The immutable
+        # retained checkpoint is published by its existing provider owner.
+        state.mamba_last_track_seqlen = None
+        state.mamba_prev_track_seqlen = None
+        scratch = cache.req_to_token_pool.req_to_token[
+            state.req_pool_idx, replay_start : self.missing_start
+        ].clone()
+        cache.req_to_token_pool.write(
+            (state.req_pool_idx, slice(replay_start, self.missing_start)),
+            self.healthy_replay_indices,
+        )
+        cache.token_to_kv_pool_allocator.free(scratch)
+        self.healthy_replay_indices = self.healthy_replay_indices[:0]
+
+    def abort(self, allocator: BaseTokenToKVPoolAllocator) -> None:
+        """Release only still-private attention rows, never the borrowed state."""
+        allocator.free(self.healthy_replay_indices)
+        self.healthy_replay_indices = self.healthy_replay_indices[:0]
 
 
 @dataclass
@@ -30,6 +80,7 @@ class KVLoadRecovery:
     restored_extent: int
     suffix_indices: torch.Tensor
     source_tier: Literal["storage", "host"] = "storage"
+    hybrid: HybridReplay | None = None
 
     def commit(self, req: Req, cache: BasePrefixCache) -> None:
         """Adopt the untouched suffix into a completed repair's request row.
@@ -40,6 +91,8 @@ class KVLoadRecovery:
         """
         if req.extend_end != self.span_end or req.kv.kv_committed_len != self.span_end:
             raise RuntimeError("KV hole repair must commit exactly at its span end")
+        if self.hybrid is not None:
+            self.hybrid.restore(req, cache, self.span_start)
         cache.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(self.span_end, self.restored_extent)),
             self.suffix_indices,
@@ -64,6 +117,8 @@ class KVLoadRecovery:
         """Free the private suffix exactly once; repeated aborts are no-ops."""
         allocator.free(self.suffix_indices)
         self.suffix_indices = self.suffix_indices[:0]
+        if self.hybrid is not None:
+            self.hybrid.abort(allocator)
 
 
 def prepare_partial_kv_load(
@@ -100,6 +155,39 @@ def prepare_partial_kv_load(
         return prefix, None
     allocator.free(loaded_indices[lo:hi])
     return prefix, KVLoadRecovery(start, end, extent, loaded_indices[hi:])
+
+
+def prepare_hybrid_kv_load(
+    *,
+    loaded_start: int,
+    loaded_indices: torch.Tensor,
+    missing_span: tuple[int, int],
+    page_size: int,
+    allocator: BaseTokenToKVPoolAllocator,
+    resume_checkpoint: torch.Tensor,
+) -> tuple[torch.Tensor, KVLoadRecovery]:
+    """Keep healthy KV private while replaying from the local joint checkpoint.
+
+    ``loaded_start`` is the healthy local attention/recurrent boundary (zero
+    uses the model's initial state). The normal scheduler allocates fresh KV
+    and mutable recurrent state for replay. Only missing attention rows survive
+    commit; healthy replay rows and the suffix keep their original allocations.
+    The caller owns the already-delivered resume checkpoint throughout replay.
+    """
+    if resume_checkpoint.numel() != 1:
+        raise ValueError("Hybrid repair requires one healthy resume checkpoint")
+    prefix, recovery = prepare_partial_kv_load(
+        loaded_start=loaded_start,
+        loaded_indices=loaded_indices,
+        missing_span=missing_span,
+        page_size=page_size,
+        allocator=allocator,
+        policy="repair",
+    )
+    assert recovery is not None
+    recovery.span_start = loaded_start
+    recovery.hybrid = HybridReplay(missing_span[0], prefix, resume_checkpoint)
+    return prefix[:0], recovery
 
 
 def abort_kv_load_recovery(req: Req, cache: BasePrefixCache) -> None:

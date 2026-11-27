@@ -4,6 +4,9 @@ import pytest
 import torch
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_load_recovery import prepare_partial_kv_load
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize("hole", [(0, 4), (4, 8), (8, 12)])
@@ -103,3 +106,31 @@ def test_commit_restores_the_private_suffix_only_after_repair_forward():
     before = allocator.available_size()
     recovery.abort(allocator)
     assert allocator.available_size() == before
+
+
+@pytest.mark.parametrize("hole", [(0, 4), (4, 8), (8, 12)])
+def test_hybrid_replay_privately_retains_all_healthy_attention_slots(hole):
+    """Replay may start before the hole without freeing or mutating healthy KV."""
+    from sglang.srt.mem_cache.kv_load_recovery import prepare_hybrid_kv_load
+
+    allocator = TokenToKVPoolAllocator(32, torch.float32, "cpu", None, False)
+    indices = allocator.alloc(12)
+    checkpoint = torch.tensor([7])
+    prefix, recovery = prepare_hybrid_kv_load(
+        loaded_start=0,
+        loaded_indices=indices,
+        missing_span=hole,
+        page_size=1,
+        allocator=allocator,
+        resume_checkpoint=checkpoint,
+    )
+    assert len(prefix) == 0
+    assert recovery.span_start == 0 and recovery.span_end == hole[1]
+    assert recovery.restored_extent == 12
+    assert torch.equal(recovery.hybrid.healthy_replay_indices, indices[: hole[0]])
+    assert torch.equal(recovery.suffix_indices, indices[hole[1] :])
+    assert torch.equal(checkpoint, torch.tensor([7]))
+    assert allocator.available_size() == 24
+    recovery.abort(allocator)
+    recovery.abort(allocator)
+    assert allocator.available_size() == 32

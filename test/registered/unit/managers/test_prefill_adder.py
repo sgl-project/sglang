@@ -293,6 +293,36 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.can_run_list, [repair, short])
         self.assertIs(adder.new_chunked_req, repair)
 
+    def test_resumed_hybrid_repair_stops_at_commit_boundary(self):
+        from sglang.srt.mem_cache.kv_load_recovery import HybridReplay, KVLoadRecovery
+
+        self.mock_token_allocator.available_size.return_value = 100000
+        for prefix_len in (509, 510, 511):
+            with self.subTest(prefix_len=prefix_len):
+                req = Req(
+                    "repair",
+                    "",
+                    array("q", range(2048)),
+                    SamplingParams(max_new_tokens=128, temperature=0),
+                )
+                req.init_next_round_input()
+                req.prefix_len = prefix_len
+                req.kv_load_recovery = KVLoadRecovery(
+                    0,
+                    512,
+                    1536,
+                    torch.arange(1024),
+                    hybrid=HybridReplay(256, torch.arange(256), torch.tensor([1])),
+                )
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    rem_chunk_tokens=511,
+                )
+                self.assertIs(adder.add_chunked_req(req), req)
+                self.assertEqual(adder.can_run_list, [req])
+                self.assertEqual(req.extend_end, 512)
+                self.assertEqual(req.extend_len, 512 - prefix_len)
+
     def test_capped_chunk_holds_its_rest_from_later_requests(self):
         """A request admitted beside a capped chunk may not take the KV the
         chunk's rest needs next pass; an uncapped chunk holds only itself."""

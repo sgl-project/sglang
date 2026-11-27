@@ -1778,7 +1778,14 @@ class PrefillAdder:
             assert self.chunked_req_limit > 0
             _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
 
+        recovery = req.kv_load_recovery
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        if recovery is not None:
+            if not recovery.span_start <= req.prefix_len < recovery.span_end:
+                raise RuntimeError("Repair prefill prefix is outside its replay span")
+            # Mixed decode traffic can cut a replay before its commit boundary.
+            # Its continuation must stop there before the healthy suffix is adopted.
+            cand_extend_input_len = recovery.span_end - req.prefix_len
         _rem_tokens = self.grid_continuation_limit(_rem_tokens, cand_extend_input_len)
         prefix_tokens = 0
         if is_cp_sharded_padded():
@@ -1795,7 +1802,7 @@ class PrefillAdder:
         )
         if _rem_tokens is None:
             return req
-        truncated = cand_extend_input_len > _rem_tokens
+        truncated = recovery is not None or cand_extend_input_len > _rem_tokens
         new_len = self.floor_chunked_tokens(
             min(cand_extend_input_len, _rem_tokens), cand_extend_input_len
         )
@@ -2320,9 +2327,9 @@ class PrefillAdder:
         if recovery is not None:
             if has_chunked_req or self.new_chunked_req is not None:
                 return AddReqResult.OTHER
-            if prefix_len != recovery.span_start:
-                raise RuntimeError("Repair prefill prefix does not end at the hole")
-            extend_len = recovery.span_end - recovery.span_start
+            if not recovery.span_start <= prefix_len < recovery.span_end:
+                raise RuntimeError("Repair prefill prefix is outside its replay span")
+            extend_len = recovery.span_end - prefix_len
         input_tokens = self.ceil_paged_tokens(extend_len)
         # Whether the request fits whole. Against the raw length under
         # exact-chunk-fill, so a request whose ceiled length would spill is
@@ -2358,7 +2365,12 @@ class PrefillAdder:
         ):
             return AddReqResult.OTHER
 
-        if recovery is not None and chunk_tokens_limit is not None and extend_len > chunk_tokens_limit:
+        if (
+            recovery is not None
+            and recovery.hybrid is None
+            and chunk_tokens_limit is not None
+            and extend_len > chunk_tokens_limit
+        ):
             return AddReqResult.OTHER
         is_chunked = recovery is not None
         max_new_tokens = 0 if is_chunked else min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
