@@ -862,6 +862,7 @@ def eagle_sample(
     sparse_bonus_argmax: bool = False,
     local_keys: Optional[LocalKeysFn] = None,
     has_custom_logit_processor: bool = False,
+    is_ngram: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -943,6 +944,7 @@ def eagle_sample(
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
         local_keys=local_keys,
+        is_ngram=is_ngram,
     )
 
 
@@ -961,6 +963,7 @@ def _tree_accept(
     simulated_acc_len_rng: Optional[torch.Generator],
     sparse_bonus_argmax: bool,
     local_keys: Optional[LocalKeysFn],
+    is_ngram: bool,
 ):
     """A gather it still needs is published to ``logits_output``."""
     from sglang.srt.layers.dp_attention import (
@@ -1066,6 +1069,7 @@ def _tree_accept(
                 retrieve_next_token=verify_input.retrieve_next_token,
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
+                is_ngram=is_ngram,
             )
 
         if _is_hip:
@@ -1109,6 +1113,7 @@ def _tree_accept(
                 retrieve_next_token=verify_input.retrieve_next_token,
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
+                is_ngram=is_ngram,
             )
     elif sparse:
         from sglang.srt.speculative.uno_utils import (
@@ -1145,6 +1150,7 @@ def _tree_accept(
                 retrieve_next_token=verify_input.retrieve_next_token,
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
+                is_ngram=is_ngram,
             )
 
         tp_group = (

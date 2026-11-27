@@ -13,13 +13,18 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 class TestNativeEagerVerify(CustomTestCase):
     def test_master_selects_native_sampling_or_runtime_hooks(self):
-        # EAGLE passes its sparse and simulated-acceptance options; NGRAM the defaults.
+        # EAGLE passes its sparse and simulated-acceptance options; NGRAM uses the default sampling options.
         eagle_options = dict(
             uno_target_max_top_k=17,
             simulated_acc_len_rng=object(),
             sparse_bonus_argmax=True,
         )
-        for label, options in (("eagle", eagle_options), ("defaults", {})):
+        for label, options, is_npu, supports_runtime in (
+            ("eagle", eagle_options, False, True),
+            ("npu_eagle", eagle_options, True, True),
+            ("ngram", dict(is_ngram=True), False, True),
+            ("npu_ngram", dict(is_ngram=True), True, False),
+        ):
             # A custom processor matters only with the switch on.
             for enabled, custom in ((False, False), (True, False), (True, True)):
                 with self.subTest(options=label, enabled=enabled, custom=custom):
@@ -56,6 +61,7 @@ class TestNativeEagerVerify(CustomTestCase):
                     )
                     with (
                         patch.object(eagle_worker_common, "eagle_sample", sample),
+                        patch.object(eagle_worker_common, "_is_npu", is_npu),
                         patch.object(
                             eagle_worker_common, "make_post_verify_io", make_io
                         ),
@@ -75,7 +81,7 @@ class TestNativeEagerVerify(CustomTestCase):
                         (accept.tokens, accept.accept_lens, accept.accept_index),
                         outputs,
                     )
-                    if enabled and not custom:
+                    if enabled and not custom and supports_runtime:
                         sample.assert_not_called()
                         make_io.assert_called_once()
                         hooks.post_verify.assert_called_once_with(make_io.return_value)
@@ -94,6 +100,7 @@ class TestNativeEagerVerify(CustomTestCase):
                                 "sparse_bonus_argmax", False
                             ),
                             has_custom_logit_processor=custom,
+                            is_ngram=options.get("is_ngram", False),
                         )
 
 

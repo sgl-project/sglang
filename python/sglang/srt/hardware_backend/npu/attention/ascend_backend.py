@@ -85,6 +85,13 @@ def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     )
 
 
+def _is_ngram_verify(spec_info: Optional[SpecInput]) -> bool:
+    return (
+        spec_info is not None
+        and spec_info.spec_input_type == SpecInputType.NGRAM_VERIFY
+    )
+
+
 def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
     if topk_indices.dim() == 2:
@@ -148,6 +155,8 @@ class ForwardMetadata:
 
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
+
+    ngram_attn_mask: Optional[torch.Tensor] = None
 
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
@@ -530,8 +539,13 @@ class AscendAttnBackend(AttentionBackend):
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
             # FIA host IntArrays consume the CPU mirror; keep it on instead of
             # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
-            if self.use_fia and not (
-                self.use_quant_flash_attn or self.use_flash_mla or self.use_paged_mtp
+            if model_runner.spec_algorithm.is_ngram() or (
+                self.use_fia
+                and not (
+                    self.use_quant_flash_attn
+                    or self.use_flash_mla
+                    or self.use_paged_mtp
+                )
             ):
                 logger.warning(
                     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
@@ -754,6 +768,20 @@ class AscendAttnBackend(AttentionBackend):
                 extend_seq_lens=forward_batch.extend_seq_lens,
             )
             return
+        if (
+            _is_ngram_verify(forward_batch.spec_info)
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            from sgl_kernel_npu.operators.attention import (
+                build_ngram_attention_mask,
+            )
+
+            self.forward_metadata.ngram_attn_mask = build_ngram_attention_mask(
+                forward_batch.spec_info.custom_mask,
+                forward_batch.seq_lens,
+                int(forward_batch.spec_info.draft_token_num),
+                self.forward_metadata.block_tables.shape[1] * self.page_size,
+            )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
@@ -1501,6 +1529,33 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     kv_lens = device_kv_lens[:bs]
                 metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
+        if _is_ngram_verify(spec_info):
+            from sgl_kernel_npu.operators.attention import (
+                build_ngram_attention_mask,
+            )
+
+            d = int(spec_info.draft_token_num)
+            kv_len = metadata.block_tables.shape[1] * self.page_size
+            if metadata.ngram_attn_mask is None:
+                # Allocate once per graph bucket; replay updates this storage.
+                metadata.ngram_attn_mask = torch.empty(
+                    (bs, 1, d, kv_len), dtype=torch.bool, device=self.device
+                )
+            # A live batch can have fewer requests than its captured bucket.
+            # Block every key for padding rows and expand only the live trees.
+            mask_bs = min(bs, spec_info.custom_mask.numel() // (d * d))
+            metadata.ngram_attn_mask.fill_(True)
+            metadata.ngram_attn_mask[:mask_bs].copy_(
+                build_ngram_attention_mask(
+                    spec_info.custom_mask[: mask_bs * d * d],
+                    seq_lens[:mask_bs],
+                    d,
+                    kv_len,
+                )
+            )
+            metadata.seq_lens_cpu_list = attention_kv_lens_cpu.tolist()
+
+        # The graph-bound seq_lens may alias the prefix used by the NGRAM mask.
         if not self.dense_mla_dcp_target:
             metadata.seq_lens[:bs].copy_(device_kv_lens[:bs])
 
@@ -3388,6 +3443,8 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         q_descale: Optional[torch.Tensor] = None,
     ):
+        """Share KV preparation and FIA dispatch for MTP and NGRAM verification."""
+        is_ngram = _is_ngram_verify(forward_batch.spec_info)
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -3512,7 +3569,11 @@ class AscendAttnBackend(AttentionBackend):
             ):
                 actual_seq_lengths_kv = actual_seq_lengths_kv[:real_bs]
 
-            if forward_batch.forward_mode.is_draft_extend_v2():
+            if is_ngram:
+                actual_seq_lengths = [self.speculative_num_draft_tokens] * (
+                    query.shape[0] // self.speculative_num_draft_tokens
+                )
+            elif forward_batch.forward_mode.is_draft_extend_v2():
                 extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
                 if not self.graph_mode:
                     extend_seq_lens_cpu = extend_seq_lens_cpu[
@@ -3548,7 +3609,18 @@ class AscendAttnBackend(AttentionBackend):
                 # Drop DP padding rows (see real_bs comment above).
                 block_table = block_table[:real_bs]
 
-            if layer.attn_type == AttentionType.ENCODER_ONLY:
+            input_layout = "TND"
+            if is_ngram:
+                # The paged MHA TND split-fuse path only accepts causal masks.
+                input_layout = "BSH"
+                query = query.reshape(
+                    -1,
+                    self.speculative_num_draft_tokens,
+                    layer.tp_q_head_num * layer.qk_head_dim,
+                )
+                mask = self.forward_metadata.ngram_attn_mask
+                sparse_mode = 0
+            elif layer.attn_type == AttentionType.ENCODER_ONLY:
                 mask = None
                 sparse_mode = 0
             else:
@@ -3564,7 +3636,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_size=self.page_size,
                     num_query_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="TND",
+                    input_layout=input_layout,
                     atten_mask=mask,
                     softmax_scale=layer.scaling,
                     actual_seq_qlen=actual_seq_lengths,
@@ -3587,7 +3659,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_size=self.page_size,
                     num_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="TND",
+                    input_layout=input_layout,
                     atten_mask=mask,
                     scale=layer.scaling,
                     actual_seq_lengths=actual_seq_lengths,
@@ -3704,44 +3776,51 @@ class AscendAttnBackend(AttentionBackend):
                 self.q_head_num_padding is not None
                 and self.q_head_num_padding > self.tp_q_head_num
             ):
-                nope_padding = torch.empty(
-                    [
-                        q_nope.shape[0],
-                        self.q_head_num_padding - self.tp_q_head_num,
-                        self.kv_lora_rank,
-                    ],
-                    dtype=self.nope_padding_dtype,
-                    device=q_nope.device,
-                )
-                rope_padding = torch.empty(
-                    [
-                        q_rope.shape[0],
-                        self.q_head_num_padding - self.tp_q_head_num,
-                        self.qk_rope_head_dim,
-                    ],
-                    dtype=(
-                        self.model_dtype
-                        if self.model_dtype is not None
-                        else torch.bfloat16
-                    ),
-                    device=q_rope.device,
-                )
-                q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
-                q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
-                if modelslim_kv_scheme is not None:
-                    q_descale = torch.cat(
+                if is_ngram:
+                    padding = self.q_head_num_padding - self.tp_q_head_num
+                    q_nope = torch.nn.functional.pad(q_nope, (0, 0, 0, padding))
+                    q_rope = torch.nn.functional.pad(q_rope, (0, 0, 0, padding))
+                else:
+                    nope_padding = torch.empty(
                         [
-                            q_descale,
-                            q_descale.new_ones(
-                                (
-                                    q_descale.shape[0],
-                                    self.q_head_num_padding - self.tp_q_head_num,
-                                )
-                            ),
+                            q_nope.shape[0],
+                            self.q_head_num_padding - self.tp_q_head_num,
+                            self.kv_lora_rank,
                         ],
-                        dim=1,
+                        dtype=self.nope_padding_dtype,
+                        device=q_nope.device,
                     )
+                    rope_padding = torch.empty(
+                        [
+                            q_rope.shape[0],
+                            self.q_head_num_padding - self.tp_q_head_num,
+                            self.qk_rope_head_dim,
+                        ],
+                        dtype=(
+                            self.model_dtype
+                            if self.model_dtype is not None
+                            else torch.bfloat16
+                        ),
+                        device=q_rope.device,
+                    )
+                    q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
+                    q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
+                    if modelslim_kv_scheme is not None:
+                        q_descale = torch.cat(
+                            [
+                                q_descale,
+                                q_descale.new_ones(
+                                    (
+                                        q_descale.shape[0],
+                                        self.q_head_num_padding - self.tp_q_head_num,
+                                    )
+                                ),
+                            ],
+                            dim=1,
+                        )
 
+            mask = self.forward_metadata.ngram_attn_mask if is_ngram else self.mtp_mask
+            sparse_mode = 0 if is_ngram else 3
             num_query_heads = q_nope.shape[1]
             if self.use_fias_v2_bsnd:
                 # The existing paged MLA cache is [block, KV_N, page, D].
@@ -3808,8 +3887,8 @@ class AscendAttnBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         block_table=block_table,
                         block_size=self.page_size,
-                        sparse_mode=3,
-                        atten_mask=self.mtp_mask,
+                        sparse_mode=sparse_mode,
+                        atten_mask=mask,
                         actual_seq_qlen=(
                             None
                             if modelslim_kv_scheme is not None
@@ -3867,8 +3946,8 @@ class AscendAttnBackend(AttentionBackend):
                         antiquant_scale=None,
                         block_table=block_table,
                         block_size=self.page_size,
-                        sparse_mode=3,
-                        atten_mask=self.mtp_mask,
+                        sparse_mode=sparse_mode,
+                        atten_mask=mask,
                         actual_seq_lengths=actual_seq_lengths,
                         actual_seq_lengths_kv=actual_seq_lengths_kv,
                     )
@@ -3889,8 +3968,8 @@ class AscendAttnBackend(AttentionBackend):
                     antiquant_scale=None,
                     block_table=block_table,
                     block_size=self.page_size,
-                    sparse_mode=3,
-                    atten_mask=self.mtp_mask,
+                    sparse_mode=sparse_mode,
+                    atten_mask=mask,
                     actual_seq_lengths=actual_seq_lengths,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     workspace=workspace,
@@ -3900,6 +3979,7 @@ class AscendAttnBackend(AttentionBackend):
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode
+                and forward_batch.global_num_token_non_padded_cpu is not None
                 and forward_batch.global_num_token_non_padded_cpu != num_token_padding
             ):
                 attn_output = torch.cat(

@@ -264,6 +264,7 @@ def accept_draft_tree(
     uno_target_max_top_k: Optional[int] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
+    is_ngram: bool = False,
 ) -> VerifyAccept:
     """The tree accept core of EAGLE and NGRAM: the runtime hooks' post-verify
     under the NV mega runtime, eagle_sample otherwise."""
@@ -271,9 +272,11 @@ def accept_draft_tree(
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
     has_custom_logit_processor = batch.sampling_info.has_custom_logit_processor
     # The provider's sampling view carries no custom logit processors.
+    # NPU NGRAM uses its own tree verifier through eagle_sample.
     if (
         envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
         and not has_custom_logit_processor
+        and not (is_ngram and _is_npu)
     ):
         # Without its forced length on the device, eagle_sample would leave the fused
         # chain for the tree kernels and draw the length on the host instead.
@@ -316,6 +319,7 @@ def accept_draft_tree(
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
         has_custom_logit_processor=has_custom_logit_processor,
+        is_ngram=is_ngram,
     )
     return VerifyAccept(
         tokens=predict, accept_lens=accept_lens, accept_index=accept_index
