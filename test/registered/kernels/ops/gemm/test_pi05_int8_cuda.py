@@ -59,11 +59,16 @@ def tiny_core():
     prefix.model = nn.Module()
     prefix.model.vision_tower = nn.Module()
     prefix.model.vision_tower.encoder = nn.Module()
-    vision_config = SiglipVisionConfig(hidden_size=64, intermediate_size=128, num_attention_heads=4)
+    vision_config = SiglipVisionConfig(
+        hidden_size=64, intermediate_size=128, num_attention_heads=4
+    )
     prefix.model.vision_tower.encoder.layers = nn.ModuleList(
         [
             SiglipEncoderLayer(
-                vision_config, qkv_backend="sdpa", flatten_batch=False, use_data_parallel=True
+                vision_config,
+                qkv_backend="sdpa",
+                flatten_batch=False,
+                use_data_parallel=True,
             ).to(torch.bfloat16)
         ]
     )
@@ -78,7 +83,8 @@ def tiny_core():
 
 
 @unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 0), "needs sm80+"
+    torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 0),
+    "needs sm80+",
 )
 class TestPi05Int8CUDA(CustomTestCase):
     @classmethod
@@ -118,8 +124,12 @@ class TestPi05Int8CUDA(CustomTestCase):
             # 4 action-expert + 4 SigLIP projections + projector; the FP32 action/time heads and
             # AdaRMS modulation dense layers must stay unquantized.
             self.assertEqual(len(names), 9)
-            self.assertFalse(any(n.startswith("action_") or ".dense" in n for n in names))
-            self.assertTrue(all(isinstance(core.get_submodule(n), Pi05Int8Linear) for n in names))
+            self.assertFalse(
+                any(n.startswith("action_") or ".dense" in n for n in names)
+            )
+            self.assertTrue(
+                all(isinstance(core.get_submodule(n), Pi05Int8Linear) for n in names)
+            )
             actual = run(core)
         self.assertEqual(actual.dtype, torch.float32)
         self.assertLess((actual - baseline).abs().mean().item(), 0.01)

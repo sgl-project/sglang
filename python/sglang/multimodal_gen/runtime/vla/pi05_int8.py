@@ -25,7 +25,9 @@ def int8_supported(device: torch.device) -> bool:
 
 
 def validate_int8_components(components: list[str]) -> list[str]:
-    if not isinstance(components, list) or not all(isinstance(c, str) for c in components):
+    if not isinstance(components, list) or not all(
+        isinstance(c, str) for c in components
+    ):
         raise ValueError("int8_components must be a list of strings")
     if len(set(components)) != len(components):
         raise ValueError("int8_components must be unique")
@@ -37,7 +39,9 @@ def validate_int8_components(components: list[str]) -> list[str]:
     return components
 
 
-def _quantize_weight_per_channel(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize_weight_per_channel(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     w = weight.detach().float()
     scale = w.abs().amax(dim=1).clamp(min=1e-8) / 127.0
     q = torch.round(w / scale[:, None]).clamp_(-128, 127).to(torch.int8)
@@ -85,7 +89,9 @@ class Pi05Int8Linear(nn.Module):
         from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 
         leading = x.shape[:-1]
-        x_q, x_scale = per_token_quant_int8(x.reshape(-1, self.in_features).to(torch.bfloat16))
+        x_q, x_scale = per_token_quant_int8(
+            x.reshape(-1, self.in_features).to(torch.bfloat16)
+        )
         # int8_scaled_mm takes the weight as a [K, N] column-major operand.
         out = int8_scaled_mm(
             x_q, self.weight.t(), x_scale, self.weight_scale, torch.bfloat16, self.bias
@@ -100,5 +106,9 @@ def quantize_projections_int8(model: nn.Module, components: list[str]) -> list[s
     for name in names:
         module = model.get_submodule(name)
         parent_name, _, child_name = name.rpartition(".")
-        setattr(model.get_submodule(parent_name), child_name, Pi05Int8Linear.from_module(module))
+        setattr(
+            model.get_submodule(parent_name),
+            child_name,
+            Pi05Int8Linear.from_module(module),
+        )
     return names

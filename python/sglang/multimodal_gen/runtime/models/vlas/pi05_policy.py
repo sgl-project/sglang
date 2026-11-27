@@ -253,7 +253,9 @@ class Pi05PolicyModel(nn.Module):
         if not config.int8_components:
             return []
         if self._fp8_projection_names:
-            raise ValueError("Pi0.5 INT8 cannot be combined with a ModelOpt FP8 checkpoint")
+            raise ValueError(
+                "Pi0.5 INT8 cannot be combined with a ModelOpt FP8 checkpoint"
+            )
         if not self._supports_resident_quantization(
             config=config,
             device=device,
@@ -261,13 +263,19 @@ class Pi05PolicyModel(nn.Module):
             prefix_tensor_parallel=prefix_tensor_parallel,
             min_capability=(8, 0),
         ):
-            raise ValueError("Pi0.5 INT8 requires single-GPU resident BF16 inference on sm80+")
-        from sglang.multimodal_gen.runtime.vla.pi05_int8 import quantize_projections_int8
+            raise ValueError(
+                "Pi0.5 INT8 requires single-GPU resident BF16 inference on sm80+"
+            )
+        from sglang.multimodal_gen.runtime.vla.pi05_int8 import (
+            quantize_projections_int8,
+        )
 
         names = quantize_projections_int8(self.core_model, config.int8_components)
         torch.cuda.empty_cache()
         logger.info(
-            "Pi05 INT8 W8A8: quantized %d projections in %s", len(names), config.int8_components
+            "Pi05 INT8 W8A8: quantized %d projections in %s",
+            len(names),
+            config.int8_components,
         )
         return names
 
