@@ -168,11 +168,14 @@ if _is_hip:
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
     )
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4 as _gemm_afp4wfp4_orig
     from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
         gemm_afp4wfp4_pre_quant as _gemm_afp4wfp4_pre_quant_orig,
     )
     from aiter.ops.triton.quant import dynamic_mxfp4_quant as _dynamic_mxfp4_quant_orig
+
+    from sglang.kernels.ops.gemm.afp4wfp4_k_tail_gfx950 import (
+        gemm_afp4wfp4_k_tail_safe,
+    )
 
     def _aiter_gemm_afp4wfp4(
         x: torch.Tensor,
@@ -181,7 +184,7 @@ if _is_hip:
         w_scales: torch.Tensor,
         y: torch.Tensor,
     ) -> None:
-        _gemm_afp4wfp4_orig(x, w, x_scales, w_scales, y.dtype, y)
+        gemm_afp4wfp4_k_tail_safe(x=x, w=w, x_scales=x_scales, w_scales=w_scales, y=y)
 
     def _aiter_gemm_afp4wfp4_fake(
         x: torch.Tensor,
