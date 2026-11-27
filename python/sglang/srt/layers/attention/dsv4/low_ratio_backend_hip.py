@@ -194,14 +194,14 @@ def _indexer_inputs(layer, x, q_lora, pos):
 def build_low_ratio_decode_workspaces(
     metadata_by_ratio: Dict[int, PagedIndexerMetadata],
     *,
-    max_context_len: int,
+    max_kv_len: int,
     num_requests: Optional[int] = None,
     page8_ratios: FrozenSet[int] = frozenset(),
 ) -> Dict[int, Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]]:
     """Capture-safe: everything the schedule kernel touches is pinned in the workspace.
     With the row-group kernel there is no schedule; a request's rows (``num_requests``
     requests of equal row counts, consecutive: decode 1, target-verify its draft rows)
-    score as one sequence, on a table as wide as ``max_context_len`` needs. A page8 pool
+    score as one sequence, on a table as wide as ``max_kv_len`` needs. A page8 pool
     is read by the row-group kernel only."""
     rowgroup = _fp4_rowgroup_enabled()
     workspaces = {}
@@ -222,7 +222,7 @@ def build_low_ratio_decode_workspaces(
             rows_per_request,
             page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
             table_columns=rowgroup_table_columns(
-                max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+                max_kv_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
             ),
         )
     return workspaces
@@ -233,12 +233,12 @@ def refresh_low_ratio_prefill_workspaces(
     previous: Optional[Dict[int, FP4PrefillWorkspace]],
     *,
     extend_lens: Optional[List[int]],
-    max_context_len: int,
+    max_kv_len: int,
     page8_ratios: FrozenSet[int] = frozenset(),
 ) -> Dict[int, Union[FP4PrefillWorkspace, FP4RowgroupPrefillWorkspace]]:
     """Must run outside CUDA-graph capture; see prepare_fp4_prefill_workspace. A page8 pool
     scores on the row-group kernel, which takes no schedule, on a table as wide as
-    ``max_context_len`` needs (without extend_lens, the indexer builds its workspace
+    ``max_kv_len`` needs (without extend_lens, the indexer builds its workspace
     itself)."""
     previous = previous or {}
     workspaces = {}
@@ -250,7 +250,7 @@ def refresh_low_ratio_prefill_workspaces(
                     extend_lens,
                     page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
                     table_columns=rowgroup_table_columns(
-                        max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+                        max_kv_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
                     ),
                 )
             continue
@@ -437,7 +437,7 @@ def low_ratio_index_topk_hip_decode(
         decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
         page8=page8,
         rowgroup_table_columns=rowgroup_table_columns(
-            backend.model_runner.model_config.context_len,
+            backend.max_kv_len,
             ratio,
             LOW_RATIO_PAGE_TABLE_BUCKET,
         ),
@@ -651,7 +651,7 @@ def low_ratio_index_topk_hip_extend(
             extend_lens_cpu,
             page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
             table_columns=rowgroup_table_columns(
-                backend.model_runner.model_config.context_len,
+                backend.max_kv_len,
                 ratio,
                 LOW_RATIO_PAGE_TABLE_BUCKET,
             ),
