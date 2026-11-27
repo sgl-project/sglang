@@ -48,6 +48,7 @@ from sglang.srt.utils import (
     is_gfx1250_supported,
     is_hip,
     is_musa,
+    is_rdna_supported,
     is_xpu,
     offloader,
 )
@@ -62,6 +63,7 @@ _is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+_is_rdna = is_rdna_supported()
 _is_musa = is_musa()
 
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
@@ -2080,9 +2082,13 @@ def apply_fp8_linear(
     # This could change in the future.
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
+    # On RDNA, hipBLASLt is no faster at 17 rows than at M <= 16 (slightly slower
+    # at M = 1-2), so padding only adds work there.
     if pad_output is None:
-        pad_output = not cutlass_fp8_supported and not get_bool_env_var(
-            "SGLANG_ENABLE_TORCH_COMPILE"
+        pad_output = (
+            not cutlass_fp8_supported
+            and not _is_rdna
+            and not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
         )
     output_padding = 17 if pad_output else None
 
