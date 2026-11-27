@@ -112,9 +112,12 @@ def _resolve_store_protocol(config: Mapping[str, Any], from_env: bool = False) -
                 "Mooncake store is configured from environment variables, so it "
                 "uses MOONCAKE_PROTOCOL=nvlink, which the PD KV transfer also "
                 "reads. Host KV pool pages are not GPU memory; to give the store "
-                "its own protocol (e.g. 'rdma'), set 'protocol' in "
+                "its own protocol (e.g. 'rdma'), configure the store in "
                 "--hicache-storage-backend-extra-config or in the "
-                "SGLANG_HICACHE_MOONCAKE_CONFIG_PATH file."
+                "SGLANG_HICACHE_MOONCAKE_CONFIG_PATH file with 'protocol' "
+                "together with 'master_server_address' (or "
+                "'client_server_address'). A store config replaces the "
+                "environment setup, so 'protocol' alone is ignored."
             )
         else:
             logger.warning(

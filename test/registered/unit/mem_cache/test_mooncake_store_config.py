@@ -76,6 +76,8 @@ class TestMooncakeStoreConfigProtocol(CustomTestCase):
         out = "\n".join(logs.output)
         self.assertIn("environment variables", out)
         self.assertIn("--hicache-storage-backend-extra-config", out)
+        # A protocol-only extra config is ignored, so the hint must name the address key.
+        self.assertIn("master_server_address", out)
         self.assertNotIn("config omits 'protocol'", out)
 
 
