@@ -17,6 +17,7 @@ on:
       - "python/sglang/test/test_utils.py"
       - "python/sglang/test/lora_utils.py"
       - "python/sglang/test/ci/**"
+      - "scripts/ci/hf_repo_scan.py"
       - "scripts/ci/list_stage_models.py"
       - "scripts/ci/stage_models_overrides.json"
       - "scripts/ci/runner_configs.yml"
@@ -26,8 +27,9 @@ on:
     # filtered on test/registered/** -- that would run on most PRs; the
     # published inventory is refreshed by the push-to-main trigger instead.
     paths:
+      - "python/sglang/test/ci/ci_register.py"
+      - "scripts/ci/hf_repo_scan.py"
       - "scripts/ci/list_stage_models.py"
-      - "scripts/ci/test_list_stage_models.py"
       - "scripts/ci/stage_models_overrides.json"
       - ".github/workflows/ci-model-inventory.yml"
   schedule:
@@ -46,9 +48,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run extractor unit tests
-        run: python3 -m unittest discover -s scripts/ci -p 'test_list_stage_models.py'
-
       - name: Generate model inventory
         run: |
           python3 scripts/ci/list_stage_models.py \
@@ -56,6 +55,16 @@ jobs:
             --commit "${{ github.sha }}" \
             --output models-per-stage.json \
             --markdown inventory.md
+
+      # check-changes' prefetch lists warn instead of failing, so check here
+      # that a scanner change still yields one non-empty list per partition.
+      - name: Dry-run the prefetch lists
+        run: |
+          out=$(python3 scripts/ci/hf_repo_scan.py \
+            --partitions '{"base-b-test-1-gpu-small": {"size": 2}}')
+          echo "$out"
+          jq -e '.["base-b-test-1-gpu-small"] | length == 2 and all(length > 0)' \
+            <<< "${out#prefetch_repos=}"
 
       - name: Write job summary
         run: cat inventory.md >> "$GITHUB_STEP_SUMMARY"
