@@ -150,6 +150,7 @@ def _storage(
             state_slots=4 if state else 0,
             max_running_requests=3,
             context_len=256,
+            req_to_token_row_width=256,
             alignment=1,
         ),
     )
@@ -163,7 +164,6 @@ def _storage(
             enable_memory_saver=False,
             need_sort=False,
             max_num_reqs=3,
-            model_context_len=256,
             lazy_compaction=True,
             state_cache_params=SimpleNamespace(layers=state_layers),
         ),
@@ -359,7 +359,7 @@ class TestWindowRetirement(CustomTestCase):
                 patch("sglang.srt.runtime_context.get_schedule", return_value=schedule),
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec),
                 patch(
-                    "sglang.srt.mem_cache.allocation_sizing.get_decode_reserve",
+                    "sglang.srt.mem_cache.allocation_sizing.get_spec_decode_reserve",
                     return_value=10,
                 ),
             ):

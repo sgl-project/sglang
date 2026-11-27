@@ -7,7 +7,6 @@ from array import array
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
-import torch
 from test_prefill_memory_budget import (
     _cache,
     _shared_allocator,
@@ -226,7 +225,7 @@ class TestPlainTreeReclaimsADemand(CustomTestCase):
             CacheInitParams(
                 disable=False,
                 req_to_token_pool=ReqToTokenPool(
-                    size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+                    size=4, row_width=64, device="cpu", enable_memory_saver=False
                 ),
                 token_to_kv_pool_allocator=allocator,
                 page_size=4,
@@ -256,13 +255,13 @@ class TestSpeculativeHeadroomAsksADemand(CustomTestCase):
         page = allocator.page_size
         batch = SimpleNamespace(
             reqs=[SimpleNamespace(kv=SimpleNamespace(kv_committed_len=need))],
-            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(1, 1024)),
+            req_to_token_pool=SimpleNamespace(row_width=1024),
             hisparse_coordinator=None,
             token_to_kv_pool_allocator=allocator,
         )
         aligned = -(-need // page) * page
         with patch(
-            "sglang.srt.mem_cache.allocation_sizing.get_decode_reserve",
+            "sglang.srt.mem_cache.allocation_sizing.get_spec_decode_reserve",
             return_value=0,
         ):
             return add_spec_decode_headroom_pages(batch, [aligned], page)

@@ -49,7 +49,8 @@ class KVSizingInputs(msgspec.Struct, frozen=True, kw_only=True):
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     pre_alloc_rows: int = 0
-    req_to_token_headroom: int = 0
+    # The request table's req_to_token row width.
+    req_to_token_row_width: int
     alignment: int = 4096
 
 
@@ -67,6 +68,8 @@ class SizedKVStorage(msgspec.Struct, frozen=True, kw_only=True):
     max_running_requests: int
     scratch_rows: int
     request_rows: int
+    # The request table's req_to_token row width.
+    req_to_token_row_width: int
     fixed: Tuple[FixedAllocation, ...]
     full_cap_tokens: Optional[int] = None
     bs1_floor_terms: Tuple[Tuple[str, int], ...] = ()
@@ -99,7 +102,7 @@ def _request_estimate(plan, inp):
 def _fixed_terms(plan, inp, running, strategy):
     scratch_rows = running + 1
     request_rows = scratch_rows + inp.pre_alloc_rows
-    row_bytes = 4 * ((inp.context_len or 0) + inp.req_to_token_headroom)
+    row_bytes = 4 * inp.req_to_token_row_width
     row_bytes += sum(
         4 + 8 * strategy.tracking_slots
         for s in plan.sub_pools
@@ -367,8 +370,10 @@ def size_plan(
         if explicit_chain is not None:
             budget = chain + sum(t.bytes for t in fixed)
         scratch_rows, request_rows = running + 1, running + inp.pre_alloc_rows + 1
+        req_to_token_row_width = inp.req_to_token_row_width
     else:
         scratch_rows, request_rows = frozen.scratch_rows, frozen.request_rows
+        req_to_token_row_width = frozen.req_to_token_row_width
     check_bs1_floor(total_bytes=chain, floor_terms=terms, where="size_plan")
     if full <= 0 or running <= 0:
         raise RuntimeError("the declared storage budget cannot serve one request")
@@ -381,6 +386,7 @@ def size_plan(
         max_running_requests=running,
         scratch_rows=scratch_rows,
         request_rows=request_rows,
+        req_to_token_row_width=req_to_token_row_width,
         fixed=fixed,
         bs1_floor_terms=terms,
         state_strategy=strategy,

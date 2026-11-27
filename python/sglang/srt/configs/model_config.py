@@ -36,6 +36,7 @@ from sglang.srt.configs.ernie55 import (
     to_dspark_draft_config,
     to_nextn_draft_config,
 )
+from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.unlimited_ocr_v2 import (
     FALLBACK_CONTEXT_LENGTH,
@@ -721,6 +722,8 @@ class ModelConfig:
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
         uocr_v2_default_context_len: int = FALLBACK_CONTEXT_LENGTH,
+        inkling2_loop_num_passes: Optional[int] = None,
+        inkling2_loop_share_cache: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -777,6 +780,11 @@ class ModelConfig:
             self.model_path, self.revision = base
             revision = self.revision
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        if inkling2_loop_num_passes is not None or inkling2_loop_share_cache:
+            self._configure_inkling2_loop(
+                num_passes=inkling2_loop_num_passes,
+                share_cache=inkling2_loop_share_cache,
+            )
         self.decision_config = None
         if self.hf_config.architectures == ["Qwen3_5Model"]:
             self.decision_config = load_decision_config(self.model_path, revision)
@@ -840,7 +848,7 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
                 "InklingForConditionalGeneration",
-                "Inkling2ForConditionalGeneration",
+                *INKLING2_ARCHS,
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
@@ -1142,8 +1150,30 @@ class ModelConfig:
             uocr_v2_default_context_len=UocrDocumentConfig.from_args(
                 cfg
             ).default_context_length(),
+            inkling2_loop_num_passes=cfg.inkling2_loop_num_passes,
+            inkling2_loop_share_cache=cfg.inkling2_loop_share_cache,
             **kwargs,
         )
+
+    def _configure_inkling2_loop(
+        self, *, num_passes: Optional[int], share_cache: bool
+    ) -> None:
+        if self.hf_config.model_type != "inkling2_loop":
+            raise ValueError(
+                "--inkling2-loop-num-passes and --inkling2-loop-share-cache need an "
+                f"inkling2_loop checkpoint, not {self.hf_config.model_type!r}"
+            )
+        checkpoint_passes = self.hf_text_config.loop_config["num_passes"]
+        if (
+            self.speculative_algorithm is not None
+            and num_passes is not None
+            and num_passes != checkpoint_passes
+        ):
+            raise ValueError(
+                "Inkling2 DSpark drafts read hidden states at fixed layer visits; "
+                f"serve them at the checkpoint's {checkpoint_passes} loop passes"
+            )
+        self.hf_config.configure_loop(num_passes=num_passes, share_cache=share_cache)
 
     def _derive_multimodal_cuda_graph_support(self, enable_multimodal: bool) -> None:
         """Declare graph capabilities before deriving shapes and validating config.
@@ -1282,10 +1312,7 @@ class ModelConfig:
                 self.sliding_window_size = (
                     self.hf_text_config.mtp_local_extent or self.sliding_window_size
                 )
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "Inkling2ForConditionalGeneration"
-        ):
+        if is_draft_model and self.hf_config.architectures[0] in INKLING2_ARCHS:
             from sglang.srt.configs.inkling2 import Inkling2MTPConfig
 
             if self.speculative_algorithm not in (None, "DSPARK"):
@@ -1440,7 +1467,7 @@ class ModelConfig:
             "EmbeddingGemma2Model",
             "InklingForConditionalGeneration",
             "InklingForConditionalGenerationMTP",
-            "Inkling2ForConditionalGeneration",
+            *INKLING2_ARCHS,
             "Gemma4UnifiedForConditionalGeneration",
             "DiffusionGemmaForBlockDiffusion",
         ]
@@ -1817,7 +1844,10 @@ class ModelConfig:
             ):
                 self.hc_hidden_size = self.hidden_size * hc_mult
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
-        self.num_attention_layers = self.num_hidden_layers
+        # Partially looped models cache one attention layer per layer visit.
+        self.num_attention_layers = getattr(
+            self.hf_text_config, "num_attention_layers", self.num_hidden_layers
+        )
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
             self.num_attention_layers = self.num_hidden_layers * 2
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
@@ -1847,7 +1877,7 @@ class ModelConfig:
             self.vocab_size = self.hf_text_config.vision_vocab_size
         self.token_id_vocab_size = self.vocab_size
         if _hf_arch(self.hf_config) in {
-            "Inkling2ForConditionalGeneration",
+            *INKLING2_ARCHS,
             "Inkling2ForConditionalGenerationMTP",
         }:
             self.vocab_size = self.hf_text_config.padded_vocab_size
@@ -2736,7 +2766,7 @@ multimodal_model_archs = [
     "KimiVLForConditionalGeneration",
     "LocateAnythingForConditionalGeneration",
     "InternVLChatModel",
-    "Inkling2ForConditionalGeneration",
+    *INKLING2_ARCHS,
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
@@ -3153,10 +3183,10 @@ def get_hybrid_layer_ids(
         # (1 = SWA, 0 = full) without needing to be added to the allowlist.
         hybrid_layer_pattern = hf_text_config.hybrid_layer_pattern
         swa_attention_layer_ids = [
-            i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
+            i for i, pattern in enumerate(hybrid_layer_pattern) if pattern == 1
         ]
         full_attention_layer_ids = [
-            i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
+            i for i, pattern in enumerate(hybrid_layer_pattern) if pattern == 0
         ]
     elif (layer_types := mixed_sliding_layer_types(hf_text_config)) is not None:
         swa_attention_layer_ids = [

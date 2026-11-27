@@ -86,7 +86,7 @@ The dependencies required for the NPU runtime environment have been integrated i
 online platform. You can directly pull it.
 
 Both **stable releases** and **daily builds** are available. CANN 9.2.0 has no stable release yet, so the command
-below uses the validated build tag `cann9.2.0-a3-B050`.
+below uses the validated build tag `cann9.2.0-a3-B051`.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
 The command requires
@@ -102,7 +102,7 @@ on the host; it selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
 NAME=sglang-glm-5-3
 
 # pull image
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
 
 # create container
 docker run -itd --shm-size=16g --name "$NAME" \
@@ -113,7 +113,7 @@ docker run -itd --shm-size=16g --name "$NAME" \
 -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
 
 # enter container
 docker exec -it "$NAME" bash
