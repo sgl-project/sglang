@@ -3,22 +3,29 @@
 import pickle
 import tempfile
 import threading
+import time
 import unittest
 from array import array
+from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from queue import Empty, Queue
 from unittest.mock import Mock, call, patch
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
+    InsertParams,
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.hicache_storage import (
@@ -38,10 +45,13 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kits.unified_radix_cache import fixtures
+from sglang.test.kits.unified_radix_cache.config import CacheConfig
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=19, suite="base-a-test-cpu")
+register_cpu_ci(est_time=39, suite="base-a-test-cpu")
 
 # The pool schema a hit query over stages holding only the KV host pool
 # reduces: the host pools some stage registers.
@@ -121,6 +131,7 @@ class TestPrefetchAckSchema(unittest.TestCase):
 class TestPPPrefetchTicket(CustomTestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
+        c._register_thread_trace_info = Mock()  # Workers run on the test thread.
         c.page_size = c.prefetch_threshold = 4
         c.storage_config = HiCacheStorageConfig(
             tp_rank=0,
@@ -355,11 +366,21 @@ class TestPPPrefetchTicket(CustomTestCase):
                 self.assertIsNone(c.get_prefetch_submission(rid))
         self.assertTrue(c.pp_prefetch_command_queue.empty())
 
-    def test_all_backends_query_and_allocate_before_one_worker_consensus(self):
+    def test_local_query_and_allocation_share_one_worker_consensus(self):
         c = self.c
         for backend in ("file", "mooncake", "dynamic"):
             with self.subTest(backend=backend):
                 c.storage_backend_type = backend
+                # An out-of-tree backend exposing the same hook still queries locally.
+                c.storage_backend = (
+                    Mock()
+                    if backend == "mooncake"
+                    else type(
+                        "OtherStorage",
+                        (),
+                        {"pp_query_namespace": Mock(), "pp_query_layout": Mock()},
+                    )()
+                )
                 c._storage_hit_query.reset_mock()
                 c._all_reduce.reset_mock()
                 c.mem_pool_host.alloc.reset_mock()
@@ -403,6 +424,8 @@ class TestPPPrefetchTicket(CustomTestCase):
                     [call(first.operation), call(second.operation)],
                 )
                 self.assertEqual(votes, [8, 8])
+                if backend != "mooncake":
+                    c.storage_backend.pp_query_layout.assert_not_called()
                 self.assertEqual(c._all_reduce.call_count, 2)
                 self.assertIs(c.prefetch_buffer.get_nowait(), first.operation)
                 self.assertIs(c.prefetch_buffer.get_nowait(), second.operation)
@@ -431,6 +454,98 @@ class TestPPPrefetchTicket(CustomTestCase):
                     else:
                         with self.assertNoLogs(logger, "WARNING"):
                             c.attach_storage_backend("dynamic")
+
+    def test_global_query_keeps_ack_count_and_uses_agreed_checkpoint(self):
+        c = self.c
+
+        class Mooncake(Mock):
+            def pp_query_namespace(self):
+                return "shared"
+
+            def pp_query_layout(self):
+                return {PoolName.KV: ("_kv",), PoolName.SWA: ("_swa",)}
+
+        store = c.storage_backend = Mooncake()
+        store.consumes_kv_hints.return_value = True
+        c._storage_hit_query = HybridCacheController._storage_hit_query.__get__(c)
+        store.batch_exists.return_value = 0
+        self.submit("warmup")
+        key = RadixKey(array("q", range(16)))
+        handle = CacheRequestHandle("sparse", 0)
+        sidecar = PoolTransfer(
+            PoolName.SWA,
+            keys=["last"],
+            host_indices=torch.arange(4),
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        hints = KvHintsEnvelope(protocol_version="0.1", message_id="query")
+        metadata = {"kv_hints": hints}
+        op = c.submit_prefetch(
+            handle, key, None, None, [], [sidecar], storage_read_metadata=metadata
+        ).operation
+        store.batch_exists_v2.return_value = PoolTransferResult(
+            4, {"kv": 4, "swa": 4}, [1, 4]
+        )
+        c.mem_pool_host.available_size.return_value = 12
+        self.run_commands()
+        (query,) = store.batch_exists_v2.call_args_list
+        self.assertEqual(query.args[2].extra_info["kv_hints"], hints)
+        self.assertEqual(
+            set(query.kwargs["pool_suffixes"]), {PoolName.KV, PoolName.SWA}
+        )
+        self.assertEqual(
+            c._all_reduce.call_count, 1
+        )  # First ticket discovers the layout.
+        self.assertEqual(op.storage_hit_count, 12)
+
+        # This stage has room for three pages, a peer for two, and only the
+        # first and fourth pages have the required checkpoint. Every stage
+        # must issue four progress ACKs, then read the checkpoint at page one.
+        c.page_get_func = Mock(return_value=1)
+        store.batch_get_v2.return_value = {"swa": [True]}
+        progress = []
+
+        def reduce(tensor, *_):
+            if tensor.numel() == 1:
+                progress.append(tensor.item())
+                tensor.clamp_(max=8)
+
+        c._all_reduce.side_effect = reduce
+        c.prefetch_sync_thread = threading.Thread(
+            target=c.prefetch_sync_thread_func, daemon=True
+        )
+        c.prefetch_sync_thread.start()
+        try:
+            with patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1):
+                c._page_transfer(op)
+            c.prefetch_sync_queue.put(PrefetchAck(handle.rid, op, completed_req=True))
+            self.assertTrue(c.pp_prefetch_states[handle.rid].ready_event.wait(3))
+        finally:
+            c.storage_stop_event.set()
+            c.prefetch_sync_queue.put(None)
+            c.prefetch_sync_thread.join(3)
+        self.assertFalse(c.prefetch_sync_thread.is_alive())
+        self.assertEqual(progress[:4], [4, 8, 12, 12])
+        self.assertEqual(c.page_get_func.call_count, 3)
+        restored = store.batch_get_v2.call_args.args[0][0]
+        self.assertEqual(restored.keys, op.all_hash_values[:1])
+        self.assertEqual(op.completed_tokens, 4)
+
+    def test_global_ticket_allocation_miss_keeps_downstream_ack_sequence(self):
+        c = self.c
+        self.submit()
+        ticket = c.pp_prefetch_states.pop("hit").ticket
+        ticket.global_hit = PoolTransferResult(2, {"kv": 2})
+        c.storage_config.pp_rank = 1
+        c.mem_pool_host.available_size.return_value = 0
+        c._storage_hit_query = HybridCacheController._storage_hit_query.__get__(c)
+        self.run_commands(ticket)
+        acks = self.run_io(1)
+        self.assertEqual([ack.completed_tokens for ack in acks], [0, 0, None])
+        c._all_reduce.assert_not_called()
+        c.storage_backend.batch_exists.assert_not_called()
+        c.storage_backend.batch_exists_v2.assert_not_called()
+        c.mem_pool_host.alloc.assert_not_called()
 
     def test_file_attachment_enables_pp_tickets(self):
         c = self.c
@@ -1185,6 +1300,294 @@ class TestPPPrefetchTicket(CustomTestCase):
         self.assertTrue(c.prefetch_buffer.empty())
         c.mem_pool_host.alloc.assert_called_once()
         task_done.assert_not_called()
+
+
+class _StageStore:
+    load_mode = "prefetch"
+    prefetch_policy = "wait_complete"
+
+    def __init__(self, rank):
+        self.pools = {}
+        self.num_completed_offloads = Mock(return_value=0)
+        self.offload = Mock(return_value=False)
+        self.reset = Mock()
+        self.close = Mock()
+        self.rank = rank
+        self.first_lookup = threading.Event()
+        self.reads = []
+        self.requests_by_first_page = {}
+        self.slow_read = None
+
+    def lookup(self, rid, transfers):
+        self.requests_by_first_page[transfers[0].keys[0]] = rid
+        if rid == "hit":
+            self.first_lookup.set()
+            return [1, 3, 5] if self.rank == 0 else [2, 3, 5]
+        if rid == "miss" and self.rank == 1:
+            return []
+        return [2]
+
+    def prefetch(self, transfers):
+        keys = transfers[0].keys
+        rid = self.requests_by_first_page[keys[0]]
+        self.reads.append((rid, len(keys)))
+        done = Future()
+        if rid == "slow":
+            done.set_running_or_notify_cancel()
+            self.slow_read = done
+        else:
+            done.set_result(rid != "failed-get" or self.rank == 0)
+        return done
+
+
+def _request(rid, first_token, size=7):
+    return Req(
+        rid=rid,
+        origin_input_text=None,
+        origin_input_ids=array("q", range(first_token, first_token + size)),
+        sampling_params=SamplingParams(max_new_tokens=1),
+    )
+
+
+def _drain_until(cache, condition=None):
+    deadline = time.monotonic() + 20
+    while True:
+        cache.check_hicache_events()
+        done = not cache.linker.pp_tickets.pending if condition is None else condition()
+        ready = torch.tensor(int(done))
+        dist.all_reduce(ready, op=dist.ReduceOp.MIN)
+        if ready.item():
+            return
+        assert time.monotonic() < deadline, "stage did not reach the expected state"
+
+
+def _check_blocked_follower_lookup(cache, store, policy):
+    """Drive PP0 while PP1's lookup, then its query/ack worker, is delayed."""
+    cache.prefetch_stop_policy = policy
+    wait = policy == "wait_complete"
+    tickets = cache.linker.pp_tickets
+    resume, submitted, published = (threading.Event() for _ in range(3))
+    lookup, reduce = store.lookup, dist.all_reduce
+
+    def blocked_lookup(rid, transfers):
+        if store.rank == 1:
+            assert resume.wait(10), "scheduler waited on follower lookup"
+        return lookup(rid, transfers)
+
+    def delay_result(tensor, *args, group=None, **kwargs):
+        result = reduce(tensor, *args, group=group, **kwargs)
+        if wait and store.rank == 1:
+            if group is tickets.query_groups[-1]:
+                assert submitted.wait(10)
+            elif group is tickets.ack_groups[-1]:
+                assert published.wait(10)
+        return result
+
+    req = _request(policy, 160 if wait else 60)
+    with (
+        patch.object(store, "lookup", blocked_lookup),
+        patch.object(dist, "all_reduce", delay_result),
+    ):
+        assert tickets.bind(req, expected=True)
+        state = tickets.pending[req.cache_request_handle]
+        try:
+            _drain_until(cache, lambda: state.capacity is not None)
+            assert state.capacity == 2 and not tickets.can_admit(
+                req.cache_request_handle
+            )
+            cache.check_hicache_events()
+            assert tickets.can_admit(req.cache_request_handle) == (not wait)
+            resume.set()
+            if wait:
+                _drain_until(cache, lambda: state.read is not None)
+                submitted.set()
+            _drain_until(cache)
+        finally:
+            resume.set()
+            submitted.set()
+            published.set()
+    hit = fixtures.match_prefix(cache, req.origin_input_ids[:-1])
+    assert hit.device_prefix_len == (2 if wait else 0)
+    assert ((policy, 2) in store.reads) == wait
+
+
+def _check_unbound_and_retracted_tickets(cache, store):
+    tickets = cache.linker.pp_tickets
+    req = _request("retry", 80)
+    rejected = req.cache_request_handle
+    if store.rank == 1:
+        tickets.skip_unbound(req.rid)
+    dist.barrier()  # The follower rejected the relay before receiving the ticket.
+    if store.rank == 0:
+        assert tickets.bind(req, expected=False)
+    empty = _request("empty", 90, size=1)
+    for retracted in (empty, req):
+        retracted.reset_for_retract()
+        retracted.advance_cache_request_handle()
+        cache.linker.prefetch(retracted)
+
+    _drain_until(cache)
+    assert tickets.can_admit(rejected)
+    assert rejected not in cache.prefetch_loaded_tokens_by_reqid
+    assert empty.cache_request_handle not in cache.prefetch_loaded_tokens_by_reqid
+    assert cache.prefetch_loaded_tokens_by_reqid[req.cache_request_handle] == 2
+
+    # Stop with a locked L1 anchor on PP0 and no matching request on PP1.
+    protected = cache.full_protected_size()
+    if store.rank == 0:
+        assert tickets.bind(_request("pending-reset", 80), expected=False)
+        assert cache.full_protected_size() > protected
+    dist.barrier()
+    cache.linker.reset()
+    assert cache.full_protected_size() == protected
+    following = _request("after-reset", 100)
+    assert cache.linker.pp_tickets.bind(following, expected=True)
+    _drain_until(cache)
+    assert cache.prefetch_loaded_tokens_by_reqid[following.cache_request_handle] == 2
+
+
+def _check_pp0_linker_lookup(cache, allocator, store):
+    tickets = cache.linker.pp_tickets
+    query = Mock(return_value=[1, 3, 5])
+    cache.prefetch_stop_policy = "wait_complete"
+    query_votes = []
+    all_reduce = dist.all_reduce
+
+    def count_query_votes(tensor, *args, **kwargs):
+        if kwargs.get("group") is tickets.query_groups[-1]:
+            query_votes.append(tuple(tensor.shape))
+        return all_reduce(tensor, *args, **kwargs)
+
+    with (
+        patch.object(tickets, "pp_lookup", query),
+        patch.object(store, "lookup", return_value=[1, 3, 5]) as local,
+        patch.object(dist, "all_reduce", count_query_votes),
+    ):
+        for n, (case, expected) in enumerate(
+            (
+                ("hit", 5),
+                ("pressure", 3),
+                ("no-slots", 0),
+                ("anchor", 5),
+                ("failure", 0),
+            )
+        ):
+            req = _request(case, 200 + 10 * n)
+            held = None
+            if case in ("pressure", "no-slots") and store.rank == 1:
+                free = 4 if case == "pressure" else 0
+                held = allocator.alloc(allocator.available_size() - free)
+            if case == "anchor" and store.rank == 1:
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(req.origin_input_ids[:2]),
+                        value=allocator.alloc(2),
+                        inserted_len=2,
+                    )
+                )
+            done = Future()
+            done.set_result(case != "failure" or store.rank == 0)
+            with patch.object(store, "prefetch", return_value=done):
+                assert tickets.bind(req, expected=True)
+                _drain_until(cache)
+            if held is not None:
+                allocator.free(held)
+            assert (
+                fixtures.match_prefix(
+                    cache, req.origin_input_ids[:-1]
+                ).device_prefix_len
+                == expected
+            )
+            assert local.call_count == (case in ("pressure", "no-slots", "anchor"))
+            assert len(query_votes) == local.call_count
+            query_votes.clear()
+            local.reset_mock()
+        assert query.call_count == (5 if store.rank == 0 else 0)
+
+
+def _run_linker_stage(rank, init_method):
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=2,
+        init_method=init_method,
+        timeout=timedelta(seconds=40),
+    )
+    with patch.object(fixtures, "get_device", return_value="cpu"):
+        cache, allocator, _ = fixtures.build_fixture(
+            CacheConfig(page_size=1, num_layers=1, kv_size=32),
+            tree_core_backend="python",
+        )
+    cache.pp_group = dist.group.WORLD
+    cache.pp_size, cache.pp_rank = 2, rank
+    store = _StageStore(rank)
+    # Third-party stores always keep their stage-local ticket protocol.
+    with patch.object(
+        store, "prepare_pp_lookup", create=True, side_effect=AssertionError
+    ):
+        cache.init_cache_linker(store)
+    tickets = cache.linker.pp_tickets
+    try:
+        # Stage 1 can reserve four slots. Although both stores offer page 5,
+        # only page 3 is both restorable and backed by local reservations.
+        held = allocator.alloc(28) if rank == 1 else None
+        hit = _request("hit", 0)
+        if rank == 1:
+            assert store.first_lookup.wait(20), "ticket did not precede request relay"
+        assert tickets.bind(hit, expected=rank == 1)
+        _drain_until(cache)
+        assert store.reads == [("hit", 3)]
+        if held is not None:
+            allocator.free(held)
+
+        # The slow GET extends that three-page L1 anchor. Following tickets can
+        # run while its writer is live, even if the leader abandons the wait.
+        cache.prefetch_stop_policy = "timeout"
+        cache.prefetch_timeout_base = cache.prefetch_timeout_per_page = 0
+        slow = _request("slow", 0)
+        rest = [
+            _request(rid, n * 10)
+            for n, rid in enumerate(("miss", "failed-get", "next"), 1)
+        ]
+        for req in (slow, *rest):
+            assert tickets.bind(req, expected=True)
+        _drain_until(cache, lambda: ("next", 2) in store.reads)
+        assert store.slow_read.running()
+        if rank == 0:
+            assert not tickets.can_admit(slow.cache_request_handle)
+            store.slow_read.set_result(True)
+        dist.barrier()
+        cache.check_hicache_events()
+        assert tickets.can_admit(slow.cache_request_handle)
+        assert cache.full_protected_size() >= 3
+        if rank == 1:
+            store.slow_read.set_result(True)
+        _drain_until(cache)
+        assert store.reads == [("hit", 3), ("slow", 2), ("failed-get", 2), ("next", 2)]
+        for req, expected in zip((slow, *rest), (3, 0, 0, 2), strict=True):
+            assert (
+                fixtures.match_prefix(
+                    cache, req.origin_input_ids[:-1]
+                ).device_prefix_len
+                == expected
+            )
+        assert cache.full_protected_size() == 0 and allocator.available_size() == 27
+        for policy in ("wait_complete", "best_effort"):
+            _check_blocked_follower_lookup(cache, store, policy)
+        _check_unbound_and_retracted_tickets(cache, store)
+        _check_pp0_linker_lookup(cache, allocator, store)
+    finally:
+        if store.slow_read is not None and not store.slow_read.done():
+            store.slow_read.set_result(False)
+        cache.linker.close()
+        dist.destroy_process_group()
+
+
+class TestLinkerPPTickets(CustomTestCase):
+    def test_prefetch_admission_across_stages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rendezvous = (Path(tmp) / "init").as_uri()
+            mp.spawn(_run_linker_stage, args=(rendezvous,), nprocs=2, join=True)
 
 
 if __name__ == "__main__":
