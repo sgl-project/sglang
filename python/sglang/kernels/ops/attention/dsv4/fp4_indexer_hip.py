@@ -187,13 +187,13 @@ def _guarded_pages(logical_width: int, page_table_bucket: int = 4) -> int:
 
 
 def rowgroup_table_columns(
-    max_context_len: int, ratio: int, page_table_bucket: int = 4
+    max_kv_len: int, ratio: int, page_table_bucket: int = 4
 ) -> int:
     """Block-table columns of every row-group launch at ``ratio``: one width for the
     server's life. AITER compiles the row-group kernel per block-table width and stride,
     and its bounded compile cache unloads an evicted variant that a captured CUDA graph
     still launches; widths that track the context would also compile on the request path."""
-    compressed_len = -(-max_context_len // ratio)
+    compressed_len = -(-max_kv_len // ratio)
     pages = -(-compressed_len // _KV_BLOCK_SIZE)
     return _guarded_pages(pages, page_table_bucket) + 4
 
