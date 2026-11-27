@@ -2125,13 +2125,10 @@ class LowRatioCompressAscendBackendMixin:
     def _dsv41_a3_kernel_metadata(
         self, forward_batch, ratio, *, batch_size, metadata=None
     ):
-        op = _dsv41_a3_ops().metadata
         if ratio and self._dsv41_int8_kv:
-            from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8_ops import (
-                int8_csa_metadata,
-            )
-
-            op = int8_csa_metadata
+            from sgl_kernel_npu.operators.attention import int8_csa_metadata as op
+        else:
+            op = _dsv41_a3_ops().metadata
         return op(
             self._dsv4_q_head_num,
             1,
@@ -2227,20 +2224,11 @@ class LowRatioCompressAscendBackendMixin:
             if compress_ratio:
                 topk = getattr(fm, f"c{compress_ratio}_topk_indices")
                 if self._dsv41_int8_kv:
-                    from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8_ops import (
-                        int8_csa_attention,
+                    from sgl_kernel_npu.operators.attention import (
+                        int8_csa_attention as attention,
                     )
 
-                    attention = int8_csa_attention
                     topk = topk[: attention_q.shape[0]].to(torch.int32).contiguous()
-                    if sinks is None:
-                        sinks = torch.full(
-                            (attention_q.shape[1],),
-                            -torch.inf,
-                            dtype=torch.float32,
-                            device=q.device,
-                        )
-                    sinks = sinks.contiguous()
                 kwargs.update(
                     cmp_kv=pool.get_compress_buffer(layer.layer_id, False),
                     cmp_sparse_indices=topk.view(-1, 1, self._dsv4_index_topk),
@@ -2921,9 +2909,13 @@ class DeepseekV4AscendAttnBackend(
         )
         self._dsv41_int8_kv = getattr(self.token_to_kv_pool, "dsv41_int8_kv", False)
         if self._dsv41_int8_kv:
-            from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8_ops import (
-                check_int8_csa_support,
-            )
+            try:
+                from sgl_kernel_npu.operators.attention import check_int8_csa_support
+            except ImportError as exc:
+                raise RuntimeError(
+                    "DeepSeek-V4.1 INT8 KV requires sgl-kernel-npu built with "
+                    "the ops_transformer_int8_csa profile."
+                ) from exc
 
             check_int8_csa_support(self.device)
         if self._dsv4_has_low_ratio:

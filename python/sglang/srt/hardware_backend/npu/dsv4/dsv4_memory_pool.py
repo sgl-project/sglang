@@ -31,7 +31,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
     NPUDSV4KVLayout,
     get_a3_c2_state_bank_count,
 )
-from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8_ops import write_int8_csa_rows
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4IndexerBufferInfo,
@@ -110,8 +109,14 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         )
 
 
-def _write_dsv41_bf16_rows(buf, loc, cache):
+def _write_dsv41_a3_rows(buf, loc, cache):
     """Fixed-shape A3 scatter; page zero is reserved for padding, never live KV."""
+    if buf.dtype == torch.int8:
+        from sgl_kernel_npu.operators.attention import int8_csa_write
+
+        int8_csa_write(buf, cache, loc, reserve_page_zero=True)
+        return
+
     rows = buf.view(-1, 1, buf.shape[-1])
     slots = loc.reshape(-1).long()
     values = cache.reshape(-1, 1, buf.shape[-1]).to(rows.dtype)
@@ -438,7 +443,7 @@ class DSV41NPUIndexerPool(NPUDeepSeekV4IndexerPool):
         if is_npu_arch35():
             return super().set_index_k_scale(layer_id, loc, index_k, index_k_scale)
         assert index_k_scale is None, "A3 V4.1 index K is unquantized BF16"
-        _write_dsv41_bf16_rows(self.index_k_buffer[layer_id], loc, index_k)
+        _write_dsv41_a3_rows(self.index_k_buffer[layer_id], loc, index_k)
 
 
 class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
@@ -926,10 +931,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         buf = pool.kv_buffer[self._swa_local_layer_id(layer_id)]
         if isinstance(pool, DSV41NPUSingleKVPool):
             if not is_npu_arch35():
-                if buf.dtype == torch.int8:
-                    write_int8_csa_rows(buf, loc, cache)
-                else:
-                    _write_dsv41_bf16_rows(buf, loc, cache)
+                _write_dsv41_a3_rows(buf, loc, cache)
                 return
             # A V4.1 window row is FP8 E4M3 group 32 (544 B), not the V4 584-byte
             # arch35 row: the ds41 attention op reads ori_kv with all head_dim values
@@ -1092,11 +1094,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         assert compress_pool is not None, "Missing compressed KV pool"
         if isinstance(compress_pool, DSV41NPUSingleKVPool) and not is_npu_arch35():
             assert kv_scale is None, "A3 V4.1 main KV has no separate scale tensor"
-            buf = compress_pool.kv_buffer[compress_layer_id]
-            if buf.dtype == torch.int8:
-                write_int8_csa_rows(buf, loc, kv)
-            else:
-                _write_dsv41_bf16_rows(buf, loc, kv)
+            _write_dsv41_a3_rows(compress_pool.kv_buffer[compress_layer_id], loc, kv)
             return
         if device_type == "npu":
             # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,

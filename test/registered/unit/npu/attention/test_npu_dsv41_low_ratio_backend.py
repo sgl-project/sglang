@@ -333,6 +333,14 @@ class TestPoolFactory(unittest.TestCase):
             [row.dtype for row in pool.kv_buffer],
             [torch.bfloat16, torch.int8, torch.int8],
         )
+        rows = torch.zeros((1, 1, 512), dtype=torch.bfloat16)
+        slots = torch.tensor([128], dtype=torch.int32)
+        kernel_attention = sys.modules["sgl_kernel_npu.operators.attention"]
+        with patch.object(kernel_attention, "int8_csa_write", create=True) as writer:
+            dsv4_memory_pool._write_dsv41_a3_rows(pool.kv_buffer[1], slots, rows)
+        writer.assert_called_once_with(
+            pool.kv_buffer[1], rows, slots, reserve_page_zero=True
+        )
 
     def test_compressed_pools_are_fp4(self):
         # A ratio-1 compressed page keeps the global page; a ratio-2 page holds
@@ -1289,8 +1297,7 @@ class TestLowRatioAttentionBody(unittest.TestCase):
             self._run(ratio=2, seq_lens=[7], topk_indices=False)
 
     def test_a3_int8_reuses_lengths_but_dispatches_native_csa(self):
-        from sglang.srt.hardware_backend.npu.dsv4 import dsv41_int8_ops
-
+        kernel_attention = sys.modules["sgl_kernel_npu.operators.attention"]
         backend = _low_ratio_backend()
         backend._dsv41_int8_kv = True
         full_length = torch.tensor([7], dtype=torch.int32)
@@ -1317,10 +1324,16 @@ class TestLowRatioAttentionBody(unittest.TestCase):
             patch.object(dsv4_backend, "is_npu_arch35", return_value=False),
             patch.object(dsv4_backend, "_dsv41_a3_ops") as bf16,
             patch.object(
-                dsv41_int8_ops, "int8_csa_metadata", return_value=metadata
+                kernel_attention,
+                "int8_csa_metadata",
+                return_value=metadata,
+                create=True,
             ) as meta,
             patch.object(
-                dsv41_int8_ops, "int8_csa_attention", return_value=(q, None)
+                kernel_attention,
+                "int8_csa_attention",
+                return_value=(q, None),
+                create=True,
             ) as attn,
         ):
             bf16.return_value.metadata.return_value = torch.zeros(
@@ -1340,7 +1353,7 @@ class TestLowRatioAttentionBody(unittest.TestCase):
         self.assertEqual(kw["cmp_residual_kv"].tolist(), [1])
         self.assertEqual(kw["seqused_cmp_kv"].tolist(), [3])
         self.assertEqual(kw["cmp_sparse_indices"].shape, (1, 1, 512))
-        self.assertTrue(torch.isneginf(kw["sinks"]).all())
+        self.assertIsNone(kw["sinks"])
 
 
 class TestCompressedRowIdentity(unittest.TestCase):
