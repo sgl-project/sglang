@@ -16,9 +16,9 @@ Usage:
     # Opt in to a compile control (presets are eager by default)
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --torch-compile
 
-    # Check Eager/BCG at every request quality on one GPU set; lossless/high
-    # + BCG are invalid when request-scoped DiT fusions mount only after the
-    # lossless graph capture.
+    # Check Eager/BCG at every request quality on one GPU set; each BCG run
+    # warms up at its own quality, because a request at a level warmup did not
+    # capture runs eager.
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model sana-video --quality-bcg-matrix --model-cache-root /task/model-caches --cleanup-model-cache
 
     # Clean an isolated model cache even if the run fails or is interrupted
@@ -89,8 +89,9 @@ BCG_INVALID_SIGNALS = (
     "[diffusion bcg] serving signature missed",
     "no graph will be captured",
     "cannot be used with breakable cuda graphs",
+    # the request's quality differs from the warmup's, so it ran eager
+    "has no captured breakable cuda graphs",
 )
-BCG_LATE_QUALITY_FUSION_SIGNAL = "quality fusion mounted after BCG capture"
 QUALITY_BCG_ABBA_MATRIX = (
     ("eager-exact-a", "exact", False),
     ("bcg-exact-a", "exact", True),
@@ -1793,6 +1794,9 @@ def build_sglang_cmd(
                 cmd.extend(warmup_resolutions)
         if "warmup-num-frames" not in parsed_args and "num-frames" in parsed_args:
             cmd.extend(["--warmup-num-frames", str(parsed_args["num-frames"])])
+        # Graphs are captured per quality level, at the warmup request's level.
+        if "warmup-sampling-params" not in parsed_args:
+            cmd.extend(["--warmup-sampling-params", json.dumps({"quality": quality})])
         if bcg_text_buckets is not None:
             cmd.append("--bcg-text-buckets")
             cmd.extend(str(bucket) for bucket in bcg_text_buckets)
@@ -1835,7 +1839,6 @@ def _run_benchmark_once_impl(
     )
 
     env = os.environ.copy()
-    env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     # Perf dumps are consumed as stage-attributed denoise measurements.  Drain
     # the device queue at stage boundaries so asynchronous denoise work cannot
     # leak into a later stage (most visibly DecodingStage).  An explicit 0 in
@@ -1895,14 +1898,6 @@ def _run_benchmark_once_impl(
                 fallback_detected = True
             if BCG_CAPTURE_SIGNAL in lower_line:
                 bcg_capture_detected = True
-            if (
-                quality in {"lossless", "high"}
-                and breakable_cuda_graph
-                and bcg_capture_detected
-                and "mounted " in lower_line
-                and f"for quality={quality}" in lower_line
-            ):
-                bcg_invalid_signals.add(BCG_LATE_QUALITY_FUSION_SIGNAL)
             bcg_invalid_signals.update(
                 signal for signal in BCG_INVALID_SIGNALS if signal in lower_line
             )
@@ -2158,8 +2153,9 @@ def run_quality_bcg_matrix(
 ) -> list[dict]:
     """Run the quality/BCG applicability matrix on one fixed GPU set.
 
-    A high+BCG cell is intentionally retained as a compatibility check. It is
-    invalid when request-scoped DiT fusions mount after graph capture.
+    Each BCG cell warms up at its own quality. The lossless/high+BCG cells
+    remain compatibility checks: a cell is invalid when capture fails, the
+    request finds no captured graph, or its output differs from eager.
     """
     cache_dir = None
     exit_reason = "error"
@@ -2300,8 +2296,9 @@ def main():
         "--breakable-cuda-graph",
         action="store_true",
         help=(
-            "Run a BCG comparator. The result is invalid unless capture is "
-            "observed and no disable/failure/signature-miss marker appears."
+            "Run a BCG comparator, warmed up at the run's --quality. The "
+            "result is invalid unless capture is observed and no "
+            "disable/failure/signature-miss/no-captured-graph marker appears."
         ),
     )
     parser.add_argument(
