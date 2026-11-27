@@ -10,7 +10,6 @@ import triton.language as tl
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import (
-    cdiv,
     cpu_has_amx_support,
     is_cpu,
     is_npu,
@@ -22,6 +21,27 @@ _use_cpu = is_cpu() and cpu_has_amx_support()
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
+
+
+def _positive_cdiv(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def _uses_eight_row_tile(
+    num_rows: int, *, use_pdl: bool, is_rms_norm: bool, activation: str
+) -> bool:
+    """Whether a PDL launch tiles eight rows per CTA; row counts are only read with PDL."""
+    if not use_pdl:
+        return False
+    if is_rms_norm and activation == "sigmoid":
+        return 8 <= num_rows <= 256
+    return num_rows == 64
+
+
+def _is_statically_noncontiguous(value: torch.Tensor) -> bool:
+    if torch.compiler.is_compiling():
+        return False
+    return not value.is_contiguous()
 
 
 @triton.jit
@@ -243,14 +263,16 @@ def layer_norm_gated_fwd(
     if D <= 512:
         use_pdl = is_arch_support_pdl()
         BT = 32
-        use_bt8 = 8 <= T <= 256 if is_rms_norm and activation == "sigmoid" else T == 64
-        if use_pdl and use_bt8 and (D, x.dtype) == (128, torch.bfloat16):
+        use_bt8 = _uses_eight_row_tile(
+            T, use_pdl=use_pdl, is_rms_norm=is_rms_norm, activation=activation
+        )
+        if use_bt8 and (D, x.dtype) == (128, torch.bfloat16):
             if current_arch().is_sm(10, 3):
                 # Small sigmoid-gated RMSNorm batches use eight rows per CTA.
                 # Other norm modes retain their T=64 selection.
                 BT = 8
         pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if use_pdl else {}
-        layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](
+        layer_norm_gated_fwd_kernel[(_positive_cdiv(T, BT),)](
             x=x,
             g=g,
             y=y,
@@ -335,7 +357,7 @@ class LayerNormGatedFunction(torch.autograd.Function):
         # pass its strides instead of copying.
         g_strided = None
         if (
-            not g.is_contiguous()
+            _is_statically_noncontiguous(g)
             and g.dim() >= 3
             and g.shape[-1] == x.shape[-1]
             and g.shape[-1] <= 512

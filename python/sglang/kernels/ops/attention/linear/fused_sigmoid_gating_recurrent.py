@@ -25,6 +25,13 @@ _is_sm103 = is_cuda() and get_device_sm() == 103
 _is_sm107 = is_cuda() and get_device_sm() == 107
 
 
+def _tree_token_tile(num_tokens: int, has_tree_mask: bool) -> int:
+    """Token tile of the EAGLE tree-mask path; unused, and so constant, without it."""
+    if not has_tree_mask:
+        return 1
+    return triton.next_power_of_2(num_tokens)
+
+
 def _select_recurrent_launch_config(
     n: int,
     h: int,
@@ -714,7 +721,7 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_retrieve_parent_token_seq = 0
         stride_retrieve_parent_token_token = 0
 
-    NP2_T = triton.next_power_of_2(T)
+    NP2_T = _tree_token_tile(T, retrieve_parent_token is not None)
 
     split_n_hv_grid = q.device.type == "cuda"
     grid = (NV, N, HV) if split_n_hv_grid else (NK, NV, N * HV)
