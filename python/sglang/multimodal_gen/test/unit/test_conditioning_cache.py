@@ -18,8 +18,8 @@ from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.runtime.cache.conditioning import (
     _DIGEST_CHUNK_BYTES,
     ConditioningCache,
-    cached_conditioning,
     cached_condition_image,
+    cached_conditioning,
     cached_encoder_call,
     cached_vae_encode,
     invalidate_conditioning_caches,
@@ -66,6 +66,7 @@ def test_decoded_reference_is_content_keyed_and_isolated(tmp_path):
 
 def test_decoded_reference_preserves_metadata_and_cache_scope(tmp_path):
     from PIL.PngImagePlugin import PngInfo
+
     from sglang.multimodal_gen.runtime.utils.vision import load_image
 
     image = Image.new("RGB", (4, 8), "blue")
