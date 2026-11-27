@@ -893,6 +893,8 @@ class Inkling2Experts(nn.Module):
                 self.w2_amax,
                 self.w2_outer_scale_denominator,
             )
+        elif not moe_lowm_sm120.can_use_lowm_mxfp8(x.shape[0]):
+            down = self._sm120_mxfp8(x_c, dst2src, gammas, offsets, 8)
         else:
             values, scales = experts_sm120.mxfp8_routed_quantize(
                 x=x_c, dst2src=dst2src, top_k=8, offsets=offsets

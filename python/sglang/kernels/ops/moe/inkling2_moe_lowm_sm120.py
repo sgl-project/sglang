@@ -75,6 +75,10 @@ def can_use_lowm_moe(tokens, experts, top_k, hidden_size, intermediate_size, dev
     )
 
 
+def can_use_lowm_mxfp8(tokens):
+    return current_arch().is_sm(12, 0) or tokens == 1
+
+
 def route_topk_meta_lowm(partials, bias, route_scale, global_scale=None):
     _, tokens, num_experts = partials.shape
     if num_experts != _NUM_EXPERTS:
