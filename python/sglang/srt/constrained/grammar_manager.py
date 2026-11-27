@@ -424,7 +424,9 @@ class GrammarManager:
 
         # On later PP stages, peers resolve their own futures after PP0 admits
         # the request. Agree on compilation outcomes across TP/CP before caching
-        # or starting prefill so a rank-local exception cannot split the batch.
+        # or starting prefill, keeping synced_ready_req_idxs intact so queue
+        # ordering matches PP0.
+        pp_non_cacheable_errors: set[int] = set()
         if self.pp_rank > 0 and sync_groups and synced_ready_req_idxs:
             pp_compile_errors: dict[int, str] = {}
             pp_cacheable_invalid: set[int] = set()
@@ -443,11 +445,9 @@ class GrammarManager:
                 )
             )
             if synced_compile_errors:
-                non_cacheable_errors = (
+                pp_non_cacheable_errors = (
                     set(synced_compile_errors) - synced_cacheable_invalid
                 )
-                synced_failed_req_idxs = synced_failed_req_idxs | non_cacheable_errors
-                synced_ready_req_idxs = synced_ready_req_idxs - synced_failed_req_idxs
 
         # Return ready requests
         return_reqs: List[Req] = []
@@ -461,7 +461,16 @@ class GrammarManager:
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
             resolved = self._resolved_futures.pop(req.grammar, None)
-            if resolved is not None:
+            should_cache = True
+            if i in pp_non_cacheable_errors:
+                local_obj = resolved[0] if resolved is not None else None
+                req.grammar = (
+                    local_obj
+                    if isinstance(local_obj, InvalidGrammarObject)
+                    else InvalidGrammarObject(synced_compile_errors[i])
+                )
+                should_cache = False
+            elif resolved is not None:
                 req.grammar = resolved[0]
             else:
                 try:
@@ -474,7 +483,9 @@ class GrammarManager:
                     req.grammar = InvalidGrammarObject(
                         f"Grammar compilation failed: {e}"
                     )
-            self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                    should_cache = False
+            if should_cache:
+                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
             self._apply_request_reasoning_config(req)
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"

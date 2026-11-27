@@ -196,7 +196,8 @@ def _worker(rank, rendezvous):
             assert not manager._resolved_futures
 
             # Later PP stages receive PP0's admitted indices and still resolve
-            # local futures; verify TP/CP outcome agreement before caching/prefill.
+            # local futures; verify TP/CP outcome agreement while preserving
+            # PP0's exact admission order [0, 1, 2] (even when index 1 fails).
             pp_group = SimpleNamespace(recv_object=lambda src, tag: ({0, 1, 2}, set()))
             pp1_mgr = _manager(
                 own_tp, own_cp, cp_size, pp_rank=1, pp_size=2, pp_group=pp_group
@@ -214,8 +215,8 @@ def _worker(rank, rendezvous):
             pp1_out = pp1_mgr.get_ready_grammar_requests()
             assert [r.rid for r in pp1_out] == [
                 pp1_reqs[0].rid,
-                pp1_reqs[2].rid,
                 pp1_reqs[1].rid,
+                pp1_reqs[2].rid,
             ]
             assert not pp1_reqs[0].finished()
             assert pp1_reqs[0].grammar_key in pp1_mgr.grammar_backend.cache
@@ -314,6 +315,23 @@ class TestGrammarCpSync(unittest.TestCase):
         self.assertIsInstance(req.grammar, InvalidGrammarObject)
         self.assertIn(req.grammar_key, mgr.grammar_backend.cache)
         self.assertEqual(len(mgr._resolved_futures), 0)
+
+    def test_single_rank_compile_exception_does_not_cache(self):
+        """With TP=1 and CP=1, a compiler exception must not poison the cache."""
+        tp = SimpleNamespace(
+            cpu_group=object(), world_size=1, first_rank=0, is_first_rank=True
+        )
+        mgr = _manager(tp, None, 1, dp_enabled=False)
+
+        req = _Request("r_exc")
+        req.grammar.set_exception(RuntimeError("transient compiler error"))
+        mgr.grammar_queue = [req]
+
+        self.assertEqual(mgr.get_ready_grammar_requests(), [req])
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.grammar, InvalidGrammarObject)
+        self.assertIn("transient compiler error", req.abort_reason)
+        self.assertNotIn(req.grammar_key, mgr.grammar_backend.cache)
 
     def test_real_gloo_admission_timeout_and_dpa_isolation(self):
         with tempfile.TemporaryDirectory(prefix="grammar-cp-sync-") as folder:
