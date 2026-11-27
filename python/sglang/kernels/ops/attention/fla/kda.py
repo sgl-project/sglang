@@ -45,6 +45,15 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 RCP_LN2 = 1.4426950216293335
 
 
+def _compiled_chunk_index_capacity(
+    num_tokens: int, cu_seqlens: torch.Tensor, chunk_size: int
+) -> int | None:
+    if not torch.compiler.is_compiling():
+        return None
+    chunks_for_tokens = (num_tokens + chunk_size - 1) // chunk_size
+    return chunks_for_tokens + cu_seqlens.shape[0] - 1
+
+
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
     return -(a // -b)
@@ -658,7 +667,11 @@ def recompute_w_u_fwd(
     BT = A.shape[-1]
 
     if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        chunk_indices = prepare_chunk_indices(
+            cu_seqlens,
+            BT,
+            _compiled_chunk_index_capacity(T, cu_seqlens, BT),
+        )
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     w = torch.empty_like(k)
@@ -809,7 +822,11 @@ def chunk_gla_fwd_o_gk(
     BT = chunk_size
 
     if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        chunk_indices = prepare_chunk_indices(
+            cu_seqlens,
+            BT,
+            _compiled_chunk_index_capacity(T, cu_seqlens, BT),
+        )
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     def grid(meta):
@@ -1000,7 +1017,11 @@ def kda_gate_chunk_cumsum(
     B, T, H, S = g.shape
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        chunk_indices = prepare_chunk_indices(
+            cu_seqlens,
+            BT,
+            _compiled_chunk_index_capacity(T, cu_seqlens, BT),
+        )
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
         "chunk_size must be a power of 2"
@@ -1071,7 +1092,11 @@ def chunk_kda_fwd(
     # CUDA-graph caller passes padded chunk_indices / chunk_offsets it rebuilds
     # before every replay (kda_prefill_graph.py).
     if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+        chunk_indices = prepare_chunk_indices(
+            cu_seqlens,
+            chunk_size,
+            _compiled_chunk_index_capacity(q.shape[1], cu_seqlens, chunk_size),
+        )
 
     if A_log is not None:
         # Fused: gate activation + chunk-local cumsum in one kernel.

@@ -5,7 +5,10 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.kernels.ops.attention.fla.kda import _compiled_chunk_index_capacity
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    CAUSAL_CONV1D_FWD_BLOCK_M,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
@@ -71,6 +74,74 @@ def _validate_flashinfer_kda_prefill(
         raise ValueError(
             "FlashInfer KDA prefill requires eager linear attention; use disabled or breakable prefill CUDA graphs"
         )
+
+
+def _trim_kda_token_padding(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    logical_num_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    physical_num_tokens = mixed_qkv.shape[0]
+    compiling = torch.compiler.is_compiling()
+    if compiling:
+        torch._check_is_size(logical_num_tokens)
+        torch._check(logical_num_tokens <= physical_num_tokens)
+    elif logical_num_tokens >= physical_num_tokens:
+        return mixed_qkv, a, b
+    return (
+        mixed_qkv[:logical_num_tokens],
+        a[:, :logical_num_tokens],
+        b[:, :logical_num_tokens],
+    )
+
+
+def _compiled_conv_block_table(
+    query_start_loc: torch.Tensor, num_tokens: int
+) -> Optional[torch.Tensor]:
+    if not torch.compiler.is_compiling():
+        return None
+    return prepare_chunk_indices(
+        query_start_loc,
+        CAUSAL_CONV1D_FWD_BLOCK_M,
+        _compiled_chunk_index_capacity(
+            num_tokens, query_start_loc, CAUSAL_CONV1D_FWD_BLOCK_M
+        ),
+    )
+
+
+def _mask_kda_padding_rows(
+    core_attn_out: torch.Tensor, query_start_loc: torch.Tensor
+) -> torch.Tensor:
+    token_ids = torch.arange(
+        core_attn_out.shape[1],
+        dtype=query_start_loc.dtype,
+        device=core_attn_out.device,
+    )
+    valid = (token_ids < query_start_loc[-1]).view(
+        1, -1, *([1] * (core_attn_out.dim() - 2))
+    )
+    return torch.where(valid, core_attn_out, 0)
+
+
+def _restore_kda_token_padding(
+    core_attn_out: torch.Tensor,
+    logical_num_tokens: int,
+    physical_num_tokens: int,
+) -> torch.Tensor:
+    compiling = torch.compiler.is_compiling()
+    if compiling:
+        torch._check_is_size(logical_num_tokens)
+        torch._check(logical_num_tokens <= physical_num_tokens)
+    elif logical_num_tokens >= physical_num_tokens:
+        return core_attn_out
+    padding_num_tokens = physical_num_tokens - logical_num_tokens
+    if compiling:
+        torch._check_is_size(padding_num_tokens)
+    pad = core_attn_out.new_zeros(
+        (1, padding_num_tokens) + tuple(core_attn_out.shape[2:])
+    )
+    return torch.cat((core_attn_out, pad), dim=1)
 
 
 def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
@@ -1058,8 +1129,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         mixed_qkv: torch.Tensor,
         conv_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        block_table: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return Q/K/V, using contiguous planes for equal-width FlashInfer prefill."""
+        graph_kwargs = {} if block_table is None else {"block_table": block_table}
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width matches the decode path and saves two kernel launches.
         split_size = (
@@ -1079,6 +1152,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             query_start_loc=self.forward_metadata.query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             output_split_size=split_size,
+            **graph_kwargs,
         )
         if split_size:
             return conv_output.unbind(0)
@@ -1106,19 +1180,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 logical_num_tokens = (
                     self.forward_metadata.query_start_loc.shape[0] - 1
                 ) * forward_batch.spec_info.draft_token_num
-                mixed_qkv = mixed_qkv[:logical_num_tokens]
-                a = a[:, :logical_num_tokens]
-                b = b[:, :logical_num_tokens]
+            mixed_qkv, a, b = _trim_kda_token_padding(
+                mixed_qkv, a, b, logical_num_tokens
+            )
             core_attn_out = self._forward_target_verify(
                 layer, forward_batch, mixed_qkv, a, b
             )
-            if logical_num_tokens < physical_num_tokens:
-                pad = core_attn_out.new_zeros(
-                    (1, physical_num_tokens - logical_num_tokens)
-                    + tuple(core_attn_out.shape[2:])
-                )
-                core_attn_out = torch.cat((core_attn_out, pad), dim=1)
-            return core_attn_out
+            return _restore_kda_token_padding(
+                core_attn_out, logical_num_tokens, physical_num_tokens
+            )
 
         if self.prefill_graph_metadata is not None:
             # Breakable prefill CUDA graph bucket: host-free chain on static
@@ -1155,13 +1225,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
 
         physical_num_tokens = mixed_qkv.shape[0]
-        logical_num_tokens = self.forward_metadata.logical_num_tokens
-        if logical_num_tokens is None:
-            logical_num_tokens = int(query_start_loc[-1])
-        if logical_num_tokens < physical_num_tokens:
-            mixed_qkv = mixed_qkv[:logical_num_tokens]
-            a = a[:, :logical_num_tokens]
-            b = b[:, :logical_num_tokens]
+        compiling = torch.compiler.is_compiling()
+        if compiling:
+            # Graph inputs carry no host token count: run on every row and mask
+            # the rows after query_start_loc[-1] at the end.
+            logical_num_tokens = physical_num_tokens
+        else:
+            logical_num_tokens = self.forward_metadata.logical_num_tokens
+            if logical_num_tokens is None:
+                logical_num_tokens = int(query_start_loc[-1])
+        mixed_qkv, a, b = _trim_kda_token_padding(mixed_qkv, a, b, logical_num_tokens)
 
         if self.forward_metadata.has_mamba_track_mask:
             # Snapshot the conv sliding window at the last track-aligned chunk
@@ -1174,7 +1247,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
         q, k, v = self._convolve_prefill(
-            layer, forward_batch, mixed_qkv, conv_states, cache_indices
+            layer,
+            forward_batch,
+            mixed_qkv,
+            conv_states,
+            cache_indices,
+            _compiled_conv_block_table(query_start_loc, physical_num_tokens),
         )
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -1263,12 +1341,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 h_track_buf=h_track_buf,
             )
 
-        if logical_num_tokens < physical_num_tokens:
-            pad = core_attn_out.new_zeros(
-                (1, physical_num_tokens - logical_num_tokens)
-                + tuple(core_attn_out.shape[2:])
+        if compiling:
+            core_attn_out = _mask_kda_padding_rows(core_attn_out, query_start_loc)
+        else:
+            core_attn_out = _restore_kda_token_padding(
+                core_attn_out, logical_num_tokens, physical_num_tokens
             )
-            core_attn_out = torch.cat((core_attn_out, pad), dim=1)
 
         if (
             self.accept_lens_pool is not None

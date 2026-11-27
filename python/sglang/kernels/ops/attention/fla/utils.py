@@ -119,6 +119,8 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         nonlocal cache_entries, cache_size
+        if torch.compiler.is_compiling():
+            return fn(*args, **kwargs)
         for i, entry in enumerate(cache_entries):
             last_args, last_kwargs, last_result = entry
             if len(args) == len(last_args) and len(kwargs) == len(last_kwargs):
