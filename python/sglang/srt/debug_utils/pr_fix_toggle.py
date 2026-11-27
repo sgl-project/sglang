@@ -67,9 +67,11 @@ patches:
   - target: sglang.srt.layers.attention.flashinfer_backend.FlashInferMultiStepDraftBackend.init_cuda_graph_state
     edits:
       - match: |
-          (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
+          kv_indices_width = draft_kv_indices_buffer_width(
+              max_bs, self.topk, self.max_kv_len
+          )
         replacement: |
-          (self.speculative_num_steps, max_bs * self.max_context_len),
+          kv_indices_width = max_bs * self.max_kv_len
 """
 
 
@@ -99,9 +101,11 @@ patches:
   - target: sglang.srt.layers.attention.flashinfer_mla_backend.FlashInferMLAMultiStepDraftBackend.init_cuda_graph_state
     edits:
       - match: |
-          (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
+          kv_indices_width = draft_kv_indices_buffer_width(
+              max_bs, self.topk, self.max_kv_len
+          )
         replacement: |
-          (self.speculative_num_steps, max_bs * self.max_context_len),
+          kv_indices_width = max_bs * self.max_kv_len
 """
 
 
