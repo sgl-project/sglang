@@ -204,7 +204,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.nccl_port = nccl_port
         self.target_worker = target_worker
 
         # Args for easy access
@@ -642,6 +641,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 or isinstance(self.draft_extend_attn_backend, DeepseekSparseAttnBackend)
                 or isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
             )
+
+            # The vectorized_5d KV layout shuffles the cache as
+            # (block, page, head, dim). A captured draft-extend graph bakes in
+            # the capture-time gather length; on replay with a longer prompt the
+            # attention reads the live KV offsets, desyncing the page/token
+            # mapping and mixing token positions. Fall back to eager draft
+            # extend (which re-reads live offsets each call) for this opt-in
+            # layout; every other layout keeps the graph.
+            if supports_hip_draft_extend_graph and (
+                getattr(
+                    self.draft_extend_attn_backend, "kv_cache_is_vectorized_5d", False
+                )
+                or any(
+                    getattr(b, "kv_cache_is_vectorized_5d", False)
+                    for b in getattr(self.draft_attn_backend, "attn_backends", [])
+                )
+            ):
+                supports_hip_draft_extend_graph = False
 
         graph_supported_backend_types = [
             TritonAttnBackend,
@@ -1627,12 +1644,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
-        # Some dummy tensors
-        self.num_new_pages_per_topk = torch.empty(
-            (), dtype=torch.int64, device=self.device
-        )
-        self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
-
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     @property
@@ -2016,7 +2027,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             elif batch.seq_lens_cpu is not None:
                 seq_lens_sum = int(batch.seq_lens_cpu.sum())
             else:
-                seq_lens_sum = bs * attn_backend.max_context_len
+                seq_lens_sum = (
+                    bs * self._target_worker.model_runner.req_to_token_pool.row_width
+                )
             custom_mask = torch.ones(seq_lens_sum + bs, dtype=torch.bool, device=device)
 
         positions = batch.seq_lens.to(torch.int64)
@@ -2303,7 +2316,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             topk=self.topk,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
-            metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
             uno_target_max_top_k=max_top_k,

@@ -87,7 +87,7 @@ def test_matches_unfused_across_thread_transitions(quant: bool):
 
 
 @pytest.mark.parametrize("block_m", [64, 128])
-@pytest.mark.parametrize("m", [1, 37, 64, 65, 180, 257])
+@pytest.mark.parametrize("m", [1, 37, 64, 65, 180, 257, 1152])
 def test_moe_input_matches_mega_moe_pre_dispatch(m: int, block_m: int):
     from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
         mhc_post_combine_norm_decode,

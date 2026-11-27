@@ -239,6 +239,7 @@ class RayDataParallelController(DataParallelController):
                         server_args, actual_dp_rank, worker_ports
                     )
                     rank_port_args.nccl_port = port_args.nccl_port
+                    rank_port_args.instance_id = port_args.instance_id
                     rank_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
                     rank_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
