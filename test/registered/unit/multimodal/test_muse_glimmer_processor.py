@@ -745,4 +745,4 @@ def test_model_get_video_feature_and_mixed_embed_scatter():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    raise SystemExit(pytest.main([__file__, "-v"]))

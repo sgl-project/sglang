@@ -28,9 +28,7 @@ from sglang.srt.models.muse_glimmer import MuseGlimmerForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import (
-    MultimodalSpecialTokens,
-)
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
@@ -113,17 +111,11 @@ def _sample_and_decode_video_sync(
     video_processor: Any,
     sampling_config: Dict[str, Any],
 ) -> Tuple[torch.Tensor, VideoMetadata]:
-    """Decode/normalize a single video into a (T, C, H, W) tensor and VideoMetadata."""
     do_sample_frames = bool(
-        sampling_config.get(
-            "do_sample_frames",
-            getattr(video_processor, "do_sample_frames", True),
-        )
+        sampling_config.get("do_sample_frames", video_processor.do_sample_frames)
     )
-    target_fps = sampling_config.get("fps", getattr(video_processor, "fps", 2.0))
-    target_num_frames = sampling_config.get(
-        "num_frames", getattr(video_processor, "num_frames", 96)
-    )
+    target_fps = sampling_config.get("fps", video_processor.fps)
+    target_num_frames = sampling_config.get("num_frames", video_processor.num_frames)
     max_frames = sampling_config.get("max_frames")
     if max_frames is not None:
         target_num_frames = (
@@ -133,7 +125,7 @@ def _sample_and_decode_video_sync(
         )
     temporal_patch_size = sampling_config.get(
         "temporal_patch_size",
-        getattr(video_processor, "temporal_patch_size", 2),
+        video_processor.temporal_patch_size,
     )
 
     if isinstance(video, VideoDecoderWrapper):
@@ -163,11 +155,7 @@ def _sample_and_decode_video_sync(
         else:
             indices = list(range(total_frames))
 
-        if hasattr(video, "get_frames_as_tensor"):
-            raw_frames = video.get_frames_as_tensor(indices)
-        else:
-            raw_frames = video.get_frames_at(indices)
-
+        raw_frames = video.get_frames_as_tensor(indices)
         if isinstance(raw_frames, np.ndarray):
             frames = torch.from_numpy(raw_frames)
         elif isinstance(raw_frames, torch.Tensor):
@@ -266,17 +254,16 @@ class MuseGlimmerMultimodalProcessor(SGLangBaseProcessor):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         self.image_token_id = _processor.image_token_id
-        self.image_start_token_id = getattr(_processor, "image_start_token_id", None)
-        self.image_end_token_id = getattr(_processor, "image_end_token_id", None)
-        self.video_token_id = getattr(_processor, "video_token_id", None)
+        self.image_start_token_id = _processor.image_start_token_id
+        self.image_end_token_id = _processor.image_end_token_id
+        self.video_token_id = _processor.video_token_id
         if self.video_token_id is None:
-            self.video_token_id = getattr(hf_config, "video_token_id", None)
+            self.video_token_id = hf_config.video_token_id
 
-        video_token = getattr(_processor, "video_token", "<|video|>")
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=_processor.image_token,
             image_token_id=self.image_token_id,
-            video_token=video_token,
+            video_token=_processor.video_token,
             video_token_id=self.video_token_id,
         ).build(_processor)
 
@@ -328,7 +315,7 @@ class MuseGlimmerMultimodalProcessor(SGLangBaseProcessor):
     ):
         video_data = kwargs.get("video_data")
         if video_data is None and request_obj is not None:
-            video_data = getattr(request_obj, "video_data", None)
+            video_data = request_obj.video_data
 
         video_overrides = _extract_video_sampling_overrides(video_data)
 
@@ -347,7 +334,7 @@ class MuseGlimmerMultimodalProcessor(SGLangBaseProcessor):
         ]
 
         if raw_video_positions:
-            video_processor = getattr(self._processor, "video_processor", None)
+            video_processor = self._processor.video_processor
             if video_processor is None:
                 raise RuntimeError(
                     "MuseGlimmer processor is missing `video_processor`; cannot "
