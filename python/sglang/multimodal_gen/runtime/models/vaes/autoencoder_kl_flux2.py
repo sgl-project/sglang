@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     ParallelTiledVAE,
     can_install_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.models.vaes.parallel.diffusers_spatial import (
     enable_diffusers_decoder_spatial_parallel,
 )
@@ -130,7 +131,7 @@ class AutoencoderKLFlux2(AutoencoderKLMixin, ParallelTiledVAE):
 
     @cached_vae_encode
     def encode(
-        self, x: torch.Tensor, return_dict: bool = True
+        self, x: torch.Tensor, return_dict: bool = True, *, use_fast_path: bool = False
     ) -> Union[DiagonalGaussianDistribution]:
         """
         Encode a batch of images into latents.
@@ -149,11 +150,12 @@ class AutoencoderKLFlux2(AutoencoderKLMixin, ParallelTiledVAE):
             assert x.shape[2] == 1
             x = x.squeeze(2)
 
-        if self.use_slicing and x.shape[0] > 1:
-            encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
-            h = torch.cat(encoded_slices)
-        else:
-            h = self._encode(x)
+        with use_vae_fast_path(self.encoder, use_fast_path):
+            if self.use_slicing and x.shape[0] > 1:
+                encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
+                h = torch.cat(encoded_slices)
+            else:
+                h = self._encode(x)
 
         posterior = DiagonalGaussianDistribution(h)
         return posterior

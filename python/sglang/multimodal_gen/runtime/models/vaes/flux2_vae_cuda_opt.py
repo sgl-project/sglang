@@ -94,7 +94,7 @@ class FusedGroupNormSiLU(nn.Module):
         )
 
 
-def _install_norm_silu(decoder, resnet_cls, gate: VaeFastPathGate) -> int:
+def _install_norm_silu(module, resnet_cls, gate: VaeFastPathGate) -> int:
     def _fusable(norm) -> bool:
         return (
             type(norm) is nn.GroupNorm
@@ -104,7 +104,7 @@ def _install_norm_silu(decoder, resnet_cls, gate: VaeFastPathGate) -> int:
         )
 
     count = 0
-    for m in decoder.modules():
+    for m in module.modules():
         if (
             type(m) is resnet_cls
             and m.time_emb_proj is None
@@ -122,12 +122,12 @@ def _install_norm_silu(decoder, resnet_cls, gate: VaeFastPathGate) -> int:
             m.nonlinearity = nn.Identity()
             count += 2
     if (
-        type(getattr(decoder, "conv_norm_out", None)) is nn.GroupNorm
-        and isinstance(getattr(decoder, "conv_act", None), nn.SiLU)
-        and _fusable(decoder.conv_norm_out)
+        type(getattr(module, "conv_norm_out", None)) is nn.GroupNorm
+        and isinstance(getattr(module, "conv_act", None), nn.SiLU)
+        and _fusable(module.conv_norm_out)
     ):
-        decoder.conv_norm_out = FusedGroupNormSiLU(decoder.conv_norm_out, gate)
-        decoder.conv_act = nn.Identity()
+        module.conv_norm_out = FusedGroupNormSiLU(module.conv_norm_out, gate)
+        module.conv_act = nn.Identity()
         count += 1
     return count
 
@@ -392,8 +392,9 @@ def _install_decoder_fast_paths(vae: nn.Module, label: str) -> nn.Module:
 
 
 def maybe_optimize_flux2_vae(vae: nn.Module) -> nn.Module:
-    """Install the quality-gated CUDA FLUX.2 VAE decoder fast paths."""
-    from diffusers.models.autoencoders.vae import Decoder
+    """Install the CUDA FLUX.2 VAE encoder and decoder fast paths."""
+    from diffusers.models.autoencoders.vae import Decoder, Encoder
+    from diffusers.models.resnet import ResnetBlock2D
 
     from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_flux2 import (
         AutoencoderKLFlux2,
@@ -401,6 +402,11 @@ def maybe_optimize_flux2_vae(vae: nn.Module) -> nn.Module:
 
     if not isinstance(vae, AutoencoderKLFlux2) or type(vae.decoder) is not Decoder:
         return vae
+    if _HAS_TRITON and type(vae.encoder) is Encoder:
+        gate = VaeFastPathGate()
+        if _install_norm_silu(vae.encoder, ResnetBlock2D, gate):
+            register_vae_fast_path_gate(vae.encoder, gate)
+            vae.supports_fast_encode = True
     return _install_decoder_fast_paths(vae, "FLUX.2 VAE")
 
 
