@@ -179,6 +179,8 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 
 @_register_for("KimiK31ForConditionalGeneration")
 def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
+    if get_platform().is_npu:
+        return {"decode_state_free_radix_default": True}
     cfg = resolving_view(server_args)
     overrides = {}
     if cfg.dcp_size > 1:

@@ -762,6 +762,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         use_fp4_indexer: bool = False,
         modelslim_cache_layout=None,
         kv_capability: Optional[PackedQuantKvCapability] = None,
+        shard_index_k: bool = False,
     ):
         if use_fp4_indexer:
             raise ValueError("FP4 indexer KV cache is not supported on NPU.")
@@ -900,10 +901,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
+        self.shard_index_k = shard_index_k
         self.use_combined_kv_buffer = use_combined_kv_buffer
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
-        index_page_padding = global_page_padding if index_head_dim is not None else 1
+        index_page_padding = (
+            global_page_padding
+            if index_head_dim is not None and not shard_index_k
+            else 1
+        )
         if kv_page_padding < 1 or index_page_padding < 1:
             raise ValueError("NPU MLA page padding must be positive")
         self.kv_page_padding = kv_page_padding
@@ -1021,7 +1027,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
-                # index_size, not self.size: the indexer is replicated.
                 self.index_k_buffer = torch.zeros(
                     (
                         self.num_indexer_layers,
@@ -1326,15 +1331,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 for buffer, layer_id in zip(self.v_buffer, kv_layer_ids, strict=True)
             ]
         if self.index_head_dim is not None:
+            index_is_global = not self.shard_index_k
             entries += [
-                (buffer, True, layer_id)
+                (buffer, index_is_global, layer_id)
                 for buffer, layer_id in zip(
                     self.index_k_buffer, self.indexer_layer_ids, strict=True
                 )
             ]
             if self.index_k_scale_buffer is not None:
                 entries += [
-                    (buffer, True, layer_id)
+                    (buffer, index_is_global, layer_id)
                     for buffer, layer_id in zip(
                         self.index_k_scale_buffer, self.indexer_layer_ids, strict=True
                     )
@@ -1465,6 +1471,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 cache_v.view(-1, 1, self.qk_rope_head_dim),
             )
 
+    def set_mla_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc_info,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
+    ):
+        if layer_id_override is not None:
+            return super().set_mla_kv_buffer(
+                layer, loc_info, cache_k_nope, cache_k_rope, layer_id_override
+            )
+        self._check_physical_write_loc(loc_info, "set_mla_kv_buffer (NPU MLA)")
+        self.set_kv_buffer(layer, loc_info, cache_k_nope, cache_k_rope)
+
     def _set_fia_nz_kv_buffer(
         self,
         layer_id: int,
@@ -1501,14 +1522,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
-        # The indexer writes at the raw, untranslated loc.
         maybe_detect_oob(
             loc,
-            0,
-            # Virtual pages start at 1 and span attn_dcp_size index pages, so the
-            # top is index_size plus one virtual page (index_page_padding pages).
+            -1 if self.shard_index_k else 0,
             self.index_size + self.index_page_size * self.index_page_padding,
-            "set_index_k_buffer (NPU MLA, raw virtual loc)",
+            "set_index_k_buffer (NPU MLA)",
         )
 
         if self.indexer_kv_store_int8:
@@ -1647,6 +1665,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _get_index_cache_cpu_copy(self, indices):
         index_indices = torch.unique_consecutive(indices // self.index_kpool)
+        index_indices = self._copy_indices_for_buffer(
+            index_indices, not self.shard_index_k
+        )
         chunk_size = self.cpu_offloading_chunk_size
         index_cpu = []
         for local_layer_id in range(self.layer_num):  # each layer
@@ -1663,6 +1684,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _load_index_cache_cpu_copy(self, index_cpu, indices):
         index_indices = torch.unique_consecutive(indices // self.index_kpool)
+        index_indices = self._copy_indices_for_buffer(
+            index_indices, not self.shard_index_k
+        )
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):  # each layer
             buffers = self._get_index_cache_layer_buffers(local_layer_id)
@@ -1746,6 +1770,9 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
         kv_scale_ue8m0: bool = False,
         fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
+        is_draft_worker: bool = False,
+        modelslim_cache_layout=None,
+        shard_index_k: bool = False,
     ):
         # Accepted for signature compatibility with the in-tree DSATokenToKVPool
         # contract; the NPU indexer kernels manage fp8 latent + fp32 per-tile
@@ -1770,6 +1797,9 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
             indexer_layer_ids = [
                 i for i, skip in enumerate(skip_topk_layers) if not skip
             ]
+        index_size = size
+        if not (is_draft_worker or shard_index_k):
+            index_size *= get_parallel().attn_dcp_size
         super().__init__(
             size=size,
             page_size=page_size,
@@ -1780,7 +1810,10 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
             index_head_dim=index_head_dim,
-            index_page_size=page_size // index_kpool,
+            index_size=index_size,
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=kv_cache_dim,
+            is_draft_worker=is_draft_worker,
+            modelslim_cache_layout=modelslim_cache_layout,
+            shard_index_k=shard_index_k,
         )

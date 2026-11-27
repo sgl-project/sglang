@@ -290,6 +290,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.model_executor.pool_configurator import (
         MemoryPoolConfig,
+        MemoryPoolConfigurator,
     )
 
 
@@ -447,6 +448,7 @@ class KVCacheConfigurator:
     draft_owns_its_depth: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
     modelslim_cache_layout: Optional[Any] = field(init=False, default=None)
+    _npu_k31_shard_index_k: bool = field(init=False, default=False)
     _unified_plan: Any = field(init=False, default=None)
     _unified_sized: Any = field(init=False, default=None)
 
@@ -503,6 +505,12 @@ class KVCacheConfigurator:
                 self.model,
                 use_mla_backend=self.use_mla_backend,
             )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.pool_configurator import (
+                resolve_kimi_k31_index_k_sharding,
+            )
+
+            self._npu_k31_shard_index_k = resolve_kimi_k31_index_k_sharding(self)
 
     def hybrid_swa_token_capacity(
         self,
@@ -3067,7 +3075,11 @@ class KVCacheConfigurator:
                     NPUDSATokenToKVPool,
                 )
 
-                return NPUDSATokenToKVPool
+                return partial(
+                    NPUDSATokenToKVPool,
+                    is_draft_worker=self.is_draft_worker,
+                    shard_index_k=self._npu_k31_shard_index_k,
+                )
             return dsa_pool_class
         if _is_npu:
             self._reject_registered_kv_cache_dtype(pool="the NPU KV pool")
@@ -3543,14 +3555,24 @@ class KVCacheConfigurator:
             )
         return max_num_reqs
 
-    def _resolve_memory_pool_config(
-        self, pre_model_load_memory: int
-    ) -> MemoryPoolConfig:
-        """Profile GPU memory and resolve all pool parameters into a config."""
+    def _create_memory_pool_configurator(self) -> MemoryPoolConfigurator:
+        if self._npu_k31_shard_index_k:
+            from sglang.srt.hardware_backend.npu.pool_configurator import (
+                NPUKimiK31PoolConfigurator,
+            )
+
+            return NPUKimiK31PoolConfigurator(self)
+
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
 
+        return create_memory_pool_configurator(self)
+
+    def _resolve_memory_pool_config(
+        self, pre_model_load_memory: int
+    ) -> MemoryPoolConfig:
+        """Profile GPU memory and resolve all pool parameters into a config."""
         # Foundry LOAD reuses the pool config SAVE resolved;
         # the free-memory profile the pool sizes come from differs between the two.
         replayed = get_foundry_adapter().replay_saved_memory_pool_config()
@@ -3565,7 +3587,7 @@ class KVCacheConfigurator:
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
-        configurator = create_memory_pool_configurator(self)
+        configurator = self._create_memory_pool_configurator()
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
         # Foundry SAVE records the resolved config for LOAD.
@@ -3580,12 +3602,7 @@ class KVCacheConfigurator:
         optional ``cap_tokens`` clamp."""
         if get_memory().enable_unified_memory and not self.is_draft_worker:
             return self._unified_config_from_budget(budget_bytes, cap_tokens=cap_tokens)
-        # Local import avoids a pool_configurator import cycle.
-        from sglang.srt.model_executor.pool_configurator import (
-            create_memory_pool_configurator,
-        )
-
-        configurator = create_memory_pool_configurator(self)
+        configurator = self._create_memory_pool_configurator()
         config = configurator.calculate_pool_sizes(
             budget_bytes, get_schedule().page_size
         )

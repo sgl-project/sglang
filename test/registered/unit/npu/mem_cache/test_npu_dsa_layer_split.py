@@ -57,6 +57,7 @@ def _make_pool(
     pool.dtype = torch.float32
     pool.use_combined_kv_buffer = False
     pool.use_fia_nz = False
+    pool.shard_index_k = False
 
     owned_start, owned_end = get_layer_shard_range(shard_rank, shard_size, layer_num)
     num_owned = owned_end - owned_start

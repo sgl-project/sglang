@@ -47,7 +47,10 @@ try:
     from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
         forward_dcp_sparse_attention,
     )
-    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+        NPUDSATokenToKVPool,
+        NPUMLATokenToKVPool,
+    )
     from sglang.srt.layers.dcp.comm import cp_lse_ag_out_rs_mla_npu
     from sglang.srt.layers.dcp.layout import (
         filter_dcp_local_chunk_kv_indices,
@@ -322,6 +325,34 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
             torch.equal(call["actual_seq_lengths_kv"], metadata.dcp_spec_seq_lens)
         )
 
+    def test_padded_query_heads_are_removed_from_output_and_lse(self):
+        q = torch.ones(2, 96, 4, dtype=torch.bfloat16)
+        _, _, k, k_rope, topk = self._inputs()
+
+        def fake_sparse_attention(**kwargs):
+            self.assertEqual(kwargs["query"].shape, (2, 128, 4))
+            self.assertEqual(kwargs["query_rope"].shape, (2, 128, 4))
+            stats = torch.arange(256, dtype=torch.float32).view(1, 2, 128)
+            return kwargs["query"], stats, torch.ones_like(stats)
+
+        with patch.object(_dsa_dcp, "sparse_flash_attention", fake_sparse_attention):
+            out, lse = forward_dcp_sparse_attention(
+                q_nope=q,
+                q_rope=q,
+                k_nope=k,
+                k_rope=k_rope,
+                topk_indices=topk,
+                actual_seq_lengths_query=torch.tensor([1, 2]),
+                forward_metadata=self._metadata(),
+                forward_batch=SimpleNamespace(forward_mode=_Mode(False)),
+                speculative_num_draft_tokens=None,
+                scaling=1.0,
+            )
+        torch.testing.assert_close(out, q)
+        torch.testing.assert_close(
+            lse, torch.arange(256, dtype=torch.float32).view(2, 128)[:, :96]
+        )
+
     def test_missing_rank_local_metadata_fails_loudly(self):
         q, rope, _, _, topk = self._inputs()
         bad = SimpleNamespace(dcp_block_tables=None, dcp_seq_lens=None)
@@ -435,6 +466,37 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
 
 
 class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
+    def test_hybrid_dsa_index_k_capacity(self):
+        with patch(
+            "sglang.srt.hardware_backend.npu.memory_pool_npu.get_parallel",
+            return_value=SimpleNamespace(attn_dcp_size=2, attn_dcp_rank=0),
+        ):
+            for is_draft_worker, shard_index_k, size in (
+                (False, False, 256),
+                (True, False, 512),
+                (False, True, 256),
+            ):
+                pool = NPUDSATokenToKVPool(
+                    size=size,
+                    page_size=128,
+                    kv_lora_rank=512,
+                    dtype=torch.bfloat16,
+                    qk_rope_head_dim=64,
+                    layer_num=2,
+                    device="cpu",
+                    index_head_dim=128,
+                    enable_memory_saver=False,
+                    skip_topk_layers=[False, True],
+                    is_draft_worker=is_draft_worker,
+                    shard_index_k=shard_index_k,
+                )
+                self.assertEqual(pool.size, size)
+                self.assertEqual(pool.index_size, 256 if shard_index_k else 512)
+                self.assertEqual(
+                    pool.index_k_buffer.shape,
+                    (1, 3 if shard_index_k else 6, 128, 1, 128),
+                )
+
     def test_retraction_indices_map_target_kv_to_rank_local_slots(self):
         pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2)
         indices = torch.tensor([0, 1, 4, 5, 6, 7, 12, 13], dtype=torch.int64)
@@ -462,6 +524,7 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
     def test_pd_buffer_infos_expand_only_global_page_strides(self):
         pool = object.__new__(NPUMLATokenToKVPool)
         pool.use_combined_kv_buffer = False
+        pool.shard_index_k = False
         pool.k_buffer = [torch.empty(4, 8, 1, 2)]
         pool.v_buffer = [torch.empty(4, 8, 1, 1)]
         pool.dcp_size = 4
@@ -472,9 +535,9 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
         pool.index_page_size = 8
         pool.index_k_buffer = [torch.empty(4, 8, 1, 2)]
         pool.index_k_scale_buffer = [torch.empty(4, 8, 1)]
-        pool.start_layer = 0
+        pool.start_layer = 7
         pool.layer_num = 1
-        pool.indexer_layer_ids = (0,)
+        pool.indexer_layer_ids = (7,)
 
         ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
         buffers = (
@@ -494,6 +557,15 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
                 pool.index_k_buffer[0][0].nbytes * pool.dcp_size,
                 pool.index_k_scale_buffer[0][0].nbytes * pool.dcp_size,
             ],
+        )
+        self.assertEqual(
+            pool.get_dcp_remote_decode_layout(), [False, False, True, True]
+        )
+        pool.shard_index_k = True
+        self.assertEqual(pool.get_dcp_remote_decode_layout(), [False] * 4)
+        self.assertEqual(pool.get_kv_layer_ids(), [7] * 4)
+        self.assertEqual(
+            pool.get_contiguous_buf_infos()[2], [buffer[0].nbytes for buffer in buffers]
         )
 
     def test_lse_merge_world_size_one_is_identity(self):

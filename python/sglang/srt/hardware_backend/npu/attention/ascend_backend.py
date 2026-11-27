@@ -3852,6 +3852,13 @@ class AscendAttnBackend(AttentionBackend):
                     value_quant_mode=0,
                 )
             else:
+                mask_kwargs = dict(sparse_mode=3)
+                if layer.sliding_window_size != -1:
+                    mask_kwargs.update(
+                        sparse_mode=4,
+                        pre_tokens=layer.sliding_window_size,
+                        next_tokens=0,
+                    )
                 workspace = (
                     torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                         q_nope,
@@ -3867,10 +3874,10 @@ class AscendAttnBackend(AttentionBackend):
                         antiquant_scale=None,
                         block_table=block_table,
                         block_size=self.page_size,
-                        sparse_mode=3,
                         atten_mask=self.mtp_mask,
                         actual_seq_lengths=actual_seq_lengths,
                         actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        **mask_kwargs,
                     )
                 )
                 attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
@@ -3889,12 +3896,12 @@ class AscendAttnBackend(AttentionBackend):
                     antiquant_scale=None,
                     block_table=block_table,
                     block_size=self.page_size,
-                    sparse_mode=3,
                     atten_mask=self.mtp_mask,
                     actual_seq_lengths=actual_seq_lengths,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     workspace=workspace,
                     out=[attn_output, softmax_lse],
+                    **mask_kwargs,
                 )
             attn_output = attn_output[:, : layer.tp_q_head_num, :]
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)

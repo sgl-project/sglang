@@ -230,6 +230,50 @@ def test_empty_batch_does_not_call_cann(backend):
     backend.flash_mla.assert_not_called()
 
 
+@pytest.mark.parametrize("window", [-1, 1023])
+def test_mla_verify_uses_same_window_for_workspace_and_fia(backend, window):
+    backend.use_flash_mla = backend.use_fias_v2_bsnd = False
+    backend.forward_metadata = mod.ForwardMetadata(
+        block_tables=torch.zeros((1, 9), dtype=torch.int32),
+        seq_lens_cpu_list=[1050],
+    )
+    backend.mtp_mask = torch.ones((16, 16), dtype=torch.bool).triu(1)
+    q = torch.zeros(8, 2, 512)
+    rope = torch.zeros(8, 2, 64)
+    backend.token_to_kv_pool.get_kv_buffer = Mock(
+        return_value=(torch.zeros(9, 128, 1, 512), torch.zeros(9, 128, 1, 64))
+    )
+    batch = make_batch(ForwardMode.TARGET_VERIFY, [1042])
+    batch.global_num_token_non_padded_cpu = 8
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=2,
+        tp_k_head_num=1,
+        tp_v_head_num=1,
+        v_head_dim=512,
+        sliding_window_size=window,
+        scaling=0.1,
+    )
+    plan, execute = Mock(), Mock()
+    with (
+        patch.object(mod, "is_fia_nz", return_value=False),
+        patch.object(
+            mod,
+            "torch_npu",
+            create=True,
+            new=SimpleNamespace(
+                _npu_fused_infer_attention_score_get_max_workspace=plan,
+                npu_fused_infer_attention_score=SimpleNamespace(out=execute),
+            ),
+        ),
+    ):
+        backend.forward_mtp(q, None, None, layer, batch, False, q_rope=rope)
+    for call in (plan.call_args, execute.call_args):
+        assert call.kwargs["sparse_mode"] == (3 if window == -1 else 4)
+        assert call.kwargs.get("pre_tokens") == (None if window == -1 else window)
+        assert call.kwargs.get("next_tokens") == (None if window == -1 else 0)
+
+
 @pytest.mark.parametrize("graph,use_fia", [(False, False), (False, True), (True, True)])
 def test_non_speculative_decode_keeps_default_operators(backend, graph, use_fia):
     backend.use_flash_mla = False
@@ -595,6 +639,32 @@ def test_disabled_combined_kv_buffer_keeps_separate_allocations(pool_factory, fi
     assert key.untyped_storage().data_ptr() != rope.untyped_storage().data_ptr()
     assert len(pool.get_contiguous_buf_infos()[0]) == 4
     assert pool.get_kv_layer_ids() == [0, 1, 0, 1]
+
+
+def test_mla_prefix_write_uses_split_npu_cache(pool_factory):
+    pool = pool_factory(use_combined_kv_buffer=False, is_draft_worker=True)
+    layer = SimpleNamespace(layer_id=0)
+    locs = torch.tensor([[127, 128], [129, 130]])
+    key = torch.arange(1, 5, dtype=torch.bfloat16).view(4, 1, 1).expand(4, 1, 512)
+    rope = (key[..., :64] + 4).contiguous()
+
+    def scatter(destination, indices, updates):
+        destination.index_copy_(0, indices.flatten(), updates)
+
+    with patch.object(
+        pool_mod,
+        "torch_npu",
+        SimpleNamespace(npu_scatter_nd_update_=scatter),
+        create=True,
+    ):
+        pool.set_mla_kv_buffer_prefix_valid(
+            layer, locs, torch.tensor([1, 2]), key, rope
+        )
+
+    key_cache, rope_cache = pool.get_kv_buffer(0)
+    rows = locs.flatten()
+    assert key_cache.view(-1, 512)[rows, 0].tolist() == [1, 0, 3, 4]
+    assert rope_cache.view(-1, 64)[rows, 0].tolist() == [5, 0, 7, 8]
 
 
 @pytest.mark.parametrize(
