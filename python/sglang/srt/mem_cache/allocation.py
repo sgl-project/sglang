@@ -866,14 +866,14 @@ def alloc_for_spec_decode(
     # Nothing clamps the write below to the row: an allocation past it lands in
     # the next request's row.
     nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
-    req_to_token_row_width = req_to_token_pool.req_to_token.shape[1]
+    req_to_token_row_width = req_to_token_pool.row_width
     max_nxt_kv_len = max(nxt_kv_lens_list, default=0)
     if max_nxt_kv_len > req_to_token_row_width:
         raise RuntimeError(
             f"Speculative decode allocation ({max_nxt_kv_len}) exceeds the "
-            f"req_to_token row width ({req_to_token_row_width}); the row headroom "
-            "(get_req_to_token_headroom) must cover the decode reserve "
-            "(get_spec_decode_reserve) and its page rounding."
+            f"req_to_token row width ({req_to_token_row_width}); the row width "
+            "(get_req_to_token_row_width) must cover the decode-ahead "
+            "(get_decode_ahead) and its page rounding."
         )
 
     if num_needed_tokens > 0:

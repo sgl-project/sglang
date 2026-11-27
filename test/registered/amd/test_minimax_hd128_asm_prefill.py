@@ -83,7 +83,7 @@ class TestMiniMaxHD128AsmPrefill(unittest.TestCase):
             qo_indptr=cu_q,
             kv_last_page_len=None,
             max_q_len=max(q_lens),
-            max_kv_len=max(k_lens),
+            batch_max_kv_len=max(k_lens),
         )
         batch = SimpleNamespace(
             batch_size=len(q_lens),

@@ -97,23 +97,23 @@ def cap_glm_split_index_k_dcp_context_length(server_args: Any) -> None:
         max_speculative_num_draft_tokens,
     )
     from sglang.srt.configs.model_config import glm_dsa_shards_index_k
-    from sglang.srt.mem_cache.allocation_sizing import req_to_token_headroom
+    from sglang.srt.mem_cache.allocation_sizing import decode_ahead
 
     cfg = resolving_view(server_args)
     model_config = model_config_of(server_args)
     if not glm_dsa_shards_index_k(model_config.hf_config, cfg.dcp_size):
         return
     alloc_page_size = cfg.page_size * cfg.dcp_size
-    headroom = req_to_token_headroom(
+    max_decode_ahead = decode_ahead(
         speculative_algorithm=cfg.speculative_algorithm,
         num_steps=cfg.speculative_num_steps,
         eagle_topk=cfg.speculative_eagle_topk,
         num_draft_tokens=max_speculative_num_draft_tokens(server_args),
         page_size=alloc_page_size,
-    )
+    ) + (alloc_page_size - 1)
     # The merge takes rows of at most 2^20 scores; a row spans the request
     # table rounded up to whole allocator pages.
-    max_context_len = (1 << 20) // alloc_page_size * alloc_page_size - headroom
+    max_context_len = (1 << 20) // alloc_page_size * alloc_page_size - max_decode_ahead
     if cfg.context_length is None:
         if model_config.context_len > max_context_len:
             declare_resolution(

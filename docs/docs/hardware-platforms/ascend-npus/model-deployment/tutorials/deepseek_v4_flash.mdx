@@ -106,7 +106,7 @@ on the host; each selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
 NAME=sglang-deepseek-v4-flash
 
 # pull image
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
 
 # create container
 docker run -itd --shm-size=16g --name "$NAME" \
@@ -117,7 +117,7 @@ docker run -itd --shm-size=16g --name "$NAME" \
 -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
 
 # enter container
 docker exec -it "$NAME" bash
@@ -135,7 +135,7 @@ docker exec -it "$NAME" bash
 NAME=sglang-deepseek-v4-flash
 
 # pull image
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B050
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B051
 
 # create container
 docker run -itd --shm-size=16g --name "$NAME" \
@@ -146,7 +146,7 @@ docker run -itd --shm-size=16g --name "$NAME" \
 -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B050
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B051
 
 # enter container
 docker exec -it "$NAME" bash

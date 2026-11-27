@@ -547,7 +547,7 @@ If the `--attention-backend` argument is not specified, SGLang automatically sel
 **1. MHA Models (e.g., Llama, Qwen)**
 - **Hopper (e.g., H100, H200)**: Defaults to `fa3` if using CUDA 12.3+ and the model configuration is supported.
 - **Blackwell (e.g., B200)**: Defaults to `trtllm_mha`, unless using speculative decoding with `topk > 1`.
-- **Other Architectures (Ampere, Ada, etc.)**: Defaults to `flashinfer` if available; otherwise falls back to `triton`.
+- **Other Architectures (Ampere, Ada, etc.)**: Defaults to `flashinfer` if available and its FA2 prefill supports the model's head dims (multiples of 64); otherwise falls back to `triton`.
 
 **2. MLA Models (e.g., DeepSeek V3)**
 - **Hopper**: Defaults to `fa3` (requires CUDA 12.3+).
