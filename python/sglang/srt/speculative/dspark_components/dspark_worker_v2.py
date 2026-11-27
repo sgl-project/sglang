@@ -31,6 +31,7 @@ from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_utils import _get_or_create_chain_verify_buffers
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
@@ -113,7 +114,10 @@ from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.log_utils import log_info_on_rank0
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.model_runner import (
+        ModelRunner,
+        SamplingPrewarmResult,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -677,6 +681,20 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def _draft_context(self):
         return draft_tp_context(self.draft_parallel_layout)
+
+    def prewarm_sampling(self) -> "SamplingPrewarmResult":
+        if self._sampling_accept_graph is not None:
+            # Size the chain verify buffers the region captures once, for the
+            # largest decode batch.
+            _get_or_create_chain_verify_buffers(
+                bs=max(
+                    self._verify_epilogue.max_bs,
+                    self.model_runner.max_running_requests or 0,
+                ),
+                draft_token_num=self.verify_num_draft_tokens,
+                device=self._verify_epilogue.correct_len_buf.device,
+            )
+        return super().prewarm_sampling()
 
     def alloc_memory_pool(
         self,
@@ -1309,7 +1327,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     bs, simulate_bonus_sampling_info.temperatures[:bs]
                 )
             region_accept = self._sampling_accept_graph.run(
-                bs=bs, target_logits=target_logits
+                bs=bs,
+                target_logits=target_logits,
+                target_hidden=logits_output.hidden_states,
             )
         # The accept and its commits ran in a graph: the verify graph's fold or the
         # sampling-accept region replayed right after it.
