@@ -374,6 +374,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_backend = "fa2"
 
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.req_to_token_pool.row_width
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.runner_ids = model_runner.runner_ids
         self._swa_kv_pool = resolve_window_kv_pool(model_runner)
@@ -1250,7 +1251,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
-                (max_num_tokens * self.req_to_token_pool.row_width,),
+                (max_num_tokens * self.max_kv_len,),
                 dtype=torch.int32,
                 device="cuda",
             )
@@ -1284,7 +1285,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.req_to_token_pool.row_width),
+                (max_num_tokens * self.max_kv_len),
                 dtype=torch.uint8,
                 device="cuda",
             )
@@ -1409,7 +1410,7 @@ class FlashInferAttnBackend(AttentionBackend):
         captured bucket. The request-slot count is fixed at capture (the
         runner pads real batches up to it with zero-length sentinel
         requests); kv indices cover up to num_slots sequences of
-        req_to_token_row_width.
+        max_kv_len.
         """
         device = self.workspace_buffer.device
         self.full_cg_prefill_req_slots = num_slots
@@ -1444,7 +1445,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # indices; size the fixed buffer for the worst case.
         self.full_cg_prefill_kv_indices = [
             torch.zeros(
-                (num_slots * self.req_to_token_pool.row_width + 256,),
+                (num_slots * self.max_kv_len + 256,),
                 dtype=torch.int32,
                 device=device,
             )
@@ -2730,7 +2731,7 @@ class FlashInferMultiStepDraftBackend:
             )
 
         # Cached variables for generate_draft_decode_kv_indices
-        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.attn_backends[0].max_kv_len
         self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
             model_runner
         )
@@ -2770,7 +2771,7 @@ class FlashInferMultiStepDraftBackend:
         # Blocks from the length sum (upper bound on the longest live row),
         # capped by the draft window, not from the table width.
         num_token_blocks = spec_kv_index_token_blocks(
-            table_width=self.req_to_token_pool.row_width,
+            table_width=self.max_kv_len,
             kv_lens_sum=seq_lens_sum,
             batch_size=num_seqs,
             base_programs=self.speculative_num_steps * num_seqs * self.topk,
@@ -2895,7 +2896,7 @@ class FlashInferMultiStepDraftBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
-            forward_batch.batch_size, self.topk, self.req_to_token_pool.row_width
+            forward_batch.batch_size, self.topk, self.max_kv_len
         )
         kv_indices = torch.empty(
             (self.speculative_num_steps, kv_indices_width),
@@ -2941,9 +2942,9 @@ class FlashInferMultiStepDraftBackend:
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         # generate_draft_decode_kv_indices packs topk per-branch sequences per row,
         # so the row needs the topk factor -- same as the eager init_forward_metadata
-        # (batch_size * topk * req_to_token_row_width). Dropping it overflows the buffer.
+        # (batch_size * topk * max_kv_len). Dropping it overflows the buffer.
         kv_indices_width = draft_kv_indices_buffer_width(
-            max_bs, self.topk, self.req_to_token_pool.row_width
+            max_bs, self.topk, self.max_kv_len
         )
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),
