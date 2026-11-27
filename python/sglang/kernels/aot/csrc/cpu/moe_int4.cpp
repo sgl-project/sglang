@@ -51,22 +51,6 @@ void fused_experts_int4_w4a8_kernel_impl(
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
   int num_threads = at::get_num_threads();
-  // int64_t buffer_size_nbytes = M * topk * N * 2
-  //                              M * topk * K * 2 +
-  //                              num_threads * BLOCK_M * K +
-  //                              num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float)  +
-  //                              M * topk * 2 * N * 2 +
-  //                              max(M * K, M * topk * N)  +
-  //                              M * topk * sizeof(float);
-
-  // intermediate_cache1 (scalar_t):     START + M * topk * N
-  // intermediate_cache2 (scalar_t):     + M * topk * K
-  // A_tmp (uint8_t):                    + num_threads * BLOCK_M * K
-  // C_tmp (float):                      + num_threads * 2 * BLOCK_M * BLOCK_N
-  // intermediate_cache0 (scalar_t):     + M * topk * 2 * N
-  // Aq_tmp (uint8_t):                   + max(M * K, M * topk * N)
-  // As_tmp (float):                     + M * topk
-  // dqB_tmp (int8_t)                    + num_threads * _block_k * BlOCK_N
 
   // stage 0: quantize input to uint8, [M, K]
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {

@@ -913,6 +913,12 @@ at::Tensor fused_experts_cpu(
   //   7. intermediate_cache0 : [M * topk, 2N]
   //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
   //
+  // for int4 w4a8:
+  //   5. intermediate_cache0 : [M * topk, 2N]
+  //   6. Aq_tmp : [M, K] or [M * topk, N]
+  //   7. As_tmp : [M * topk]
+  //   8. dqB_tmp : [T, cache_size_per_thread]
+  //
   int64_t buffer_size_nbytes =
       M * topk * N * 2 + M * topk * K * 2 +
       num_threads * BLOCK_M * K *
