@@ -344,6 +344,13 @@ def handle_linear_attn_backend(server_args: Any):
             "(FlashKDA stays on prefill)."
         )
 
+    # FlyDSL also shares the choice list but has only a GDN prefill kernel.
+    if decode == "flydsl" or cfg.linear_attn_verify_backend == "flydsl":
+        raise ValueError(
+            "FlyDSL supports linear-attention prefill only. Use "
+            "--linear-attn-prefill-backend flydsl and keep decode/verify on triton."
+        )
+
     if (
         decode == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
