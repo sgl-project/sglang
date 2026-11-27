@@ -20,8 +20,8 @@ SGLang supports the following Ascend inference hardware:
 
 <Note>
 Throughout these docs, **A3 Series** and **950PR/DT Series** are used as shorthand for the hardware above.
-Docker image tags use `a3` for the A3 Series. For example, `cann9.1.0-a3-B105`.
-Tags for the 950PR/DT Series use `950`. For example, `cann9.1.0-950-B105`.
+Docker image tags use `a3` for the A3 Series. For example, `cann9.2.0-a3-B051`.
+Tags for the 950PR/DT Series use `950`. For example, `cann9.2.0-950-B051`.
 
 On the A3 Series, each card has 2 dies, giving 16 devices per node.
 Benchmark pages use "Cards" to refer to physical cards, so `Cards: 4` on the A3 Series means `--tp-size 8`.
@@ -35,6 +35,9 @@ The terms "NPU" and "davinci" are used interchangeably in commands and error log
 
 On the A3 Series, devices are numbered `/dev/davinci0` through `/dev/davinci15` (16 devices).
 On the 950PR/DT Series, each card exposes a single device, numbered `/dev/davinci0` through `/dev/davinci7` (8 devices).
+
+When a container is started with [Ascend Docker Runtime](/docs/hardware-platforms/ascend-npus/getting-started/installation#install-ascend-docker-runtime),
+`ASCEND_VISIBLE_DEVICES` uses these device numbers directly (for example `0-15` on a full A3 Series node).
 
 On an A3 Series server, run `npu-smi info` to view NPU information such as device
 health, memory usage, and chip status. If the command is not found or reports no devices,

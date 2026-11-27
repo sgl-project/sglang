@@ -41,16 +41,14 @@ class TestKimiK3ExpertPlacement(CustomTestCase):
             (text.num_layers, text.num_logical_experts, text.num_groups), (93, 896, 1)
         )
 
-    def test_rejects_unimplemented_weight_relocation(self):
+    def test_rejects_redundant_experts(self):
         config = KimiLinearConfig()
-        for online, redundant in [(True, 0), (False, 8)]:
+        for online in [False, True]:
             with (
-                self.subTest(online=online, redundant=redundant),
-                get_exec().moe.override(
-                    enable_eplb=online, ep_num_redundant_experts=redundant
-                ),
+                self.subTest(online=online),
+                get_exec().moe.override(enable_eplb=online, ep_num_redundant_experts=8),
             ):
-                with self.assertRaisesRegex(ValueError, "without online EPLB"):
+                with self.assertRaisesRegex(ValueError, "redundant experts"):
                     KimiK3MoE(config)
 
 

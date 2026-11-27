@@ -410,6 +410,7 @@ class MMDoubleStreamBlock(nn.Module):
         )
         self.attn = USPAttention(
             num_heads=self.local_heads_num,
+            global_num_heads=self.heads_num,
             head_size=self.head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
@@ -553,7 +554,6 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     """
 
-    _supports_gradient_checkpointing = True
     _fsdp_shard_conditions = [is_blocks_or_double_blocks]
     _compile_conditions = [is_blocks_or_double_blocks]
     param_names_mapping = JoyImageDiTConfig().param_names_mapping

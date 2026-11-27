@@ -16,6 +16,7 @@ import json
 import logging
 import operator
 import os
+import secrets
 import signal
 import threading
 import time
@@ -222,6 +223,13 @@ class RustServer:
         self.startup_time: Optional[Dict[str, Any]] = None
         # Set by `launch`: the launch state a crash dump carries.
         self.server_args: Optional[ServerArgs] = None
+        # Set by `launch`: the cores `_partition_cores` kept free for the
+        # scheduler thread and the ones it gave the server threads (None when
+        # the server runs unpinned), from this listener's `(index, count)`
+        # share of its CPU mask.
+        self.launch_cores: Optional[List[int]] = None
+        self.server_cores: Optional[List[int]] = None
+        self.frontend_cpu_share: Tuple[int, int] = (0, 1)
         # Once per process: the exception path and a watchdog may both try.
         self._crash_dump_lock = threading.Lock()
         self._crash_dump_performed = False
@@ -382,7 +390,11 @@ class RustServer:
 
     @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
-        """Collective: every rank calls once; returns listener endpoints by DP rank."""
+        """Collective: every rank calls once; returns listener endpoints by DP rank.
+
+        Each listener's entry carries a ``peer_token`` its rank draws here: the
+        listener serves relayed control requests only with it, and only the
+        ranks of this launch learn it, through this gather."""
         if get_exec().moe.is_ep_joiner:
             # An elastic-EP joiner stays out: the serving ranks gathered at
             # their own startup and never enter this collective again, so a
@@ -417,6 +429,7 @@ class RustServer:
                     get_parallel().dp_rank,
                 ),
                 "endpoint": address.to_url(),
+                "peer_token": secrets.token_urlsafe(32),
             }
             if bind_host == "0.0.0.0" and address.is_ipv6:
                 config["address_error"] = (
@@ -475,7 +488,7 @@ class RustServer:
         listen_port = get_serving().port + port_offset
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
-        _, server_cores = cls._partition_cores(
+        launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
                 (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
                 if scheduler.model_config.is_multimodal
@@ -525,6 +538,9 @@ class RustServer:
         instance = cls(server, http_port=listen_port)
         instance._mm_cache_namespace = mm_cache_namespace
         instance.server_args = scheduler.server_args
+        instance.launch_cores = launch_cores
+        instance.server_cores = server_cores
+        instance.frontend_cpu_share = frontend_cpu_share
         instance._broadcasts_shutdown = get_parallel().tp_rank == 0
 
         if scheduler.model_config.is_multimodal:

@@ -319,6 +319,8 @@ pub struct ServerConfig {
     pub termination_grace_secs: Option<u64>,
     /// `Authorization` for the router's own requests to workers, from `--worker-api-key`.
     pub worker_auth: Option<HeaderValue>,
+    /// `Authorization` required by Worker management mutation endpoints.
+    pub worker_management_auth: Option<HeaderValue>,
 }
 
 impl ServerConfig {
@@ -350,6 +352,7 @@ impl Default for ServerConfig {
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
             worker_auth: None,
+            worker_management_auth: None,
         }
     }
 }
@@ -558,6 +561,8 @@ pub struct CacheAwareConfig {
     /// Max requests one pending stake may attract before later requests fall
     /// through to the confirmed tree and the load policy; 0 = unlimited.
     pub pending_prefix_max_followers: u64,
+    /// `--cache-media-affinity-ttl-ms`; 0 disables media affinity.
+    pub media_affinity_ttl_ms: u64,
     /// Confirmed-first mode when set: consult and stake pending prefixes only
     /// where a stake is strictly deeper than the confirmed match and while that
     /// match covers less than this share of the prompt. `None` keeps the
@@ -575,6 +580,7 @@ impl Default for CacheAwareConfig {
             bootstrap_seed_required: false,
             pending_prefix_ttl_ms: 0,
             pending_prefix_max_followers: 0,
+            media_affinity_ttl_ms: 0,
             pending_prefix_consult_below: None,
         }
     }

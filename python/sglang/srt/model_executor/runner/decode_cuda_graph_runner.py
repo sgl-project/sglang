@@ -59,6 +59,7 @@ from sglang.srt.layers.attention.graph_variants import (
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_capacity_for,
     require_attn_tp_gather,
     require_mlp_tp_gather,
     set_dp_buffer_len,
@@ -98,12 +99,13 @@ from sglang.srt.model_executor.runner.early_verify_metadata import (
     VerifyInputSources,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    flashinfer_tactics_cache_for_persistence,
     maybe_flashinfer_autotune_speculative_draft,
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
-    BreakableCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
+    BaseBreakableGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.capture_profile import (
     CaptureProfileOptions,
@@ -134,6 +136,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import UOCRDecod
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
 from sglang.srt.utils import empty_context, get_available_gpu_memory
 from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -352,7 +355,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
-        self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
         # True if the DSA or MLA prefill-CP flavor is active. These flavors
@@ -1210,6 +1212,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         global_num_tokens_cpu = self._global_num_tokens_for_graph(num_tokens)
+        # Captured at the buffer ceiling; replay fills only the live num_dp_ranks.
+        if self.require_mlp_tp_gather:
+            global_num_tokens_cpu = [num_tokens] * dp_capacity_for(self.num_dp_ranks)
 
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
@@ -1308,7 +1313,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
-        with self.model_context():
+        # Foundry: SAVE archives the graphs this loop captures, LOAD restores them.
+        with (
+            self.model_context(),
+            get_foundry_adapter().capture_scope(
+                phase="decode",
+                model=self.model_runner.model,
+                # Read only when active: a test may drive capture() on a stand-in.
+                kind=self._foundry_graph_kind()
+                if get_foundry_adapter().enabled
+                else None,
+                flashinfer_tactics=flashinfer_tactics_cache_for_persistence(
+                    self.model_runner
+                ),
+            ),
+        ):
             self._capture()
 
     def _capture_profile_options(self) -> CaptureProfileOptions:
@@ -1320,6 +1339,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             per_shape=per_shape,
             get_trace_tag=lambda: getattr(self, "_profile_trace_tag", None),
         )
+
+    def _foundry_graph_kind(self) -> str:
+        # Names this runner's graph set in Foundry's archive, EAGLE subclasses included:
+        # target_decode, target_verify, draft_decode, draft_extend, draft_verify.
+        role = "draft" if self.model_runner.is_draft_worker else "target"
+        mode = self.capture_forward_mode
+        if mode.is_target_verify():
+            return f"{role}_verify"
+        if mode.is_draft_extend_v2():
+            return f"{role}_extend"
+        return f"{role}_{mode.name.lower()}"
 
     def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
@@ -1446,7 +1476,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if get_exec().graph.debug_cuda_graph:
-            assert isinstance(self.backend, BreakableCudaGraphBackend), (
+            assert isinstance(self.backend, BaseBreakableGraphBackend), (
                 "Breakable CUDA graph is required for --debug-cuda-graph"
             )
 
@@ -1582,13 +1612,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         buf = self.buffers.num_token_non_padded
         if buf is not None and _dp_tp_moe_masks_pad_rows():
             buf.fill_(raw_num_token)
-
-    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
-        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
-            raise RuntimeError(
-                "The runtime hidden-state mode exceeds the fixed CUDA graph "
-                f"capture mode ({self.capture_hidden_mode.name})."
-            )
 
     def load_batch(
         self,
