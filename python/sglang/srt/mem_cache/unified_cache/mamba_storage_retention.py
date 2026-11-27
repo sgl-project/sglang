@@ -91,30 +91,63 @@ class MambaStateRemover:
     ):
         self.stats = stats
         self.retry_delay_s = retry_delay_s
-        self._tasks: queue.Queue[tuple[HiCacheStorage, list[str]]] = queue.Queue()
+        self._tasks: queue.Queue[tuple[HiCacheStorage, list[str]] | None] = (
+            queue.Queue()
+        )
         self._thread: threading.Thread | None = None
         self._unsupported_logged = False
+        self._stop = threading.Event()
+        self._lifecycle_lock = threading.Lock()
 
     def submit(self, storage: HiCacheStorage, keys: list[str]) -> None:
-        if self._thread is None:
-            self._thread = threading.Thread(
-                target=self._run, name="mamba-state-remover", daemon=True
-            )
-            self._thread.start()
-        self._tasks.put((storage, keys))
+        with self._lifecycle_lock:
+            # Late acks drained during detach must not restart deletion.
+            if self._stop.is_set():
+                return
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="mamba-state-remover", daemon=True
+                )
+                self._thread.start()
+            self._tasks.put((storage, keys))
+
+    def close(self) -> None:
+        """Cancel queued/retry work and wait for an active removal before teardown."""
+        with self._lifecycle_lock:
+            self._stop.set()
+            thread = self._thread
+            self._tasks.put(None)
+        if thread is not None:
+            thread.join(timeout=5)
+            if thread.is_alive():
+                raise RuntimeError("Mamba state remover did not stop; retry teardown")
+        # Release backend references held by work the worker never consumed.
+        while True:
+            try:
+                self._tasks.get_nowait()
+            except queue.Empty:
+                break
 
     def _run(self) -> None:
         deferred: deque[tuple[float, HiCacheStorage, list[str]]] = deque()
-        while True:
+        while not self._stop.is_set():
             while deferred and deferred[0][0] <= time.monotonic():
+                if self._stop.is_set():
+                    return
                 _, storage, keys = deferred.popleft()
                 self._remove(storage, keys, None)
+                del storage, keys
             timeout = max(0.0, deferred[0][0] - time.monotonic()) if deferred else None
             try:
-                storage, keys = self._tasks.get(timeout=timeout)
+                task = self._tasks.get(timeout=timeout)
             except queue.Empty:
                 continue
+            if task is None or self._stop.is_set():
+                return
+            storage, keys = task
+            del task
             self._remove(storage, keys, deferred)
+            del storage, keys
 
     def _remove(self, storage, keys, deferred) -> None:
         try:

@@ -712,6 +712,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def release_host_resources(self) -> None:
         if self.mamba_storage_retention is not None:
+            self.mamba_storage_retention.remover.close()
             logger.info(
                 "Mamba storage retention stats: %s",
                 dict(self.mamba_storage_retention.stats),
@@ -4245,6 +4246,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, lock_params = entry
                 self.dec_host_lock_ref(node_id, lock_params)
             superseded = self._superseded_mamba_by_backup.pop(operation.id, None)
+        # These beliefs control backup admission, so every rank must invalidate
+        # the same snapshot, even when its local Mamba write failed. Actual
+        # deletion below still requires this rank's newer state to persist.
+        if superseded and not short:
+            self.storage_existence_cache.pool(PoolName.MAMBA).invalidate_beyond(
+                superseded, 0
+            )
         result = getattr(operation, "pool_storage_result", None)
         if (
             superseded
@@ -4252,10 +4260,6 @@ class UnifiedRadixCache(BasePrefixCache):
             and result is not None
             and result.extra_pool_hit_pages.get(PoolName.MAMBA, 0) > 0
         ):
-            # Buffer mode would otherwise skip re-writing a removed state.
-            self.storage_existence_cache.pool(PoolName.MAMBA).invalidate_beyond(
-                superseded, 0
-            )
             self.mamba_storage_retention.remover.submit(
                 self.cache_controller.storage_backend, superseded
             )

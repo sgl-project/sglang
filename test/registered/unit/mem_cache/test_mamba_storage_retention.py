@@ -1,7 +1,10 @@
 """Only the newest Mamba state of a radix path stays in external storage."""
 
+import gc
+import threading
 import time
 import unittest
+import weakref
 from collections import Counter
 from types import SimpleNamespace
 
@@ -15,6 +18,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     TreePathNodeInfo,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -50,7 +54,104 @@ def _wait_for(predicate):
     return predicate()
 
 
-class TestMambaStorageRetention(unittest.TestCase):
+class TestMambaStorageRetention(CustomTestCase):
+    def _remover(self, stats, **kwargs):
+        remover = MambaStateRemover(stats, **kwargs)
+        self.addCleanup(remover.close)
+        return remover
+
+    def test_close_cancels_retry_and_releases_backend(self):
+        """Detach must release even a backend retained for a leased-key retry."""
+        storage = _Storage([-706])
+        backend_ref = weakref.ref(storage)
+        stats = Counter()
+        remover = self._remover(stats, retry_delay_s=65)
+        remover.submit(storage, ["old"])
+        self.assertTrue(_wait_for(lambda: stats["mamba_remove_deferred"] == 1))
+        remover.close()
+        self.assertFalse(remover._thread.is_alive())
+        self.assertEqual(len(storage.calls), 1)
+        # Late ACKs during detach must neither restart nor retain the backend.
+        remover.submit(storage, ["late"])
+        del storage
+        gc.collect()
+        self.assertIsNone(backend_ref())
+
+    def test_close_waits_for_active_remove_and_cancels_queued_work(self):
+        """A backend cannot close while its removal RPC is still in progress."""
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        def remove(pool, keys):
+            calls.append(list(keys))
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release removal")
+            return [0]
+
+        remover = self._remover(Counter())
+        self.addCleanup(release.set)
+        storage = SimpleNamespace(batch_remove_pool_keys=remove)
+        remover.submit(storage, ["active"])
+        self.assertTrue(entered.wait(5))
+        remover.submit(storage, ["queued"])
+        closer = threading.Thread(target=remover.close)
+        closer.start()
+        try:
+            self.assertTrue(remover._stop.wait(5))
+            self.assertTrue(closer.is_alive())
+        finally:
+            release.set()
+            closer.join(5)
+        self.assertFalse(closer.is_alive())
+        self.assertFalse(remover._thread.is_alive())
+        self.assertEqual(calls, [["active"]])
+
+    def test_partial_rank_write_keeps_backup_beliefs_identical(self):
+        """Local Mamba write failure must not split subsequent TP admission."""
+        from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
+            StorageExistenceCache,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        coverage = []
+        deletes = []
+        for written in (1, 0):
+            beliefs = StorageExistenceCache()
+            beliefs.pool(PoolName.MAMBA).add(["old"])
+            submitted = []
+            entry = SimpleNamespace(superseded_mamba_keys=["old"])
+            cache = SimpleNamespace(
+                page_size=64,
+                buffer_pipeline=SimpleNamespace(
+                    finish_storage_write_ack=lambda *a, **kw: entry
+                ),
+                storage_existence_cache=beliefs,
+                mamba_storage_retention=SimpleNamespace(
+                    remover=SimpleNamespace(
+                        submit=lambda storage, keys: submitted.extend(keys)
+                    )
+                ),
+                cache_controller=SimpleNamespace(storage_backend=object()),
+            )
+            operation = SimpleNamespace(
+                id=1,
+                pool_storage_result=SimpleNamespace(
+                    extra_pool_hit_pages={PoolName.MAMBA: written}
+                ),
+            )
+            UnifiedRadixCache._finish_backup_ack(
+                cache,
+                operation,
+                requested_tokens=None,
+                agreed_tokens=0,
+                log_metrics=False,
+            )
+            coverage.append(beliefs.pool(PoolName.MAMBA).covered(["old"]))
+            deletes.append(submitted)
+        self.assertEqual(coverage, [False, False])
+        self.assertEqual(deletes, [["old"], []])
+
     def test_supersede_keeps_forks_and_unknown_states(self):
         path_info = (
             TreePathNodeInfo(1, 0, 0, 4, 4, 2),
@@ -80,7 +181,7 @@ class TestMambaStorageRetention(unittest.TestCase):
     def test_leased_page_is_retried_once(self):
         storage = _Storage([0, 0, -706, 0], [-706, -706])
         stats = Counter()
-        MambaStateRemover(stats, retry_delay_s=0.01).submit(storage, ["a", "b"])
+        self._remover(stats, retry_delay_s=0.01).submit(storage, ["a", "b"])
         self.assertTrue(_wait_for(lambda: sum(stats.values()) == 6))
         self.assertEqual(
             storage.calls, [(PoolName.MAMBA, ["a", "b"]), (PoolName.MAMBA, ["b"])]
@@ -93,7 +194,7 @@ class TestMambaStorageRetention(unittest.TestCase):
     def test_remove_counts_each_outcome(self):
         storage = _Storage([0, -704, -1], RuntimeError("down"), None)
         stats = {"offload": 3}
-        remover = MambaStateRemover(stats, retry_delay_s=0.01)
+        remover = self._remover(stats, retry_delay_s=0.01)
         remover.submit(storage, ["a", "b", "c"])
         remover.submit(storage, ["d", "e"])
         remover.submit(storage, ["f"])
@@ -116,7 +217,7 @@ class TestMambaStorageRetention(unittest.TestCase):
 
         storage = _Storage(None, None)
         stats = Counter()
-        remover = MambaStateRemover(stats, retry_delay_s=0.01)
+        remover = self._remover(stats, retry_delay_s=0.01)
         with self.assertLogs(
             "sglang.srt.mem_cache.unified_cache.mamba_storage_retention", "INFO"
         ) as logs:
