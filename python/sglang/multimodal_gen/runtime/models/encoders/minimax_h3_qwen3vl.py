@@ -352,20 +352,30 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
         return BaseEncoderOutput(last_hidden_state=outputs.last_hidden_state)
 
     @torch.no_grad()
+    def encode_image_features(self, pixels: torch.Tensor, grid: torch.Tensor):
+        return self.model._get_flat_visual_features(
+            pixels.to(self.device, torch.bfloat16), grid
+        )
+
+    @torch.no_grad()
     def encode_ids(
         self,
         input_ids: torch.Tensor,
         *,
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
+        image_features: tuple[torch.Tensor, list[torch.Tensor]] | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if input_ids.dim() != 1:
             raise ValueError(f"input_ids must be 1-D, got {list(input_ids.shape)}")
-        if (pixel_values is None) != (image_grid_thw is None):
-            raise ValueError("pixel_values and image_grid_thw must be given together")
+        has_image = pixel_values is not None or image_features is not None
+        if has_image != (image_grid_thw is not None):
+            raise ValueError("an image input and image_grid_thw must be given together")
+        if image_features is not None and pixel_values is not None:
+            raise ValueError("give either image_features or pixel_values")
         if (pixel_values_videos is None) != (video_grid_thw is None):
             raise ValueError(
                 "pixel_values_videos and video_grid_thw must be given together"
@@ -403,7 +413,10 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             call_kwargs["position_ids"] = position_ids.to(self.device)
         if pixel_values is not None:
             call_kwargs["pixel_values"] = pixel_values.to(self.device, torch.bfloat16)
+        if has_image:
             call_kwargs["image_grid_thw"] = host_image_grid_thw
+        if image_features is not None:
+            call_kwargs["image_features"] = image_features
         if pixel_values_videos is not None:
             call_kwargs["pixel_values_videos"] = pixel_values_videos.to(
                 self.device, torch.bfloat16
