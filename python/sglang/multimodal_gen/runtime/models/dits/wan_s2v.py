@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import functools
 import math
-from copy import deepcopy
-from typing import Any
+from collections import OrderedDict
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -26,15 +28,16 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
+    get_ulysses_parallel_rank,
+    get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.layers.attention.layer import (
-    UlyssesAttention,
-    USPAttention,
-)
-from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
+from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
+from sglang.multimodal_gen.runtime.layers.elementwise import GatedResidual2Seg, MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
+    LayerNormScaleShift2Seg,
     RMSNorm,
     tensor_parallel_rms_norm,
 )
@@ -43,6 +46,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -73,35 +77,48 @@ def rope_params(max_seq_len, dim, theta=10000):
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
+def rope_cos_sin(freqs):
+    """Complex rotation table [b, s, 1, d/2] -> fp32 (cos, sin), each [b, s, d/2]."""
+    freqs = freqs[:, :, 0]
+    return freqs.real.float().contiguous(), freqs.imag.float().contiguous()
+
+
 def rope_apply(x, grid_sizes, freqs):
-    n = x.size(2)
-    output = []
-    for i, _ in enumerate(x):
-        seq_len = x.size(1)
-        x_i = torch.view_as_complex(
-            x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2)
+    # freqs = (cos, sin) from rope_cos_sin. One rotation is shared by every head, and
+    # the interleaved (GPT-J) pairing is view_as_complex's, as in wanvideo.py.
+    cos, sin = freqs
+    if cos.shape[0] == 1:
+        return _apply_rotary_emb(x, cos[0], sin[0], is_neox_style=False)
+    return torch.cat(
+        [
+            _apply_rotary_emb(x[i : i + 1], cos[i], sin[i], is_neox_style=False)
+            for i in range(x.size(0))
+        ]
+    )
+
+
+class RopeTableMixin:
+    """Builds the RoPE table once per request shape, not once per forward: an
+    ``lru_cache`` keyed on int grids and on the owning module (which carries
+    ``freqs``), as ``RotaryEmbedding._forward_cached_from_grid`` in mrope.py."""
+
+    @functools.lru_cache(maxsize=4)
+    def _cached_rope_table(self, grids, start, x_shape, device_str):
+        return _build_rope_table(
+            grids, start, x_shape, torch.device(device_str), self.freqs
         )
-        freqs_i = freqs[i, :seq_len]
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-        output.append(x_i)
-    return torch.stack(output).to(dtype=x.dtype)
 
 
-def rope_precompute(x, grid_sizes, freqs, start=None):
-    b, s, n, c = x.size(0), x.size(1), x.size(2), x.size(3) // 2
+def _build_rope_table(grids, start, x_shape, device, freqs):
+    b, s, n, c = x_shape[0], x_shape[1], x_shape[2], x_shape[3] // 2
     if isinstance(freqs, list):
         trainable_freqs = freqs[1]
         freqs = freqs[0]
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-    output = torch.view_as_complex(x.detach().reshape(b, s, n, -1, 2).to(torch.float64))
+    output = torch.zeros(b, s, n, c, dtype=torch.complex128, device=device)
     seq_bucket = [0]
-    if not isinstance(grid_sizes, list):
-        grid_sizes = [grid_sizes]
-    for g in grid_sizes:
-        if not isinstance(g, list):
-            g = [torch.zeros_like(g), g]
-        batch_size = g[0].shape[0]
+    for g in grids:
+        batch_size = len(g[0])
         for i in range(batch_size):
             if start is None:
                 f_o, h_o, w_o = g[0][i]
@@ -115,26 +132,16 @@ def rope_precompute(x, grid_sizes, freqs, start=None):
                 if t_f > 0:
                     if f_o >= 0:
                         f_sam = (
-                            np.linspace(f_o.item(), (t_f + f_o).item() - 1, seq_f)
-                            .astype(int)
-                            .tolist()
+                            np.linspace(f_o, t_f + f_o - 1, seq_f).astype(int).tolist()
                         )
                     else:
                         f_sam = (
-                            np.linspace(-f_o.item(), (-t_f - f_o).item() + 1, seq_f)
+                            np.linspace(-f_o, -t_f - f_o + 1, seq_f)
                             .astype(int)
                             .tolist()
                         )
-                    h_sam = (
-                        np.linspace(h_o.item(), (t_h + h_o).item() - 1, seq_h)
-                        .astype(int)
-                        .tolist()
-                    )
-                    w_sam = (
-                        np.linspace(w_o.item(), (t_w + w_o).item() - 1, seq_w)
-                        .astype(int)
-                        .tolist()
-                    )
+                    h_sam = np.linspace(h_o, t_h + h_o - 1, seq_h).astype(int).tolist()
+                    w_sam = np.linspace(w_o, t_w + w_o - 1, seq_w).astype(int).tolist()
                     freqs_0 = freqs[0][f_sam] if f_o >= 0 else freqs[0][f_sam].conj()
                     freqs_0 = freqs_0.view(seq_f, 1, 1, -1)
                     freqs_i = torch.cat(
@@ -153,7 +160,132 @@ def rope_precompute(x, grid_sizes, freqs, start=None):
                     freqs_i = trainable_freqs.unsqueeze(1)
                 output[i, seq_bucket[-1] : seq_bucket[-1] + seq_len] = freqs_i
         seq_bucket.append(seq_bucket[-1] + seq_len)
+    # The table starts at zero, so the grids must place every token.
+    if seq_bucket[-1] != s:
+        raise ValueError(f"RoPE grids cover {seq_bucket[-1]} of {s} tokens")
     return output
+
+
+class _RequestShapes(NamedTuple):
+    video_seq_len: int
+    grids: tuple
+    seq_lens: torch.Tensor
+    mask_input: list[torch.Tensor]
+    unpatchify_grids: list[list[int]]
+    rope_table: torch.Tensor
+
+
+def _build_request_shapes(
+    *,
+    video_shapes: tuple,
+    ref_shapes: tuple,
+    motion_lens: tuple,
+    num_heads: int,
+    dim: int,
+    device: torch.device,
+    rope_freqs: Any,
+) -> _RequestShapes:
+    # Latent shapes are (b, c, f, h, w) before the flatten. Grids stay plain ints, so
+    # the RoPE table needs no tensor to key on and unpatchify needs no tolist().
+    video_grids = tuple(tuple(shape[2:]) for shape in video_shapes)
+    batch_size = len(ref_shapes)
+    ref_height, ref_width = ref_shapes[0][3], ref_shapes[0][4]
+    grids = (
+        (tuple((0, 0, 0) for _ in video_grids), video_grids, video_grids),
+        (
+            tuple((30, 0, 0) for _ in range(batch_size)),
+            tuple((31, ref_height, ref_width) for _ in range(batch_size)),
+            tuple((1, ref_height, ref_width) for _ in range(batch_size)),
+        ),
+    )
+    video_lens = [math.prod(grid) for grid in video_grids]
+    total_lens = [
+        video_len + math.prod(shape[2:])
+        for video_len, shape in zip(video_lens, ref_shapes)
+    ]
+    # Every element splits at the first one's video length, as the mask loop did.
+    video_seq_len = video_lens[0]
+    mask_input = []
+    for i, total_len in enumerate(total_lens):
+        mask = torch.zeros([1, total_len], dtype=torch.long, device=device)
+        mask[:, video_seq_len:] = 1
+        if motion_lens:
+            # motion tokens follow the reference ones, marked 2
+            mask = torch.cat(
+                [
+                    mask,
+                    2
+                    * torch.ones([1, motion_lens[i]], dtype=torch.long, device=device),
+                ],
+                dim=1,
+            )
+        mask_input.append(mask)
+    seq_lens = torch.tensor(total_lens, dtype=torch.long)
+    if motion_lens:
+        seq_lens = seq_lens + torch.tensor(motion_lens, dtype=torch.long)
+    return _RequestShapes(
+        video_seq_len=video_seq_len,
+        grids=grids,
+        seq_lens=seq_lens,
+        mask_input=mask_input,
+        unpatchify_grids=[list(grid) for grid in video_grids],
+        rope_table=_build_rope_table(
+            grids,
+            None,
+            # one head: the rotation does not depend on it
+            (len(video_shapes), total_lens[0], 1, dim // num_heads),
+            device,
+            rope_freqs,
+        ),
+    )
+
+
+def ulysses_input_a2a_with_suffix(x, num_rep):
+    """[b, s_local + num_rep, h, d] -> [b, s_global + num_rep, h_local, d].
+
+    The sharded tokens are packed destination-major in one copy and received
+    straight into the output; this rank's heads of the replicated suffix fill
+    the tail. Same values and K/V order as UlyssesAttention(replicated_*),
+    without its stacked-qkv and suffix concatenations.
+    """
+    ws, rank = get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
+    group = get_sp_group().ulysses_group
+    b, s, h, d = x.shape
+    s_local, h_local = s - num_rep, h // ws
+    send = x[:, :s_local].unflatten(2, (ws, h_local)).permute(2, 0, 1, 3, 4)
+    send = send.contiguous()
+    out = x.new_empty(b, ws * s_local + num_rep, h_local, d)
+    if b == 1:
+        recv = out[:, : ws * s_local].view(ws, 1, s_local, h_local, d)
+        torch.distributed.all_to_all_single(recv, send, group=group)
+    else:
+        recv = torch.empty_like(send)
+        torch.distributed.all_to_all_single(recv, send, group=group)
+        out[:, : ws * s_local].unflatten(1, (ws, s_local)).copy_(recv.transpose(0, 1))
+    out[:, ws * s_local :] = x[:, s_local:, rank * h_local : (rank + 1) * h_local]
+    return out
+
+
+def ulysses_output_a2a_with_suffix(x, num_rep):
+    """[b, s_global + num_rep, h_local, d] -> [b, s_local + num_rep, h, d]."""
+    ws = get_ulysses_parallel_world_size()
+    group = get_sp_group().ulysses_group
+    b, s, h_local, d = x.shape
+    s_local = (s - num_rep) // ws
+    out = x.new_empty(b, s_local + num_rep, ws * h_local, d)
+    send = x[:, : ws * s_local].unflatten(1, (ws, s_local)).transpose(0, 1)
+    send = send.contiguous()
+    recv = torch.empty_like(send)
+    torch.distributed.all_to_all_single(recv, send, group=group)
+    out[:, :s_local].unflatten(2, (ws, h_local)).copy_(recv.permute(1, 2, 0, 3, 4))
+    rep = x[:, ws * s_local :].contiguous()
+    gathered = rep.new_empty((ws,) + tuple(rep.shape))
+    # all_gather concatenates along dim 0 and copy_s into the output, so hand it a
+    # (ws*b, ...) view; gathered stays 5-D for the permute below. Same storage and
+    # layout, so eager is unchanged -- but dynamo's functional path enforces the rank.
+    all_gather_single(gathered.view(-1, *rep.shape[1:]), rep, group=group)
+    out[:, s_local:].unflatten(2, (ws, h_local)).copy_(gathered.permute(1, 2, 0, 3, 4))
+    return out
 
 
 class WanSelfAttention(nn.Module):
@@ -191,12 +323,6 @@ class WanSelfAttention(nn.Module):
             skip_sequence_parallel=skip_sequence_parallel,
             is_cross_attention=is_cross_attention,
         )
-        self.ulysses_attn = UlyssesAttention(
-            num_heads=self.local_num_heads,
-            head_size=self.head_dim,
-            causal=False,
-            supported_attention_backends=supported_attention_backends,
-        )
 
     def forward(self, x, seq_lens, grid_sizes, freqs, num_replicated_suffix=0):
         del seq_lens
@@ -217,32 +343,22 @@ class WanSelfAttention(nn.Module):
         v = v.view(b, s, n, d)
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
+        # Ulysses + replicated suffix: the minimal-copy exchange below. Ring and
+        # K/V-gather (--kv-gather-degree > 1) take USPAttention, which serves both.
         if (
             num_replicated_suffix > 0
             and get_sp_world_size() > 1
             and get_ring_parallel_world_size() == 1
+            and self.attn.sp_attention_mode == "ulysses"
         ):
-            q_shard, q_rep = (
-                q[:, :-num_replicated_suffix],
-                q[:, -num_replicated_suffix:],
+            q, k, v = (
+                ulysses_input_a2a_with_suffix(t, num_replicated_suffix)
+                for t in (q, k, v)
             )
-            k_shard, k_rep = (
-                k[:, :-num_replicated_suffix],
-                k[:, -num_replicated_suffix:],
+            x = self.attn.attn_impl.forward(
+                q, k, v, get_forward_context().attn_metadata
             )
-            v_shard, v_rep = (
-                v[:, :-num_replicated_suffix],
-                v[:, -num_replicated_suffix:],
-            )
-            x, x_rep = self.ulysses_attn(
-                q_shard,
-                k_shard,
-                v_shard,
-                replicated_q=q_rep,
-                replicated_k=k_rep,
-                replicated_v=v_rep,
-            )
-            x = torch.cat([x, x_rep], dim=1)
+            x = ulysses_output_a2a_with_suffix(x, num_replicated_suffix)
         else:
             x = self.attn(
                 q,
@@ -580,7 +696,7 @@ def torch_dfs(model: nn.Module, parent_name="root"):
     return modules, module_names
 
 
-class FramePackMotioner(nn.Module):
+class FramePackMotioner(RopeTableMixin, nn.Module):
     def __init__(
         self,
         inner_dim=1024,
@@ -592,7 +708,9 @@ class FramePackMotioner(nn.Module):
         self.proj = nn.Conv3d(16, inner_dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
         self.proj_2x = nn.Conv3d(16, inner_dim, kernel_size=(2, 4, 4), stride=(2, 4, 4))
         self.proj_4x = nn.Conv3d(16, inner_dim, kernel_size=(4, 8, 8), stride=(4, 8, 8))
-        self.zip_frame_buckets = torch.tensor(zip_frame_buckets, dtype=torch.long)
+        # Python ints: as a tensor every size and slice taken from it was a data-dependent
+        # graph break.
+        self.zip_frame_buckets = tuple(int(b) for b in zip_frame_buckets)
         self.inner_dim = inner_dim
         self.num_heads = num_heads
         d = inner_dim // num_heads
@@ -608,11 +726,12 @@ class FramePackMotioner(nn.Module):
 
     def forward(self, motion_latents, add_last_motion=2):
         mot, mot_remb = [], []  # codespell:ignore mot
+        buckets = self.zip_frame_buckets
         for m in motion_latents:
             lat_height, lat_width = m.shape[2], m.shape[3]
             padd_lat = torch.zeros(
                 16,
-                self.zip_frame_buckets.sum(),
+                sum(buckets),
                 lat_height,
                 lat_width,
                 device=m.device,
@@ -622,14 +741,12 @@ class FramePackMotioner(nn.Module):
             if overlap_frame > 0:
                 padd_lat[:, -overlap_frame:] = m[:, -overlap_frame:]
             if add_last_motion < 2 and self.drop_mode != "drop":
-                zero_end_frame = self.zip_frame_buckets[
-                    : self.zip_frame_buckets.__len__() - add_last_motion - 1
-                ].sum()
+                zero_end_frame = sum(buckets[: len(buckets) - add_last_motion - 1])
                 padd_lat[:, -zero_end_frame:] = 0
             padd_lat = padd_lat.unsqueeze(0)
             clean_latents_4x, clean_latents_2x, clean_latents_post = padd_lat[
-                :, :, -self.zip_frame_buckets.sum() :, :, :
-            ].split(list(self.zip_frame_buckets)[::-1], dim=2)
+                :, :, -sum(buckets) :, :, :
+            ].split(list(buckets)[::-1], dim=2)
             clean_latents_post = (
                 self.proj(clean_latents_post).flatten(2).transpose(1, 2)
             )
@@ -647,69 +764,39 @@ class FramePackMotioner(nn.Module):
             motion_lat = torch.cat(
                 [clean_latents_post, clean_latents_2x, clean_latents_4x], dim=1
             )
-            start_time_id = -(self.zip_frame_buckets[:1].sum())
-            end_time_id = start_time_id + self.zip_frame_buckets[0]
-            grid_sizes = (
-                []
-                if add_last_motion < 2 and self.drop_mode == "drop"
-                else [
-                    [
-                        torch.tensor([start_time_id, 0, 0]).unsqueeze(0).repeat(1, 1),
-                        torch.tensor([end_time_id, lat_height // 2, lat_width // 2])
-                        .unsqueeze(0)
-                        .repeat(1, 1),
-                        torch.tensor(
-                            [self.zip_frame_buckets[0], lat_height // 2, lat_width // 2]
-                        )
-                        .unsqueeze(0)
-                        .repeat(1, 1),
-                    ]
-                ]
-            )
-            start_time_id = -(self.zip_frame_buckets[:2].sum())
-            end_time_id = start_time_id + self.zip_frame_buckets[1] // 2
-            grid_sizes_2x = (
-                []
-                if add_last_motion < 1 and self.drop_mode == "drop"
-                else [
-                    [
-                        torch.tensor([start_time_id, 0, 0]).unsqueeze(0).repeat(1, 1),
-                        torch.tensor([end_time_id, lat_height // 4, lat_width // 4])
-                        .unsqueeze(0)
-                        .repeat(1, 1),
-                        torch.tensor(
-                            [self.zip_frame_buckets[1], lat_height // 2, lat_width // 2]
-                        )
-                        .unsqueeze(0)
-                        .repeat(1, 1),
-                    ]
-                ]
-            )
-            start_time_id = -(self.zip_frame_buckets[:3].sum())
-            end_time_id = start_time_id + self.zip_frame_buckets[2] // 4
-            grid_sizes_4x = [
-                [
-                    torch.tensor([start_time_id, 0, 0]).unsqueeze(0).repeat(1, 1),
-                    torch.tensor([end_time_id, lat_height // 8, lat_width // 8])
-                    .unsqueeze(0)
-                    .repeat(1, 1),
-                    torch.tensor(
-                        [self.zip_frame_buckets[2], lat_height // 2, lat_width // 2]
+            # One (start, end, total) group per resolution, batch of one, as plain ints
+            # in the layout the main forward's grids use.
+            groups = []
+            if not (add_last_motion < 2 and self.drop_mode == "drop"):
+                start = -sum(buckets[:1])
+                groups.append(
+                    (
+                        ((start, 0, 0),),
+                        ((start + buckets[0], lat_height // 2, lat_width // 2),),
+                        ((buckets[0], lat_height // 2, lat_width // 2),),
                     )
-                    .unsqueeze(0)
-                    .repeat(1, 1),
-                ]
-            ]
-            motion_rope_emb = rope_precompute(
-                motion_lat.detach().view(
-                    1,
-                    motion_lat.shape[1],
-                    self.num_heads,
-                    self.inner_dim // self.num_heads,
-                ),
-                grid_sizes + grid_sizes_2x + grid_sizes_4x,
-                self.freqs,
-                start=None,
+                )
+            if not (add_last_motion < 1 and self.drop_mode == "drop"):
+                start = -sum(buckets[:2])
+                groups.append(
+                    (
+                        ((start, 0, 0),),
+                        ((start + buckets[1] // 2, lat_height // 4, lat_width // 4),),
+                        ((buckets[1], lat_height // 2, lat_width // 2),),
+                    )
+                )
+            start = -sum(buckets[:3])
+            groups.append(
+                (
+                    ((start, 0, 0),),
+                    ((start + buckets[2] // 4, lat_height // 8, lat_width // 8),),
+                    ((buckets[2], lat_height // 2, lat_width // 2),),
+                )
+            )
+            # one head: the rotation does not depend on it
+            head_shape = (1, motion_lat.shape[1], 1, self.inner_dim // self.num_heads)
+            motion_rope_emb = self._cached_rope_table(
+                tuple(groups), None, head_shape, str(motion_lat.device)
             )
             mot.append(motion_lat)  # codespell:ignore mot
             mot_remb.append(motion_rope_emb)
@@ -757,6 +844,11 @@ class WanS2VAttentionBlock(WanAttentionBlock):
             eps,
             supported_attention_backends=supported_attention_backends,
         )
+        # The video tokens and the t=0 suffix are modulated with different rows of e.
+        self.norm1 = LayerNormScaleShift2Seg(dim, eps=eps, dtype=torch.float32)
+        self.norm2 = LayerNormScaleShift2Seg(dim, eps=eps, dtype=torch.float32)
+        self.self_attn_residual = GatedResidual2Seg()
+        self.mlp_residual = GatedResidual2Seg()
 
     def forward(
         self,
@@ -769,60 +861,49 @@ class WanS2VAttentionBlock(WanAttentionBlock):
         context_lens,
         num_replicated_suffix=0,
     ):
-        seg_idx = min(max(0, e[1].item()), x.size(1))
-        seg_idx = [0, seg_idx, x.size(1)]
+        seg_idx = min(max(0, e[1]), x.size(1))
         e = e[0]
         e = (self.modulation.float().unsqueeze(2) + e.float()).chunk(6, dim=1)
         e = [element.squeeze(1) for element in e]
-        norm_x = torch.cat(
-            [
-                self.norm1(
-                    x[:, seg_idx[i] : seg_idx[i + 1]],
-                    e[0][:, i : i + 1],
-                    e[1][:, i : i + 1],
-                )
-                for i in range(2)
-            ],
-            dim=1,
-        )
         y = self.self_attn(
-            norm_x,
+            self.norm1(x, e[0], e[1], seg_idx),
             seq_lens,
             grid_sizes,
             freqs,
             num_replicated_suffix=num_replicated_suffix,
         )
-        y = torch.cat(
-            [
-                y[:, seg_idx[i] : seg_idx[i + 1]].float() * e[2][:, i : i + 1]
-                for i in range(2)
-            ],
-            dim=1,
-        )
-        x = x + y.to(dtype=x.dtype)
+        x = self.self_attn_residual(x, y, e[2], seg_idx)
         cross = self.cross_attn(self.norm3(x), context, context_lens)
         x = x + cross
-        norm2_x = torch.cat(
-            [
-                self.norm2(
-                    x[:, seg_idx[i] : seg_idx[i + 1]],
-                    e[3][:, i : i + 1],
-                    e[4][:, i : i + 1],
-                )
-                for i in range(2)
-            ],
-            dim=1,
-        )
-        y = self.ffn(norm2_x)
-        y = torch.cat(
-            [
-                y[:, seg_idx[i] : seg_idx[i + 1]].float() * e[5][:, i : i + 1]
-                for i in range(2)
-            ],
-            dim=1,
-        )
-        x = x + y.to(dtype=x.dtype)
+        y = self.ffn(self.norm2(x, e[3], e[4], seg_idx))
+        x = self.mlp_residual(x, y, e[5], seg_idx)
         return x
+
+
+class WanS2VBlockRunner(nn.Module):
+    """One transformer block followed by its audio injector.
+
+    The injector must sit inside the iterated unit, not in the caller's loop: a
+    DiT cache replaces the iterated ModuleList with a single pseudo-block that
+    runs the blocks itself, so an injector driven by the loop index would fire
+    once per step instead of at each injected layer. The first argument is named
+    `hidden_states` for cache-dit's Pattern_3 contract.
+    """
+
+    def __init__(
+        self,
+        block: nn.Module,
+        block_idx: int,
+        after_block: Callable[[int, torch.Tensor], torch.Tensor],
+    ):
+        super().__init__()
+        # Kept out of the module tree: the block stays owned by `blocks`, so
+        # state_dict keys and the layerwise-offload hooks are unchanged.
+        self._runs = (block, block_idx, after_block)
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        block, block_idx, after_block = self._runs
+        return after_block(block_idx, block(hidden_states, **kwargs))
 
 
 class WanModelS2V(ModelMixin, ConfigMixin):
@@ -838,6 +919,9 @@ class WanModelS2V(ModelMixin, ConfigMixin):
     _no_split_modules = ["WanS2VAttentionBlock"]
     # Not a BaseDiT, so take the default set the other Wan DiTs inherit.
     _supported_attention_backends = BaseDiT._supported_attention_backends
+    # As comment 3's lru_cache(maxsize=4): a server alternating resolutions still hits.
+    _REQUEST_SHAPES_CACHE_SIZE = 4
+    _request_shapes_cache: OrderedDict | None = None
 
     @register_to_config
     def __init__(
@@ -959,6 +1043,19 @@ class WanModelS2V(ModelMixin, ConfigMixin):
             adain_dim=self.dim,
             need_adain_ont=adain_mode != "attn_norm",
         )
+        # What forward iterates, instead of `blocks`: a DiT cache swaps this
+        # list for its own pseudo-block, so the injectors ride along with it
+        # (see _CUSTOM_BLOCK_ADAPTER_SPECS in runtime/cache).
+        self.block_runners = nn.ModuleList(
+            [
+                WanS2VBlockRunner(
+                    block=block,
+                    block_idx=block_idx,
+                    after_block=self.after_transformer_block,
+                )
+                for block_idx, block in enumerate(self.blocks)
+            ]
+        )
         self.adain_mode = adain_mode
         self.trainable_cond_mask = nn.Embedding(3, self.dim)
         if zero_init:
@@ -999,47 +1096,41 @@ class WanModelS2V(ModelMixin, ConfigMixin):
             return [m[:, :0] for m in flattern_mot], [m[:, :0] for m in mot_remb]
         return flattern_mot, mot_remb
 
-    def inject_motion(
-        self,
-        x,
-        seq_lens,
-        rope_embs,
-        mask_input,
-        motion_latents,
-        drop_motion_frames=False,
-        add_last_motion=True,
-    ):
-        mot, mot_remb = self.process_motion_frame_pack(  # codespell:ignore mot
-            motion_latents,
-            drop_motion_frames=drop_motion_frames,
-            add_last_motion=add_last_motion,
+    def _request_shapes(
+        self, *, video_shapes, ref_shapes, motion_lens, device
+    ) -> _RequestShapes:
+        # A request's 40 steps (x2 under CFG) rebuilt these identical tensors on every
+        # forward; they are a function of the latent and motion-token shapes alone.
+        if self._request_shapes_cache is None:
+            self._request_shapes_cache = OrderedDict()
+        cache = self._request_shapes_cache
+        signature = (video_shapes, ref_shapes, motion_lens, str(device))
+        if signature in cache:
+            cache.move_to_end(signature)
+            return cache[signature]
+        shapes = _build_request_shapes(
+            video_shapes=video_shapes,
+            ref_shapes=ref_shapes,
+            motion_lens=motion_lens,
+            num_heads=self.num_heads,
+            dim=self.dim,
+            device=device,
+            rope_freqs=self.freqs,
         )
+        cache[signature] = shapes
+        if len(cache) > self._REQUEST_SHAPES_CACHE_SIZE:
+            cache.popitem(last=False)
+        return shapes
+
+    def inject_motion(self, x, rope_embs, mot, mot_remb):  # codespell:ignore mot
+        # seq_lens and the mask already count the motion tokens (_request_shapes).
         if len(mot) > 0:  # codespell:ignore mot
             x = [
                 torch.cat([u, m], dim=1)
                 for u, m in zip(x, mot)  # codespell:ignore mot
             ]
-            seq_lens = seq_lens + torch.tensor(
-                [r.size(1) for r in mot],  # codespell:ignore mot
-                dtype=torch.long,
-            )
             rope_embs = [torch.cat([u, m], dim=1) for u, m in zip(rope_embs, mot_remb)]
-            mask_input = [
-                torch.cat(
-                    [
-                        m,
-                        2
-                        * torch.ones(
-                            [1, u.shape[1] - m.shape[1]],
-                            device=m.device,
-                            dtype=m.dtype,
-                        ),
-                    ],
-                    dim=1,
-                )
-                for m, u in zip(mask_input, x)
-            ]
-        return x, seq_lens, rope_embs, mask_input
+        return x, rope_embs
 
     def after_transformer_block(self, block_idx, hidden_states):
         if block_idx in self.audio_injector.injected_block_id:
@@ -1138,50 +1229,38 @@ class WanModelS2V(ModelMixin, ConfigMixin):
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_states]
         x = [x_ + pose for x_, pose in zip(x, cond)]
-        grid_sizes = torch.stack(
-            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]
-        )
+        video_shapes = tuple(tuple(u.shape) for u in x)
         x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        original_grid_sizes = deepcopy(grid_sizes)
-        grid_sizes = [[torch.zeros_like(grid_sizes), grid_sizes, grid_sizes]]
         self.lat_motion_frames = motion_latents[0].shape[1]
         ref = [self.patch_embedding(r.unsqueeze(0)) for r in ref_latents]
-        batch_size = len(ref)
-        height, width = ref[0].shape[3], ref[0].shape[4]
-        ref_grid_sizes = [
-            [
-                torch.tensor([30, 0, 0]).unsqueeze(0).repeat(batch_size, 1),
-                torch.tensor([31, height, width]).unsqueeze(0).repeat(batch_size, 1),
-                torch.tensor([1, height, width]).unsqueeze(0).repeat(batch_size, 1),
-            ]
-        ]
+        ref_shapes = tuple(tuple(r.shape) for r in ref)
         ref = [r.flatten(2).transpose(1, 2) for r in ref]
-        self.original_seq_len = seq_lens[0]
-        seq_lens = seq_lens + torch.tensor([r.size(1) for r in ref], dtype=torch.long)
-        grid_sizes = grid_sizes + ref_grid_sizes
         x = [torch.cat([u, r], dim=1) for u, r in zip(x, ref)]
-        mask_input = [
-            torch.zeros([1, u.shape[1]], dtype=torch.long, device=x[0].device)
-            for u in x
-        ]
-        for i in range(len(mask_input)):
-            mask_input[i][:, self.original_seq_len :] = 1
         x = torch.cat(x)
-        b, s, n, d = x.size(0), x.size(1), self.num_heads, self.dim // self.num_heads
-        self.pre_compute_freqs = rope_precompute(
-            x.detach().view(b, s, n, d), grid_sizes, self.freqs, start=None
-        )
-        x = [u.unsqueeze(0) for u in x]
-        self.pre_compute_freqs = [u.unsqueeze(0) for u in self.pre_compute_freqs]
-        x, seq_lens, self.pre_compute_freqs, mask_input = self.inject_motion(
-            x,
-            seq_lens,
-            self.pre_compute_freqs,
-            mask_input,
+        mot, mot_remb = self.process_motion_frame_pack(  # codespell:ignore mot
             motion_latents,
             drop_motion_frames=drop_motion_frames,
             add_last_motion=add_last_motion,
+        )
+        shapes = self._request_shapes(
+            video_shapes=video_shapes,
+            ref_shapes=ref_shapes,
+            motion_lens=tuple(m.size(1) for m in mot),  # codespell:ignore mot
+            device=x.device,
+        )
+        grid_sizes = shapes.grids
+        seq_lens = shapes.seq_lens
+        mask_input = shapes.mask_input
+        # A Python int, not seq_lens[0]: the blocks split on it without a graph break.
+        self.original_seq_len = shapes.video_seq_len
+        self.pre_compute_freqs = shapes.rope_table
+        x = [u.unsqueeze(0) for u in x]
+        self.pre_compute_freqs = [u.unsqueeze(0) for u in self.pre_compute_freqs]
+        x, self.pre_compute_freqs = self.inject_motion(
+            x,
+            self.pre_compute_freqs,
+            mot,  # codespell:ignore mot
+            mot_remb,
         )
         x = torch.cat(x, dim=0)
         self.pre_compute_freqs = torch.cat(self.pre_compute_freqs, dim=0)
@@ -1292,14 +1371,13 @@ class WanModelS2V(ModelMixin, ConfigMixin):
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            freqs=self.pre_compute_freqs,
+            freqs=rope_cos_sin(self.pre_compute_freqs),
             context=context,
             context_lens=None,
             num_replicated_suffix=condition_suffix_len if sequence_shard_enabled else 0,
         )
-        for idx, block in enumerate(self.blocks):
-            x = block(x, **kwargs)
-            x = self.after_transformer_block(idx, x)
+        for block_runner in self.block_runners:
+            x = block_runner(x, **kwargs)
         if sequence_shard_enabled:
             x_video = sequence_model_parallel_all_gather(
                 x[:, : self.local_original_seq_len].contiguous(), dim=1
@@ -1309,12 +1387,12 @@ class WanModelS2V(ModelMixin, ConfigMixin):
                 x = x[:, :seq_len_full]
         x = x[:, : self.original_seq_len]
         x = self.head(x, e)
-        x = self.unpatchify(x, original_grid_sizes)
+        x = self.unpatchify(x, shapes.unpatchify_grids)
         return [u.float() for u in x]
 
     def unpatchify(self, x, grid_sizes):
         out = []
-        for u, v in zip(x, grid_sizes.tolist()):
+        for u, v in zip(x, grid_sizes):
             u = u[: math.prod(v)].view(*v, *self.patch_size, self.out_dim)
             u = torch.einsum("fhwpqrc->cfphqwr", u)
             out.append(
@@ -1419,13 +1497,6 @@ class WanS2VTransformer3DModel(WanModelS2V, LayerwiseOffloadableModuleMixin):
             ).to(device=device)
         frame_packer = getattr(self, "frame_packer", None)
         if frame_packer is not None:
-            if (
-                isinstance(frame_packer.zip_frame_buckets, torch.Tensor)
-                and frame_packer.zip_frame_buckets.is_meta
-            ):
-                frame_packer.zip_frame_buckets = torch.tensor(
-                    (1, 2, 16), dtype=torch.long, device=device
-                )
             if (
                 isinstance(frame_packer.freqs, torch.Tensor)
                 and frame_packer.freqs.is_meta
