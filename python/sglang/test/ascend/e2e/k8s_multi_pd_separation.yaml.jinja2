@@ -47,8 +47,6 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: status.hostIP
-          - name: INSTALL_SGLANG_FROM_SOURCE
-            value: "{{ install_sglang_from_source }}"
           - name: KUBECONFIG
             value: "{{ kube_config }}"
           - name: NAMESPACE
@@ -69,6 +67,12 @@ spec:
             value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
+          - name: SGLANG_NPU_CONTAINER_PATCHES
+            value: "{{ container_patches }}"
+          - name: SGLANG_USE_IMAGE
+            value: "{{ use_image_sglang }}"
+          - name: NPU_TEST_METHOD
+            value: "{{ test_method }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -172,8 +176,6 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: status.hostIP
-          - name: INSTALL_SGLANG_FROM_SOURCE
-            value: "{{ install_sglang_from_source }}"
           - name: KUBECONFIG
             value: "{{ kube_config }}"
           - name: NAMESPACE
@@ -194,6 +196,12 @@ spec:
             value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
+          - name: SGLANG_NPU_CONTAINER_PATCHES
+            value: "{{ container_patches }}"
+          - name: SGLANG_USE_IMAGE
+            value: "{{ use_image_sglang }}"
+          - name: NPU_TEST_METHOD
+            value: "{{ test_method }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -272,7 +280,7 @@ spec:
           accelerator-type: module-a3-16
           {% endif %}
         restartPolicy: OnFailure
-  - name: "sglang-router"
+  - name: "sgl-router"
     replicas: {{ router_size }}
     template:
       metadata:
@@ -297,8 +305,6 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: status.hostIP
-          - name: INSTALL_SGLANG_FROM_SOURCE
-            value: "{{ install_sglang_from_source }}"
           - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
           - name: NPU_ACCURACY_DATASET
@@ -319,6 +325,12 @@ spec:
             value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
+          - name: SGLANG_NPU_CONTAINER_PATCHES
+            value: "{{ container_patches }}"
+          - name: SGLANG_USE_IMAGE
+            value: "{{ use_image_sglang }}"
+          - name: NPU_TEST_METHOD
+            value: "{{ test_method }}"
           command: ["/bin/bash", "-c"]
           args:
             - |

@@ -530,8 +530,6 @@ class LingBotWorldTransformerBlock(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends=None,
         prefix: str = "",
-        attention_type: str = "original",
-        sla_topk: float = 0.1,
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
@@ -584,6 +582,7 @@ class LingBotWorldTransformerBlock(nn.Module):
 
         self.attn1 = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=num_heads,
             head_size=self.dim_head,
             causal=False,
             supported_attention_backends=supported_attention_backends,

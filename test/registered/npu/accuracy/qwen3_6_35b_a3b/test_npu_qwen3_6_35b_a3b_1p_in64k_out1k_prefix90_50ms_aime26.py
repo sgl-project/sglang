@@ -10,14 +10,12 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=2800,
-    suite="nightly-acc-2-npu-a3",
+    suite="nightly-acc-test-2-npu-a3",
     nightly=True,
 )
 
 QWEN3_6_35B_A3B_64K_PREFIX_ENVS = {
-    "PYTORCH_NPU_ALLOC_CONF": (
-        "expandable_segments:True,pin_memory_expandable_segments:True"
-    ),
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "DEEPEP_HCCL_BUFFSIZE": "300",
     "HCCL_SOCKET_IFNAME": "lo",

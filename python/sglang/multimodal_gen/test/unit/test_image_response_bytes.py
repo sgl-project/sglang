@@ -380,6 +380,8 @@ def test_b64_response_publishes_only_successful_outputs(
 
     def build(request_id, **kwargs):
         captured.update(kwargs)
+        if endpoint == "edits":
+            assert os.path.isfile(kwargs["image_path"][0])
         return SamplingParams()
 
     monkeypatch.setattr(image_api, "_build_request_sampling_params", build)
@@ -418,11 +420,17 @@ def test_b64_response_publishes_only_successful_outputs(
                 files={"image": ("reference.png", png, "image/png")},
             )
 
+    if not persistent:
+        assert not os.path.exists(captured["output_path"])
+    if endpoint == "edits":
+        assert not os.path.exists(captured["image_path"][0])
     if error:
         assert response.status_code == 500, response.text
         assert "b64_json" not in response.text
         return
     assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == "application/json"
+    image_api.ImageResponse.model_validate_json(response.content)
     (item,) = response.json()["data"]
     assert base64.b64decode(item["b64_json"]) == png
     assert captured["return_image_bytes"] is True

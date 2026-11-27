@@ -149,6 +149,11 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.model_executor.model_interfaces import (
+    CPBoundedTailLogits,
+    CPLogitsInputs,
+    LanguageModelInputPreparation,
+)
 from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -935,7 +940,8 @@ def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
         forward_batch.forward_mode.is_extend()
         and is_in_breakable_cuda_graph()
         and (
-            not getattr(attn_backend, "low_ratio_prefill_graph", False)
+            is_cp_active(forward_batch)
+            or not getattr(attn_backend, "low_ratio_prefill_graph", False)
             or in_replay_tail_graph()
         )
     )
@@ -1070,6 +1076,16 @@ class MqaAttentionBase(nn.Module):
         fuse: bool = (
             envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
         )
+        # Separate ModelSlim projections carry their own INT8 quantization
+        # parameters, which the native weight/FP8-scale fusion cannot merge.
+        if (
+            fuse
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+            and add_prefix("wqkv_a.weight", prefix)
+            not in quant_config.quant_description
+        ):
+            fuse = False
         fp8: bool = (
             wo_a_fp8_gemm_enabled(quant_config) if wo_a_fp8 is None else wo_a_fp8
         )
@@ -1158,7 +1174,7 @@ class MqaAttentionBase(nn.Module):
             # wo_a is quantized but never *applied* through its quant method:
             # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
             # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
-            # mxscale BMM on gfx950), both of which want the plain row-major
+            # mxscale BMM on ROCm), both of which start from the plain row-major
             # [G, R, D] weight. Opt out of any backend-private weight layout the
             # linear method would otherwise install for its own GEMM -- on ROCm
             # that is aiter's B-preshuffle, which silently permutes the weight
@@ -1225,6 +1241,14 @@ class MqaAttentionBase(nn.Module):
     def _kernel_num_heads(self, num_tokens: int) -> int:
         if self.attn_tp_size == 1:
             return self.n_local_heads
+
+        if _is_npu and self.is_dsv41:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            # A3 BF16 SMLA accepts the per-rank width (e.g. TP16/DP8: 32).
+            # The A5 mixed-quant kernel retains its existing 64-head padding.
+            if not is_npu_arch35():
+                return self.n_local_heads
 
         if get_platform().is_sm120:
             # Prefill already accepts the native per-rank query width.
@@ -1346,6 +1370,9 @@ class MqaAttentionBase(nn.Module):
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
         ctx = get_cp_decode_attn_tp_ctx()
+        if not ctx.is_enabled:
+            yield
+            return
         attn = self.attn_mqa if isinstance(self, MQALayer) else self.attn
         with ctx.maybe_use_decode_attn_tp(
             forward_batch,
@@ -1566,7 +1593,9 @@ class MQALayer(MqaAttentionBase):
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
-        if self.indexer is not None and hasattr(self.indexer.compressor, "fp4_cos"):
+        if isinstance(self.indexer, C4Indexer) and hasattr(
+            self.indexer.compressor, "fp4_cos"
+        ):
             self.indexer.compressor.fp4_cos = self.cos_cache[:, 0, 0, :]
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
         return result
@@ -2478,7 +2507,10 @@ class MQALayer(MqaAttentionBase):
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            # V4 normalizes each query head before RoPE; V4.1 (q_head_norm
+            # False) does not -- its only q norm is the q_lora one above.
+            if self.q_head_norm:
+                q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
@@ -2715,6 +2747,9 @@ class MQALayer(MqaAttentionBase):
             and self.alt_streams is not None
             and x.shape[0] <= self._multi_stream_bs_limit
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            # V4.1 runs the compressor + indexer as one ordered call, which the
+            # NPU multi-stream split does not model.
+            and not self.is_dsv41
         )
 
         low_ratio_multi_stream = (
@@ -2955,7 +2990,16 @@ class MQALayer(MqaAttentionBase):
                     # TRT-LLM returns BF16 even with FP8 queries.
                     dtype=x.dtype,
                 )
-                bcg_deepseek_v4_attention_with_output(
+                # NPU backends refresh capacity-sized metadata before each
+                # replay, so the attention can stay inside the captured
+                # segment.  Every other platform keeps ending the segment.
+                attention_with_output = (
+                    deepseek_v4_attention_with_output
+                    if _is_npu
+                    and attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+                    else bcg_deepseek_v4_attention_with_output
+                )
+                attention_with_output(
                     attn_q,
                     attn_k,
                     o,
@@ -3082,7 +3126,7 @@ class MQALayer(MqaAttentionBase):
                     perm_y=(1, 0, 2),
                 )
             elif self.wo_a_fp8 and _wo_a_fp8_mxscale is not None:
-                # ROCm gfx950: same fp8 absorb GEMM as the DeepGEMM path below,
+                # ROCm gfx950/gfx1250: same fp8 absorb GEMM as the DeepGEMM path below,
                 # but through aiter's e8m0 block-scale batched GEMM. The
                 # activation is quantized per token-group inside the helper.
                 T, G, D = o.shape
@@ -4134,11 +4178,17 @@ class DeepseekV4Model(nn.Module):
         )
         if self.engram_hasher is not None:
             if cp_extend:
-                # n-gram hashing needs each token's predecessors: hash the whole prompt
+                # N-gram hashing needs each token's predecessors, so hash the
+                # whole prompt before selecting this CP rank's interleaved rows.
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
+                global_input_ids = forward_batch.input_ids[:total]
+                if is_in_breakable_cuda_graph():
+                    hash_ids = self.engram_hasher.new_hash_ids(global_input_ids)
+                    bcg_deepseek_v4_engram_hash_ids(
+                        self.engram_hasher, global_input_ids, hash_ids
+                    )
+                else:
+                    hash_ids = self.engram_hasher(global_input_ids, forward_batch)
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
@@ -4190,7 +4240,6 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
                 num_tokens=input_ids.shape[0],
                 tail_in_graph=tail_in_graph,
-                late_dp_counts=late_dp_counts,
             )
         saved_full = None
         # The HIP defer_post gate excludes residual readers. CUDA materializes
@@ -4198,6 +4247,7 @@ class DeepseekV4Model(nn.Module):
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
+        fused_step = _is_hip and _hip.fused_boundary_this_step(forward_batch)
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4227,7 +4277,7 @@ class DeepseekV4Model(nn.Module):
             if tail is not None and i == self.late_layer_start:
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
-                    if _is_hip and source.hc_boundary_fused:
+                    if fused_step and source.hc_boundary_fused:
                         # The previous FFN hc_post has not run yet, so run it here too.
                         source_x = fused_boundary_attn_input(source, state)
                     else:
@@ -4337,6 +4387,9 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     input_ids=input_ids,
                     cp_all_tokens=cp_extend,
+                    gate_basis=(
+                        getattr(self, "engram_gate_basis", None) if _is_npu else None
+                    ),
                 )
                 state = state.with_residual(hidden_states)
                 if _is_cuda:
@@ -4365,7 +4418,7 @@ class DeepseekV4Model(nn.Module):
                         input_ids_global=input_ids_global,
                     )
                 else:
-                    if _is_hip and self.layers[i].hc_boundary_fused:
+                    if fused_step and self.layers[i].hc_boundary_fused:
                         state = forward_layer_fused_boundary(
                             self,
                             i,
@@ -4545,7 +4598,7 @@ class DeepseekV4Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: Optional[torch.Tensor],
+        input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if not _is_cuda:
@@ -4744,10 +4797,11 @@ class DeepseekV4Model(nn.Module):
             )
         hidden_states = self.norm(hidden_states)
 
-        # CUDA prefill CP: the runner gathers every output, DSpark captures
-        # included, by this rank's full shard layout, so the tail rows go back
-        # into that layout before the gather.
-        cuda_cp_tail = _needs_cp_tail_scatter(tail, forward_batch)
+        # DSpark's model-boundary hook gathers compact tail rows. Other CP
+        # outputs are gathered with this rank's full shard layout.
+        cuda_cp_tail = not capture_dspark and _needs_cp_tail_scatter(
+            tail, forward_batch
+        )
         num_tokens = input_ids.shape[0]
         if tail is not None and (not capture_dspark or cuda_cp_tail):
             # The logits processor indexes rows by the full extend layout.
@@ -4785,7 +4839,14 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     return quantization_config.get("quant_method") == "quark"
 
 
-class DeepseekV4ForCausalLM(nn.Module):
+def _v41_vision_a2a_supported() -> bool:
+    backend = get_moe_a2a_backend()
+    return backend.is_none() or (_is_cuda and backend.is_megamoe())
+
+
+class DeepseekV4ForCausalLM(
+    nn.Module, LanguageModelInputPreparation, CPBoundedTailLogits
+):
     supports_cuda_vmm_feature_transport = True
 
     @classmethod
@@ -4837,15 +4898,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             and not getattr(config, "language_model_only", False)
         ):
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+                get_parallel().pp_group.world_size != 1
+                or not _v41_vision_a2a_supported()
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP and prefill CP without PP; "
                     "MoE A2A requires CUDA MegaMoE"
                 )
 
@@ -4905,6 +4962,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         request/KV/draft state is touched; the runner owns the autotune context."""
         if getattr(self.config, "model_type", None) != "deepseek_v41":
             return 0
+        from flashinfer.fused_moe.utils import map_to_hybrid_bucket_uncapped
+
+        num_tokens = map_to_hybrid_bucket_uncapped(num_tokens)
         seen = set()
         # The backbone excludes vision and lm_head, whose prefill shapes differ.
         for layer in self.model.modules():
@@ -5051,6 +5111,25 @@ class DeepseekV4ForCausalLM(nn.Module):
     def num_fusable_shared_experts(cls, hf_config) -> int:
         """Shared experts fused as routed slots when fusion is on."""
         return hf_config.n_shared_experts or 0
+
+    def prepare_cp_logits_inputs(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> CPLogitsInputs:
+        if not (
+            self.capture_aux_hidden_states
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return CPLogitsInputs(input_ids, forward_batch)
+
+        tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        if tail is None:
+            raise RuntimeError("CP bounded-tail logits require prepared tail metadata")
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        logits_metadata.extend_seq_lens = tail.extend_seq_lens
+        logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+        logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        return CPLogitsInputs(tail.rows(input_ids), logits_metadata, tail.token_indices)
 
     def prepare_language_model_inputs(
         self,
@@ -5224,10 +5303,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             if _wo_a_weight_scale_to_e8m0 is not None:
                 # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
                 # requantizes the weight when the checkpoint's scales are not
-                # already powers of two. It also needs the weight row-major, so
-                # check the linear method honoured keep_plain_weight_layout: a
-                # preshuffled weight has the same shape, dtype and strides and
-                # would only show up as garbage output.
+                # already powers of two. It starts from the row-major weight
+                # (and applies the layout its kernel reads itself), so check the
+                # linear method honoured keep_plain_weight_layout: a preshuffled
+                # weight has the same shape, dtype and strides and would only
+                # show up as garbage output.
                 assert not getattr(attn.wo_a, "aiter_bpreshuffled", False), (
                     "DSV4 wo_a was B-preshuffled by the fp8 linear method; the "
                     "aiter mxscale absorb GEMM needs the row-major weight"
@@ -5258,6 +5338,81 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
+    def _load_npu_engram_gate_basis(self) -> None:
+        """Load the ModelSlim sidecar once, shared by this rank's Engram layers."""
+        if (
+            not _is_npu
+            or self.quant_config is None
+            or self.quant_config.get_name() != "modelslim"
+        ):
+            return
+        rotation = getattr(self.config, "engram_rotation_config", None)
+        if not rotation:
+            return
+        expected = {
+            "value_projection_rotated": True,
+            "value_basis": "quarot_global",
+            "key_and_gate_basis": "original",
+            "runtime_delta_rotation": False,
+        }
+        if not isinstance(rotation, dict) or any(
+            rotation.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError(f"Unsupported ModelSlim Engram rotation: {rotation}")
+        if getattr(self.model, "engram_gate_basis", None) is not None:
+            return
+        engram = next(
+            (
+                layer.engram
+                for layer in self.model.layers
+                if getattr(layer, "engram", None) is not None
+            ),
+            None,
+        )
+        if engram is None:
+            return
+        if engram.q_weight.is_meta:
+            raise ValueError("Load Engram weights before loading the gate rotation")
+
+        from pathlib import Path
+
+        from safetensors import safe_open
+
+        from sglang.srt.runtime_context import get_context, get_model
+
+        if get_context().is_config_namespace_published("model"):
+            from sglang.srt.model_loader.loader import loaded_checkpoint_files
+
+            # A checkpoint's config can still name a different, existing directory.
+            config = get_model()
+            loaded = loaded_checkpoint_files(config.model_path, config.revision)
+            model_path = loaded[0] if loaded is not None else config.model_path
+        else:
+            model_path = getattr(self.config, "_name_or_path", None)
+        if not model_path:
+            raise ValueError("ModelSlim Engram rotation requires the checkpoint path")
+        path = Path(model_path) / "optional" / "quarot.safetensors"
+        if not path.is_file():
+            raise FileNotFoundError(f"ModelSlim Engram rotation requires {path}")
+        with safe_open(str(path), framework="pt", device="cpu") as tensors:
+            if "global_rotation" not in tensors.keys():
+                raise ValueError(f"Missing global_rotation in {path}")
+            basis = tensors.get_tensor("global_rotation")
+        dim = self.config.hidden_size
+        if basis.shape != (dim, dim) or not basis.is_floating_point():
+            raise ValueError(
+                f"global_rotation must be a floating-point [{dim}, {dim}] tensor"
+            )
+        basis = basis.float()
+        if not torch.isfinite(basis).all():
+            raise ValueError("global_rotation contains non-finite values")
+        self.model.register_buffer(
+            "engram_gate_basis",
+            basis.to(device=engram.q_weight.device),
+            persistent=False,
+        )
+        logger.info("Loaded ModelSlim Engram gate rotation from %s", path)
+
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
@@ -5268,6 +5423,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
+        self._load_npu_engram_gate_basis()
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
@@ -5489,7 +5645,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
         skipped_by_group: dict[str, int] = {}
         # V4 checkpoints must load every compressor / indexer tensor.
@@ -5724,9 +5879,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     loaded_params.add(param_name)
                                     cache_compressor_weight.pop(key)
                             elif (
-                                fuse_wqa_wkv
-                                and ".compressor." not in name
+                                ".compressor." not in name
                                 and ".engram." not in name
+                                and name.replace(".wq_a.", ".wqkv_a.").replace(
+                                    ".wkv.", ".wqkv_a."
+                                )
+                                in params_dict
                                 and (
                                     name.endswith(".wq_a.weight")
                                     or name.endswith(".wq_a.weight_scale_inv")

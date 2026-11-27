@@ -28,6 +28,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import dp_capacity_for
 from sglang.srt.model_executor.forward_batch_info import (
     NgramEmbeddingInfo,
     enable_num_token_non_padded,
@@ -209,6 +210,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 encoder_lens = None
 
             if require_mlp_tp_gather:
+                # Pool ceiling, not live width: captured graphs replay this storage.
+                num_dp_ranks = dp_capacity_for(num_dp_ranks)
                 global_num_tokens_gpu = torch.zeros((num_dp_ranks,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros(
                     (num_dp_ranks,), dtype=torch.int32
@@ -301,6 +304,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
         pp_proxy_dspark_hidden_size: int = 0,
+        input_embeds_dtype: Optional[torch.dtype] = None,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
@@ -325,7 +329,9 @@ class PrefillInputBuffers(ForwardInputBuffers):
                 enable_input_embeds = is_multimodal
 
             if enable_input_embeds:
-                input_embeds = torch.zeros((max_num_tokens, hidden_size), dtype=dtype)
+                input_embeds = torch.zeros(
+                    (max_num_tokens, hidden_size), dtype=input_embeds_dtype or dtype
+                )
             else:
                 input_embeds = None
 

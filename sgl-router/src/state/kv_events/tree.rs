@@ -117,6 +117,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, error};
 
 use super::pending::PendingPrefixes;
+use crate::tokenizer::MEDIA_TAG_MARK;
 
 mod snapshot;
 
@@ -1196,6 +1197,18 @@ pub struct HashTree {
     pub(super) lora: Mutex<HashMap<KvWorkerId, sgl_kv_indexer::lora::LoraIndex>>,
     /// Route-time predictions, kept apart from the event-driven shards.
     pending: PendingPrefixes,
+    /// Where each chat with images was routed, per worker URL. KV events can
+    /// confirm such a chat only up to its first image (the engine derives image
+    /// token ids from pixels the router never sees), so this remembers the
+    /// rest for `--cache-media-affinity-ttl-ms`.
+    media: PendingPrefixes,
+    /// The same placements per DP rank, owned as `"{url}#{rank}"`.
+    media_ranks: PendingPrefixes,
+    /// Token ids marking an image in a rendered prompt; a prompt carrying one
+    /// is a media chat.
+    media_tokens: OnceLock<Vec<u32>>,
+    /// Lookups where media affinity broke a tie on the shared prefix.
+    media_tiebreaks: AtomicU64,
 }
 
 impl Default for HashTree {
@@ -1215,11 +1228,59 @@ impl HashTree {
             writer: Mutex::new(()),
             lora: Mutex::new(HashMap::new()),
             pending: PendingPrefixes::default(),
+            media: PendingPrefixes::default(),
+            media_ranks: PendingPrefixes::default(),
+            media_tokens: OnceLock::new(),
+            media_tiebreaks: AtomicU64::new(0),
         }
     }
 
     pub fn pending(&self) -> &PendingPrefixes {
         &self.pending
+    }
+
+    pub fn media(&self) -> &PendingPrefixes {
+        &self.media
+    }
+
+    pub fn media_ranks(&self) -> &PendingPrefixes {
+        &self.media_ranks
+    }
+
+    pub(crate) fn record_media_tiebreak(&self) {
+        self.media_tiebreaks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn media_tiebreaks(&self) -> u64 {
+        self.media_tiebreaks.load(Ordering::Relaxed)
+    }
+
+    /// Set the image placeholder token ids once, at startup.
+    pub fn set_media_tokens(&self, ids: Vec<u32>) {
+        let _ = self.media_tokens.set(ids);
+    }
+
+    /// Position of the prompt's first image placeholder when media affinity is
+    /// enabled and the placeholder carries its identity tag, which only a chat's
+    /// routing ids do (see [`crate::tokenizer::tag_images`]). `None` for a text
+    /// prompt, with media affinity off, or for ids that were never tagged: a
+    /// caller's `input_ids`, or a `/generate` or completions prompt spelling the
+    /// placeholder out. Those carry no image identity, so a placement keyed from
+    /// them would stand for every image behind the same text; they route by
+    /// their text, as without media affinity.
+    pub fn first_media_position(&self, tokens: &[u32]) -> Option<usize> {
+        if !self.media.is_enabled() {
+            return None;
+        }
+        let ids = self.media_tokens.get().filter(|ids| !ids.is_empty())?;
+        let position = tokens.iter().position(|t| ids.contains(t))?;
+        (tokens.get(position + 1) == Some(&MEDIA_TAG_MARK)).then_some(position)
+    }
+
+    /// Whether media affinity applies to this prompt: it is enabled and the
+    /// prompt carries a tagged image placeholder.
+    pub fn is_media_prompt(&self, tokens: &[u32]) -> bool {
+        self.first_media_position(tokens).is_some()
     }
 
     /// Resolve an `insert`'s `parent_hash` over the COMPLETE carrier set and
@@ -1534,6 +1595,9 @@ impl HashTree {
             shard.write().clear_worker(worker);
         }
         self.pending.forget_worker(&worker.url);
+        self.media.forget_worker(&worker.url);
+        self.media_ranks
+            .forget_worker(&format!("{}#{}", worker.url, worker.dp_rank));
     }
 
     /// Find the longest path from the root that matches a prefix of
