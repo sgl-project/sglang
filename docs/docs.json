@@ -1725,7 +1725,7 @@
                 ]
               },
               {
-                "group": "Action Models (VLA · WAM)",
+                "group": "Action Models",
                 "pages": [
                   "cookbook/vla/intro",
                   {
@@ -1752,7 +1752,7 @@
                 ]
               },
               {
-                "group": "By use case",
+                "group": "Use Cases",
                 "pages": [
                   "cookbook/use-cases/robotics-physical-ai"
                 ]
