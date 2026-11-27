@@ -439,6 +439,7 @@ from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.device import is_confidential_compute, is_npu
 from sglang.srt.utils.foundry_adapter import activate_foundry, get_foundry_adapter
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
+from sglang.srt.utils.process import gpu_proc_affinity_requested
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
 
@@ -7255,8 +7256,8 @@ def configure_scheduler_process(
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process
-    if envs.SGLANG_SET_CPU_AFFINITY.get():
-        set_gpu_proc_affinity(gpu_id)
+    if gpu_proc_affinity_requested():
+        set_gpu_proc_affinity(gpu_id, server_args)
     if envs.SGLANG_DISABLE_THP.get():
         disable_transparent_hugepages()
     if not envs.SGLANG_NUMA_BIND_V2.get():

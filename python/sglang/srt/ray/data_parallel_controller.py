@@ -30,6 +30,7 @@ from sglang.srt.ray.engine import (
     _get_bundle_node_ip,
     _resolve_bundle_indices,
 )
+from sglang.srt.ray.scheduler_actor import CpuShareLaunch
 from sglang.srt.runtime_context import (
     get_parallel,
 )
@@ -99,9 +100,20 @@ class RayDataParallelController(DataParallelController):
         for sock in sockets:
             sock.close()
 
-        # Create actors for each DP rank sequentially
+        # Create every DP group before any loads its weights: an actor waits for the
+        # others on its node to split their CPUs.
+        cpu_share = CpuShareLaunch(self.pg)
+        firsts = []
         for dp_rank in range(get_parallel().num_dp_ranks):
-            self._launch_ray_tp_group(server_args, dp_port_args_list[dp_rank], dp_rank)
+            firsts.append(len(self.scheduler_actors))
+            self._launch_ray_tp_group(
+                server_args, dp_port_args_list[dp_rank], dp_rank, cpu_share=cpu_share
+            )
+        self._close_cpu_share(cpu_share)
+        # Then load one DP group at a time, so one replica's weights sit in host memory
+        # at once.
+        for first, stop in zip(firsts, firsts[1:] + [None]):
+            self._await_ray_actors(first, stop)
 
     def launch_dp_attention_schedulers(
         self, server_args: ServerArgs, port_args: PortArgs
@@ -121,9 +133,17 @@ class RayDataParallelController(DataParallelController):
 
         # Skip _broadcast_worker_ports — Ray creates all actors centrally,
         # so there's no need for the inter-node handshake protocol.
+        first = len(self.scheduler_actors)
+        cpu_share = CpuShareLaunch(self.pg)
         self._launch_ray_tp_group(
-            server_args, port_args, dp_rank=None, worker_ports=worker_ports
+            server_args,
+            port_args,
+            dp_rank=None,
+            worker_ports=worker_ports,
+            cpu_share=cpu_share,
         )
+        self._close_cpu_share(cpu_share)
+        self._await_ray_actors(first)
 
     def _launch_ray_tp_group(
         self,
@@ -131,15 +151,16 @@ class RayDataParallelController(DataParallelController):
         port_args: PortArgs,
         dp_rank: Optional[int],
         worker_ports: Optional[List[int]] = None,
+        cpu_share: Optional[CpuShareLaunch] = None,
     ):
-        """Create SchedulerActor Ray actors for one TP group (one DP rank).
+        """Create SchedulerActor Ray actors for one TP group (one DP rank); the caller
+        waits for them with ``_await_ray_actors``.
 
         Args:
             dp_rank: DP rank for regular DP; None for DP attention (derived from tp_rank).
             worker_ports: Pre-allocated ports for DP attention; None for regular DP.
         """
         nnodes = get_parallel().nnodes
-        batch_start_idx = len(self.scheduler_actors)
 
         if not self.is_custom_pg:
             for node_idx in range(nnodes):
@@ -196,6 +217,7 @@ class RayDataParallelController(DataParallelController):
                             dp_rank=actual_dp_rank,
                             dist_init_addr=dist_init_addr,
                             rank0_node_ip=self.rank0_node_ip,
+                            cpu_share=cpu_share,
                         )
                         self.scheduler_actors.append(actor)
 
@@ -256,21 +278,37 @@ class RayDataParallelController(DataParallelController):
                     dp_rank=actual_dp_rank,
                     dist_init_addr=dist_init_addr,
                     rank0_node_ip=local_rank0_node_ip,
+                    cpu_share=cpu_share,
                 )
                 self.scheduler_actors.append(actor)
 
-        # Wait for all actors created in this call to initialize
-        batch_actors = self.scheduler_actors[batch_start_idx:]
+    def _kill_scheduler_actors(self):
+        for actor in self.scheduler_actors:
+            try:
+                ray.kill(actor)
+            except Exception:
+                logger.error(f"Failed to kill Ray scheduler actor: {actor}")
+
+    def _close_cpu_share(self, cpu_share: CpuShareLaunch):
         try:
+            cpu_share.close()
+        except ray.exceptions.RayError as e:
+            self._kill_scheduler_actors()
+            raise RuntimeError(f"Scheduler actors' CPU split failed: {e}")
+
+    def _await_ray_actors(self, first: int, stop: Optional[int] = None):
+        """Start the actors at ``scheduler_actors[first:stop]``, wait for them to
+        initialize, then start their event loops."""
+        batch_actors = self.scheduler_actors[first:stop]
+        try:
+            ray.get([actor.start.remote() for actor in batch_actors])
             scheduler_infos = ray.get(
                 [actor.get_info.remote() for actor in batch_actors]
             )
-        except ray.exceptions.RayActorError as e:
-            for actor in self.scheduler_actors:
-                try:
-                    ray.kill(actor)
-                except Exception:
-                    logger.error(f"Failed to kill Ray scheduler actor: {actor}")
+        except ray.exceptions.RayError as e:
+            # an actor that died or a start() that raised (e.g. out of memory loading
+            # weights): stop every actor, the groups already running included
+            self._kill_scheduler_actors()
             raise RuntimeError(f"Scheduler actor failed to initialize: {e}")
 
         # Store init info from the first actor (same across all actors)

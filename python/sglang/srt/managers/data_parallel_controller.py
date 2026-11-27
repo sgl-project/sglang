@@ -87,7 +87,11 @@ from sglang.srt.utils.network import (
     get_zmq_socket,
     get_zmq_socket_on_host,
 )
-from sglang.srt.utils.process import kill_itself_when_parent_died
+from sglang.srt.utils.process import (
+    gpu_proc_affinity_env,
+    kill_itself_when_parent_died,
+    plan_gpu_proc_affinity,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 
@@ -413,6 +417,18 @@ class DataParallelController:
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
+        # Every DP group's schedulers on this node share the node's CPUs.
+        group_stride = (
+            get_parallel().tp_size * get_parallel().pp_size * get_device().gpu_id_step
+        )
+        cpu_plan = plan_gpu_proc_affinity(
+            server_args,
+            [
+                gpu_id
+                for dp_rank in range(get_parallel().num_dp_ranks)
+                for gpu_id in _tp_group_gpu_ids(dp_rank * group_stride).values()
+            ],
+        )
 
         threads = []
         sockets = []
@@ -433,7 +449,14 @@ class DataParallelController:
             # Create a thread for each worker
             thread = threading.Thread(
                 target=self.launch_tensor_parallel_group_thread,
-                args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event),
+                args=(
+                    server_args,
+                    tmp_port_args,
+                    base_gpu_id,
+                    dp_rank,
+                    ready_event,
+                    cpu_plan,
+                ),
             )
             threads.append(thread)
             base_gpu_id += (
@@ -467,8 +490,11 @@ class DataParallelController:
         base_gpu_id: int,
         dp_rank: int,
         ready_event: threading.Event,
+        cpu_plan: dict[int, list[int]] | None = None,
     ):
-        self.launch_tensor_parallel_group(server_args, port_args, base_gpu_id, dp_rank)
+        self.launch_tensor_parallel_group(
+            server_args, port_args, base_gpu_id, dp_rank, cpu_plan=cpu_plan
+        )
         ready_event.set()
 
         # This thread cannot be closed because otherwise the `kill_itself_when_parent_died`
@@ -676,6 +702,7 @@ class DataParallelController:
         base_gpu_id: int,
         dp_rank: int | None,
         worker_ports: list[int] | None = None,
+        cpu_plan: dict[int, list[int]] | None = None,
     ):
         if not get_parallel().attn_dp_enabled:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
@@ -686,24 +713,10 @@ class DataParallelController:
 
         scheduler_pipe_readers = []
 
-        pp_size_per_node = max(get_parallel().pp_size // get_parallel().nnodes, 1)
-        nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
-        pp_rank_range = range(
-            pp_size_per_node * (get_parallel().node_rank // nnodes_per_pp_rank),
-            pp_size_per_node * (get_parallel().node_rank // nnodes_per_pp_rank + 1),
-        )
-
-        nnodes_per_tp_group = nnodes_per_pp_rank
-        tp_size_per_node = get_parallel().tp_size // nnodes_per_tp_group
-        if get_exec().moe.is_ep_scale_joiner:
-            # Scale joiners enumerate their full local TP span.
-            tp_rank_range = range(get_parallel().tp_size)
-            tp_size_per_node = get_parallel().tp_size
-        else:
-            tp_rank_range = range(
-                tp_size_per_node * (get_parallel().node_rank % nnodes_per_tp_group),
-                tp_size_per_node * (get_parallel().node_rank % nnodes_per_tp_group + 1),
-            )
+        gpu_ids = _tp_group_gpu_ids(base_gpu_id)
+        if cpu_plan is None:
+            cpu_plan = plan_gpu_proc_affinity(server_args, gpu_ids.values())
+        pp_rank_range, tp_rank_range = _local_rank_ranges()[:2]
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
@@ -738,12 +751,7 @@ class DataParallelController:
                     rank_port_args.nccl_port = port_args.nccl_port
                     rank_port_args.instance_id = port_args.instance_id
 
-                gpu_id = (
-                    get_device().base_gpu_id
-                    + base_gpu_id
-                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                    + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
-                )
+                gpu_id = gpu_ids[pp_rank, tp_rank]
                 # Derive the child's EP rank for its display label.
                 moe_ep_rank = (
                     tp_rank
@@ -788,6 +796,7 @@ class DataParallelController:
                         with (
                             memory_saver_adapter.configure_subprocess(),
                             numa_utils.configure_subprocess(server_args, gpu_id),
+                            gpu_proc_affinity_env(cpu_plan, gpu_ids[pp_rank, tp_rank]),
                         ):
                             proc.start()
                         self.scheduler_procs.append(proc)
@@ -926,6 +935,45 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
+
+
+def _local_rank_ranges() -> tuple[range, range, int, int]:
+    """This node's PP and TP rank ranges, and the PP and TP sizes per node."""
+    pp_size_per_node = max(get_parallel().pp_size // get_parallel().nnodes, 1)
+    nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
+    pp_rank_range = range(
+        pp_size_per_node * (get_parallel().node_rank // nnodes_per_pp_rank),
+        pp_size_per_node * (get_parallel().node_rank // nnodes_per_pp_rank + 1),
+    )
+
+    nnodes_per_tp_group = nnodes_per_pp_rank
+    tp_size_per_node = get_parallel().tp_size // nnodes_per_tp_group
+    if get_exec().moe.is_ep_scale_joiner:
+        # Scale joiners enumerate their full local TP span.
+        tp_rank_range = range(get_parallel().tp_size)
+        tp_size_per_node = get_parallel().tp_size
+    else:
+        tp_rank_range = range(
+            tp_size_per_node * (get_parallel().node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (get_parallel().node_rank % nnodes_per_tp_group + 1),
+        )
+    return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def _tp_group_gpu_ids(base_gpu_id: int) -> dict[tuple[int, int], int]:
+    """The GPU of each (pp_rank, tp_rank) scheduler the TP group at ``base_gpu_id``
+    starts on this node."""
+    pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
+        _local_rank_ranges()
+    )
+    return {
+        (pp_rank, tp_rank): get_device().base_gpu_id
+        + base_gpu_id
+        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+        + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
+        for pp_rank in pp_rank_range
+        for tp_rank in tp_rank_range
+    }
 
 
 def run_scheduler_process_with_init_pipe(run_scheduler_process_func: Callable, pipe):

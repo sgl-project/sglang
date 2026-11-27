@@ -2105,6 +2105,8 @@ class Envs:
     # NUMA and CPU affinity
     # ===================================================================
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    # The CPUs the launcher planned for one scheduler (set_gpu_proc_affinity).
+    SGLANG_GPU_PROC_CPUS = EnvStr("")
     SGLANG_DISABLE_THP = EnvBool(False)
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(True)

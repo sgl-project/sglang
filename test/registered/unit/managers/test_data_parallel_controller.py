@@ -369,6 +369,56 @@ class TestRayAttentionDpPortArgs(CustomTestCase):
                     )
 
 
+class TestRayActorStartFailure(CustomTestCase):
+    def test_a_failed_start_stops_every_actor(self):
+        """DP1 running out of memory in start(): DP0, already running, is stopped too."""
+        ray = ModuleType("ray")
+        ray.remote = lambda cls: cls
+
+        class RayError(Exception):
+            pass
+
+        ray.exceptions = SimpleNamespace(RayError=RayError)
+        killed = []
+        ray.kill = killed.append
+
+        def get(refs):
+            if "boom" in refs:
+                raise RayError("out of memory")
+            return refs
+
+        ray.get = get
+        placement = ModuleType("ray.util.placement_group")
+        placement.PlacementGroup = object
+        strategies = ModuleType("ray.util.scheduling_strategies")
+        strategies.PlacementGroupSchedulingStrategy = object
+        stubs = {
+            "ray": ray,
+            "ray.util": ModuleType("ray.util"),
+            "ray.util.placement_group": placement,
+            "ray.util.scheduling_strategies": strategies,
+        }
+        srt_package = importlib.import_module("sglang.srt")
+        with patch.dict("sys.modules", stubs), patch.dict(vars(srt_package)):
+            ray_dp = importlib.import_module("sglang.srt.ray.data_parallel_controller")
+            controller = ray_dp.RayDataParallelController.__new__(
+                ray_dp.RayDataParallelController
+            )
+            controller.event_loop_refs = []
+
+            def actor(start_result):
+                return SimpleNamespace(
+                    start=SimpleNamespace(remote=lambda: start_result),
+                    get_info=SimpleNamespace(remote=lambda: {}),
+                    run_event_loop=SimpleNamespace(remote=lambda: None),
+                )
+
+            controller.scheduler_actors = [actor("ok"), actor("boom")]
+            with self.assertRaises(RuntimeError):
+                controller._await_ray_actors(1)
+            self.assertEqual(killed, controller.scheduler_actors)
+
+
 class TestInitInfoReply(CustomTestCase):
     @staticmethod
     def _reply(*scheduler_infos):
