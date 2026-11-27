@@ -1002,6 +1002,37 @@ def _minimax_h3_collective_pipelined_attention(
     return ulysses_head_group_pipelined_attention(q, k, v, attend, groups)
 
 
+def _supports_device_varlen_graph(impl) -> bool:
+    from sglang.multimodal_gen.runtime.layers.attention.backends import flash_attn
+    from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
+        get_request_skip_softmax_params,
+    )
+
+    # Native FA consumes device offsets and a static sequence-length bound.
+    # Skip-softmax needs host planning. FA3's packed-padding specialization
+    # also slices and zeroes the tail using a host length; keep its eager break.
+    return (
+        isinstance(impl, flash_attn.FlashAttentionImpl)
+        and get_request_skip_softmax_params() is None
+        and (
+            flash_attn.fa_ver == 4
+            or (flash_attn.fa_ver == 3 and not impl.packed_trailing_padding)
+        )
+    )
+
+
+def _live_attention_bounds() -> tuple[tuple[int, ...], int]:
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+        live_packed_prompt,
+    )
+
+    branch = live_packed_prompt.get()
+    if branch is None:
+        raise RuntimeError("H3 packed attention requires a live request branch")
+    bounds = branch.bounds
+    return bounds, max(bounds[1], bounds[-1] - bounds[1])
+
+
 def _minimax_h3_qknorm_rope_pipelined_attention(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -1029,6 +1060,9 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
+    if cu_seqlens_host == ():
+        cu_seqlens_host, max_seqlen = _live_attention_bounds()
+        cu_seqlens = cu_seqlens[: len(cu_seqlens_host)]
     _minimax_h3_bind_attention_backend(attention, q.dtype)
     cos_sin_cache, positions = rope_cache
     head_dim = attention.head_dim
@@ -1104,6 +1138,10 @@ def _minimax_h3_attention_core_impl(
     residuals, and MLPs remain captured while the dynamic packed attention
     kernel and sequence-parallel collectives execute eagerly.
     """
+
+    if cu_seqlens_host == ():
+        cu_seqlens_host, max_seqlen = _live_attention_bounds()
+        cu_seqlens = cu_seqlens[: len(cu_seqlens_host)]
 
     _minimax_h3_bind_attention_backend(attention, q.dtype)
 
@@ -1191,7 +1229,9 @@ def _minimax_h3_attention_core_impl(
             k,
             v,
             attn_impl=attention._attention_impl,
-            real_seq_len=max_seqlen,
+            real_seq_len=cu_seqlens_host[1]
+            if cu_seqlens_host is not None
+            else max_seqlen,
             ring_ws=ring_ws,
         )
     else:
@@ -1761,7 +1801,18 @@ class MiniMaxH3Attention(nn.Module):
             gate_compress=gate_compress,
         )
         if self.bcg_breakpoint and is_in_breakable_cuda_graph():
-            out = _minimax_h3_attention_core_bcg(self, q, k, v, **core_kwargs)
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+                live_packed_prompt,
+            )
+
+            branch = live_packed_prompt.get()
+            if cu_seqlens_host == () and branch is not None and branch.capture_varlen:
+                # The normal two capture-stream warmups initialize the same backend and workspace.
+                out = self._attention_impl.forward_varlen(
+                    q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+                )
+            else:
+                out = _minimax_h3_attention_core_bcg(self, q, k, v, **core_kwargs)
         else:
             out = _minimax_h3_attention_core_impl(self, q, k, v, **core_kwargs)
         return out.reshape(total, self.num_heads * self.head_dim)
@@ -3173,34 +3224,49 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         refiner_cu_seqlens: torch.Tensor,
         *,
         device: torch.device,
+        text_len: int | None = None,
     ) -> torch.Tensor:
         """Project and refine request-static text conditioning once."""
         self.materialize_mps_non_layer_weights(
             "condition_proj", "token_refiner.final_norm"
         )
-        text_len = int(refiner_cu_seqlens[1].item())
-        if text_len <= 0 or text_len > int(prompt_embeds.shape[0]):
+        if text_len is None:
+            # Compatibility for direct padded calls that only provide device boundaries.
+            text_len = int(refiner_cu_seqlens[1])
+            refiner_cu_seqlens = torch.cat(
+                (refiner_cu_seqlens[:2], refiner_cu_seqlens[1:2])
+            )
+        if not 0 < text_len <= prompt_embeds.shape[0]:
             raise ValueError(
-                "refiner cu_seqlens live text length must be in "
-                f"[1, {int(prompt_embeds.shape[0])}], got {text_len}"
+                f"invalid live prompt length {text_len} for {prompt_embeds.shape[0]} rows"
             )
         text_rows = prompt_embeds[:text_len].to(device=device, dtype=_BF16_DTYPE)
-        true_refiner_cu = torch.stack(
-            (
-                refiner_cu_seqlens[0],
-                refiner_cu_seqlens[1],
-                refiner_cu_seqlens[1],
-            )
-        )
         text_embed, _ = self.condition_proj(text_rows)
         refined = self.token_refiner(
             text_embed,
-            cu_seqlens=true_refiner_cu,
+            cu_seqlens=refiner_cu_seqlens,
             cu_seqlens_host=(0, text_len, text_len),
             max_seqlen=text_len,
         )
         self.release_mps_non_layer_weights("condition_proj", "token_refiner.final_norm")
         return refined
+
+    def supports_graph_device_varlen(self) -> bool:
+        # The embedding and PDD head remain eager breaks. Only independent
+        # self-attention can be folded into the intervening graph segment.
+        if hasattr(self, "_resolve_attention_backend_once"):
+            self._resolve_attention_backend_once()
+        for block in self.blocks:
+            attn = block.attn
+            if (
+                not isinstance(attn, MiniMaxH3Attention)
+                or attn.to_gate_compress is not None
+            ):
+                return False
+            _minimax_h3_bind_attention_backend(attn, _BF16_DTYPE)
+            if not _supports_device_varlen_graph(attn._attention_impl):
+                return False
+        return True
 
     def build_rope_cache(
         self,
@@ -3277,6 +3343,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         text_pos: torch.Tensor,
         refiner_cu_seqlens: torch.Tensor,
         refiner_max_seqlen: int,
+        use_live_text_len: bool = False,
+        refiner_text_len: int | None = None,
         row_start: int,
         row_stop: int,
         device: torch.device,
@@ -3289,21 +3357,24 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         Returns embeddings [S_local, H] bf16 and t_emb [M, t_dim] fp32.
         During BCG capture/replay, embeddings are filled directly in the pool.
         """
-        # BCG pads the prompt tensor only to stabilize its input signature.
-        # Raw-input callers recover the live length from refiner metadata;
-        # request-static refined inputs carry it as a host integer and avoid a
-        # per-step device scalar read. Running the refiner at the bucketed M
-        # dimension changes GEMM selection and is not bitwise equivalent.
-        if refined_prompt_embeds_length is None:
-            text_len = int(refiner_cu_seqlens[1].item())
-        elif torch.is_tensor(refined_prompt_embeds_length):
-            # BCG turns this request-varying host constant into a scalar input
-            # so different live lengths can replay one padded-text signature.
-            # _embed is an eager graph break, so this value is read outside
-            # captured CUDA graphs.
-            text_len = int(refined_prompt_embeds_length.item())
-        else:
+        # The embedding break keeps the live GEMM extent even when the graph's
+        # prompt and position buffers are padded to a request bucket.
+        if use_live_text_len:
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+                live_packed_prompt,
+            )
+
+            branch = live_packed_prompt.get()
+            if branch is None:
+                raise RuntimeError("H3 packed replay requires the live request branch")
+            text_len = branch.text_len
+        elif refined_prompt_embeds_length is not None:
             text_len = int(refined_prompt_embeds_length)
+        elif refiner_text_len is not None:
+            text_len = refiner_text_len
+        else:
+            # Direct callers that have neither refined rows nor host bounds.
+            text_len = int(refiner_cu_seqlens[1])
         if text_len <= 0 or text_len > int(text_embeddings_selected.shape[0]):
             raise ValueError(
                 "refiner cu_seqlens live text length must be in "
@@ -3320,10 +3391,15 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     f"{self.hidden_size}, got {int(text_embed.shape[-1])}"
                 )
         else:
+            if not use_live_text_len:
+                refiner_cu_seqlens = torch.cat(
+                    (refiner_cu_seqlens[:2], refiner_cu_seqlens[1:2])
+                )
             text_embed = self.refine_prompt_embeds(
                 text_embeddings_selected,
                 refiner_cu_seqlens,
                 device=device,
+                text_len=text_len,
             )
 
         local_seq_len = row_stop - row_start
@@ -3480,14 +3556,17 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             torch.int32
         )
         raw_cu_seqlens_host = self._psp_optional_field(psp, "cu_seqlens_q_host")
-        cu_seqlens_host = tuple(
-            int(value)
-            for value in (
-                cu_seqlens.tolist()
-                if raw_cu_seqlens_host is None
-                else raw_cu_seqlens_host
+        if self._psp_optional_field(psp, "bcg_live_bounds"):
+            cu_seqlens_host = ()
+        else:
+            cu_seqlens_host = tuple(
+                int(value)
+                for value in (
+                    cu_seqlens.tolist()
+                    if raw_cu_seqlens_host is None
+                    else raw_cu_seqlens_host
+                )
             )
-        )
         # max_seqlen_q is set to cu_seqlens[1] (`used`, the real/non-padding
         # row count) by construction -- already a plain host int here, so
         # ring can reuse it as real_seq_len below with no new device sync.
@@ -3496,6 +3575,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         refiner_cu = self._psp_field(
             refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q"
         ).to(torch.int32)
+        refiner_bounds = self._psp_optional_field(refiner_psp, "cu_seqlens_q_host")
         refiner_max = int(
             self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q")
         )
@@ -3584,6 +3664,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             text_pos=text_pos,
             refiner_cu_seqlens=refiner_cu.to(device),
             refiner_max_seqlen=refiner_max,
+            use_live_text_len=bool(self._psp_optional_field(psp, "bcg_live_bounds")),
+            refiner_text_len=refiner_bounds[1] if refiner_bounds is not None else None,
             row_start=row_start,
             row_stop=row_stop,
             device=device,
