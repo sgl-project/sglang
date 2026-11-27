@@ -447,6 +447,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
 
 
 class ReasonerGrammarBackend(BaseGrammarBackend):
+    gates_reasoning_by_token_ids = True
+
     def __init__(
         self,
         grammar_backend: BaseGrammarBackend,

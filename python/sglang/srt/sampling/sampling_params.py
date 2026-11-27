@@ -16,7 +16,7 @@
 import copy
 import logging
 import math
-from typing import Any, Dict, List, Optional, Sequence, Set, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
 
@@ -143,6 +143,46 @@ def set_request_reasoning_in_grammar(sampling_params: Dict, enabled: bool) -> No
         return
     custom_params = dict(sampling_params.get("custom_params") or {})
     custom_params[REQUEST_REASONING_IN_GRAMMAR_KEY] = True
+    sampling_params["custom_params"] = custom_params
+
+
+# Private transport, like the reasoning terminator above: a whole-turn EBNF
+# (ebnf_full_assistant) without its reasoning, for a grammar backend that ends
+# the reasoning at the think-end token ids instead of at their text.
+REQUEST_REASONING_GATED_EBNF_KEY = "__sglang_reasoning_gated_ebnf"
+
+
+def get_request_reasoning_gated_ebnf(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+) -> Optional[str]:
+    if not isinstance(custom_params, dict):
+        return None
+    ebnf = custom_params.get(REQUEST_REASONING_GATED_EBNF_KEY)
+    return ebnf if isinstance(ebnf, str) and ebnf else None
+
+
+def set_request_reasoning_gated_ebnf(
+    sampling_params: Dict, build_ebnf: Optional[Callable[[], Optional[str]]]
+) -> None:
+    """Attach the post-reasoning variant of the request's whole-turn EBNF.
+
+    Removes any client-supplied value, and builds and attaches the variant
+    only when the request still carries a whole-turn EBNF."""
+    custom_params = sampling_params.get("custom_params")
+    ebnf = None
+    if build_ebnf is not None and sampling_params.get("ebnf_full_assistant") is True:
+        ebnf = build_ebnf()
+    keep = ebnf is not None
+    if not keep and not (
+        isinstance(custom_params, dict)
+        and REQUEST_REASONING_GATED_EBNF_KEY in custom_params
+    ):
+        return
+    custom_params = dict(custom_params or {})
+    if keep:
+        custom_params[REQUEST_REASONING_GATED_EBNF_KEY] = ebnf
+    else:
+        del custom_params[REQUEST_REASONING_GATED_EBNF_KEY]
     sampling_params["custom_params"] = custom_params
 
 

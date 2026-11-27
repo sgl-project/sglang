@@ -74,6 +74,7 @@ from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
+    REQUEST_REASONING_GATED_EBNF_KEY,
     get_request_reasoning_in_grammar,
 )
 from sglang.srt.server_args import ServerArgs
@@ -2643,6 +2644,66 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(
             second_tools, [tool.function.model_dump() for tool in req.tools]
         )
+
+    def test_glm47_request_carries_the_post_reasoning_grammar(self):
+        """With reasoning on, the whole-turn glm47 grammar travels with its
+        post-reasoning variant, which only a reasoning grammar backend uses.
+
+        Without both thinking signals the request carries no variant, and a
+        client cannot inject one.
+        """
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        self.chat.reasoning_parser = "glm45"
+        self.chat.tool_call_parser = "glm47"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        tool = {
+            "type": "function",
+            "function": {"name": "alpha", "parameters": {"type": "object"}},
+        }
+        cases = (
+            ("reasoning", None, "glm45", True),
+            ("enable_thinking=False", {"enable_thinking": False}, "glm45", False),
+            # Falsy but not False: the template config opens the reasoning
+            # while the grammar does not, so the grammar alone stays in charge.
+            ("enable_thinking=0", {"enable_thinking": 0}, "glm45", False),
+            # Without a reasoning parser nothing gates the reasoning by token ids.
+            ("no reasoning parser", None, None, False),
+        )
+        for name, kwargs, reasoning_parser, gated in cases:
+            with self.subTest(name):
+                self.chat.reasoning_parser = reasoning_parser
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Call alpha."}],
+                    tools=[tool],
+                    chat_template_kwargs=kwargs,
+                    custom_params={REQUEST_REASONING_GATED_EBNF_KEY: "root ::= x"},
+                )
+                with patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+                ):
+                    adapted, _ = self.chat._convert_to_internal_request(
+                        request, self.fastapi_request
+                    )
+                params = adapted.sampling_params
+                self.assertTrue(params["ebnf_full_assistant"])
+                variant = params["custom_params"].get(REQUEST_REASONING_GATED_EBNF_KEY)
+                if not gated:
+                    self.assertIsNone(variant)
+                    continue
+                self.assertTrue(adapted.require_reasoning)
+                whole, answer = (
+                    Grammar.from_ebnf(params["ebnf"]),
+                    Grammar.from_ebnf(variant),
+                )
+                call = "<tool_call>alpha</tool_call>"
+                self.assertTrue(_is_grammar_accept_string(whole, "plan</think>" + call))
+                self.assertTrue(_is_grammar_accept_string(answer, call))
+                self.assertFalse(_is_grammar_accept_string(answer, "</think>" + call))
 
     def test_glm47_constraint_includes_message_tools(self):
         """Constrain every active message tool, but none when tool use is disabled.

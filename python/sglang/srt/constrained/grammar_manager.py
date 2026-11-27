@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from concurrent import futures
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
@@ -23,6 +23,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
+    get_request_reasoning_gated_ebnf,
     get_request_reasoning_in_grammar,
 )
 
@@ -128,6 +129,22 @@ class GrammarManager:
                     req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
+    def _ebnf_key(self, req: Req) -> Tuple[str, str]:
+        sampling_params = req.sampling_params
+        if not sampling_params.ebnf_full_assistant:
+            return ("ebnf", sampling_params.ebnf)
+        gated = get_request_reasoning_gated_ebnf(sampling_params.custom_params)
+        if (
+            gated is not None
+            and req.require_reasoning
+            and self.grammar_backend.gates_reasoning_by_token_ids
+        ):
+            # The whole-turn grammar ends the reasoning at the text of its end
+            # marker, which ordinary tokens can spell; the backend ends it at
+            # the token ids and then applies the rest of the turn.
+            return ("ebnf", gated)
+        return ("full_assistant_ebnf", sampling_params.ebnf)
+
     def _get_request_thinking_budget(self, req: Req) -> int | None:
         custom_params = req.sampling_params.custom_params
         if not isinstance(custom_params, dict):
@@ -172,12 +189,7 @@ class GrammarManager:
                 elif req.sampling_params.regex is not None:
                     key = ("regex", req.sampling_params.regex)
                 elif req.sampling_params.ebnf is not None:
-                    key_type = (
-                        "full_assistant_ebnf"
-                        if req.sampling_params.ebnf_full_assistant
-                        else "ebnf"
-                    )
-                    key = (key_type, req.sampling_params.ebnf)
+                    key = self._ebnf_key(req)
                 elif req.sampling_params.structural_tag is not None:
                     key = ("structural_tag", req.sampling_params.structural_tag)
                 key = self.grammar_backend.get_request_grammar_key(

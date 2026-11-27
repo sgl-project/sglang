@@ -112,6 +112,7 @@ from sglang.srt.parser.response_template import (
 from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
+    set_request_reasoning_gated_ebnf,
 )
 from sglang.srt.utils import random_uuid
 
@@ -521,6 +522,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                         set_request_reasoning_end_token_ids(
                             sampling_params,
                             processed_messages.reasoning_end_token_ids,
+                        )
+                        set_request_reasoning_gated_ebnf(
+                            sampling_params,
+                            processed_messages.reasoning_gated_ebnf,
                         )
                     # _process_messages set skip_special_tokens on a chat_request
                     # we then discard, so re-apply it to the engine sampling dict.
