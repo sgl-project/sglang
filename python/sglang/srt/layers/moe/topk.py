@@ -1915,13 +1915,11 @@ class _DpPadRows:
     """The padding rows of a MAX_LEN DP gather, to route to no expert.
 
     ``masked`` is set once a router call has done it, so select_experts skips its
-    own mask launch. ``declined`` is set by a router that leaves the padding rows
-    routed, so select_experts masks nothing either.
+    own mask launch.
     """
 
     real_rows: torch.Tensor
     masked: bool = False
-    declined: bool = False
 
 
 def _dp_pad_rows_gate_kwargs(dp_pad_rows: Optional[_DpPadRows]) -> dict:
@@ -2234,7 +2232,6 @@ def biased_grouped_topk_gpu(
             )
         )
         if _jit_gate_ok:
-            from sglang.kernels.ops.moe import moe_route_radix
             from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate as jit_gate
 
             # Pass BF16 logits through untouched for the automatic radix-select
@@ -2245,17 +2242,6 @@ def biased_grouped_topk_gpu(
                 if gating_output.dtype == torch.bfloat16
                 else gating_output.to(dtype=torch.float32)
             )
-            _bias = correction_bias.to(dtype=torch.float32)
-            # K3 routes (the radix fast path) leave the DP padding rows routed:
-            # masking them would take two fill launches after the radix route
-            # and give up the fused handoff below, which takes no counts.
-            if (
-                dp_pad_rows is not None
-                and num_fused_shared_experts == 0
-                and moe_route_radix.covered(_gating, _bias, topk)
-            ):
-                dp_pad_rows.declined = True
-                dp_pad_rows = None
             # K3 staged fusion: when the model layer staged the routed
             # activations (route_quant_handoff), the radix route, the trtllm id
             # pack and the mxfp8 quant run as one launch. Bit-identical
@@ -2266,7 +2252,7 @@ def biased_grouped_topk_gpu(
             if dp_pad_rows is None:
                 fused = route_quant_handoff.try_route_quant_fused(
                     _gating,
-                    _bias,
+                    correction_bias.to(dtype=torch.float32),
                     topk,
                     num_fused_shared_experts=num_fused_shared_experts,
                     renormalize=renormalize,
@@ -2279,7 +2265,7 @@ def biased_grouped_topk_gpu(
                 return fused
             return jit_gate(
                 _gating,
-                _bias,
+                correction_bias.to(dtype=torch.float32),
                 topk=topk,
                 scoring_func="sigmoid",
                 num_fused_shared_experts=num_fused_shared_experts,
@@ -3048,8 +3034,6 @@ def select_experts(
                 **({"dp_pad_rows": dp_pad_rows} if dp_pad_rows is not None else {}),
             )
             padded_rows_masked = route_quant_handoff.take_padded_rows_masked()
-            if dp_pad_rows is not None and dp_pad_rows.declined:
-                dp_real_rows = dp_pad_rows = None
     elif torch_native and custom_routing_function is None:
         fold_scale_after_routing = True
         topk_weights, topk_ids = fused_topk_native(

@@ -3770,6 +3770,11 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
+    # route_radix (896 experts, top-16) has no DP padding-row mask: masking after
+    # it would cost two fill launches per MoE layer and the fused route + quant
+    # launch, so decode builds no DP counts for K3 (_model_skips_dp_pad_rows).
+    moe_skips_dp_pad_rows = False
+
     @staticmethod
     def get_model_config_for_expert_location(config):
         from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -4349,6 +4354,8 @@ class KimiK3LinearForCausalLM(nn.Module):
 
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
+
+    moe_skips_dp_pad_rows = KimiK3LinearForCausalLM.moe_skips_dp_pad_rows
 
     @staticmethod
     def get_model_config_for_expert_location(config):

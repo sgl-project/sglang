@@ -2015,6 +2015,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and not self.is_extend_in_batch
             and self.spec_info is None
             and _dp_tp_moe_skips_pad_rows()
+            and _model_skips_dp_pad_rows(model_runner)
         ):
             self.dp_real_rows_gpu = torch.empty(
                 len(dp_real_rows), dtype=torch.int64, device=device
@@ -2416,6 +2417,13 @@ def _dp_tp_moe_skips_pad_rows() -> bool:
         and not world_dp_gather_enabled()
         and not get_exec().overlap.enable_two_batch_overlap
     )
+
+
+def _model_skips_dp_pad_rows(model_runner: ModelRunner) -> bool:
+    """False for a model whose router keeps the padding rows routed
+    (``moe_skips_dp_pad_rows = False``): decode builds no counts for it."""
+    model = getattr(model_runner, "model", None)
+    return getattr(model, "moe_skips_dp_pad_rows", True)
 
 
 @lru_cache(maxsize=1)

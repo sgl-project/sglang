@@ -83,6 +83,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     _dp_tp_moe_masks_pad_rows,
     _dp_tp_moe_skips_pad_rows,
+    _model_skips_dp_pad_rows,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
     get_required_capture_hidden_mode,
@@ -595,6 +596,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and self.captured_req_width == 1
             and not self.model_runner.spec_algorithm.is_speculative()
             and _dp_tp_moe_skips_pad_rows()
+            and _model_skips_dp_pad_rows(self.model_runner)
             else None
         )
         # The early verify metadata writes these slots beside the draft graph, which
