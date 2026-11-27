@@ -48,6 +48,7 @@ def _routed(pool):
 def make_xqa_backend(monkeypatch):
     def parent_init(self, model_runner, *args, **kwargs):
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = model_runner.req_to_token_pool.row_width
         self.kv_cache_quant_method = SimpleNamespace(
             resolve_attention_access=lambda *args: SimpleNamespace(
                 kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN
@@ -514,7 +515,7 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
 
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
     backend.device = torch.device("cpu")
-    backend.req_to_token_pool = SimpleNamespace(row_width=1024)
+    backend.max_kv_len = 1024
     backend.page_size = PAGE_SIZE
     backend.max_num_pages = 8
     backend.req_to_token = torch.zeros(4, 1024, dtype=torch.int32)

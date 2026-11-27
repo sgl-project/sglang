@@ -47,6 +47,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
+        object.__setattr__(scheduler.request_receiver, "input_blocker", None)
         scheduler.pause_state = PauseState()
         scheduler.pause_state.pause()
         scheduler.enable_overlap = False

@@ -76,6 +76,7 @@ def _construct_sparse_backend(
         device="cpu",
         decode_cuda_graph_metadata={},
         req_to_token_pool=req_pool,
+        max_kv_len=req_pool.row_width,
         token_to_kv_pool=routed(SimpleNamespace()),
         page_size=1,
     )
@@ -382,6 +383,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             device="cpu",
             decode_cuda_graph_metadata={},
             req_to_token_pool=req_pool,
+            max_kv_len=req_pool.row_width,
             token_to_kv_pool=routed(SimpleNamespace()),
             page_size=1,
         )
@@ -907,7 +909,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         backend.device = "cpu"
         backend.model_dtype = torch.float16
         backend.heads_per_group = 16
-        backend.req_to_token_pool = SimpleNamespace(row_width=256)
+        backend.max_kv_len = 256
         backend.config_dense_len = 8192
         backend.dense_len = 8192
         backend.head_dim = 128
@@ -993,7 +995,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
                 metadata,
                 torch.empty(0),
                 torch.empty(0),
-                max_context_length=256,
+                max_kv_len=256,
                 k1_kernel_size=5,
                 k1_kernel_stride=3,
                 k2_kernel_size=13,
@@ -1011,7 +1013,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             k1=SimpleNamespace(cu_seqlens_cpu=[0, 2, 3]),
             k2=SimpleNamespace(cu_seqlens_cpu=[0, 1, 1]),
         )
-        backend.req_to_token_pool = SimpleNamespace(row_width=8)
+        backend.max_kv_len = 8
         backend.k1_kernel_size = 2
         backend.k1_kernel_stride = 2
         backend.k2_kernel_size = 4
@@ -1282,7 +1284,7 @@ import sglang.srt.layers.attention.minicpm.backend
         backend.k2_kernel_size = 1
         backend.k2_kernel_stride = 1
         backend.dense_len = 1
-        backend.req_to_token_pool = SimpleNamespace(row_width=1)
+        backend.max_kv_len = 1
         layer = SimpleNamespace(tp_q_head_num=1, tp_k_head_num=1, head_dim=1)
         forward_batch = SimpleNamespace(batch_size=2, extend_seq_lens_cpu=[1, 1])
 
@@ -1357,7 +1359,7 @@ import sglang.srt.layers.attention.minicpm.backend
         backend.head_group_num = 2
         backend.k1_kernel_stride = 2
         backend.k2_kernel_stride = 4
-        backend.req_to_token_pool = SimpleNamespace(row_width=8)
+        backend.max_kv_len = 8
         backend.req_to_sparse_k1_token = torch.arange(8).reshape(4, 2)
         backend.req_to_sparse_k2_token = torch.arange(8).reshape(4, 2)
         backend.decode_cuda_graph_metadata = {

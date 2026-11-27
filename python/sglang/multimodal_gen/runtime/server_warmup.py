@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen.configs.pipeline_configs.nomas import NomasPipelineConfig
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     has_realtime_model_adapter,
 )
@@ -90,10 +91,19 @@ def is_realtime_serving(server_args: ServerArgs) -> bool:
 
 
 def should_run_synthetic_server_warmup(server_args: ServerArgs) -> bool:
-    return (
-        should_run_server_warmup(server_args)
-        and supports_synthetic_warmup(server_args)
-        and not is_realtime_serving(server_args)
+    if not (
+        should_run_server_warmup(server_args) and supports_synthetic_warmup(server_args)
+    ):
+        return False
+    if not is_realtime_serving(server_args):
+        return True
+    # The same Nomas server accepts independent offline event requests.
+    return bool(
+        isinstance(server_args.pipeline_config, NomasPipelineConfig)
+        and server_args.enable_breakable_cuda_graph
+        and server_args.warmup_resolutions
+        and server_args.warmup_num_frames
+        and server_args.warmup_sampling_params
     )
 
 

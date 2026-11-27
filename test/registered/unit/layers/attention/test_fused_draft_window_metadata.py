@@ -185,13 +185,15 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         # The model's per-step attention is outside this metadata test. All
         # placement, allocation, translation and multi-step metadata are real.
         if backend_kind == "triton":
-            inner = SimpleNamespace()
+            inner = SimpleNamespace(max_kv_len=req.row_width)
             with patch.object(tb, "TritonAttnBackend", return_value=inner):
                 backend = tb.TritonMultiStepDraftBackend(runner, 1, 3)
         else:
             # The step backend writes a window sub-pool, as
             # FlashInferAttnBackend resolves it for this runner.
-            inner = SimpleNamespace(use_sliding_window_kv_pool=True)
+            inner = SimpleNamespace(
+                use_sliding_window_kv_pool=True, max_kv_len=req.row_width
+            )
             with patch.object(fb, "FlashInferAttnBackend", return_value=inner):
                 if backend_kind == "flashinfer":
                     backend = fb.FlashInferMultiStepDraftBackend(runner, 1, 3)

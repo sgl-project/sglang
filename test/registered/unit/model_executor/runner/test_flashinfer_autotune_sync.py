@@ -352,6 +352,16 @@ class TestModelPrefillAutotune(CustomTestCase):
                 self.hook.assert_not_called()
                 self.flashinfer_autotune_context.assert_not_called()
 
+    def test_hook_covers_verify_rows_above_prefill_chunk(self):
+        self.max_prefill_buffer_tokens.return_value = 1024
+        autotune.maybe_flashinfer_autotune_extend(self.runner, decode_num_tokens=1152)
+        self.hook.assert_called_once_with(1152, dtype=torch.bfloat16)
+
+        self.hook.reset_mock()
+        self.max_prefill_buffer_tokens.return_value = 4096
+        autotune.maybe_flashinfer_autotune_extend(self.runner, decode_num_tokens=768)
+        self.hook.assert_called_once_with(4096, dtype=torch.bfloat16)
+
 
 class TestExtendAutotuneDummy(CustomTestCase):
     """SGLANG_FLASHINFER_AUTOTUNE_EXTEND must tune exactly the per-rank prefill
