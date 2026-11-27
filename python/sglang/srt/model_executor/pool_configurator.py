@@ -1686,7 +1686,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
             padding_bytes = 0
             if self.swa_cap_tokens is None:
-                # SWA ratio sizing rounds down, so this difference can be negative.
+                # Reserved pages and C4 state padding cover SWA page rounding.
                 swa_tokens = self._get_swa_tokens(full_tokens, self.page_size)
                 logical_swa_bytes = (
                     full_tokens * self.swa_ratio * self._get_bytes_per_swa_token()
@@ -1987,22 +1987,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
         full_token = full_token // page_size * page_size
 
+        # The coefficient excludes reserved pages. Remove the few full pages
+        # needed to cover them, including indexer rounding at this capacity.
         while full_token > 0 and (
             full_token * self.bytes_per_full_token
             + self._get_low_ratio_kv_padding_bytes(full_token)
             > available_bytes_for_tokens
         ):
             full_token -= page_size
-        if _is_npu:
-            # The linear estimate can also leave room for another full page.
-            next_token = full_token + page_size
-            while (
-                next_token * self.bytes_per_full_token
-                + self._get_low_ratio_kv_padding_bytes(next_token)
-                <= available_bytes_for_tokens
-            ):
-                full_token = next_token
-                next_token += page_size
         if full_token <= 0 and self.swa_cap_tokens is not None:
             raise RuntimeError(
                 f"The DSV4 SWA pool cap ({self.swa_cap_tokens} tokens, "
