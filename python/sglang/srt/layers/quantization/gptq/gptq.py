@@ -99,6 +99,9 @@ class _CheckpointTensorManifest:
                 weight_modules.add(name.removesuffix(".weight"))
             elif name.endswith(".qweight"):
                 qweight_modules.add(name.removesuffix(".qweight"))
+            elif name.endswith((".experts.gate_up_proj", ".experts.down_proj")):
+                # Qwen3.5 stores stacked experts as bare parameters, no ``.weight``.
+                weight_modules.add(name)
         return cls(weight_modules, qweight_modules)
 
     def __deepcopy__(self, memo: dict[int, Any]) -> _CheckpointTensorManifest:
@@ -204,13 +207,10 @@ class _GPTQCheckpointMixin:
         ) is False or self.is_checkpoint_module_unquantized(prefix)
 
     def _expert_module_state(self, name: str, *, stacked: bool) -> Optional[str]:
-        # None: the checkpoint does not carry this tensor name, so it says nothing.
+        # With a manifest the checkpoint decides; None means it lacks this name.
         manifest = getattr(self, "_checkpoint_tensor_manifest", None)
         if manifest is not None:
-            state = manifest.classify_module(name)
-            if state is None:
-                return None
-            return "dense" if get_dynamic_override(self, layer_name=name) is False else state
+            return manifest.classify_module(name)
         if get_dynamic_override(self, layer_name=name) is False:
             return "dense"
         return None if stacked else "quantized"
