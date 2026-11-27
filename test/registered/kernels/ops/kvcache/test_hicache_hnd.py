@@ -9,6 +9,7 @@ holding the same KV as the NHD pool, viewed as slot rows.
 import pytest
 import torch
 
+from sglang.srt.managers.cache_controller import storage_model_name
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -118,6 +119,21 @@ def test_hnd_round_trip_matches_nhd(layout, io_backend, page, dtype):
     ):
         assert torch.equal(_bytes(n_buf)[dst.cuda()], old[src.cuda()])
         assert torch.equal(_bytes(_as_nhd(h_buf)), _bytes(n_buf))
+
+
+def test_hnd_pages_have_their_own_storage_keys():
+    nhd = _host(_device_pool("nhd", 64, torch.bfloat16), "page_first")
+    hnd = _host(_device_pool("hnd", 64, torch.bfloat16), "page_first")
+    try:
+        assert nhd.storage_format_tag is None
+        assert hnd.storage_format_tag == "hnd"
+        names = {
+            storage_model_name("org/model", host, torch.bfloat16) for host in (nhd, hnd)
+        }
+        assert len(names) == 2
+    finally:
+        nhd.destroy()
+        hnd.destroy()
 
 
 @pytest.mark.parametrize("layout", ["page_head", "page_unified"])

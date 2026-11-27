@@ -254,6 +254,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             pool_label=pool_label,
             host_token_capacity=host_token_capacity,
         )
+        # HND host pages hold device page bytes: key them apart from NHD in L3.
+        if buffer_info.buffers.layout == KVBufferLayout.HND:
+            self.storage_format_tag = "hnd"
         self.device_k_buffers = tuple(
             _transfer_rows(b, info) for info in infos for b in info.buffers.k
         )
