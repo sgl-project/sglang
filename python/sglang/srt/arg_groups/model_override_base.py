@@ -246,30 +246,27 @@ def ep_joiner_of(cfg: Any) -> bool:
     return cfg.ep_join_mode in ("scale", "recover")
 
 
-def context_parallel_attn_dp_size(cfg: Any, layout: str) -> int:
-    """The attention-DP width a DeepSeek context-parallel layout runs.
-
-    These layouts run data-parallel groups as attention DP, so `--dp-size N`
-    alone still means N attention-DP groups there. That reading is deprecated.
-    """
-    assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
-        f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
-        "data-parallel replicas combined with attention data parallelism "
-        "are not supported."
-    )
+def reject_dp_size_under_context_parallel(cfg: Any, layout: str) -> None:
+    """Reject `--dp-size > 1` under a DeepSeek context-parallel layout;
+    attention DP there is `--attn-dp-size`."""
     if cfg.dp_size > 1:
-        # TODO: reject `--dp-size > 1` here after 2026-12-31.
-        logger.warning(
-            f"--dp-size {cfg.dp_size} under {layout} runs {cfg.dp_size} attention "
-            "data-parallel groups. This is deprecated and will be rejected after "
-            f"2026-12-31; use --attn-dp-size {cfg.dp_size} instead."
+        raise ValueError(
+            f"--dp-size {cfg.dp_size} as attention data parallelism under "
+            f"{layout} was removed in SGLang 1.0; use --attn-dp-size "
+            f"{cfg.dp_size}."
         )
-    return cfg.attn_dp_size * cfg.dp_size
 
 
 def ep_scale_joiner_of(cfg: Any) -> bool:
     """The scale-up arm of :func:`ep_joiner_of`."""
     return cfg.ep_join_mode == "scale"
+
+
+def ep_offset_joiner_of(cfg: Any) -> bool:
+    """Joiner taking a specific global rank: scale, or recover into a retired slot."""
+    return cfg.ep_join_mode == "scale" or (
+        cfg.ep_join_mode == "recover" and cfg.ep_join_rank_offset > 0
+    )
 
 
 def startup_weight_load_overlap_of(cfg: Any) -> bool:
@@ -311,6 +308,23 @@ def _forces_eagle_topk_one(speculative_algorithm: str) -> bool:
     return str(speculative_algorithm).upper() == SpeculativeAlgorithm.DFLASH.name
 
 
+def flashinfer_fa2_serves_head_dims(model_config) -> bool:
+    """Whether FlashInfer's FA2 prefill handles every (qk, vo) head-dim pair.
+
+    FA2 needs both dims to be multiples of 64, and a vo dim above 256 to be a
+    multiple of 256. Other dims read out of bounds or return wrong results, and
+    FlashInfer 0.7.5 rejects them in plan() (flashinfer-ai/flashinfer#4312).
+    """
+    pairs = (
+        (model_config.head_dim, model_config.v_head_dim),
+        (model_config.swa_head_dim, model_config.swa_v_head_dim),
+    )
+    return all(
+        qk % 64 == 0 and vo % 64 == 0 and (vo <= 256 or vo % 256 == 0)
+        for qk, vo in pairs
+    )
+
+
 def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_config):
     """
     Auto select the fastest attention backend.
@@ -319,7 +333,8 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
         1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
         1.2 Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1.
            Note: trtllm_mha does not support SM120, which will fall back to flashinfer.
-        1.3 In other cases, we will use flashinfer if available, otherwise use triton.
+        1.3 In other cases, we will use flashinfer if available and its FA2 prefill
+            handles the model's head dims, otherwise use triton.
     2. Models with MLA Architecture and using FA3
         2.1 We will use FA3 backend on hopper.
         2.2 We will use Flashinfer backend on blackwell.
@@ -328,6 +343,9 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
     cfg = resolving_view(server_args)
     # OOT platforms provide their own default attention backend.
     if current_platform.is_out_of_tree():
+        return current_platform.get_default_attention_backend()
+
+    if get_platform().is_mlu:
         return current_platform.get_default_attention_backend()
 
     # Whisper requires flashinfer for cross-attention CUDA graph support.
@@ -367,7 +385,17 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
         else:
             # FlashInfer does not support attention sinks.
             if get_platform().has_flashinfer and not model_config.has_attention_sinks:
-                return "flashinfer"
+                if flashinfer_fa2_serves_head_dims(model_config):
+                    return "flashinfer"
+                logger.info(
+                    "FlashInfer FA2 prefill does not support head_dim=%s "
+                    "(v_head_dim=%s, swa_head_dim=%s, swa_v_head_dim=%s); "
+                    "using triton.",
+                    model_config.head_dim,
+                    model_config.v_head_dim,
+                    model_config.swa_head_dim,
+                    model_config.swa_v_head_dim,
+                )
             return "triton"
     else:
         # MLA architecture

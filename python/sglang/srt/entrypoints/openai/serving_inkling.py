@@ -3,6 +3,7 @@ Chat Completions and Responses APIs."""
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -25,15 +26,21 @@ from sglang.srt.parser.inkling_output import (
     InklingToolCall,
 )
 from sglang.srt.parser.inkling_renderer import (
+    check_served_tokenizer,
+    check_tool_call_author_name_mode,
     load_tml_renderers,
     render_inkling_assistant_prefix,
     render_inkling_messages,
 )
-from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 from sglang.srt.runtime_context import get_serving
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.chat_encoding_adapters import ChatOutputHooks
+
+# inkling2 shares Inkling's token format; only its auto-choice constraints differ.
+_TOKEN_TOOL_CALL_PARSERS = frozenset({"inkling", "inkling2"})
 
 
 class InklingChatEncodingAdapter:
@@ -42,6 +49,7 @@ class InklingChatEncodingAdapter:
     renders_response_format = False
     uncounted_prompt_tokens = 0
     wire = OPENAI_CHAT_WIRE
+    native_encoder = None
 
     def __init__(
         self,
@@ -50,23 +58,36 @@ class InklingChatEncodingAdapter:
         reasoning_parser: str | None,
         tool_call_parser: str | None,
         chat_hooks: ChatOutputHooks,
+        spec: str = "inkling",
+        tool_call_author_name_mode: str = "tool_name",
     ):
         # Validate the frozen effort default at startup,
         # so configuration errors fail before requests.
         self._default_reasoning_effort = get_default_reasoning_effort()
-        load_tml_renderers()
+        load_tml_renderers(spec)
         if tokenizer is not None:
-            _check_served_tokenizer(tokenizer)
-        parsers = {reasoning_parser, tool_call_parser} - {None}
-        if "inkling" in parsers and parsers != {"inkling"}:
+            check_served_tokenizer(tokenizer, spec=spec)
+        self._spec = spec
+        check_tool_call_author_name_mode(tool_call_author_name_mode, spec=spec)
+        self._tool_call_author_name_mode = tool_call_author_name_mode
+        if spec == "inkling2":
+            logger.info(
+                "Inkling2 tool-call header mode: %s", tool_call_author_name_mode
+            )
+        reasoning_is_token = reasoning_parser == "inkling"
+        tool_call_is_token = tool_call_parser in _TOKEN_TOOL_CALL_PARSERS
+        self._token_output = reasoning_is_token or tool_call_is_token
+        if self._token_output and not (
+            (reasoning_parser is None or reasoning_is_token)
+            and (tool_call_parser is None or tool_call_is_token)
+        ):
             # The token parser emits Inkling calls while constraints would come
             # from the other parser's format.
             raise ValueError(
-                "Inkling token parsing requires --reasoning-parser and "
-                "--tool-call-parser to be inkling or unset, got "
-                f"{reasoning_parser!r} and {tool_call_parser!r}"
+                "Inkling token parsing requires --reasoning-parser inkling and "
+                f"--tool-call-parser one of {sorted(_TOKEN_TOOL_CALL_PARSERS)} "
+                f"(or unset), got {reasoning_parser!r} and {tool_call_parser!r}"
             )
-        self._token_output = "inkling" in parsers
         self._separate_reasoning = bool(reasoning_parser)
         self._hooks = chat_hooks
 
@@ -101,9 +122,13 @@ class InklingChatEncodingAdapter:
             tool_choice=tool_choice,
             parallel_tool_calls=request.parallel_tool_calls,
             reasoning_effort=reasoning_effort,
+            spec=self._spec,
+            tool_call_author_name_mode=self._tool_call_author_name_mode,
         )
         if assistant_prefix is not None:
-            prompt_ids += render_inkling_assistant_prefix(assistant_prefix)
+            prompt_ids += render_inkling_assistant_prefix(
+                assistant_prefix, spec=self._spec
+            )
         return prompt_ids
 
     def parse_chat_response(
@@ -193,6 +218,7 @@ class InklingChatEncodingAdapter:
         parser = InklingOutputParser(
             separate_reasoning=separate_reasoning,
             parse_tool_calls=parse_tool_calls,
+            spec=self._spec,
         )
         delta = _finish(
             parser=parser,
@@ -213,6 +239,7 @@ class InklingChatEncodingAdapter:
         return InklingResponsesStream(
             separate_reasoning=separate_reasoning,
             parse_tool_calls=parse_tool_calls,
+            spec=self._spec,
         )
 
     def _new_output_parser(self, request: ChatCompletionRequest) -> InklingOutputParser:
@@ -225,6 +252,7 @@ class InklingChatEncodingAdapter:
                 and request.messages
                 and _is_continuable_message(request.messages[-1].model_dump())
             ),
+            spec=self._spec,
         )
 
     def _tool_call(
@@ -246,10 +274,12 @@ class InklingResponsesStream:
         *,
         separate_reasoning: bool,
         parse_tool_calls: bool,
+        spec: str = "inkling",
     ):
         self._parser = InklingOutputParser(
             separate_reasoning=separate_reasoning,
             parse_tool_calls=parse_tool_calls,
+            spec=spec,
         )
         self._incremental = get_serving().incremental_streaming_output
 
@@ -297,31 +327,6 @@ def _tool_call_items(delta: InklingOutputDelta) -> list[ToolCallItem]:
         ToolCallItem(tool_index=call.index, name=call.name, parameters=call.arguments)
         for call in delta.tool_calls
     ]
-
-
-_TOKENIZER_PROBE = "Hello, 世界! def f(x): return x**2"
-
-
-def _check_served_tokenizer(tokenizer: Any) -> None:
-    # Prompts and outputs use tml-renderers' tokenizer, while the scheduler matches
-    # stop strings and detokenizes with the served one; they must agree.
-    tml_tokenizer = load_tml_renderers().tokenizer
-    # encode() is the lookup both the HF and the tiktoken tokenizer wrappers share.
-    mismatched = [
-        token
-        for token in INKLING_SPECIAL_TOKEN_IDS
-        if tokenizer.encode(token, add_special_tokens=False)
-        != [tml_tokenizer.encode_special(token[2:-2])]
-    ]
-    if tokenizer.encode(_TOKENIZER_PROBE, add_special_tokens=False) != list(
-        tml_tokenizer.encode_ordinary(_TOKENIZER_PROBE)
-    ):
-        mismatched.append("ordinary text")
-    if mismatched:
-        raise ValueError(
-            "The served tokenizer disagrees with tml-renderers' o200k_base_chat on "
-            f"{', '.join(mismatched)}; Inkling prompts and outputs would be misencoded."
-        )
 
 
 def _pop_assistant_prefix(

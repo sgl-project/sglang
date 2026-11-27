@@ -11,6 +11,7 @@ from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectness
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
 from sglang.test.kits.eval_accuracy_kit import MMLUSanityMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
+from sglang.test.kits.sampling_penalty_kit import PenalizedEOSMixin
 from sglang.test.kits.spec_server_kits import SpecSamplingMaskKit
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
@@ -32,6 +33,7 @@ class TestBasicSanityDFlash(
     BasicSchedulerStressMixin,
     FwdOccupancyMixin,
     MMLUSanityMixin,
+    PenalizedEOSMixin,
     SpecSamplingMaskKit,
     CustomTestCase,
 ):
@@ -72,7 +74,11 @@ class TestBasicSanityDFlash(
                 "--enable-metrics",
                 "--cuda-graph-backend-prefill=disabled",
             ],
-            env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
+            env={
+                "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
+                # The DFlash draft derives a shorter context than the target.
+                "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
+            },
         )
 
     @classmethod

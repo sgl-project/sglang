@@ -608,7 +608,7 @@ Name the family the kernel was built for. `is_sm_at_least(10)` also admits SM120
 
 ## Step 4: Write tests (required)
 
-JIT kernel correctness tests and benchmarks live under `test/registered/kernels/ops/<group>/` and `test/registered/kernels/benchmark/<group>/`, mirroring the wrapper's group under `python/sglang/kernels/ops/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call anywhere under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook). Only their test-only helpers (e.g. `benchmark/marker.py`) stay alongside the kernel source under `python/sglang/kernels/jit/` and are imported by absolute path. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` and `bench_*.py` under `test/registered/`, collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
+JIT kernel correctness tests and benchmarks live under `test/registered/kernels/ops/<group>/` and `test/registered/kernels/benchmark/<group>/`, mirroring the wrapper's group under `python/sglang/kernels/ops/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call anywhere under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook). Only their test-only helpers (e.g. the `benchmark/marker/` package) stay alongside the kernel source under `python/sglang/kernels/jit/` and are imported by absolute path. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` and `bench_*.py` under `test/registered/`, collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
 
 - **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-large` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`).
 - **Nightly kernel suite**: register with `stage="nightly"` plus the `runner_config` of the machine it needs (e.g. `1-gpu-large`), giving the `nightly-test-1-gpu-large` suite. `.github/workflows/nightly-test-nvidia.yml` sets `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` for the whole nightly run, so the expanded parameter grids apply automatically (see `python/sglang/kernels/jit/utils/common.py` → `should_run_full_tests` / `get_ci_test_range`). There is no separate kernel-only nightly job: every nightly test on one machine type shares that machine's suite.
@@ -713,11 +713,13 @@ if __name__ == "__main__":
 
 ## Step 5: Add a benchmark (required)
 
-Benchmarks are `bench_*.py` files under `test/registered/kernels/benchmark/<group>/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`base-b-kernel-benchmark-test-1-gpu-large`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large`).
+Benchmarks are `bench_*.py` files under `test/registered/kernels/benchmark/<group>/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`base-b-kernel-benchmark-test-1-gpu-large`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large`). A kernel with an sm100-specific path (tcgen05, cluster launch, an arch branch) or a hot kernel of a model served on Blackwell also gets a second `register_cuda_ci(..., stage="base-b-kernel-benchmark", runner_config="1-gpu-b200")`; that subset runs as its own B200 job in the PR's JIT kernel workflow.
+
+Marker benchmarks also feed a regression check: CI sets `SGLANG_JIT_BENCHMARK_OUTPUT` so every case writes a record, `kernel-bench-nightly.yml` runs each runner's benchmark suite with full ranges and publishes a per-GPU baseline, and the PR's `kernel-bench-compare` job reports the cases slower than the baseline beyond the benchmark's `tolerance`; its Compare step then fails, but the job does not, so it never blocks a merge. By default every line is checked (`gate=...`); when the benchmark also has reference lines such as torch or flashinfer, list only this repo's own implementations in `@marker.benchmark(..., gate=[...])` (`gate=[]` checks nothing). `tolerance=marker.Tolerance(rel=..., abs_us=...)` sets how much slowdown is allowed.
 
 Every benchmark must account for L2 cache reuse — see [`rules/kernel-benchmark.md`](../../rules/kernel-benchmark.md).
 
-Benchmarks use the project's own `marker` framework (in `python/sglang/kernels/jit/benchmark/marker.py`) — **do not** use `triton.testing.perf_report` / `triton.testing.do_bench` directly. The marker framework provides (public names: `benchmark`, `parametrize`, `do_bench`, `skip`, `BenchResult`, `BenchSkip`):
+Benchmarks use the project's own `marker` framework (in `python/sglang/kernels/jit/benchmark/marker/`) — **do not** use `triton.testing.perf_report` / `triton.testing.do_bench` directly. The marker framework provides (public names: `benchmark`, `parametrize`, `do_bench`, `skip`, `BenchResult`, `BenchSkip`):
 
 - **`@marker.benchmark(line_arg, line_vals, *, unit="us")`** — the **innermost** decorator (bottom of the stack, directly above `def benchmark`). Declares the column axis: each value in `line_vals` becomes a result column, and `line_arg` is the parameter name passed into the benchmark function. `unit` is one of `"us" | "ms" | "s"`.
 - **`@marker.parametrize(names, vals, ci_vals=None)`** — stackable decorator that adds a row axis (pytest-style). Each `@parametrize` adds one (or more, correlated) parameter the benchmark is swept over (Cartesian product across all `parametrize` decorators). `names` may be a single name (`"size"`) or a comma-separated correlated tuple axis (`"h,d"`, with `vals` then a list of tuples like `[(1, 64), (2, 128)]`). Pass the optional third `ci_vals` for a smaller sweep that is auto-selected under `is_in_ci()` — this is the built-in CI-shrinking mechanism, so you usually don't need `get_benchmark_range` for swept axes.
@@ -799,6 +801,14 @@ Run the benchmark suite the way CI does:
 cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large
 ```
 
+Record the cases and compare them with a baseline (`--inputs` / `--current` take record directories or files; the baseline can be the nightly `kernel-bench-baseline` artifact):
+
+```bash
+SGLANG_JIT_BENCHMARK_OUTPUT=/tmp/kb python test/registered/kernels/benchmark/elementwise/bench_scale.py
+python3 scripts/ci/utils/kernel_bench_baseline.py build --inputs /tmp/kb_main --out /tmp/baseline.json
+python3 scripts/ci/utils/kernel_bench_baseline.py compare --baseline /tmp/baseline.json --current /tmp/kb
+```
+
 ---
 
 ## Troubleshooting
@@ -839,7 +849,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - `python/sglang/kernels/jit/csrc/elementwise/add_constant.cuh` — minimal runnable reference
 - `python/sglang/kernels/jit/csrc/elementwise/rmsnorm.cuh` — real example using `TensorMatcher` + `LaunchKernel` + `tile::Memory`
 - `python/sglang/kernels/jit/csrc/elementwise/qknorm.cuh` — real example using `runtime::get_blocks_per_sm` + persistent kernel pattern
-- `python/sglang/kernels/jit/benchmark/marker.py` — `benchmark`, `parametrize`, `do_bench`, `BenchResult`
+- `python/sglang/kernels/jit/benchmark/marker/` — `benchmark`, `parametrize`, `do_bench`, `BenchResult`
 - `python/sglang/kernels/jit/benchmark/utils.py` — `create_random` / `create_empty` / `get_benchmark_range` helpers and `DEFAULT_DTYPE` / `DEFAULT_DEVICE`
 - `test/registered/kernels/benchmark/layernorm/bench_qknorm.py` — real example: multi-axis `parametrize` (with `ci_vals`) + in-place `memory_output`
 - `test/registered/kernels/benchmark/kvcache/bench_store_cache.py` — real example: scoped `memory_args` / `memory_output` + selective `graph_clone_args`

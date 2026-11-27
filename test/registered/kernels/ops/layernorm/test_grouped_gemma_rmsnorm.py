@@ -2,9 +2,10 @@ import pytest
 import torch
 
 from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import grouped_gemma_rmsnorm
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 def _reference_grouped_gemma_rmsnorm(
@@ -30,6 +31,14 @@ _TOLERANCES = {
     torch.bfloat16: dict(rtol=5e-3, atol=5e-3),
     torch.float16: dict(rtol=1e-3, atol=1e-3),
 }
+
+
+def test_empty_dp_rank():
+    x = torch.empty(0, 10240, device="cuda", dtype=torch.bfloat16)
+    weight = torch.ones(10240, device=x.device, dtype=x.dtype)
+    out = grouped_gemma_rmsnorm(x, weight, 2560)
+    torch.cuda.synchronize()
+    assert out.shape == x.shape and out.dtype == x.dtype
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

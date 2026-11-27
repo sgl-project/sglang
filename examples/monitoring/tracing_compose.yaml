@@ -4,9 +4,10 @@ services:
     volumes:
       - ./opentelemetry.yaml:/etc/otelcol/config.yaml
       - /tmp:/tmp
+    # Published on loopback only; neither port has authentication.
     ports:
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
+      - "127.0.0.1:4317:4317"   # OTLP gRPC
+      - "127.0.0.1:4318:4318"   # OTLP HTTP
     depends_on:
       - jaeger
     restart: unless-stopped
@@ -15,7 +16,7 @@ services:
     image: jaegertracing/all-in-one
     container_name: jaeger
     ports:
-      - "16686:16686"
+      - "127.0.0.1:16686:16686"
     environment:
       - COLLECTOR_OTLP_ENABLED=true
     restart: unless-stopped

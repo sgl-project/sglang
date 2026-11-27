@@ -139,6 +139,7 @@ def maybe_dump_performance(
             reserved_mb=snapshot_dict.get("reserved_mb", 0.0),
             peak_allocated_mb=snapshot_dict.get("peak_allocated_mb", 0.0),
             peak_reserved_mb=snapshot_dict.get("peak_reserved_mb", 0.0),
+            peak_host_anon_mb=snapshot_dict.get("peak_host_anon_mb", 0.0),
         )
         metrics.memory_snapshots[checkpoint_name] = snapshot
 
@@ -155,14 +156,25 @@ def maybe_dump_performance(
 
 def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the generate command."""
-    server_args = ServerArgs.from_cli_args(args, unknown_args)
+    config_file = getattr(args, "config", None)
+    config_args = {}
+    if config_file:
+        config_args = ServerArgs.load_config_file(config_file) or {}
+    # A request for the diffusion decoder loads it, whether it comes from the
+    # CLI or the config file and whatever load_diffusion_decoder is set to.
+    # ServerArgs plans memory placement when it is built, so it has to know by
+    # then.
+    forced_args = None
+    if getattr(args, "use_diffusion_decoder", False) or config_args.get(
+        "use_diffusion_decoder"
+    ):
+        forced_args = {"load_diffusion_decoder": True}
+    server_args = ServerArgs.from_cli_args(args, unknown_args, forced_args=forced_args)
     sampling_params_cls = _resolve_cli_sampling_params_cls(server_args)
 
     sampling_params_kwargs = {}
-    config_file = getattr(args, "config", None)
     # respect config file by overriding args with args parsed from it
     if config_file:
-        config_args = ServerArgs.load_config_file(config_file) or {}
         if hasattr(sampling_params_cls, "supported_override_fields"):
             sampling_param_fields = sampling_params_cls.supported_override_fields()
         else:
@@ -204,6 +216,8 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     )
     try:
         results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
+        if results is None:
+            raise RuntimeError("Generation produced no results. See the errors above.")
 
         prompt = sampling_params_kwargs.get("prompt")
         maybe_dump_performance(args, server_args, prompt, results)

@@ -873,6 +873,7 @@ def _fused_conv_window_scatter_multi_kernel(
     NUM_TYPES: tl.constexpr,
     META_COLS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    CONTIGUOUS: tl.constexpr = False,
 ):
     pid_req = tl.program_id(0)
     pid_layer = tl.program_id(1).to(tl.int64)
@@ -927,15 +928,17 @@ def _fused_conv_window_scatter_multi_kernel(
             start = (pid_block - block_start) * BLOCK_SIZE
             e = start + tl.arange(0, BLOCK_SIZE)
             mask = e < elem_per_entry
-            d = e // last_axis
-            w = e % last_axis
             src_off = (
                 pid_layer * src_layer_stride
                 + src_idx * src_req_stride
                 + step_idx * src_step_stride
-                + d * src_dim_stride
-                + w * src_win_stride
             )
+            if CONTIGUOUS:
+                src_off += e
+            else:
+                src_off += (e // last_axis) * src_dim_stride + (
+                    e % last_axis
+                ) * src_win_stride
             dst_off = pid_layer * dst_layer_stride + dst_idx * dst_req_stride + e
             data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
             tl.store(dst_ptr + dst_off, data, mask=mask)
@@ -1018,10 +1021,16 @@ def fused_conv_window_scatter_multi(
     )
     cached = _conv_multi_meta_cache.get(key)
     if cached is None:
-        cached = _conv_multi_build_meta(pairs, BLOCK_SIZE)
+        cached = (
+            *_conv_multi_build_meta(pairs, BLOCK_SIZE),
+            all(
+                src.stride(4) == 1 and src.stride(3) == dst.shape[3]
+                for dst, src in pairs
+            ),
+        )
         _conv_multi_meta_cache.clear()
         _conv_multi_meta_cache[key] = cached
-    meta, total_blocks = cached
+    meta, total_blocks, contiguous = cached
 
     idx1 = (
         dst_indices_raw
@@ -1062,6 +1071,7 @@ def fused_conv_window_scatter_multi(
         NUM_TYPES=len(pairs),
         META_COLS=_CONV_MULTI_META_COLS,
         BLOCK_SIZE=BLOCK_SIZE,
+        CONTIGUOUS=contiguous,
     )
 
 
@@ -1146,12 +1156,16 @@ def _fused_commit_track_indices_kernel(
     accept_stride,
     interval,
     HAS_TRACK: tl.constexpr,
+    HAS_ACCEPT_INDEX: tl.constexpr,
 ):
     b = tl.program_id(0).to(tl.int64)
     al = tl.load(accept_lens_ptr + b).to(tl.int64)
     row = b * accept_stride
     base = b * dtn
-    last = tl.load(accept_index_ptr + row + al - 1).to(tl.int64) - base
+    if HAS_ACCEPT_INDEX:
+        last = tl.load(accept_index_ptr + row + al - 1).to(tl.int64) - base
+    else:
+        last = al - 1
     tl.store(last_correct_out_ptr + b, last)
     if HAS_TRACK:
         pre = tl.load(seq_lens_ptr + b).to(tl.int64)
@@ -1160,12 +1174,15 @@ def _fused_commit_track_indices_kernel(
         tp = (post // interval) * interval
         ti = tp - pre - 1
         ti = tl.where(ti < 0, 0, ti)
-        cand = tl.load(accept_index_ptr + row + ti).to(tl.int64) - base
+        if HAS_ACCEPT_INDEX:
+            cand = tl.load(accept_index_ptr + row + ti).to(tl.int64) - base
+        else:
+            cand = ti
         tl.store(track_steps_out_ptr + b, tl.where(cross, cand, -1))
 
 
 def fused_commit_track_indices(
-    accept_index: torch.Tensor,
+    accept_index: torch.Tensor | None,
     accept_lens: torch.Tensor,
     seq_lens: torch.Tensor | None,
     draft_token_num: int,
@@ -1176,11 +1193,14 @@ def fused_commit_track_indices(
 ):
     """Single-launch replacement for the eager verify-commit index math.
 
-    ``accept_index`` is [bs, tree_depth] but its values index
-    ``bs * draft_token_num`` rows. Optional output tensors let CUDA-graph
-    callers reuse stable storage instead of allocating on every replay.
+    ``accept_index`` is [bs, tree_depth] or None, indexing ``bs * draft_token_num``
+    rows when present. Optional output tensors let CUDA-graph callers reuse
+    stable storage across replays.
     """
-    accept_index = accept_index.contiguous()
+    has_accept_index = accept_index is not None
+    if has_accept_index:
+        accept_index = accept_index.contiguous()
+    accept_lens = accept_lens.contiguous()
     bs = accept_lens.shape[0]
     if last_correct_out is None:
         last_correct_step_indices = torch.empty(
@@ -1219,15 +1239,16 @@ def fused_commit_track_indices(
     else:
         mamba_steps_to_track = last_correct_step_indices
     _fused_commit_track_indices_kernel[(bs,)](
-        accept_index,
+        accept_index if has_accept_index else accept_lens,
         accept_lens,
-        seq_lens if has_track else accept_lens,
+        seq_lens.contiguous() if has_track else accept_lens,
         last_correct_step_indices,
         mamba_steps_to_track,
         draft_token_num,
-        accept_index.shape[1],
+        accept_index.shape[1] if has_accept_index else 0,
         mamba_track_interval,
         HAS_TRACK=has_track,
+        HAS_ACCEPT_INDEX=has_accept_index,
     )
     return last_correct_step_indices, (mamba_steps_to_track if has_track else None)
 

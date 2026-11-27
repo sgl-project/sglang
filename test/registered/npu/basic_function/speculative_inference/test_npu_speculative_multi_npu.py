@@ -45,7 +45,8 @@ _COMMON_ARGS = [
     "decode",
     "--mem-fraction-static",
     "0.7",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--dtype",
     "bfloat16",
 ]

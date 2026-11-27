@@ -17,7 +17,6 @@ import torch
 from sglang.srt.runtime_context import get_platform
 
 E2M1_MAX = 6.0
-MAX_BLOCK_SCALE_FP8 = 448.0  # Maximum FP8 E4M3 value
 # E2M1 format: 1 sign bit + 2 exponent bits + 1 mantissa bit = 4 bits
 # 16 possible values: 0x0-0xF
 # Negative values: 0x8-0xF (sign bit = 1)

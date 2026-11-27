@@ -505,6 +505,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.enable_external_cache_linker = False
         self.write_through_threshold = 256
         self.is_write_back = False
+        self.mamba_path_cap_counts_host = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(
@@ -649,6 +650,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
         return self._node_arena[node_id].backuped
+
+    def needs_incremental_component_backup(self, node_id: NodeId) -> bool:
+        """Whether an auxiliary component has device data missing from host."""
+        return self._needs_incremental_component_backup(self.node_by_id(node_id))
 
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
@@ -2084,12 +2089,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         ), f"D-leaf {node.id} has write {node.write_through_pending_id} in flight"
         self._begin_tracking_unbacked_tokens()
         try:
+            if is_write_back and (
+                not node.backuped or self._needs_incremental_component_backup(node)
+            ):
+                result.backup_kv = self._build_backup_kv_action(node, write_back=True)
+                return result
             if not node.backuped:
-                if is_write_back:
-                    result.backup_kv = self._build_backup_kv_action(
-                        node, write_back=True
-                    )
-                    return result
                 # Write-through: node has no backup, delete entirely.
                 self._delete_unbacked_device_leaf(
                     node,
@@ -2731,6 +2736,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_host_memory_buffer_only(self) -> None:
         self.is_host_memory_buffer_only = True
+
+    def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
+        self.mamba_path_cap_counts_host = enabled
 
     def insert_host(
         self,
