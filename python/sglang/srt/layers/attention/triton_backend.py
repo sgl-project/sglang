@@ -88,12 +88,12 @@ _MLA_DECODE_MIN_BLOCK_KV = 32
 
 
 def _mla_decode_kv_splits_cap(
-    base_max_kv_splits: int, sm_count: int, max_context_len: int
+    base_max_kv_splits: int, sm_count: int, max_kv_len: int
 ) -> int:
     if sm_count <= 0:
         return base_max_kv_splits
     sm_cap = next_power_of_2(sm_count)
-    ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _MLA_DECODE_MIN_BLOCK_KV))
+    ctx_cap = next_power_of_2(triton.cdiv(max_kv_len, _MLA_DECODE_MIN_BLOCK_KV))
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
@@ -1345,7 +1345,7 @@ class TritonAttnBackend(AttentionBackend):
             is_draft_runner=self.is_draft_runner,
             skip_prefill=self.skip_prefill,
             max_bs=max_bs,
-            max_context_len=self.max_kv_len,
+            max_kv_len=self.max_kv_len,
             num_draft_tokens=self.num_draft_tokens,
             device=self.device,
             is_read=True,
@@ -2709,7 +2709,6 @@ class TritonMultiStepDraftBackend:
         )
         self.device = model_runner.device
         # Cached variables for generate_draft_decode_kv_indices
-        self.req_to_token_pool = model_runner.req_to_token_pool
         self.max_kv_len = self.attn_backends[0].max_kv_len
         self.page_size = get_schedule().page_size
         self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
