@@ -87,18 +87,19 @@ def _deserialize(value: str) -> Any:
     return value
 
 
-def _json_arguments(value: str) -> Dict[str, Any]:
-    parsed = _deserialize(value)
-    if not isinstance(parsed, Mapping):
-        return {}
+def _mapping_arguments(parsed: Mapping) -> Dict[str, Any]:
     arguments = parsed.get("arguments", parsed.get("parameters", parsed))
     if isinstance(arguments, Mapping):
         return dict(arguments)
     return {}
 
 
-def _split_payload(payload: str, tools: Sequence[Tool]) -> tuple[str, str, str]:
-    """Split payload into (tool_name, params_text, json_text).
+def _split_payload(payload: str, tools: Sequence[Tool]) -> tuple[str, str, Any]:
+    """Split payload into (tool_name, params_text, parsed_json).
+
+    JSON payloads are deserialized once here and returned as the third
+    element (``None`` when the payload carries no JSON), so callers never
+    re-parse the same text.
 
     Handles three formats:
     1. Pure JSON: ``{"name": "func", "arguments": {...}}``
@@ -108,41 +109,39 @@ def _split_payload(payload: str, tools: Sequence[Tool]) -> tuple[str, str, str]:
     payload = payload.strip()
     param_pos = payload.find(PARAM_KEY_START_TOKEN)
     if param_pos != -1:
-        return payload[:param_pos].strip(), payload[param_pos:], ""
+        return payload[:param_pos].strip(), payload[param_pos:], None
 
     # Pure JSON: extract tool name from the "name" field.
     if payload.startswith("{"):
-        return "", "", payload
+        return "", "", _deserialize(payload)
 
     for tool_name in _iter_tool_names(tools):
         if payload == tool_name:
-            return tool_name, "", ""
+            return tool_name, "", None
         if payload.startswith(tool_name):
             rest = payload[len(tool_name) :].strip()
             if rest.startswith("{"):
-                return tool_name, "", rest
+                return tool_name, "", _deserialize(rest)
 
     # Name + JSON for tools not declared in `tools` (forwarded as-is).
     brace_pos = payload.find("{")
     if brace_pos > 0:
         candidate_name = payload[:brace_pos].strip()
-        candidate_json = payload[brace_pos:]
-        if candidate_name and isinstance(_deserialize(candidate_json), Mapping):
-            return candidate_name, "", candidate_json
+        parsed = _deserialize(payload[brace_pos:])
+        if candidate_name and isinstance(parsed, Mapping):
+            return candidate_name, "", parsed
 
-    return payload, "", ""
+    return payload, "", None
 
 
 def _parse_payload(payload: str, tools: Sequence[Tool]) -> tuple[str, Dict[str, Any]]:
-    tool_name, params_text, json_text = _split_payload(payload, tools)
-    arguments = _json_arguments(json_text) if json_text else {}
+    tool_name, params_text, parsed = _split_payload(payload, tools)
+    arguments = _mapping_arguments(parsed) if isinstance(parsed, Mapping) else {}
 
     # Pure JSON format: extract tool name from the JSON object.
-    if not tool_name and json_text:
-        parsed = _deserialize(json_text)
-        if isinstance(parsed, Mapping):
-            raw_name = parsed.get("name")
-            tool_name = raw_name.strip() if isinstance(raw_name, str) else ""
+    if not tool_name and isinstance(parsed, Mapping):
+        raw_name = parsed.get("name")
+        tool_name = raw_name.strip() if isinstance(raw_name, str) else ""
 
     for key, value in PARAM_REGEX.findall(params_text):
         arg_key = key.strip()
