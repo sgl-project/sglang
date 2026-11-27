@@ -14,7 +14,8 @@ from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 
 # The element count, token count and strides change with the resolution, so
 # they stay out of the constexprs. N and the strides keep Triton's divisibility
-# hint.
+# hint. BLOCK divides 128 * HEADS, so a program stays inside one (batch, token)
+# pair and divides by TOKENS once, not per element.
 @triton.jit(do_not_specialize=["TOKENS"])
 def _qk_norm_mrope_kernel(
     X,
@@ -34,12 +35,15 @@ def _qk_norm_mrope_kernel(
     EPS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.static_assert((128 * HEADS) % BLOCK == 0)
+    start = tl.program_id(0) * BLOCK
+    off = start + tl.arange(0, BLOCK)
     valid = off < N
     col = off % 128
     row = off // 128
-    token = (row // HEADS) % TOKENS
-    batch = row // (HEADS * TOKENS)
+    pair = start // (128 * HEADS)
+    token = pair % TOKENS
+    batch = pair // TOKENS
     head = row % HEADS
     src = batch * BS + token * TS + head * HS
     half = tl.where(col < 64, 32, 16)
@@ -120,8 +124,10 @@ def fused_nomas_qk_norm_mrope(
     if not math.isfinite(eps) or eps < 0:
         raise ValueError("eps must be finite and nonnegative")
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    # The largest power of two that divides 128 * heads, capped at 1024.
+    block = min(1024, 128 * heads & -(128 * heads))
     with torch.cuda.device(x.device):
-        _qk_norm_mrope_kernel[(triton.cdiv(x.numel(), 1024),)](
+        _qk_norm_mrope_kernel[(triton.cdiv(x.numel(), block),)](
             x,
             mean_t,
             mean_hw,
@@ -137,7 +143,7 @@ def fused_nomas_qk_norm_mrope(
             x.stride(1),
             x.stride(2),
             eps,
-            1024,
+            block,
             enable_fp_fusion=False,
         )
     return out

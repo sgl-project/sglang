@@ -5,7 +5,8 @@ import triton.language as tl
 
 # The sequence length and the cos/sin strides change with the resolution and the
 # frame count, so they stay out of the constexprs: one compile per model, not one
-# per token count. The strides keep Triton's divisibility hint.
+# per token count. The strides keep Triton's divisibility hint. The grid has a
+# token axis, so no program divides by the runtime sequence length.
 @triton.jit(do_not_specialize=["seq_len"])
 def _ltx2_split_rotary_kernel(
     out_ptr,
@@ -25,10 +26,9 @@ def _ltx2_split_rotary_kernel(
     BLOCK_HEADS: tl.constexpr,
     BLOCK_HALF: tl.constexpr,
 ):
-    pid_bt = tl.program_id(0)
+    token = tl.program_id(0)
     head_block = tl.program_id(1)
-    batch = pid_bt // seq_len
-    token = pid_bt - batch * seq_len
+    batch = tl.program_id(2)
     heads = head_block * BLOCK_HEADS + tl.arange(0, BLOCK_HEADS)
     offsets = tl.arange(0, BLOCK_HALF)
     mask = (heads[:, None] < num_heads) & (offsets[None, :] < half_dim)
@@ -82,7 +82,7 @@ def apply_ltx2_split_rotary_emb(
     block_half = triton.next_power_of_2(half_dim)
     block_heads = min(16, triton.next_power_of_2(num_heads))
     num_warps = min(8, max(1, block_heads))
-    grid = (batch * seq_len, triton.cdiv(num_heads, block_heads))
+    grid = (seq_len, triton.cdiv(num_heads, block_heads), batch)
     _ltx2_split_rotary_kernel[grid](
         out,
         x,
