@@ -16,16 +16,42 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/vllm/model_executor/layers/mamba/mamba2_metadata.py
 
 
+import itertools
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.linear.kernels.state_pool_io import PoolStaging
+
+
+class Mamba2MISMetadata(msgspec.Struct, frozen=True, kw_only=True):
+    """Compact query/item segment descriptors for Mamba-2 multi-item scoring."""
+
+    chunk_size: int
+    reset_cache_indices: torch.Tensor
+    query_token_indices: torch.Tensor
+    query_cu_seqlens: torch.Tensor
+    query_seq_lens_cpu: list[int]
+    query_seq_idx: torch.Tensor
+    query_cache_indices: torch.Tensor
+    query_cache_indices_i64: torch.Tensor
+    query_has_initial_states: torch.Tensor
+    item_token_indices: torch.Tensor
+    item_cu_seqlens: torch.Tensor
+    item_seq_lens_cpu: list[int]
+    item_seq_idx: torch.Tensor
+    item_chunk_indices: Optional[torch.Tensor]
+    item_chunk_offsets: Optional[torch.Tensor]
+    item_ssm_indices_i64: torch.Tensor
+    item_conv_indices: torch.Tensor
+    item_has_initial_states: torch.Tensor
 
 
 class ForwardStateSlots(NamedTuple):
@@ -129,6 +155,7 @@ class Mamba2Metadata(ForwardMetadata):
 
     mixed_metadata: MixedMetadata | None = None
     """`mixed_metadata` is used for extend/mixed requests"""
+    mis_metadata: Mamba2MISMetadata | None = None
 
     @staticmethod
     def _query_start_loc_to_chunk_indices_offsets(
@@ -355,3 +382,314 @@ class Mamba2Metadata(ForwardMetadata):
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
             ),
         )
+
+    @classmethod
+    def prepare_mis(
+        cls,
+        *,
+        cache_indices: torch.Tensor,
+        replayssm_ring_indices: Optional[torch.Tensor],
+        extend_prefix_lens_cpu: Optional[Sequence[int] | torch.Tensor],
+        extend_seq_lens_cpu: Optional[Sequence[int] | torch.Tensor],
+        multi_item_delimiter_indices: Optional[Sequence[torch.Tensor]],
+        num_input_tokens: int,
+        chunk_size: int,
+        device: torch.device,
+        is_prefill_only: bool = True,
+        is_extend: bool = True,
+        is_target_verify: bool = False,
+        mamba_prefill_track_mask_cpu: Optional[Sequence[bool]] = None,
+        has_mamba_track_mask: bool = False,
+        has_mamba_track_indices: bool = False,
+    ) -> "Mamba2Metadata":
+        """Build prefill-only MIS metadata without touching prepare_mixed sync paths."""
+        if (
+            (
+                mamba_prefill_track_mask_cpu is not None
+                and any(mamba_prefill_track_mask_cpu)
+            )
+            or (mamba_prefill_track_mask_cpu is None and has_mamba_track_mask)
+            or has_mamba_track_indices
+        ):
+            raise ValueError(
+                "Mamba-2 multi-item scoring requires --disable-radix-cache"
+            )
+        if not is_prefill_only or not is_extend or is_target_verify:
+            raise ValueError("Mamba2 MIS is only supported for prefill-only requests")
+        if extend_seq_lens_cpu is None or extend_prefix_lens_cpu is None:
+            raise ValueError(
+                "Mamba2 MIS requires extend_seq_lens_cpu and extend_prefix_lens_cpu"
+            )
+
+        seq_lens = _to_int_list(values=extend_seq_lens_cpu)
+        num_prefills = len(seq_lens)
+        prefill_cache_indices = cache_indices[:num_prefills]
+        prefill_ring_indices = (
+            None
+            if replayssm_ring_indices is None
+            else replayssm_ring_indices[:num_prefills]
+        )
+        mis_metadata = build_mamba2_mis_metadata(
+            is_prefill_only=is_prefill_only,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=seq_lens,
+            multi_item_delimiter_indices=multi_item_delimiter_indices,
+            num_input_tokens=num_input_tokens,
+            cache_indices=prefill_cache_indices,
+            chunk_size=chunk_size,
+            device=device,
+        )
+        return cls(
+            query_start_loc=torch.empty(0, dtype=torch.int32, device=device),
+            logical_num_tokens=sum(seq_lens),
+            mamba_cache_indices=prefill_cache_indices,
+            replayssm_ring_indices=prefill_ring_indices,
+            num_prefills=num_prefills,
+            num_prefill_tokens=sum(seq_lens),
+            num_decodes=0,
+            mis_metadata=mis_metadata,
+        )
+
+
+def build_mamba2_mis_metadata(
+    *,
+    is_prefill_only: bool,
+    extend_prefix_lens_cpu: Sequence[int] | torch.Tensor,
+    extend_seq_lens_cpu: Sequence[int] | torch.Tensor,
+    multi_item_delimiter_indices: Optional[Sequence[torch.Tensor]],
+    num_input_tokens: int,
+    cache_indices: torch.Tensor,
+    chunk_size: int,
+    device: torch.device,
+) -> Mamba2MISMetadata:
+    """Build compact query and item segments from request-local MIS delimiters."""
+    seq_lens, validated_delimiters = _validate_mis_batch_inputs(
+        is_prefill_only=is_prefill_only,
+        extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        multi_item_delimiter_indices=multi_item_delimiter_indices,
+        num_input_tokens=num_input_tokens,
+        cache_indices=cache_indices,
+        chunk_size=chunk_size,
+        device=device,
+    )
+    (
+        query_token_indices,
+        query_seq_lens_cpu,
+        query_seq_idx_flat,
+        query_request_indices,
+        item_token_indices,
+        item_seq_lens_cpu,
+        item_seq_idx_flat,
+        item_request_indices,
+    ) = _collect_mis_segments(
+        seq_lens=seq_lens,
+        multi_item_delimiter_indices=validated_delimiters,
+    )
+
+    query_cu_seqlens_cpu = _cu_seqlens_cpu(lengths=query_seq_lens_cpu)
+    item_cu_seqlens_cpu = _cu_seqlens_cpu(lengths=item_seq_lens_cpu)
+    if item_token_indices:
+        chunk_idx_cpu, chunk_off_cpu = (
+            Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
+                query_start_loc=item_cu_seqlens_cpu,
+                chunk_size=chunk_size,
+                total_seqlens=len(item_token_indices),
+            )
+        )
+        item_chunk_indices = chunk_idx_cpu.to(device=device, non_blocking=True)
+        item_chunk_offsets = chunk_off_cpu.to(device=device, non_blocking=True)
+    else:
+        item_chunk_indices = None
+        item_chunk_offsets = None
+
+    # Clone so later caller mutations to cache_indices cannot alias batch metadata.
+    reset_cache_indices = cache_indices.to(dtype=torch.int64).clone()
+    query_req_t = _to_device_non_blocking(
+        values=query_request_indices, dtype=torch.int64, device=device
+    )
+    item_req_t = _to_device_non_blocking(
+        values=item_request_indices, dtype=torch.int64, device=device
+    )
+    query_cache_i64 = reset_cache_indices.index_select(0, query_req_t)
+    item_ssm_i64 = reset_cache_indices.index_select(0, item_req_t)
+
+    return Mamba2MISMetadata(
+        chunk_size=chunk_size,
+        reset_cache_indices=reset_cache_indices,
+        query_token_indices=_to_device_non_blocking(
+            values=query_token_indices, dtype=torch.int64, device=device
+        ),
+        query_cu_seqlens=query_cu_seqlens_cpu.to(device=device, non_blocking=True),
+        query_seq_lens_cpu=query_seq_lens_cpu,
+        query_seq_idx=_to_device_non_blocking(
+            values=query_seq_idx_flat, dtype=torch.int32, device=device
+        ).unsqueeze(0),
+        query_cache_indices=query_cache_i64.to(dtype=torch.int32),
+        query_cache_indices_i64=query_cache_i64,
+        query_has_initial_states=torch.zeros(
+            len(query_seq_lens_cpu), dtype=torch.bool, device=device
+        ),
+        item_token_indices=_to_device_non_blocking(
+            values=item_token_indices, dtype=torch.int64, device=device
+        ),
+        item_cu_seqlens=item_cu_seqlens_cpu.to(device=device, non_blocking=True),
+        item_seq_lens_cpu=item_seq_lens_cpu,
+        item_seq_idx=_to_device_non_blocking(
+            values=item_seq_idx_flat, dtype=torch.int32, device=device
+        ).unsqueeze(0),
+        item_chunk_indices=item_chunk_indices,
+        item_chunk_offsets=item_chunk_offsets,
+        item_ssm_indices_i64=item_ssm_i64,
+        item_conv_indices=torch.arange(
+            len(item_seq_lens_cpu), dtype=torch.int32, device=device
+        ),
+        item_has_initial_states=torch.ones(
+            len(item_seq_lens_cpu), dtype=torch.bool, device=device
+        ),
+    )
+
+
+def _validate_mis_batch_inputs(
+    *,
+    is_prefill_only: bool,
+    extend_prefix_lens_cpu: Sequence[int] | torch.Tensor,
+    extend_seq_lens_cpu: Sequence[int] | torch.Tensor,
+    multi_item_delimiter_indices: Optional[Sequence[torch.Tensor]],
+    num_input_tokens: int,
+    cache_indices: torch.Tensor,
+    chunk_size: int,
+    device: torch.device,
+) -> tuple[list[int], Sequence[torch.Tensor]]:
+    if not is_prefill_only:
+        raise ValueError("Mamba2 MIS is only supported for prefill-only requests")
+
+    prefix_lens = _to_int_list(values=extend_prefix_lens_cpu)
+    if any(prefix_len != 0 for prefix_len in prefix_lens):
+        raise ValueError("Mamba2 MIS does not support cached prefixes")
+
+    seq_lens = _to_int_list(values=extend_seq_lens_cpu)
+    if multi_item_delimiter_indices is None or len(multi_item_delimiter_indices) != len(
+        seq_lens
+    ):
+        raise ValueError("Mamba2 MIS requires delimiter indices for every request")
+    if sum(seq_lens) > num_input_tokens:
+        raise ValueError("Mamba2 MIS sequence lengths exceed the input tokens")
+    if chunk_size <= 0:
+        raise ValueError("Mamba2 MIS requires a positive chunk_size")
+    if (
+        cache_indices.is_meta
+        or cache_indices.ndim != 1
+        or cache_indices.numel() != len(seq_lens)
+        or cache_indices.device != device
+        or cache_indices.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError(
+            "Mamba2 MIS requires 1D integer cache_indices on the batch device for every request"
+        )
+    return seq_lens, multi_item_delimiter_indices
+
+
+def _validate_mis_delimiters(
+    *, seq_len: int, request_delimiters: torch.Tensor
+) -> list[int]:
+    delimiters = [int(index) for index in request_delimiters.tolist()]
+    if len(delimiters) < 2:
+        raise ValueError("Mamba2 MIS requires at least two delimiters per request")
+    if any(
+        current >= following for current, following in zip(delimiters, delimiters[1:])
+    ):
+        raise ValueError("Mamba2 MIS delimiter indices must be strictly increasing")
+    if delimiters[0] < 0 or delimiters[-1] >= seq_len:
+        raise ValueError("Mamba2 MIS delimiter index is outside the request")
+    if delimiters[-1] != seq_len - 1:
+        raise ValueError("Mamba2 MIS final delimiter must be the last request token")
+    if any(
+        following - current == 1
+        for current, following in zip(delimiters, delimiters[1:])
+    ):
+        raise ValueError("Mamba2 MIS does not support empty items")
+    return delimiters
+
+
+def _collect_mis_segments(
+    *,
+    seq_lens: list[int],
+    multi_item_delimiter_indices: Sequence[torch.Tensor],
+) -> tuple[
+    list[int],
+    list[int],
+    list[int],
+    list[int],
+    list[int],
+    list[int],
+    list[int],
+    list[int],
+]:
+    query_token_indices: list[int] = []
+    query_seq_lens_cpu: list[int] = []
+    query_seq_idx_flat: list[int] = []
+    query_request_indices: list[int] = []
+    item_token_indices: list[int] = []
+    item_seq_lens_cpu: list[int] = []
+    item_seq_idx_flat: list[int] = []
+    item_request_indices: list[int] = []
+
+    request_start = 0
+    for request_idx, (seq_len, request_delimiters) in enumerate(
+        zip(seq_lens, multi_item_delimiter_indices)
+    ):
+        delimiters = _validate_mis_delimiters(
+            seq_len=seq_len, request_delimiters=request_delimiters
+        )
+        query_len = delimiters[0]
+        if query_len > 0:
+            q_seg_idx = len(query_seq_lens_cpu)
+            query_token_indices.extend(range(request_start, request_start + query_len))
+            query_seq_lens_cpu.append(query_len)
+            query_seq_idx_flat.extend([q_seg_idx] * query_len)
+            query_request_indices.append(request_idx)
+
+        # Skip delimiter tokens themselves; items start right after each delimiter
+        # and stop before the next delimiter (leaving the trailing delimiter excluded).
+        for branch_start, branch_end in zip(delimiters, delimiters[1:]):
+            item_start = branch_start + 1
+            item_len = branch_end - item_start
+            assert item_len > 0
+            it_seg_idx = len(item_seq_lens_cpu)
+            item_token_indices.extend(
+                range(request_start + item_start, request_start + branch_end)
+            )
+            item_seq_lens_cpu.append(item_len)
+            item_seq_idx_flat.extend([it_seg_idx] * item_len)
+            item_request_indices.append(request_idx)
+
+        request_start += seq_len
+
+    return (
+        query_token_indices,
+        query_seq_lens_cpu,
+        query_seq_idx_flat,
+        query_request_indices,
+        item_token_indices,
+        item_seq_lens_cpu,
+        item_seq_idx_flat,
+        item_request_indices,
+    )
+
+
+def _cu_seqlens_cpu(*, lengths: list[int]) -> torch.Tensor:
+    if not lengths:
+        return torch.zeros(1, dtype=torch.int32)
+    return torch.tensor([0, *itertools.accumulate(lengths)], dtype=torch.int32)
+
+
+def _to_int_list(*, values: Sequence[int] | torch.Tensor) -> list[int]:
+    raw_values = values.tolist() if isinstance(values, torch.Tensor) else values
+    return [int(value) for value in raw_values]
+
+
+def _to_device_non_blocking(
+    *, values: Sequence[int], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    return torch.tensor(values, dtype=dtype).to(device=device, non_blocking=True)
