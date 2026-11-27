@@ -36,15 +36,6 @@ on:
           - gsm8k
           - gpqa_diamond
         default: 'auto'
-      acc_profile:
-        description: 'A/B profile of the qwen3.6-27b W8A8 GPQA accuracy case. "baseline" keeps the nightly configuration; "det" only adds determinism env vars; "ab" runs baseline then det serially in the same run.'
-        required: false
-        type: choice
-        options:
-          - baseline
-          - det
-          - ab
-        default: 'baseline'
   workflow_call:
     inputs:
       ref:
@@ -72,11 +63,6 @@ on:
         required: false
         type: string
         default: ''
-      acc_profile:
-        description: 'A/B profile of the qwen3.6-27b W8A8 GPQA accuracy case (baseline/det/ab). Empty keeps "baseline".'
-        required: false
-        type: string
-        default: ''
 concurrency:
   group: nightly-test-npu-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
@@ -91,7 +77,6 @@ jobs:
       run_start_metadata: ${{ steps.set-vars.outputs.run_start_metadata }}
       accuracy_dataset: ${{ steps.set-vars.outputs.accuracy_dataset }}
       accuracy_date_parity: ${{ steps.set-vars.outputs.accuracy_date_parity }}
-      acc_profiles: ${{ steps.set-vars.outputs.acc_profiles }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
       - name: Set image config
@@ -109,9 +94,10 @@ jobs:
           fi
           JOB_FILTER="$(echo "${JOB_FILTER}" | tr -d '[:space:]')"
           # TEMP: pull_request runs carry no inputs, so pin the PR rerun to the
-          # qwen3.6-27b W8A8 GPQA accuracy case.
+          # qwen3.6-27b W8A8 GPQA accuracy case, the qwen3.6-27b 2P
+          # in16k/out1k perf case, and the GLM-5.3-Flash 1P1D 16P perf case.
           if [ -z "${JOB_FILTER}" ] && [ "${{ github.event_name }}" = "pull_request" ]; then
-            JOB_FILTER="nightly-acc-test-2-npu-a3"
+            JOB_FILTER="nightly-acc-test-2-npu-a3,nightly-perf-test-4-npu-a3,nightly-poc-multi-node-specified-tests"
           fi
           echo "job_filter=${JOB_FILTER:-all}" | tee -a $GITHUB_OUTPUT
           if [ -z "${{ inputs.image_a3 }}" ]; then
@@ -173,33 +159,6 @@ jobs:
             ACCURACY_DATE_PARITY="even"
           fi
           echo "accuracy_date_parity=${ACCURACY_DATE_PARITY}" | tee -a $GITHUB_OUTPUT
-          # A/B profile of the qwen3.6-27b W8A8 GPQA accuracy case: an explicit
-          # input selects the determinism profile, anything else keeps the
-          # unchanged nightly configuration. The value is emitted as the JSON
-          # array driving the acc job matrix: "ab" runs the two profiles
-          # serially in one run (max-parallel: 1), baseline first.
-          ACC_PROFILE_INPUT="${{ inputs.acc_profile }}"
-          # TEMP: pull_request runs carry no inputs, so run the baseline and the
-          # det profiles back to back inside the same run for the A/B comparison.
-          if [ -z "${ACC_PROFILE_INPUT}" ] && [ "${{ github.event_name }}" = "pull_request" ]; then
-            ACC_PROFILE_INPUT="ab"
-          fi
-          case "${ACC_PROFILE_INPUT}" in
-            ""|baseline)
-              ACC_PROFILES='["baseline"]'
-              ;;
-            det)
-              ACC_PROFILES='["det"]'
-              ;;
-            ab)
-              ACC_PROFILES='["baseline","det"]'
-              ;;
-            *)
-              echo "Unsupported acc_profile: ${ACC_PROFILE_INPUT}"
-              exit 1
-              ;;
-          esac
-          echo "acc_profiles=${ACC_PROFILES}" | tee -a $GITHUB_OUTPUT
 
   nightly-test-1-npu-a3:
     name: nightly-test-1-npu-a3
@@ -304,9 +263,7 @@ jobs:
 
   nightly-perf-test-4-npu-a3:
     name: nightly-perf-test-4-npu-a3
-    # Temporary PR rerun pipeline: the qwen3.6-27b 2P in16k/out1k perf case already
-    # passed in run 45770380384, so this job is disabled to free the runner.
-    if: false
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-4-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -345,17 +302,12 @@ jobs:
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   # Temporary PR rerun pipeline: only the qwen3.6-27b 1P in3k5/out1k5 GPQA case runs,
   # via only_tests, so the suite is no longer partitioned here.
-  # The acc_profiles matrix runs the A/B profiles one at a time on the same
-  # 2-NPU runner: "ab" expands to baseline then det inside a single run.
+  # The case runs with HCCL_DETERMINISTIC=true (see the test file) to remove the
+  # run-to-run drift observed at temperature=0.
   nightly-acc-test-2-npu-a3:
-    name: nightly-acc-test-2-npu-a3 (${{ matrix.acc_profile }})
+    name: nightly-acc-test-2-npu-a3
     if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-2-npu-a3,')) }}
     needs: [set-image-config]
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        acc_profile: ${{ fromJSON(needs.set-image-config.outputs.acc_profiles) }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       ref: ${{ inputs.ref || '' }}
@@ -364,7 +316,6 @@ jobs:
       test_suite: nightly-acc-test-2-npu-a3
       only_tests: |
         test/registered/npu/accuracy/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in3k5_out1k5_50ms_gpqa.py
-      acc_profile: ${{ matrix.acc_profile }}
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}

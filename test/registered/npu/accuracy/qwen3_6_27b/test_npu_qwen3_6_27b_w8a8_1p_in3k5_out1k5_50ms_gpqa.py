@@ -1,5 +1,4 @@
 import logging
-import os
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
@@ -19,19 +18,11 @@ register_npu_ci(
 
 logger = logging.getLogger(__name__)
 
-# A/B switch for the accuracy determinism experiment. Two attempts of the same
-# job at temperature=0 were observed to differ by 4-6 questions, i.e. more than
-# the 5-question tolerance, so the drift is measured on both profiles without
-# editing this file:
-#   unset / "baseline" -> nightly configuration, unchanged
-#   "det"              -> identical flags, determinism env only. The nightly
-#                         stage already exports GDN_ATTN_BACKEND_TRITON=1, so
-#                         inside CI the effective delta is HCCL_DETERMINISTIC;
-#                         the GDN value only matters when this case is run
-#                         outside the CI wrapper.
-ACC_PROFILE_ENV = "QWEN3_6_27B_ACC_PROFILE"
-ACC_PROFILE = os.environ.get(ACC_PROFILE_ENV, "baseline").strip().lower()
-
+# Two attempts of the same job at temperature=0 were observed to differ by 4-6
+# questions, i.e. more than the 5-question tolerance, so the case now always
+# runs with a deterministic HCCL reduction order (see HCCL_DETERMINISTIC
+# below) instead of measuring the drift on two separate profiles.
+#
 # Fail fast when the NEXTN draft model stops being accepted. When acceptance
 # collapses (accept length ~1.0, accept rate ~0.0) decoding is several times
 # slower and this 198-question GPQA run cannot finish within the nightly
@@ -49,6 +40,15 @@ QWEN3_6_27B_3K5_1K5_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "0",
     "ASCEND_USE_FIA": "1",
+    # TP=2 all-reduce with a fixed reduction order: removes the run-to-run
+    # drift seen at temperature=0. CANN 9.2.0 only accepts true/false/strict.
+    "HCCL_DETERMINISTIC": "true",
+    # GDN attention path used by the other qwen3.6-27b cases
+    # (test_npu_qwen3_6_27b_1p_gpqa.py and
+    # test_npu_qwen3_6_27b_w8a8_2p_in16k_out1k_50ms.py). The nightly stage
+    # already exports this, so it is a no-op in CI and only pins the value
+    # when the case runs outside the CI wrapper.
+    "GDN_ATTN_BACKEND_TRITON": "1",
 }
 
 QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
@@ -109,17 +109,6 @@ QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
     "--prefill-delayer-max-delay-passes",
     "130",
 ]
-
-if ACC_PROFILE == "det":
-    # TP=2 all-reduce with a fixed reduction order: removes the run-to-run
-    # drift seen at temperature=0.
-    QWEN3_6_27B_3K5_1K5_ENVS["HCCL_DETERMINISTIC"] = "1"
-    # GDN attention path used by the other qwen3.6-27b cases
-    # (test_npu_qwen3_6_27b_1p_gpqa.py and
-    # test_npu_qwen3_6_27b_w8a8_2p_in16k_out1k_50ms.py). The nightly stage
-    # already exports this, so it is a no-op in CI and only pins the value
-    # when the case runs outside the CI wrapper.
-    QWEN3_6_27B_3K5_1K5_ENVS["GDN_ATTN_BACKEND_TRITON"] = "1"
 
 
 class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_gpqa(TestNpuAccuracyTestCaseBase):

@@ -75,18 +75,12 @@ on:
         description: 'Coverage-recommended test files for this suite (one repo-relative path per line, from recommend-tests-from-coverage). Empty = run the full suite.'
         type: string
         default: ''
-      acc_profile:
-        description: 'Optional value exported as QWEN3_6_27B_ACC_PROFILE to the test process; empty keeps the test-side default (baseline).'
-        type: string
-        default: ''
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
 
 concurrency:
-  # acc_profile is part of the key so the A/B matrix legs of one suite (same
-  # runner, e.g. baseline then det) queue instead of cancelling each other.
-  group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_suite }}-${{ inputs.acc_profile }}
+  group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_suite }}
   cancel-in-progress: true
 
 jobs:
@@ -236,7 +230,6 @@ jobs:
           SGLANG_IS_IN_CI: true
           TRANSFORMERS_VERBOSITY: "error"
           GDN_ATTN_BACKEND_TRITON: 1
-          QWEN3_6_27B_ACC_PROFILE: ${{ inputs.acc_profile }}
           ONLY_TESTS: ${{ inputs.only_tests }}
         shell: bash
         run: |
