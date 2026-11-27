@@ -28,10 +28,10 @@ class IntelAMXAttnBackend(AttentionBackend):
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.req_to_token_pool.row_width
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.runner_ids = model_runner.runner_ids
         self.use_mla = model_runner.use_mla_backend
-        self.max_context_len = model_runner.model_config.context_len
 
         # full->SWA translated out_cache_loc, computed once per forward (the only
         # set_kv_buffer is in eager forward_extend; decode writes KV in-kernel).
@@ -446,7 +446,6 @@ class IntelAMXMultiStepDraftBackend:
         for _ in range(self.speculative_num_steps - 1):
             self.attn_backends.append(IntelAMXAttnBackend(model_runner))
         self.device = model_runner.device
-        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         num_seqs = forward_batch.batch_size
@@ -455,7 +454,6 @@ class IntelAMXMultiStepDraftBackend:
         num_steps = self.speculative_num_steps
         req_to_token = self.attn_backends[0].req_to_token_pool.req_to_token
         seq_lens = forward_batch.seq_lens
-        pool_len = self.pool_len
         num_head = self.attn_backends[0].num_head
         v_head_dim = self.attn_backends[0].v_head_dim
         device = self.device
@@ -467,7 +465,7 @@ class IntelAMXMultiStepDraftBackend:
             seq_lens,
             topk,
             num_steps,
-            pool_len,
+            self.attn_backends[0].max_kv_len,
         )
 
         req_pool_indices_expanded = torch.arange(bs, dtype=torch.int64, device=device)

@@ -41,7 +41,7 @@ def _strided_rows(num_slots, row_shape, slot_stride):
     )
 
 
-def _fake_runner(*, row_width):
+def _fake_runner(*, req_to_token_row_width):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             context_len=64,
@@ -56,7 +56,8 @@ def _fake_runner(*, row_width):
         dtype=torch.bfloat16,
         page_size=16,
         req_to_token_pool=SimpleNamespace(
-            max_context_len=row_width, req_to_token=torch.zeros((2, row_width))
+            row_width=req_to_token_row_width,
+            req_to_token=torch.zeros((2, req_to_token_row_width)),
         ),
         device="cpu",
         is_draft_worker=False,
@@ -70,7 +71,9 @@ def _construct_backend(runner, *, configured=0, xqa=False):
     ``_init_full_attn_kv_splits``."""
     access = SimpleNamespace(kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN)
 
-    def parent_init(backend, *args, **kwargs):
+    def parent_init(backend, model_runner, *args, **kwargs):
+        backend.req_to_token_pool = model_runner.req_to_token_pool
+        backend.max_kv_len = model_runner.req_to_token_pool.row_width
         backend.kv_cache_quant_method = SimpleNamespace(
             resolve_attention_access=lambda *args: access
         )
@@ -216,7 +219,7 @@ class TestTRTLLMHAPageTableWidth(CustomTestCase):
     def test_page_table_spans_the_request_row(self):
         # A spec verify reads past the model context, up to the row width; a
         # narrower page table would spill its fill into the next request's row.
-        backend, _ = _construct_backend(_fake_runner(row_width=72))
+        backend, _ = _construct_backend(_fake_runner(req_to_token_row_width=72))
         self.assertEqual(backend.max_num_pages, 5)  # ceil(72 / 16), not 64 / 16
 
 
@@ -228,7 +231,7 @@ class TestTRTLLMHAFullAttnKVSplit(CustomTestCase):
     SMS, KV_HEADS, SPLITS = 148, 4, 8
 
     def test_constructor_keeps_main_kv_split_configuration(self):
-        runner = _fake_runner(row_width=64)
+        runner = _fake_runner(req_to_token_row_width=64)
         for configured, xqa, expected in ((0, False, 0), (8, False, 8), (8, True, 0)):
             with self.subTest(configured=configured, xqa=xqa):
                 backend, initialize = _construct_backend(
@@ -280,7 +283,7 @@ class TestTRTLLMHAFullAttnKVSplit(CustomTestCase):
         backend = self._backend()
         backend.decode_seq_len_splits = 1
         backend.q_data_type = torch.bfloat16
-        backend.max_context_len = 1024
+        backend.max_kv_len = 1024
         backend.workspace_buffer = backend._multi_ctas_kv_counter_buffer = None
         seen = []
         decode = SimpleNamespace(get_device_sm_count=lambda device: self.SMS)

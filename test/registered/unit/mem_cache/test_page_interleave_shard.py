@@ -1195,7 +1195,7 @@ def _unified_tree(page_size=4, pool_size=256, disable=False):
     )
     req_pool = ReqToTokenPool(
         size=8,
-        max_context_len=128,
+        row_width=128,
         device="cpu",
         enable_memory_saver=False,
     )
@@ -1248,7 +1248,7 @@ class TestShardedAllocationEviction(CustomTestCase):
                 disable=False,
                 req_to_token_pool=ReqToTokenPool(
                     size=8,
-                    max_context_len=128,
+                    row_width=128,
                     device="cpu",
                     enable_memory_saver=False,
                 ),
@@ -1402,7 +1402,7 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
         params = CacheInitParams(
             disable=False,
             req_to_token_pool=ReqToTokenPool(
-                size=8, max_context_len=128, device="cpu", enable_memory_saver=False
+                size=8, row_width=128, device="cpu", enable_memory_saver=False
             ),
             token_to_kv_pool_allocator=tree.token_to_kv_pool_allocator,
             page_size=4,

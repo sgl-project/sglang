@@ -36,7 +36,7 @@ def test_split_full_attention_applies_model_wrapper_once():
             server_args=SimpleNamespace(speculative_attention_mode="prefill"),
             kv_cache_dtype=None,
             token_to_kv_pool=object(),
-            req_to_token_pool=SimpleNamespace(max_context_len=2048),
+            req_to_token_pool=SimpleNamespace(row_width=2048),
             runner_ids=None,
             init_new_workspace=None,
             is_draft_worker=False,
