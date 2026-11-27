@@ -218,15 +218,15 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(TestNpuAccuracyMultiNodePdSepTestCas
         self.run_accuracy()
 
     def test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_l2_host_hit_rate(self):
-        """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
-        # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
-        # plus a 3200-token question, which exceeds L1 so evictions land in L2.
+        """Run the 18k GSP bench; assert_metrics checks the host hit rate"""
+        # 3 groups x 32 prompts share a 16200-token system prompt (18k * 0.9)
+        # plus a 1800-token question, which exceeds L1 so evictions land in L2.
         metrics = run_bench_serving(
             host=self.host,
             port=self.port,
             model_path=self.model_config.get("model_path"),
             dataset_name="generated-shared-prefix",
-            input_len=32000,
+            input_len=18000,
             output_len=1024,
             max_concurrency=32,
             gsp_num_groups=3,

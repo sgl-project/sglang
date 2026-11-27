@@ -97,7 +97,7 @@ _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 # Log the deferred-finalize config at most once per process (rank). Different MoE
 # layers can resolve to different quant methods, so print_info_once (keyed on the
@@ -451,7 +451,8 @@ class FusedMoE(torch.nn.Module):
             num_shared_slots = num_fused_shared_experts
 
         self._num_global_routed = num_experts - num_shared_slots
-        if get_exec().moe.ep_join_mode == "scale":
+        # Offset > 0: launch-cohort storage so DeepGEMM cache and MoE shapes match.
+        if get_parallel().ep_join_rank_offset > 0:
             storage_ep_size = get_parallel().elastic_ep_initial_size
             assert storage_ep_size is not None
             self._expert_storage_rank = (
