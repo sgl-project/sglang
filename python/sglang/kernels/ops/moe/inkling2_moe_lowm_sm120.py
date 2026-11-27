@@ -45,6 +45,22 @@ def _route_module():
     )
 
 
+@cache_once
+def _quant_module(hidden_size: int):
+    _require_sm12x()
+    return load_jit(
+        "inkling2_moe_quant_lowm_sm120",
+        str(hidden_size),
+        cuda_files=["inkling2/moe_nvfp4_quant_lowm_sm120.cuh"],
+        cuda_wrappers=[
+            (
+                "nvfp4_quant_dedup_lowm",
+                f"inkling2_moe_nvfp4_quant_sm120::nvfp4_quant_dedup_lowm<{hidden_size}>",
+            ),
+        ],
+    )
+
+
 def can_use_lowm_moe(tokens, experts, top_k, hidden_size, intermediate_size, device):
     return (
         0 < tokens <= LOWM_MAX_TOKENS
@@ -121,26 +137,44 @@ def route_metadata_lowm(ids, weights, num_experts=_NUM_EXPERTS):
     return src2dst, dst2src, gammas, offsets
 
 
-def moe_combine_bf16(down_bf16, src2dst, top_k=_TOP_K):
-    """Sum top-8 routed BF16 rows per token; -1 or OOB src2dst entries contribute zero."""
-    if top_k != _TOP_K:
-        raise ValueError(f"moe_combine_bf16 requires top_k={_TOP_K}, got {top_k}")
-    src2dst_flat = src2dst.reshape(-1).contiguous()
-    n = src2dst_flat.numel()
-    if n % top_k != 0:
+def nvfp4_quant_dedup_lowm(x, ids, src2dst, offsets):
+    """Quantize each token once and scatter to valid expert slots (skipping -1 sentinels)."""
+    tokens, width = x.shape
+    rows = ids.numel()
+    experts = offsets.numel() - 1
+    if experts != _NUM_EXPERTS:
         raise ValueError(
-            f"moe_combine_bf16 src2dst length {n} is not divisible by top_k={top_k}"
+            f"nvfp4_quant_dedup_lowm requires {_NUM_EXPERTS} experts, got {experts}"
         )
-    if down_bf16.shape[0] != n:
-        raise ValueError(
-            f"moe_combine_bf16 down_bf16 rows ({down_bf16.shape[0]}) must equal "
-            f"src2dst length ({n})"
-        )
-    tokens = n // top_k
-    hidden = down_bf16.shape[1]
-    out = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=down_bf16.device)
+    scale_rows = ((rows + 127 * experts + 127) // 128) * 128
+    values = torch.empty((rows, width // 2), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((scale_rows, width // 16), dtype=torch.uint8, device=x.device)
+    amax = torch.empty(rows, dtype=torch.float32, device=x.device)
     if tokens:
-        _combine_module().moe_combine_bf16(
-            down_bf16.contiguous(), src2dst_flat, out, top_k
+        _quant_module(width).nvfp4_quant_dedup_lowm(
+            x, ids.reshape(-1).contiguous(), src2dst, offsets, values, scales, amax
         )
+    return values, scales, amax
+
+
+def moe_combine_bf16(down_bf16, src2dst, top_k=_TOP_K):
+    """Sum routed BF16 rows per token in FP32, skipping -1 or out-of-range src2dst slots."""
+    if top_k != _TOP_K:
+        raise ValueError(f"moe_combine_bf16 requires top_k == {_TOP_K}, got {top_k}")
+    map_len = src2dst.numel()
+    if map_len % top_k != 0:
+        raise ValueError(
+            f"moe_combine_bf16 src2dst length {map_len} must be divisible by {top_k}"
+        )
+    if down_bf16.ndim != 2 or down_bf16.shape[0] != map_len:
+        raise ValueError(
+            f"moe_combine_bf16 down_bf16 must have shape ({map_len}, H), "
+            f"got {tuple(down_bf16.shape)}"
+        )
+    tokens = map_len // top_k
+    out = torch.empty(
+        (tokens, down_bf16.shape[1]), dtype=torch.bfloat16, device=down_bf16.device
+    )
+    if tokens:
+        _combine_module().moe_combine_bf16(down_bf16, src2dst, out, top_k)
     return out
