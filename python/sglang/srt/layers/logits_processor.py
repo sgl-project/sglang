@@ -38,6 +38,8 @@ from sglang.kernels.ops.sampling.softcap_row_argmax import (
     merge_row_argmax_shards,
     softcap_row_argmax,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.batch_invariant_ops.compiled import batch_invariant_linear
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
@@ -1441,7 +1443,19 @@ class LogitsProcessor(nn.Module):
             )
             # A shared FP32 buffer must not change the lm_head's output precision.
             # Keep the same rounding as the unbuffered path unless FP32 is enabled.
-            if use_mm_out_dtype and (
+            if (
+                is_batch_invariant_mode_enabled()
+                and torch.compiler.is_compiling()
+                and not self.use_fp32_lm_head
+                and not self.use_fp32_lm_head_output
+                and self.rl_on_policy_target is None
+            ):
+                logits = batch_invariant_linear(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight, None
+                )
+                if out is not None and out.dtype == logits.dtype:
+                    logits = out.copy_(logits)
+            elif use_mm_out_dtype and (
                 self.use_fp32_lm_head or self.use_fp32_lm_head_output
             ):
                 from sglang.srt.layers.quantization.unquant import (

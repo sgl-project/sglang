@@ -22,6 +22,7 @@ import torch
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 
@@ -29,6 +30,13 @@ _is_hip = is_hip()
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int) -> None:
+    # Deterministic serving must retain the same fused-op arithmetic in
+    # compiled decode and graph-captured prefill. Switching to forward_native
+    # changes BF16 rounding (e.g. SiLU/mul) and can change greedy tokens when
+    # cache recovery changes the batch schedule. Dynamo still compiles the
+    # surrounding model; supported custom kernels remain opaque operators.
+    if get_exec().deterministic.enable_deterministic_inference:
+        return
     for sub in model._modules.values():
         if isinstance(sub, BaseFusedOp):
             if reverse:
