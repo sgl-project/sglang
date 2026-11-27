@@ -1813,6 +1813,8 @@ class Envs:
     # Speculative decoding
     # ===================================================================
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # Opt in to BF16 Frozen-KV target verify with validated CUDA tiles.
+    SGLANG_ENABLE_CUDA_VERIFY_SPLITKV = EnvBool(False)
     # Experimental: allow pipeline parallelism x speculative decoding
     # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
     # (non-overlap schedule, no DP attention).

@@ -6,8 +6,8 @@ causal (target-verify) path. These tests check:
       (the operative case at topk=1), across head dims / GQA ratios / prefix
       lengths / extend lengths / KV scales / attention sinks / fp8 KV buffers /
       splits left without keys / an empty prefix;
-  (b) ``can_handle()`` rejects cases the kernel cannot serve bit-equivalently
-      (non-causal, sliding-window, logit-cap, ragged extend, mis-shaped
+  (b) ``can_handle()`` rejects cases the kernel cannot serve
+      (non-causal, logit-cap, ragged extend, mis-shaped
       sinks), so the backend falls back to ``extend_attention_fwd``.
 
 The topk>1 case is gated off in the backend (TritonAttnBackend enables this path
@@ -96,6 +96,39 @@ def _build_verify_inputs(
 
 @unittest.skipIf(not torch.cuda.is_available(), "GPU required")
 class TestVerifySplitKV(CustomTestCase):
+    def test_inactive_splits_ignore_poisoned_scratch(self):
+        q = torch.zeros(3, 16, 256, device="cuda", dtype=torch.bfloat16)
+        k = torch.zeros(3, 8, 256, device="cuda", dtype=q.dtype)
+        v = torch.tensor([4, 6, 8], device="cuda", dtype=q.dtype)
+        v = v[:, None, None].expand_as(k).contiguous()
+        kb = torch.zeros(1, 8, 256, device="cuda", dtype=q.dtype)
+        vb = torch.full_like(kb, 2)
+        qo = torch.tensor([0, 3], device="cuda", dtype=torch.int32)
+        kp = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        ids = torch.zeros(1, device="cuda", dtype=torch.int64)
+        kernel = VerifySplitKV(1, 16, 8, 256, 256, 3, n_splits=16)
+        out = torch.empty_like(q)
+
+        def run():
+            kernel(q, k, v, kb, vb, qo, kp, ids, 256**-0.5, o_out=out)
+
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for prefix, expected in ((1, [3, 4, 5]), (0, [4, 5, 6])):
+            with self.subTest(prefix=prefix):
+                kp[1] = prefix
+                ref = torch.tensor(expected, device="cuda", dtype=q.dtype)
+                ref = ref[:, None, None].expand_as(q)
+                for replay in (False, True):
+                    # Stage1 writes -inf LSE for unused splits but leaves their
+                    # output scratch untouched. Zero times NaN is still NaN.
+                    kernel.att_out.fill_(float("nan"))
+                    kernel.att_lse.fill_(float("nan"))
+                    graph.replay() if replay else run()
+                    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
     def _run_parity(
         self,
         prefix_lens,
@@ -304,26 +337,15 @@ class TestVerifySplitKV(CustomTestCase):
         q, k, v, kb, vb, qo, kvp, kvi, mle = self._inputs()
         self.assertFalse(
             can_handle(
-                q,
-                k,
-                v,
-                kb,
-                vb,
-                qo,
-                kvp,
-                kvi,
-                None,
-                True,
-                None,
-                mle,
-                sliding_window_size=128,
-            )
-        )
-        self.assertFalse(
-            can_handle(
                 q, k, v, kb, vb, qo, kvp, kvi, None, True, None, mle, logit_cap=30.0
             )
         )
+
+    def test_sliding_window_eligibility(self):
+        q, k, v, kb, vb, qo, kvp, kvi, mle = self._inputs()
+        args = (q, k, v, kb, vb, qo, kvp, kvi, None, True, None, mle)
+        self.assertTrue(can_handle(*args, sliding_window_size=128))
+        self.assertFalse(can_handle(*args, sliding_window_size="128"))
 
     def test_fallback_ragged_extend(self):
         # q rows (bs*l_ext) inconsistent with the claimed max_len_extend -> reject.

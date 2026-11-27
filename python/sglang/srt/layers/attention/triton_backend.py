@@ -13,6 +13,8 @@ from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
 )
+from sglang.kernels.ops.attention.verify_mla import cuda_shared_kv_tile
+from sglang.kernels.ops.attention.verify_splitkv import cuda_splitkv_tile
 from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
 from sglang.srt.configs.attention_execution import attention_dcp_size
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -120,6 +122,40 @@ def logit_capping_mod(logit_capping_method, logit_cap):
         return logit_cap
     else:
         raise ValueError()
+
+
+def _can_use_cuda_verify(
+    q, k, v, k_buffer, v_buffer, max_len_extend, arch, *, sliding_window=False
+):
+    """Check the tensor contract and require a validated tile for arch."""
+    if not isinstance(max_len_extend, int) or max_len_extend < 1:
+        return False
+    if k is None or v is None:
+        return False
+    tensors = (q, k, v, k_buffer, v_buffer)
+    if any(t.ndim != 3 for t in tensors):
+        return False
+    if q.device.type != "cuda" or _is_hip:
+        return False
+    if not all(
+        t.dtype == torch.bfloat16 and t.device == q.device and t.stride(-1) == 1
+        for t in tensors
+    ):
+        return False
+    h_q, head_dim = q.shape[1:]
+    h_kv = k.shape[1]
+    if h_kv == 0 or h_q % h_kv:
+        return False
+    if k.shape != (q.shape[0], h_kv, head_dim) or v.shape != k.shape:
+        return False
+    if k_buffer.shape[1:] != (h_kv, head_dim) or v_buffer.shape != k_buffer.shape:
+        return False
+    if sliding_window:
+        return cuda_splitkv_tile(h_q, h_kv, head_dim, max_len_extend, arch) is not None
+    return (
+        h_kv == 1
+        and cuda_shared_kv_tile(h_q // h_kv, head_dim, max_len_extend, arch) is not None
+    )
 
 
 class WindowRail(msgspec.Struct, kw_only=True):
@@ -271,7 +307,7 @@ class TritonAttnBackend(AttentionBackend):
         self.target_verify_num_tokens_per_req = model_runner.decode_num_tokens_per_req()
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk or 0
-        # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
+        # Split-KV verify assumes a pure-causal chain (topk==1)
         # and runs on gfx95 and CUDA (its HIP-only launch kwargs are gated inside
         # verify_splitkv.py); else fall back to extend_attention_fwd. On CUDA that
         # fallback loops the whole prefix serially per (seq, head), so long-context
@@ -285,6 +321,17 @@ class TritonAttnBackend(AttentionBackend):
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+        )
+        self.use_cuda_verify = (
+            _is_cuda
+            and envs.SGLANG_ENABLE_CUDA_VERIFY_SPLITKV.get()
+            and self.topk == 1
+            and not model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_frozen_kv_mtp()
+        )
+        # Resolved once: eligibility runs per layer on every eager verify step.
+        self.cuda_verify_arch = (
+            torch.cuda.get_device_capability() if self.use_cuda_verify else None
         )
         # gfx1151 verify attention reads full-space slot ids straight from req_to_token
         self.use_verify_gfx115 = (
@@ -1999,22 +2046,44 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
-        # Split-KV EAGLE-verify fast path (Triton, gfx95 and CUDA). On target-verify
-        # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
-        # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
-        # returns True if it ran (o written), or False for any case it cannot
-        # serve bit-equivalently (its can_handle() gates on non-causal /
-        # sliding-window / ragged / topk>1), so we fall through to
-        # extend_attention_fwd below. Correctness is never at risk.
-        # Route target-verify to the grouped-head kernel when eligible, else the
-        # per-head split-KV kernel.
+        kv = self.kv_layers.read(layer.layer_id)
+        k_buffer, v_buffer = kv.key(), kv.value()
+        use_cuda_verify = (
+            self.use_cuda_verify
+            and forward_batch.forward_mode.is_target_verify()
+            and causal
+            and sinks is None
+            and score_mod is None
+            and layer.k_scale is None
+            and layer.v_scale is None
+            and (
+                (sliding_window_size == -1 and window_kv_offsets is None)
+                or (sliding_window_size > 0 and window_kv_offsets is not None)
+            )
+            and _can_use_cuda_verify(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k,
+                v,
+                k_buffer,
+                v_buffer,
+                self.forward_metadata.max_extend_len,
+                self.cuda_verify_arch,
+                sliding_window=sliding_window_size > 0,
+            )
+        )
         verify_options = {}
         if self.verify_mla_draft_fwd is not None:
             verify_fwd = self.verify_mla_draft_fwd
             verify_options = {"bf16_dot": self.draft_bf16_dot}
+        elif use_cuda_verify:
+            verify_fwd = (
+                self.verify_splitkv_fwd
+                if sliding_window_size > 0
+                else self.verify_shared_kv_fwd
+            )
         elif self.use_verify_shared_kv:
             verify_fwd = self.verify_shared_kv_fwd
-        elif self.use_verify_splitkv:
+        elif self.use_verify_splitkv and sliding_window_size <= 0:
             verify_fwd = self.verify_splitkv_fwd
         else:
             verify_fwd = None
@@ -2028,8 +2097,8 @@ class TritonAttnBackend(AttentionBackend):
                 k if self.use_verify_shared_kv else k.contiguous(),
                 v if self.use_verify_shared_kv else v.contiguous(),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                self.kv_layers.read(layer.layer_id).key(),
-                self.kv_layers.read(layer.layer_id).value(),
+                k_buffer,
+                v_buffer,
                 self.forward_metadata.qo_indptr,
                 kv_indptr,
                 kv_indices,
@@ -2057,8 +2126,8 @@ class TritonAttnBackend(AttentionBackend):
             k.contiguous() if self.dllm_attention is None else k,
             v.contiguous() if self.dllm_attention is None else v,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            self.kv_layers.read(layer.layer_id).key(),
-            self.kv_layers.read(layer.layer_id).value(),
+            k_buffer,
+            v_buffer,
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
