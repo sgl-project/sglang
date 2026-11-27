@@ -21,9 +21,8 @@ def _sgemm_lora_b_cublas(
 ) -> torch.Tensor:
     """Single-adapter dense path: one cuBLAS addmm_ over the full output.
 
-    Mirrors the Triton kernel exactly: single slice, K = max_r (the kernel
-    reads the full K; the loader zero-pads the weight tail beyond the
-    adapter's rank), scaling fused via a pre-scaled x.
+    Single slice, K = max_r with a zero-padded weight tail beyond the
+    adapter's rank, scaling fused via a pre-scaled x.
     """
     if base_output is None:
         base_output = torch.zeros(
@@ -68,6 +67,7 @@ def _sgemm_lora_b_kernel(
     ENABLE_PDL: tl.constexpr = False,
     APPLY_SCALING: tl.constexpr = True,
     PADDED_RANK: tl.constexpr = True,
+    SINGLE_K_TILE: tl.constexpr = False,
     FLAT_GRID: tl.constexpr = False,
     ATOMIC_ADD: tl.constexpr = True,
 ):
@@ -136,7 +136,7 @@ def _sgemm_lora_b_kernel(
     output_mask = (s_offset[:, None] < seg_len) & n_mask
 
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
+    for k in range(0, 1 if SINGLE_K_TILE else tl.cdiv(K, BLOCK_K)):
         k_remaining = K - k * BLOCK_K
         x_tile = tl.load(
             x_ptrs,
@@ -243,6 +243,12 @@ def sgemm_lora_b_fwd(
         BLOCK_R,
         batch_info.scalings,
         ENABLE_PDL=enable_pdl,
+        # sgemm_lora_a_fwd writes only the actual rank columns. The unwritten
+        # tail can contain NaN/Inf even when the corresponding B weights are zero.
+        PADDED_RANK=False,
+        # BLOCK_R covers the entire padded rank. Keep this single iteration
+        # static while masking loads by the adapter's actual rank.
+        SINGLE_K_TILE=True,
         **pdl_kwargs,
     )
     return output
