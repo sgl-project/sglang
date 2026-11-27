@@ -115,7 +115,7 @@ if not _is_xpu:
     )
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
+    from sgl_kernel_npu.operators.norm import split_qkv_tp_rmsnorm_rope
 
 
 @triton.jit
@@ -566,10 +566,6 @@ class MiniMaxM2MoE(nn.Module):
 
         self.layer_id = layer_id
 
-        if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_parallel().moe_ep_size
-            self.top_k = config.num_experts_per_tok
-
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
@@ -625,8 +621,6 @@ class MiniMaxM2MoE(nn.Module):
         )
 
         return final_hidden_states
-
-    # TBO Operations for MiniMax MoE
 
 
 class MiniMaxM2Attention(nn.Module):
@@ -908,8 +902,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
-
-    # TBO Operations for MiniMax Decoder Layer
 
 
 class MiniMaxM2Model(nn.Module):

@@ -20,11 +20,12 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 import torch.distributed as dist
 
+from sglang.srt.beam_search.trie_output_head import configure_model_trie_output_heads
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
@@ -35,6 +36,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
+    is_kimi_k31,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -42,18 +44,39 @@ from sglang.srt.distributed import bootstrap
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
+    _lowest_survivor,
+    clear_expert_map_inbox,
+    clear_recover_cohort,
+    cohort_vote_via_store,
     get_healthy_expert_location_src_rank,
     get_scale_cohort,
+    join_faulted_rank_process_groups,
     join_process_groups,
     join_scale_process_group,
     maybe_rebalance_after_rank_fault,
-    maybe_recover_ep_ranks,
+    mooncake_world_settle_probe,
+    register_recover_cohort,
     register_scale_cohort,
+    reset_barriers_after_failure,
+    scale_ready_barrier_via_store,
+    seed_barrier_epochs,
+    sync_random_seed_via_store,
     try_admit_scale_ranks,
+    try_recover_faulted_ranks,
+    try_recover_ranks,
     update_dp_attention_for_elastic_ep,
     validate_scale_cohort_topology,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
+from sglang.srt.elastic_ep.expert_map_repair import (
+    local_relabelled_logicals,
+    shrink_expert_metadata,
+)
+from sglang.srt.elastic_ep.scale_down_driver import ScaleDownDriver, advance_scale_down
+from sglang.srt.elastic_ep.scale_down_finalizer import (
+    finalize_scale_down,
+    retire_and_exit,
+)
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
@@ -152,6 +175,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     drop_elastic_cuda_graph_state,
     finalize_cuda_graph_capture,
     recapture_elastic_cuda_graph,
+    release_decode_cuda_graph,
     resolve_elastic_cuda_graph_config,
     sync_elastic_cuda_graph_config,
     validate_elastic_cuda_graph_recapture,
@@ -217,6 +241,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_device,
     get_exec,
+    get_forward,
     get_global_dwdp_manager,
     get_lora,
     get_memory,
@@ -228,9 +253,10 @@ from sglang.srt.runtime_context import (
     remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
-from sglang.srt.sampling.watermarking.core import WatermarkState
+from sglang.srt.sampling.sampling_pipeline import SamplingPipeline
+from sglang.srt.sampling.watermarking.interface import WatermarkEngine
+from sglang.srt.sampling.watermarking.runtime import make_watermark_engine
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
@@ -250,9 +276,7 @@ from sglang.srt.state_capturer.routed_experts import (
     set_global_experts_capturer,
 )
 from sglang.srt.utils import (
-    cpu_has_amx_support,
     get_available_gpu_memory,
-    is_host_cpu_arm64,
     is_npu,
     set_cuda_arch,
     slow_rank_detector,
@@ -260,12 +284,10 @@ from sglang.srt.utils import (
 from sglang.srt.utils.aiter_tuned_tables import install_aiter_tuned_tables
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_npu = is_npu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -273,8 +295,6 @@ if _is_npu:
     init_npu_backend()
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
-
-# Detect stragger ranks in model loading
 
 
 logger = logging.getLogger(__name__)
@@ -328,7 +348,7 @@ def resolve_draft_attention_backend(
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
-    watermark_state: Optional[WatermarkState] = None
+    watermark: Optional[WatermarkEngine] = None
     # Unlimited-OCR v2 only; see maybe_init_uocr_greedy_graph.
     uocr_greedy_graph: Optional[UocrGreedyGraph] = None
     canary_manager: Optional[CanaryManager] = None
@@ -420,9 +440,6 @@ class ModelRunner:
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
-        self.is_multimodal_chunked_prefill_supported = (
-            model_config.is_multimodal_chunked_prefill_supported
-        )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
@@ -441,6 +458,9 @@ class ModelRunner:
         self.enable_elastic_ep = get_exec().moe.elastic_ep_backend is not None
         self.forward_pass_id = 0
         self._pending_elastic_scale_update = None
+        self._elastic_pending_graph_recapture = False
+        # Set by the scheduler, which owns the retiree's terminal park.
+        self.elastic_park_hook: Optional[Callable[[], None]] = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         # HiSparse owns target KV only. Draft KV keeps its logical GPU page
@@ -495,6 +515,8 @@ class ModelRunner:
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
 
+        self._announce_recover_join_width()
+
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream(
             priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
@@ -533,6 +555,8 @@ class ModelRunner:
         self.initialize()
         self.check_quantized_moe_compatibility()
 
+        # Before the joiner hook, which fetches weights through the weight updater.
+        self.init_weight_updater()
         self._initialize_elastic_ep_joiner()
 
         if self.is_multimodal:
@@ -550,7 +574,6 @@ class ModelRunner:
                 )
 
         # For weight updates
-        self.init_weight_updater()
         self.init_weight_exporter()
 
     def init_startup_observability(self) -> None:
@@ -558,58 +581,103 @@ class ModelRunner:
         self.graph_memory_usage: dict[str, float] = {}
         self.graph_time_usage: dict[str, float] = {}
 
+    def _announce_recover_join_width(self) -> None:
+        """Publish a recover joiner's width ahead of weight load; grows plan from it."""
+        moe, parallel = get_exec().moe, get_parallel()
+        if (
+            moe.elastic_ep_backend is not None
+            and moe.is_ep_offset_joiner
+            and not moe.is_ep_scale_joiner
+            and parallel.tp_rank == 0
+        ):
+            offset = parallel.ep_join_rank_offset
+            register_recover_cohort(offset, offset + parallel.tp_size, parallel.tp_size)
+
     def _initialize_elastic_ep_joiner(self) -> None:
-        if not (
-            get_exec().moe.elastic_ep_backend is not None
-            and get_exec().moe.is_ep_scale_joiner
+        # Offset-0 recovery rejoins later; a second rendezvous here goes unanswered.
+        if (
+            get_exec().moe.elastic_ep_backend is None
+            or not get_exec().moe.is_ep_offset_joiner
         ):
             return
-
+        is_scale = get_exec().moe.is_ep_scale_joiner
         parallel = get_parallel()
-        join_effective_ep_size = parallel.ep_join_rank_offset + parallel.tp_size
-        dist.barrier(group=parallel.tp_group.cpu_group)
-        if parallel.tp_rank == 0:
-            register_scale_cohort(
-                parallel.ep_join_rank_offset,
-                join_effective_ep_size,
-                self._elastic_cuda_graph_enabled(),
-            )
-        join_scale_process_group()
-        get_context().override("elastic_ep.scale_join", ep_size=join_effective_ep_size)
+        offset = parallel.ep_join_rank_offset
+        width = offset + parallel.tp_size
+        # Ahead of the announce below, which is what lets survivors write our inbox.
+        clear_expert_map_inbox(parallel.tp_rank + offset)
+        # Before the announce, so every epoch minted for this grow sits above our floor;
+        # seeding later lets this rank adopt a stale epoch and cross a barrier alone.
+        seed_barrier_epochs()
+        if is_scale:
+            dist.barrier(group=parallel.tp_group.cpu_group)
+            if parallel.tp_rank == 0:
+                register_scale_cohort(offset, width, self._elastic_cuda_graph_enabled())
+            join_scale_process_group()
+            get_context().override("elastic_ep.scale_join", ep_size=width)
+        else:
+            join_process_groups()
 
-        global_ep_rank = parallel.tp_rank + parallel.ep_join_rank_offset
-        broadcast_global_expert_location_metadata(
-            model_config=self.model_config,
-            moe_ep_rank=global_ep_rank,
-            src_rank=0,
-        )
-        set_global_expert_distribution_recorder(
-            ExpertDistributionRecorder.init_new(
-                get_global_expert_location_metadata(),
-                rank=global_ep_rank,
+        global_ep_rank = parallel.tp_rank + offset
+        # What our weights were loaded against; the broadcast overwrites it in place.
+        prior = get_global_expert_location_metadata().physical_to_logical_map.clone()
+        # src 0 matches survivors' _lowest_survivor unless rank 0 is itself a retiree.
+        self._broadcast_expert_location(src_rank=0)
+        # Survivors cannot write our tensors: reload any slot the cohort relabelled.
+        metadata = get_global_expert_location_metadata()
+        self._reload_relabelled_expert_weights(
+            local_relabelled_logicals(
+                prior,
+                metadata.physical_to_logical_map,
+                num_local=metadata.num_local_physical_experts,
+                ep_rank=global_ep_rank,
             )
         )
+        self._reinit_expert_distribution_recorder()
 
         from sglang.srt.layers.dp_attention import enable_joiner_all_gather
 
         enable_joiner_all_gather()
-        update_dp_attention_for_elastic_ep(
-            physical_ep_size=join_effective_ep_size,
-            physical_ep_rank=global_ep_rank,
-        )
+        self._apply_dp_size(width, global_ep_rank)
         if self.eplb_manager is not None:
             self.eplb_manager.disable_rebalance(
                 "EPLB rebalance is disabled while elastic EP scale-up "
                 "is being finalized"
             )
-
         state = ElasticEPStateManager.instance()
         if state is not None:
-            state.active_ranks.zero_()
-            state.active_ranks[:join_effective_ep_size] = 1
-            state.snapshot_active_to_last()
-            state.sync_active_to_cpu()
+            state.effective_ep_size = width
+            state.reset()
             state.scale_phase = "syncing_new_world"
+        # Recover seeds over TCPStore: partial-recover retirees may have left WORLD.
+        if not is_scale:
+            sync_random_seed_via_store(is_source=False)
+        if not self._joiner_ready_is_deferred():
+            self._finish_joiner_ready(width)
+
+    def _joiner_ready_is_deferred(self) -> bool:
+        """Defer ready to capture; it resolves the graph config survivors all-gather."""
+        return (
+            get_exec().moe.is_ep_offset_joiner
+            and not self.is_draft_worker
+            and self._elastic_cuda_graph_enabled()
+        )
+
+    def _finish_joiner_ready(self, width: int) -> None:
+        try:
+            self._elastic_scale_ready_barrier(target_size=width, log_tag="JOINER")
+        except Exception as exc:
+            # Only a scale-requested regrow posts this; offset+tp_size is a tail width.
+            raise RuntimeError(
+                f"Joiner rendezvous at width {width} failed ({exc}). "
+                "Recovery into a slot must be driven by /scale_elastic_ep; recovering a "
+                "mid-cohort slot from a bare fault is unsupported."
+            ) from exc
+        if ElasticEPStateManager.instance() is not None:
+            # Not serving_expanded yet: prefill kernels JIT on the first forward.
+            ElasticEPStateManager.mark_warming_up()
+        # rebalance() is collective: a joiner left disabled hangs the next EPLB round.
+        self._rearm_eplb_after_elastic_scale()
 
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger()
@@ -661,24 +729,21 @@ class ModelRunner:
             device=self.device,
         )
 
-    def maybe_init_watermark_state(self):
-        features = get_exec().features
-        self.watermark_state = (
-            WatermarkState(
+    def maybe_init_watermark(self):
+        self.watermark = (
+            make_watermark_engine(
                 max_num_reqs=self.req_to_token_pool.req_to_token.shape[0],
-                context_window=features.watermark_context_window,
-                max_contexts_per_req=self.req_to_token_pool.req_to_token.shape[1],
+                max_contexts_per_req=self.req_to_token_pool.row_width,
                 vocab_size=self.model_config.vocab_size,
-                key=features.watermark_key,
-                key_b=features.watermark_key_b,
-                mixing_probability=features.watermark_mixing_probability,
-                max_probability=features.watermark_max_probability,
                 device=self.device,
-                default_enabled=features.watermark_default_enabled,
-                enforce_all=features.watermark_enforce_all,
             )
-            if features.enable_watermark and not self.is_draft_worker
+            if not self.is_draft_worker
             else None
+        )
+
+    def init_sampling_pipeline(self):
+        self.sampling_pipeline = SamplingPipeline(
+            sampler=self.sampler, watermark=self.watermark
         )
 
     def init_kv_cache_configurator(
@@ -760,6 +825,7 @@ class ModelRunner:
                 model=self.model, model_config=self.model_config
             )
         prepare_moe_topk(model=self.model, model_config=self.model_config)
+        self.maybe_warmup_bf16_gemms()
 
         self.maybe_init_dwdp()
 
@@ -777,6 +843,12 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
+        self.beam_trie_compact_enabled = configure_model_trie_output_heads(
+            self.model,
+            self.model_config,
+            self.device,
+            lora_enabled=self.lora_manager is not None,
+        )
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
         # after every post-load change to the model, before the KV cache is sized
@@ -802,7 +874,7 @@ class ModelRunner:
             return
         expert_rank = get_parallel().moe_ep_rank + (
             get_parallel().ep_join_rank_offset
-            if get_exec().moe.is_ep_scale_joiner
+            if get_exec().moe.is_ep_offset_joiner
             else 0
         )
         set_global_expert_location_metadata(
@@ -1068,7 +1140,8 @@ class ModelRunner:
 
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
-        self.maybe_init_watermark_state()
+        self.maybe_init_watermark()
+        self.init_sampling_pipeline()
 
         self.maybe_init_hisparse_coordinator()
 
@@ -1139,7 +1212,7 @@ class ModelRunner:
                 )
 
     def post_capture_elastic_ep_recover(self):
-        join_process_groups()
+        join_faulted_rank_process_groups()
 
         global_ep_rank = get_parallel().tp_rank + get_parallel().ep_join_rank_offset
         broadcast_global_expert_location_metadata(
@@ -1259,7 +1332,9 @@ class ModelRunner:
         #     )
 
         #     warmup_all_flashinfer_megamoe_layers(self.model)
-        is_scale_joiner = get_exec().moe.is_ep_scale_joiner and not self.is_draft_worker
+        is_scale_joiner = (
+            get_exec().moe.is_ep_offset_joiner and not self.is_draft_worker
+        )
         defer_decode_capture = (
             is_scale_joiner
             and capture_decode_cuda_graph
@@ -1286,14 +1361,14 @@ class ModelRunner:
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
 
-        if is_scale_joiner:
-            if self._elastic_cuda_graph_enabled():
-                if defer_decode_capture:
-                    self._recapture_elastic_cuda_graphs()
-                    finalize_cuda_graph_capture(self)
-            # Scheduler startup calls this path even when CUDA graphs are disabled.
-            target_size = get_parallel().ep_join_rank_offset + get_parallel().tp_size
-            self._finalize_elastic_ep_joiner(target_size)
+        # Must match the joiner init's predicate exactly: a second post waits forever.
+        if self._joiner_ready_is_deferred():
+            if defer_decode_capture:
+                self._recapture_elastic_cuda_graphs()
+                finalize_cuda_graph_capture(self)
+            self._finish_joiner_ready(
+                get_parallel().ep_join_rank_offset + get_parallel().tp_size
+            )
 
         prebuild_deepep_v2_buffer(model=self.model)
 
@@ -1347,6 +1422,18 @@ class ModelRunner:
         # value from the context where it is used.
         self.pp_group = get_parallel().pp_group
 
+    def maybe_warmup_bf16_gemms(self):
+        """Load cuBLASLt's kernel libraries, which CUDA_MODULE_LOADING=EAGER does not
+        cover; a first load during a PP prefill can hang in cuLibraryLoadData."""
+        max_m = envs.SGLANG_WARMUP_BF16_GEMM_MAX_M.get()
+        if max_m is None:
+            max_m = 16384 if is_kimi_k31(self.model_config.hf_config) else 0
+        if max_m <= 0 or self.device != "cuda":
+            return
+        from sglang.srt.layers.quantization.unquant import warmup_bf16_gemms
+
+        warmup_bf16_gemms(self.model, max_m)
+
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1374,6 +1461,7 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=get_model().weight_cache_mode,
             weight_cache_socket=get_model().weight_cache_socket,
+            weight_cache_transport=get_model().weight_cache_transport,
             load_group=self.load_group,
         )
 
@@ -1485,11 +1573,7 @@ class ModelRunner:
             dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
-        reserve_rope_cache_for_long_sequences(
-            self.model,
-            self.model_config,
-            logger,
-        )
+        reserve_rope_cache_for_long_sequences(self.model, self.model_config)
 
         if self.startup_weight_load is None:
             dist_barrier_after_load(
@@ -1663,6 +1747,7 @@ class ModelRunner:
                 ),
                 speculative_draft_attention_backend=self.draft_attention_backend,
                 speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
+                model_config=getattr(self, "model_config", None),
             )
         )
 
@@ -1707,6 +1792,9 @@ class ModelRunner:
             self.capture_tail_hooks.append(self.uocr_greedy_graph.capture_tail_hook)
 
     def init_decode_cuda_graph(self):
+        release_decode_cuda_graph(
+            decode_runner=self.decode_cuda_graph_runner, eager_runner=self.eager_runner
+        )
         self.decode_cuda_graph_runner = None
         capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner
@@ -1907,7 +1995,7 @@ class ModelRunner:
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(
+        step_span_ctx = forward_nvtx_range(
             build_step_span_name(
                 forward_batch,
                 is_draft_worker=self.is_draft_worker,
@@ -1943,6 +2031,7 @@ class ModelRunner:
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
+            get_forward().scoped(forward_batch=forward_batch),
         ):
             output = self._forward_raw(forward_batch, pp_proxy_tensors)
             if self.enable_elastic_ep:
@@ -1952,6 +2041,11 @@ class ModelRunner:
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
         if isinstance(output.logits_output, LogitsProcessorOutput):
             output.logits_output.own_customized_info()
+        if (
+            not self.is_draft_worker
+            and (placement := getattr(self.model, "expert_placement", None)) is not None
+        ):
+            placement.on_forward_end(forward_batch)
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (
@@ -2176,34 +2270,6 @@ class ModelRunner:
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
-    def _preprocess_logits(
-        self,
-        logits_output: LogitsProcessorOutput,
-        sampling_info: SamplingBatchInfo,
-        observer: Optional[SamplingObserver] = None,
-    ):
-        # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
-        #       was executed after we processed last batch's results.
-
-        # Calculate logits bias and apply it to next_token_logits.
-        sampling_info.update_regex_vocab_mask()
-        observer_state = None
-        if observer is not None:
-            observer_state = sampling_info.apply_logits_bias_with_observer(
-                logits_output.next_token_logits,
-                observer=observer,
-            )
-        else:
-            sampling_info.apply_logits_bias(logits_output.next_token_logits)
-
-        # Release the vocab_mask GPU tensor immediately after it has been applied
-        # to the logits. In overlap scheduling, the sampling_info (and its
-        # grammar_mask) can be kept alive by the delay_sample_func closure and
-        # batch_record_buf until the next iteration, causing a steady VRAM leak
-        # when structured output (grammar) is used.
-        sampling_info.grammar_mask = None
-        return observer_state
-
     def sample(
         self,
         logits_output: LogitsProcessorOutput,
@@ -2222,75 +2288,16 @@ class ModelRunner:
         # runners may reuse backing objects. Never leak an auxiliary result from
         # a previous replay into a request with no observer state.
         logits_output.auxiliary_device_output = None
-        observer = self.sampling_observer
-        # Preserve two-argument overrides when observation is inactive.
-        if observer is not None and observer.is_active(forward_batch.sampling_info):
-            observer_state = self._preprocess_logits(
-                logits_output,
-                forward_batch.sampling_info,
-                observer=observer,
-            )
-        else:
-            observer_state = self._preprocess_logits(
-                logits_output, forward_batch.sampling_info
-            )
-
-        watermark_state = self.watermark_state
-        if (
-            watermark_state is not None
-            and forward_batch.sampling_info.has_watermark_candidates
-        ):
-            logprob_logits = (
-                logits_output.next_token_logits.clone()
-                if forward_batch.return_logprob
+        next_token_ids = self.sampling_pipeline.sample(
+            logits_output,
+            forward_batch,
+            observer=self.sampling_observer,
+            graph_token_ids=(
+                self.uocr_greedy_graph.recorded_ids(logits_output, forward_batch)
+                if self.uocr_greedy_graph is not None
                 else None
-            )
-            req_pool_indices = forward_batch.req_pool_indices[
-                : logits_output.next_token_logits.shape[0]
-            ]
-            watermark_state.init_from_prompt(
-                req_pool_indices,
-                forward_batch.watermark_prompt_tail_ids,
-                forward_batch.watermark_context_hash_history,
-            )
-            watermark_state.force(
-                logits_output.next_token_logits,
-                req_pool_indices,
-                forward_batch.sampling_info,
-            )
-        else:
-            logprob_logits = None
-
-        # Sample the next tokens
-        next_token_ids = None
-        if self.uocr_greedy_graph is not None:
-            next_token_ids = self.uocr_greedy_graph.recorded_ids(
-                logits_output, forward_batch, watermark_state=watermark_state
-            )
-        if next_token_ids is None:
-            next_token_ids = self.sampler(
-                logits_output,
-                forward_batch.sampling_info,
-                forward_batch.return_logprob,
-                forward_batch.top_logprobs_nums,
-                forward_batch.token_ids_logprobs,
-                # For prefill, we only use the position of the last token.
-                (
-                    forward_batch.positions
-                    if forward_batch.forward_mode.is_decode()
-                    else forward_batch.seq_lens - 1
-                ),
-                **(
-                    {"logprob_logits": logprob_logits}
-                    if logprob_logits is not None
-                    else {}
-                ),
-            )
-        if observer_state is not None:
-            logits_output.auxiliary_device_output = observer.after_sample(
-                observer_state,
-                next_token_ids,
-            )
+            ),
+        )
         if (c := self.canary_manager) is not None:
             c.on_sampled(
                 logits_output=logits_output,
@@ -2301,14 +2308,6 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
         )
-        if (
-            watermark_state is not None
-            and forward_batch.sampling_info.has_watermark_candidates
-        ):
-            watermark_state.append(
-                req_pool_indices,
-                next_token_ids,
-            )
         return next_token_ids
 
     def compute_logprobs_only(
@@ -2328,19 +2327,7 @@ class ModelRunner:
             forward_batch: The forward batch that generates logits_output
         """
         logits_output.auxiliary_device_output = None
-        if not forward_batch.token_ids_logprobs:
-            return
-
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
-
-        # Delegate to sampler for logprob-only computation
-        # This populates logits_output with requested token probabilities
-        self.sampler.compute_logprobs_only(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-        )
+        self.sampling_pipeline.compute_logprobs_only(logits_output, forward_batch)
 
     def check_weights(
         self,
@@ -2388,7 +2375,7 @@ class ModelRunner:
             physical_to_logical_map=expanded_p2l,
             moe_ep_rank=self._elastic_global_rank(),
         )
-        set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
+        metadata.adopt_scaled_in_place(new_metadata)
 
     def _elastic_global_rank(self) -> int:
         return get_parallel().tp_rank + get_parallel().ep_join_rank_offset
@@ -2412,8 +2399,30 @@ class ModelRunner:
         )
         self._rearm_eplb_after_elastic_scale()
 
+    def _reinit_expert_distribution_recorder(self, keep_gatherers=False) -> None:
+        previous = get_global_expert_distribution_recorder()
+        recorder = ExpertDistributionRecorder.init_new(
+            get_global_expert_location_metadata(), rank=self._elastic_global_rank()
+        )
+        if keep_gatherers:
+            recorder.adopt_single_pass_gatherers(previous)
+        set_global_expert_distribution_recorder(recorder)
+
+    def _broadcast_expert_location(self, src_rank: int) -> None:
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=self._elastic_global_rank(),
+            src_rank=src_rank,
+        )
+
+    def _apply_dp_size(self, physical_ep_size: int, physical_ep_rank: int) -> int:
+        return update_dp_attention_for_elastic_ep(
+            physical_ep_size=physical_ep_size, physical_ep_rank=physical_ep_rank
+        )
+
     def _report_elastic_scale_failure(self, error: str, effective_size: int) -> None:
-        if get_parallel().tp_rank != 0 or get_exec().moe.is_ep_scale_joiner:
+        # Global rank 0 only (ex-joiners also have tp_rank==0).
+        if self._elastic_global_rank() != 0:
             return
         from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
@@ -2431,7 +2440,10 @@ class ModelRunner:
                 log_tag,
                 target_size,
             )
-        dist.barrier(group=dist.group.WORLD)
+        # Store, not dist.barrier(WORLD): that races Mooncake digesting retirees' links.
+        scale_ready_barrier_via_store(target_size=target_size)
+        # Converge the bitmap here, or Mooncake refuses the next dp_attn collective.
+        mooncake_world_settle_probe(cohort_size=target_size)
         if get_parallel().tp_rank == 0:
             logger.debug(
                 "[Elastic EP][scale] %s passed post-scale WORLD barrier "
@@ -2440,27 +2452,18 @@ class ModelRunner:
                 target_size,
             )
 
-    def _finalize_elastic_ep_joiner(self, target_size: int) -> None:
-        self._elastic_scale_ready_barrier(target_size=target_size, log_tag="JOINER")
-        state = ElasticEPStateManager.instance()
-        if state is not None:
-            state.scale_phase = "serving_expanded"
-        self._rearm_eplb_after_elastic_scale()
-
     def _finalize_scale_up(
         self,
         ranks_to_join: list[int],
         target_size: int,
         effective_size: int,
+        is_recover: bool = False,
     ) -> None:
         self.forward_pass_id = 0
         ElasticEPStateManager.mark_configuring_data_plane()
 
         state = ElasticEPStateManager.instance()
-        for rank in ranks_to_join:
-            state.active_ranks[rank] = 1
-        state.snapshot_active_to_last()
-        state.sync_active_to_cpu()
+        state.activate_ranks(ranks_to_join)
         if self.eplb_manager is not None:
             self.eplb_manager.reset_generator()
 
@@ -2468,19 +2471,13 @@ class ModelRunner:
             from_ep_size=effective_size,
             effective_size=target_size,
         )
-        broadcast_global_expert_location_metadata(
-            model_config=self.model_config,
-            moe_ep_rank=self._elastic_global_rank(),
-            src_rank=0,
+        # Recover grows into a retired slot, where rank 0 may have exited WORLD.
+        self._broadcast_expert_location(
+            _lowest_survivor(set(ranks_to_join)) if is_recover else 0
         )
 
         ElasticEPStateManager.on_scale(effective_size, target_size)
-        set_global_expert_distribution_recorder(
-            ExpertDistributionRecorder.init_new(
-                get_global_expert_location_metadata(),
-                rank=self._elastic_global_rank(),
-            )
-        )
+        self._reinit_expert_distribution_recorder()
 
         if self.eplb_manager is not None:
             self.eplb_manager.disable_rebalance(
@@ -2490,30 +2487,39 @@ class ModelRunner:
 
         replica_size = attn_replica_size()
         effective_dp_size = physical_ep_size_to_dp_size(effective_size, replica_size)
-        target_dp_size = update_dp_attention_for_elastic_ep(
-            physical_ep_size=target_size,
-            physical_ep_rank=self._elastic_global_rank(),
-        )
+        target_dp_size = self._apply_dp_size(target_size, self._elastic_global_rank())
+
+        if is_recover and self._elastic_global_rank() == 0:
+            # Single-writer store: rank 0 publishes the seed the joiner waits on.
+            sync_random_seed_via_store(is_source=True)
 
         recapture_cuda_graph = self._elastic_cuda_graph_enabled()
         if recapture_cuda_graph:
             self._recapture_elastic_cuda_graphs()
         ElasticEPStateManager.mark_syncing_new_world()
-        self._elastic_scale_ready_barrier(
-            target_size=target_size,
-            log_tag="JOINER" if get_exec().moe.is_ep_scale_joiner else "PRIMARY",
-        )
+        # Commit before the barrier (see shrink finalizer note).
         ElasticEPStateManager.commit_scale()
+        self._elastic_scale_ready_barrier(target_size=target_size, log_tag="PRIMARY")
         self._rearm_eplb_after_elastic_scale()
 
-        if get_parallel().tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
+        # A survivor drops the announce, not the joiner: a joiner that dies mid-join
+        # would leave the next grow onto these slots planned off a stale width.
+        if is_recover and self._elastic_global_rank() == _lowest_survivor(
+            set(ranks_to_join)
+        ):
+            for slot in ranks_to_join:
+                clear_recover_cohort(slot)
+
+        if self._elastic_global_rank() == 0:
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
+            # Mixed grows are rejected, so a recover batch is the contiguous tail too.
             self._pending_elastic_scale_update = ElasticScaleUpdateReq(
                 success=True,
                 effective_ep_size=target_size,
                 slot_offset=effective_dp_size,
                 slot_count=target_dp_size - effective_dp_size,
+                direction="grow",
             )
             logger.info(
                 "[Elastic EP] Scale completed: old_ep_size=%d "
@@ -2539,15 +2545,33 @@ class ModelRunner:
         validate_elastic_cuda_graph_recapture()
         self.attn_backend.validate_elastic_cuda_graph_recapture()
 
-    def _recapture_elastic_cuda_graphs(self) -> None:
-        if not self._elastic_cuda_graph_enabled():
+    def maybe_recapture_elastic_graphs(self) -> None:
+        """Rebuild decode graphs a shrink deferred. Runs between forward passes: a
+        capture at the tail of forward() frees the pool its output points into."""
+        if not self._elastic_pending_graph_recapture:
             return
+        self._elastic_pending_graph_recapture = False
+        # Not _elastic_cuda_graph_enabled(): shrink-only cohorts keep stale graphs too.
+        if not (
+            get_exec().moe.elastic_ep_backend is not None
+            and not self.is_draft_worker
+            and check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
+            and self.decode_cuda_graph_runner is not None
+        ):
+            return
+        # No config verify: its all-gather runs over WORLD, which counts departed ranks.
+        self._recapture_elastic_cuda_graphs(after_shrink=True)
 
-        sync_elastic_cuda_graph_config(
-            config=resolve_elastic_cuda_graph_config(self),
-            device=self.device,
-            world_group=dist.group.WORLD,
-        )
+    def _recapture_elastic_cuda_graphs(self, *, after_shrink: bool = False) -> None:
+        if not after_shrink and not self._elastic_cuda_graph_enabled():
+            return
+        tic = time.perf_counter()
+        if not after_shrink:
+            sync_elastic_cuda_graph_config(
+                config=resolve_elastic_cuda_graph_config(self),
+                device=self.device,
+                world_group=dist.group.WORLD,
+            )
         drop_elastic_cuda_graph_state(
             decode_runner=self.decode_cuda_graph_runner,
             eager_runner=self.eager_runner,
@@ -2565,6 +2589,50 @@ class ModelRunner:
             capture.time_usage,
             phases=("decode", "target_verify", "draft_decode"),
         )
+        logger.info(
+            "[Elastic EP] decode CUDA graphs rebuilt in %.2f s",
+            time.perf_counter() - tic,
+        )
+
+    def _fail_scale(self, error: str, effective_size: int) -> None:
+        ElasticEPStateManager.fail_scale(error)
+        reset_barriers_after_failure()
+        self._reset_eplb_after_elastic_scale_failure()
+        # Report the reconciled width: the tokenizer sizes its control fan-out from it.
+        reconciled = ElasticEPStateManager.get_effective_ep_size() or effective_size
+        self._narrow_to_reconciled_width(reconciled)
+        # A failure after the mask flip can narrow this rank under graphs captured at
+        # the old width. Read after the narrowing, which may itself have failed.
+        runner = self.decode_cuda_graph_runner
+        if runner is not None and runner.num_dp_ranks != get_parallel().num_dp_ranks:
+            self._elastic_pending_graph_recapture = True
+        self._report_elastic_scale_failure(error, reconciled)
+        if self._elastic_global_rank() == 0:
+            logger.error("[Elastic EP] %s", error)
+
+    def _narrow_to_reconciled_width(self, reconciled: int) -> None:
+        """Finish narrowing num_dp_ranks and the expert map to fail_scale's width: the
+        mask flip cannot be undone, and mlp_sync rejects a mismatched num_dp_ranks."""
+        applied = get_parallel().num_dp_ranks * attn_replica_size()
+        if reconciled >= applied:
+            return
+        try:
+            shrink_expert_metadata(
+                model_config=self.model_config,
+                from_ep_size=applied,
+                effective_size=reconciled,
+                moe_ep_rank=self._elastic_global_rank(),
+                reload_relabelled=self._reload_relabelled_expert_weights,
+            )
+            self._apply_dp_size(reconciled, self._elastic_global_rank())
+        except Exception:
+            logger.error(
+                "[Elastic EP] could not narrow dp_size/expert map to the reconciled "
+                "width %d after a failed scale; this rank is inconsistent and a "
+                "later scale is refused until it is recovered.",
+                reconciled,
+                exc_info=True,
+            )
 
     def maybe_join_ep_ranks(self) -> None:
         if not ElasticEPStateManager.is_scaling():
@@ -2576,119 +2644,106 @@ class ModelRunner:
 
         if pending_size is None:
             if state is not None and state.has_scaled:
-                error = (
-                    "Elastic EP rank recovery is unsupported after runtime scale-up. "
-                    "Restart the expanded deployment."
-                )
-                ElasticEPStateManager.fail_recovery(error)
-                self._report_elastic_scale_failure(error, effective_size)
-                if (
-                    get_parallel().tp_rank == 0
-                    and not get_exec().moe.is_ep_scale_joiner
-                ):
-                    logger.error("[Elastic EP] %s", error)
+                # Silent: marking the state failed would block every future scale.
                 return
-
-            recovered = maybe_recover_ep_ranks(
-                tp_group=get_parallel().tp_group,
-                eplb_manager=self.eplb_manager,
-                model_config=self.model_config,
-                moe_ep_rank=self._elastic_global_rank(),
-            )
-            if recovered:
-                self.forward_pass_id = 0
+            # Fault recovery is Mooncake's peer-state path; nixl only reports the fault.
+            if get_exec().moe.elastic_ep_backend != "mooncake":
+                return
+            active_cpu = state.active_ranks_cpu.detach().numpy()
+            ranks_to_recover = [i for i in range(effective_size) if not active_cpu[i]]
+            if not ranks_to_recover:
+                return
+            current_platform.synchronize()
+            if try_recover_faulted_ranks(ranks_to_recover):
+                self._finalize_recovered_ep_ranks(ranks_to_recover)
             return
 
-        local_timeout = (
+        # Shrinks run from is_shrink_pending(), whose timeout also abandons the FSM;
+        # voting here would stall peers' mlp_sync.
+        if pending_size < effective_size:
+            return
+
+        if (
             state.pending_since is not None
             and time.monotonic() - state.pending_since
-            > get_exec().moe.elastic_ep_scale_timeout
-        )
-        timeout = state.active_ranks.new_tensor(int(local_timeout))
-        dist.all_reduce(timeout, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
-        if timeout.item():
+            > self.server_args.elastic_ep_scale_timeout
+        ):
             error = f"Timed out waiting for ranks to join target EP size {pending_size}"
-            ElasticEPStateManager.fail_scale(error)
-            self._reset_eplb_after_elastic_scale_failure()
-            self._report_elastic_scale_failure(error, effective_size)
-            if get_parallel().tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
-                logger.error("[Elastic EP] %s", error)
+            self._fail_scale(error, effective_size)
             return
 
+        # Grow into a retired slot: survivors take try_recover_ranks and skip the cohort
+        # rendezvous, since Mooncake peer-state polling replaces admit-side sync.
+        pending_recover = list(state.pending_recover_ranks)
+
         if state.scale_phase == "waiting_for_cohort":
-            cohort = get_scale_cohort(effective_size)
-            if cohort is None:
-                return
-            if cohort.target_ep_size != pending_size:
-                error = (
-                    f"Requested target EP size {pending_size} does not match "
-                    f"joining cohort target {cohort.target_ep_size}"
-                )
-                ElasticEPStateManager.fail_scale(error)
-                self._reset_eplb_after_elastic_scale_failure()
-                self._report_elastic_scale_failure(error, effective_size)
-                if (
-                    get_parallel().tp_rank == 0
-                    and not get_exec().moe.is_ep_scale_joiner
-                ):
-                    logger.error("[Elastic EP] %s", error)
-                return
-            try:
-                validate_scale_cohort_topology(cohort)
-            except ValueError as exc:
-                error = str(exc)
-                ElasticEPStateManager.fail_scale(error)
-                self._reset_eplb_after_elastic_scale_failure()
-                self._report_elastic_scale_failure(error, effective_size)
-                if (
-                    get_parallel().tp_rank == 0
-                    and not get_exec().moe.is_ep_scale_joiner
-                ):
-                    logger.error("[Elastic EP] %s", error)
-                return
-            cuda_graph_enabled = self._elastic_cuda_graph_enabled()
-            if cohort.cuda_graph_enabled != cuda_graph_enabled:
-                error = (
-                    "Primary and joining cohort must use the same CUDA graph "
-                    "configuration for Elastic EP scale-up"
-                )
-                ElasticEPStateManager.fail_scale(error)
-                self._reset_eplb_after_elastic_scale_failure()
-                self._report_elastic_scale_failure(error, effective_size)
-                if (
-                    get_parallel().tp_rank == 0
-                    and not get_exec().moe.is_ep_scale_joiner
-                ):
-                    logger.error("[Elastic EP] %s", error)
-                return
-            try:
-                self._validate_elastic_cuda_graph_recapture()
-            except ValueError as exc:
-                error = str(exc)
-                ElasticEPStateManager.fail_scale(error)
-                self._reset_eplb_after_elastic_scale_failure()
-                self._report_elastic_scale_failure(error, effective_size)
-                if (
-                    get_parallel().tp_rank == 0
-                    and not get_exec().moe.is_ep_scale_joiner
-                ):
-                    logger.error("[Elastic EP] %s", error)
-                return
+            # Only survivors vote: the tally is sized by the voter's own width, so a
+            # rank already at the target counts in a namespace nobody reads.
+            if not pending_recover:
+                cohort = get_scale_cohort(effective_size)
+                # Survivors read the cohort key microseconds apart, so one can
+                # branch into the scale path while peers post another mlp_sync.
+                # Branch together or not at all, under a sub-watchdog budget.
+                budget = float(self.server_args.elastic_ep_scale_timeout)
+                if state.pending_since is not None:
+                    budget -= time.monotonic() - state.pending_since
+                budget = max(1.0, min(budget, self.server_args.watchdog_timeout / 3.0))
+                try:
+                    unanimous = cohort_vote_via_store(
+                        cohort is not None,
+                        effective_size,
+                        tag=f"admit{pending_size}",
+                        timeout_s=budget,
+                    )
+                except RuntimeError as exc:
+                    logger.warning("[Elastic EP] cohort vote not settled yet (%s)", exc)
+                    return
+                if not unanimous:
+                    return
+                try:
+                    if cohort.target_ep_size != pending_size:
+                        raise ValueError(
+                            f"Requested target EP size {pending_size} does not match "
+                            f"joining cohort target {cohort.target_ep_size}"
+                        )
+                    validate_scale_cohort_topology(cohort)
+                    if cohort.cuda_graph_enabled != self._elastic_cuda_graph_enabled():
+                        raise ValueError(
+                            "Primary and joining cohort must use the same CUDA graph "
+                            "configuration for Elastic EP scale-up"
+                        )
+                    self._validate_elastic_cuda_graph_recapture()
+                except ValueError as exc:
+                    self._fail_scale(str(exc), effective_size)
+                    return
             if not ElasticEPStateManager.begin_scale():
                 return
 
-        ranks_to_join = list(range(effective_size, pending_size))
+        ranks_to_join = list(pending_recover or range(effective_size, pending_size))
         if not ranks_to_join:
             return
 
         current_platform.synchronize()
         ElasticEPStateManager.mark_joining()
-        if try_admit_scale_ranks(ranks_to_join):
-            self._finalize_scale_up(
-                ranks_to_join=ranks_to_join,
-                target_size=pending_size,
-                effective_size=effective_size,
+        admit = try_recover_ranks if pending_recover else try_admit_scale_ranks
+        try:
+            if admit(ranks_to_join):
+                self._finalize_scale_up(
+                    ranks_to_join=ranks_to_join,
+                    target_size=pending_size,
+                    effective_size=effective_size,
+                    is_recover=bool(pending_recover),
+                )
+        except Exception as exc:
+            error = (
+                f"scale finalize failed target={pending_size} join={ranks_to_join}: "
+                f"{type(exc).__name__}: {exc}"
             )
+            # Log on every rank: this one will be missing from the ready barrier.
+            logger.exception(
+                "[Elastic EP] rank=%d %s", self._elastic_global_rank(), error
+            )
+            self._fail_scale(error, effective_size)
 
     def _maybe_rebalance_after_rank_fault(
         self,
@@ -2718,6 +2773,83 @@ class ModelRunner:
                 load_format=load_format,
             )
         self.load_config = load_config
+
+    def _finalize_recovered_ep_ranks(self, ranks_to_recover: list[int]) -> None:
+        self.forward_pass_id = 0
+        if self.eplb_manager is not None:
+            self.eplb_manager.reset_generator()
+        # Collective, not _lowest_survivor: the rejoining rank elects over WORLD too.
+        self._broadcast_expert_location(
+            get_healthy_expert_location_src_rank(
+                invoked_in_elastic_ep_rejoin_path=False
+            )
+        )
+        self._reinit_expert_distribution_recorder()
+        ElasticEPStateManager.instance().reset()
+        reset_barriers_after_failure()
+        # Every survivor, verbatim: test_elastic_recover.py counts one per survivor.
+        logger.info("[Elastic EP] recover ranks %s done", ranks_to_recover)
+
+    def maybe_retire_ep_ranks(self, is_idle: Optional[Callable] = None) -> None:
+        """Advance a Mooncake-native scale-down one step, from tick_elastic_scale only so
+        every backend shares one stage cadence."""
+        if (
+            self.server_args.elastic_ep_backend != "mooncake"
+            or not ElasticEPStateManager.is_shrink_pending()
+        ):
+            return
+        self._scale_down_sm = advance_scale_down(
+            sm=getattr(self, "_scale_down_sm", None),
+            driver=ScaleDownDriver(
+                self._finalize_scale_down,
+                lambda: retire_and_exit(
+                    my_global_rank=self._elastic_global_rank(),
+                    park_hook=self.elastic_park_hook,
+                ),
+                is_idle,
+            ),
+            pending_size=ElasticEPStateManager.get_pending_ep_size(),
+            effective_size=ElasticEPStateManager.get_effective_ep_size(),
+            pending_since=ElasticEPStateManager.instance().pending_since,
+            my_global_rank=self._elastic_global_rank(),
+            scale_timeout=self.server_args.elastic_ep_scale_timeout,
+            fail_scale=self._fail_scale,
+        )
+
+    def _reload_relabelled_expert_weights(self, layers: dict[int, list[int]]) -> None:
+        """Fetch weights for logicals whose slot does not hold them yet."""
+        from sglang.srt.eplb.eplb_manager import reload_missing_expert_weights
+
+        if not layers:
+            return
+        reload_missing_expert_weights(
+            layers,
+            model=self.model,
+            expert_backup_client=self.expert_backup_client,
+            update_weights_from_disk_callable=self.weight_updater.update_weights_from_disk,
+        )
+
+    def _finalize_scale_down(
+        self, ranks_to_retire: list[int], target_size: int, effective_size: int
+    ) -> None:
+        result = finalize_scale_down(
+            model_config=self.model_config,
+            moe_ep_rank=self._elastic_global_rank(),
+            eplb=self.eplb_manager,
+            reload_relabelled=self._reload_relabelled_expert_weights,
+            apply_dp_size=self._apply_dp_size,
+            scale_ready_barrier=self._elastic_scale_ready_barrier,
+            init_lplb_solvers=self.maybe_init_lplb_solvers,
+            reinit_recorder=self._reinit_expert_distribution_recorder,
+            rearm_eplb=self._rearm_eplb_after_elastic_scale,
+            ranks_to_retire=ranks_to_retire,
+            target_size=target_size,
+            effective_size=effective_size,
+        )
+        self.forward_pass_id = 0
+        self._elastic_pending_graph_recapture |= result.request_graph_recapture
+        if result.scale_update is not None:
+            self._pending_elastic_scale_update = result.scale_update
 
 
 def _is_block_fp8(layer: torch.nn.Module) -> bool:

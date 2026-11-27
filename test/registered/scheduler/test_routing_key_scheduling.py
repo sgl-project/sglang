@@ -21,8 +21,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=50, stage="weekly", runner_config="1-gpu-large")
-register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
-register_cpu_ci(est_time=55, suite="stage-b-test-cpu-intel")
+register_amd_ci(est_time=120, suite="nightly-test-1-gpu-amd", nightly=True)
+register_cpu_ci(est_time=55, suite="extra-test-cpu-intel")
 
 
 class TestRoutingKeyScheduling(CustomTestCase):

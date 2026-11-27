@@ -36,11 +36,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
-    is_gfx1250_supported,
     is_hip,
     is_mlu,
     is_musa,
@@ -55,7 +53,7 @@ _is_hip = is_hip()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_mlu = is_mlu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
@@ -115,17 +113,8 @@ _has_rocm_triton_gemma_rms_norm = False
 if _use_aiter:
     import aiter as _aiter
     from aiter import layernorm2d_fwd as layer_norm
-
-    if is_gfx1250_supported():
-        from aiter.ops.triton.normalization.rmsnorm import (
-            rms_norm,
-        )
-        from aiter.ops.triton.normalization.rmsnorm import (
-            rmsnorm2d_fwd_with_add as fused_add_rms_norm,
-        )
-    else:
-        from aiter import rmsnorm2d_fwd as rms_norm
-        from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
+    from aiter import rmsnorm2d_fwd as rms_norm
+    from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
     _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
@@ -185,7 +174,7 @@ if _is_npu:
     import torch_npu
 
     try:
-        from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
+        from sgl_kernel_npu.operators.norm import gemma_rmsnorm as npu_gemma_rms_norm
     except ImportError:
         # sgl-kernel-npu wheels built before the target-specific Gemma provider
         # landed expose only the torch_npu operator, which is exactly what that

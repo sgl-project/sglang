@@ -92,6 +92,7 @@ from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
+    MHATokenToKVPoolMXFP8,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
@@ -707,6 +708,72 @@ class TestMTPKVShardConfig(CustomTestCase):
                 _build_mtp_pool(kvc)
 
 
+class _PastShardGate(Exception):
+    pass
+
+
+class TestHybridLinearShardGate(CustomTestCase):
+    """The QSA hybrid builder swaps in the striped full-attention pool only
+    where the plain MHA pool would be built."""
+
+    @staticmethod
+    def _build(*, pool_class=MHATokenToKVPool, quant_method=None, qsa=True):
+        kvc = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        kvc.is_draft_worker = False
+        kvc.use_mla_backend = False
+        kvc.kv_shard_rank = 0
+        kvc.kv_shard_spec = kvc.kv_shard_group = None
+        kvc.mambaish_config = SimpleNamespace(full_attention_layer_ids=[3])
+        kvc.layer_info = SimpleNamespace(start_layer=0, end_layer=4)
+        kvc.model_config = SimpleNamespace(hf_config=SimpleNamespace())
+        with (
+            unittest.mock.patch.object(
+                KVCacheConfigurator,
+                "_build_mha_quant_method",
+                return_value=quant_method,
+            ),
+            unittest.mock.patch.object(
+                KVCacheConfigurator,
+                "_hybrid_full_attention_pool_class",
+                return_value=pool_class,
+            ),
+            unittest.mock.patch(
+                "sglang.srt.layers.attention.qsa.config.parse_qsa_profile",
+                return_value=object() if qsa else None,
+            ),
+            # The first call after the gate.
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_model",
+                side_effect=_PastShardGate,
+            ),
+        ):
+            kvc._build_hybrid_linear_kv_pool(
+                max_total_num_tokens=128,
+                req_to_token_pool=None,
+                state_pool=None,
+                mha_pool_class=pool_class,
+                mla_pool_class=MLATokenToKVPool,
+                dsa_pool_class=None,
+            )
+
+    def test_plain_mha_pool_passes(self):
+        # BF16 and ordinary CUDA FP8 both build the plain pool, no quant method.
+        with self.assertRaises(_PastShardGate):
+            self._build()
+
+    def test_rejects_what_the_striped_pool_cannot_carry(self):
+        for options, message in (
+            ({"qsa": False}, "only with compressed QSA"),
+            ({"pool_class": MHATokenToKVPoolMXFP8}, "MHATokenToKVPoolMXFP8 pool"),
+            ({"quant_method": object()}, "ordinary CUDA FP8 is supported"),
+        ):
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                self._build(**options)
+
+
 def _make_spec(shard_rank=0, max_prefix_groups=64, chunk_pages=32):
     return PageShardSpec(
         shard_rank=shard_rank,
@@ -985,6 +1052,77 @@ class TestClassedAllocator(CustomTestCase):
         self.assertIsNone(out)
         self.assertEqual(alloc.class_free_page_counts(), counts_before)
 
+    def test_batch_alloc_matches_sequential_requests(self):
+        """The batched commit pops each class once for the whole batch; it
+        must hand out exactly the pages a request-by-request commit would,
+        with staged (need_sort) or reordered (no sort) free lists."""
+        prefix_lens = [2 * PS, 0, 0, 5 * PS, 0]
+        seq_lens = [7 * PS - 3, 3 * PS + 1, 1, 6 * PS, 9 * PS - 5]
+        bases = [1, None, None, 3, None]
+        last_locs = [
+            (5 * N + 2) * PS + PS - 1,
+            -1,
+            -1,
+            (7 * N + 3) * PS + PS - 1,
+            -1,
+        ]
+        for need_sort in (False, True):
+            with self.subTest(need_sort=need_sort):
+                batched, sequential = (
+                    _make_allocator(pages_per_rank=16, need_sort=need_sort)
+                    for _ in range(2)
+                )
+                for alloc in (batched, sequential):
+                    # Free part of an allocation so the classes hold staged
+                    # pages (need_sort) or reordered heads (no sort).
+                    warm = _alloc_extend(alloc, 0, 12 * PS, rotation_base=2)
+                    alloc.free(warm[3 * PS : 9 * PS])
+
+                batch_bases = list(bases)
+                out = _alloc_extend_batch(
+                    batched, prefix_lens, seq_lens, batch_bases, last_locs
+                )
+                expected = torch.cat(
+                    [
+                        _alloc_extend(sequential, p, s, b, loc)
+                        for p, s, b, loc in zip(
+                            prefix_lens, seq_lens, batch_bases, last_locs
+                        )
+                    ]
+                )
+                self.assertTrue(torch.equal(out, expected))
+                self.assertEqual(
+                    batched.class_free_page_counts(),
+                    sequential.class_free_page_counts(),
+                )
+
+    def test_grouped_free_segments_release_each_page_once(self):
+        """free() and free_segment() calls in one group are released together:
+        each page returns to its owner class exactly once, staged until the
+        next merge under need_sort."""
+        alloc = _make_allocator(need_sort=True)
+        total = alloc.class_free_page_counts()
+        out = _alloc_extend(alloc, 0, 6 * PS + 5, rotation_base=1)
+
+        alloc.free_group_begin()
+        alloc.free_segment(out[: 2 * PS], start_pos=0)
+        alloc.free_segment(out[2 * PS : 5 * PS], start_pos=2 * PS)
+        alloc.free(out[5 * PS :])
+        # Grouped segment ids must not alias the caller's row.
+        out[: 5 * PS].zero_()
+        alloc.free_group_end()
+
+        self.assertEqual(alloc.class_free_page_counts(), total)
+        free_pages = alloc.get_all_free_pages()
+        self.assertEqual(len(torch.unique(free_pages)), free_pages.numel())
+        alloc.debug_check_classes()
+
+    def test_free_segment_rejects_unaligned_start(self):
+        alloc = _make_allocator()
+        out = _alloc_extend(alloc, 0, 2 * PS, rotation_base=0)
+        with self.assertRaises(AssertionError):
+            alloc.free_segment(out[1:], start_pos=1)
+
 
 class TestEvictUntilAllocatable(CustomTestCase):
     """The evict-then-allocate contract under min-class accounting: one
@@ -1056,7 +1194,7 @@ def _unified_tree(page_size=4, pool_size=256, disable=False):
     )
     req_pool = ReqToTokenPool(
         size=8,
-        max_context_len=128,
+        row_width=128,
         device="cpu",
         enable_memory_saver=False,
     )
@@ -1109,7 +1247,7 @@ class TestShardedAllocationEviction(CustomTestCase):
                 disable=False,
                 req_to_token_pool=ReqToTokenPool(
                     size=8,
-                    max_context_len=128,
+                    row_width=128,
                     device="cpu",
                     enable_memory_saver=False,
                 ),
@@ -1263,7 +1401,7 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
         params = CacheInitParams(
             disable=False,
             req_to_token_pool=ReqToTokenPool(
-                size=8, max_context_len=128, device="cpu", enable_memory_saver=False
+                size=8, row_width=128, device="cpu", enable_memory_saver=False
             ),
             token_to_kv_pool_allocator=tree.token_to_kv_pool_allocator,
             page_size=4,
@@ -1905,6 +2043,21 @@ class TestShardedPoolFootprint(CustomTestCase):
 class TestShardSendFilter(CustomTestCase):
     """P/D send side: rank r sends the pages with l % N == r, as its local page
     l // N, at their request-global send positions."""
+
+    def test_single_host_tensor_page_preserves_ownership_and_send_position(self):
+        # A short last chunk has one page. NumPy must treat its torch-derived
+        # mask as a boolean mask, not scalar index 0/1.
+        for rank in range(N):
+            with self.subTest(rank=rank):
+                local, positions = filter_kv_indices_for_shard_rank(
+                    kv_indices=torch.tensor([5], dtype=torch.int32),
+                    index_slice=slice(64, 65),
+                    shard_rank=rank,
+                    shard_size=N,
+                )
+                self.assertIsInstance(local, np.ndarray)
+                np.testing.assert_array_equal(local, [1] if rank == 1 else [])
+                np.testing.assert_array_equal(positions, [64] if rank == 1 else [])
 
     def test_ranks_partition_a_rotated_chunk(self):
         # A base-2 rotated chain: owners are not position-congruent.

@@ -58,6 +58,12 @@ spec:
           value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
+        - name: SGLANG_USE_IMAGE
+          value: "{{ use_image_sglang }}"
+        - name: SGLANG_NPU_CONTAINER_PATCHES
+          value: "{{ container_patches }}"
+        - name: NPU_TEST_METHOD
+          value: "{{ test_method }}"
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -168,6 +174,12 @@ spec:
           value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
+        - name: SGLANG_USE_IMAGE
+          value: "{{ use_image_sglang }}"
+        - name: SGLANG_NPU_CONTAINER_PATCHES
+          value: "{{ container_patches }}"
+        - name: NPU_TEST_METHOD
+          value: "{{ test_method }}"
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -277,6 +289,12 @@ spec:
           value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
+        - name: SGLANG_USE_IMAGE
+          value: "{{ use_image_sglang }}"
+        - name: SGLANG_NPU_CONTAINER_PATCHES
+          value: "{{ container_patches }}"
+        - name: NPU_TEST_METHOD
+          value: "{{ test_method }}"
         command: ["/bin/bash", "-c"]
         args:
           - |
