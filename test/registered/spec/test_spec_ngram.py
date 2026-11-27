@@ -4,7 +4,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
-from sglang.test.kits.spec_server_kits import SpecLogprobKit
+from sglang.test.kits.spec_server_kits import SpecLogprobKit, SpecSamplingMaskKit
 from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
 
 # Per-commit: Paged backend only.
@@ -17,6 +17,7 @@ class TestNgramSpeculativeDecodingPaged(
     NgramServerBase,
     GSM8KMixin,
     SpecLogprobKit,
+    SpecSamplingMaskKit,
     RegexConstrainedMixin,
     JSONConstrainedMixin,
 ):

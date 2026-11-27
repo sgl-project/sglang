@@ -18,6 +18,7 @@ from sglang.test.kits.spec_server_kits import (
     SpecHiddenStatesKit,
     SpecLogprobKit,
     SpecPenaltyKit,
+    SpecSamplingMaskKit,
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
@@ -31,6 +32,7 @@ class TestEagle3Topk16(
     SpecLogprobKit,
     SpecFeatureKit,
     SpecHiddenStatesKit,
+    SpecSamplingMaskKit,
 ):
     """EAGLE3 topk=16 tree, overlap scheduler: guards the accepted-path
     compaction (via logprob_decode_match_prefill) and the per-request
@@ -59,6 +61,7 @@ class TestEagleLlama2Suite(
     SpecPenaltyKit,
     PenalizedEOSMixin,
     SpecFeatureKit,
+    SpecSamplingMaskKit,
     AbortAllMixin,
 ):
     """EAGLE/Llama-2 topk=8 full coverage (kits listed in bases).

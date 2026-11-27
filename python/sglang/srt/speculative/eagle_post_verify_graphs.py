@@ -135,6 +135,8 @@ class EaglePostVerifyGraphs:
             or batch.hisparse_coordinator is not None
             or verify_input.draft_probs is not None
             or adjusts_logits(info, has_grammar=batch.has_grammar)
+            # The replayed result does not carry a sampling mask.
+            or info.sampling_mask_batch_indices is not None
             # the replayed sampling view carries no seeds and no min-p
             or info.sampling_seed is not None
             or info.need_min_p_sampling

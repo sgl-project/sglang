@@ -967,6 +967,7 @@ def _tree_accept(
         is_dp_attention_enabled,
     )
     from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.speculative.spec_info import SpecInputType
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -1034,6 +1035,13 @@ def _tree_accept(
     )
 
     # Sample tokens
+    mask_rows = (
+        getattr(batch.sampling_info, "sampling_mask_batch_indices", None)
+        if getattr(verify_input, "spec_input_type", None)
+        in (SpecInputType.NGRAM_VERIFY, SpecInputType.EAGLE_VERIFY)
+        else None
+    )
+    mask_target_probs = None
     target_predict = None
     accept_lens = None
     if greedy:
@@ -1228,6 +1236,8 @@ def _tree_accept(
             threshold_acc=get_spec().speculative_accept_threshold_acc,
             deterministic=True,
         )
+        if mask_rows is not None:
+            mask_target_probs = target_probs
         del (
             target_probs,
             draft_probs,
@@ -1335,6 +1345,36 @@ def _tree_accept(
     # name no longer flips semantics mid-function (naming doc C2).
     if accept_lens is None:
         accept_lens = num_correct_drafts + 1
+    if mask_rows is not None:
+        from sglang.srt.runtime_context import get_exec
+        from sglang.srt.speculative.spec_sampling_mask import build_tree_sampling_mask
+
+        # The accepted tokens must refer to the dense target actually passed to
+        # the verifier. Never synthesize a singleton for a stochastic row.
+        if not greedy and mask_target_probs is None:
+            raise RuntimeError(
+                "Missing target probabilities for the tree sampling mask."
+            )
+        logits_output.sampling_mask_output = build_tree_sampling_mask(
+            batch.sampling_info,
+            mask_target_probs,
+            predict,
+            accept_index,
+            accept_lens,
+            get_exec().features.sampling_mask_max_tokens,
+        )
+        # Every replica must make the same request-abort decision.
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_parallel().tp_group
+        )
+        if tp_group.world_size > 1:
+            torch.distributed.all_reduce(
+                logits_output.sampling_mask_output.statuses,
+                op=torch.distributed.ReduceOp.MAX,
+                group=tp_group.device_group,
+            )
     return predict, accept_lens, accept_index
 
 
