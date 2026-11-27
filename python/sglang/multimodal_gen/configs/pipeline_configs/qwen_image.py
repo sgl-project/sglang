@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.qwenimage import (
@@ -473,6 +474,89 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             negative=True,
         )
 
+    _CFG_BRANCH_KEYS = frozenset(
+        (
+            "encoder_hidden_states",
+            "encoder_hidden_states_mask",
+            "txt_seq_lens",
+            "img_shapes",
+            "freqs_cis",
+            "freqs_complex",
+        )
+    )
+
+    def batch_cfg_branch_kwargs(self, cond_kwargs, uncond_kwargs):
+        # Same layout as a multi-request batch: text right-padded to the longer
+        # prompt with a mask of real tokens. Both branches share img_shapes, and
+        # the text RoPE table is indexed by position, so the longer branch's
+        # tables serve both rows.
+        if (
+            cond_kwargs.keys() != uncond_kwargs.keys()
+            or not self._CFG_BRANCH_KEYS - {"freqs_complex"} <= cond_kwargs.keys()
+        ):
+            return None
+        for key in cond_kwargs.keys() - self._CFG_BRANCH_KEYS:
+            a, b = cond_kwargs[key], uncond_kwargs[key]
+            if a is not b and (isinstance(a, torch.Tensor) or a != b):
+                return None
+        if (
+            cond_kwargs.get("encoder_hidden_states_mask") is not None
+            or uncond_kwargs.get("encoder_hidden_states_mask") is not None
+            or cond_kwargs.get("freqs_cis") is None
+            or cond_kwargs.get("img_shapes") != uncond_kwargs.get("img_shapes")
+            or len(cond_kwargs["img_shapes"]) != 1
+        ):
+            return None
+        embeds = []
+        for kwargs in (cond_kwargs, uncond_kwargs):
+            e = kwargs.get("encoder_hidden_states")
+            if isinstance(e, (list, tuple)) and len(e) == 1:
+                e = e[0]
+            if not isinstance(e, torch.Tensor) or e.dim() != 3 or e.shape[0] != 1:
+                return None
+            if list(kwargs.get("txt_seq_lens") or []) != [e.shape[1]]:
+                return None
+            embeds.append(e)
+        lens = [e.shape[1] for e in embeds]
+        max_len = max(lens)
+        mask = None
+        if lens[0] != lens[1]:
+            mask = torch.ones(2, max_len, dtype=torch.bool, device=embeds[0].device)
+            for row, n in enumerate(lens):
+                mask[row, n:] = False
+        longer = cond_kwargs if lens[0] >= lens[1] else uncond_kwargs
+        merged = {
+            k: v for k, v in cond_kwargs.items() if k not in self._CFG_BRANCH_KEYS
+        }
+        merged.update(
+            encoder_hidden_states=torch.cat(
+                [F.pad(e, (0, 0, 0, max_len - e.shape[1])) for e in embeds]
+            ),
+            encoder_hidden_states_mask=mask,
+            txt_seq_lens=lens,
+            img_shapes=cond_kwargs["img_shapes"] * 2,
+            freqs_cis=longer["freqs_cis"],
+        )
+        if "freqs_complex" in cond_kwargs:
+            merged["freqs_complex"] = longer["freqs_complex"]
+        return merged
+
+    # Estimated activation memory of one CFG row of the DiT forward, in hidden-size
+    # rows per token. The extra peak of the batch-2 forward at 1024x1024 measured
+    # on H200 (Qwen-Image 318 MiB, Edit-2509 636 MiB, Edit-2511 734 MiB) is 13 to
+    # 15 rows; 16 covers all three.
+    _CFG_ROW_ACTIVATION_ROWS_PER_TOKEN = 16
+
+    def batch_cfg_row_bytes(self, latent_tokens, text_tokens, dtype):
+        """Estimated activation bytes of one CFG row of the DiT forward."""
+        hidden = self.dit_config.arch_config.hidden_size
+        return (
+            self._CFG_ROW_ACTIVATION_ROWS_PER_TOKEN
+            * (latent_tokens + text_tokens)
+            * hidden
+            * dtype.itemsize
+        )
+
     def post_denoising_loop(self, latents, batch):
         # unpack latents for qwen-image
         (
@@ -766,6 +850,10 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
         # The Layered pipeline's first stage does not split an n > 1 request, so the
         # worker must not expect one result per output.
         return False
+
+    def batch_cfg_branch_kwargs(self, cond_kwargs, uncond_kwargs):
+        # additional_t_cond holds one row and is not stacked for a batch-2 forward
+        return None
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
