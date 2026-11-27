@@ -362,7 +362,7 @@ class _SegmentEncoder:
         self.cuts = {}
         self.lock = threading.Lock()
         self.cache = OrderedDict()
-        # Key -> _InFlightEncode of a text that one call is encoding now.
+        # Key -> _InFlightEncode of the call that is encoding the text now.
         self.in_flight = {}
         self.cached_bytes = 0
 
@@ -398,16 +398,19 @@ class _SegmentEncoder:
             # encoding is waited for, not encoded again.
             own, waits = self._claim(texts, known, cache_salt)
             if own:
-                encoded = {}
+                encoded = lists = {}
                 try:
-                    encoded = self._encode(own, cache_salt)
+                    lists = self._encode(own, cache_salt)
+                    encoded = {text: array("I", ids) for text, ids in lists.items()}
                 finally:
                     self._publish(own, encoded, cache_salt)
-                known.update(encoded)
+                # This call's own ids as lists: extending from them is cheaper.
+                known.update(lists)
             for text, pending in waits.items():
                 pending.done.wait()
-                if pending.ids is not None:
-                    known[text] = pending.ids
+                ids = pending.ids.get(text)
+                if ids is not None:
+                    known[text] = ids
             # Left only if the encode waited for raised: encode them here.
             texts = [text for text in waits if text not in known]
 
@@ -423,7 +426,7 @@ class _SegmentEncoder:
         """Copy the cached ids of `texts` into `known`. Of the rest, return the
         texts this call must encode (now claimed, once each) and
         {text: _InFlightEncode} of those another call is encoding."""
-        own, waits = [], {}
+        own, waits, claim = [], {}, None
         with self.lock:
             for text in dict.fromkeys(texts):
                 key = (cache_salt, text)
@@ -434,7 +437,9 @@ class _SegmentEncoder:
                 elif key in self.in_flight:
                     waits[text] = self.in_flight[key]
                 else:
-                    self.in_flight[key] = _InFlightEncode()
+                    if claim is None:
+                        claim = _InFlightEncode()
+                    self.in_flight[key] = claim
                     own.append(text)
         return own, waits
 
@@ -452,18 +457,19 @@ class _SegmentEncoder:
         encodings = self.backend.encode_batch(chunks, add_special_tokens=False)
         encoded, start = {}, 0
         for text, count in zip(texts, counts):
-            encoded[text] = array(
-                "I",
-                chain.from_iterable(e.ids for e in encodings[start : start + count]),
-            )
+            if count == 1:
+                encoded[text] = encodings[start].ids
+            else:
+                encoded[text] = list(
+                    chain.from_iterable(e.ids for e in encodings[start : start + count])
+                )
             start += count
         return encoded
 
     def _publish(self, texts, encoded, cache_salt):
         """Cache the ids of the claimed `texts` and release their claims, in one
         step under the lock, so a text is always cached, in flight or unclaimed.
-        A text missing from `encoded` (its encode raised) wakes its waiters
-        with no ids."""
+        If the encode raised, `encoded` is empty and the waiters get no ids."""
         with self.lock:
             for text in texts:
                 key = (cache_salt, text)
@@ -473,19 +479,20 @@ class _SegmentEncoder:
                     if key not in self.cache and size <= _SEGMENT_CACHE_MAX_ENTRY_BYTES:
                         self.cache[key] = ids
                         self.cached_bytes += size
-                pending = self.in_flight.pop(key)
-                pending.ids = ids
-                pending.done.set()
+                claim = self.in_flight.pop(key)
+            claim.ids = encoded
+            claim.done.set()
             while self.cached_bytes > _SEGMENT_CACHE_MAX_BYTES:
                 self.cached_bytes -= _entry_bytes(*self.cache.popitem(last=False))
 
 
 class _InFlightEncode:
-    """A text's encode in progress; `ids` is set before `done`."""
+    """One call's encode of the texts it claimed; `ids` ({text: ids}, empty if
+    the encode raised) is set before `done`."""
 
     def __init__(self):
         self.done = threading.Event()
-        self.ids = None
+        self.ids = {}
 
 
 def _samples_merges(backend):
