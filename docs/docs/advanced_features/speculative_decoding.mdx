@@ -566,7 +566,7 @@ UBTree adds a trained tree selector to a DFlash draft model. The current integra
 Set `LING_TARGET` and `UBTREE_DRAFT` to your paired checkpoint paths, then launch:
 
 ```bash
-SGLANG_PLUGINS=none python -m sglang.launch_server \
+python -m sglang.launch_server \
     --model-path "$LING_TARGET" \
     --speculative-draft-model-path "$UBTREE_DRAFT" \
     --speculative-algorithm UBTREE \
@@ -582,7 +582,9 @@ SGLANG_PLUGINS=none python -m sglang.launch_server \
     --trust-remote-code
 ```
 
-`--speculative-num-draft-tokens` sets a fixed number of target verification nodes, including the root. Choose any integer from the draft block size (16 for the released drafts) through the exported `tree_budget + 1`. The default is 49, capped by that budget. The 32- and 49-node configurations have specialized kernel paths; other sizes use general paths. Throughput depends on acceptance length, tree size, model, and hardware, so benchmark your workload when choosing a size. The draft block size comes from the checkpoint. `--speculative-eagle-topk` is an internal tree-metadata setting for UBTree and does not tune proposal breadth.
+For `inclusionAI/Ling-3.0-flash` paired with `inclusionAI/Ling-3.0-flash-UBTree`, add `--tp 4` on 4x 141 GB GPUs such as H200 (or `--tp 8` on 80 GB GPUs) and pass `--context-length 131072` because the released UBTree draft exports a 131072 native context length while the target defaults to 262144.
+
+`--speculative-num-draft-tokens` sets a fixed number of target verification nodes, including the root. Choose any integer from the draft block size (16 for the released drafts) through the exported `tree_budget + 1`. The default is 49, capped by that budget. The fused tree convolution and factorized KDA verification run across all valid verify widths. Throughput depends on acceptance length, tree size, model, and hardware, so benchmark your workload when choosing a size. The draft block size comes from the checkpoint. `--speculative-eagle-topk` is an internal tree-metadata setting fixed to 2 for UBTree and does not tune proposal breadth.
 
 Send requests with `temperature=0` or `top_k=1` for greedy decoding. For sampling, use `--sampling-backend flashinfer` (the CUDA default) and set `temperature`, `top_k`, `top_p`, and optionally `min_p` in each request. For example:
 

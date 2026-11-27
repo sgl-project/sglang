@@ -24,7 +24,7 @@ def _outputs(batch, heads, nodes, dim, device):
     return pk, pd, pb, rv, rk, g, beta
 
 
-@pytest.mark.parametrize("heads,nodes", [(8, 32), (16, 49)])
+@pytest.mark.parametrize("heads,nodes", [(8, 16), (8, 24), (8, 32), (16, 49)])
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("lower_bound", [None, -5.0])
 def test_fused_conv_tree_transform_matches_reference(

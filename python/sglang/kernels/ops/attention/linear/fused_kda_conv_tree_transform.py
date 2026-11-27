@@ -343,8 +343,8 @@ def fused_kda_conv_tree_transform(
     batch, dim, tree_width = x.shape
     if batch != 1:
         raise ValueError(f"factorized UBTree conv supports only BS=1, got {batch}")
-    if tree_width not in (32, 49):
-        raise ValueError(f"tree_width must be 32 or 49, got {tree_width}")
+    if tree_width < 2:
+        raise ValueError(f"tree_width must be at least 2, got {tree_width}")
     hv, key_dim = processed_beta.shape[1], processed_k.shape[-1]
     if dim != 3 * hv * key_dim or processed_k.shape != (batch, hv, tree_width, key_dim):
         raise ValueError("only equal Q/K/V head geometry is supported")

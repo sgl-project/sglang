@@ -1525,8 +1525,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         tree_transforms = None
         use_fused_tree_conv = (
             tree_factorized_on
-            # Other widths use the general conv and factor-transform path.
-            and draft_token_num in (32, 49)
+            and draft_token_num >= 2
             and fm.has_direct_parent
             and isinstance(self.kernel_dispatcher.verify_kernel, TritonKDAKernel)
             and mixed_qkv_reshaped.dtype == torch.bfloat16

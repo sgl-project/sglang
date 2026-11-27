@@ -449,6 +449,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
 def _handle_ubtree(server_args: ServerArgs) -> None:
     from sglang.srt.hf_transformers import get_config
+    from sglang.srt.hf_transformers.common import get_context_length
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
     from sglang.srt.speculative.ubtree_components.config import (
         parse_ubtree_config,
@@ -485,9 +486,33 @@ def _handle_ubtree(server_args: ServerArgs) -> None:
             f"vocab_size {target.vocab_size}. Use the UBTree draft exported for "
             "this target checkpoint."
         )
+    draft_context_len = get_context_length(draft)
+    if (
+        target.context_len > draft_context_len
+        and not envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get()
+        and not envs.SGLANG_IS_IN_CI.get()
+    ):
+        raise ValueError(
+            f"UBTREE draft context_length ({draft_context_len}) is smaller than "
+            f"the target context_length ({target.context_len}). Pass "
+            f"--context-length {draft_context_len} or set "
+            "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1."
+        )
     width = resolve_verify_width(tree, cfg.speculative_num_draft_tokens)
     if cfg.speculative_dflash_block_size not in (None, tree.block_size):
         raise ValueError("UBTREE draft block size does not match the checkpoint")
+    if cfg.speculative_num_steps not in (None, tree.depth_count):
+        raise ValueError(
+            f"UBTREE requires --speculative-num-steps {tree.depth_count} to match "
+            f"the checkpoint depth count, got {cfg.speculative_num_steps}"
+        )
+    if cfg.speculative_eagle_topk not in (None, 2):
+        raise ValueError(
+            "UBTREE fixes --speculative-eagle-topk to 2, "
+            f"got {cfg.speculative_eagle_topk}"
+        )
+    if cfg.enable_mixed_chunk:
+        raise ValueError("UBTREE does not support --enable-mixed-chunk")
     # The backend uses topk>1 to enable direct-parent tree metadata. UBTree's
     # actual irregular topology is carried by UBTreeVerifyInput, not topk.
     declare_resolution(

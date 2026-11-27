@@ -385,7 +385,70 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
         torch.testing.assert_close(committed_state[0, :3], state[:3], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("production_layout", [False, True])
+@pytest.mark.parametrize("use_dynamic_depth", [False, True])
+def test_factorized_tree_supports_depth_over_16(use_dynamic_depth):
+    torch.manual_seed(4097)
+    device = "cuda"
+    width = 18
+    num_heads, head_dim = 4, 32
+    parents = torch.tensor([[-1, *range(width - 1)]], dtype=torch.int32, device=device)
+    depths = torch.arange(width, dtype=torch.int32, device=device).unsqueeze(0)
+    q = torch.randn(1, width, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    a = torch.randn_like(q)
+    b = torch.randn(1, width, num_heads, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(num_heads, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    state = torch.randn(
+        1, num_heads, head_dim, head_dim, dtype=torch.float32, device=device
+    )
+    indices = torch.zeros(1, dtype=torch.int32, device=device)
+    cu_seqlens = torch.tensor([0, width], dtype=torch.int32, device=device)
+    serial_states = torch.empty(
+        1, width, num_heads, head_dim, head_dim, dtype=torch.float32, device=device
+    )
+    common = dict(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=state,
+        initial_state_indices=indices,
+        cu_seqlens=cu_seqlens,
+        is_kda=True,
+        use_qk_l2norm_in_kernel=True,
+        disable_state_update=True,
+        intermediate_state_indices=indices,
+        cache_steps=width,
+        retrieve_parent_token=parents,
+        lower_bound=-5.0,
+    )
+    serial_out = fused_sigmoid_gating_delta_rule_update(
+        **common, intermediate_states_buffer=serial_states
+    )
+    factorized_out = fused_sigmoid_gating_delta_rule_update(
+        **common,
+        intermediate_states_buffer=None,
+        tree_depths=depths if use_dynamic_depth else None,
+        tree_max_depth=width,
+        tree_query_factors=torch.empty(
+            1, num_heads, width, head_dim, dtype=torch.float32, device=device
+        ),
+        tree_value_factors=torch.empty(
+            1, num_heads, width, width, dtype=torch.float32, device=device
+        ),
+        force_factorized_tree=True,
+    )
+    torch.testing.assert_close(factorized_out, serial_out, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("layout", ["dim_win", "win_dim", "transposed_view"])
 @pytest.mark.parametrize(
     "paths,track_nodes",
     [
@@ -394,9 +457,7 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
         ([[0, 1, 4, 13]], [4]),
     ],
 )
-def test_tree_conv_raw_commit_matches_full_window(
-    paths, track_nodes, production_layout
-):
+def test_tree_conv_raw_commit_matches_full_window(paths, track_nodes, layout):
     """Raw-node tree verify must preserve output and restore exact conv windows."""
     from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
@@ -483,9 +544,13 @@ def test_tree_conv_raw_commit_matches_full_window(
 
     commit_state = raw_state.unsqueeze(0)
     commit_scratch = raw_scratch
-    if production_layout:
+    if layout == "win_dim":
         commit_state = commit_state.transpose(-1, -2).contiguous()
         commit_scratch = commit_scratch.transpose(-1, -2).contiguous()
+    elif layout == "transposed_view":
+        commit_state = commit_state.transpose(-1, -2).contiguous().transpose(-1, -2)
+        commit_scratch = commit_scratch.transpose(-1, -2).contiguous().transpose(-1, -2)
+        assert not commit_state.is_contiguous()
 
     fused_conv_tree_raw_commit_with_mask(
         commit_state,
@@ -500,7 +565,7 @@ def test_tree_conv_raw_commit_matches_full_window(
     )
     committed = (
         commit_state.transpose(-1, -2).squeeze(0)
-        if production_layout
+        if layout == "win_dim"
         else commit_state.squeeze(0)
     )
     assert torch.equal(committed, expected)

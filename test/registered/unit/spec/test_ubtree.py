@@ -100,7 +100,9 @@ def _config():
     )
 
 
-def _run_ubtree_hook(*, target_vocab_size=17, locked=()):
+def _run_ubtree_hook(
+    *, target_vocab_size=17, target_context_len=2048, locked=(), **overrides
+):
     from sglang.srt.arg_groups import speculative_hook
     from sglang.srt.arg_groups.overrides import declare_resolution
     from sglang.srt.model_executor.cuda_graph_config import (
@@ -117,10 +119,12 @@ def _run_ubtree_hook(*, target_vocab_size=17, locked=()):
         speculative_algorithm="UBTREE",
         speculative_draft_model_path="draft",
         speculative_draft_attention_backend="fa3",
+        **overrides,
     )
     args._model_config = SimpleNamespace(
         hf_config=SimpleNamespace(architectures=["BailingMoeV3ForCausalLM"]),
         vocab_size=target_vocab_size,
+        context_len=target_context_len,
     )
     graph = CudaGraphConfig(
         decode=PhaseConfig(backend="full", bs=[1, 2, 4]),
@@ -284,6 +288,15 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
             )
         with self.assertRaisesRegex(ValueError, "vocab_size 17 must match"):
             _run_ubtree_hook(target_vocab_size=18)
+        with self.assertRaisesRegex(ValueError, "--context-length 2048"):
+            _run_ubtree_hook(target_context_len=4096)
+        for bad_kwargs in (
+            {"speculative_num_steps": 9},
+            {"speculative_eagle_topk": 4},
+            {"enable_mixed_chunk": True},
+        ):
+            with self.subTest(bad_kwargs=bad_kwargs), self.assertRaises(ValueError):
+                _run_ubtree_hook(**bad_kwargs)
 
     def test_hook_fills_single_valued_graph_settings(self):
         from sglang.srt.arg_groups.overrides import resolution_result
@@ -368,6 +381,11 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
                 ),
                 ("fa3",),
             )
+        with (
+            patch.dict("os.environ", {"SGLANG_SIMULATE_ACC_LEN": "3"}),
+            self.assertRaisesRegex(ValueError, "SGLANG_SIMULATE_ACC_LEN"),
+        ):
+            validate_runtime_config(cfg, ("fa3",))
 
 
 class TestUBTreeRequestValidation(CustomTestCase):

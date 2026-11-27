@@ -768,8 +768,6 @@ def fused_conv_tree_raw_commit_with_mask(
         raise ValueError("conv raw commit requires CUDA tensors on the same device")
     if dst.dtype != raw_src.dtype:
         raise ValueError(f"dtype mismatch: {dst.dtype=} {raw_src.dtype=}")
-    if not dst.is_contiguous():
-        raise ValueError("dst must be contiguous")
     if any(x.ndim != 1 for x in (state_indices, factor_indices, accept_lens)):
         raise ValueError("state_indices, factor_indices and accept_lens must be 1D")
     batch = accept_lens.shape[0]
@@ -801,7 +799,7 @@ def fused_conv_tree_raw_commit_with_mask(
 
     # KDA stores conv state as [..., window, dim], while the causal-conv
     # kernel consumes a transposed [..., dim, window] view. Support both using
-    # real strides; do not require an entry-contiguous layout here.
+    # real strides without requiring a contiguous layout.
     trailing = dst.shape[-2:]
     window_axes = [
         axis for axis, size in enumerate(trailing, start=2) if 1 <= size <= 4
@@ -812,10 +810,6 @@ def fused_conv_tree_raw_commit_with_mask(
     dim_axis = 5 - win_axis
     km1 = dst.shape[win_axis]
     dim = dst.shape[dim_axis]
-    if raw_src.shape[3:] != dst.shape[2:]:
-        raise ValueError(
-            f"Conv trailing shapes mismatch: {dst.shape=} {raw_src.shape=}"
-        )
     if raw_src.shape[2] < tree_width:
         raise ValueError("raw source does not cover tree_width")
     block_size = min(triton.next_power_of_2(dim), 256)

@@ -11,6 +11,8 @@ from typing import Any, Mapping
 import msgspec
 from transformers import PretrainedConfig
 
+from sglang.srt.environ import envs
+
 
 class UBTreeConfig(msgspec.Struct, frozen=True):
     block_size: int
@@ -155,6 +157,8 @@ def validate_runtime_config(cfg, target_backends: tuple[str, ...]) -> None:
         raise ValueError(
             "UBTREE requires a fixed verify width; adaptive steps are unsupported"
         )
+    if envs.SGLANG_SIMULATE_ACC_LEN.get() > 0:
+        raise ValueError("UBTREE does not support SGLANG_SIMULATE_ACC_LEN")
     if not target_backends or set(target_backends) != {"fa3"}:
         raise ValueError("UBTREE target attention requires FA3")
     if cfg.speculative_draft_attention_backend != "fa3":

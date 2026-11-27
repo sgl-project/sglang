@@ -1124,7 +1124,6 @@ def fused_sigmoid_gating_delta_rule_update(
         assert tree_query_factors.dtype == tree_value_factors.dtype == torch.float32
         assert tree_query_factors.is_contiguous()
         assert tree_value_factors.is_contiguous()
-        assert tree_max_depth <= 16
         use_dynamic_depth = tree_depths is not None
         if use_dynamic_depth:
             assert tree_depths.shape == (N, tree_width)
@@ -1140,11 +1139,7 @@ def fused_sigmoid_gating_delta_rule_update(
             assert tree_processed_k.shape == (N, HV, tree_width, K)
             assert tree_processed_decay.shape == (N, HV, tree_width, K)
             assert tree_processed_beta.shape == (N, HV, tree_width)
-        # M=32 on Ling3-Flash TP4 is occupancy-limited at BV=16.  Splitting
-        # V into BV=8 tiles lowers the verify kernel register footprint and
-        # wins despite doubling the V-grid.  Other widths keep their
-        # previously validated tile.
-        factor_verify_bv = 8 if tree_width == 32 else 32
+        factor_verify_bv = 32
         cache_tree_factors = cache_ring
         if cache_tree_factors:
             assert V == K, "factorized tree raw cache currently requires V == K"
@@ -1208,9 +1203,9 @@ def fused_sigmoid_gating_delta_rule_update(
             **factor_pdl_kwargs,
         )
         factor_verify_nv = triton.cdiv(V, factor_verify_bv)
-        # Keep the tuned 32-node schedule. The general schedule tiles the node
-        # dimension in 64-row CTAs, including partial tiles and trees > 64 nodes.
-        factor_verify_bm = 32 if tree_width == 32 else 64
+        # Tile the node dimension in 64-row CTAs for all valid tree widths,
+        # including partial tiles and trees with more than 64 nodes.
+        factor_verify_bm = 64
         factor_verify_nm = triton.cdiv(tree_width, factor_verify_bm)
         factor_verify_grid = (factor_verify_nv, N * factor_verify_nm, HV)
         fused_sigmoid_gating_delta_rule_tree_factor_verify_kernel[factor_verify_grid](
@@ -1234,8 +1229,8 @@ def fused_sigmoid_gating_delta_rule_update(
             BT=max(16, triton.next_power_of_2(tree_width)),
             BM=factor_verify_bm,
             NM=factor_verify_nm,
-            num_warps=2 if tree_width == 32 else 8,
-            num_stages=1 if tree_width == 32 else 3,
+            num_warps=8,
+            num_stages=3,
             **factor_pdl_kwargs,
         )
         return o.squeeze(0)
