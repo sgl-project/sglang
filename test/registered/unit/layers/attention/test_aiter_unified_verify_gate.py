@@ -1,4 +1,4 @@
-"""When AITER EAGLE target_verify and draft_extend take the unified_attention path."""
+"""When AITER EAGLE target_verify takes the unified_attention path."""
 
 import os
 import unittest
@@ -76,15 +76,6 @@ class TestAiterUnifiedVerifyGate(CustomTestCase):
     def test_env_opt_out_keeps_legacy_verify(self):
         self.assertFalse(_enabled(opt_out="0"))
         self.assertFalse(_enabled(opt_out="0", use_triton_unified_attention=True))
-
-
-class TestAiterUnifiedDraftExtendGate(CustomTestCase):
-    def test_draft_extend_moves_only_with_unified_attn(self):
-        enabled = aiter_backend._unified_draft_extend_enabled
-        self.assertFalse(enabled(True, False))
-        self.assertTrue(enabled(True, True))
-        self.assertFalse(enabled(False, True))
-        self.assertFalse(enabled(False, False))
 
 
 if __name__ == "__main__":
