@@ -339,8 +339,9 @@ class KVStorage:
         rows: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
+        last_loc: Optional[torch.Tensor],
         make_room: Callable[[int], Any],
+        req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         tree_cache=None,
         batch=None,
     ) -> Optional[torch.Tensor]:
@@ -349,7 +350,11 @@ class KVStorage:
         fit. See `take_extend` for ``tree_cache`` and ``batch``."""
 
         make_room(len(seq_lens) * self._allocator.page_size)
-        return self._allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+        if req_to_token_write is None:
+            return self._allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+        return self._allocator.alloc_decode(
+            seq_lens, seq_lens_cpu, last_loc, req_to_token_write=req_to_token_write
+        )
 
     def free_tokens(self, ids: torch.Tensor) -> None:
         """Give back owner token ids no request holds any more."""
@@ -776,6 +781,16 @@ class KVStorage:
             )
             for s in self._plan.owner_first()
         )
+
+    def kv_bytes_usage(self, full_tokens: int, swa_tokens: int) -> Optional[float]:
+        """The arena's byte share of the pages that hold ``full_tokens`` owner
+        tokens and ``swa_tokens`` window tokens. None unless the chain is the
+        owner band and exactly one window band, with no state band."""
+        allocator = self._allocator
+        if len(allocator.window_allocators) != 1 or allocator.roles.state is not None:
+            return None
+        used_bytes = allocator.shared_bytes(full_tokens, swa_tokens)
+        return used_bytes / allocator.arena.total_bytes
 
     def page_envelope_pair(self) -> Optional[Tuple[str, str]]:
         """The two sub-pools whose host pools may share one page-envelope

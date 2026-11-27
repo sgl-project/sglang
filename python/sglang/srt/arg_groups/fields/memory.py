@@ -228,8 +228,9 @@ class Memory(msgspec.Struct):
                 "namespace digest plus absolute layer and head-group indices), "
                 "so any topology whose shards tile the same grid shares one "
                 "cache. Implies --hicache-mem-layout page_unified and "
-                "--hicache-io-backend kernel. Currently supported by the file "
-                "backend for one chunk per page."
+                "--hicache-io-backend kernel. Supported by the file and "
+                "mooncake backends, which store one object per chunk and "
+                "serve head- and layer-partitioned grids."
             ),
             choices=["rank-suffix", "unified"],
         ),
@@ -309,6 +310,18 @@ class Memory(msgspec.Struct):
             help='A dictionary in JSON string format for hierarchical sparse attention configuration. Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
             aliases=["--hierarchical-sparse-attention-extra-config"],
         ),
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Hierarchical engram
+    # -------------------------------------------------------------------------
+    enable_hi_engram: A[
+        bool,
+        "Enable HiCache Engram storage. Configure the backend through --hi-engram-config.",
+    ] = False
+    hi_engram_config: A[
+        Optional[str],
+        'A dictionary in JSON string format for hierarchical Engram storage. Example: {"backend": "local", "local_dir": "/dev/shm/sglang-engram"}',
     ] = None
 
     # -------------------------------------------------------------------------

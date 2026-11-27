@@ -50,18 +50,14 @@ try:
     from humming.config import GemmType as HummingGemmType
     from humming.config import InputQuantizationMode
     from humming.layer import HummingMethod
-
-    _humming_available = True
 except ModuleNotFoundError:
-    _humming_available = False
+    pass
 
 
 def get_standard_humming_moe_gemm_type() -> HummingGemmType:
     env_gemm_type_str = envs.SGLANG_HUMMING_MOE_GEMM_TYPE.get().lower()
     if env_gemm_type_str == "grouped":
         gemm_type = HummingGemmType.GROUPED_CONTIGUOUS
-    elif env_gemm_type_str == "indexed":
-        gemm_type = HummingGemmType.INDEXED
     else:
         gemm_type = HummingGemmType.INDEXED
 
@@ -322,76 +318,47 @@ class HummingRunnerCore(MoeRunnerCore):
 
         return buffer_metas, required_buffers
 
-    def _workspace_shapes(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        gemm_type: HummingGemmType,
-    ):
-        buffer_metas, required_buffers = self.get_buffer_metas(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            gemm_type=gemm_type,
-        )
-
-        workspace1_nbytes = 0
-        workspace2_nbytes = 0
-
-        for index, name in enumerate(required_buffers[::-1]):
-            buffer_meta = buffer_metas[name]
-            nelement = math.prod(buffer_meta["shape"])
-            nbytes = nelement * buffer_meta["dtype"].itemsize
-            if index % 2 == 0:
-                workspace1_nbytes = max(workspace1_nbytes, nbytes)
-            else:
-                workspace2_nbytes = max(workspace2_nbytes, nbytes)
-
-        output_key = (
-            "down_output" if gemm_type == HummingGemmType.GROUPED_MASKED else "output"
-        )
-        output_shape = buffer_metas[output_key]["shape"]
-
-        return (workspace1_nbytes // 2,), (workspace2_nbytes // 2,), output_shape
-
-    def make_workspaces(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        gemm_type: HummingGemmType,
-    ):
-        shapes = self._workspace_shapes(hidden_states, topk_ids, gemm_type)
-        workspace1_shape, workspace2_shape, output_shape = shapes
-        torch_dtype = self.layer.params_dtype
-        device = hidden_states.device
-        workspace1 = torch.empty(workspace1_shape, dtype=torch_dtype, device=device)
-        workspace2 = torch.empty(workspace2_shape, dtype=torch_dtype, device=device)
-        output = workspace1[: math.prod(output_shape)].view(*output_shape)
-        return workspace1, workspace2, output
-
     def prepare_buffers(
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         gemm_type: HummingGemmType,
     ) -> dict[str, torch.Tensor]:
-        workspace1, workspace2, output = self.make_workspaces(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            gemm_type=gemm_type,
-        )
         buffer_metas, required_buffers = self.get_buffer_metas(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             gemm_type=gemm_type,
         )
-        buffers = {"output": output}
-        for index, name in enumerate(required_buffers[::-1]):
-            buffer_meta = buffer_metas[name]
-            workspace = workspace1 if index % 2 == 0 else workspace2
-            workspace = workspace.view(buffer_meta["dtype"])
-            shape = buffer_meta["shape"]
-            tensor = workspace[: math.prod(shape)].view(*shape)
-            buffers[name] = tensor
+
+        # Assign buffers backwards so the final result lands in workspace 0.
+        workspace_nbytes = [0, 0]
+        layout = []
+        for index, name in enumerate(reversed(required_buffers)):
+            slot = index % 2
+            meta = buffer_metas[name]
+            shape, dtype = meta["shape"], meta["dtype"]
+            numel = math.prod(shape)
+            workspace_nbytes[slot] = max(workspace_nbytes[slot], numel * dtype.itemsize)
+            layout.append((name, slot, shape, dtype, numel))
+
+        workspace_dtype = self.layer.params_dtype
+        workspaces = [
+            torch.empty(nbytes // 2, dtype=workspace_dtype, device=hidden_states.device)
+            for nbytes in workspace_nbytes
+        ]
+        buffers = {}
+        if gemm_type == HummingGemmType.GROUPED_MASKED:
+            # Keep the model-dtype output alias alongside the typed down_output.
+            shape = buffer_metas["down_output"]["shape"]
+            buffers["output"] = workspaces[0][: math.prod(shape)].view(shape)
+
+        for name, slot, shape, dtype, numel in layout:
+            workspace = workspaces[slot]
+            if dtype != workspace_dtype:
+                workspace = workspace.view(dtype)
+            if numel != workspace.numel():
+                workspace = workspace[:numel]
+            buffers[name] = workspace.view(shape)
 
         return buffers
 

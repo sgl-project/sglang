@@ -825,6 +825,7 @@ class Cosmos3CrossAttention(nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.local_num_attention_heads,
+            global_num_heads=num_attention_heads,
             head_size=head_dim,
             num_kv_heads=self.local_num_key_value_heads,
             causal=False,
@@ -1617,13 +1618,6 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             if cache_key in self.cached_gen_rope_inputs:
                 del self.cached_gen_rope_inputs[cache_key]
 
-    def _ensure_cache_dicts(self):
-        """Ensure cache dictionaries exist (for backwards compatibility)."""
-        if not isinstance(self.cached_kv, dict):
-            self.cached_kv = {}
-        if not isinstance(self.cached_gen_rope_inputs, dict):
-            self.cached_gen_rope_inputs = {}
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1849,8 +1843,6 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_gen = shard_sequence(
                     hidden_gen, self.sp_size, self.sp_rank, dim=1, pad_last=False
                 )
-
-        self._ensure_cache_dicts()
 
         # The T=1 fused path is faster on Blackwell. It also benefits the
         # single-GPU Hopper Nano (SwiGLU) and Edge (2048-wide dense) workloads,

@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
 from sglang.srt.arg_groups.model_override_base import (
+    ep_offset_joiner_of,
     model_config_of,
     resolved_view,
     resolving_view,
@@ -227,6 +228,77 @@ def handle_shared_experts_tp(server_args: Any):
             "--shared-experts-tp-size requires an expert-parallel all-to-all "
             "backend (deepep, megamoe, mooncake, ascend_fuseep or mori)."
         )
+
+
+_KDA_DWDP_LOAD_FORMATS_REFUSED = (
+    "sharded_state",
+    "presharded",
+    "remote",
+    "remote_instance",
+    "ipc_cache",
+)
+
+
+def handle_kda_dwdp(server_args: Any):
+    cfg = resolving_view(server_args)
+    size = cfg.kda_dwdp_size
+    if size is None:
+        return
+    if cfg.disaggregation_mode != "prefill":
+        raise ValueError(
+            "--kda-dwdp-size runs on PD prefill workers only "
+            f"(--disaggregation-mode prefill; got {cfg.disaggregation_mode!r}): a "
+            "decoding server would re-gather the sharded weights every step (about "
+            "54 GB per rank for K3 at attention TP 1 and N=8)."
+        )
+    if size < 2 or cfg.tp_size % size != 0:
+        raise ValueError(
+            f"--kda-dwdp-size ({size}) must be >= 2 and divide TP size ({cfg.tp_size})."
+        )
+    view = resolved_view(server_args)
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    if cfg.attn_dp_size <= 1 or cfg.attn_dp_size % size != 0:
+        raise ValueError(
+            f"--kda-dwdp-size ({size}) needs attention DP and must divide the "
+            f"attention-DP size ({cfg.attn_dp_size}; attention TP {attn_tp_size})."
+        )
+    if view.attn_cp_size > 1:
+        raise ValueError("--kda-dwdp-size does not support --attn-cp-size > 1.")
+    if cfg.pp_size > 1:
+        raise ValueError("--kda-dwdp-size does not support pipeline parallelism.")
+    if cfg.load_format in _KDA_DWDP_LOAD_FORMATS_REFUSED:
+        raise ValueError(
+            f"--kda-dwdp-size does not support --load-format {cfg.load_format}: "
+            "the shards are filled by the model's load_weights (use a checkpoint format "
+            "such as auto or safetensors, or dummy)."
+        )
+    if cfg.weight_cache_mode != "off":
+        raise ValueError(
+            "--kda-dwdp-size does not support --weight-cache-mode "
+            f"{cfg.weight_cache_mode}: cached weights skip the shard loaders."
+        )
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        raise ValueError("--kda-dwdp-size requires a Kimi-K3 model configuration.")
+    from sglang.srt.configs.model_config import is_kimi_k3
+
+    hf_config = model_config_of(server_args).hf_config
+    if not is_kimi_k3(hf_config):
+        raise ValueError(
+            "--kda-dwdp-size is only supported for Kimi-K3 "
+            f"(got {hf_config.architectures[0]})."
+        )
+    graph = cfg.cuda_graph_config
+    for phase in ("prefill", "decode"):
+        if graph is not None and getattr(graph, phase).backend == Backend.FULL:
+            raise ValueError(
+                "--kda-dwdp-size issues its layer-weight gathers between graph "
+                f"segments and cannot run inside a full {phase} CUDA graph; use "
+                f"--cuda-graph-backend-{phase} breakable or disabled."
+            )
 
 
 def handle_decode_context_parallelism(server_args: Any):
@@ -535,6 +607,32 @@ def handle_elastic_ep(server_args: Any):
                 "_handle_elastic_ep",
                 mooncake_ib_device=validate_ib_devices(cfg.mooncake_ib_device),
             )
+            # A fault-tolerance-only deployment (no --max-ep-size) never retires a rank.
+            scalable = cfg.max_ep_size is not None
+            # Raw-NCCL fast paths that bypass active_ranks.
+            for name, enabled in (
+                (
+                    "SGLANG_SYNC_TOKEN_IDS_ACROSS_TP",
+                    envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.get(),
+                ),
+                ("--enable-symm-mem", cfg.enable_symm_mem),
+            ):
+                if not enabled:
+                    continue
+                message = f"{name} + mooncake bypasses active_ranks."
+                if scalable:
+                    raise ValueError(message)
+                logger.warning(
+                    "[Elastic EP] %s Tolerated: --max-ep-size is unset, "
+                    "so this deployment does not change width.",
+                    message,
+                )
+            # Hooks must not write env vars; see _use_message_queue_broadcaster.
+            if scalable and envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get():
+                logger.warning(
+                    "[Elastic EP] mooncake: the shm message-queue broadcaster is "
+                    "bypassed for the TP-family groups while --max-ep-size is set."
+                )
     if cfg.ep_join_mode is not None:
         assert cfg.elastic_ep_backend is not None, (
             "--elastic-ep-join-mode requires --elastic-ep-backend to be set."
@@ -550,9 +648,9 @@ def handle_elastic_ep(server_args: Any):
                 "effective EP size."
             )
     if cfg.ep_join_rank_offset != 0:
-        assert cfg.ep_join_mode == "scale", (
+        assert cfg.ep_join_mode in ("scale", "recover"), (
             "--elastic-ep-join-rank-offset is only valid with "
-            "--elastic-ep-join-mode scale."
+            "--elastic-ep-join-mode scale or recover."
         )
         assert cfg.ep_join_rank_offset >= 0, "elastic EP join rank offset must be >= 0."
     if cfg.max_ep_size is not None:
@@ -560,6 +658,22 @@ def handle_elastic_ep(server_args: Any):
             "--max-ep-size requires --elastic-ep-backend to be set."
         )
         assert cfg.max_ep_size > 0, "--max-ep-size must be a positive integer."
+    if cfg.elastic_ep_reuse_cuda_graph:
+        assert cfg.elastic_ep_backend is not None, (
+            "--elastic-ep-reuse-cuda-graph requires --elastic-ep-backend to be set."
+        )
+        # Only NIXL takes a dispatch width wider than the live cohort.
+        assert cfg.moe_a2a_backend == "nixl", (
+            "--elastic-ep-reuse-cuda-graph requires --moe-a2a-backend nixl "
+            f"(got {cfg.moe_a2a_backend})."
+        )
+        # A shrink rebuilds the LPLB solvers, and a kept graph replays the old ones.
+        assert cfg.ep_dispatch_algorithm != "lp", (
+            "--elastic-ep-reuse-cuda-graph does not support --ep-dispatch-algorithm lp."
+        )
+        assert cfg.speculative_algorithm is None, (
+            "--elastic-ep-reuse-cuda-graph does not support speculative decoding."
+        )
 
     scaling_active = (
         cfg.elastic_ep_backend is not None
@@ -570,6 +684,12 @@ def handle_elastic_ep(server_args: Any):
         assert scaling_active, (
             "--elastic-ep-initial-size is only valid for an Elastic EP "
             "deployment with --max-ep-size larger than its local TP size."
+        )
+    if ep_offset_joiner_of(cfg):
+        # A valid joiner always satisfies this; without it the checks below are skipped.
+        assert scaling_active, (
+            "An Elastic EP joiner requires --elastic-ep-backend and "
+            "--max-ep-size larger than its local TP size."
         )
     if scaling_active:
         resolved = resolved_view(server_args)
@@ -648,6 +768,14 @@ def handle_elastic_ep(server_args: Any):
                     "A single-rank Elastic EP joining group requires "
                     "--moe-dense-tp-size 1."
                 )
+        elif ep_offset_joiner_of(cfg):
+            # Recover-into-retired-slot: slot must lie inside launch cohort.
+            cohort = cfg.elastic_ep_initial_size
+            target = cfg.ep_join_rank_offset + cfg.tp_size
+            assert cohort is not None, "recover needs --elastic-ep-initial-size"
+            assert target <= cohort, f"joiner target {target} > cohort {cohort}"
+            if cfg.tp_size == 1:
+                assert cfg.moe_dense_tp_size == 1, "needs --moe-dense-tp-size 1"
         else:
             if cfg.elastic_ep_initial_size is None:
                 declare_resolution(
@@ -678,6 +806,11 @@ def handle_elastic_ep(server_args: Any):
             "Elastic EP scale-up requires --dcp-size to divide the fixed "
             "attention TP width "
             f"(got dcp_size={cfg.dcp_size}, attn_tp_size={attn_tp_size})."
+        )
+        # Only the base event loops tick the scale FSM; others drop scales silently.
+        assert cfg.disaggregation_mode == "null", (
+            "Elastic EP does not support disaggregation "
+            f"(got disaggregation_mode={cfg.disaggregation_mode})."
         )
 
         decode_backend = cfg.cuda_graph_config.decode.backend
@@ -786,7 +919,7 @@ def handle_eplb_and_dispatch(server_args: Any):
             "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
         )
 
-    if cfg.enable_eplb and cfg.ep_join_mode != "scale":
+    if cfg.enable_eplb and not ep_offset_joiner_of(cfg):
         assert resolved_view(server_args).ep_size > 1
 
 

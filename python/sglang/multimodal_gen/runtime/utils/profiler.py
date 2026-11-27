@@ -7,19 +7,18 @@ from pathlib import Path
 import torch
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_replica_group,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.srt.environ import envs as srt_envs
-from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
+from sglang.srt.hardware_backend.npu import get_torch_npu
+from sglang.srt.observability.profile_analysis_npu import NPUTraceHandler
 
 if current_platform.is_npu():
-    import torch_npu
-
-    patches = [
-        ["profiler.profile", torch_npu.profiler.profile],
-        ["profiler.schedule", torch_npu.profiler.schedule],
-    ]
-    apply_torch_npu_patches(torch_npu, patches)
+    NPUTraceHandler.apply_patches("diffusion")
 
 logger = init_logger(__name__)
 
@@ -47,7 +46,10 @@ def _resolve_profiler_log_dir(log_dir: str | None) -> str:
     if diffusion_profiler_dir:
         return diffusion_profiler_dir
 
-    return os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
+    # Unlike the LLM server (/tmp), diffusion traces default to ./logs.
+    if srt_envs.SGLANG_TORCH_PROFILER_DIR.is_set():
+        return srt_envs.SGLANG_TORCH_PROFILER_DIR.get()
+    return "./logs"
 
 
 class SGLDiffusionProfiler:
@@ -101,7 +103,7 @@ class SGLDiffusionProfiler:
             if current_platform.is_cuda_alike():
                 activities.append(torch.profiler.ProfilerActivity.CUDA)
             if current_platform.is_npu():
-                activities.append(torch_npu.profiler.ProfilerActivity.NPU)
+                activities.append(get_torch_npu().profiler.ProfilerActivity.NPU)
 
             if hasattr(torch, "xpu") and torch.xpu.is_available():
                 activities.append(torch.profiler.ProfilerActivity.XPU)
@@ -111,9 +113,9 @@ class SGLDiffusionProfiler:
             record_shapes=self.record_shapes,
             with_stack=self.with_stack,
             on_trace_ready=(
-                None
-                if not current_platform.is_npu()
-                else torch_npu.profiler.tensorboard_trace_handler(self.log_dir)
+                NPUTraceHandler.get_on_trace_ready(self.log_dir)
+                if current_platform.is_npu()
+                else None
             ),
         )
 
@@ -222,23 +224,33 @@ class SGLDiffusionProfiler:
             return
         self.has_stopped = True
         logger.info("Stopping Profiler...")
-        if current_platform.is_cuda_alike():
-            torch.cuda.synchronize()
-        if current_platform.is_npu():
-            torch.npu.synchronize()
-            export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
-        self.profiler.stop()
-
-        if export_trace:
-            if dump_rank is not None and dump_rank != self.rank:
-                pass
+        try:
+            if current_platform.is_npu():
+                group = get_replica_group() if model_parallel_is_initialized() else None
+                NPUTraceHandler.stop_capture(
+                    self.profiler,
+                    export_trace=export_trace,
+                    synchronize=True,
+                    rank=self.rank,
+                    cpu_group=group.cpu_group if group is not None else None,
+                )
             else:
-                self._export_trace()
+                if current_platform.is_cuda_alike():
+                    torch.cuda.synchronize()
+                self.profiler.stop()
+                if export_trace and (dump_rank is None or dump_rank == self.rank):
+                    self._export_trace()
+        finally:
+            SGLDiffusionProfiler._instance = None
 
-        SGLDiffusionProfiler._instance = None
+    def stop_on_error(self, dump_rank: int | None = None):
+        """Clean up locally without masking an inference error or cancellation."""
+        try:
+            self.stop(export_trace=not current_platform.is_npu(), dump_rank=dump_rank)
+        except Exception:
+            logger.exception("Failed to stop profiler while handling a request error")
 
     def _export_trace(self):
-
         try:
             os.makedirs(self.log_dir, exist_ok=True)
 

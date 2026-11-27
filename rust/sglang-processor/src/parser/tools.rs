@@ -257,6 +257,7 @@ where
                                 name: named.then_some(call.name),
                                 arguments: Some(call.parameters),
                             }),
+                            custom: None,
                         }
                     });
                     choice.delta.tool_calls = Some(calls.collect());
