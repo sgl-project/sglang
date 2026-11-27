@@ -435,7 +435,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.req_to_token_pool = ReqToTokenPool(
             size=4,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
         )
@@ -703,7 +703,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         runner._req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -763,7 +763,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         runner._req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=128,
+            row_width=128,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -820,7 +820,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         runner._req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=512,
+            row_width=512,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -916,7 +916,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_req_pool_maps_request_indices(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -944,7 +944,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_req_pool_can_keep_tracked_auxiliary_slot(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -963,7 +963,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_component_inserts_tracked_slot_and_frees_live_slot(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -1005,7 +1005,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_component_unfinished_frees_tracked_source_slot(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -1048,7 +1048,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     ):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,
@@ -1089,7 +1089,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_component_frees_duplicate_live_slot(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
-            max_context_len=8,
+            row_width=8,
             device="cpu",
             enable_memory_saver=False,
             auxiliary_state_size=4,

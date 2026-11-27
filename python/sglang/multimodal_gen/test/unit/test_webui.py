@@ -50,6 +50,17 @@ def test_h3_webui_tasks_follow_loaded_partition():
     assert minimax_h3_tasks_for_server(
         SimpleNamespace(model_variant="fl2va+ref2va", model_subfolder=None)
     ) == ("t2va", "fl2va", "ref2va")
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+        PiH3PipelineConfig,
+    )
+
+    assert minimax_h3_tasks_for_server(
+        SimpleNamespace(
+            model_variant="2step",
+            model_subfolder=None,
+            pipeline_config=PiH3PipelineConfig(),
+        )
+    ) == ("t2va", "fl2va")
 
 
 def test_h3_t2va_uses_native_contract_without_generic_cfg_fields():

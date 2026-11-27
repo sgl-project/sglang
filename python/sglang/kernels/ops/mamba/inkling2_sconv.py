@@ -3,6 +3,9 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 _CUDA_TYPES = {torch.float32: "float", torch.bfloat16: "__nv_bfloat16"}
 # safe_idx, cache_mask, cu, si, track mask, track indices, src2dst
@@ -36,6 +39,7 @@ def _sconv_kernel(
     Partial,
     Attention,
     Out,
+    X_ROWS,
     SX: tl.constexpr,
     SW0: tl.constexpr,
     SW1: tl.constexpr,
@@ -77,7 +81,15 @@ def _sconv_kernel(
         gathered = tl.zeros([BLOCK], dtype=tl.float32)
         for k in tl.static_range(TOP_K):
             dst = tl.load(Src2Dst + row * TOP_K + k).to(tl.int64)
-            gathered += tl.load(X + dst * SX + col, valid) * 1.0
+            dst_ok = (dst >= 0) & (dst < X_ROWS)
+            gathered += (
+                tl.load(
+                    X + tl.where(dst_ok, dst, 0) * SX + col,
+                    valid & dst_ok,
+                    other=0,
+                )
+                * 1.0
+            )
         current = gathered.to(X.dtype.element_ty).to(tl.float32)
         if ROUND_BF16:
             current = current.to(tl.bfloat16).to(tl.float32)
@@ -93,8 +105,16 @@ def _sconv_kernel(
         elif TOP_K:
             gathered = tl.zeros([BLOCK], dtype=tl.float32)
             for k in tl.static_range(TOP_K):
-                dst = tl.load(Src2Dst + src * TOP_K + k, from_x, other=0).to(tl.int64)
-                gathered += tl.load(X + dst * SX + col, valid & from_x, other=0) * 1.0
+                dst = tl.load(Src2Dst + src * TOP_K + k, from_x, other=-1).to(tl.int64)
+                dst_ok = from_x & (dst >= 0) & (dst < X_ROWS)
+                gathered += (
+                    tl.load(
+                        X + tl.where(dst_ok, dst, 0) * SX + col,
+                        valid & dst_ok,
+                        other=0,
+                    )
+                    * 1.0
+                )
             value = gathered.to(X.dtype.element_ty).to(tl.float32)
             if ROUND_BF16:
                 value = value.to(tl.bfloat16).to(tl.float32)
@@ -311,6 +331,8 @@ def _cuda_sconv(
     """_sconv_kernel in CUDA; False when an operand layout or dtype is unsupported.
     FP32 x only in the routed epilogue, and with top-k rows only under round_bf16
     (the CUDA gather rounds the sum to bf16)."""
+    if _is_hip:
+        return False
     rows, d = (attention if attention is not None else x).shape
     ints = (
         metadata["safe_idx"],
@@ -497,6 +519,7 @@ def short_convolution(
             None,
             None,
             None,
+            x.shape[0],
             x.stride(0),
             *weight.stride(),
             *cache.stride(),
@@ -586,6 +609,7 @@ def routed_sconv_epilogue(
             partial,
             attention,
             out,
+            down.shape[0],
             down.stride(0),
             *weight.stride(),
             *cache.stride(),

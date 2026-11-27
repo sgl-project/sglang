@@ -2,7 +2,6 @@
 title: FishAudio S2 Pro
 metatags:
     description: "Deploy FishAudio S2 Pro with SGLang - state-of-the-art text-to-speech with dual-autoregressive architecture, voice cloning, prosody control, and 80+ language support."
-tag: NEW
 ---
 
 ## 1. Model Introduction
