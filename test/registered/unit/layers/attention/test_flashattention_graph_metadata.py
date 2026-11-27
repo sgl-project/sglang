@@ -48,7 +48,7 @@ class _DraftWidthModelRunner:
         )
         self.device = "cpu"
         self.req_to_token_pool = SimpleNamespace(
-            max_context_len=128, req_to_token=torch.zeros((3, 128), dtype=torch.int32)
+            row_width=128, req_to_token=torch.zeros((3, 128), dtype=torch.int32)
         )
         self.token_to_kv_pool = SimpleNamespace(
             layer_router=SimpleNamespace(routes_to=lambda _kind: False)
@@ -206,7 +206,7 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         backend.full_cg_prefill_metadata = None
         backend.use_sliding_window_kv_pool = True
         backend.max_num_pages = 4
-        backend.max_context_len = 4
+        backend.max_kv_len = 4
         backend.page_size = 1
         backend.req_to_token = torch.zeros((1, 4), dtype=torch.int32)
         backend.token_to_kv_pool = SimpleNamespace(
@@ -242,10 +242,10 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
 
     def test_empty_cpu_sequence_lengths_use_static_bound(self):
         backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
-        backend.max_context_len = 16
         backend.req_to_token_pool = SimpleNamespace(
-            req_to_token=torch.zeros((1, 16), dtype=torch.int32)
+            row_width=16, req_to_token=torch.zeros((1, 16), dtype=torch.int32)
         )
+        backend.max_kv_len = 16
         # A real source over the stub pool: the probe disables it, giving the
         # backend the strict passthrough view it now reads its tables from.
         backend.runner_ids = RunnerIds(
@@ -463,7 +463,6 @@ def _ring_fa_backend(page_size=4):
     )
 
     b = FlashAttentionBackend.__new__(FlashAttentionBackend)
-    b.max_context_len = 128
     b.page_size = page_size
     b.max_num_pages = 128 // page_size
     b.device = "cpu"
@@ -474,8 +473,9 @@ def _ring_fa_backend(page_size=4):
     b.has_swa = True
     b.use_sliding_window_kv_pool = False
     b.req_to_token_pool = SimpleNamespace(
-        req_to_token=torch.zeros((4, 128), dtype=torch.int32)
+        row_width=128, req_to_token=torch.zeros((4, 128), dtype=torch.int32)
     )
+    b.max_kv_len = 128
     b.req_to_token = b.req_to_token_pool.req_to_token
     b.runner_ids = RunnerIds(
         req_to_token=b.req_to_token,

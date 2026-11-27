@@ -4962,6 +4962,9 @@ class DeepseekV4ForCausalLM(
         request/KV/draft state is touched; the runner owns the autotune context."""
         if getattr(self.config, "model_type", None) != "deepseek_v41":
             return 0
+        from flashinfer.fused_moe.utils import map_to_hybrid_bucket_uncapped
+
+        num_tokens = map_to_hybrid_bucket_uncapped(num_tokens)
         seen = set()
         # The backbone excludes vision and lm_head, whose prefill shapes differ.
         for layer in self.model.modules():
