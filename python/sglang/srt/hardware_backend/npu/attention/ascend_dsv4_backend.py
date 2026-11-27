@@ -2162,7 +2162,7 @@ class LowRatioCompressAscendBackendMixin:
         if is_npu_arch35() or mode is None:
             return None
         if mode.is_target_verify():
-            layout = forward_batch.ragged_verify_layout
+            layout = getattr(forward_batch, "ragged_verify_layout", None)
             if layout is not None:
                 if layout.total_verify_tokens is not None:
                     return layout.total_verify_tokens
@@ -2424,7 +2424,7 @@ class LowRatioCompressAscendBackendMixin:
             n = min(n, query_tokens)
         positions, out_loc = positions[:n], out_loc[:n]
         bs = int(forward_batch.batch_size)
-        if is_a3_verify:
+        if is_a3_verify and getattr(forward_batch, "ragged_verify_layout", None) is None:
             # A3 verification uses fixed-width blocks. Keep ghost request rows
             # out of both compressed pools without a device-side indptr search.
             width = int(forward_batch.spec_info.draft_token_num)
@@ -3072,10 +3072,10 @@ class DeepseekV4AscendAttnBackend(
                 f"decoding (static mode), got {spec_algorithm!r}."
             )
         ragged_mode = read_ragged_verify_mode()
-        if ragged_mode is not RaggedVerifyMode.STATIC:
+        if ragged_mode not in (RaggedVerifyMode.STATIC, RaggedVerifyMode.COMPACT):
             raise ValueError(
                 "DeepSeek-V4.1 on NPU supports only DSpark speculative "
-                "decoding in static mode (SGLANG_RAGGED_VERIFY_MODE=static), "
+                "decoding in static and compact mode (SGLANG_RAGGED_VERIFY_MODE=static/compact) "
                 f"got SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value!r}."
             )
 
@@ -3557,10 +3557,11 @@ class DeepseekV4AscendAttnBackend(
             and forward_mode.is_target_verify()
         ):
             capture_prefix = forward_batch.seq_lens.to(torch.int32)
+            verify_lens = ragged_layout.verify_lens if ragged_layout is not None else tokens_per_req
             metadata.actual_seq_lengths_kv.copy_(
                 torch.where(
                     capture_prefix > 0,
-                    capture_prefix + tokens_per_req,
+                    capture_prefix + verify_lens,
                     torch.zeros_like(capture_prefix),
                 )
             )
@@ -3609,7 +3610,7 @@ class DeepseekV4AscendAttnBackend(
             # The live-row mask the captured graphs read; filled per replay by
             # _refresh_graph_seq_metadata (never traced inside the graph).
             metadata.dsv41_live_mask_buf = torch.zeros(
-                bs * tokens_per_req, dtype=torch.bool, device=device
+                n_tok, dtype=torch.bool, device=device
             )
             # V4.1: MQSMLA/QLI dispatch tables plus window/topk-length buffers.
             self._init_dsv41_graph_metadata(
@@ -4412,7 +4413,19 @@ class DeepseekV4AscendAttnBackend(
             return
 
         device = forward_batch.seq_lens.device
-        ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
+        raw_layout = forward_batch.ragged_verify_layout
+        a3_compact = (
+            self._dsv4_has_low_ratio
+            and not is_npu_arch35()
+            and forward_batch.forward_mode.is_target_verify()
+            and raw_layout is not None
+        )
+        ragged_layout = (
+            raw_layout
+            if a3_compact
+            else self._dspark_ragged_verify_layout(forward_batch)
+        )
+        # ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         # cu_seqlens_q must hold per-request QUERY token counts, not KV lengths.
         if (
             forward_batch.forward_mode.is_extend()
@@ -4452,6 +4465,14 @@ class DeepseekV4AscendAttnBackend(
             fm.actual_seq_lengths_q_pa = ragged_layout.qo_indptr_device.to(
                 device=device, dtype=torch.int32
             )
+            if a3_compact:
+                pad_bs = forward_batch.batch_size - ragged_layout.bs
+                if pad_bs > 0:
+                    cu_q = fm.actual_seq_lengths_q_pa
+                    fm.actual_seq_lengths_q_pa = torch.cat((cu_q, cu_q[-1:].expand(pad_bs)))
+            if ragged_layout.total_verify_tokens is None:
+                fm.actual_seq_lengths_q_pa_cpu = fm.actual_seq_lengths_q_pa.cpu()
+
             fm.actual_seq_lengths_q = fm.actual_seq_lengths_q_pa[1:]
         elif (
             forward_batch.forward_mode.is_target_verify()
