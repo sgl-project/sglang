@@ -731,6 +731,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
 
         self.attn = USPAttention(
             num_heads=self.local_heads,
+            global_num_heads=self.heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -985,6 +986,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
 
         self.attn = USPAttention(
             num_heads=self.local_heads,
+            global_num_heads=self.heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
