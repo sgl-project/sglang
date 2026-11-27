@@ -131,6 +131,32 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         self.assertEqual(waiting_queue[1].rid, "b")
         self.assertEqual(waiting_queue[2].rid, "c")
 
+    def test_uncached_len_matches_actual_prefill_sequence(self):
+        ordinary = _make_req("ordinary", "x" * 100, list(range(100)))
+        ordinary.num_matched_prefix_tokens = 30
+        self.assertEqual(SchedulePolicy._uncached_len(ordinary), 70)
+
+        retracted = _make_req("retracted", "x" * 100, list(range(100)))
+        retracted.output_ids.extend(range(100, 1000))
+        retracted.reset_for_retract()
+        retracted.num_matched_prefix_tokens = 100
+        self.assertEqual(SchedulePolicy._uncached_len(retracted), 900)
+
+    def test_hrrn_older_fresh_request_precedes_long_retracted_prefill(self):
+        fresh = _make_req("fresh", "x" * 100, list(range(100)))
+        fresh.arrival_processed_tokens = 0
+
+        requeued = _make_req("requeued", "x" * 100, list(range(100)))
+        requeued.output_ids.extend(range(100, 1000))
+        requeued.reset_for_retract()
+        requeued.num_matched_prefix_tokens = 100
+        requeued.arrival_processed_tokens = 1000
+
+        waiting_queue = [requeued, fresh]
+        SchedulePolicy._sort_by_hrrn(waiting_queue, set(), processed_tokens=1000)
+
+        self.assertEqual([req.rid for req in waiting_queue], ["fresh", "requeued"])
+
 
 class TestShortestPrefillFirst(CustomTestCase):
     def setUp(self):
