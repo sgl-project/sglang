@@ -1,0 +1,245 @@
+name: Nightly Test (Xeon)
+
+# Nightly accuracy + performance benchmark for CPU (Xeon) models, plus a full
+# re-run of the per-commit UT suites. Unlike PR Test (Xeon) this runs the large
+# models (8B-35B) that are too slow for per-commit CI, and uses
+# --continue-on-error so one failing model does not mask the rest.
+
+on:
+  schedule:
+    # 18:07 UTC daily (02:07 Beijing). Off-minute to avoid colliding with the
+    # fleet of :00/:30 scheduled jobs; clear of the XPU nightly at 16:45 UTC.
+    - cron: '7 18 * * *'
+  workflow_dispatch:
+    inputs:
+      continue_on_error:
+        description: 'Continue remaining tests after a failure; the workflow still fails'
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to checkout'
+        required: false
+        type: string
+        default: ''
+      continue_on_error:
+        description: 'Continue remaining tests after a failure; the workflow still fails'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  # Explicit entry points supply a boolean input; direct push/schedule runs do not.
+  group: nightly-test-xeon-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || (toJSON(inputs.continue_on_error) == 'true' || toJSON(inputs.continue_on_error) == 'false') && format('caller-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ toJSON(inputs.continue_on_error) != 'true' && toJSON(inputs.continue_on_error) != 'false' }}
+
+jobs:
+  nightly-xeon:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: xeon-gnr
+    # UT (4h) + model tests (2 x 5h), with time for image build and cleanup.
+    timeout-minutes: 960
+    env:
+      REPORT_DIR: nightly-results/${{ matrix.name }}
+      # Honor explicit false even when a reusable caller was triggered by push/schedule.
+      CONTINUE_ON_ERROR_FLAG: ${{ toJSON(inputs.continue_on_error) != 'false' && '--continue-on-error' || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gnr1
+            part_id: 0
+            part_size: 2
+            nightly_part_lo: 0
+            nightly_part_hi: 3
+          - name: gnr2
+            part_id: 1
+            part_size: 2
+            nightly_part_lo: 1
+            nightly_part_hi: 2
+    steps:
+      - name: Cleanup workspace
+        run: |
+          sudo rm -rf ${{ github.workspace }} || true
+          sudo mkdir -p ${{ github.workspace }}
+          sudo chown $(id -u):$(id -g) ${{ github.workspace }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          clean: false
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Build image
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          # Resolve a branch/tag input once, then build from the exact checkout.
+          # Keep the fixed image tag; no per-commit image tags are retained.
+          CHECKOUT_SHA=$(git rev-parse HEAD)
+          echo "Building Xeon image from checkout ${CHECKOUT_SHA}"
+          docker build \
+            --build-arg "SGLANG_REPO=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
+            --build-arg "VER_SGLANG=${CHECKOUT_SHA}" \
+            . -f docker/xeon.Dockerfile -t sglang_xeon --no-cache
+
+          IMAGE_SHA=$(docker run --rm --entrypoint git sglang_xeon rev-parse HEAD)
+          if [[ "$IMAGE_SHA" != "$CHECKOUT_SHA" ]]; then
+            echo "::error::Xeon image source ${IMAGE_SHA} does not match checkout ${CHECKOUT_SHA}"
+            exit 1
+          fi
+
+      - name: Run container
+        id: run_container
+        run: |
+          mkdir -p "$REPORT_DIR"
+          touch "$REPORT_DIR/model-summary.md"
+          docker rm -f ci_sglang_${{ matrix.name }} || true
+          docker run -dt \
+            -v ${{ github.workspace }}:/sglang-checkout/ --shm-size=32g \
+            -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+            -v $HOME/.cache/sgl_eval:/root/.cache/sgl_eval \
+            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
+            --name ci_sglang_${{ matrix.name }} \
+            sglang_xeon
+
+      - name: Check AMX support
+        id: check_amx
+        timeout-minutes: 5
+        run: |
+          docker exec -e SGLANG_IS_IN_CI=true -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
+            bash -c "source /opt/.venv/bin/activate && python3 -c 'import torch; import sgl_kernel; assert torch.cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
+
+      # Phase 1: the current Xeon PR suites (non-TP + TP), partitioned
+      # across the 2 GNR boxes by est_time. Small models -> partitioning safe.
+      - name: Run unit test suites
+        id: unit_tests
+        timeout-minutes: 240
+        run: |
+          set -o pipefail
+          docker exec -e SGLANG_IS_IN_CI=true -e SGLANG_XEON_NIGHTLY=true -e PYTHONUNBUFFERED=1 -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite extra-test-cpu-intel,extra-tp-test-cpu-intel --auto-partition-id ${{ matrix.part_id }} --auto-partition-size ${{ matrix.part_size }} --timeout-from-est-time $CONTINUE_ON_ERROR_FLAG" \
+            2>&1 | tee "$REPORT_DIR/unit-tests.log"
+
+      # Phase 2: nightly large-model accuracy + performance suite. Runs AFTER
+      # phase 1 on the same box (serial docker exec), so only one server is ever
+      # resident -> no dual-model OOM. Four balanced partitions run as two
+      # serial batches per GNR, keeping each step below the 360-minute limit.
+      # Pair 0+3 and 1+2 to keep GPT-OSS and Phi-4 on separate machines.
+      # Model estimates balance partitions; each file has a separate 3-hour limit.
+      # Continue after test failures once container and AMX setup succeeded.
+      - name: Run nightly model accuracy + perf (batch 1)
+        id: model_batch_1
+        if: ${{ !cancelled() && steps.run_container.outcome == 'success' && steps.check_amx.outcome == 'success' && (env.CONTINUE_ON_ERROR_FLAG != '' || steps.unit_tests.outcome == 'success') }}
+        timeout-minutes: 300
+        run: |
+          set -o pipefail
+          # A timed-out earlier step leaves its processes running; a restart also resets /dev/shm.
+          docker restart ci_sglang_${{ matrix.name }}
+          docker exec -w /sglang-checkout/ \
+            -e SGLANG_IS_IN_CI=true -e PYTHONUNBUFFERED=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/$REPORT_DIR/model-summary.md" \
+            -e SGLANG_TEST_METRICS_FILE="/sglang-checkout/$REPORT_DIR/metrics.jsonl" \
+            ci_sglang_${{ matrix.name }} \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-test-cpu-intel --auto-partition-id ${{ matrix.nightly_part_lo }} --auto-partition-size 4 --timeout-per-file 10800 $CONTINUE_ON_ERROR_FLAG" \
+            2>&1 | tee "$REPORT_DIR/model-batch-1.log"
+
+      - name: Run nightly model accuracy + perf (batch 2)
+        id: model_batch_2
+        if: ${{ !cancelled() && steps.run_container.outcome == 'success' && steps.check_amx.outcome == 'success' && (env.CONTINUE_ON_ERROR_FLAG != '' || (steps.unit_tests.outcome == 'success' && steps.model_batch_1.outcome == 'success')) }}
+        timeout-minutes: 300
+        run: |
+          set -o pipefail
+          docker restart ci_sglang_${{ matrix.name }}
+          docker exec -w /sglang-checkout/ \
+            -e SGLANG_IS_IN_CI=true -e PYTHONUNBUFFERED=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/$REPORT_DIR/model-summary.md" \
+            -e SGLANG_TEST_METRICS_FILE="/sglang-checkout/$REPORT_DIR/metrics.jsonl" \
+            ci_sglang_${{ matrix.name }} \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-test-cpu-intel --auto-partition-id ${{ matrix.nightly_part_hi }} --auto-partition-size 4 --timeout-per-file 10800 $CONTINUE_ON_ERROR_FLAG" \
+            2>&1 | tee "$REPORT_DIR/model-batch-2.log"
+
+      - name: Collect evaluation reports
+        if: always() && steps.run_container.outcome == 'success'
+        timeout-minutes: 5
+        run: |
+          mkdir -p "$REPORT_DIR"
+          # run_eval writes per-question HTML and aggregate JSON inside /tmp.
+          # Copy them before removing the container, including on test failure.
+          docker exec ci_sglang_${{ matrix.name }} bash -c '
+            shopt -s nullglob
+            reports=(/tmp/gsm8k_*.html /tmp/gsm8k_*.json)
+            if (( ${#reports[@]} )); then
+              mkdir -p "/sglang-checkout/$1/accuracy"
+              cp -- "${reports[@]}" "/sglang-checkout/$1/accuracy/"
+            fi
+          ' bash "$REPORT_DIR" || echo "::warning::Could not collect container evaluation reports"
+          if [[ -d test/performance_results_text_models ]]; then
+            cp -a test/performance_results_text_models "$REPORT_DIR/performance"
+          fi
+
+      - name: Change permission
+        if: always()
+        timeout-minutes: 2
+        run: |
+          docker exec -u root ci_sglang_${{ matrix.name }} bash -c "rm -rf /tmp/ci-home && chown -R $(id -u):$(id -g) /sglang-checkout/ 2>/dev/null || true" 2>/dev/null || true
+
+      - name: Publish GitHub report
+        if: always()
+        env:
+          PARTITION_NAME: ${{ matrix.name }}
+          UT_OUTCOME: ${{ steps.unit_tests.outcome }}
+          BATCH_1_OUTCOME: ${{ steps.model_batch_1.outcome }}
+          BATCH_2_OUTCOME: ${{ steps.model_batch_2.outcome }}
+        run: |
+          mkdir -p "$REPORT_DIR"
+          checkout_sha=$(git rev-parse HEAD 2>/dev/null || echo "$GITHUB_SHA")
+          {
+            printf '## Xeon nightly: %s\n\n' "$PARTITION_NAME"
+            printf '**Runner:** `%s` · **Commit:** `%s`\n\n' "$RUNNER_NAME" "$checkout_sha"
+            printf '| Phase | Result |\n| --- | --- |\n'
+            printf '| Unit tests | %s |\n' "${UT_OUTCOME:-not run}"
+            printf '| Model batch 1 | %s |\n' "${BATCH_1_OUTCOME:-not run}"
+            printf '| Model batch 2 | %s |\n\n' "${BATCH_2_OUTCOME:-not run}"
+            if [[ -s "$REPORT_DIR/model-summary.md" ]]; then
+              cat "$REPORT_DIR/model-summary.md"
+            else
+              printf 'No model report was produced. See the batch logs for startup errors or timeouts.\n'
+            fi
+            printf '\nLogs, benchmark JSON, and available per-question evaluation reports are in the `xeon-nightly-%s` artifact.\n' "$PARTITION_NAME"
+          } > "$REPORT_DIR/summary.md"
+          cat "$REPORT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload nightly results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xeon-nightly-${{ matrix.name }}
+          path: nightly-results/${{ matrix.name }}/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f ci_sglang_${{ matrix.name }} || true
+          # Match PR Xeon cleanup: unused images and build cache only.
+          docker image prune -f --filter until=24h || true
+          docker builder prune -f --filter until=24h || true
+
+  check-all-jobs:
+    if: always() && github.repository == 'sgl-project/sglang'
+    needs:
+      - nightly-xeon
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ needs['nightly-xeon'].result }}" != "success" ]]; then
+            echo "Nightly Xeon test job did not succeed"
+            exit 1
+          fi
+          echo "All nightly test jobs passed"
