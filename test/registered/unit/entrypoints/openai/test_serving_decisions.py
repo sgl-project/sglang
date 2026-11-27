@@ -596,8 +596,7 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
         prompt_len = len(
             _encoded(_handler(ScoringManager(self.tokenizer)), request)[0][0]
         )
-        past_limit = ScoringManager(self.tokenizer, max_req_input_len=prompt_len + 2)
-        past_limit.num_reserved_tokens = 3
+        past_limit = ScoringManager(self.tokenizer, max_req_input_len=prompt_len - 1)
         # The label merges with the trailing space, or follows a split double space.
         trailing_space = "{{ messages[0]['content'] }}\nAnswer: "
         double_space = "{{ messages[0]['content'] }}\nAnswer:  "
@@ -629,8 +628,7 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("question 'first'", error)
                 self.assertEqual(manager.requests, [])
         self.tokenizer.chat_template = original_template
-        at_limit = ScoringManager(self.tokenizer, max_req_input_len=prompt_len + 3)
-        at_limit.num_reserved_tokens = 3
+        at_limit = ScoringManager(self.tokenizer, max_req_input_len=prompt_len)
         response = await _handler(at_limit).handle_request(request, None)
         self.assertEqual(response.status_code, 200)
 

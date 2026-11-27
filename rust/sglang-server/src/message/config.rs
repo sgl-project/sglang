@@ -499,6 +499,10 @@ impl Default for ServerArgs {
     /// complete `model_config` so the runtime boots. Real launches never use
     /// this — Python supplies every field.
     fn default() -> Self {
+        let model_config = ModelConfig::default();
+        // What the scheduler's `get_request_length_limits` derives from that
+        // context with an unbounded KV pool, no dLLM block and nothing reserved.
+        let max_req_len = model_config.context_len;
         Self {
             model_path: String::new(),
             served_model_name: String::new(),
@@ -537,7 +541,7 @@ impl Default for ServerArgs {
             enable_request_decompression: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
-            model_config: ModelConfig::default(),
+            model_config,
             preferred_sampling_params: None,
             default_max_new_tokens: Some(128),
             lora_ids: BTreeMap::new(),
@@ -550,10 +554,8 @@ impl Default for ServerArgs {
             tokenizer_model_max_length: -1,
             version: String::new(),
             max_total_num_tokens: 0,
-            // What the scheduler derives from `ModelConfig::default()`'s
-            // 2048-token context with an unbounded KV pool.
-            max_req_len: 2047,
-            max_req_input_len: 2042,
+            max_req_len,
+            max_req_input_len: max_req_len - 1 - 5,
             deployment_info: DeploymentInfo::default(),
             launch_server_info: JsonObject::default(),
             launch_model_info: JsonObject::default(),

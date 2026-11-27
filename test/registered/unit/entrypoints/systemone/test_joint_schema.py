@@ -121,7 +121,6 @@ class HeadManager:
         )
         self.is_generation = False
         self.allow_auto_truncate = False
-        self.num_reserved_tokens = 0
         # The scheduler's limit for context_len 4096.
         self.max_req_input_len = 4090
         self.mm_processor = PatchCounter()
@@ -135,7 +134,7 @@ class HeadManager:
     async def generate_request(self, request, raw_request):
         self.requests.append(request)
         num_tokens = _expanded_length(request)
-        if num_tokens + self.num_reserved_tokens > self.max_req_input_len:
+        if num_tokens > self.max_req_input_len:
             raise ValueError(f"The input ({num_tokens} tokens) is too long")
         if num_tokens > get_schedule().max_prefill_tokens:
             raise ValueError(f"A prefill of {num_tokens} tokens outgrows its memory")
@@ -379,7 +378,7 @@ def _admission_manager(joint_head_config):
     )
     manager.is_generation = joint_head_config is None
     manager.num_reserved_tokens = 0
-    manager.max_req_len = 4095
+    manager.max_req_len = 4096
     manager.max_req_input_len = 4090
     # A layout must be refused before auto-truncation could cut its prompt.
     manager.allow_auto_truncate = True

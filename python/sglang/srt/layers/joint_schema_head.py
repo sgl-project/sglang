@@ -39,19 +39,13 @@ class LayoutQuestion(msgspec.Struct, frozen=True):
     option_spans: Tuple[Tuple[int, int], ...]
 
 
-def max_joint_prompt_tokens(
-    *,
-    num_reserved_tokens: int,
-    max_req_input_len: int,
-    max_prefill_tokens: int,
-) -> int:
+def max_joint_prompt_tokens(*, max_req_input_len: int, max_prefill_tokens: int) -> int:
     """The longest prompt, images expanded, that the server runs as one prefill.
 
-    The tokenizer manager takes a prompt of up to max_req_input_len tokens
-    with the reserved tokens counted, and without chunked prefill activation
-    memory is reserved for max_prefill_tokens.
+    The server takes a prompt of up to max_req_input_len tokens, and without
+    chunked prefill activation memory is reserved for max_prefill_tokens.
     """
-    return min(max_req_input_len - num_reserved_tokens, max_prefill_tokens)
+    return min(max_req_input_len, max_prefill_tokens)
 
 
 def pack_decision_layout(

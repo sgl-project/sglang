@@ -13,7 +13,7 @@ use crate::message::buffers::{Buffer, BufferData, BufferStore, ExternalBuffer};
 use crate::message::config::MmSpec;
 use crate::message::request::{MmData, Request, RequestKind};
 use crate::message::types::TokenIds;
-use crate::tokenizer_manager::to_scheduler::{Limits, fit_input};
+use crate::tokenizer_manager::to_scheduler::{Limits, input_length_error};
 use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::error::Error;
 use crate::utils::fsm::Event;
@@ -418,21 +418,18 @@ fn published_features(
 }
 
 /// The ring's named buffers for one result: the per-item features (those
-/// `publisher` publishes, see [`published_features`], else see
+/// `processor` publishes, see [`published_features`], else see
 /// [`place_features`]), the M-RoPE positions, and the `mm.meta` sidecar --
 /// always last, so a reader that finds it knows the rest is present.
 fn make_buffers(
     entry: MmEncodedEntry,
     feature_shm: bool,
-    publisher: Option<&dyn MmProcessor>,
+    processor: &dyn MmProcessor,
 ) -> Result<Vec<Buffer>, String> {
     let meta = MmMeta::of(&entry)?.encode()?;
     let MmEncodedEntry { items, mrope, .. } = entry;
-    let published = match publisher {
-        Some(publisher) => publisher.publish_features(&items)?,
-        None => Vec::new(),
-    };
-    if publisher.is_some() && published.len() != items.len() {
+    let published = processor.publish_features(&items)?;
+    if published.len() != items.len() {
         return Err(format!(
             "the processor published {} entries for {} features",
             published.len(),
@@ -470,7 +467,7 @@ impl Processed {
     /// The final expanded ids and the buffers to ride the ring; an
     /// unplaceable buffer is the server's fault, `Internal` (a 500).
     fn into_buffers(self, ctx: &MmContext) -> Result<(TokenIds, Vec<Buffer>), Error> {
-        let buffers = make_buffers(self.result, ctx.feature_shm, Some(ctx.processor.as_ref()))
+        let buffers = make_buffers(self.result, ctx.feature_shm, ctx.processor.as_ref())
             .map_err(Error::Internal)?;
         Ok((self.input_ids, buffers))
     }
@@ -514,8 +511,10 @@ fn process(
     // The expanded ids must fit the context as they are: a multimodal prompt
     // is rejected, never truncated, so `processed` sees the ids the scheduler
     // gets and never a prompt that intake rejects.
-    if let Some(limits) = &ctx.limits {
-        fit_input(&mut output.input_ids, limits, true)?;
+    if let Some(limits) = &ctx.limits
+        && let Some(error) = input_length_error(output.input_ids.len(), limits, true)
+    {
+        return Err(Error::Validation(error));
     }
     ctx.processor
         .try_processed(request, &output)
@@ -913,7 +912,7 @@ mod tests {
     fn published_features_ride_as_external_buffers() {
         let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let publisher = Publishing::new(|_| true, &dropped);
-        let buffers = make_buffers(qwen_entry(), false, Some(&publisher)).unwrap();
+        let buffers = make_buffers(qwen_entry(), false, &publisher).unwrap();
         let names: Vec<&str> = buffers.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(
             names,
@@ -926,7 +925,8 @@ mod tests {
                 .iter()
                 .all(|b| matches!(b.store, BufferStore::External(_)))
         );
-        let inline = make_buffers(qwen_entry(), false, None).unwrap();
+        let inline =
+            make_buffers(qwen_entry(), false, &Publishing::new(|_| false, &dropped)).unwrap();
         assert_eq!(decoded_meta(&buffers), decoded_meta(&inline));
         assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
         drop(buffers);
@@ -941,7 +941,7 @@ mod tests {
     fn unpublished_features_travel_inline_and_a_miscount_fails() {
         let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let first_only = Publishing::new(|i| i == 0, &dropped);
-        let buffers = make_buffers(qwen_entry(), true, Some(&first_only)).unwrap();
+        let buffers = make_buffers(qwen_entry(), true, &first_only).unwrap();
         assert!(matches!(
             find(&buffers, "mm.feature.0").unwrap().store,
             BufferStore::External(_)
@@ -956,17 +956,18 @@ mod tests {
         assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
 
         let none = Publishing::new(|_| false, &dropped);
-        let buffers = make_buffers(qwen_entry(), false, Some(&none)).unwrap();
-        assert_eq!(
-            buffers_layout(&buffers),
-            buffers_layout(&make_buffers(qwen_entry(), false, None).unwrap())
+        let buffers = make_buffers(qwen_entry(), false, &none).unwrap();
+        assert!(
+            buffers
+                .iter()
+                .all(|b| matches!(b.store, BufferStore::Inline(_)))
         );
 
         let short = Publishing {
             entries: Some(1),
             ..Publishing::new(|_| true, &dropped)
         };
-        let error = make_buffers(qwen_entry(), false, Some(&short)).unwrap_err();
+        let error = make_buffers(qwen_entry(), false, &short).unwrap_err();
         assert!(
             error.contains("published 1 entries for 2 features"),
             "{error}"
@@ -974,20 +975,17 @@ mod tests {
         assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
-    /// Each buffer's name and whether it is inline.
-    fn buffers_layout(buffers: &[Buffer]) -> Vec<(String, bool)> {
-        buffers
-            .iter()
-            .map(|b| (b.name.clone(), matches!(b.store, BufferStore::Inline(_))))
-            .collect()
-    }
-
     /// Inline: one shaped `mm.feature.{i}` per item owning its own tensor, the
     /// M-RoPE positions as `[3, len]`, and the sidecar last, decoding to named
     /// maps with the item metadata in order.
     #[test]
     fn buffers_are_shaped_features_mrope_and_meta_sidecar() {
-        let buffers = make_buffers(qwen_entry(), false, None).unwrap();
+        let buffers = make_buffers(
+            qwen_entry(),
+            false,
+            &Publishing::new(|_| false, &Arc::default()),
+        )
+        .unwrap();
         let names: Vec<&str> = buffers.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(
             names,
@@ -1652,7 +1650,7 @@ mod tests {
             let ctx = MmContext::with_processor(processor.clone(), false).with_limits(Limits {
                 skip_tokenizer_init: false,
                 vocab_size: 1000,
-                max_req_len: 17,
+                max_req_len: 18,
                 max_req_input_len,
                 num_reserved_tokens: 0,
                 allow_auto_truncate,

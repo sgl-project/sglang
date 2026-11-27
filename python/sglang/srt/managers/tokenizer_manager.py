@@ -147,7 +147,7 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerSc
 from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
     get_context_length_sentence,
-    get_context_max_new_tokens,
+    get_input_length_error,
     get_preserve_last_token_id,
     is_health_check_generate_req,
     truncate_input_ids,
@@ -1436,7 +1436,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         audio_data=obj.audio_data,
                         input_text=mm_processor_input,
                         request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
                     )
             elif (
                 get_disagg().language_only
@@ -1451,7 +1450,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     audio_data=obj.audio_data,
                     input_text=mm_processor_input,
                     request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
                 )
 
             if mm_inputs and mm_inputs.input_ids is not None:
@@ -1527,7 +1525,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         *,
         is_multimodal: bool = False,
     ) -> None:
-        """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        """Validates the input token count and the requested token count against the server's request length limits."""
         if get_exec().features.enable_encoder_swa_bounded_replay:
             if obj.image_data is not None and not get_platform().is_cuda:
                 raise ValueError(
@@ -1549,47 +1547,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
         self._validate_joint_schema_request(obj, input_ids)
-        # The scheduler's limits, with the reserved output slots counted as input.
+        # Validate input length; a multimodal prompt is never truncated.
+        input_len = len(input_ids) if input_ids is not None else 0
+        error_msg = get_input_length_error(
+            input_len, self.max_req_input_len, is_multimodal=is_multimodal
+        )
+        if error_msg is not None:
+            if is_multimodal or not self.allow_auto_truncate:
+                raise ValueError(error_msg)
+            logger.warning(
+                f"The input ({input_len} tokens) is longer than the maximum "
+                f"allowed length ({self.max_req_input_len} tokens on this "
+                "server). Truncating the input."
+            )
+            input_ids[:] = truncate_input_ids(
+                input_ids,
+                max_len=self.max_req_input_len,
+                preserve_last_token_id=self._embedding_preserve_last_token_id,
+            )
+
+        # Validate total tokens (input + max_new_tokens). The reserved output
+        # slots count as input here.
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
-
-        # Validate input length. A multimodal prompt is never truncated: the
-        # cut can split an item's placeholder tokens.
-        if input_token_num > self.max_req_input_len:
-            if self.allow_auto_truncate and not is_multimodal:
-                logger.warning(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length allows ({self.max_req_input_len} "
-                    "tokens on this server). Truncating the input."
-                )
-                input_ids[:] = truncate_input_ids(
-                    input_ids,
-                    max_len=self.max_req_input_len - self.num_reserved_tokens,
-                    preserve_last_token_id=self._embedding_preserve_last_token_id,
-                )
-                input_token_num = len(input_ids) + self.num_reserved_tokens
-            else:
-                raise ValueError(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    "model's context length allows. "
-                    f"{get_context_length_sentence(self.max_req_input_len)}"
-                )
-
-        # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
-        context_max_new_tokens = get_context_max_new_tokens(
-            self.max_req_len, input_token_num
-        )
+        context_max_new_tokens = self.max_req_len - input_token_num
         if (
             self.validate_total_tokens
             and max_new_tokens is not None
             and max_new_tokens > context_max_new_tokens
         ):
-            max_total_tokens = input_token_num + context_max_new_tokens
             if self.allow_auto_truncate:
                 logger.warning(
                     f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
-                    f"exceeds the model's context length ({max_total_tokens} tokens "
+                    f"exceeds the model's context length ({self.max_req_len} tokens "
                     "on this server). Truncating max_new_tokens."
                 )
                 obj.sampling_params["max_new_tokens"] = max(0, context_max_new_tokens)
@@ -1597,7 +1588,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 total_tokens = max_new_tokens + input_token_num
                 error_msg = (
                     "Requested token count exceeds the model's maximum context length. "
-                    f"{get_context_length_sentence(max_total_tokens)} "
+                    f"{get_context_length_sentence(self.max_req_len)} "
                     f"You requested a total of {total_tokens} "
                     f"tokens: {input_token_num} tokens from the input messages and "
                     f"{max_new_tokens} tokens for the completion. Please reduce the number "
@@ -1694,7 +1685,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "This checkpoint answers schema decisions, send them to /v1/systemone"
             )
         limit = max_joint_prompt_tokens(
-            num_reserved_tokens=self.num_reserved_tokens,
             max_req_input_len=self.max_req_input_len,
             max_prefill_tokens=get_schedule().max_prefill_tokens,
         )

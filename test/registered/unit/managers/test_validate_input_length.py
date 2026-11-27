@@ -29,7 +29,7 @@ class TestValidateInputLength(CustomTestCase):
     def test_rejection_uses_openai_context_length_wording(self):
         req = _req(1500)
         msg = validate_input_length(
-            req, max_req_input_len=1018, allow_auto_truncate=False
+            req, max_req_input_len=1018, allow_auto_truncate=False, is_multimodal=False
         )
         self.assertIn(
             "Input length (1500 tokens) exceeds the maximum allowed length (1018 tokens).",
@@ -45,19 +45,30 @@ class TestValidateInputLength(CustomTestCase):
             req = _req(1018)
             self.assertIsNone(
                 validate_input_length(
-                    req, max_req_input_len=1018, allow_auto_truncate=allow_auto_truncate
+                    req,
+                    max_req_input_len=1018,
+                    allow_auto_truncate=allow_auto_truncate,
+                    is_multimodal=False,
                 )
             )
             self.assertEqual(len(req.origin_input_ids), 1018)
         msg = validate_input_length(
-            _req(1019), max_req_input_len=1018, allow_auto_truncate=False
+            _req(1019),
+            max_req_input_len=1018,
+            allow_auto_truncate=False,
+            is_multimodal=False,
         )
         self.assertIn("This model's maximum context length is 1018 tokens", msg)
 
     def test_auto_truncate_unchanged(self):
         req = _req(1500)
         self.assertIsNone(
-            validate_input_length(req, max_req_input_len=1018, allow_auto_truncate=True)
+            validate_input_length(
+                req,
+                max_req_input_len=1018,
+                allow_auto_truncate=True,
+                is_multimodal=False,
+            )
         )
         self.assertEqual(list(req.origin_input_ids), list(range(1018)))
 
@@ -66,7 +77,10 @@ class TestValidateInputLength(CustomTestCase):
         for allow_auto_truncate in (False, True):
             self.assertIsNone(
                 validate_input_length(
-                    req, max_req_input_len=1018, allow_auto_truncate=allow_auto_truncate
+                    req,
+                    max_req_input_len=1018,
+                    allow_auto_truncate=allow_auto_truncate,
+                    is_multimodal=False,
                 )
             )
         self.assertEqual(len(req.origin_input_ids), 1017)

@@ -241,7 +241,7 @@ fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
 #[test]
 fn total_tokens_over_context_is_rejected() {
     let limits = Limits {
-        max_req_len: 9, // a 10-token window: the last output token is never forwarded
+        max_req_len: 10,
         ..test_limits()
     };
     let mut g = GenerateRequest {
@@ -278,7 +278,7 @@ fn total_tokens_over_context_is_rejected() {
 #[test]
 fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
     let limits = Limits {
-        max_req_len: 999,
+        max_req_len: 1000,
         ..test_limits()
     };
     let request = |max_new_tokens| GenerateRequest {
@@ -312,7 +312,7 @@ fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
 #[test]
 fn reserved_tokens_count_toward_the_limit() {
     let limits = Limits {
-        max_req_len: 9,
+        max_req_len: 10,
         num_reserved_tokens: 5,
         ..test_limits()
     };
@@ -342,7 +342,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
         ..Default::default()
     };
     let truncating = Limits {
-        max_req_len: 9,
+        max_req_len: 10,
         allow_auto_truncate: true,
         ..test_limits()
     };
@@ -358,7 +358,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
     // itself is still checked (see `input_length_is_checked_unconditionally`).
     g.sampling_params = sp(None);
     let roomy = Limits {
-        max_req_len: 99,
+        max_req_len: 100,
         ..test_limits()
     };
     assert!(check_total_tokens(&mut g, &roomy).is_ok());
@@ -371,7 +371,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
 fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
     for allow_auto_truncate in [false, true] {
         let limits = Limits {
-            max_req_len: 9,
+            max_req_len: 10,
             allow_auto_truncate,
             ..test_limits()
         };
@@ -398,7 +398,10 @@ fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
         ..test_limits()
     };
     let err = check_total_tokens(&mut g, &limits).unwrap_err();
-    assert!(err.to_string().contains("longer than the model's context"));
+    assert!(
+        err.to_string()
+            .contains("exceeds the maximum allowed length")
+    );
 }
 
 /// `max_new_tokens: null` means "no cap", NOT "skip the checks" — the input
@@ -424,11 +427,12 @@ fn input_length_is_checked_unconditionally() {
         let err = check_total_tokens(&mut req(max_new_tokens), &limits)
             .expect_err("input > max_req_input_len must be rejected");
         assert!(matches!(err, Error::Validation(_)));
-        let msg = err.to_string();
-        assert!(msg.contains("longer than the model's context"), "{msg}");
-        assert!(
-            msg.contains("This model's maximum context length is 2 tokens"),
-            "{msg}"
+        // Python's `get_input_length_error` text, byte for byte.
+        assert_eq!(
+            err.to_string(),
+            "Input length (3 tokens) exceeds the maximum allowed length (2 tokens). \
+             This model's maximum context length is 2 tokens on this server. \
+             Use a shorter input or enable --allow-auto-truncate."
         );
     }
     // One token shorter fits, with or without a cap.
@@ -439,8 +443,7 @@ fn input_length_is_checked_unconditionally() {
     g.sampling_params.max_new_tokens = None;
     assert!(check_total_tokens(&mut g, &limits).is_ok());
 
-    // Under auto-truncate the input is cut to fit instead of rejected, leaving
-    // room for the reserved slots.
+    // Under auto-truncate the input is cut to fit instead of rejected.
     let truncating = Limits {
         allow_auto_truncate: true,
         ..limits.clone()
@@ -456,13 +459,14 @@ fn input_length_is_checked_unconditionally() {
         num_reserved_tokens: 1,
         ..truncating
     };
-    let mut g = req(None);
+    // The reserved slots are already taken out of `max_req_input_len`, so
+    // they do not count against it again.
+    let mut g = GenerateRequest {
+        input_ids: Some(vec![1, 2]),
+        ..Default::default()
+    };
     assert!(check_total_tokens(&mut g, &reserving).is_ok());
-    assert_eq!(
-        g.input_ids.as_deref(),
-        Some(&[1][..]),
-        "cut below the reserved slot"
-    );
+    assert_eq!(g.input_ids.as_deref(), Some(&[1, 2][..]), "not cut");
 }
 
 /// The clamp runs AFTER `verify` (which happens in `Normalizing`), so lowering
@@ -472,7 +476,7 @@ fn input_length_is_checked_unconditionally() {
 #[test]
 fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
     let limits = Limits {
-        max_req_len: 9,
+        max_req_len: 10,
         allow_auto_truncate: true,
         ..test_limits()
     };
@@ -568,7 +572,7 @@ fn limits_resolve_the_hidden_states_mode() {
 #[test]
 fn over_context_request_deregisters_unless_its_cap_is_defaulted() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {
-        max_req_len: 3,
+        max_req_len: 4,
         ..test_limits()
     });
     let sampling_params = SamplingParams {

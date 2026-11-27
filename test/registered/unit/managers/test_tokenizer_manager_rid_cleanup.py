@@ -87,7 +87,7 @@ class TestSamplingParamsTruncation(CustomTestCase):
         self.addCleanup(override.restore)
         manager = TokenizerManager.__new__(TokenizerManager)
         # The scheduler's limits for context_len 100 and a larger KV pool.
-        manager.max_req_len = 99
+        manager.max_req_len = 100
         manager.max_req_input_len = 94
         manager.num_reserved_tokens = 0
         manager.allow_auto_truncate = True
@@ -116,14 +116,15 @@ class TestSamplingParamsTruncation(CustomTestCase):
                     self.assertEqual(shared, {"max_new_tokens": 20})
 
     def test_truncated_prompt_keeps_its_reserved_tokens(self):
-        """Reserved tokens still count as input after truncation, which never
-        applies to a multimodal prompt; rejections carry OpenAI's sentence."""
+        """Reserved tokens still count in the total after truncation, which
+        never applies to a multimodal prompt; rejections carry OpenAI's sentence."""
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
         manager = TokenizerManager.__new__(TokenizerManager)
-        manager.max_req_len = 99
-        manager.max_req_input_len = 94
+        # The scheduler's limits for context_len 100 with 3 reserved tokens.
+        manager.max_req_len = 100
+        manager.max_req_input_len = 91
         manager.num_reserved_tokens = 3
         manager._embedding_preserve_last_token_id = None
         manager.allow_auto_truncate = True
@@ -138,8 +139,8 @@ class TestSamplingParamsTruncation(CustomTestCase):
         req.normalize_batch_and_arguments()
         manager._validate_one_request(req, req.input_ids)
 
-        self.assertEqual(len(req.input_ids), 94 - 3)
-        self.assertEqual(req.sampling_params["max_new_tokens"], 99 - 94 + 1)
+        self.assertEqual(len(req.input_ids), 91)
+        self.assertEqual(req.sampling_params["max_new_tokens"], 100 - 91 - 3)
 
         # A multimodal prompt is rejected instead: a cut could split an item's
         # placeholder tokens.
@@ -148,15 +149,15 @@ class TestSamplingParamsTruncation(CustomTestCase):
         )
         mm_req.normalize_batch_and_arguments()
         with self.assertRaisesRegex(
-            ValueError, "longer than the model's context"
+            ValueError, "Multimodal prompt is too long after expanding"
         ) as cm:
             manager._validate_one_request(mm_req, mm_req.input_ids, is_multimodal=True)
         self.assertEqual(len(mm_req.input_ids), 120)
         # OpenAI-compatible clients (e.g. LiteLLM) classify a context overflow
-        # by OpenAI's sentence; it quotes the prompt limit here and the window
-        # (max_req_len + 1) for the total.
+        # by OpenAI's sentence; it quotes the prompt limit here and
+        # max_req_len for the total.
         self.assertIn(
-            "This model's maximum context length is 94 tokens on this server.",
+            "This model's maximum context length is 91 tokens on this server.",
             str(cm.exception),
         )
         manager.allow_auto_truncate = False

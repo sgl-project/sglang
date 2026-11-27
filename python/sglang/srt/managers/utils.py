@@ -339,28 +339,27 @@ def truncate_input_ids(
 
 
 def get_request_length_limits(
-    context_len: int, kv_capacity: int, dllm_block_size: int = 0
+    context_len: int,
+    kv_capacity: int,
+    *,
+    dllm_block_size: int,
+    num_reserved_tokens: int,
 ) -> tuple[int, int]:
     """(max_req_len, max_req_input_len) for a model context and a KV pool.
 
-    A request holds at most min(context_len, kv_capacity) tokens, prompt and
-    output together. Its last output token is sampled but never forwarded, so
-    max_req_len, the most tokens one request forwards, is one less;
-    get_context_max_new_tokens adds that token back.
+    max_req_len is the most tokens one request holds, prompt and output
+    together: a request gets at most max_req_len - input_len new tokens.
 
-    max_req_input_len is the longest prompt accepted. The 5 is a fixed margin
-    with no recorded purpose. A dLLM forward runs a whole block past the
-    prompt, so the prompt also leaves room for one block.
+    max_req_input_len is the longest prompt accepted, inclusive. It leaves:
+    - 1 for the first output token, so every accepted prompt can generate;
+    - 5, a fixed margin with no recorded purpose;
+    - dllm_block_size, since a dLLM forward runs a whole block past the prompt;
+    - num_reserved_tokens, the output slots eagle fills with draft tokens
+      (compute_num_reserved_tokens).
     """
-    max_req_len = min(context_len, kv_capacity) - 1
-    max_req_input_len = max_req_len - 5 - dllm_block_size
+    max_req_len = min(context_len, kv_capacity)
+    max_req_input_len = max_req_len - 1 - 5 - dllm_block_size - num_reserved_tokens
     return max_req_len, max_req_input_len
-
-
-def get_context_max_new_tokens(max_req_len: int, input_len: int) -> int:
-    """The +1 is the last output token, sampled but never forwarded: the -1 in
-    get_request_length_limits."""
-    return max_req_len - input_len + 1
 
 
 def get_context_length_sentence(max_tokens: int) -> str:
@@ -370,8 +369,8 @@ def get_context_length_sentence(max_tokens: int) -> str:
     return f"This model's maximum context length is {max_tokens} tokens on this server."
 
 
-def get_prompt_length_error(
-    input_len: int, max_req_input_len: int, *, is_multimodal: bool = False
+def get_input_length_error(
+    input_len: int, max_req_input_len: int, *, is_multimodal: bool
 ) -> Optional[str]:
     """The rejection of a prompt longer than max_req_input_len, or None if it fits.
 
@@ -399,7 +398,7 @@ def validate_input_length(
     allow_auto_truncate: bool,
     preserve_last_token_id: Optional[int] = None,
     *,
-    is_multimodal: bool = False,
+    is_multimodal: bool,
 ) -> Optional[str]:
     """Validate and potentially truncate input length.
 
@@ -408,12 +407,12 @@ def validate_input_length(
         max_req_input_len: Maximum allowed input length, inclusive
         allow_auto_truncate: Whether to truncate long inputs to that length
         preserve_last_token_id: See ``truncate_input_ids``.
-        is_multimodal: See ``get_prompt_length_error``.
+        is_multimodal: See ``get_input_length_error``.
 
     Returns:
         Error message if validation fails, None if successful
     """
-    error_msg = get_prompt_length_error(
+    error_msg = get_input_length_error(
         len(req.origin_input_ids), max_req_input_len, is_multimodal=is_multimodal
     )
     if error_msg is None or is_multimodal or not allow_auto_truncate:
@@ -662,7 +661,8 @@ def compute_num_reserved_tokens() -> int:
 
     The current eagle implementation stores draft tokens in the output token
     slots, so the context budget has to account for them; every other algorithm
-    reserves nothing. Shared by `TokenizerManager` and the rust server's
+    reserves nothing. Shared by the scheduler's `max_req_input_len`
+    (`get_request_length_limits`), `TokenizerManager`, and the rust server's
     `server_args` handoff (`RustServer._build_server_args`), which needs the same
     number to run the total-token check in Rust.
     """

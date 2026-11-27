@@ -343,7 +343,6 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     allocate_distinct_stream,
-    get_context_max_new_tokens,
     get_preserve_last_token_id,
     is_health_check_generate_req,
     is_war_barrier_enabled,
@@ -3162,7 +3161,7 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
-        context_max_new_tokens = get_context_max_new_tokens(self.max_req_len, input_len)
+        context_max_new_tokens = self.max_req_len - input_len
         max_new_tokens = max(
             0,
             min(
