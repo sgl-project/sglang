@@ -27,8 +27,24 @@ const walk = (dir) =>
   readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
     entry.isDirectory() ? walk(join(dir, entry.name)) : [join(dir, entry.name)],
   );
-const imported = (source, binding) =>
-  source.match(new RegExp(`import\\s*{\\s*${binding}\\s*}\\s*from\\s*"/src/snippets/configs/([^"]+)"`))?.[1];
+// The config file behind each `<Deployment config={X}>` on a page: X resolved through the page's
+// imports, which may rename (`{ config as ascendConfig }`) and use either quote style.
+const deploymentConfigs = (source) => {
+  const imports = new Map();
+  for (const m of source.matchAll(/import\s*{([^}]*)}\s*from\s*["']\/src\/snippets\/configs\/([^"']+)["']/g)) {
+    for (const part of m[1].split(",")) {
+      const [name, alias] = part.trim().split(/\s+as\s+/);
+      if (name) imports.set(alias ?? name, { file: m[2], name });
+    }
+  }
+  // A tag this cannot resolve throws rather than being skipped: a page missing from the output
+  // would have its live votes treated as orphans.
+  return [...source.matchAll(/<Deployment\b[^>]*>/g)].map(([tag]) => {
+    const ref = imports.get(tag.match(/\bconfig=\{\s*([A-Za-z_$][\w$]*)\s*\}/)?.[1]);
+    if (!ref) throw new Error(`cannot resolve the config of ${tag}`);
+    return ref;
+  });
+};
 const load = async (name) =>
   import("data:text/javascript," + encodeURIComponent(readFileSync(join(configsDir, name), "utf8")));
 
@@ -39,8 +55,8 @@ const overlayCombos = (specs) =>
     [{}],
   );
 
-const idsForPage = async (pagePath, configName) => {
-  const { config } = await load(configName);
+const idsForPage = async (pagePath, { file, name }) => {
+  const config = (await load(file))[name];
   // The component shows no rating on builder pages or pages that opt out.
   if (!config || config.commandBuilder || config.ratings === false) return [];
   const engine = createEngine(config);
@@ -51,12 +67,16 @@ const idsForPage = async (pagePath, configName) => {
       const sel = engine.validateSelection(config.cells, { ...base.match, ...combo });
       const cell = engine.findCell(config.cells, sel);
       if (!cell || cell.redirect) continue;
-      // Keep only selections a reader can reach: each showing overlay row on an option it offers.
+      // Keep only selections a reader can reach: each showing overlay row on an option it offers,
+      // unless the row offers none (every option disabled here). The page then keeps whatever
+      // pick the row held, and ratingKey leaves that row out, so any pick gives the same id.
       const reachable = engine.overlayDimSpecs
         .filter((spec) => engine.rowVisible(spec, sel))
         .every((spec) => {
-          const opt = (spec.options || []).find((o) => o.id === sel[spec.id]);
-          return opt && engine.optionVisible(opt, sel) && !engine.optionDisabled(opt, sel);
+          const usable = (spec.options || []).filter(
+            (o) => engine.optionVisible(o, sel) && !engine.optionDisabled(o, sel),
+          );
+          return !usable.length || usable.some((o) => o.id === sel[spec.id]);
         });
       if (reachable) ids.add(`${pagePath}|${engine.ratingKey(sel)}`);
     }
@@ -67,11 +87,17 @@ const idsForPage = async (pagePath, configName) => {
 const all = new Set();
 for (const path of walk(join(docs, "cookbook")).filter((p) => p.endsWith(".mdx")).sort()) {
   const source = readFileSync(path, "utf8");
-  const name = imported(source, "config");
-  if (!name || !source.includes("<Deployment")) continue;
   // The browser's location.pathname, lower-cased as the component does.
   const pagePath = `/${relative(docs, path).replace(/\.mdx$/, "")}`.toLowerCase();
-  for (const id of await idsForPage(pagePath, name)) all.add(id);
+  let refs;
+  try {
+    refs = deploymentConfigs(source);
+  } catch (e) {
+    throw new Error(`${relative(docs, path)}: ${e.message}`);
+  }
+  for (const ref of refs) {
+    for (const id of await idsForPage(pagePath, ref)) all.add(id);
+  }
 }
 
 process.stdout.write(`${[...all].sort().join("\n")}\n`);

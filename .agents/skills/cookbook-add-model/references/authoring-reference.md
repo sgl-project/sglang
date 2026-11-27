@@ -86,7 +86,8 @@ playground axis back to inherit-from-base.
 
 Overlay dims do not key the cell lookup, but they **do** key the recipe ratings:
 a recipe is the page path plus `hw`, every match dim and every overlay dim whose
-row is showing (`ratingKey` in `_deployment.jsx`), so a speculative-decoding
+pick applies, i.e. its row is showing and the pick is not disabled (`ratingKey`
+in `_deployment.jsx`, same test as `overlayPick`), so a speculative-decoding
 overlay's on and off states are rated apart. See *Ids are rating keys* under
 Pitfalls.
 

@@ -105,7 +105,7 @@
 //                      for cookbooks that only expose the deployment matrix
 //   ratings            optional — false hides the per-recipe 👍/👎 row (it is
 //                      also off for commandBuilder pages and redirect cells).
-//                      A recipe is keyed by page path + hw, match-dim and shown
+//                      A recipe is keyed by page path + hw, match-dim and applied
 //                      overlay-dim ids (ratingKey), so renaming any of them
 //                      resets that recipe's ratings
 // Component props besides `config` / `benchmarks`:
@@ -649,15 +649,24 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   };
   // ==== end MIRROR ====
   // Recipe-rating key for a selection: every dim that shapes the command, i.e.
-  // the match dims plus the overlay dims whose row is showing (an overlay such
+  // the match dims plus the overlay dims whose pick applies (an overlay such
   // as speculative decoding changes the command, so its on and off states are
-  // rated apart). These ids are the ratings' storage keys: renaming hw, a
-  // dim, or an option id (or moving the page) starts its recipes from zero.
-  // docs/scripts/export_rating_ids.mjs lists every reachable key.
-  const ratingKey = (sel) =>
-    [...DIMENSIONS, ...overlayDimSpecs.filter((d) => rowVisible(d, sel)).map((d) => d.id)]
+  // rated apart). Same test as overlayPick: a visible row holding a disabled
+  // pick (every option disabled on this hardware) adds nothing to the command,
+  // so it stays out of the key. These ids are the ratings' storage keys:
+  // renaming hw, a dim, or an option id (or moving the page) starts its
+  // recipes from zero. docs/scripts/export_rating_ids.mjs lists every
+  // reachable key.
+  const ratingKey = (sel) => {
+    const applied = overlayDimSpecs.filter((spec) => {
+      if (!rowVisible(spec, sel)) return false;
+      const opt = (spec.options || []).find((o) => o.id === sel[spec.id]);
+      return !!opt && !optionDisabled(opt, sel);
+    });
+    return [...DIMENSIONS, ...applied.map((d) => d.id)]
       .map((d) => `${d}=${sel[d]}`)
       .join("&");
+  };
   // `soft` marks an option that is plausible but outside the verified matrix:
   // it stays selectable (the status badge reports verification separately),
   // where `disabled` is reserved for combinations that cannot work at all.
@@ -1581,27 +1590,33 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       ? `${ratingPath}|${ratingKey(sel)}`
       : null;
   // Fingerprint of the command the reader saw, stored with each vote so votes
-  // cast before a recipe fix can be told apart from votes cast after it.
+  // cast before a recipe fix can be told apart from votes cast after it. It
+  // hashes the whole rendered command (env, model, image, flags, PD commands)
+  // in the first run mode, with placeholders unfilled and no calculator
+  // ratio, so it depends on the recipe alone, not on the reader's inputs.
   const recipeFingerprint = (() => {
     if (!recipeId) return "";
     let h = 0x811c9dc5; // FNV-1a, 32-bit
-    const text = overlayCompose(cell.flags, sel).join("\n");
+    const text = renderCommand(cell, sel, {}, runModes[0]);
     for (let i = 0; i < text.length; i++) {
       h ^= text.charCodeAt(i);
       h = Math.imul(h, 0x01000193) >>> 0;
     }
     return h.toString(16).padStart(8, "0");
   })();
-  // {up, down, mine} from the service; null while loading or unavailable.
-  const [rating, setRating] = useState(null);
+  // {id, up, down, mine}: the service's answer, tagged with the recipe it is
+  // for. Only an answer for the current recipe is shown, and a vote reply that
+  // lands after the reader moved to another recipe neither shows nor replaces
+  // the new recipe's answer.
+  const [ratingState, setRatingState] = useState(null);
+  const rating = ratingState && ratingState.id === recipeId ? ratingState : null;
   const [ratingBusy, setRatingBusy] = useState(false);
   useEffect(() => {
-    setRating(null);
     if (!recipeId) return;
     const ctrl = new AbortController();
     fetch(`${RATINGS_ENDPOINT}?id=${encodeURIComponent(recipeId)}`, { signal: ctrl.signal })
       .then((r) => (r.ok ? r.json() : null))
-      .then((data) => { if (data) setRating(data); })
+      .then((data) => { if (data) setRatingState({ ...data, id: recipeId }); })
       .catch(() => {}); // A down rating service must never break the page.
     return () => ctrl.abort();
   }, [recipeId]);
@@ -1609,14 +1624,19 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     if (!recipeId || !rating || ratingBusy) return;
     // Clicking the active thumb again withdraws the vote.
     const next = rating.mine === vote ? "none" : vote;
+    const votedId = recipeId;
     setRatingBusy(true);
     fetch(RATINGS_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: recipeId, vote: next, fp: recipeFingerprint }),
+      body: JSON.stringify({ id: votedId, vote: next, fp: recipeFingerprint }),
     })
       .then((r) => (r.ok ? r.json() : null))
-      .then((data) => { if (data) setRating(data); })
+      // Keep an answer the page already holds for another recipe: the reader
+      // moved on while this vote was in flight.
+      .then((data) => {
+        if (data) setRatingState((prev) => (prev && prev.id !== votedId ? prev : { ...data, id: votedId }));
+      })
       .catch(() => {})
       .finally(() => setRatingBusy(false));
   };
