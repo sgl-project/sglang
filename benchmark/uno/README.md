@@ -1,5 +1,8 @@
 # UNO full-dataset math evaluation
 
+For an automated AR/linear UNO performance comparison on NPU or CUDA, see
+[PERFORMANCE.md](PERFORMANCE.md) and `run_perf.py`.
+
 `run_math_eval.py` evaluates AR, UNO, DFLASH, EAGLE, or EAGLE3 with identical
 datasets, prompts, sampling parameters, and grading. It creates an in-process
 `sgl.Engine`; there is no separate server process. Engine startup is excluded
