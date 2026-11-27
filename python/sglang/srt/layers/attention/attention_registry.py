@@ -425,10 +425,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     ), "hybrid_gdn can only be used with non-MLA models."
 
     from sglang.srt.configs.dots3 import Dots3Config
-    from sglang.srt.configs.model_config import (
-        is_minimax_sparse,
-        uses_minimax_m3_nvfp4_native_stack,
-    )
+    from sglang.srt.configs.model_config import is_minimax_sparse
 
     if isinstance(runner.model_config.hf_text_config, Dots3Config):
         return runner.model_config.hf_text_config.wrap_attention_backend(
@@ -436,21 +433,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     if is_minimax_sparse(runner.model_config.hf_config):
-        if uses_minimax_m3_nvfp4_native_stack(runner.model_config.quantization):
-            from sglang.srt.layers.attention.minimax_sparse_nvfp4_backend import (
-                MiniMaxSparseNvfp4AttnBackend,
-            )
-
-            return MiniMaxSparseNvfp4AttnBackend(runner)
-        from sglang.srt.layers.attention.minimax_sparse_backend import (
-            MiniMaxHybridAttnBackend,
-            MiniMaxSparseAttnBackend,
+        from sglang.srt.layers.attention.minimax_sparse import (
+            build_minimax_attn_backend,
         )
 
-        sparse_backend = MiniMaxSparseAttnBackend(runner)
-        return MiniMaxHybridAttnBackend(
-            full_attn_backend, sparse_backend, sparse_backend.sparse_layer_ids
-        )
+        return build_minimax_attn_backend(runner, full_attn_backend)
 
     if cfg := mambaish_config(runner.model_config):
         from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig

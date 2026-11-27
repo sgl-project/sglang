@@ -6,8 +6,8 @@ import torch
 
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
-    get_req_to_token_headroom,
-    spec_decode_alloc_lens,
+    decode_alloc_targets,
+    get_req_to_token_row_width,
 )
 from sglang.srt.runtime_context import get_schedule, get_spec, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -16,8 +16,9 @@ from sglang.test.unified_allocator_fixtures import setup_allocator_context
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-# (algorithm, num_steps, topk, num_draft_tokens)
-_SPEC_CONFIGS = [
+# (algorithm, num_steps, topk, num_draft_tokens); None is non-speculative decode.
+_DECODE_CONFIGS = [
+    (None, None, None, None),
     ("EAGLE", 3, 1, 4),
     ("EAGLE", 5, 8, 64),
     ("NGRAM", 1, 8, 16),
@@ -31,8 +32,8 @@ class TestRowHoldsDecodeAllocation(CustomTestCase):
         setup_allocator_context()
         self.addCleanup(reset_context)
 
-    def test_spec_decode_allocation_fits_the_row(self):
-        for algorithm, steps, topk, draft in _SPEC_CONFIGS:
+    def test_decode_allocation_fits_the_row(self):
+        for algorithm, steps, topk, draft in _DECODE_CONFIGS:
             for page_size in (1, 16, 64):
                 with (
                     self.subTest(
@@ -50,7 +51,6 @@ class TestRowHoldsDecodeAllocation(CustomTestCase):
                     ),
                     get_schedule().override(page_size=page_size),
                 ):
-                    headroom = get_req_to_token_headroom()
                     # A request at the context length, at every page phase of it.
                     context_lens = range(1000, 1000 + page_size)
                     reqs = [
@@ -62,18 +62,18 @@ class TestRowHoldsDecodeAllocation(CustomTestCase):
                         )
                         for context_len in context_lens
                     ]
-                    _, nxt_kv_lens, _ = spec_decode_alloc_lens(
-                        reqs, page_size=page_size
-                    )
-                    for context_len, nxt_kv_len in zip(context_lens, nxt_kv_lens):
-                        self.assertLessEqual(nxt_kv_len, context_len + headroom)
+                    _, target_lens, _ = decode_alloc_targets(reqs, page_size=page_size)
+                    for context_len, target_len in zip(context_lens, target_lens):
+                        self.assertLessEqual(
+                            target_len, get_req_to_token_row_width(context_len)
+                        )
 
 
 class TestSpecDecodeAllocationRowGuard(CustomTestCase):
     def _alloc(self, tree_cache, req_to_token, *, nxt_kv_len: int, num_needed: int):
         alloc_for_spec_decode(
             tree_cache,
-            SimpleNamespace(req_to_token=req_to_token),
+            SimpleNamespace(req_to_token=req_to_token, row_width=req_to_token.shape[1]),
             reqs=[SimpleNamespace(kv=MagicMock())],
             req_pool_indices=torch.tensor([0]),
             cur_kv_lens=torch.tensor([0]),

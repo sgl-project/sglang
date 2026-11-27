@@ -666,7 +666,7 @@ _FUSED_TOPK_CREATED = False
 
 
 def init_dcp_fused_topk(
-    max_rows: int, topk: int, page_size: int, max_context_len: int
+    max_rows: int, topk: int, page_size: int, max_kv_len: int
 ) -> bool:
     """Collective over the DCP group; call on every rank before CUDA graph
     capture. Returns whether decode rows select and merge in one kernel."""
@@ -676,8 +676,8 @@ def init_dcp_fused_topk(
 
         _FUSED_TOPK = DcpTopKHip(page_size)
         return True
-    if max_context_len > DCP_FUSED_TOPK_MAX_CONTEXT:
-        print_info_once("DSA DCP fused top-k off: it needs context length <= 1M")
+    if max_kv_len > DCP_FUSED_TOPK_MAX_CONTEXT:
+        print_info_once("DSA DCP fused top-k off: it needs KV length <= 1M")
         return False
     if not _FUSED_TOPK_CREATED:  # one buffer per process, also when create declined
         _FUSED_TOPK_CREATED = True

@@ -62,7 +62,6 @@ class PromptEnhancementStage(PipelineStage):
         else:
             batch.prompt = enhanced
 
-        logger.debug("PE enhanced prompt: %s", batch.prompt)
         return batch
 
     def _enhance_single_prompt(

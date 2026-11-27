@@ -284,6 +284,7 @@ def _metadata_backend(req_to_token, runner_ids, bs):
         runner_ids=runner_ids,
         req_to_token=req_to_token,
         req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        max_kv_len=req_to_token.shape[1],
         token_to_kv_pool=SimpleNamespace(
             size=PAGES * PAGE, page_size=PAGE, dtype=torch.float8_e4m3fn
         ),

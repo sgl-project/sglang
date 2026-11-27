@@ -3221,6 +3221,10 @@ class MQALayer(MqaAttentionBase):
             )
             and not should_skip_mlp_all_reduce()
         )
+        if _is_gfx95_supported and not defer_all_reduce:
+            fused_o = _hip.fused_wo_b(self, o)
+            if fused_o is not None:
+                return fused_o
         o, _ = self.wo_b(
             o.flatten(1) if isinstance(o, torch.Tensor) else o,
             skip_all_reduce=defer_all_reduce,
@@ -4962,6 +4966,9 @@ class DeepseekV4ForCausalLM(
         request/KV/draft state is touched; the runner owns the autotune context."""
         if getattr(self.config, "model_type", None) != "deepseek_v41":
             return 0
+        from flashinfer.fused_moe.utils import map_to_hybrid_bucket_uncapped
+
+        num_tokens = map_to_hybrid_bucket_uncapped(num_tokens)
         seen = set()
         # The backbone excludes vision and lm_head, whose prefill shapes differ.
         for layer in self.model.modules():
@@ -5463,6 +5470,12 @@ class DeepseekV4ForCausalLM(
                 module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
+
+        if _is_gfx95_supported:
+            # only MQALayer routes wo_b through _hip.fused_wo_b
+            _hip.prepare_fused_wo_b(
+                [m.wo_b for m in self.modules() if isinstance(m, MQALayer)]
+            )
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
