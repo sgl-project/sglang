@@ -1,6 +1,5 @@
 ---
 title: FireRed-Image-Edit
-tag: NEW
 description: "Deploy FireRed-Image-Edit 1.0 and 1.1 with SGLang Diffusion for general-purpose and multi-image editing."
 metatags:
     description: "Serve FireRed-Image-Edit 1.0 and 1.1 for identity-preserving, multi-image, text-style, and photo-restoration edits with SGLang Diffusion."
