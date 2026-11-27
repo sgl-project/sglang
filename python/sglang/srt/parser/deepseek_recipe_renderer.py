@@ -13,9 +13,10 @@ from types import ModuleType
 from typing import Any, Optional, Union
 
 DEEPSEEK_RECIPE_INSTALL_HINT = (
-    "Serving DeepSeek-V4 / V4.1 requires the `deepseek-recipe` package (DeepSeek's "
-    "reference encoder and parser; wheels for Linux and macOS). Install it with "
-    "`pip install deepseek-recipe`."
+    "Serving DeepSeek-V4 / V4.1 requires the `sgl-deepseek-recipe` package "
+    "(SGLang's build of DeepSeek's reference encoder and parser; wheels for Linux "
+    "and macOS). Install it with `pip install sgl-deepseek-recipe`. Do not also "
+    "install `deepseek-recipe`: both provide the `deepseek_recipe` module."
 )
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,52 @@ def pre_normalize(body: dict[str, Any]) -> dict[str, Any]:
     if continue_final and messages and messages[-1]["role"] == "assistant":
         messages[-1]["prefix"] = True
     return request
+
+
+def loaded_tools(conversation: Any) -> list[Any]:
+    """The tools the model can call after `conversation`'s history: those it does
+    not defer and the deferred ones a system message has loaded."""
+    recipe = load_deepseek_recipe()
+    loaded = {
+        tool.name
+        for message in conversation.messages
+        if isinstance(message, recipe.SystemMessage)
+        for tool in message.tools or []
+    }
+    return [
+        tool
+        for tool in conversation.tools
+        if not tool.defer_loading or tool.name in loaded
+    ]
+
+
+def _replaced(conversation: Any, **fields: Any) -> Any:
+    """`conversation` with `fields` (messages, tools or response_schema) replaced."""
+    recipe = load_deepseek_recipe()
+    return recipe.Conversation(
+        fields.get("messages", conversation.messages),
+        thinking_mode=conversation.thinking_mode,
+        tools=fields.get("tools", conversation.tools),
+        tool_choice=conversation.tool_choice,
+        reasoning_effort=conversation.reasoning_effort,
+        response_schema=fields.get("response_schema", conversation.response_schema),
+    )
+
+
+def _with_host_settings(
+    conversation: Any, *, response_schema: Optional[dict[str, Any]]
+) -> Any:
+    """`conversation` with what recipe's Responses and Messages conversions leave
+    out: a JSON response schema, and SGLang's reading of a trailing assistant turn,
+    re-sent as a user turn."""
+    recipe = load_deepseek_recipe()
+    fields = {} if response_schema is None else {"response_schema": response_schema}
+    messages = conversation.messages
+    if messages and messages[-1].role == "assistant":
+        # recipe closes the turn and opens another; SGLang, as
+        # `_handle_last_assistant_message`, re-sends it as a user turn.
+        fields["messages"] = [*messages[:-1], recipe.UserMessage(messages[-1].content)]
+    return _replaced(conversation, **fields) if fields else conversation
 
 
 def _error_message(body: Any) -> str:
@@ -279,10 +326,7 @@ class DeepSeekRecipe:
         conversation = self.convert(body, effort_budget=effort_budget)
         prompt_ids = self.encode_conversation(conversation, effort_budget=effort_budget)
         if image_urls is not None:
-            rendered = self._encoding.render_conversation(conversation)
-            image_urls.extend(
-                source.url or source.data_url for source in rendered.image_sources
-            )
+            image_urls.extend(self.image_urls(conversation))
         if task is not None:
             prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
         return prompt_ids
@@ -334,6 +378,42 @@ class DeepSeekRecipe:
         return _declare_message_tools(
             converted.conversation, declarations, self._encoding
         )
+
+    def convert_native(
+        self,
+        protocol: str,
+        body: dict[str, Any],
+        *,
+        thinking: bool,
+        response_schema: Optional[dict[str, Any]],
+    ) -> tuple[Any, dict[str, tuple[str, str]]]:
+        """Convert a Responses or Messages request to recipe's `Conversation` in the
+        host's thinking mode, with the namespace and name each namespace member's
+        call name stands for; invalid requests raise ValueError."""
+        recipe = load_deepseek_recipe()
+        options = self._options.with_default_thinking_mode(thinking)
+        request_type = (
+            recipe.MessagesRequest
+            if protocol == "messages"
+            else recipe.ResponsesRequest
+        )
+        converted = self._converted(request_type, body, options)
+        conversation = _with_host_settings(
+            converted.conversation, response_schema=response_schema
+        )
+        return conversation, converted.namespace_tool_map or {}
+
+    def _converted(self, request_type: Any, body: dict[str, Any], options: Any) -> Any:
+        recipe = load_deepseek_recipe()
+        try:
+            return request_type({**body, "model": self.model}).convert(options)
+        except recipe.ConversionError as error:
+            raise ValueError(_error_message(error.body)) from error
+
+    def image_urls(self, conversation: Any) -> list[str]:
+        """The images of `conversation` in the order its prompt places them."""
+        rendered = self._encoding.render_conversation(conversation)
+        return [source.url or source.data_url for source in rendered.image_sources]
 
     def encode_conversation(
         self, conversation: Any, *, effort_budget: Optional[int] = None
