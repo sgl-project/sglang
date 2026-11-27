@@ -24,6 +24,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _ClosingStreamingResponse(StreamingResponse):
+    """Close the body iterator however streaming ends.
+
+    Starlette leaves the iterator suspended when a send fails, and on ASGI
+    spec >= 2.4 it also skips the background task, so nothing would abort the
+    request until the generator is garbage collected.
+    """
+
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            await self.body_iterator.aclose()
+
+
 # Base class for specific endpoint handlers
 class OpenAIServingBase(ABC):
     """Abstract base class for OpenAI endpoint handlers"""

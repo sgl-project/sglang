@@ -19,7 +19,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     SglExt,
     convert_json_schema_to_str,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    _ClosingStreamingResponse,
+)
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
@@ -212,11 +215,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         async def prepend_first_chunk():
-            yield first_chunk
-            async for chunk in generator:
-                yield chunk
+            try:
+                yield first_chunk
+                async for chunk in generator:
+                    yield chunk
+            finally:
+                await generator.aclose()
 
-        return StreamingResponse(
+        return _ClosingStreamingResponse(
             prepend_first_chunk(),
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
@@ -247,15 +253,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
         spec_tokens_details = {}
 
         stream_started = False
+        stream = self.tokenizer_manager.generate_request(adapted_request, raw_request)
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
                 get_serving().stream_response_default_include_usage,
             )
 
-            async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ):
+            async for content in stream:
                 index = content.get("index", 0)
 
                 text = content["text"]
@@ -500,6 +505,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        finally:
+            # Closing generate_request runs its cleanup, which aborts the
+            # request only while this request still owns its rid.
+            await stream.aclose()
 
         yield "data: [DONE]\n\n"
 
