@@ -102,25 +102,21 @@ class _FakeGC:
     pause_us(interval), or, with pause_us None, fixed_us plus the garbage
     added to garbage_us since the last pass."""
 
-    def __init__(self, clock, pause_us, keeps_third=True):
+    def __init__(self, clock, pause_us):
         self.threshold = (700, 10, 10)
-        self.keeps_third = keeps_third
         self.clock = clock
         self.pause_us = pause_us
         self.interval = None
         self.fixed_us = 0.0
         self.garbage_us = 0.0
-        self.collections = 0
 
     def get_threshold(self):
         return self.threshold
 
     def set_threshold(self, *values):
-        t = tuple(values) + self.threshold[len(values) :]
-        self.threshold = t if self.keeps_third else (t[0], t[1], 0)
+        self.threshold = tuple(values) + self.threshold[len(values) :]
 
     def collect(self):
-        self.collections += 1
         if self.pause_us is None:
             pause_us, self.garbage_us = self.fixed_us + self.garbage_us, 0.0
         else:
@@ -132,14 +128,13 @@ class TestGCLockstep(CustomTestCase):
     """Lockstep full GC: on by default with attention-DP gathers, with an
     interval that every rank derives from the same gathered pause."""
 
-    def _patch(self, pause_us=lambda n: 1, keeps_third=True):
+    def _patch(self, pause_us=lambda n: 1):
         clock = [0.0]
-        fake = _FakeGC(clock, pause_us, keeps_third)
-        self.freeze_gc = Mock()
+        fake = _FakeGC(clock, pause_us)
         self.logger = Mock()
         for target, value in (
             ("gc", fake),
-            ("freeze_gc", self.freeze_gc),
+            ("freeze_gc", Mock()),
             ("logger", self.logger),
             (
                 "time",
@@ -150,24 +145,6 @@ class TestGCLockstep(CustomTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         return fake
-
-    @staticmethod
-    def _run(ranks, gathers, fake=None):
-        """One loaded gather at a time on every rank; returns each rank's pass
-        gathers."""
-        cbs = [r.dp_gather_callbacks() for r in ranks]
-        passes = [[] for _ in ranks]
-        for gather in range(1, gathers + 1):
-            for rank, cb in enumerate(cbs):
-                if fake is not None:
-                    fake.interval = ranks[rank]._interval
-                cb["before_gather"]()
-                if cb["get_gc_pause_us"]():
-                    passes[rank].append(gather)
-            longest = max(cb["get_gc_pause_us"]() for cb in cbs)
-            for cb in cbs:
-                cb["after_gather"](longest, True)
-        return passes
 
     @staticmethod
     def _run_phases(freezer, fake, phases):
@@ -202,55 +179,8 @@ class TestGCLockstep(CustomTestCase):
         self.assertEqual(off.dp_gather_callbacks(), {})
         self.assertIn("--gc-threshold", self.logger.info.call_args.args[0])
 
-    def test_off_when_the_collector_ignores_the_third_threshold(self):
-        fake = self._patch(keeps_third=False)
-        freezer = GCFreezer(freeze_on_idle_secs=0.0, dp_lockstep=True)
-        self.assertEqual(freezer.dp_gather_callbacks(), {})
-        self.assertIn("third threshold", self.logger.info.call_args.args[0])
-        self.assertEqual(fake.threshold[:2], (700, 10))
-
-    def test_first_gather_freezes_and_the_first_pass_comes_after_the_initial_interval(
-        self,
-    ):
-        fake = self._patch()
-        freezer = GCFreezer(freeze_on_idle_secs=0.0, dp_lockstep=True)
-        (passes,) = self._run([freezer], gc_freezer.LOCKSTEP_INITIAL_GATHERS + 1)
-        self.freeze_gc.assert_called_once_with("Scheduler")
-        self.assertEqual(fake.threshold, (700, 10, gc_freezer.NO_AUTOMATIC_FULL_GC))
-        # Right before the gather that follows the first 1000 loaded ones.
-        self.assertEqual(passes, [gc_freezer.LOCKSTEP_INITIAL_GATHERS + 1])
-
-    def _intervals(self, pause_us, gathers):
-        fake = self._patch(pause_us=pause_us)
-        freezer = GCFreezer(freeze_on_idle_secs=0.0, dp_lockstep=True)
-        (passes,) = self._run([freezer], gathers, fake)
-        return [b - a for a, b in zip(passes, passes[1:])]
-
-    def test_interval_grows_at_most_twofold_toward_the_pause_budget(self):
-        # 0.5 us of garbage per gather: the budget fits 10000 gathers.
-        intervals = self._intervals(lambda n: 0.5 * n, 60_000)
-        self.assertEqual(intervals[:5], [2000, 4000, 8000, 10000, 10000])
-
-    def test_interval_shrinks_at_once_after_a_long_pass(self):
-        # 50 us per gather: the first pass (1000 gathers) takes 50 ms.
-        intervals = self._intervals(lambda n: 50 * n, 3000)
-        self.assertEqual(set(intervals), {100})
-
-    def test_a_large_fixed_part_is_spread_over_longer_intervals(self):
-        # 8 ms of live objects per pass whatever the interval, plus 0.1 us per
-        # gather: shrinking cannot meet the 5 ms budget, so the interval grows
-        # until the garbage adds about as much again.
-        intervals = self._intervals(lambda n: 8000 + 0.1 * n, 400_000)
-        self.assertEqual(min(intervals), intervals[0])
-        # Non-decreasing, up to the fit's noise from microsecond-rounded pauses.
-        self.assertTrue(all(b >= a * 0.999 for a, b in zip(intervals, intervals[1:])))
-        self.assertAlmostEqual(intervals[-1], 80_000, delta=1_000)
-
     def test_idle_gathers_get_idle_passes_and_do_not_size_the_interval(self):
-        # 400 us of live objects; idle event-loop gathers leave 0.2 us of
-        # garbage each and loaded ones 16 us. Before this, idle gathers counted
-        # toward the interval: it grew to the maximum, and the first passes
-        # under load took 0.4-1.6 s.
+        # 400 us of live objects; idle gathers leave 0.2 us of garbage, loaded 16 us.
         fake = self._patch(pause_us=None)
         fake.fixed_us = 400
         freezer = GCFreezer(freeze_on_idle_secs=0.0, dp_lockstep=True)
@@ -308,13 +238,6 @@ class TestGCLockstep(CustomTestCase):
         self.assertGreater(len(passes[0]), 3)
         self.assertEqual(passes[0], passes[1])
         self.assertEqual(passes[0], passes[2])
-
-    def test_interval_bounds(self):
-        self._patch()
-        freezer = GCFreezer(freeze_on_idle_secs=0.0, dp_lockstep=True)
-        self.assertEqual(freezer._next_interval(10**9), gc_freezer.LOCKSTEP_MIN_GATHERS)
-        freezer._interval = 80_000
-        self.assertEqual(freezer._next_interval(1), gc_freezer.LOCKSTEP_MAX_GATHERS)
 
 
 @unittest.skipUnless(

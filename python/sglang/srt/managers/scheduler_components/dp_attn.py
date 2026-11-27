@@ -584,15 +584,8 @@ class DPDrainColumn:
 
 
 class DPGCPauseColumn:
-    """Carries each rank's lockstep GC pause through the MLP-sync gather.
-
-    ``local`` is how long (in microseconds, at least 1) the full collection this
-    rank ran right before the gather took, or 0 if it ran none. Whenever the
-    gather produced metadata, ``max`` receives the longest pause across every
-    rank and ``any_tokens`` whether any rank has tokens in this gather, so every
-    rank counts the same loaded gathers and sizes its next lockstep interval
-    from the same values (see GCFreezer).
-    """
+    """This rank's pause in us; after the gather, the longest pause and whether
+    any rank has tokens, the same on every rank."""
 
     __slots__ = ("local", "max", "any_tokens")
 
@@ -847,10 +840,6 @@ class SchedulerDPAttnAdapter:
     # iteration (see DPDrainColumn).
     get_drain_state: Callable[[], int] = lambda: 0
     on_drain_rows: Optional[Callable[[list[int]], None]] = None
-    # Lockstep GC (see GCFreezer and DPGCPauseColumn): runs before every
-    # gather; then this rank's pause; then, after each gather with metadata,
-    # the longest pause across ranks and whether any rank has tokens (the same
-    # on every rank).
     before_gather: Optional[Callable[[], None]] = None
     get_gc_pause_us: Callable[[], int] = lambda: 0
     after_gather: Optional[Callable[[int, bool], None]] = None
