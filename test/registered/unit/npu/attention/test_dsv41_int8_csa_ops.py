@@ -22,13 +22,11 @@ class TestInt8CsaOps(unittest.TestCase):
             dsv41_int8_ops.write_int8_csa_rows(cache, slots, latent)
 
         dest, rows, valid_slots = writer.call_args.args
-        self.assertEqual(dest.dtype, torch.uint8)
+        self.assertIs(dest, cache)
         self.assertEqual(dest.data_ptr(), cache.data_ptr())
         self.assertEqual(dest.stride(), cache.stride())
         self.assertEqual(rows.shape, (6, 512))
         self.assertEqual(valid_slots.tolist(), [-1, -1, -1, 4, 11, -1])
-        self.assertEqual(writer.call_args.kwargs["quant_group_size"], 64)
-        self.assertEqual(writer.call_args.kwargs["quant_mode"], "int8_bf16")
 
     def test_empty_writer_does_not_load_the_native_ops(self):
         with patch.object(dsv41_int8_ops, "int8_csa_ops") as ops:
@@ -37,7 +35,7 @@ class TestInt8CsaOps(unittest.TestCase):
             )
         ops.assert_not_called()
 
-    def test_native_mode_and_rope_dimensions(self):
+    def test_attention_and_metadata_delegate_to_kernel_package(self):
         metadata, attention = Mock(), Mock()
         q = torch.empty((1, 1, 512), dtype=torch.bfloat16)
         with patch.object(
@@ -45,7 +43,5 @@ class TestInt8CsaOps(unittest.TestCase):
         ):
             dsv41_int8_ops.int8_csa_metadata(1, 1, 512, cmp_ratio=2)
             dsv41_int8_ops.int8_csa_attention(q, cmp_ratio=2)
-        metadata.assert_called_once_with(1, 1, 512, 1, rope_head_dim=64, cmp_ratio=2)
-        attention.assert_called_once_with(
-            q, 1, rope_head_dim=64, topk_value_mode=1, cmp_ratio=2
-        )
+        metadata.assert_called_once_with(1, 1, 512, cmp_ratio=2)
+        attention.assert_called_once_with(q, cmp_ratio=2)

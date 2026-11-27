@@ -1,7 +1,6 @@
 """Native CANN bindings for the DeepSeek-V4.1 A3 signed INT8 CSA cache."""
 
 from functools import cache
-from importlib import import_module
 from math import isclose
 
 import torch
@@ -10,18 +9,17 @@ import torch
 @cache
 def int8_csa_ops():
     try:
-        import_module("cann_ops_transformer")
-        ops = torch.ops.cann_ops_transformer
-        return (
-            ops.kv_compress_epilog,
-            ops.mixed_quant_sparse_flash_mla_metadata,
-            ops.mixed_quant_sparse_flash_mla,
+        from sgl_kernel_npu.operators.attention.int8_csa import (
+            int8_csa_attention,
+            int8_csa_metadata,
+            int8_csa_write,
         )
-    except (ImportError, AttributeError) as exc:
+    except ImportError as exc:
         raise RuntimeError(
-            "DeepSeek-V4.1 INT8 KV requires the CANN arch22 INT8 KvCompressEpilog, "
-            "MixedQuantSparseFlashMla and MixedQuantSparseFlashMlaMetadata package."
+            "DeepSeek-V4.1 INT8 KV requires sgl-kernel-npu with the "
+            "ops_transformer_int8_csa profile."
         ) from exc
+    return int8_csa_write, int8_csa_metadata, int8_csa_attention
 
 
 @cache
@@ -94,7 +92,7 @@ def check_int8_csa_support(device):
     except (ImportError, AttributeError, RuntimeError, ValueError) as exc:
         raise RuntimeError(
             f"DeepSeek-V4.1 INT8 KV failed the native CANN probe on {soc_name}. "
-            "Install a matching arch22 INT8 ops-transformer vendor and Python binding."
+            "Use a matching sgl-kernel-npu wheel with the ops_transformer_int8_csa profile."
         ) from exc
 
 
@@ -110,22 +108,14 @@ def write_int8_csa_rows(cache, loc, kv):
     # Page zero is reserved in SGLang. CANN treats it as writable.
     slots = torch.where(live, slots, -1).contiguous()
     writer, _, _ = int8_csa_ops()
-    writer(
-        cache.view(torch.uint8),
-        rows,
-        slots,
-        quant_group_size=64,
-        quant_mode="int8_bf16",
-        round_scale=False,
-        x_scale=1.0,
-    )
+    writer(cache, rows, slots)
 
 
 def int8_csa_metadata(num_heads_q, num_heads_kv, head_dim, **kwargs):
     _, metadata, _ = int8_csa_ops()
-    return metadata(num_heads_q, num_heads_kv, head_dim, 1, rope_head_dim=64, **kwargs)
+    return metadata(num_heads_q, num_heads_kv, head_dim, **kwargs)
 
 
 def int8_csa_attention(q, **kwargs):
     _, _, attention = int8_csa_ops()
-    return attention(q, 1, rope_head_dim=64, topk_value_mode=1, **kwargs)
+    return attention(q, **kwargs)
