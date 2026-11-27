@@ -408,6 +408,82 @@ class TestLateReadsUseTheForwardSlots(CustomTestCase):
                             (f.working_physical.tolist(), f.track_physical.tolist()),
                         )
 
+    def test_checkpoint_hook_sees_the_compact_commit_tensors(self):
+        """A provider's checkpoint view borrows the slots, ring rows and cursors
+        the stock compact commit would write, not the live request table."""
+        accept_lens = torch.tensor([2, 1])
+        accept_index = torch.tensor([[0, 1], [2, -1]])
+        ring = torch.zeros((1, 8, 4, 2))
+        spec_state = SimpleNamespace(
+            temporal=ring,
+            conv=[ring],
+            intermediate_conv_window=[ring],
+            **{
+                f"replayssm_{name}": ring
+                for name in ("d", "k", "g", "rawv", "rawk", "beta")
+            },
+        )
+        for graph in self._cases():
+            f = _Forward(mode=ForwardMode.TARGET_VERIFY, graph=graph)
+            ring_rows = torch.tensor([5, 6], dtype=torch.int32)
+            f.backend.forward_metadata.replayssm_ring_indices = ring_rows
+            mamba_pool = SimpleNamespace(
+                replayssm_cache_base=torch.zeros(8, dtype=torch.int32),
+                replayssm_spec_write_pos=torch.zeros(8, dtype=torch.int32),
+                replayssm_is_flush=torch.zeros(8, dtype=torch.int8),
+                replayssm_request_ring=False,
+                replayssm_spec_fold=False,
+                replayssm_is_kda=False,
+                get_speculative_mamba2_params_all_layers=lambda: spec_state,
+            )
+            f.reuse_rows()
+            views = []
+            with (
+                patch.object(spec_utils, "mambaish_config", return_value=True),
+                patch.object(spec_utils, "mamba_track_grid", return_value=8),
+                patch(
+                    "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
+                    "commit_gdn_replayssm_circular"
+                ) as commit,
+                patch(
+                    "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
+                    "commit_gdn_replayssm_spec"
+                ),
+                patch(
+                    "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
+                    "fused_conv_window_scatter_with_mask"
+                ),
+                patch(_HLA + ".commit_ple_states_after_verify"),
+            ):
+                spec_utils.commit_mamba_states_after_verify(
+                    self._target_worker(f, mamba_pool),
+                    self._verify_batch(f),
+                    accept_lens,
+                    accept_index,
+                    _DRAFT_TOKENS,
+                    checkpoint_commit=lambda view: views.append(view) or True,
+                )
+            kwargs = commit.call_args.kwargs
+            self.assertTrue(kwargs["compact_commit"]())
+            (view,) = views
+            for field, arg in (
+                ("checkpoint", "checkpoint_state"),
+                ("state_indices", "state_batch_indices"),
+                ("history_indices", "replay_indices"),
+                ("history_lengths", "write_pos"),
+                ("history_offsets", "cache_base"),
+                ("fold_mask", "is_flush"),
+                ("accepted_lengths", "accept_lens"),
+                ("track_state_indices", "mamba_track_indices"),
+                ("track_steps", "mamba_steps_to_track"),
+            ):
+                self.assertIs(getattr(view, field), kwargs[arg], field)
+            self.assertEqual(view.state_indices.tolist(), f.working_physical.tolist())
+            self.assertEqual(view.history_indices.tolist(), ring_rows.tolist())
+            self.assertEqual(
+                view.track_state_indices.tolist(), f.track_physical.tolist()
+            )
+
     def test_megakernel_recurrent_commit(self):
         accept_lens = torch.tensor([2, 1])
         accept_index = torch.tensor([[0, 1], [2, -1]])

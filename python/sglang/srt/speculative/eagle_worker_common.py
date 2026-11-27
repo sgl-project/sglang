@@ -91,6 +91,7 @@ class _FallbackPostVerifyStrategy:
 
 class _FallbackRuntimeHooks:
     post_verify = _FallbackPostVerifyStrategy()
+    checkpoint_commit = None
 
 
 def stock_speculative_runtime_hooks() -> Any:
@@ -1054,6 +1055,7 @@ def run_eagle_verify(
         accept_index,
         num_draft_tokens,
         prepared_step_indices=prepared_commit_steps,
+        checkpoint_commit=speculative_runtime_hooks.checkpoint_commit,
     )
 
     if not fused_commit_outputs and not batch.forward_mode.is_idle():

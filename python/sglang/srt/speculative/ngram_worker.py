@@ -494,6 +494,7 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_lens,
                 accept_index,
                 self.draft_token_num,
+                checkpoint_commit=self._speculative_runtime_hooks.checkpoint_commit,
             )
             accept_tokens = predict[accept_index].flatten()
             next_token_ids = accept_tokens

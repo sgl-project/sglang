@@ -250,6 +250,7 @@ class EaglePostVerifyGraphs:
             slot.tokens_per_request,
             prepared_step_indices=outputs[6],
             state_slots=state_slots,
+            checkpoint_commit=self._speculative_runtime_hooks.checkpoint_commit,
         )
 
 
