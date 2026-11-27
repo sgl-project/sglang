@@ -763,64 +763,36 @@ def kv_b_lora_correction(attn_module) -> str | None:
     return "v2" if layer.lora_active else None
 
 
+_warned_lora_token_rows = False
+
+
 def check_lora_token_rows(x: torch.Tensor, batch_info: LoRABatchInfo) -> None:
-    """Refuse an activation whose rows are not the tokens the segments describe.
+    """Warn once when an activation's rows are not the tokens the segments describe.
 
     The dense LoRA kernels walk ``seg_lens`` / ``seg_indptr`` and never look at
-    ``x.shape[0]``; a caller that hands them a tensor of other rows (a cached
-    prefix, a TBO child) reads and writes past the buffers or lands the delta
-    on the wrong rows. ``expected_tokens`` is the host-side token count of the
-    eager batch; graph infos carry the captured width instead, so only eager
-    infos are checked.
+    ``x.shape[0]``, so such a caller gets the adapter delta on the wrong rows
+    (more rows) or reads and writes past the buffers (fewer rows). The known
+    case is a ``kv_b_proj`` adapter on an MHA cached-prefix prefill path that
+    the LoRA hook does not reroute (e.g. the dsa / nsa one-shot prefill). Graph infos carry the captured width and decode routing
+    infos carry no count, so only eager infos are compared.
     """
+    global _warned_lora_token_rows
     expected = batch_info.expected_tokens
-    if expected is None or batch_info.use_cuda_graph:
-        return
-    assert x.shape[0] == expected, (
-        f"LoRA kernel input has {x.shape[0]} rows but the batch metadata "
-        f"describes {expected} tokens; the adapter segments only cover the "
-        "forward batch's own tokens."
-    )
-
-
-# Prefill backends whose dispatch keeps a cached prefix on the MHA paths no
-# matter what --disable-chunked-prefix-cache says (attention_backend_handler).
-KV_B_LORA_UNSAFE_PREFILL_BACKENDS = ("dsa", "nsa", "aiter")
-
-
-def kv_b_lora_prefix_cache_error(
-    prefill_backend: Optional[str],
-    *,
-    disable_chunked_prefix_cache: bool,
-    enable_kv_cache_sharding: bool,
-    fa4_absorbed_mla: bool,
-) -> Optional[str]:
-    """Why a ``kv_b_proj`` adapter cannot serve cached prefixes here, or None.
-
-    The MHA prefix paths of DeepSeek-style attention re-project the cached
-    latent through ``kv_b_proj`` on prefix rows, and the wrapped layer runs the
-    adapter kernels with the batch's extend-token segments: fewer prefix rows
-    than extend tokens read and write past the buffers, more land the delta on
-    the wrong rows. Only the absorbed MLA path adds the ``kv_b_proj`` delta per
-    token, so cached prefixes must dispatch there, which
-    ``--disable-chunked-prefix-cache`` guarantees on the backends that honor it.
-    """
-    lead = (
-        "LoRA on kv_b_proj can only serve cached prefixes through the absorbed MLA path"
-    )
-    if prefill_backend in KV_B_LORA_UNSAFE_PREFILL_BACKENDS or (
-        prefill_backend == "fa4" and not fa4_absorbed_mla
+    if (
+        _warned_lora_token_rows
+        or expected is None
+        or batch_info.use_cuda_graph
+        or x.shape[0] == expected
     ):
-        return (
-            f"{lead}, but the {prefill_backend} prefill backend keeps them on the "
-            "MHA path regardless of --disable-chunked-prefix-cache; drop kv_b_proj "
-            "from the LoRA targets or use another attention backend."
-        )
-    if enable_kv_cache_sharding:
-        return (
-            f"{lead}, which --enable-kv-cache-sharding cannot use (it requires the "
-            "chunked prefix cache); drop kv_b_proj from the LoRA targets."
-        )
-    if not disable_chunked_prefix_cache:
-        return f"{lead}; pass --disable-chunked-prefix-cache."
-    return None
+        return
+    _warned_lora_token_rows = True
+    logger.warning(
+        "LoRA kernel input has %d rows but the batch metadata describes %d "
+        "tokens; the adapter delta is applied by token segments, so these rows "
+        "get it misplaced or not at all. Known case: a kv_b_proj adapter on the "
+        "dsa/nsa one-shot prefill with a cached prefix (drop kv_b_proj from the "
+        "LoRA targets, or set SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD=0). "
+        "Reported once per process.",
+        x.shape[0],
+        expected,
+    )

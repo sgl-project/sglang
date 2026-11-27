@@ -235,6 +235,23 @@ class TestKVShardedMLADispatch(CustomTestCase):
                             AttnForwardMethod.MLA,
                         )
 
+    def test_trtllm_mla_routes_cached_prefix_to_mla_when_flag_is_set(self):
+        # The kv_b_proj LoRA rule (lora_hook.check_kv_b_lora_prefix_cache) relies
+        # on this: with the chunked prefix cache disabled, an extend with a cached
+        # prefix leaves the MHA path, a prefix-free extend keeps it.
+        self.attn.disable_chunked_prefix_cache = True
+        for prefix, expected in (
+            (64, AttnForwardMethod.MLA),
+            (0, AttnForwardMethod.MHA_CHUNKED_KV),
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    abh.handle_attention_trtllm_mla(
+                        self.attn, self._batch(prefix=prefix)
+                    ),
+                    expected,
+                )
+
     def test_trtllm_mla_keeps_chunked_mha_for_prefill(self):
         # TRTLLM has a separate dispatcher and requires prefix caching for
         # sharding; changing FA3 dispatch must not change its supported path.
