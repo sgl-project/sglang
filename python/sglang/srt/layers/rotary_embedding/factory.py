@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.bailing_mrope import BailingMRotaryEmbedding
 from sglang.srt.layers.rotary_embedding.base import (
     LinearScalingRotaryEmbedding,
@@ -27,7 +28,7 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
     Phi3LongRoPEScaledRotaryEmbedding,
 )
 from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -68,16 +69,17 @@ def _bailing_yarn_kwargs(rope_scaling: Dict[str, Any], max_position: int) -> Dic
 
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
 
 
 @functools.lru_cache(maxsize=1)
-def _aiter_rope_unsupported_arch() -> bool:
-    """aiter's rope kernels (csrc/kernels/rope/rope_common.h) depend on ck_tile
-    types that do not build on gfx1250; fall back to sglang's native rope there."""
+def _keeps_sglang_rope_modules() -> bool:
+    """gfx1250 keeps sglang's rope modules: its MLA paths read cos_sin_cache,
+    which aiter's rope modules do not have. DeepseekScalingRotaryEmbedding
+    calls the aiter rope kernel directly instead."""
     if not _is_hip:
         return False
     try:
@@ -497,7 +499,7 @@ def get_rope_wrapper(
     device: Optional[str] = None,
 ):
     if device != "cpu":
-        use_aiter_rope = _use_aiter and not _aiter_rope_unsupported_arch()
+        use_aiter_rope = _use_aiter and not _keeps_sglang_rope_modules()
         wrapper = aiter_get_rope if use_aiter_rope else get_rope
         return wrapper(
             head_size,
