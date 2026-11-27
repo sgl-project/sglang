@@ -296,14 +296,14 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         by other source nodes. The CUDA pointer-copy kernel cannot address this
         layout, and token indices must span page and slot axes together.
         """
-        if tgt_loc.numel() == 0:
-            return
         if self._hicache_k_buffer.dtype in (torch.float16, torch.bfloat16):
             from sgl_kernel_npu.operators.mem_cache import move_kv_cache_rows
 
             move_kv_cache_rows(
                 self._hicache_k_buffer, self._hicache_v_buffer, tgt_loc, src_loc
             )
+            return
+        if tgt_loc.numel() == 0:
             return
         keys = self._hicache_k_buffer.flatten(1, 2)
         values = self._hicache_v_buffer.flatten(1, 2)

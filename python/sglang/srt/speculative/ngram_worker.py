@@ -43,7 +43,6 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 
-USE_FULL_MASK = True
 # Tail of each request's context inserted into the trie once its prefill ends.
 NGRAM_EXTEND_PROMPT_WINDOW = 1024
 
@@ -323,7 +322,7 @@ class NGRAMWorker(BaseSpecWorker):
         # Pre-sync: only needs seq_lens_cpu, so build before the blocking
         # accept sync inside _prepare_draft_tokens.
         ones_masks = None
-        if USE_FULL_MASK and not _is_cpu and not _is_npu:
+        if not (_is_cpu or _is_npu):
             ones_masks = [
                 torch.ones(
                     (self.draft_token_num, batch.seq_lens_cpu[i]), device=self.device
@@ -352,7 +351,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK and not _is_cpu and not _is_npu:
+        if ones_masks is not None:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
@@ -438,7 +437,6 @@ class NGRAMWorker(BaseSpecWorker):
         self._prepare_for_speculative_decoding(batch)
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
 
-        verify_input: NgramVerifyInput = batch.spec_info
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
 
         if batch.forward_mode.is_target_verify():

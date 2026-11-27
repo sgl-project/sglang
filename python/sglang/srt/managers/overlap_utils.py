@@ -30,7 +30,7 @@ def decide_needs_cpu_seq_lens(
 
     OR over per-backend needs_cpu_seq_lens; force True under TBO (it reads the
     CPU mirror outside the backend layer to split the batch) or ngram (its
-    USE_FULL_MASK verify path reads the host mirror regardless of backend).
+    full-mask verify path reads the host mirror regardless of attention backend).
     """
     # Local import: keep overlap_utils' module-level deps leaf-only so it stays
     # importable everywhere; spec_info pulls in the spec/schedule_batch graph.
@@ -41,8 +41,8 @@ def decide_needs_cpu_seq_lens(
         return True
     algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
     if algo.is_ngram():
-        # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
-        # the tree mask, regardless of the attn backend (e.g. Triton opts out).
+        # NGRAM sizes full masks using seq_lens_cpu even when the attention
+        # backend does not ask for the CPU mirror.
         return True
     # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
     # missing flag -> True so undeclared backends stay on the legacy path.

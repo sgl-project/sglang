@@ -50,7 +50,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
 from sglang.srt.layers.dcp.layout import get_dcp_chain_spec_lens, get_dcp_lens
-from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -67,7 +67,6 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 import logging
@@ -526,12 +525,25 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_flash_mla:
             self.flash_mla_mask = self.mtp_mask.to(torch.int8)
         self.is_hybrid_swa = model_runner.is_hybrid_swa
-        if model_runner.spec_algorithm.is_ngram():
+        is_ngram = model_runner.spec_algorithm.is_ngram()
+        if is_ngram:
             unsupported = []
             if self.is_hybrid_swa or (
                 model_runner.model_config.linear_attn_registry_result is not None
             ):
                 unsupported.append("sliding-window or linear attention")
+            elif any(
+                isinstance(layer, RadixAttention)
+                and (
+                    layer.sliding_window_size != -1
+                    or layer.attn_type != AttentionType.DECODER
+                    or layer.logit_cap != 0
+                )
+                for layer in model_runner.model.modules()
+            ):
+                unsupported.append(
+                    "non-decoder, sliding-window, or logit-capped layers"
+                )
             if getattr(self.token_to_kv_pool, "index_head_dim", None) is not None:
                 unsupported.append("sparse indexed attention")
             if getattr(self, "use_alibi", False):
@@ -557,7 +569,7 @@ class AscendAttnBackend(AttentionBackend):
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
             # FIA host IntArrays consume the CPU mirror; keep it on instead of
             # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
-            if model_runner.spec_algorithm.is_ngram() or (
+            if is_ngram or (
                 self.use_fia
                 and not (
                     self.use_quant_flash_attn
@@ -3468,16 +3480,8 @@ class AscendAttnBackend(AttentionBackend):
     ):
         """Share KV preparation and FIA dispatch for MTP and NGRAM verification."""
         is_ngram = _is_ngram_verify(forward_batch.spec_info)
-        if is_ngram and (
-            layer.sliding_window_size != -1
-            or layer.attn_type != AttentionType.DECODER
-            or layer.logit_cap != 0
-            or sinks is not None
-        ):
-            raise ValueError(
-                "NGRAM on Ascend requires full decoder attention without "
-                "attention sinks or logit capping."
-            )
+        if is_ngram and sinks is not None:
+            raise ValueError("NGRAM on Ascend does not support attention sinks.")
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
