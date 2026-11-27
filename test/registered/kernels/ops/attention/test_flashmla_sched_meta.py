@@ -433,6 +433,7 @@ def _graph_backend(mode, max_bs, **attrs):
     backend.req_to_token = torch.arange(
         max_bs * 512, device="cuda", dtype=torch.int32
     ).view(max_bs, 512)
+    backend.max_kv_len = backend.req_to_token.shape[1]
     backend._arange_buf = torch.arange(max_bs * 8 + 1, device="cuda", dtype=torch.int32)
     for name, value in attrs.items():
         setattr(backend, name, value)

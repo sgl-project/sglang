@@ -36,6 +36,10 @@ on:
         required: false
         type: string
         default: ''
+      prefetch_suite_models:
+        description: 'Prefetch the model inventory overrides for an unpartitioned suite.'
+        type: boolean
+        default: false
       pre_suite_commands:
         description: 'Commands run from the repo root after install, before the suite.'
         required: false
@@ -90,7 +94,7 @@ jobs:
       # from this checkout of the workflow's own commit before any step runs PR code.
       - name: Check out the prefetch scripts
         id: prefetch_scripts
-        if: inputs.partition_plan != ''
+        if: inputs.partition_plan != '' || inputs.prefetch_suite_models
         continue-on-error: true
         uses: actions/checkout@v4
         with:
@@ -100,9 +104,17 @@ jobs:
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             .github/actions/prefetch-hf-models/
+            scripts/ci/stage_models_overrides.json
             scripts/ci/utils/prefetch_hf_models.py
             scripts/ci/utils/prefetch_policy.json
             scripts/ci/utils/prefetch_requirements.txt
+
+      - name: Read models for the unpartitioned suite
+        id: suite_models
+        if: inputs.prefetch_suite_models && steps.prefetch_scripts.outcome == 'success'
+        run: |
+          repos=$(jq -er --arg suite "$SUITE" '.by_suite[$suite] | join(" ")' .ci-prefetch/scripts/ci/stage_models_overrides.json)
+          echo "repo_ids=$repos" >> "$GITHUB_OUTPUT"
 
       - name: Prefetch Hugging Face models
         if: steps.prefetch_scripts.outcome == 'success'
@@ -111,7 +123,7 @@ jobs:
         uses: ./.ci-prefetch/.github/actions/prefetch-hf-models
         with:
           hf-token: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
-          repo-ids: ${{ join(fromJson(inputs.partition_plan).partitions[matrix.part].repo_ids, ' ') }}
+          repo-ids: ${{ inputs.partition_plan != '' && join(fromJson(inputs.partition_plan).partitions[matrix.part].repo_ids, ' ') || steps.suite_models.outputs.repo_ids }}
 
       - name: Resolve runner_config
         id: rc
@@ -123,6 +135,7 @@ jobs:
       - uses: ./.github/actions/check-pr-test-health
         with:
           independent-test-job-prefix: 'call-multimodal-gen-tests /'
+          max-quota-wait-minutes: '12'
 
       - uses: ./.github/actions/check-maintenance
 
