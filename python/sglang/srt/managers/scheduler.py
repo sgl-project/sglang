@@ -1997,90 +1997,15 @@ class Scheduler(
             f"helps."
         )
 
-    def _has_noncausal_extend_layer(self) -> bool:
-        cached = getattr(self, "_bidir_has_noncausal_layer", None)
-        if cached is not None:
-            return cached
-        model_cfg = getattr(self, "model_config", None)
-        if (
-            getattr(self, "dllm_config", None) is not None
-            or getattr(model_cfg, "is_encoder_decoder", False)
-            or getattr(getattr(model_cfg, "hf_text_config", None), "is_causal", True)
-            is False
-        ):
-            self._bidir_has_noncausal_layer = True
-            return True
-        tp_worker = getattr(self, "tp_worker", None)
-        model_runner = getattr(tp_worker, "model_runner", None)
-        model = getattr(model_runner, "model", None)
-        if model is None:
-            return False
-        from sglang.srt.layers.radix_attention import AttentionType
-
-        allow_bidir_extend = False
-        stack = [getattr(model_runner, "attn_backend", None)]
-        seen = set()
-        while stack:
-            backend = stack.pop()
-            if backend is None or isinstance(backend, str) or id(backend) in seen:
-                continue
-            seen.add(id(backend))
-            if getattr(backend, "allow_bidirectional_attention_in_extend", False):
-                allow_bidir_extend = True
-                break
-            for attr in ("prefill_backend", "full_attn_backend", "primary"):
-                inner = getattr(backend, attr, None)
-                if inner is not None and not isinstance(inner, str):
-                    stack.append(inner)
-        found = any(
-            getattr(mod, "is_cross_attention", False)
-            or getattr(mod, "attn_type", None) == AttentionType.ENCODER_ONLY
-            or (
-                allow_bidir_extend
-                and getattr(mod, "attn_type", None)
-                == AttentionType.DECODER_BIDIRECTIONAL
-            )
-            for mod in model.modules()
-        )
-        self._bidir_has_noncausal_layer = found
-        return found
-
     def _validate_bidir_prompt_cut(self, req: Req) -> Optional[str]:
         if req.bidir_prefix_len < 0:
             return None
         # Window pools (a speculative draft's too) price a re-prefill by its chunk,
         # so the largest cut that fits after a retraction can split the prompt.
-        model_cfg = getattr(self, "model_config", None)
-        if (
-            self.token_to_kv_pool_allocator.window_pool_names()
-            or (getattr(model_cfg, "sliding_window_size", None) or -1) > 0
-        ):
+        if self.token_to_kv_pool_allocator.window_pool_names():
             return (
                 "bidir_prefix_len cannot run with sliding-window KV pools "
-                "or sliding-window models (the model's or a speculative draft's)."
-            )
-        if self._has_noncausal_extend_layer():
-            return "bidir_prefix_len requires causal attention layers."
-        tree_cache = getattr(self, "tree_cache", None)
-        if tree_cache is not None and not getattr(tree_cache, "disable", False):
-            if getattr(tree_cache, "is_eagle", False) or getattr(
-                getattr(tree_cache, "tree_core", None), "is_eagle", False
-            ):
-                return (
-                    "bidir_prefix_len cannot run with bigram speculative radix "
-                    "caching (EAGLE, EAGLE3, or NEXTN on non-SSM models)."
-                )
-            if type(tree_cache).__name__ == "FlexKVRadixCache":
-                return "bidir_prefix_len cannot run with FlexKV external storage."
-        prompt_len = len(req.origin_input_ids)
-        chunk = getattr(self, "chunked_prefill_size", None)
-        if req.bidir_prefix_len > prompt_len or (
-            chunk is not None and 0 < chunk < prompt_len
-        ):
-            return (
-                f"bidir_prefix_len ({req.bidir_prefix_len}) must lie within "
-                f"the prompt ({prompt_len} tokens), and the prompt must fit "
-                f"in --chunked-prefill-size ({chunk}), got {prompt_len}."
+                "(the model's or a speculative draft's)."
             )
         align = self.truncation_align_size
         if align is None:
@@ -3509,12 +3434,6 @@ class Scheduler(
                 recv_req.input_ids = array("q", [1]) * seq_length
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
-            raw_bidir = getattr(recv_req, "bidir_prefix_len", None)
-            bidir_kwargs = (
-                {}
-                if raw_bidir is None or (type(raw_bidir) is int and raw_bidir == -1)
-                else {"bidir_prefix_len": raw_bidir}
-            )
             req = self._create_generation_req(
                 recv_req,
                 recv_req.rid,
@@ -3534,6 +3453,7 @@ class Scheduler(
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
                 custom_logit_processor=recv_req.custom_logit_processor,
+                bidir_prefix_len=recv_req.bidir_prefix_len,
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
@@ -3563,7 +3483,6 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
                 token_indices_to_pool=recv_req.token_indices_to_pool,
                 filler_seed=recv_req.filler_seed,
-                **bidir_kwargs,
             )
             req.tokenizer = self.tokenizer
 
@@ -3788,7 +3707,6 @@ class Scheduler(
                 req.origin_input_ids = duplicate_pad_mm_input_ids(
                     req.origin_input_ids, image_inputs, self.pad_input_ids_func
                 )
-            req.refresh_bidir_extra_key()
             req.extend_image_inputs(image_inputs)
             # the request now owns cleanup, including rejection after padding
             mm_cleanup.pop_all()

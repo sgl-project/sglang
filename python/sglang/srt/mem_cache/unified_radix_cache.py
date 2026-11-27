@@ -1662,10 +1662,6 @@ class UnifiedRadixCache(BasePrefixCache):
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished()
-        if req.bidir_prefix_len >= 0:
-            up_to = min(up_to, req.bidir_prefix_len)
-            if not is_finished and up_to <= req.kv.cache_protected_len:
-                return
         token_ids = req.full_untruncated_fill_ids[:up_to]
 
         if self.disable:

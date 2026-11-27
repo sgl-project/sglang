@@ -373,7 +373,6 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
                         mamba_last_track_seqlen=8, mamba_pool_idx=owned[0]
                     ),
                     lock=None,
-                    bidir_prefix_len=-1,
                 )
                 params = InsertParams()
 

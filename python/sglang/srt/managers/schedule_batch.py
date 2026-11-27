@@ -449,16 +449,10 @@ def _causal_extra_key(extra_key: Optional[str]) -> Optional[str]:
 
 
 def _raw_causal_extra_key(extra_key: Optional[str]) -> Optional[str]:
-    # Invert _causal_extra_key to recover the original causal caller key.
+    # Invert _causal_extra_key to recover the caller's causal key.
     if extra_key is not None and extra_key.startswith("bidir-bidir"):
-        return extra_key[6:]
+        return extra_key[len("bidir-") :]
     return extra_key
-
-
-def _bidir_state_hash(origin_input_ids: array[int], bidir_prefix_len: int) -> str:
-    return hashlib.sha256(
-        array("q", origin_input_ids[:bidir_prefix_len]).tobytes()
-    ).hexdigest()
 
 
 class Req(ReqDllmMixin):
@@ -520,7 +514,7 @@ class Req(ReqDllmMixin):
         cache_salt: Optional[str] = None,
         filler_seed: Optional[int] = None,
         *,
-        bidir_prefix_len: Optional[int] = -1,
+        bidir_prefix_len: int = -1,
     ):
         # Input and output info
         self.rid = rid
@@ -554,8 +548,6 @@ class Req(ReqDllmMixin):
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
         self.token_indices_to_pool = token_indices_to_pool
-        if bidir_prefix_len is None:
-            bidir_prefix_len = -1
         self.bidir_prefix_len = bidir_prefix_len
         self.decision_layout = decision_layout
 
@@ -621,7 +613,9 @@ class Req(ReqDllmMixin):
 
         if bidir_prefix_len >= 0:
             # State KV depends on the whole state block: states never share radix nodes.
-            state_hash = _bidir_state_hash(origin_input_ids, bidir_prefix_len)
+            state_hash = hashlib.sha256(
+                array("q", origin_input_ids[:bidir_prefix_len]).tobytes()
+            ).hexdigest()
             caller_key = extra_key or ""
             extra_key = f"bidir{state_hash}|{len(caller_key)}|{caller_key}"
         else:
@@ -1761,22 +1755,6 @@ class Req(ReqDllmMixin):
         self.logprob_start_len = -1
         self.routed_experts_start_len = 0
         self.request_finish(FINISH_ABORT(error_msg, status_code, err_type))
-
-    def refresh_bidir_extra_key(self) -> None:
-        if self.bidir_prefix_len < 0:
-            return
-        state_hash = _bidir_state_hash(self.origin_input_ids, self.bidir_prefix_len)
-        if (
-            self.extra_key
-            and self.extra_key.startswith("bidir")
-            and not self.extra_key.startswith("bidir-")
-        ):
-            parts = self.extra_key.split("|", 2)
-            if len(parts) == 3 and parts[1].isdigit():
-                self.extra_key = f"bidir{state_hash}|{parts[1]}|{parts[2]}"
-                return
-        caller_key = self.extra_key or ""
-        self.extra_key = f"bidir{state_hash}|{len(caller_key)}|{caller_key}"
 
     def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:

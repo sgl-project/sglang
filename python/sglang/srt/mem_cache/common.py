@@ -139,13 +139,6 @@ def _req_radix_key(
     # bounded replay); cap the match so the window is re-prefilled.
     reprefill_tail = tree_cache.window_reprefill_tail_tokens(req)
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
-    if req.bidir_prefix_len >= 0:
-        bidir_cap = (
-            0
-            if getattr(req, "positional_embed_overrides", None) is not None
-            else req.bidir_prefix_len
-        )
-        key_limit = bidir_cap if key_limit is None else min(key_limit, bidir_cap)
     if max_prefix_len is not None:
         key_limit = (
             max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
@@ -205,15 +198,11 @@ def match_kv_cache(
             req=req,
         )
     )
-    if envs.SGLANG_RADIX_FORCE_MISS.get() and tree_cache.supports_prefix_sharing():
+    if envs.SGLANG_RADIX_FORCE_MISS.get():
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key
-        )._replace(mamba_branching_seqlen=None, cache_protected_len=None)
-        if getattr(req.kv, "mamba_cow_src_index", None) is not None:
-            req.kv.mamba_cow_src_index = None
-        if getattr(req.kv, "holds_mamba", False):
-            req.kv.mamba_needs_clear = True
-    if req.bidir_prefix_len >= 0 and tree_cache.supports_prefix_sharing():
+        )
+    if req.bidir_prefix_len >= 0:
         # The state block attends to itself in full, so a partial match is a miss.
         state_hit = match_result.full_kv_hit_length or match_result.device_prefix_len
         if 0 < state_hit < req.bidir_prefix_len:

@@ -50,7 +50,8 @@ _LORA_ID_LEN = 32
 
 
 def _normalize_lora_extra_key(extra_key: Optional[str]) -> Optional[str]:
-    """Drop the per-state bidir header so LoRA lookup stays bounded."""
+    # A bidir namespace is "bidir<digest>|<len>|<caller key>";
+    # one entry per caller key keeps the table bounded across states.
     if (
         not extra_key
         or not extra_key.startswith("bidir")
@@ -58,18 +59,7 @@ def _normalize_lora_extra_key(extra_key: Optional[str]) -> Optional[str]:
     ):
         return extra_key
     parts = extra_key.split("|", 2)
-    if len(parts) == 3 and parts[1].isdigit():
-        return parts[2]
-    return extra_key
-
-
-def _extract_adapter_id_suffix(extra_key: str) -> str:
-    if extra_key.startswith("bidir") and not extra_key.startswith("bidir-"):
-        parts = extra_key.split("|", 2)
-        if len(parts) == 3 and parts[1].isdigit():
-            caller_key = parts[2][: int(parts[1])]
-            return caller_key[-_LORA_ID_LEN:]
-    return extra_key[-_LORA_ID_LEN:]
+    return parts[2] if len(parts) == 3 and parts[1].isdigit() else extra_key
 
 
 class LoRANameTable:
@@ -99,7 +89,7 @@ class LoRANameTable:
     def resolve(self, extra_key: Optional[str]) -> Optional[str]:
         if not extra_key:
             return None
-        return self._names.get(_extract_adapter_id_suffix(extra_key))
+        return self._names.get(extra_key[-_LORA_ID_LEN:])
 
 
 class KvEventLoraNames(LoRANameTable):
@@ -141,7 +131,7 @@ class KvEventLoraNames(LoRANameTable):
             return None
         return self._names.get(
             _normalize_lora_extra_key(extra_key)
-        ) or self._adapter_names.get(_extract_adapter_id_suffix(extra_key))
+        ) or self._adapter_names.get(extra_key[-_LORA_ID_LEN:])
 
 
 class MmRoutingLabels:

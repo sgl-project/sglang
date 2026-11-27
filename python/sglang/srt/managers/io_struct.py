@@ -23,7 +23,6 @@ instead, such as sglang.srt.utils.common.
 from __future__ import annotations
 
 import copy
-import inspect
 import logging
 import pickle
 import uuid
@@ -31,7 +30,6 @@ from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from types import MemberDescriptorType
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -435,8 +433,8 @@ class GenerateReqInput:
     kv_hints: Optional[
         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
     ] = None
-    # Block-bidirectional attention boundary for decision models (None or -1 = causal).
-    # StrictInt rejects booleans and null list entries.
+    # Block-bidirectional attention boundary for decision models; None/-1 = causal.
+    # Strict, so a JSON false or a null entry is refused, not read as 0 or causal.
     bidir_prefix_len: Optional[Union[List[StrictInt], StrictInt]] = field(
         default=None, kw_only=True
     )
@@ -680,11 +678,6 @@ class GenerateReqInput:
         self.kv_hints = (
             decode_kv_hints_envelope(self.kv_hints) if self.kv_hints else None
         )
-        if type(self) is not GenerateReqInput and isinstance(
-            inspect.getattr_static(type(self), "bidir_prefix_len", _MISSING_BIDIR_ATTR),
-            MemberDescriptorType,
-        ):
-            self._read_or_bind_bidir_prefix_len()
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -982,41 +975,20 @@ class GenerateReqInput:
             get_return_hidden_states_mode(self.return_hidden_states)
             self.return_hidden_states = [self.return_hidden_states] * num
 
-    def _read_or_bind_bidir_prefix_len(self):
-        try:
-            return self.bidir_prefix_len
-        except AttributeError as exc:
-            if _is_missing_bidir_attr_error(self, exc):
-                cls_attr = inspect.getattr_static(
-                    type(self), "bidir_prefix_len", _MISSING_BIDIR_ATTR
-                )
-                if isinstance(cls_attr, MemberDescriptorType):
-                    cls_attr.__set__(self, None)
-                    return None
-                if cls_attr is _MISSING_BIDIR_ATTR:
-                    return None
-            raise
-
     def _normalize_bidir_prefix_len(self, num):
-        value = self._read_or_bind_bidir_prefix_len()
-        if value is None:
-            return
-        if type(value) is int and value == -1:
-            self.bidir_prefix_len = None
-            return
-        if not isinstance(value, list):
-            self.bidir_prefix_len = [value] * num
+        if self.bidir_prefix_len is None:
+            self.bidir_prefix_len = [-1] * num
+        elif not isinstance(self.bidir_prefix_len, list):
+            self.bidir_prefix_len = [self.bidir_prefix_len] * num
         elif self.parallel_sample_num > 1:
             raise ValueError(
                 "Cannot use list bidir_prefix_len with parallel_sample_num > 1"
             )
-        elif len(value) != num:
+        elif len(self.bidir_prefix_len) != num:
             raise ValueError(
-                f"bidir_prefix_len has {len(value)} entries "
+                f"bidir_prefix_len has {len(self.bidir_prefix_len)} entries "
                 f"for a batch of {num} prompts"
             )
-        elif all(type(v) is int and v == -1 for v in value):
-            self.bidir_prefix_len = None
 
     def _normalize_custom_logit_processor(self, num):
         """Normalize custom logit processor for batch processing."""
@@ -1201,9 +1173,7 @@ class GenerateReqInput:
             ),
             mm_processor_kwargs=self.mm_processor_kwargs,
             bidir_prefix_len=(
-                bidir_prefix_len[i]
-                if (bidir_prefix_len := read_bidir_prefix_len(self)) is not None
-                else None
+                self.bidir_prefix_len[i] if self.bidir_prefix_len is not None else None
             ),
             positional_embed_overrides=self._get_positional_embed_overrides_item(i),
             # If `__getitem__` is called, these bootstrap fields must be lists.
@@ -1380,6 +1350,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_ids_logprob_rows: Optional[List[List[int]]] = None
     # Internal: the scheduler overwrites it on receipt; see Req.filler_seed.
     filler_seed: Optional[int] = None
+    # Block-bidirectional attention boundary; -1 = causal.
+    bidir_prefix_len: int = -1
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
@@ -1396,15 +1368,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
         self.time_stats = unwrap_from_pickle(self.time_stats)
 
 
-class BidirTokenizedGenerateReqInput(TokenizedGenerateReqInput, kw_only=True):
-    # Block-bidirectional attention boundary (-1 means causal).
-    bidir_prefix_len: int = -1
-
-
 class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized requests
     # Routing for request i is batch[i].http_worker_ipc, not http_worker_ipcs[i].
-    batch: List[Union[TokenizedGenerateReqInput, BidirTokenizedGenerateReqInput]]
+    batch: List[TokenizedGenerateReqInput]
 
     def __len__(self):
         return len(self.batch)
@@ -3013,223 +2980,11 @@ def unwrap_object_fields_from_pickle(
     return obj.map_object_fields(unpickle_values)
 
 
-_MISSING_BIDIR_ATTR = object()
-
-
-def _is_missing_bidir_attr_error(obj: Any, exc: AttributeError) -> bool:
-    if type(exc) is not AttributeError:
-        return False
-    cls = type(obj)
-    if (
-        inspect.getattr_static(cls, "__getattr__", None) is None
-        and cls.__getattribute__ is object.__getattribute__
-    ):
-        return (
-            getattr(exc, "name", None) == "bidir_prefix_len"
-            and getattr(exc, "obj", None) is obj
-        )
-    return exc.args in (
-        ("bidir_prefix_len",),
-        (f"'{cls.__name__}' object has no attribute 'bidir_prefix_len'",),
-        (
-            f"'{cls.__module__}.{cls.__name__}' object has no attribute "
-            "'bidir_prefix_len'",
-        ),
-    )
-
-
-def read_bidir_prefix_len(obj: Any) -> Any:
-    try:
-        return obj.bidir_prefix_len
-    except AttributeError as exc:
-        if _is_missing_bidir_attr_error(obj, exc):
-            cls_attr = inspect.getattr_static(
-                type(obj), "bidir_prefix_len", _MISSING_BIDIR_ATTR
-            )
-            if cls_attr is _MISSING_BIDIR_ATTR or isinstance(
-                cls_attr, MemberDescriptorType
-            ):
-                return None
-        raise
-
-
-def _msgspec_item_accepts_row(item_type: Any, row_type: Type) -> bool:
-    while isinstance(item_type, msgspec.inspect.Metadata):
-        item_type = item_type.type
-    if isinstance(item_type, msgspec.inspect.StructType):
-        return item_type.cls is row_type
-    if isinstance(item_type, msgspec.inspect.UnionType):
-        return any(_msgspec_item_accepts_row(arm, row_type) for arm in item_type.types)
-    return False
-
-
-def _batch_container_accepts_rows(field_type: Any, row_types: Sequence[Type]) -> bool:
-    while isinstance(field_type, msgspec.inspect.Metadata):
-        field_type = field_type.type
-    if isinstance(field_type, msgspec.inspect.UnionType):
-        return any(
-            _batch_container_accepts_rows(arm, row_types) for arm in field_type.types
-        )
-    if isinstance(field_type, (msgspec.inspect.ListType, msgspec.inspect.VarTupleType)):
-        count = len(row_types)
-        if field_type.min_length is not None and count < field_type.min_length:
-            return False
-        if field_type.max_length is not None and count > field_type.max_length:
-            return False
-        return all(
-            _msgspec_item_accepts_row(field_type.item_type, row_type)
-            for row_type in dict.fromkeys(row_types)
-        )
-    if isinstance(field_type, msgspec.inspect.TupleType):
-        return len(field_type.item_types) == len(row_types) and all(
-            _msgspec_item_accepts_row(arm, row_type)
-            for arm, row_type in zip(field_type.item_types, row_types)
-        )
-    return False
-
-
-def batch_type_accepts_rows(batch_type: Type, row_types: Sequence[Type]) -> bool:
-    try:
-        info = msgspec.inspect.type_info(batch_type)
-    except Exception:
-        return False
-    if not isinstance(info, msgspec.inspect.StructType):
-        return False
-    batch_field = next((f for f in info.fields if f.name == "batch"), None)
-    if batch_field is None:
-        return False
-    return _batch_container_accepts_rows(batch_field.type, row_types)
-
-
-def _batch_container_length_ranges(
-    field_type: Any, row_types: Sequence[Type]
-) -> List[str]:
-    while isinstance(field_type, msgspec.inspect.Metadata):
-        field_type = field_type.type
-    if isinstance(field_type, msgspec.inspect.UnionType):
-        ranges: List[str] = []
-        for arm in field_type.types:
-            ranges.extend(_batch_container_length_ranges(arm, row_types))
-        return ranges
-    if isinstance(field_type, (msgspec.inspect.ListType, msgspec.inspect.VarTupleType)):
-        if not all(
-            _msgspec_item_accepts_row(field_type.item_type, row_type)
-            for row_type in dict.fromkeys(row_types)
-        ):
-            return []
-        min_len = field_type.min_length
-        max_len = field_type.max_length
-        if min_len is not None and max_len is not None:
-            return [f"{min_len}" if min_len == max_len else f"{min_len}..{max_len}"]
-        if min_len is not None:
-            return [f">= {min_len}"]
-        if max_len is not None:
-            return [f"<= {max_len}"]
-        return []
-    if isinstance(field_type, msgspec.inspect.TupleType):
-        if len(field_type.item_types) != len(row_types) and all(
-            any(
-                _msgspec_item_accepts_row(arm, row_type)
-                for arm in field_type.item_types
-            )
-            for row_type in dict.fromkeys(row_types)
-        ):
-            return [f"{len(field_type.item_types)}"]
-        return []
-    return []
-
-
-def _batch_container_first_mismatch(
-    field_type: Any, row_types: Sequence[Type]
-) -> Optional[Tuple[int, Type, bool]]:
-    while isinstance(field_type, msgspec.inspect.Metadata):
-        field_type = field_type.type
-    if isinstance(field_type, msgspec.inspect.UnionType):
-        best: Optional[Tuple[int, Type, bool]] = None
-        for arm in field_type.types:
-            mismatch = _batch_container_first_mismatch(arm, row_types)
-            if mismatch is not None and (best is None or mismatch[0] > best[0]):
-                best = mismatch
-        return best
-    if isinstance(field_type, (msgspec.inspect.ListType, msgspec.inspect.VarTupleType)):
-        for idx, row_type in enumerate(row_types):
-            if not _msgspec_item_accepts_row(field_type.item_type, row_type):
-                return (idx, row_type, False)
-        return None
-    if isinstance(field_type, msgspec.inspect.TupleType):
-        if len(field_type.item_types) == len(row_types):
-            for idx, (arm, row_type) in enumerate(
-                zip(field_type.item_types, row_types)
-            ):
-                if not _msgspec_item_accepts_row(arm, row_type):
-                    declared_elsewhere = any(
-                        _msgspec_item_accepts_row(slot, row_type)
-                        for slot in field_type.item_types
-                    )
-                    return (idx, row_type, declared_elsewhere)
-            return None
-        for idx, row_type in enumerate(row_types):
-            if not any(
-                _msgspec_item_accepts_row(arm, row_type)
-                for arm in field_type.item_types
-            ):
-                return (idx, row_type, False)
-        return None
-    return None
-
-
-def describe_batch_type_rejection(batch_type: Type, row_types: Sequence[Type]) -> str:
-    batch_name = getattr(batch_type, "__name__", repr(batch_type))
-    try:
-        info = msgspec.inspect.type_info(batch_type)
-    except Exception:
-        info = None
-    if isinstance(info, msgspec.inspect.StructType):
-        batch_field = next((f for f in info.fields if f.name == "batch"), None)
-        if batch_field is not None:
-            ranges = list(
-                dict.fromkeys(
-                    _batch_container_length_ranges(batch_field.type, row_types)
-                )
-            )
-            if ranges:
-                allowed = ", ".join(ranges)
-                return (
-                    f"bidir_prefix_len batch of {len(row_types)} row(s) violates "
-                    f"batch_tokenized_generate_req_type ({batch_name}) batch "
-                    f"length bounds (allowed {allowed}) for MessagePack IPC."
-                )
-            mismatch = _batch_container_first_mismatch(batch_field.type, row_types)
-            if mismatch is not None:
-                bad_idx, bad_type, is_positional = mismatch
-                if is_positional:
-                    return (
-                        f"bidir_prefix_len row {bad_idx} ({bad_type.__name__}) "
-                        f"does not match batch_tokenized_generate_req_type "
-                        f"({batch_name}) batch slot at index {bad_idx} for "
-                        "MessagePack IPC."
-                    )
-                return (
-                    f"bidir_prefix_len with {bad_type.__name__} at row {bad_idx} "
-                    f"requires batch_tokenized_generate_req_type ({batch_name}) "
-                    "to declare that row type in its batch field and "
-                    "register both types with hook_custom_types for "
-                    "MessagePack IPC."
-                )
-    return (
-        f"bidir_prefix_len with {row_types[0].__name__} at row 0 "
-        f"requires batch_tokenized_generate_req_type ({batch_name}) "
-        "to declare that row type in its batch field and "
-        "register both types with hook_custom_types for "
-        "MessagePack IPC."
-    )
-
-
 _struct_types = tuple(
     cls
     for cls in BaseReq.__subclasses__()
     + BaseBatchReq.__subclasses__()
-    + [BidirTokenizedGenerateReqInput, PickleWrapper]
+    + [PickleWrapper]
 )
 # Primitive types that msgpack can serialize directly without PickleWrapper.
 # Do not include str here: msgspec rejects a Union containing both str and bytes

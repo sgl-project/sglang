@@ -85,7 +85,6 @@ from sglang.srt.layers.joint_schema_head import (
     parse_decision_layout,
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
-from sglang.srt.managers import io_struct as _io_struct
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import (
@@ -102,7 +101,6 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
-    BidirTokenizedGenerateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
@@ -129,7 +127,6 @@ from sglang.srt.managers.io_struct import (
     async_sock_send,
     build_flat_top_logprobs_arrays,
     flat_top_logprobs_layout,
-    read_bidir_prefix_len,
     row_output_ids,
     sock_send,
     unwrap_from_pickle,
@@ -1452,7 +1449,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
-        self._validate_one_request(obj, input_ids, mm_inputs=mm_inputs)
+        self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -1489,10 +1486,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj.mm_content_hashes = normalized
 
     def _validate_one_request(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        input_ids: List[int],
-        mm_inputs: Optional[Any] = None,
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
@@ -1524,14 +1518,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate input length
         if input_token_num >= self.context_len:
             # The block boundary indexes the whole prompt: refuse, never truncate.
-            bidir_prefix_len = (
-                None
-                if isinstance(obj, EmbeddingReqInput)
-                else read_bidir_prefix_len(obj)
-            )
             if self.allow_auto_truncate and (
-                bidir_prefix_len is None
-                or (type(bidir_prefix_len) is int and bidir_prefix_len == -1)
+                isinstance(obj, EmbeddingReqInput) or obj.bidir_prefix_len in (None, -1)
             ):
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
@@ -1624,10 +1612,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
             self._validate_bidir_prefix_len(
-                obj=obj,
-                input_ids=input_ids,
-                input_token_num=input_token_num,
-                mm_inputs=mm_inputs,
+                obj=obj, input_ids=input_ids, input_token_num=input_token_num
             )
             if (
                 obj.return_sampling_mask
@@ -1651,58 +1636,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "return_sampling_mask=true."
                 )
 
-    def _resolve_bidir_tokenized_req_type(self):
-        req_type = self.tokenized_generate_req_type
-        if req_type is TokenizedGenerateReqInput:
-            return BidirTokenizedGenerateReqInput
-        if "bidir_prefix_len" in getattr(req_type, "__struct_fields__", ()):
-            return req_type
-        raise ValueError(
-            f"bidir_prefix_len is not supported by custom tokenized request type "
-            f"{getattr(req_type, '__name__', repr(req_type))}. "
-            "Subclass BidirTokenizedGenerateReqInput or define a bidir_prefix_len field."
-        )
-
     def _validate_bidir_prefix_len(
         self,
         *,
         obj: GenerateReqInput,
         input_ids: Optional[List[int]],
         input_token_num: int,
-        mm_inputs: Optional[Any] = None,
     ) -> None:
-        bidir_prefix_len = read_bidir_prefix_len(obj)
-        if bidir_prefix_len is None:
+        if obj.bidir_prefix_len is None:
             return
-        if type(bidir_prefix_len) is not int or bidir_prefix_len < -1:
+        if type(obj.bidir_prefix_len) is not int or obj.bidir_prefix_len < -1:
             raise ValueError(
                 "bidir_prefix_len must be an integer >= -1 for each prompt; "
-                f"got {bidir_prefix_len!r}."
+                f"got {obj.bidir_prefix_len!r}."
             )
-        if bidir_prefix_len < 0:
+        if obj.bidir_prefix_len < 0:
             return
-        self._resolve_bidir_tokenized_req_type()
         budget_ratio = get_schedule().shortest_prefill_budget_min_ratio
-        memory = get_memory()
-        has_sliding_window = (
-            self.model_config.is_hybrid_swa
-            or (getattr(self.model_config, "sliding_window_size", None) or -1) > 0
-        )
-        is_noncausal_model = (
-            getattr(self.model_config, "is_encoder_decoder", False)
-            or getattr(
-                getattr(self.model_config, "hf_text_config", None), "is_causal", True
-            )
-            is False
-            or get_exec().dllm.dllm_algorithm is not None
-        )
         if (
             attention_backends()[0] != "triton"
             or get_schedule().page_size != 1
-            or has_sliding_window
-            or is_noncausal_model
-            or memory.enable_flexkv
-            or memory.radix_cache_backend == "flexkv"
+            # Hybrid SWA window pools price and cut a prompt by its chunks,
+            # never validated with block boundaries.
+            or self.model_config.is_hybrid_swa
             or get_exec().deterministic.enable_deterministic_inference
             or get_parallel().attn_dcp_size > 1
             # Two-batch overlap cannot split the block boundaries.
@@ -1716,9 +1672,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             raise ValueError(
                 "bidir_prefix_len requires --attention-backend triton with "
-                "--page-size 1 on causal non-sliding-window models without "
-                "FlexKV, --enable-deterministic-inference, DCP, "
-                "--enable-two-batch-overlap, or a "
+                "--page-size 1 and no hybrid sliding-window (SWA) KV pools, "
+                "without --enable-deterministic-inference, DCP, "
+                "--enable-two-batch-overlap or a "
                 "--shortest-prefill-boundary-halving-chunks prefill token "
                 "budget."
             )
@@ -1726,35 +1682,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Legacy sessions prepend history, which would shift the boundary;
             # radix-native sessions (session_id) are fine.
             raise ValueError("bidir_prefix_len cannot be combined with session_params.")
-        if obj.contains_mm_input() and (
-            mm_inputs is None or getattr(mm_inputs, "input_ids", None) is None
-        ):
-            # Unexpanded multimodal token IDs arrive or are padded on the
-            # scheduler, which checks the boundary and chunk limit in
-            # _validate_bidir_prompt_cut.
-            return
-        if input_ids is not None:
-            prompt_len = len(input_ids)
-            prompt_tokens = input_token_num
-        elif obj.input_embeds is not None:
-            prompt_len = len(obj.input_embeds)
-            prompt_tokens = prompt_len + self.num_reserved_tokens
-        else:
-            prompt_len = 0
-            prompt_tokens = input_token_num
-        if obj.input_embeds is not None and prompt_tokens >= self.context_len:
+        if obj.contains_mm_input():
+            # The state digest hashes token ids before media pads are filled in.
             raise ValueError(
-                f"The input ({prompt_tokens} tokens) is longer than the "
-                f"model's context length ({self.context_len} tokens)."
+                "bidir_prefix_len cannot be combined with multimodal input."
             )
+        prompt_len = len(input_ids) if input_ids is not None else 0
         chunk = get_schedule().chunked_prefill_size
-        if bidir_prefix_len > prompt_len or (
-            chunk is not None and 0 < chunk < prompt_len
+        if obj.bidir_prefix_len > prompt_len or (
+            chunk is not None and 0 < chunk < input_token_num
         ):
             raise ValueError(
-                f"bidir_prefix_len ({bidir_prefix_len}) must lie within "
+                f"bidir_prefix_len ({obj.bidir_prefix_len}) must lie within "
                 f"the prompt ({prompt_len} tokens), and the prompt must fit "
-                f"in --chunked-prefill-size ({chunk}), got {prompt_len}."
+                f"in --chunked-prefill-size ({chunk}); got {input_token_num}."
             )
 
     def _validate_joint_schema_request(
@@ -2003,18 +1944,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     hidden_size=self.model_config.hidden_size,
                 )
 
-            bidir_prefix_len = read_bidir_prefix_len(obj)
-            bidir_kwargs = (
-                {"bidir_prefix_len": bidir_prefix_len}
-                if bidir_prefix_len is not None and bidir_prefix_len >= 0
-                else {}
-            )
-            req_type = (
-                self._resolve_bidir_tokenized_req_type()
-                if bidir_kwargs
-                else self.tokenized_generate_req_type
-            )
-            tokenized_obj = req_type(
+            tokenized_obj = self.tokenized_generate_req_type(
                 input_text=input_text,
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
@@ -2041,6 +1971,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 session_id=obj.session_id,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
+                bidir_prefix_len=(
+                    obj.bidir_prefix_len if obj.bidir_prefix_len is not None else -1
+                ),
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
@@ -2060,7 +1993,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_indices_to_pool=obj.token_indices_to_pool,
                 encoder_urls=obj.encoder_urls,
                 mm_routing_labels=obj.mm_routing_labels_by_modality(),
-                **bidir_kwargs,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -2348,20 +2280,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
                 )
             )
-            had_bidir_row = (
-                not _io_struct._USE_PICKLE_IPC
-                and bool(tokenized_objs)
-                and isinstance(tokenized_objs[0], TokenizedGenerateReqInput)
-                and any(
-                    isinstance(tokenized_obj, _io_struct.BidirTokenizedGenerateReqInput)
-                    or (
-                        (raw_bidir := getattr(tokenized_obj, "bidir_prefix_len", None))
-                        is not None
-                        and raw_bidir >= 0
-                    )
-                    for tokenized_obj in tokenized_objs
-                )
-            )
             tokenized_objs = self._drop_aborted_before_dispatch(tokenized_objs)
             if not tokenized_objs:
                 return
@@ -2380,16 +2298,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
-                batch_type = self.batch_tokenized_generate_req_type
-                if not _io_struct._USE_PICKLE_IPC and had_bidir_row:
-                    row_types = [type(obj) for obj in tokenized_objs]
-                    if not _io_struct.batch_type_accepts_rows(batch_type, row_types):
-                        raise ValueError(
-                            _io_struct.describe_batch_type_rejection(
-                                batch_type, row_types
-                            )
-                        )
-                batch_req = batch_type(batch=tokenized_objs)
+                batch_req = self.batch_tokenized_generate_req_type(batch=tokenized_objs)
             else:
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 

@@ -1675,7 +1675,6 @@ class TritonAttnBackend(AttentionBackend):
                 page_size=1,
                 extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
                 identity_kv_indices=True,
-                block_boundaries=self.forward_metadata.block_boundaries,
             )
             return output
 
@@ -1716,21 +1715,6 @@ class TritonAttnBackend(AttentionBackend):
             # Empty ragged rows are returned as output=0, LSE=-inf, so the
             # portable merge_state operation ignores them exactly.
         else:
-            block_boundaries = self.forward_metadata.block_boundaries
-            if block_boundaries is not None:
-                # This launch skips cached prefix KV, so shift boundaries into
-                # chunk-relative coordinates and deactivate post-prompt rows.
-                shift = forward_batch.extend_prefix_lens[:, None].to(
-                    block_boundaries.dtype
-                )
-                active = (block_boundaries[:, :1] >= 0) & (
-                    block_boundaries[:, 1:2] > shift
-                )
-                block_boundaries = torch.where(
-                    active,
-                    (block_boundaries - shift).clamp_min(0),
-                    block_boundaries.new_full((1, 2), -1),
-                )
             self.extend_attention_fwd(
                 q,
                 k,
@@ -1752,7 +1736,6 @@ class TritonAttnBackend(AttentionBackend):
                 skip_prefix=True,
                 page_size=1,
                 extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-                block_boundaries=block_boundaries,
             )
 
         if forward_batch.mha_return_lse:
@@ -1934,9 +1917,6 @@ class TritonAttnBackend(AttentionBackend):
             )
         ):
             causal = False
-
-        if not causal and self.forward_metadata.block_boundaries is not None:
-            raise ValueError("block_boundaries requires causal attention layers.")
 
         # Dense one-shot MLA prefill (AttnForwardMethod.MHA_ONE_SHOT): k/v were
         # up-projected out of the latent cache and span prefix + current chunk,

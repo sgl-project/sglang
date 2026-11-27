@@ -984,7 +984,6 @@ class MambaComponent(TreeComponent):
         tracked = req.kv.mamba_last_track_seqlen
         if (
             req.bidir_prefix_len != token_ids_len
-            or len(req.origin_input_ids) != token_ids_len
             or not req.is_prefill_only
             or token_ids_len % self.tree_core.page_size != 0
             or tracked is None
@@ -1012,10 +1011,6 @@ class MambaComponent(TreeComponent):
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
         else:
-            if req.bidir_prefix_len >= 0 and token_ids_len < req.kv.kv_committed_len:
-                if not is_finished:
-                    insert_params.mamba_checkpoint_deferred = True
-                return 0
             cache_len = token_ids_len
             # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
             # slot's unflushed ring depth (`write_pos`), so on request finish cap
@@ -1052,9 +1047,6 @@ class MambaComponent(TreeComponent):
             return cache_len
         else:
             if cache_len is None:
-                return 0
-            if cache_len > token_ids_len:
-                insert_params.mamba_checkpoint_deferred = True
                 return 0
             if self._defers_checkpoint(req, token_ids_len, cache_len):
                 insert_params.mamba_checkpoint_deferred = True
