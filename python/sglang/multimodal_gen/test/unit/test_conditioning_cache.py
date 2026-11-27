@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
     _DIGEST_CHUNK_BYTES,
     ConditioningCache,
     cached_conditioning,
+    cached_condition_image,
     cached_encoder_call,
     cached_vae_encode,
     invalidate_conditioning_caches,
@@ -28,6 +29,91 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
 )
+
+
+def test_decoded_reference_is_content_keyed_and_isolated(tmp_path):
+    from sglang.multimodal_gen.runtime.utils.vision import load_image
+
+    image = Image.new("RGB", (16, 16), "red")
+    path = tmp_path / "upload.png"
+    image.save(path)
+    again = tmp_path / "second-upload.png"
+    again.write_bytes(path.read_bytes())
+    cache = ConditioningCache(16 * 16 * 4)
+    with cache.scope():
+        first = cached_condition_image(str(path), load_image)
+        first.putpixel((0, 0), (0, 1, 2))
+        second = cached_condition_image(str(again), load_image)
+        assert second.tobytes() == image.tobytes()
+        assert cache.stats()["hits"] == 1
+        second.paste("black", (0, 0, 16, 16))
+        assert (
+            cached_condition_image(str(path), load_image).tobytes() == image.tobytes()
+        )
+
+        replacement = Image.new("RGB", image.size, "blue")
+        replacement.save(path)
+        assert (
+            cached_condition_image(str(path), load_image).tobytes()
+            == replacement.tobytes()
+        )
+        assert cache.stats()["evictions"] == 1
+        assert (
+            cached_condition_image(str(again), load_image).tobytes() == image.tobytes()
+        )
+        assert cache.stats()["bytes"] <= cache.max_bytes
+
+
+def test_decoded_reference_preserves_metadata_and_cache_scope(tmp_path):
+    from PIL.PngImagePlugin import PngInfo
+    from sglang.multimodal_gen.runtime.utils.vision import load_image
+
+    image = Image.new("RGB", (4, 8), "blue")
+    path = tmp_path / "upload.png"
+    info = PngInfo()
+    info.add_text("description", "edit reference")
+    image.save(path, pnginfo=info)
+    cache = ConditioningCache(4096)
+    with cache.scope():
+        loaded = cached_condition_image(str(path), load_image)
+        assert loaded.info == load_image(str(path)).info
+        assert not cache.stats()["entries"]
+
+    image.save(path)
+    with cache.scope(cross_request=False):
+        assert (
+            cached_condition_image(str(path), load_image).tobytes() == image.tobytes()
+        )
+    assert not cache.stats()["entries"]
+
+
+def test_decoded_reference_forwards_other_sources_and_refreshes(tmp_path):
+    from sglang.multimodal_gen.runtime.utils.vision import load_image
+
+    image = Image.new("RGB", (5, 6), "green")
+    png = tmp_path / "source.png"
+    image.save(png)
+    raw = png.read_bytes()
+    cache = ConditioningCache(1024)
+    with cache.scope():
+        for source in (raw, image):
+            assert (
+                cached_condition_image(source, load_image).tobytes() == image.tobytes()
+            )
+        assert cache.stats()["entries"] == 0
+        png.write_bytes(b"corrupt")
+        with pytest.raises(OSError):
+            cached_condition_image(str(png), load_image)
+        image.save(png, format="JPEG")
+        assert (
+            cached_condition_image(str(png), load_image).tobytes()
+            == load_image(str(png)).tobytes()
+        )
+        assert cache.stats()["entries"] == 0
+    png.write_bytes(raw)
+    with cache.scope(refresh=True):
+        assert cached_condition_image(str(png), load_image).tobytes() == image.tobytes()
+    assert cache.stats()["entries"] == 0
 
 
 class Encoder(EncoderTensorParallelMixin, torch.nn.Module):

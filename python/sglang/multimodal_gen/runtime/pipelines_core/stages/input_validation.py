@@ -13,6 +13,7 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.task_type import ModelTaskType, get_request_task_type
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_condition_image
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs,
 )
@@ -80,7 +81,7 @@ class InputValidationStage(PipelineStage):
         self.vae_image_processor = vae_image_processor
 
     def load_condition_image(self, image):
-        return load_image(image)
+        return cached_condition_image(image, load_image)
 
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs
