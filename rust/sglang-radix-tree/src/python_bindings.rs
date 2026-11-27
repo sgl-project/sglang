@@ -10,9 +10,9 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyAssertionError, PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use tch::{Device, Kind, Tensor};
+use tch::{Kind, Tensor};
 
-use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, ComponentType, FULL, Family, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
 use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
@@ -45,26 +45,6 @@ fn catch_native_panic<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T>
     }
 }
 
-/// Parse a torch-style device string (e.g. "cpu", "cuda", "cuda:1"); a bare
-/// "cuda" means index 0, so callers must resolve the index themselves.
-fn parse_device(device: &str) -> PyResult<Device> {
-    let device = device.to_lowercase();
-    if device == "cpu" {
-        return Ok(Device::Cpu);
-    }
-    if device == "cuda" {
-        return Ok(Device::Cuda(0));
-    }
-    if let Some(index) = device.strip_prefix("cuda:")
-        && let Ok(index) = index.parse::<usize>()
-    {
-        return Ok(Device::Cuda(index));
-    }
-    Err(PyValueError::new_err(format!(
-        "unsupported device string: {device}"
-    )))
-}
-
 /// Map a Python ComponentType value onto the Rust enum.
 fn parse_component_type(component_type: u8) -> PyResult<ComponentType> {
     match component_type {
@@ -75,6 +55,12 @@ fn parse_component_type(component_type: u8) -> PyResult<ComponentType> {
             "unknown component type: {other}"
         ))),
     }
+}
+
+/// Map a tree slot's family name onto the Rust enum.
+fn parse_family(family: &str) -> PyResult<Family> {
+    Family::parse(family)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown tree slot family: {family}")))
 }
 
 /// Map the Python EvictLayer IntFlag value onto the Rust enum.
@@ -185,61 +171,22 @@ fn cache_actions_to_py(py: Python<'_>, actions: CacheActions) -> PyResult<Py<PyL
 }
 
 /// The python PoolName string for a pool.
-fn pool_name_str(name: PoolName) -> &'static str {
+fn pool_name_str(name: &PoolName) -> &str {
     match name {
         PoolName::Kv => "kv",
         PoolName::Mamba => "mamba",
         PoolName::Swa => "swa",
-        PoolName::AuxiliarySwa => "auxiliary_swa",
-        PoolName::Indexer => "indexer",
-        PoolName::DeepseekV4C4 => "deepseek_v4_c4",
-        PoolName::DeepseekV4C4Indexer => "deepseek_v4_c4_indexer",
-        PoolName::DeepseekV4C4IndexerScale => "deepseek_v4_c4_indexer_scale",
-        PoolName::DeepseekV4C128 => "deepseek_v4_c128",
-        PoolName::DeepseekV4C1 => "deepseek_v4_c1",
-        PoolName::DeepseekV4C1Indexer => "deepseek_v4_c1_indexer",
-        PoolName::DeepseekV4C1IndexerScale => "deepseek_v4_c1_indexer_scale",
-        PoolName::DeepseekV4C2 => "deepseek_v4_c2",
-        PoolName::DeepseekV4C2Indexer => "deepseek_v4_c2_indexer",
-        PoolName::DeepseekV4C2IndexerScale => "deepseek_v4_c2_indexer_scale",
-        PoolName::DeepseekV4C4Rope => "deepseek_v4_c4_rope",
-        PoolName::DeepseekV4C128Rope => "deepseek_v4_c128_rope",
-        PoolName::DeepseekV4C4State => "deepseek_v4_c4_state",
-        PoolName::DeepseekV4C4IndexerState => "deepseek_v4_c4_indexer_state",
-        PoolName::DeepseekV4C128State => "deepseek_v4_c128_state",
-        PoolName::Draft => "draft",
-        PoolName::DraftIndexer => "draft_indexer",
-        PoolName::DraftSwa => "draft_swa",
+        PoolName::Other(name) => name,
     }
 }
 
 /// Map a python PoolName string onto the Rust enum.
-fn parse_pool_name(name: &str) -> PyResult<PoolName> {
+fn parse_pool_name(name: &str) -> PoolName {
     match name {
-        "kv" => Ok(PoolName::Kv),
-        "mamba" => Ok(PoolName::Mamba),
-        "swa" => Ok(PoolName::Swa),
-        "auxiliary_swa" => Ok(PoolName::AuxiliarySwa),
-        "indexer" => Ok(PoolName::Indexer),
-        "deepseek_v4_c4" => Ok(PoolName::DeepseekV4C4),
-        "deepseek_v4_c4_indexer" => Ok(PoolName::DeepseekV4C4Indexer),
-        "deepseek_v4_c4_indexer_scale" => Ok(PoolName::DeepseekV4C4IndexerScale),
-        "deepseek_v4_c128" => Ok(PoolName::DeepseekV4C128),
-        "deepseek_v4_c1" => Ok(PoolName::DeepseekV4C1),
-        "deepseek_v4_c1_indexer" => Ok(PoolName::DeepseekV4C1Indexer),
-        "deepseek_v4_c1_indexer_scale" => Ok(PoolName::DeepseekV4C1IndexerScale),
-        "deepseek_v4_c2" => Ok(PoolName::DeepseekV4C2),
-        "deepseek_v4_c2_indexer" => Ok(PoolName::DeepseekV4C2Indexer),
-        "deepseek_v4_c2_indexer_scale" => Ok(PoolName::DeepseekV4C2IndexerScale),
-        "deepseek_v4_c4_rope" => Ok(PoolName::DeepseekV4C4Rope),
-        "deepseek_v4_c128_rope" => Ok(PoolName::DeepseekV4C128Rope),
-        "deepseek_v4_c4_state" => Ok(PoolName::DeepseekV4C4State),
-        "deepseek_v4_c4_indexer_state" => Ok(PoolName::DeepseekV4C4IndexerState),
-        "deepseek_v4_c128_state" => Ok(PoolName::DeepseekV4C128State),
-        "draft" => Ok(PoolName::Draft),
-        "draft_indexer" => Ok(PoolName::DraftIndexer),
-        "draft_swa" => Ok(PoolName::DraftSwa),
-        other => Err(PyValueError::new_err(format!("unknown pool name: {other}"))),
+        "kv" => PoolName::Kv,
+        "mamba" => PoolName::Mamba,
+        "swa" => PoolName::Swa,
+        other => PoolName::Other(other.into()),
     }
 }
 
@@ -313,7 +260,7 @@ fn parse_hit_policy(hit_policy: &str) -> PyResult<PoolHitPolicy> {
 /// Convert a pool transfer into its boundary tuple.
 fn transfer_to_py(py: Python<'_>, transfer: PoolTransfer) -> PyResult<Py<PyAny>> {
     (
-        pool_name_str(transfer.name),
+        pool_name_str(&transfer.name),
         transfer.host_indices.map(PyTensor),
         transfer.device_indices.map(PyTensor),
         transfer.nodes_to_load,
@@ -327,7 +274,7 @@ fn transfer_to_py(py: Python<'_>, transfer: PoolTransfer) -> PyResult<Py<PyAny>>
 fn transfer_from_args(args: TransferArgs) -> PyResult<PoolTransfer> {
     let (name, host_indices, device_indices, nodes_to_load, keys, hit_policy) = args;
     Ok(PoolTransfer {
-        name: parse_pool_name(&name)?,
+        name: parse_pool_name(&name),
         host_indices: host_indices.map(|t| t.0),
         device_indices: device_indices.map(|t| t.0),
         keys,
@@ -422,39 +369,48 @@ impl TlruFloatConfigBinding {
 }
 
 /// Python-visible tree-core init params; converts into CacheInitParams.
-#[pyclass(get_all, set_all, from_py_object)]
-#[derive(Clone)]
+#[pyclass(get_all, set_all)]
 pub struct TreeCoreInitParamsBinding {
     pub eviction_policy: String,
     pub slru_protected_threshold: i64,
     pub tlru_tail_budget: usize,
     pub tlru_float_config: Option<TlruFloatConfigBinding>,
+    pub state_cost: Option<(f64, f64)>,
     pub page_size: usize,
     pub is_write_back: bool,
     pub enable_hicache: bool,
     pub write_through_threshold: i64,
-    pub device: String,
+    pub empty_device_indices: Py<PyAny>,
     pub swa_sliding_window_size: Option<usize>,
     pub swa_req_ring: bool,
     pub enable_kv_cache_events: bool,
     pub dynamo_kv_event_format: bool,
     pub mamba_cache_chunk_size: Option<usize>,
     pub mamba_max_states_per_path: Option<usize>,
+    pub mamba_host_only_checkpoint: bool,
+    pub joint_lru: bool,
 }
 
 impl TreeCoreInitParamsBinding {
     /// Convert into the tree core's construction params.
-    fn to_cache_init_params(&self) -> PyResult<CacheInitParams> {
+    fn to_cache_init_params(&self, py: Python<'_>) -> PyResult<CacheInitParams> {
+        let empty = self.empty_device_indices.bind(py).extract::<PyTensor>()?.0;
+        if empty.kind() != Kind::Int64 || empty.size() != [0] {
+            return Err(PyValueError::new_err(
+                "empty_device_indices must be an empty 1-D int64 tensor",
+            ));
+        }
         Ok(CacheInitParams {
             eviction_policy: self.eviction_policy.clone(),
             slru_protected_threshold: self.slru_protected_threshold,
             tlru_tail_budget: self.tlru_tail_budget,
             tlru_float_config: self.tlru_float_config.as_ref().map(|value| value.config),
+            state_cost: self.state_cost,
             page_size: self.page_size,
             is_write_back: self.is_write_back,
             enable_hicache: self.enable_hicache,
             write_through_threshold: self.write_through_threshold,
-            device: parse_device(&self.device)?,
+            empty_device_indices: empty,
             swa_sliding_window_size: self.swa_sliding_window_size,
             swa_req_ring: self.swa_req_ring,
             // Wired post-construction via set_has_swa_host_pool.
@@ -463,6 +419,8 @@ impl TreeCoreInitParamsBinding {
             dynamo_kv_event_format: self.dynamo_kv_event_format,
             mamba_cache_chunk_size: self.mamba_cache_chunk_size,
             mamba_max_states_per_path: self.mamba_max_states_per_path,
+            mamba_host_only_checkpoint: self.mamba_host_only_checkpoint,
+            joint_lru: self.joint_lru,
         })
     }
 }
@@ -470,14 +428,14 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false))]
+    #[pyo3(signature = (empty_device_indices, eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false, joint_lru = false, state_cost = None))]
     fn new(
+        empty_device_indices: Py<PyAny>,
         eviction_policy: String,
         page_size: usize,
         is_write_back: bool,
         enable_hicache: bool,
         write_through_threshold: i64,
-        device: String,
         swa_sliding_window_size: Option<usize>,
         enable_kv_cache_events: bool,
         mamba_cache_chunk_size: Option<usize>,
@@ -487,23 +445,29 @@ impl TreeCoreInitParamsBinding {
         tlru_tail_budget: usize,
         tlru_float_config: Option<TlruFloatConfigBinding>,
         dynamo_kv_event_format: bool,
+        mamba_host_only_checkpoint: bool,
+        joint_lru: bool,
+        state_cost: Option<(f64, f64)>,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
             slru_protected_threshold,
             tlru_tail_budget,
             tlru_float_config,
+            state_cost,
             page_size,
             is_write_back,
             enable_hicache,
             write_through_threshold,
-            device,
+            empty_device_indices,
             swa_sliding_window_size,
             swa_req_ring,
             enable_kv_cache_events,
             dynamo_kv_event_format,
             mamba_cache_chunk_size,
             mamba_max_states_per_path,
+            mamba_host_only_checkpoint,
+            joint_lru,
         }
     }
 }
@@ -546,6 +510,8 @@ pub struct InsertParamsBinding {
     pub cache_salt: Option<String>,
     pub session_id: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
+    pub mamba_host_value: Option<Py<PyAny>>,
+    pub allow_missing_mamba: bool,
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
     pub swa_branching_seqlen: Option<usize>,
@@ -557,7 +523,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None, mamba_host_value = None, allow_missing_mamba = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -573,6 +539,8 @@ impl InsertParamsBinding {
         mamba_value: Option<Py<PyAny>>,
         track_adopted_ranges: bool,
         rotation_base: Option<i64>,
+        mamba_host_value: Option<Py<PyAny>>,
+        allow_missing_mamba: bool,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
             rotation_base,
@@ -582,6 +550,8 @@ impl InsertParamsBinding {
             cache_salt,
             session_id,
             mamba_value,
+            mamba_host_value,
+            allow_missing_mamba,
             prev_prefix_len,
             swa_evicted_seqlen,
             swa_branching_seqlen,
@@ -964,7 +934,7 @@ type TreePathNodeInfoTuple = (NodeId, NodeId, usize, usize, Option<usize>, usize
 struct TreeCoreBinding<Core> {
     core: Mutex<Core>,
     /// The core's construction device, kept outside the Mutex for pre-lock validation.
-    device: Device,
+    device: Py<PyAny>,
     /// The core's page size, kept outside the Mutex for pre-lock validation.
     page_size: usize,
 }
@@ -973,20 +943,20 @@ struct TreeCoreBinding<Core> {
 macro_rules! tree_core_methods {
     ($core:ident) => {
         impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<$core<K>> {
-            /// Build a tree core for the given component types from the cache's
-            /// init params.
-            fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
-                let component_types = component_types
+            /// Build a tree core for the tree's slots (each slot's id and family)
+            /// from the cache's init params.
+            fn new(py: Python<'_>, init_params: &TreeCoreInitParamsBinding, slots: Vec<(u8, String)>) -> PyResult<Self> {
+                let slots = slots
                     .into_iter()
-                    .map(parse_component_type)
+                    .map(|(slot, family)| Ok((parse_component_type(slot)?, parse_family(&family)?)))
                     .collect::<PyResult<Vec<_>>>()?;
-                let params = init_params.to_cache_init_params()?;
-                $core::<K>::validate_init_params(&params, &component_types)
+                let params = init_params.to_cache_init_params(py)?;
+                $core::<K>::validate_init_params(&params, &slots)
                     .map_err(PyValueError::new_err)?;
-                let device = params.device;
+                let device = init_params.empty_device_indices.bind(py).getattr("device")?.unbind();
                 let page_size = params.page_size;
                 Ok(TreeCoreBinding {
-                    core: Mutex::new($core::new(params, component_types)),
+                    core: Mutex::new($core::new_with_slots(params, slots)),
                     device,
                     page_size,
                 })
@@ -1007,21 +977,29 @@ macro_rules! tree_core_methods {
                 })
             }
 
+            // tch::Device cannot represent every torch backend. Read device metadata
+            // through Python while attached, before taking the tree lock or mutating it.
+            fn validate_tensor_device(&self, py: Python<'_>, value: &Tensor) -> PyResult<()> {
+                let value = tensor_to_py(py, value.shallow_clone())?;
+                let device = value.bind(py).getattr("device")?;
+                if !device.eq(self.device.bind(py))? {
+                    return Err(PyValueError::new_err(format!(
+                        "tensor device {} does not match the tree core device {}",
+                        device, self.device.bind(py)
+                    )));
+                }
+                Ok(())
+            }
+
             /// Reject an insert value whose dtype, device, or length cannot cover the key.
-            fn validate_insert_value(&self, value: &Tensor, key_atom_len: usize) -> PyResult<()> {
+            fn validate_insert_value(&self, py: Python<'_>, value: &Tensor, key_atom_len: usize) -> PyResult<()> {
                 if value.kind() != Kind::Int64 {
                     return Err(PyValueError::new_err(format!(
                         "insert value must be an int64 tensor, got {:?}",
                         value.kind()
                     )));
                 }
-                if value.device() != self.device {
-                    return Err(PyValueError::new_err(format!(
-                        "insert value device {:?} does not match the tree core device {:?}",
-                        value.device(),
-                        self.device
-                    )));
-                }
+                self.validate_tensor_device(py, value)?;
                 let aligned_key_len = key_atom_len / self.page_size * self.page_size;
                 let value_len = value.size().first().copied().unwrap_or(0);
                 if value_len < aligned_key_len as i64 {
@@ -1098,6 +1076,7 @@ macro_rules! tree_core_methods {
                 let namespace =
                     KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
                 let swa_values = swa_values.0;
+                self.validate_tensor_device(py, &swa_values)?;
                 let actions = py
                     .detach(move || {
                         self.core().attach_swa_window(
@@ -1129,9 +1108,15 @@ macro_rules! tree_core_methods {
                 let key = key.as_ref();
                 let value: PyTensor = params.value.bind(py).extract()?;
                 // The value covers key atoms (bigram: raw len - 1), so validate the converted key.
-                self.validate_insert_value(&value.0, key.atom_len())?;
+                self.validate_insert_value(py, &value.0, key.atom_len())?;
                 let mamba_value = match &params.mamba_value {
                     Some(mamba_value) => Some(mamba_value.bind(py).extract::<PyTensor>()?.0),
+                    None => None,
+                };
+                let mamba_host_value = match &params.mamba_host_value {
+                    Some(mamba_host_value) => {
+                        Some(mamba_host_value.bind(py).extract::<PyTensor>()?.0)
+                    }
                     None => None,
                 };
                 let params = InsertParams {
@@ -1144,6 +1129,8 @@ macro_rules! tree_core_methods {
                     session_id: params.session_id.as_deref(),
                     value: value.0,
                     mamba_value,
+                    mamba_host_value,
+                    allow_missing_mamba: params.allow_missing_mamba,
                     prev_prefix_len: params.prev_prefix_len,
                     swa_evicted_seqlen: params.swa_evicted_seqlen,
                     swa_branching_seqlen: params.swa_branching_seqlen,
@@ -1167,9 +1154,15 @@ macro_rules! tree_core_methods {
                 let key = key.as_ref();
                 let value: PyTensor = params.value.bind(py).extract()?;
                 // The value covers key atoms (bigram: raw len - 1), so validate the converted key.
-                self.validate_insert_value(&value.0, key.atom_len())?;
+                self.validate_insert_value(py, &value.0, key.atom_len())?;
                 let mamba_value = match &params.mamba_value {
                     Some(mamba_value) => Some(mamba_value.bind(py).extract::<PyTensor>()?.0),
+                    None => None,
+                };
+                let mamba_host_value = match &params.mamba_host_value {
+                    Some(mamba_host_value) => {
+                        Some(mamba_host_value.bind(py).extract::<PyTensor>()?.0)
+                    }
                     None => None,
                 };
                 let params = InsertParams {
@@ -1182,6 +1175,8 @@ macro_rules! tree_core_methods {
                     session_id: params.session_id.as_deref(),
                     value: value.0,
                     mamba_value,
+                    mamba_host_value,
+                    allow_missing_mamba: params.allow_missing_mamba,
                     prev_prefix_len: params.prev_prefix_len,
                     swa_evicted_seqlen: params.swa_evicted_seqlen,
                     swa_branching_seqlen: params.swa_branching_seqlen,
@@ -1379,13 +1374,7 @@ macro_rules! tree_core_methods {
                         value.kind()
                     )));
                 }
-                if value.device() != self.device {
-                    return Err(PyValueError::new_err(format!(
-                        "component device value device {:?} does not match the tree core device {:?}",
-                        value.device(),
-                        self.device
-                    )));
-                }
+                self.validate_tensor_device(py, &value)?;
                 py.detach(|| {
                     self.core()
                         .set_component_device_value(node_id, component_type, value)
@@ -1815,6 +1804,16 @@ macro_rules! tree_core_methods {
                     .map_err(node_access_error)
             }
 
+            /// Whether an auxiliary component has device data missing from host.
+            fn needs_incremental_component_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
+                py.detach(|| self.core().needs_incremental_component_backup(node_id))
+                    .map_err(node_access_error)
+            }
+
             /// Whether the node is a (default or named) root.
             fn is_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 py.detach(|| self.core().is_root(node_id))
@@ -1904,17 +1903,16 @@ macro_rules! tree_core_methods {
                             ..InsertResult::default()
                         },
                     );
-                let pool_storage_result = pool_storage_result
-                    .map(|(kv_hit_pages, extra_pool_hit_pages)| {
-                        Ok::<_, PyErr>(PoolTransferResult {
+                let pool_storage_result =
+                    pool_storage_result.map(|(kv_hit_pages, extra_pool_hit_pages)| {
+                        PoolTransferResult {
                             kv_hit_pages,
                             extra_pool_hit_pages: extra_pool_hit_pages
                                 .into_iter()
-                                .map(|(name, pages)| Ok((parse_pool_name(&name)?, pages)))
-                                .collect::<PyResult<HashMap<_, _>>>()?,
-                        })
-                    })
-                    .transpose()?;
+                                .map(|(name, pages)| (parse_pool_name(&name), pages))
+                                .collect(),
+                        }
+                    });
                 let (cache_actions, mamba_exist) = py
                     .detach(move || {
                         let mut cache_actions = Vec::new();
@@ -1989,6 +1987,17 @@ macro_rules! tree_core_methods {
                     })
                     .map_err(node_access_error)?;
                 cache_actions_to_py(py, actions)
+            }
+
+            /// Queue a write-back victim for its demote; returns its FULL device tokens.
+            fn mark_write_back_queued(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                copied: Vec<NodeId>,
+            ) -> PyResult<usize> {
+                py.detach(|| self.core().mark_write_back_queued(node_id, copied))
+                    .map_err(node_access_error)
             }
 
             /// Release a node's device KV once its host copy exists.
@@ -2078,6 +2087,10 @@ macro_rules! tree_core_methods {
             /// Set the write-back (vs write-through) policy; decided at HiCache init.
             fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) {
                 py.detach(|| self.core().set_is_write_back(is_write_back));
+            }
+
+            fn set_mamba_path_cap_counts_host(&self, py: Python<'_>, enabled: bool) {
+                py.detach(|| self.core().set_mamba_path_cap_counts_host(enabled));
             }
 
             /// The current write-back (vs write-through) policy.
@@ -2739,13 +2752,13 @@ macro_rules! tree_core_binding {
 
         #[pymethods]
         impl $name {
-            /// Build a tree core for the given component types from the cache's
-            /// init params.
+            /// Build a tree core for the tree's slots (each slot's id and family)
+            /// from the cache's init params.
             #[new]
-            fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
+            fn new(py: Python<'_>, init_params: &TreeCoreInitParamsBinding, slots: Vec<(u8, String)>) -> PyResult<Self> {
                 catch_native_panic(|| {
                     Ok($name {
-                        inner: TreeCoreBinding::<$core<$key>>::new(init_params, component_types)?,
+                        inner: TreeCoreBinding::<$core<$key>>::new(py, init_params, slots)?,
                     })
                 })
             }
@@ -3235,6 +3248,15 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.node_backuped(py, node_id))
             }
 
+            /// Whether an auxiliary component has device data missing from host.
+            fn needs_incremental_component_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
+                catch_native_panic(|| self.inner.needs_incremental_component_backup(py, node_id))
+            }
+
             /// Whether the node is a (default or named) root.
             fn is_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 catch_native_panic(|| self.inner.is_root(py, node_id))
@@ -3361,6 +3383,16 @@ macro_rules! tree_core_binding {
                 })
             }
 
+            /// Queue a write-back victim for its demote; returns its FULL device tokens.
+            fn mark_write_back_queued(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                copied: Vec<NodeId>,
+            ) -> PyResult<usize> {
+                catch_native_panic(|| self.inner.mark_write_back_queued(py, node_id, copied))
+            }
+
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
                 catch_native_panic(|| self.inner.demote(py, node_id))
@@ -3430,6 +3462,14 @@ macro_rules! tree_core_binding {
             /// The current write-back (vs write-through) policy.
             fn is_write_back(&self, py: Python<'_>) -> PyResult<bool> {
                 catch_native_panic(|| Ok(self.inner.is_write_back(py)))
+            }
+
+            /// Make the per-path Mamba cap count and free host copies; decided at HiCache init.
+            fn set_mamba_path_cap_counts_host(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_mamba_path_cap_counts_host(py, enabled);
+                    Ok(())
+                })
             }
 
             /// Set the write-through backup hit threshold; decided at HiCache init.
@@ -3959,8 +3999,59 @@ macro_rules! tree_core_binding {
     };
 }
 
-tree_core_binding! {
-    core = UnifiedTreeCore;
+// Only UnifiedTreeCore has the joint Full/SWA eviction walk.
+impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<UnifiedTreeCore<K>> {
+    fn start_joint_eviction(&self, py: Python<'_>) {
+        py.detach(|| self.core().start_joint_eviction());
+    }
+
+    fn next_joint_eviction_victim(&self, py: Python<'_>) -> Option<(u8, NodeId)> {
+        py.detach(|| self.core().next_joint_eviction_victim())
+            .map(|(ct, node_id)| (ct as u8, node_id))
+    }
+
+    fn end_joint_eviction(&self, py: Python<'_>) {
+        py.detach(|| self.core().end_joint_eviction());
+    }
+}
+
+// Stamps the UnifiedTreeCore pyclasses, each with the joint-eviction forwarders.
+macro_rules! unified_tree_core_bindings {
+    ($($(#[$doc:meta])* $name:ident, $key:ty;)+) => {
+        tree_core_binding! {
+            core = UnifiedTreeCore;
+            $(
+            $(#[$doc])*
+            $name,
+            $key,
+            {
+                fn start_joint_eviction(&self, py: Python<'_>) -> PyResult<()> {
+                    catch_native_panic(|| {
+                        self.inner.start_joint_eviction(py);
+                        Ok(())
+                    })
+                }
+
+                fn next_joint_eviction_victim(
+                    &self,
+                    py: Python<'_>,
+                ) -> PyResult<Option<(u8, NodeId)>> {
+                    catch_native_panic(|| Ok(self.inner.next_joint_eviction_victim(py)))
+                }
+
+                fn end_joint_eviction(&self, py: Python<'_>) -> PyResult<()> {
+                    catch_native_panic(|| {
+                        self.inner.end_joint_eviction(py);
+                        Ok(())
+                    })
+                }
+            };
+            )+
+        }
+    };
+}
+
+unified_tree_core_bindings! {
     /// The UnifiedTreeCore Python adapter over single-token (unigram) child keys.
     RustUnifiedTreeCoreBinding,
     Vec<i64>;

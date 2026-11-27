@@ -65,7 +65,7 @@ class LLaDAImageTextEncoderRunner:
         )
         from sglang.srt.managers.tp_worker import TpModelWorker
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.kv.plan import TREE_TOKEN, TreeSlot
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.srt.runtime_context import SpawnRanks, create_context, use_context
         from sglang.srt.server_args import ServerArgs as SRTServerArgs
@@ -159,7 +159,7 @@ class LLaDAImageTextEncoderRunner:
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
-                    tree_components=(ComponentType.FULL,),
+                    tree_slots=(TreeSlot(component="FULL", family=TREE_TOKEN),),
                 )
             )
 
@@ -232,10 +232,8 @@ class LLaDAImageTextEncoderRunner:
         from sglang.srt.managers.schedule_batch import ScheduleBatch
         from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
         from sglang.srt.mem_cache.common import release_kv_cache
-        from sglang.srt.model_executor.forward_batch_info import (
-            ForwardBatch,
-            ForwardMode,
-        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.sampling.sampling_params import (
             SamplingParams as SRTSamplingParams,
         )

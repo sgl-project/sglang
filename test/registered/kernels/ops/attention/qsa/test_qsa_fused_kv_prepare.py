@@ -9,9 +9,11 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.mem_cache_utils import routed
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=40, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 @pytest.mark.parametrize("requests", [1, 3, 8, 128])
@@ -122,7 +124,7 @@ def test_qsa_pool_routes_to_fused_prepare(monkeypatch, width):
     )
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     storage = MHATokenToKVPool.__new__(MHATokenToKVPool)
     storage.quant_method = UnquantizedKVCacheMethod()
@@ -133,7 +135,7 @@ def test_qsa_pool_routes_to_fused_prepare(monkeypatch, width):
     pool.get_key_buffer = lambda layer_id: cache
     pool.get_value_buffer = lambda layer_id: cache.clone()
     backend = backend_module.QwenSparseAttnBackend(
-        SimpleNamespace(token_to_kv_pool=pool)
+        SimpleNamespace(token_to_kv_pool=routed(pool))
     )
     metadata = SimpleNamespace(sequence_lengths=torch.ones(width, device="cuda"))
     backend._resolve_metadata = lambda batch: metadata
@@ -325,8 +327,10 @@ def test_block_indices_expand_on_attention_fallback(monkeypatch):
     backend.qsa_profile = SimpleNamespace(block_topk=512, budget=2048)
     backend.compress_ratio = 4
     cache = torch.zeros(16, 1, 256, device="cuda", dtype=torch.bfloat16)
-    backend.token_to_kv_pool = SimpleNamespace(
-        get_key_buffer=lambda _: cache, get_value_buffer=lambda _: cache
+    backend.token_to_kv_pool = routed(
+        SimpleNamespace(
+            get_key_buffer=lambda _: cache, get_value_buffer=lambda _: cache
+        )
     )
     lengths = torch.tensor([11], device="cuda", dtype=torch.int32)
     positions = lengths - 1
@@ -425,7 +429,7 @@ def test_fused_pool_eligibility(dtype, quantized, wrapped):
     if wrapped:
         pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
         pool.full_kv_pool = storage
-    backend = QwenSparseAttnBackend(SimpleNamespace(token_to_kv_pool=pool))
+    backend = QwenSparseAttnBackend(SimpleNamespace(token_to_kv_pool=routed(pool)))
     assert backend._fused_kv_pool_eligible == (not quantized and dtype != torch.float16)
     assert not QwenSparseAttnBackend()._fused_kv_pool_eligible
     assert not QwenSparseAttnBackend(
@@ -448,7 +452,7 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
     )
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     storage = MHATokenToKVPool.__new__(MHATokenToKVPool)
     storage.dtype = torch.bfloat16
@@ -467,10 +471,10 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
     )
     table = torch.arange(64, device="cuda", dtype=torch.int32).view(1, 64)
     runner = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         device="cuda",
         is_draft_worker=False,
-        req_to_token_pool=SimpleNamespace(req_to_token=table),
+        req_to_token_pool=SimpleNamespace(req_to_token=table, row_width=64),
         model_config=SimpleNamespace(hf_config=config, context_len=64),
     )
     backend = QwenSparseAttnBackend(runner)
@@ -491,6 +495,7 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
         spec_info=SimpleNamespace(draft_token_num=width, topk=1),
         input_ids=torch.zeros(width, device="cuda", dtype=torch.int32),
         extend_seq_lens=torch.tensor([width], device="cuda", dtype=torch.int32),
+        extend_seq_lens_cpu=[width],
         _original_forward_mode=None,
         mrope_positions=None,
     )

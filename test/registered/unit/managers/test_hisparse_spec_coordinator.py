@@ -11,6 +11,7 @@ from sglang.srt.managers.hisparse_coordinator import (
     HiSparseCoordinator,
     HiSparseSpecSwapManager,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -30,8 +31,8 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
         req_to_token = torch.full((1, 16), -1, dtype=torch.int64)
         req_to_token[0, 1] = 63
-        req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
-        req = SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=2))
+        req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, row_width=16)
+        req = SimpleNamespace(kv=ReqKvInfo(kv_allocated_len=2))
         batch = SimpleNamespace(
             device=torch.device("cpu"),
             hisparse_coordinator=object(),

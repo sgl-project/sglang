@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
+    get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
@@ -31,6 +32,8 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_block_scale_fp8,
+    _is_gfx1250_supported,
+    _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
@@ -43,6 +46,8 @@ if TYPE_CHECKING:
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and _use_aiter_gfx95
 )
+# Same as gfx950: write/read MLA KV rows via store_mla/read_mla, not index_put.
+_use_mla_kv_rows = _use_aiter_gfx95 or (_use_aiter and _is_gfx1250_supported)
 
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -110,12 +115,11 @@ class DeepseekMHARocmForwardMixin:
                     )
                 if self.should_run_indexer():
                     forward_dsa_indexer_for_mha(
-                        self.indexer,
+                        self.run_mla_indexer,
                         hidden_states=hidden_states,
                         q_lora=q_lora,
                         positions=positions,
                         forward_batch=forward_batch,
-                        layer_id=self.layer_id,
                     )
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant
@@ -237,10 +241,8 @@ class DeepseekMHARocmForwardMixin:
                         get_token_to_kv_pool(),
                         self.attn_mha,
                         forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                        forward_batch.seq_lens,
-                        forward_batch.extend_prefix_lens,
                         forward_batch.extend_prefix_lens_cpu,
-                        forward_batch.extend_seq_lens,
+                        forward_batch.extend_seq_lens_cpu,
                         kv_a,
                         k_pe,
                     )
@@ -328,8 +330,8 @@ class DeepseekMHARocmForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if _use_aiter_gfx95:
-            get_token_to_kv_pool().set_mla_kv_buffer(
+        if _use_mla_kv_rows:
+            get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
                 self.attn_mha,
                 KVWriteLoc.for_batch(forward_batch),
                 kv_a.unsqueeze(1),
@@ -338,7 +340,7 @@ class DeepseekMHARocmForwardMixin:
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
-            get_token_to_kv_pool().set_kv_buffer(
+            get_kv_layers().layer(self.attn_mha.layer_id).store(
                 self.attn_mha, KVWriteLoc.for_batch(forward_batch), latent_cache, None
             )
 
@@ -348,15 +350,15 @@ class DeepseekMHARocmForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        if _use_aiter_gfx95:
-            kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
-                self.attn_mha, kv_indices, dst_dtype
+        if _use_mla_kv_rows:
+            kv_a, k_pe = (
+                get_kv_layers()
+                .read(self.attn_mha.layer_id)
+                .read_mla(self.attn_mha, kv_indices, dst_dtype)
             )
             kv_a = kv_a.squeeze(1)
         else:
-            latent_cache_buf = get_token_to_kv_pool().get_key_buffer(
-                self.attn_mha.layer_id
-            )
+            latent_cache_buf = get_kv_layers().read(self.attn_mha.layer_id).key()
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
             kv_a, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1

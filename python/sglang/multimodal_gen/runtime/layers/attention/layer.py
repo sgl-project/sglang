@@ -136,6 +136,7 @@ def _kv_gather_unsupported_reason(
     replicated_mode_count: int,
     attn_mask: torch.Tensor | None,
     num_replicated_kv_prefix: int,
+    query_len: int,
 ) -> str | None:
     """Call shapes the gather path does not take; explicit mode fails closed
     on these, auto falls back to the Ulysses exchange for the call."""
@@ -153,6 +154,11 @@ def _kv_gather_unsupported_reason(
             return "K/V-gather SP masked attention expects a [B, S_local] mask."
         if torch.is_floating_point(attn_mask):
             return "K/V-gather SP supports boolean or integer padding masks."
+        # the gather path reads the mask as the local rows of one sequence: its
+        # keys after the gather, and the query rows to zero. A cross-attention
+        # key mask has another length
+        if attn_mask.shape[1] != query_len:
+            return "K/V-gather SP masked attention expects one mask row per query row."
     return None
 
 
@@ -420,6 +426,8 @@ class UlyssesAttention(nn.Module):
             dtype,
             supported_attention_backends=supported_attention_backends,
             selected_attention_backend=required_attention_backend,
+            is_cross_attention=is_cross_attention,
+            quant_config=extra_impl_args.get("quant_config"),
         )
         impl_cls = attn_backend.get_impl_cls()
 
@@ -721,6 +729,7 @@ class LocalAttention(nn.Module):
             selected_attention_backend=required_attention_backend,
             default_attention_backend=default_attention_backend,
             is_cross_attention=is_cross_attention,
+            quant_config=extra_impl_args.get("quant_config"),
         )
         impl_cls = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
@@ -851,10 +860,17 @@ class USPAttention(nn.Module):
         enable_packed_qkv_input_a2a: bool = False,
         is_cross_attention: bool = False,
         capture_dense_attention: bool = False,
+        global_num_heads: int | None = None,
         **extra_impl_args,
     ) -> None:
         """
         Args:
+            global_num_heads:
+              query heads of the layer before TP sharding. Lets the torch
+              SDPA backend keep heads sharded by TP or Ulysses on the same
+              flash kernel as the unsharded layer for "exact" quality
+              requests. Defaults to ``num_heads``, which covers Ulysses
+              sharding only.
             skip_sequence_parallel:
               when KV is replicated across all SP ranks (e.g. cross-attention to
               text/image encoder outputs), the full USP pipeline is redundant:
@@ -885,6 +901,7 @@ class USPAttention(nn.Module):
             selected_attention_backend=required_attention_backend,
             default_attention_backend=default_attention_backend,
             is_cross_attention=is_cross_attention,
+            quant_config=extra_impl_args.get("quant_config"),
         )
         if not skip_sequence_parallel and get_ring_parallel_world_size() > 1:
             if not attn_backend.supports_ring_rotation():
@@ -904,6 +921,7 @@ class USPAttention(nn.Module):
             num_kv_heads=num_kv_heads,
             prefix=f"{prefix}.impl",
             is_cross_attention=is_cross_attention,
+            global_num_heads=global_num_heads or num_heads,
             **extra_impl_args,
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
@@ -1104,6 +1122,7 @@ class USPAttention(nn.Module):
                 replicated_mode_count=replicated_mode_count,
                 attn_mask=attn_mask,
                 num_replicated_kv_prefix=num_replicated_kv_prefix,
+                query_len=q.shape[1],
             )
             if unsupported is None:
                 return self._forward_with_kv_gather(
@@ -1629,9 +1648,9 @@ class USPAttention(nn.Module):
         v_prefix: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, rows, heads = q.shape[:3]
-        ulysses = get_ulysses_parallel_world_size()
         skip_sp = self.skip_sequence_parallel or skip_sequence_parallel_override
-        if qkv_pre_all_to_all and not skip_sp and ulysses > 1:
+        if qkv_pre_all_to_all and not skip_sp:
+            ulysses = get_ulysses_parallel_world_size()
             # q arrives head-sharded; the output all-to-all shards it by rows.
             rows, heads = rows // ulysses, heads * ulysses
         if q_prefix is not None and attn_mask is not None:
@@ -1667,7 +1686,8 @@ class USPAttention(nn.Module):
         """
         groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
         if (
-            not q.is_cuda
+            envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+            or not q.is_cuda
             or groups in (0, 1)
             or self.backend not in PIPELINED_ATTENTION_BACKENDS
             or torch.compiler.is_compiling()
@@ -2441,7 +2461,7 @@ def _make_breakable_attention_forward(forward_method):
     """Wrap a DiT attention module's ``forward`` so it becomes a breakable
     CUDA graph (BCG) break point.
 
-    During BCG capture the whole attention forward runs eagerly between
+    At every BCG replay the whole attention forward runs eagerly between
     captured graph segments -- the sequence-parallel all-to-all collectives,
     varlen packing, and dynamic/sparse attention kernels that live here
     cannot (or should not) be captured into a static CUDA graph. The outputs
@@ -2450,21 +2470,12 @@ def _make_breakable_attention_forward(forward_method):
     pass-through to the original method.
     """
 
-    @eager_on_graph
-    def bcg_forward(self, *args, out, **kwargs):
-        result = forward_method(self, *args, **kwargs)
-        outs, results = (out, result) if isinstance(out, tuple) else ((out,), (result,))
-        for dst, src in zip(outs, results, strict=True):
-            if dst is None and src is None:
-                continue
-            # copy_ would broadcast a mispredicted shape or cast a dtype silently.
-            assert (
-                dst is not None
-                and src is not None
-                and dst.shape == src.shape
-                and dst.dtype == src.dtype
-            ), "BCG attention output mispredicted"
-            dst.copy_(src)
+    bcg_forward = eager_on_graph(
+        forward_method,
+        output_factory=lambda self, *args, **kwargs: self._new_bcg_output(
+            *args, **kwargs
+        ),
+    )
 
     @functools.wraps(forward_method)
     def forward(self, *args, **kwargs):
@@ -2479,13 +2490,12 @@ def _make_breakable_attention_forward(forward_method):
                 and self.backend
                 in (
                     AttentionBackendEnum.TORCH_SDPA,
+                    AttentionBackendEnum.TORCH_CUDNN_SDPA,
                     AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
                 )
             )
             if not capture_dense:
-                out = self._new_bcg_output(*args, **kwargs)
-                bcg_forward(self, *args, **kwargs, out=out)
-                return out
+                return bcg_forward(self, *args, **kwargs)
         return forward_method(self, *args, **kwargs)
 
     return forward

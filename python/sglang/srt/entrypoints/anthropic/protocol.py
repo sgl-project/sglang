@@ -56,6 +56,7 @@ class AnthropicUsage(BaseModel):
 class TextBlock(BaseModel):
     type: Literal["text"] = "text"
     text: str
+    cache_control: Optional[dict[str, Any]] = None
 
 
 class ImageBlock(BaseModel):
@@ -91,6 +92,50 @@ class ToolReferenceBlock(BaseModel):
     id: Optional[str] = None
 
 
+class McpToolReference(BaseModel):
+    type: Literal["mcp_tool_reference"]
+    server_name: str
+    name: str
+
+
+class McpToolsetReference(BaseModel):
+    type: Literal["mcp_toolset_reference"]
+    server_name: str
+
+
+class ToolDefinition(BaseModel):
+    """A tool given by value: `definition` is a `tools` entry."""
+
+    type: Literal["tool_definition"]
+    definition: dict[str, Any]
+
+
+class ToolAdditionBlock(BaseModel):
+    """Anthropic beta block: a ``system`` message offers a tool from its position
+    on. Rendered through deepseek-recipe, which reads only a ``tool_reference``
+    target."""
+
+    type: Literal["tool_addition"] = "tool_addition"
+    tool: Annotated[
+        Union[
+            ToolReferenceBlock, McpToolReference, McpToolsetReference, ToolDefinition
+        ],
+        Field(discriminator="type"),
+    ]
+    cache_control: Optional[dict[str, Any]] = None
+
+
+class ToolRemovalBlock(BaseModel):
+    """Anthropic beta block: a ``system`` message withdraws a tool."""
+
+    type: Literal["tool_removal"] = "tool_removal"
+    tool: Annotated[
+        Union[ToolReferenceBlock, McpToolReference, McpToolsetReference],
+        Field(discriminator="type"),
+    ]
+    cache_control: Optional[dict[str, Any]] = None
+
+
 class SearchResultBlock(BaseModel):
     type: Literal["search_result"] = "search_result"
     # ``source`` here is a URL/identifier string (unlike ImageBlock.source).
@@ -117,6 +162,8 @@ AnthropicContentBlock = Annotated[
         ToolUseBlock,
         ToolResultBlock,
         ToolReferenceBlock,
+        ToolAdditionBlock,
+        ToolRemovalBlock,
         SearchResultBlock,
         ThinkingBlock,
         RedactedThinkingBlock,
@@ -128,6 +175,8 @@ AnthropicContentBlock = Annotated[
 class AnthropicMessage(BaseModel):
     role: Literal["user", "assistant", "system"]
     content: Union[str, list[AnthropicContentBlock]]
+    clear_at: Optional[Literal["next_user_message", "never"]] = None
+    output_config: Optional[dict[str, Any]] = None
 
 
 # ---------- Tools (discriminated by ``type`` family) ----------
@@ -259,38 +308,21 @@ class AnthropicToolChoice(BaseModel):
 class AnthropicThinkingParam(BaseModel):
     """Anthropic extended-thinking control on the request.
 
-    Mirrors the Anthropic SDK's ``ThinkingConfigParam`` discriminated
-    union of three variants — see ``anthropic-sdk-python``'s
-    ``thinking_config_{enabled,disabled,adaptive}_param.py``:
-
-    * ``enabled`` requires ``budget_tokens`` (≥1024) and accepts
-      ``display``.
-    * ``disabled`` accepts no other fields.
-    * ``adaptive`` (Claude 4.7) accepts ``display`` but not
-      ``budget_tokens``.
-
-    The serving layer treats ``adaptive`` identically to ``enabled``
-    because the local OpenAI-compatible backend has no auto-throttle
-    equivalent. ``budget_tokens`` is accepted on ``enabled`` for SDK
-    compatibility but the backend has no hard-cap knob to honor it; the
-    serving layer logs a WARNING so operators see that the requested
-    budget is not enforced. ``display="omitted"`` is accepted but
-    similarly cannot suppress reasoning mid-stream and is logged.
+    Mirrors the SDK's ``thinking_config_{enabled,disabled,adaptive}_param.py``
+    variants. ``budget_tokens`` and ``display="omitted"``/``"updates"`` are
+    accepted for SDK compatibility but not enforced; the serving layer logs them.
+    Some Anthropic-compatible clients omit ``budget_tokens`` on ``enabled``.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: Optional[int] = None
-    display: Optional[Literal["summarized", "omitted"]] = None
+    display: Optional[Literal["summarized", "omitted", "updates"]] = None
 
     @model_validator(mode="after")
     def _validate_thinking_shape(self):
         # Cross-field rules mirror the SDK's three discriminated variants.
         if self.type == "enabled":
-            if self.budget_tokens is None:
-                raise ValueError(
-                    "thinking.budget_tokens is required when thinking.type is 'enabled'"
-                )
-            if self.budget_tokens < 1024:
+            if self.budget_tokens is not None and self.budget_tokens < 1024:
                 raise ValueError(
                     "thinking.budget_tokens must be >= 1024 (got {})".format(
                         self.budget_tokens
@@ -383,6 +415,7 @@ class AnthropicMessagesRequest(PDRoutingFields):
     tools: Optional[list[AnthropicTool]] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
+    cache_salt: Optional[str] = None
     # Claude 4.7 fields. The Anthropic SDK / Claude Code attach these even
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None

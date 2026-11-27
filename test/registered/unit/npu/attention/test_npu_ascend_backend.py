@@ -1,5 +1,5 @@
 """
-Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
+Unit tests for the Ascend attention backends.
 """
 
 import sys
@@ -9,9 +9,12 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+# Loaded before the torch_npu mock below: importing transformers runs
+# accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.
+import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=5, suite="base-a-test-npu")
+register_npu_ci(est_time=5, suite="extra-a-test-npu")
 
 # Mock NPU-only modules before importing the source module.
 for _ in (
@@ -20,6 +23,8 @@ for _ in (
     "sgl_kernel_npu",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
     "sglang.srt.speculative",
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
@@ -27,6 +32,7 @@ for _ in (
 ):
     sys.modules.setdefault(_, MagicMock())
 
+from sglang.srt.hardware_backend.npu.attention import ascend_dsa_backend
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMaskBuilder,
@@ -34,6 +40,12 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.layers.cp import base as cp_base
+from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_parallel
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -556,6 +568,276 @@ class TestGenerateAlibiBias(unittest.TestCase):
         self.assertEqual(result.dtype, torch.bfloat16)
 
 
+class TestMlaPrefixCacheDcp(unittest.TestCase):
+    def test_fp8_prefix_dequantized_before_projection_or_dcp_gather(self):
+        from sglang.srt.hardware_backend.npu.attention.mla_cache import (
+            build_mla_prefix_token_indices,
+        )
+
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        page = 4
+        for local_lens in ([5, 3], [4, 4]):
+            counts = [(length + page - 1) // page for length in local_lens]
+            blocks = sum(counts)
+            ids = torch.arange(blocks - 1, -1, -1)
+            latent = (
+                (torch.arange(blocks * page * 32).remainder(97) - 48)
+                .reshape(blocks, page, 1, 32)
+                .to(torch.float8_e4m3fn)
+            )
+            rope = (
+                torch.arange(blocks * page * 32).reshape(blocks, page, 1, 32).bfloat16()
+            )
+            expected_k, expected_pe, offset = [], [], 0
+            for length, count in zip(local_lens, counts):
+                request_ids = ids[offset : offset + count]
+                expected_k.append(latent.float()[request_ids].flatten(0, 1)[:length])
+                expected_pe.append(rope[request_ids].flatten(0, 1)[:length])
+                offset += count
+            expected_k = torch.cat(expected_k)
+            expected_pe = torch.cat(expected_pe)
+            expected_dequantized = (expected_k * 0.25).bfloat16()
+
+            for is_nz in (False, True):
+
+                def encode(data):
+                    if not is_nz:
+                        return data
+                    tile = 32 if data.dtype == torch.float8_e4m3fn else 16
+                    backing = data.view(torch.uint8) if tile == 32 else data
+                    return (
+                        backing.reshape(blocks, page, 32 // tile, tile)
+                        .permute(0, 2, 1, 3)
+                        .contiguous()
+                        .reshape_as(backing)
+                        .view(data.dtype)
+                    )
+
+                for size in (1, 2):
+                    with self.subTest(lengths=local_lens, nz=is_nz, dcp_size=size):
+                        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+                        backend.dcp_size, backend.page_size = size, page
+                        backend.kv_lora_rank = backend.qk_rope_head_dim = 32
+                        global_lens = (
+                            local_lens
+                            if size == 1
+                            else ([9, 3] if local_lens == [5, 3] else [8, 8])
+                        )
+                        backend.forward_metadata = ForwardMetadata(
+                            prefix_lens=torch.tensor(global_lens),
+                            flatten_prefix_block_tables=ids,
+                            prefix_token_indices=(
+                                build_mla_prefix_token_indices(
+                                    local_lens, page, device=torch.device("cpu")
+                                )
+                                if any(length % page for length in local_lens)
+                                else None
+                            ),
+                        )
+                        k_buffer, pe_buffer = encode(latent), encode(rope)
+                        backend.token_to_kv_pool = SimpleNamespace(
+                            get_key_buffer=lambda _: k_buffer,
+                            get_value_buffer=lambda _: pe_buffer,
+                        )
+                        dequantize = MagicMock(
+                            side_effect=lambda value: (
+                                (value.float() * 0.25).bfloat16(),
+                                None,
+                            )
+                        )
+                        full_prefix = torch.randn(sum(global_lens), 1, 64).bfloat16()
+                        with (
+                            patch(f"{module}.is_fia_nz", return_value=is_nz),
+                            patch(
+                                f"{module}.all_gather_kv_cache_for_dcp",
+                                return_value=full_prefix,
+                            ) as gather,
+                        ):
+                            result_k, result_pe = backend._load_mla_prefix_cache(
+                                SimpleNamespace(
+                                    layer_id=0,
+                                    scheme=SimpleNamespace(dequantize_cache=dequantize),
+                                )
+                            )
+                        dequantize.assert_called_once()
+                        encoded = dequantize.call_args.args[0]
+                        self.assertEqual(encoded.dtype, torch.float8_e4m3fn)
+                        torch.testing.assert_close(
+                            encoded.float(), expected_k, atol=0, rtol=0
+                        )
+                        if size == 1:
+                            gather.assert_not_called()
+                            torch.testing.assert_close(
+                                result_k, expected_dequantized, atol=0, rtol=0
+                            )
+                            torch.testing.assert_close(
+                                result_pe, expected_pe, atol=0, rtol=0
+                            )
+                        else:
+                            gather.assert_called_once()
+                            torch.testing.assert_close(
+                                gather.call_args.args[0],
+                                expected_dequantized,
+                                atol=0,
+                                rtol=0,
+                            )
+                            torch.testing.assert_close(
+                                gather.call_args.args[1], expected_pe, atol=0, rtol=0
+                            )
+                            self.assertIs(
+                                gather.call_args.args[2],
+                                backend.forward_metadata.prefix_lens,
+                            )
+                            self.assertEqual(
+                                gather.call_args.kwargs, {"interleave_size": page}
+                            )
+                            torch.testing.assert_close(
+                                torch.cat((result_k, result_pe), -1),
+                                full_prefix,
+                                atol=0,
+                                rtol=0,
+                            )
+
+    def _check_prefix_cache(self, lengths, page_size, size, rank, is_nz, mode):
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        queries = torch.tensor([3, 1, 1], dtype=torch.int32)
+        prefix_lens = torch.tensor(lengths, dtype=torch.int32)
+        seq_lens = prefix_lens + queries
+        stride = page_size * size
+        cycles = (int(seq_lens.max()) + stride - 1) // stride
+        mapping = torch.arange(3 * cycles * stride).reshape(3, -1)
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_quant_flash_attn = False
+        backend.device = torch.device("cpu")
+        backend.use_mla = True
+        backend.use_dsa = False
+        backend.dcp_size, backend.dcp_rank = size, rank
+        backend.use_flash_mla = backend.use_paged_mtp = False
+        backend.dense_mla_dcp_target = size > 1
+        backend.dsa_dcp_target = False
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+        backend.page_size = page_size
+        backend.kv_lora_rank, backend.qk_rope_head_dim = 32, 16
+        backend.req_to_token = mapping
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=mapping)
+        batch = SimpleNamespace(
+            forward_mode=mode,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens,
+            extend_seq_lens=queries,
+            extend_seq_lens_cpu=queries.tolist(),
+            extend_prefix_lens=prefix_lens,
+            extend_prefix_lens_cpu=lengths,
+            req_pool_indices=torch.tensor([2, 0, 1]),
+            spec_info=None,
+            out_cache_loc=None,
+        )
+        parallel = SimpleNamespace(attn_dcp_size=size, attn_dcp_rank=rank)
+        with (
+            patch(f"{module}.get_parallel", return_value=parallel),
+            patch(
+                f"{module}.build_mla_prefix_token_indices",
+                wraps=sys.modules[module].build_mla_prefix_token_indices,
+            ) as build_indices,
+        ):
+            backend.init_forward_metadata(batch)
+        metadata = backend.forward_metadata
+        self.assertEqual(metadata.prefix_lens.tolist(), lengths)
+
+        full, local = [], []
+        for request, length in enumerate(lengths):
+            values = torch.arange(length * 48, dtype=torch.float32).reshape(
+                length, 1, 48
+            )
+            values = values + request * 10000
+            full.append(values)
+            positions = torch.arange(length)
+            local.append(values[(positions // page_size) % size == rank])
+        expected_local = torch.cat(local)
+        expected_full = torch.cat(full)
+        needs_compaction = any(len(values) % page_size for values in local)
+        if needs_compaction:
+            self.assertEqual(
+                metadata.prefix_token_indices.numel(), expected_local.shape[0]
+            )
+        else:
+            self.assertIsNone(metadata.prefix_token_indices)
+        self.assertEqual(build_indices.call_count, int(needs_compaction))
+
+        blocks = metadata.flatten_prefix_block_tables.tolist()
+        pages = torch.full((max(blocks, default=0) + 1, page_size, 1, 48), -999.0)
+        offset = 0
+        for values in local:
+            count = (len(values) + page_size - 1) // page_size
+            if count:
+                request_pages = pages.new_full((count * page_size, 1, 48), -999)
+                request_pages[: len(values)] = values
+                pages[blocks[offset : offset + count]] = request_pages.reshape(
+                    count, page_size, 1, 48
+                )
+            offset += count
+
+        def encode(cache):
+            if not is_nz:
+                return cache
+            return (
+                cache.reshape(cache.shape[0], page_size, -1, 16)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+                .reshape_as(cache)
+            )
+
+        latent, rope = encode(pages[..., :32]), encode(pages[..., 32:])
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: latent,
+            get_value_buffer=lambda _: rope,
+        )
+
+        def gather(kv, pe, global_lens, *, interleave_size):
+            torch.testing.assert_close(kv, expected_local[..., :32], atol=0, rtol=0)
+            torch.testing.assert_close(pe, expected_local[..., 32:], atol=0, rtol=0)
+            self.assertEqual(global_lens.tolist(), lengths)
+            self.assertEqual(interleave_size, page_size)
+            return expected_full
+
+        with (
+            patch(f"{module}.is_fia_nz", return_value=is_nz),
+            patch(
+                f"{module}.all_gather_kv_cache_for_dcp", side_effect=gather
+            ) as collective,
+        ):
+            actual_kv, actual_pe = backend._load_mla_prefix_cache(
+                SimpleNamespace(layer_id=0)
+            )
+        torch.testing.assert_close(actual_kv, expected_full[..., :32], atol=0, rtol=0)
+        torch.testing.assert_close(actual_pe, expected_full[..., 32:], atol=0, rtol=0)
+        self.assertEqual(collective.call_count, int(size > 1))
+
+    def test_rank_local_compaction_and_global_prefix_contract(self):
+        for lengths, page in (
+            ([5, 3, 0], 4),
+            ([0, 9, 2], 4),
+            ([128, 255, 129], 128),
+            ([4, 8, 0], 4),
+            ([128, 256, 0], 128),
+        ):
+            for size in (1, 2, 4):
+                for rank in range(size):
+                    for is_nz in (False, True):
+                        for mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+                            with self.subTest(
+                                lengths=lengths,
+                                size=size,
+                                rank=rank,
+                                nz=is_nz,
+                                mode=mode,
+                            ):
+                                self._check_prefix_cache(
+                                    lengths, page, size, rank, is_nz, mode
+                                )
+
+
 class TestMlaPrefixFia(unittest.TestCase):
     @staticmethod
     def _fia_reference(**kwargs):
@@ -607,7 +889,15 @@ class TestMlaPrefixFia(unittest.TestCase):
         return (torch.stack(outputs) * weights).sum(0), None
 
     def _check_prefix(
-        self, query_lens, prefix_lens, dtype, padding, heads, magnitude=1, use_fia=False
+        self,
+        query_lens,
+        prefix_lens,
+        dtype,
+        padding,
+        heads,
+        magnitude=1,
+        use_fia=False,
+        page_size=1,
     ):
         torch.manual_seed(47)
         tokens, prefix_tokens = sum(query_lens), sum(prefix_lens)
@@ -616,15 +906,42 @@ class TestMlaPrefixFia(unittest.TestCase):
         v = torch.randn(tokens + padding, heads, 144, dtype=dtype)[..., :128]
         q.mul_(magnitude)
         k.mul_(magnitude)
-        cached = torch.randn(prefix_tokens + 3, 1, 32, dtype=dtype)
+        cached = torch.randn(prefix_tokens + 3, 1, 1, 32, dtype=dtype)
         cached_rope = torch.randn(prefix_tokens + 3, 1, 1, 64, dtype=dtype)
         indices = torch.randperm(prefix_tokens + 3)[:prefix_tokens]
+        row_index = None
         weight = torch.randn(32, heads * 256, dtype=dtype) / 32**0.5
+
+        if page_size > 1:
+            # Simulate the real page-granular gather: every request's prefix
+            # is rounded up to whole pages, so garbage tails trail each
+            # request's rows in the gathered output.
+            rounded_lens = [
+                -(-prefix_len // page_size) * page_size for prefix_len in prefix_lens
+            ]
+            num_pages = (
+                sum(rounded_len // page_size for rounded_len in rounded_lens) + 1
+            )  # one spare page never referenced by the block table
+            cached = torch.randn(num_pages, page_size, 1, 32, dtype=dtype)
+            cached_rope = torch.randn(num_pages, page_size, 1, 64, dtype=dtype)
+            page_parts, row_parts = [], []
+            next_page = row_start = 0
+            for prefix_len, rounded_len in zip(prefix_lens, rounded_lens):
+                page_parts.extend(
+                    range(next_page, next_page + rounded_len // page_size)
+                )
+                row_parts.extend(range(row_start, row_start + prefix_len))
+                next_page += rounded_len // page_size
+                row_start += rounded_len
+            indices = torch.tensor(page_parts, dtype=torch.int32)
+            if any(prefix_len % page_size for prefix_len in prefix_lens):
+                row_index = torch.tensor(row_parts, dtype=torch.int64)
 
         def project(x):
             return x @ weight, None
 
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.dcp_size = 1
         backend.use_mla = True
         backend.use_fia = use_fia
         backend.is_dllm_model = False
@@ -635,6 +952,7 @@ class TestMlaPrefixFia(unittest.TestCase):
             extend_seq_lens_cpu_int=torch.tensor(query_lens, dtype=torch.int32),
             prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
             flatten_prefix_block_tables=indices,
+            prefix_token_indices=row_index,
         )
         backend.token_to_kv_pool = SimpleNamespace(
             get_key_buffer=lambda _: cached,
@@ -674,13 +992,17 @@ class TestMlaPrefixFia(unittest.TestCase):
         self.assertEqual(fia.call_count, 2)
         self.assertEqual(update.call_count, 1)
 
+        if page_size > 1:
+            # Exact prefix rows scattered across the page-rounded layout.
+            key_rows = cached.view(-1, 32)[row_parts].unsqueeze(1)
+            rope_rows = cached_rope.view(-1, 1, 64)[row_parts].unsqueeze(1)
+        else:
+            key_rows, rope_rows = cached[indices], cached_rope[indices]
         prefix_k, prefix_v = (
-            project(cached[indices])[0]
-            .view(prefix_tokens, heads, 256)
-            .split(128, dim=-1)
+            project(key_rows)[0].view(prefix_tokens, heads, 256).split(128, dim=-1)
         )
         prefix_k = torch.cat(
-            (prefix_k, cached_rope[indices].flatten(0, 1).expand(-1, heads, -1)),
+            (prefix_k, rope_rows.flatten(0, 1).expand(-1, heads, -1)),
             dim=-1,
         )
         expected = torch.zeros(tokens + padding, heads, 128, dtype=dtype)
@@ -730,6 +1052,112 @@ class TestMlaPrefixFia(unittest.TestCase):
                     self._check_prefix(
                         [3, 1, 2], [0, 5, 2], dtype, 3, 4, use_fia=use_fia
                     )
+
+    def test_unaligned_prefix_trimmed_to_exact_rows(self):
+        """Page-rounded prefix gathers are trimmed to exact rows (TND tiling
+        requires prefix_lens.cumsum == gathered row count). Unaligned prefixes
+        arise from mixed batches (--enable-mixed-chunk), where decode rows run
+        as 1-token extends with prefix = seq_len - 1; without the trim the
+        kernel rejects the batch (error 561002)."""
+        for dtype in (torch.float16, torch.bfloat16):
+            for queries, prefixes in (
+                ([3, 1, 2], [5, 2, 7]),
+                ([1, 4], [0, 9]),
+                ([2], [17]),
+                ([4, 1, 2], [16, 3, 8]),
+            ):
+                with self.subTest(dtype=dtype, queries=queries, prefixes=prefixes):
+                    self._check_prefix(queries, prefixes, dtype, 0, 4, page_size=16)
+
+    def test_aligned_prefix_skips_trim(self):
+        """Page-aligned prefixes leave prefix_token_indices as None and
+        keep the un-trimmed gather path."""
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self._check_prefix([3, 1], [16, 32], dtype, 0, 4, page_size=16)
+
+
+class TestAscendKPoolPrefillCP(CustomTestCase):
+    def setUp(self):
+        self.strategy = InterleaveCPStrategy(cp_size=2)
+        self.enterContext(get_parallel().override(attn_cp_size=2, attn_cp_rank=1))
+        self.enterContext(patch.object(cp_base, "_STRATEGY", self.strategy))
+
+        # The requests extend prefixes of 6 and 14 tokens. Rank 1 gets
+        # global rows 1, 3, 5, and 7 of this uneven batch.
+        extend_lens = [3, 6]
+        cp_metadata = self.strategy.build_metadata(9, None, extend_lens)
+        pad_logical_token_to_physical(cp_metadata)
+        self.batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            extend_seq_lens_cpu=extend_lens,
+            extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32),
+            positions=torch.tensor([6, 7, 8, 14, 15, 16, 17, 18, 19]),
+            attn_cp_metadata=cp_metadata,
+        )
+
+    def test_indexer_reads_each_query_at_its_original_causal_boundary(self):
+        """Interleaved queries cross a request boundary and an 8-token pool."""
+        backend_cls = ascend_dsa_backend.AscendDSAAttnBackend
+        backend = backend_cls.__new__(backend_cls)
+        backend.use_dsa = True
+        backend.dsa_index_kpool = 8
+        page_table = torch.tensor([[11, 12], [21, 22]], dtype=torch.int32)
+        backend.forward_metadata = ascend_dsa_backend.AscendDSAForwardMetadata(
+            pool_page_table=page_table,
+            block_tables=page_table.clone(),
+        )
+        global_positions = self.batch.positions.clone()
+
+        backend.prepare_dsa_cp_metadata(self.batch)
+
+        metadata = backend.forward_metadata
+        torch.testing.assert_close(self.batch.positions, global_positions)
+        read = metadata.cp_read_metadata
+        self.assertEqual(read.pool_query_ends.tolist(), [1, 2, 3, 4])
+        self.assertEqual(read.pool_key_lens.tolist(), [1, 1, 2, 2])
+        self.assertEqual(read.pool_tail_lens.tolist(), [0, 7, 1, 3])
+        self.assertEqual(
+            read.pool_page_table.tolist(), [[11, 12], [21, 22], [21, 22], [21, 22]]
+        )
+        self.assertEqual(metadata.pool_page_table.tolist(), [[11, 12], [21, 22]])
+        self.assertEqual(metadata.actual_seq_lengths_kv.tolist(), [8, 15, 17, 19, 1, 1])
+
+    def test_compression_writer_receives_paired_rows_in_sequence_order(self):
+        """KPool groups span ranks and should contain only real key/score pairs."""
+        key = torch.arange(1.0, 10.0).unsqueeze(1)
+        score = key * -10
+        packed = torch.cat((key, score), dim=1)
+
+        def all_gather(output, rank_one):
+            # Rank-major collective receives the even rows from rank 0.
+            output[:6].copy_(torch.nn.functional.pad(packed[::2], (0, 0, 0, 1)))
+            output[6:].copy_(rank_one)
+
+        group = SimpleNamespace(world_size=2, all_gather_into_tensor=all_gather)
+        with (
+            get_parallel().override(attn_cp_group=group),
+            patch.object(ascend_dsa_backend, "_compress_write_extend_npu") as write,
+        ):
+            ascend_dsa_backend._compress_write_npu(
+                key=self.strategy.shard_hidden_states(key, self.batch),
+                gate_score=self.strategy.shard_hidden_states(score, self.batch),
+                positions=self.strategy.shard_position_ids(
+                    self.batch.positions, self.batch
+                ),
+                forward_batch=self.batch,
+                layer_id=0,
+                metadata=ascend_dsa_backend.AscendDSAIndexerMetadata(
+                    ascend_dsa_backend.AscendDSAForwardMetadata()
+                ),
+                compress_ape=torch.zeros(8, 1),
+                index_kpool=8,
+            )
+
+        self.assertIsNotNone(write.call_args)
+        torch.testing.assert_close(write.call_args.kwargs["key"], key)
+        torch.testing.assert_close(write.call_args.kwargs["gate_score"], score)
 
 
 if __name__ == "__main__":

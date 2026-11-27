@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 
@@ -137,6 +138,20 @@ def moe_wna16_marlin_gemm(
         else:
             group_size = -1
 
+    if group_size == 32:
+        from sgl_kernel.scalar_type import scalar_types
+
+        # FP8 group-32 takes E8M0 scales (MXFP8) or activation-dtype scales with
+        # the FP8 exponent bias folded in (fp8_fused_exponent_bias_into_scales).
+        if b_q_type == scalar_types.float8_e4m3fn and b_scales.dtype not in (
+            torch.float8_e8m0fnu,
+            a.dtype,
+        ):
+            raise ValueError(
+                "FP8 Marlin group-32 scales must have dtype float8_e8m0fnu or "
+                f"the activation dtype {a.dtype}, got {b_scales.dtype}"
+            )
+
     # Allocate a_tmp for act_order column permutation
     if has_act_order:
         a_tmp = torch.empty((size_m * top_k, size_k), dtype=a.dtype, device=device)
@@ -145,7 +160,7 @@ def moe_wna16_marlin_gemm(
 
     # Allocate c_tmp for fp32 reduce
     if use_fp32_reduce and not use_atomic_add:
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        sms = current_arch().num_sms
         # max num of threadblocks is sms * 4
         max_c_tmp_size = min(
             size_n * sorted_token_ids.size(0),

@@ -1,17 +1,16 @@
+import logging
 import time
 from typing import List, Union
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.interns1pro import InternS1ProForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.qwen_vl import (
     QwenVLImageProcessor,
     preprocess_video,
 )
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 
 class InternS1_1ImageProcessor(QwenVLImageProcessor):
@@ -69,46 +68,23 @@ class InternS1_1ImageProcessor(QwenVLImageProcessor):
 
         preprocess_time = time.perf_counter()
 
-        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output,
             self.mm_tokens,
             video_metadata=video_metadata,
             do_sample_frames=False,
         )
 
-        second_per_grid_ts = getattr(ret, "second_per_grid_ts", None)
-        if second_per_grid_ts is None:
-            second_per_grid_ts = getattr(ret, "video_second_per_grid", None)
-
         process_time = time.perf_counter()
 
         input_ids = input_ids.flatten()
-
-        image_grid_thw = None
-        if hasattr(ret, "image_grid_thw"):
-            image_grid_thw = ret.image_grid_thw
-
-        if image_grid_thw is None and image_data and isinstance(image_data[0], dict):
-            image_grid_thw = image_data[0].get("image_grid_thw")
-
-        video_grid_thw = None
-        if hasattr(ret, "video_grid_thw"):
-            video_grid_thw = ret.video_grid_thw
-
-        if video_grid_thw is None and request_obj.video_data:
-            first_video = request_obj.video_data[0]
-            if isinstance(first_video, dict):
-                video_grid_thw = first_video.get("video_grid_thw")
-
-        get_rope_index_time = time.perf_counter()
 
         logger.debug(
             f"[QwenVLProcessor Perf] {rid=}, "
             f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "
             f"preprocess_time: {(preprocess_time - load_time) * 1000:.2f} ms, "
             f"process_time: {(process_time - preprocess_time) * 1000:.2f} ms, "
-            f"get_rope_index_time: {(get_rope_index_time - process_time) * 1000:.2f} ms, "
-            f"total_time: {(get_rope_index_time - entry_time) * 1000:.2f} ms"
+            f"total_time: {(process_time - entry_time) * 1000:.2f} ms"
         )
 
         return MultimodalProcessorOutput(

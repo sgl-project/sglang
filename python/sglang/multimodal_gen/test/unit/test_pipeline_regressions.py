@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.pipelines.ernie_image import ErnieImagePipeli
 from sglang.multimodal_gen.runtime.pipelines.sana_video import (
     SanaVideoTextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.utils.mesh3d_utils import (
     ImageProcessorV2,
     MeshRender,
@@ -57,13 +60,15 @@ _VIDEOS = torch.from_numpy(_VALUES / 255).float().permute(0, 2, 1)[..., None, No
 
 
 @pytest.mark.parametrize(
-    "data, expected",
+    "attr, data, expected",
     [
         (
+            "frames",
             np.broadcast_to(_VALUES[:, :, None, None] / 255, (2, 3, 2, 4, 3)).copy(),
             _VIDEOS.expand(2, 3, 3, 2, 4),
         ),
         (
+            "frames",
             [
                 [Image.new("RGB", (4, 2), tuple(map(int, frame))) for frame in video]
                 for video in _VALUES
@@ -71,18 +76,21 @@ _VIDEOS = torch.from_numpy(_VALUES / 255).float().permute(0, 2, 1)[..., None, No
             _VIDEOS.expand(2, 3, 3, 2, 4),
         ),
         (
+            "images",
             [Image.new("RGB", (4, 2), tuple(map(int, video[0]))) for video in _VALUES],
             _VIDEOS[:, :, 0].expand(2, 3, 2, 4),
         ),
     ],
     ids=["np-videos", "pil-videos", "pil-images"],
 )
-def test_diffusers_output_layout_is_channels_first(data, expected):
+def test_diffusers_output_layout_is_channels_first(attr, data, expected):
     """Video outputs were permuted twice (np), PIL video lists lost all but the
     first sample, and several PIL images were stacked as video frames."""
     stage = DiffusersExecutionStage.__new__(DiffusersExecutionStage)
 
-    output = stage._postprocess_output(stage._convert_to_tensor(data))
+    output = stage._postprocess_output(
+        stage._extract_output(SimpleNamespace(**{attr: data}))
+    )
 
     torch.testing.assert_close(output, expected)
 
@@ -138,3 +146,15 @@ def test_diffusers_pipeline_add_stage_accepts_both_argument_orders(legacy_order)
         pipeline.add_stage(stage, "diffusers_execution")
     assert pipeline._stage_name_mapping == {"diffusers_execution": stage}
     assert pipeline._stages == [stage]
+
+
+def test_unknown_sta_mode_reports_the_configured_name():
+    """An unknown STA mode must surface as the enum lookup error that names the
+    configured mode."""
+    stage = DenoisingStage.__new__(DenoisingStage)
+    server_args = SimpleNamespace(
+        attention_backend_config=SimpleNamespace(STA_mode="STA_BOGUS")
+    )
+
+    with pytest.raises(KeyError, match="STA_BOGUS"):
+        stage.prepare_sta_param(SimpleNamespace(), server_args)

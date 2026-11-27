@@ -6,15 +6,20 @@ against the session state kept on the worker.
 """
 
 import math
+from functools import partial
 
 import torch
 import torch.distributed as dist
 from msgspec.structs import replace
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
     get_local_torch_device,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_replica_group,
+    get_ulysses_ctx,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -85,6 +90,19 @@ class NomasInputValidationStage(RealtimeInputValidationStage):
         ]
         if batch.session is not None and len(plan) != 1:
             raise ValueError("a Nomas realtime chunk carries exactly one event segment")
+        sp_size = get_ulysses_ctx()[0]
+        # A flush chunk never reaches the DiT, so its single latent frame is exempt.
+        for segment in [] if flush else plan:
+            tokens = (
+                (segment.end - segment.start)
+                * (batch.height // 32)
+                * (batch.width // 32)
+            )
+            if tokens % sp_size:
+                raise ValueError(
+                    f"a segment has {tokens} video tokens, not divisible by the "
+                    f"sequence-parallel degree {sp_size}; change num_frames or the event sizes"
+                )
         batch.extra["nomas_segments"] = plan
         batch.prompt = plan[0].caption
         if prompt_format == "plain" and not flush:
@@ -210,6 +228,34 @@ class NomasDenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
 
+    def drop_breakable_cuda_graphs(self, reason):
+        self.transformer.release_cuda_graphs()
+
+    @staticmethod
+    def _offline_graph_predict(batch, server_args, model, capacity, camera):
+        if not (
+            server_args.enable_breakable_cuda_graph
+            and server_args.warmup_mode == "server"
+            and not server_args.enable_torch_compile
+            and server_args.lora_path is None
+            and not (
+                batch.sampling_params.enable_cache_dit or envs.SGLANG_CACHE_DIT_ENABLED
+            )
+            and server_args.num_gpus == 1
+            and server_args.explicit_residency_mode("transformer") == "resident"
+            and batch.sampling_params.quality == "lossless"
+            and batch.latents.is_cuda
+            and torch.version.hip is None
+            and batch.latents.dtype == torch.bfloat16
+            and camera is None
+            and capacity == 0
+            and model.quant_config is None
+            and model.attention_backend == "flex"
+        ):
+            return None
+        runner = model.offline_graph(batch.is_warmup)
+        return partial(runner.predict, warmup=batch.is_warmup) if runner else None
+
     @property
     def role_affinity(self):
         return RoleType.DENOISER
@@ -254,6 +300,9 @@ class NomasDenoisingStage(PipelineStage):
                 model.embed_camera(camera[None]) if camera is not None else None
             )
             session = self._new_session(model, batch, config, capacity, generator)
+            graph_predict = self._offline_graph_predict(
+                batch, server_args, model, capacity, camera
+            )
             segments = []
             for index, (condition, segment) in enumerate(
                 zip(conditions, plan, strict=True)
@@ -268,6 +317,7 @@ class NomasDenoisingStage(PipelineStage):
                         condition,
                         initial_latents=initial,
                         cache_segment=index < len(plan) - 1,
+                        graph_predict=graph_predict,
                     )
                 )
             batch.latents = torch.cat(segments, dim=2)
@@ -419,6 +469,9 @@ def _free_bytes(device):
     if device.type != "cuda":
         return None
     free_bytes, _ = torch.cuda.mem_get_info(device)
+    # Blocks freed by an earlier request stay in PyTorch's cache, not in mem_get_info.
+    free_bytes += torch.cuda.memory_reserved(device)
+    free_bytes -= torch.cuda.memory_allocated(device)
     if model_parallel_is_initialized():
         group = get_replica_group()
         if group.world_size > 1:

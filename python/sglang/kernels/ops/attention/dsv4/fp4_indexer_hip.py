@@ -12,12 +12,12 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
-    FP4_AMAX_FLOOR,
     rope_tail_fake_quant_fp4_row,
 )
 from sglang.kernels.ops.gemm.dsv4_indexer_head_weights_hip import (
     _reduce_scale_bf16_block,
 )
+from sglang.kernels.ops.quantization.fp4_fake_quant import FP4_AMAX_FLOOR
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     _ceil_ue8m0_exp,
     quantize_fp4_indexer_row,
@@ -187,13 +187,13 @@ def _guarded_pages(logical_width: int, page_table_bucket: int = 4) -> int:
 
 
 def rowgroup_table_columns(
-    max_context_len: int, ratio: int, page_table_bucket: int = 4
+    max_kv_len: int, ratio: int, page_table_bucket: int = 4
 ) -> int:
     """Block-table columns of every row-group launch at ``ratio``: one width for the
     server's life. AITER compiles the row-group kernel per block-table width and stride,
     and its bounded compile cache unloads an evicted variant that a captured CUDA graph
     still launches; widths that track the context would also compile on the request path."""
-    compressed_len = -(-max_context_len // ratio)
+    compressed_len = -(-max_kv_len // ratio)
     pages = -(-compressed_len // _KV_BLOCK_SIZE)
     return _guarded_pages(pages, page_table_bucket) + 4
 

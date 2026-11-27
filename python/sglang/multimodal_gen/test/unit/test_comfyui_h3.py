@@ -533,7 +533,6 @@ import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
     get_adapter_class,
-    registered_model_types,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     SGLDiffusionExecutor,
@@ -604,8 +603,6 @@ def test_worker_transformer_options_drop_comfy_objects() -> None:
 
 
 def test_minimax_h3_is_registered() -> None:
-    types = registered_model_types()
-    assert "minimax_h3" in types
     assert get_adapter_class("minimax_h3") is MiniMaxH3Adapter
     assert get_adapter_class("minimax_h3").pipeline_class_name == "MiniMaxH3Pipeline"
 
@@ -921,6 +918,7 @@ def test_per_frame_denoise_mask_overlays_only_video_targets():
     fk, branch = build_step_forward_kwargs(inputs, device=torch.device("cpu"))
     sigma_v = float(timestep.reshape(-1)[0] / 1000.0)
     unique = fk["unique_timesteps"]
+    assert fk["adaln_timestep_bits"] == tuple(unique.view(torch.int32).tolist())
     inverse = fk["inverse_indices"]
     target_ts = unique[inverse[branch.img_target_seq_idx]]
     frame0 = target_ts[:4]
@@ -1135,10 +1133,6 @@ from types import SimpleNamespace
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
     get_comfyui_checkpoint_spec,
 )
@@ -1146,16 +1140,6 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3Attention,
     _reorder_grouped_qkv_to_qkv,
 )
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
-
-
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
 def _concat_qkv_rows() -> torch.Tensor:
@@ -1187,8 +1171,8 @@ def test_comfyui_h3_spec_disables_grouped_qkv_reorder() -> None:
     assert MiniMaxH3DiTArchConfig().qkv_checkpoint_grouped is True
 
 
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_concat_qkv_attention_skips_grouped_weight_loader() -> None:
-    _ensure_single_process_parallel_runtime()
     concat_arch = MiniMaxH3DiTArchConfig(
         hidden_size=32,
         num_attention_heads=2,
@@ -1215,10 +1199,10 @@ def test_concat_qkv_attention_skips_grouped_weight_loader() -> None:
 @pytest.mark.parametrize("layout", [None, "native", "interleaved"])
 @pytest.mark.parametrize("grouped", [True, False])
 @pytest.mark.parametrize("diffusers", [True, False])
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_explicit_checkpoint_qkv_layout_overrides_inferred_layout(
     layout, grouped, diffusers
 ):
-    _ensure_single_process_parallel_runtime()
     arch = MiniMaxH3DiTArchConfig(
         hidden_size=32,
         num_attention_heads=2,
@@ -1246,10 +1230,10 @@ def test_explicit_checkpoint_qkv_layout_overrides_inferred_layout(
 
 
 @pytest.mark.parametrize("backend,out_features", [("comfy_kitchen", 12), ("jit", 16)])
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_integrated_h3_int8_loader_preserves_quantized_weights(
     tmp_path, monkeypatch, backend, out_features
 ):
-    _ensure_single_process_parallel_runtime()
     import json
     from types import SimpleNamespace
 
@@ -1500,3 +1484,118 @@ def test_comfyui_h3_rejects_bcg_with_offload_before_cuda_capture():
     )
     with pytest.raises(ValueError, match="copy-stream events"):
         MiniMaxH3ComfyUIStepStage.verify_input(None, SimpleNamespace(), args)
+
+
+def test_comfyui_h3_run_dit_captures_and_replays_same_bcg_signature(monkeypatch):
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+        live_packed_prompt,
+    )
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+        _signature_kwargs,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
+        MiniMaxH3ComfyUIRunState,
+        MiniMaxH3ComfyUIStepStage,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+        MiniMaxH3DenoisingStage,
+    )
+
+    class _DummyMiniMaxH3DiTModel(torch.nn.Module):
+        pass
+
+    class _RecordingRunner:
+        def __init__(self):
+            self.entries = {}
+            self.captures = 0
+            self.replays = 0
+            self.misses = 0
+            self.captured_kwargs = []
+            self.replay_text_lens = []
+
+        def capture(self, **kwargs):
+            branch = live_packed_prompt.get()
+            assert branch is not None
+            key = _signature_kwargs(kwargs)
+            if key in self.entries:
+                return True
+            self.entries[key] = kwargs
+            self.captures += 1
+            self.captured_kwargs.append(kwargs)
+            return True
+
+        def __call__(self, **kwargs):
+            branch = live_packed_prompt.get()
+            assert branch is not None
+            key = _signature_kwargs(kwargs)
+            if key not in self.entries:
+                self.misses += 1
+                raise AssertionError("BCG replay missed the graph just captured")
+            self.replays += 1
+            self.replay_text_lens.append(branch.text_len)
+            return torch.zeros(1), torch.zeros(1)
+
+    model = _DummyMiniMaxH3DiTModel()
+    runner = _RecordingRunner()
+    denoise_stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    denoise_stage._maybe_get_bcg_runner = lambda _m: runner
+    monkeypatch.setattr(
+        MiniMaxH3DenoisingStage, "_bcg_text_buckets", staticmethod(lambda: (64, 128))
+    )
+
+    step_stage = MiniMaxH3ComfyUIStepStage.__new__(MiniMaxH3ComfyUIStepStage)
+    step_stage.transformer = model
+    step_stage._cache_stage = denoise_stage
+
+    video, audio, context, timestep, sample_sigmas = _t2va_tensors()
+    batch = SimpleNamespace(enable_spectrum=False, is_warmup=False)
+
+    def _make_state_and_fk(text_len: int):
+        ctx = torch.randn(1, text_len, context.shape[-1])
+        inputs = comfyui_payload_to_branch_inputs(
+            video,
+            audio,
+            ctx,
+            minimax_payload={},
+            sample_sigmas=sample_sigmas,
+            timestep=timestep,
+        )
+        fk, branch = build_step_forward_kwargs(inputs, device=torch.device("cpu"))
+        state = MiniMaxH3ComfyUIRunState(
+            branch=branch,
+            used=inputs["used"],
+            orig_video_shape=inputs["orig_video_shape"],
+            padded_video_shape=inputs["padded_video_shape"],
+            sample_sigmas=sample_sigmas,
+        )
+        return state, inputs, fk
+
+    state, inputs, fk0 = _make_state_and_fk(8)
+    assert "local_embedding_layout" in fk0
+    step_stage._run_dit(batch, fk0, state)
+    assert live_packed_prompt.get() is None
+    assert runner.captures == 1
+    assert runner.replays == 1
+    assert runner.misses == 0
+    captured = runner.captured_kwargs[0]
+    assert captured["packed_seq_params"].get("bcg_live_bounds") is True
+    assert "local_embedding_layout" not in captured
+    assert "adaln_timestep_bits" not in captured
+
+    # Second step on the same run reuses the branch metadata and hits the graph.
+    state.steps_done = 1
+    fk1, _ = build_step_forward_kwargs(
+        inputs, branch=state.branch, device=torch.device("cpu")
+    )
+    step_stage._run_dit(batch, fk1, state)
+    assert runner.captures == 1
+    assert runner.replays == 2
+    assert len(state.packed_branches) == 1
+
+    # Different prompt length in the same bucket still hits the same graph.
+    state2, _inputs2, fk2 = _make_state_and_fk(12)
+    step_stage._run_dit(batch, fk2, state2)
+    assert runner.captures == 1
+    assert runner.replays == 3
+    assert runner.replay_text_lens == [8, 8, 12]
+    assert live_packed_prompt.get() is None

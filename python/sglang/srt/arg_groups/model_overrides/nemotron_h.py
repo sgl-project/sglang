@@ -9,15 +9,22 @@ from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolving_view,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
 
+# Omni checkpoints wrap a NemotronH language model: Nemotron 3 Nano Omni ships
+# as NemotronH_Nano_Omni_Reasoning_V3, Nemotron 3.5 Super VL as
+# NemotronH_Omni_Reasoning_V3.
+_OMNI_ARCHS = ("NemotronH_Nano_Omni_Reasoning_V3", "NemotronH_Omni_Reasoning_V3")
+
+
 @_register_for(
     "NemotronHForCausalLM",
     "NemotronHPuzzleForCausalLM",
-    "NemotronH_Omni_Reasoning_V3",
+    *_OMNI_ARCHS,
 )
 def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     """NemotronH quantization / MoE runner / attention backend defaults
@@ -37,9 +44,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     quantization = cfg.quantization
     if is_modelopt:
         language_config = (
-            model_config.hf_text_config
-            if model_arch == "NemotronH_Omni_Reasoning_V3"
-            else hf_config
+            model_config.hf_text_config if model_arch in _OMNI_ARCHS else hf_config
         )
         assert language_config.mlp_hidden_act == "relu2"
         if model_config.quantization == "modelopt":
@@ -74,9 +79,17 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     if has_w4a16_moe_layers:
         if cfg.moe_a2a_backend != "none":
             raise ValueError("W4A16_NVFP4 MoE layers require --moe-a2a-backend=none.")
-        if cfg.moe_runner_backend not in ("auto", "marlin"):
+        # CuTe DSL supports BF16 activations with NVFP4 weights when opted in.
+        use_cutedsl_w4a16 = (
+            cfg.moe_runner_backend == "flashinfer_cutedsl"
+            and get_platform().is_sm100
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
+        if cfg.moe_runner_backend not in ("auto", "marlin") and not use_cutedsl_w4a16:
             raise ValueError(
-                "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin."
+                "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin, "
+                "or flashinfer_cutedsl on SM100-family GPUs with "
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1."
             )
         if cfg.moe_runner_backend == "auto":
             overrides["moe_runner_backend"] = "marlin"
@@ -99,7 +112,9 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     elif (is_modelopt or model_config.quantization is None) and (
         cfg.moe_runner_backend == "auto"
     ):
-        if get_platform().is_sm100 and cfg.moe_a2a_backend == "none":
+        if get_platform().is_hip and quantization == "modelopt_fp8":
+            overrides["moe_runner_backend"] = "triton"
+        elif get_platform().is_sm100 and cfg.moe_a2a_backend == "none":
             overrides["moe_runner_backend"] = "flashinfer_trtllm"
             logger.info(
                 f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
@@ -117,7 +132,18 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Use marlin as MoE runner backend on SM80-SM90 for "
                 f"{model_arch} {model_config.quantization}"
             )
-        else:
+        elif (
+            model_arch == "NemotronH_Nano_Omni_Reasoning_V3"
+            and get_platform().is_sm90
+            and model_config.quantization is None
+        ):
+            # Nano Omni BF16 on Hopper keeps the auto (Triton) runner it had
+            # before it was registered here, which is faster than
+            # flashinfer_cutlass for it today.
+            pass
+        elif get_platform().is_cuda and get_platform().device_capability >= (8, 9):
+            # FlashInfer builds its CUTLASS MoE only for SM89 and newer CUDA
+            # GPUs; elsewhere (ROCm, SM80/SM86) keep the platform's auto runner.
             overrides["moe_runner_backend"] = "flashinfer_cutlass"
 
     if get_platform().is_blackwell and is_attention_backend_not_set(cfg):

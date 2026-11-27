@@ -1,7 +1,9 @@
 """Small real CUDA metadata fixtures; no model runner or model weights required."""
 
+from contextlib import nullcontext
 from dataclasses import fields
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -9,7 +11,7 @@ from sglang.kernels.ops.attention.dsv4.topk import topk_v2_plan_is_written
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 
 BS, NEXT_N, WIDTH, TOPK, POOL = 4, 6, 131072, 2048, 4
@@ -33,6 +35,9 @@ def make_backend(mode, seq, req, *, fusion=True):
     backend.device_sm_major = torch.cuda.get_device_capability()[0]
     backend.num_q_heads = 64
     backend.physical_page_size = 64
+    backend.real_page_span = 64
+    backend.dsa_shards_index_k = False
+    backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
     backend.dsa_index_topk = TOPK
     backend.dsa_index_kpool = POOL
     backend.speculative_num_draft_tokens = NEXT_N
@@ -57,7 +62,13 @@ def make_backend(mode, seq, req, *, fusion=True):
         "page_table": torch.zeros(BS * NEXT_N, WIDTH, device="cuda", dtype=torch.int32),
         "cu_seqlens_q": backend._arange_buf,
     }
-    with envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.override(fusion):
+    # fusion=False builds the ordinary-metadata reference on the same geometry.
+    unsupported = patch(
+        "sglang.srt.layers.attention.dsa.dsa_metadata_manager."
+        "kpool_metadata_fusion_supported",
+        return_value=False,
+    )
+    with nullcontext() if fusion else unsupported:
         backend._init_kpool_metadata_fusion()
     with envs.SGLANG_OPT_USE_TOPK_V2.override(True):
         apply_metadata(backend, mode, seq, req)

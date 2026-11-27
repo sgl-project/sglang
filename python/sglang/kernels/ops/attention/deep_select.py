@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     KERNEL_PATH,
     aligned_new_empty,
@@ -13,6 +14,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
     parallel_compile,
 )
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -20,6 +22,9 @@ if TYPE_CHECKING:
 # NOTE: see the comments in `entry.cuh`
 _INPUT_STRIDE_ALIGNMENT_BYTES = 128
 _OUTPUT_STRIDE_ALIGNMENT_BYTES = 32
+# Largest batch the opt-in multi-wave cluster path takes (SGLANG_DEEP_SELECT_MULTIWAVE):
+# measured to win on long-tailed rows up to 510 rows (DSV4.1 decode indexer, top-512).
+_MULTIWAVE_MAX_ROWS = 512
 _CLUSTER_MAX_TOPK = 1024
 _CLUSTER_MIN_VOCAB_SIZE = 16384
 
@@ -78,7 +83,7 @@ _NORMAL_CONFIGS: Dict[Tuple[torch.dtype, int], Tuple[_Config, ...]] = {
     (torch.float32, 1024): (_Config(1024, 512, 1, 8192, 4096, 3),),
     (torch.float32, 4096): (_Config(4096, 256, 1, 4096, 4096, 3),),
 }
-SUPPORTED_CUDA_ARCHS = ((9, 0), (10, 0), (10, 3))
+SUPPORTED_CUDA_ARCHS = ((9, 0), (10, 0), (10, 3), (10, 7))
 
 
 # (max rows, cluster size), widest first: the most rows each cluster size runs in one wave
@@ -130,6 +135,8 @@ def _jit_deep_select_module(
     if cluster_size == 1:
         configs = _NORMAL_CONFIGS[(value_dtype, max_topk)]
         host_dispatch = "TopkNormal"
+        if not sorted_index and (value_dtype, max_topk) == (torch.bfloat16, 512):
+            configs = (*configs, _Config(512, 256, 3, 4096, 2048, 2))
     else:
         # Upstream tunes the cluster kernel for bf16 at max_topk 1024 alone, so
         # the 512 and 1024 buckets share this module.
@@ -199,16 +206,21 @@ def get_output_stride_alignment_bytes() -> int:
 @cache_once
 def is_deep_select_supported() -> bool:
     """Return whether DeepSelect JIT supports a CUDA device."""
-    if torch.version.cuda is None or not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    return (major, minor) in SUPPORTED_CUDA_ARCHS
+    cuda = current_arch().cuda
+    return cuda is not None and cuda.capability in SUPPORTED_CUDA_ARCHS
 
 
 class _CachedModuleDispatch:
-    def __init__(self, mods: list[Module], rows: list[int], fallback: Module):
+    def __init__(
+        self,
+        mods: list[Module],
+        rows: list[int],
+        fallback: Module,
+        multiwave: Optional[Module] = None,
+    ):
         self._clusters = tuple(zip(rows, mods, strict=True))
         self._fallback = fallback
+        self._multiwave = multiwave
 
     def __call__(self, rows: int, vocab_size: int):
         # NOTE: deficiency: cluster + sorted_index supports up to 1M context
@@ -216,6 +228,9 @@ class _CachedModuleDispatch:
             for max_rows, module in self._clusters:
                 if rows <= max_rows:
                     return module
+            # Opt-in: several waves of one cluster tier instead of the one-CTA-per-row fallback.
+            if self._multiwave is not None and rows <= _MULTIWAVE_MAX_ROWS:
+                return self._multiwave
         return self._fallback
 
 
@@ -247,7 +262,12 @@ def _precompile(
         )
         for bucket, cluster_size in jobs
     )
-    return _CachedModuleDispatch(modules[1:], rows, modules[0])
+    # Tiers are in increasing rows per wave, so the last one runs the most rows
+    # at once. The env is read once per signature: later changes have no effect.
+    multiwave = (
+        modules[-1] if rows and envs.SGLANG_DEEP_SELECT_MULTIWAVE.get() else None
+    )
+    return _CachedModuleDispatch(modules[1:], rows, modules[0], multiwave)
 
 
 def topk(

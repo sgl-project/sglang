@@ -19,15 +19,24 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
 from sglang.srt.managers.utils import GenerationBatchResult, get_logprob_from_pp_outputs
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_pipeline import SamplingPipeline
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -263,23 +272,9 @@ def test_append_auxiliary_output_ignores_absent_outputs():
     assert append_auxiliary_output(output, None) is output
 
 
-def test_sampling_clears_stale_device_output_when_observer_produces_no_state():
-    runner = _model_runner_for_sampling_path()
-    runner.sampling_observer = SimpleNamespace(
-        is_active=lambda sampling_info: True,
-        after_sample=lambda state, token_ids: None,
-    )
-    runner._preprocess_logits = Mock(return_value=None)
-    runner.sampler = lambda *args, **kwargs: torch.tensor([3])
-    runner.ngram_embedding_manager = SimpleNamespace(
-        update_after_decode=lambda **kwargs: None
-    )
-    logits_output = LogitsProcessorOutput(
-        next_token_logits=torch.zeros(1, 4),
-        auxiliary_device_output=DeviceOutput(torch.tensor([99.0])),
-    )
-    forward_batch = SimpleNamespace(
-        sampling_info=object(),
+def _sampling_forward_batch():
+    return SimpleNamespace(
+        sampling_info=SamplingBatchInfo(vocab_size=4, device="cpu"),
         return_logprob=False,
         top_logprobs_nums=None,
         token_ids_logprobs=None,
@@ -288,14 +283,39 @@ def test_sampling_clears_stale_device_output_when_observer_produces_no_state():
         forward_mode=SimpleNamespace(is_decode=lambda: True),
     )
 
+
+def _sample(runner, observer, logits_output):
+    """Run ModelRunner.sample; returns the forward batch and the sampled tokens."""
+    sampled_tokens = torch.tensor([3])
+    runner.sampling_observer = observer
+    runner.sampling_pipeline = SamplingPipeline(
+        sampler=Mock(return_value=sampled_tokens), watermark=None
+    )
+    runner.ngram_embedding_manager = SimpleNamespace(
+        update_after_decode=lambda **kwargs: None
+    )
+    forward_batch = _sampling_forward_batch()
     ModelRunner.sample(runner, logits_output, forward_batch)
+    return forward_batch, sampled_tokens
+
+
+def test_sampling_clears_stale_device_output_when_observer_produces_no_state():
+    runner = _model_runner_for_sampling_path()
+    observer = SimpleNamespace(
+        is_active=lambda sampling_info: True,
+        before_grammar=Mock(return_value=None),
+        after_sample=Mock(),
+    )
+    logits_output = LogitsProcessorOutput(
+        next_token_logits=torch.zeros(1, 4),
+        auxiliary_device_output=DeviceOutput(torch.tensor([99.0])),
+    )
+
+    _sample(runner, observer, logits_output)
 
     assert logits_output.auxiliary_device_output is None
-    runner._preprocess_logits.assert_called_once_with(
-        logits_output,
-        forward_batch.sampling_info,
-        observer=runner.sampling_observer,
-    )
+    observer.before_grammar.assert_called_once()
+    observer.after_sample.assert_not_called()
 
 
 def test_sampling_publishes_observer_output_for_the_sampled_tokens():
@@ -303,35 +323,15 @@ def test_sampling_publishes_observer_output_for_the_sampled_tokens():
     device_output = DeviceOutput(torch.tensor([4.0]))
     observer = SimpleNamespace(
         is_active=Mock(return_value=True),
+        before_grammar=Mock(return_value=state),
         after_sample=Mock(return_value=device_output),
     )
     runner = _model_runner_for_sampling_path()
-    runner.sampling_observer = observer
-    runner._preprocess_logits = Mock(return_value=state)
-    sampled_tokens = torch.tensor([3])
-    runner.sampler = Mock(return_value=sampled_tokens)
-    runner.ngram_embedding_manager = SimpleNamespace(
-        update_after_decode=lambda **kwargs: None
-    )
     logits_output = LogitsProcessorOutput(next_token_logits=torch.zeros(1, 4))
-    forward_batch = SimpleNamespace(
-        sampling_info=object(),
-        return_logprob=False,
-        top_logprobs_nums=None,
-        token_ids_logprobs=None,
-        positions=torch.tensor([0]),
-        seq_lens=torch.tensor([1]),
-        forward_mode=SimpleNamespace(is_decode=lambda: True),
-    )
 
-    ModelRunner.sample(runner, logits_output, forward_batch)
+    forward_batch, sampled_tokens = _sample(runner, observer, logits_output)
 
     assert logits_output.auxiliary_device_output is device_output
-    runner._preprocess_logits.assert_called_once_with(
-        logits_output,
-        forward_batch.sampling_info,
-        observer=observer,
-    )
     observer.is_active.assert_called_once_with(forward_batch.sampling_info)
     observer.after_sample.assert_called_once_with(state, sampled_tokens)
 
@@ -367,99 +367,6 @@ def test_custom_sampling_path_can_enable_sampling_observer():
     runner.sampling_observer = observer
 
     assert runner.sampling_observer is observer
-
-
-@pytest.mark.parametrize("has_inactive_observer", [False, True])
-def test_sampling_without_active_observer_preserves_preprocess_override(
-    has_inactive_observer,
-):
-    observer = (
-        SimpleNamespace(is_active=Mock(return_value=False))
-        if has_inactive_observer
-        else None
-    )
-    runner = _model_runner_for_sampling_path()
-    runner.sampling_observer = observer
-    runner._preprocess_logits = Mock(
-        side_effect=lambda logits_output, sampling_info: None
-    )
-    runner.sampler = Mock(return_value=torch.tensor([3]))
-    runner.ngram_embedding_manager = SimpleNamespace(
-        update_after_decode=lambda **kwargs: None
-    )
-    logits_output = LogitsProcessorOutput(next_token_logits=torch.zeros(1, 4))
-    forward_batch = SimpleNamespace(
-        sampling_info=object(),
-        return_logprob=False,
-        top_logprobs_nums=None,
-        token_ids_logprobs=None,
-        positions=torch.tensor([0]),
-        seq_lens=torch.tensor([1]),
-        forward_mode=SimpleNamespace(is_decode=lambda: True),
-    )
-
-    ModelRunner.sample(runner, logits_output, forward_batch)
-
-    runner._preprocess_logits.assert_called_once_with(
-        logits_output, forward_batch.sampling_info
-    )
-    if observer is not None:
-        observer.is_active.assert_called_once_with(forward_batch.sampling_info)
-
-
-def test_preprocess_logits_without_observer_uses_standard_path():
-    runner = object.__new__(ModelRunner)
-    logits_output = LogitsProcessorOutput(next_token_logits=torch.zeros(1, 4))
-    grammar_mask = object()
-    sampling_info = SimpleNamespace(
-        grammar_mask=grammar_mask,
-        update_regex_vocab_mask=Mock(),
-        apply_logits_bias=Mock(),
-        apply_logits_bias_with_observer=Mock(),
-    )
-
-    state = ModelRunner._preprocess_logits(
-        runner,
-        logits_output,
-        sampling_info,
-    )
-
-    assert state is None
-    sampling_info.update_regex_vocab_mask.assert_called_once_with()
-    sampling_info.apply_logits_bias.assert_called_once_with(
-        logits_output.next_token_logits
-    )
-    sampling_info.apply_logits_bias_with_observer.assert_not_called()
-    assert sampling_info.grammar_mask is None
-
-
-def test_active_observer_uses_observer_logits_preprocessing():
-    runner = object.__new__(ModelRunner)
-    observer = SimpleNamespace()
-    observer_state = object()
-    logits_output = LogitsProcessorOutput(next_token_logits=torch.zeros(1, 4))
-    sampling_info = SimpleNamespace(
-        grammar_mask=object(),
-        update_regex_vocab_mask=Mock(),
-        apply_logits_bias=Mock(),
-        apply_logits_bias_with_observer=Mock(return_value=observer_state),
-    )
-
-    state = ModelRunner._preprocess_logits(
-        runner,
-        logits_output,
-        sampling_info,
-        observer=observer,
-    )
-
-    assert state is observer_state
-    sampling_info.update_regex_vocab_mask.assert_called_once_with()
-    sampling_info.apply_logits_bias.assert_not_called()
-    sampling_info.apply_logits_bias_with_observer.assert_called_once_with(
-        logits_output.next_token_logits,
-        observer=observer,
-    )
-    assert sampling_info.grammar_mask is None
 
 
 def test_scheduler_copies_auxiliary_output_for_non_overlap_results():
@@ -503,65 +410,6 @@ def test_scheduler_preserves_pipeline_parallel_output_for_transport():
     scheduler.device_module.Event.assert_not_called()
 
 
-def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
-    device_output = DeviceOutput(torch.tensor([1.0]))
-    result = GenerationBatchResult(
-        logits_output=LogitsProcessorOutput(
-            next_token_logits=None,
-            auxiliary_device_output=device_output,
-        ),
-        next_token_ids=torch.tensor([7]),
-    )
-    copy_done = CopyDone()
-    scheduler = object.__new__(Scheduler)
-    scheduler.scheduler_stage_metrics = None
-    scheduler.metrics_reporter = Mock()
-    scheduler.forward_ct = 0
-    scheduler.processed_tokens_counter = 0
-    scheduler._sched_idled = False
-    scheduler.scripted_scheduler_hook = None
-    scheduler.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
-    scheduler.forward_sleep_time = None
-    scheduler.disaggregation_mode = None
-    scheduler.is_generation = True
-    scheduler.enable_overlap = False
-    scheduler.enable_pdmux = True
-    scheduler.enable_unified_cache_external_linker = False
-    scheduler.tp_worker = SimpleNamespace(
-        forward_batch_split_prefill=Mock(return_value=result)
-    )
-    scheduler.future_map = object()
-    scheduler._relay_forward_payload = Mock()
-    scheduler.device_module = SimpleNamespace(Event=Mock(return_value=copy_done))
-    scheduler.attn_dp_enabled = False
-    batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(
-            is_prebuilt=lambda: False,
-            is_split_prefill=lambda: True,
-        ),
-        split_index=0,
-        reqs=[],
-        req_pool_indices=torch.tensor([3]),
-        input_ids=torch.tensor([5]),
-        extend_num_tokens=1,
-        return_logprob=False,
-        return_hidden_states=False,
-    )
-
-    with (
-        published_topology(),
-        patch(
-            "sglang.srt.managers.scheduler.resolve_forward_inputs"
-        ) as resolve_forward_inputs,
-    ):
-        output_result = Scheduler.run_batch(scheduler, batch)
-
-    resolve_forward_inputs.assert_called_once_with(batch, scheduler.future_map)
-    assert output_result is result
-    assert result.auxiliary_host_output.values.tolist() == [1.0]
-    assert copy_done.record_count == 1
-
-
 def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     host_output = HostOutput(torch.tensor([1.0]))
     copy_done = SimpleNamespace(synchronize=Mock())
@@ -572,13 +420,12 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         copy_done=copy_done,
         auxiliary_host_output=host_output,
     )
-    req = SimpleNamespace(
+    req = FakeReq(
         output_ids=[],
         finished_len=None,
         to_finish=None,
         finished_reason=None,
         discard_output_reason=None,
-        inflight_middle_chunks=0,
         pending_bootstrap=False,
         return_logprob=False,
         return_sampling_mask=False,
@@ -590,6 +437,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     )
     batch = SimpleNamespace(
         reqs=[req],
+        chunked_req=None,
         spec_info=None,
         prefill_stats=None,
         dp_cooperation_info=None,
@@ -601,18 +449,21 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         move_logprobs_to_cpu=Mock(),
         consume_auxiliary_output=Mock(),
         snapshot_auxiliary_output_starts=snapshot_auxiliary_output_starts,
+        _maybe_collect_customized_info=Mock(),
     )
     scheduler = SimpleNamespace(
         batch_result_processor=processor,
         spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
         tree_cache=object(),
-        disagg_prefill_inflight_queue=[],
+        disagg_prefill_transfer_queue=IndexedReqList(ListKind.PD_SENDING),
+        prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         checkpoint_disagg_prefill=Mock(),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
         maybe_send_health_check_signal=Mock(),
     )
 
+    move([req], scheduler.prefill_launched_reqs)
     SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
         scheduler,
         batch,
@@ -632,9 +483,8 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
 
 
 def test_logprob_only_reuses_preprocessing_without_observer_lifecycle():
-    runner = object.__new__(ModelRunner)
-    runner._preprocess_logits = Mock()
-    runner.sampler = SimpleNamespace(compute_logprobs_only=Mock())
+    sampler = SimpleNamespace(compute_logprobs_only=Mock())
+    pipeline = SamplingPipeline(sampler=sampler, watermark=None)
     logits_output = LogitsProcessorOutput(next_token_logits=torch.zeros(1, 4))
     sampling_info = object()
     forward_batch = SimpleNamespace(
@@ -643,15 +493,21 @@ def test_logprob_only_reuses_preprocessing_without_observer_lifecycle():
         token_ids_logprobs=[1],
     )
 
-    ModelRunner.compute_logprobs_only(runner, logits_output, forward_batch)
+    with patch(
+        "sglang.srt.sampling.sampling_pipeline._adjust_before_watermark"
+    ) as adjust:
+        pipeline.compute_logprobs_only(logits_output, forward_batch)
 
-    runner._preprocess_logits.assert_called_once_with(logits_output, sampling_info)
-    runner.sampler.compute_logprobs_only.assert_called_once()
+    adjust.assert_called_once_with(
+        logits_output.next_token_logits, sampling_info, observer=None
+    )
+    sampler.compute_logprobs_only.assert_called_once()
 
 
 def test_logprob_only_clears_stale_output_before_early_return():
     runner = object.__new__(ModelRunner)
     runner.sampler = SimpleNamespace(compute_logprobs_only=Mock())
+    runner.sampling_pipeline = SamplingPipeline(sampler=runner.sampler, watermark=None)
     logits_output = LogitsProcessorOutput(
         next_token_logits=None,
         auxiliary_device_output=DeviceOutput(torch.tensor([99.0])),

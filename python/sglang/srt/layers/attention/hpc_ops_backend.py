@@ -192,10 +192,9 @@ class HPCOpsAttnBackend(AttentionBackend):
                 f"num_q_heads={num_q_heads}, num_kv_heads={num_kv_heads}."
             )
 
-        self.max_context_len = model_runner.model_config.context_len
-        self.max_num_pages = (
-            self.max_context_len + self.page_size - 1
-        ) // self.page_size
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.req_to_token_pool.row_width
+        self.max_num_pages = (self.max_kv_len + self.page_size - 1) // self.page_size
         self.device = model_runner.device
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -275,7 +274,7 @@ class HPCOpsAttnBackend(AttentionBackend):
 
             self._decode_task_map = hpc.get_attention_decode_task_workspace(
                 max_bs,
-                self.max_context_len,
+                self.max_kv_len,
                 self.num_kv_heads,
                 min_process_len=_DYNAMIC_SCHED_MIN_PROCESS_LEN,
             )
@@ -357,7 +356,7 @@ class HPCOpsAttnBackend(AttentionBackend):
             )
 
     def _paged_kv_buffers(self, layer: RadixAttention):
-        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
         k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
         v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
         return k_cache, v_cache
@@ -551,7 +550,7 @@ class HPCOpsAttnBackend(AttentionBackend):
         self._check_layer_supported(layer)
 
         if save_kv_cache and k is not None:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer,
                 KVWriteLoc(forward_batch.out_cache_loc),
                 k,
@@ -605,7 +604,7 @@ class HPCOpsAttnBackend(AttentionBackend):
         self._check_layer_supported(layer)
 
         if save_kv_cache and k is not None:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer,
                 KVWriteLoc(forward_batch.out_cache_loc),
                 k,
@@ -671,7 +670,7 @@ class HPCOpsAttnBackend(AttentionBackend):
         """Graph-splitting wrapper for the fused QKNorm+RoPE+FP8-quant+StoreKV op.
 
         Like ``RadixAttention._eager_attention``, this runs eagerly between captured
-        prefill-graph segments (at capture and at every replay), so the Python
+        prefill-graph segments (at every replay), so the Python
         hand-off of the dynamic Q scales to the following attention op stays
         alive. ``out_q`` is preallocated by the captured segment and mutated in
         place, which is what stitches the surrounding graph segments together.

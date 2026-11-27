@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Callable
 import torch
 import torch.distributed as dist
 
+from sglang.kernels.arch import current_arch
+
 if TYPE_CHECKING:
     from sglang.srt.layers.communication.sp_collective_gemm_workspace import (
         SPCollectiveGemmWorkspace,
@@ -96,7 +98,7 @@ def _check_inputs(x, weight, group):
         raise ValueError(
             "CUTLASS SP requires CUDA bf16/fp16 [M,K], contiguous [N,K], K%8=N%128=0"
         )
-    if torch.cuda.get_device_capability(x.device)[0] != 10:
+    if not current_arch().is_sm(10):
         raise ValueError("CUTLASS SP collectives require NVLink Blackwell GPUs")
     world = dist.get_world_size(group)
     if world not in (2, 4, 8):

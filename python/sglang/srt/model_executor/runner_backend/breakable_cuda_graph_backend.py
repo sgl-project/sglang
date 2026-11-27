@@ -18,17 +18,20 @@ No torch.compile.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
+    BaseBreakableGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import (
     DedupedCudaGraphMixin,
@@ -39,6 +42,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     enable_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.hicache_graph_events import (
+    HiCacheGraphEvents,
+    wait_for_layer_loads,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
     get_or_create_global_graph_memory_pool,
@@ -46,7 +53,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_replay_scope,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import is_cuda, is_npu, is_xpu
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -57,7 +64,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
-class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend):
     """Segmented capture: graphs break at attention / mamba boundaries;
     attention metadata is recomputed at replay outside captured segments.
     """
@@ -68,6 +75,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
+        enable_hicache_event_capture: bool = False,
     ) -> None:
         self._cuda_graph_runner = cuda_graph_runner
         self._model_runner = cuda_graph_runner.model_runner
@@ -79,18 +87,38 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
+        self._enable_hicache_event_capture = enable_hicache_event_capture
+        self._hicache_graph_events = None
+        # Dedup shares executables, so it must keep the ordinary load barrier.
+        if (
+            enable_hicache_event_capture
+            and is_cuda()
+            and not envs.SGLANG_ENABLE_CUDA_GRAPH_DEDUP.get()
+        ):
+            self._hicache_graph_events = HiCacheGraphEvents(
+                self._model_runner.token_to_kv_pool
+            )
         self._shared_output_buffer: Optional[Any] = None
         self._precarve = GraphPoolPrecarve()
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+            enable=enable_memory_saver and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         )
+        self._segment_capture: Optional[Callable[..., Any]] = None
         if (
             self._memory_saver_adapter is not None
             and self._memory_saver_adapter.enabled
         ):
-            raise NotImplementedError(
-                "Breakable CUDA graph is not compatible with memory saver mode"
+            if is_xpu() or is_npu():
+                # The memory saver's pauseable capture wraps torch.cuda.graph only.
+                raise NotImplementedError(
+                    "Breakable CUDA graph is not compatible with memory saver "
+                    "mode on XPU or NPU"
+                )
+            self._segment_capture = partial(
+                self._memory_saver_adapter.cuda_graph,
+                tag=GPU_MEMORY_TYPE_CUDA_GRAPH,
+                # replays read capture-time state from the pool, so a pause must back it up
+                enable_cpu_backup=True,
             )
 
     @contextmanager
@@ -126,7 +154,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        graph = BreakableCUDAGraph(self.deduped_cuda_graph)
+        graph = BreakableCUDAGraph(
+            self.deduped_cuda_graph, hicache_graph_events=self._hicache_graph_events
+        )
         size = shape_key.size
         if self._shared_output_buffer is None:
             capacity_rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(
@@ -139,12 +169,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             )
         buffer = self._shared_output_buffer
         with (
+            self._hicache_graph_events.capture_scope()
+            if self._hicache_graph_events is not None
+            else nullcontext(),
             graph_pool_capture_scope(),
             BreakableCUDAGraphCapture(
                 cuda_graph=graph,
                 pool=self._pool,
                 stream=self._capture_stream,
-                barrier_fn=self._tp_group.barrier,
+                segment_capture=self._segment_capture,
             ),
         ):
             self._precarve.mint()
@@ -277,6 +310,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        if self._enable_hicache_event_capture and self._hicache_graph_events is None:
+            wait_for_layer_loads(self._model_runner.token_to_kv_pool)
         with graph_pool_replay_scope():
             self._graphs[shape_key].replay()
         return self._outputs[shape_key]

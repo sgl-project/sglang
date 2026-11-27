@@ -6,8 +6,8 @@ import torch
 
 import sglang.srt.layers.radix_attention as radix_attention_module
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -25,11 +25,11 @@ class TestMiniMaxSparseNvfp4IdleOutput(CustomTestCase):
     """
 
     def test_idle_output_follows_v_dtype(self):
-        from sglang.srt.layers.attention.minimax_sparse_nvfp4_backend import (
-            MiniMaxSparseNvfp4AttnBackend,
+        from sglang.srt.layers.attention.minimax_sparse import (
+            MiniMaxMSAV1AttnBackend,
         )
 
-        backend = MiniMaxSparseNvfp4AttnBackend.__new__(MiniMaxSparseNvfp4AttnBackend)
+        backend = MiniMaxMSAV1AttnBackend.__new__(MiniMaxMSAV1AttnBackend)
         num_tokens, heads, head_dim = 8, 4, 128
         q = torch.zeros(num_tokens, heads, head_dim, dtype=torch.float8_e4m3fn)
         k = torch.zeros(num_tokens, 1, head_dim, dtype=torch.bfloat16)
@@ -47,9 +47,9 @@ class TestMiniMaxSparseNvfp4IdleOutput(CustomTestCase):
 
 class TestMiniMaxSparseNvfp4DeviceLengths(CustomTestCase):
     def test_prefill_with_prefix_does_not_need_cpu_sequence_lengths(self):
-        from sglang.srt.layers.attention import minimax_sparse_nvfp4_backend as module
+        from sglang.srt.layers.attention.minimax_sparse import msa_v1_backend as module
 
-        backend = object.__new__(module.MiniMaxSparseNvfp4AttnBackend)
+        backend = object.__new__(module.MiniMaxMSAV1AttnBackend)
         backend.req_to_token = torch.arange(2048).reshape(2, 1024)
         backend._msa_v1_qmul4_available = True
         backend._msa_v1_num_index_heads = 4

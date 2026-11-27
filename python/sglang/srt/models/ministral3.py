@@ -4,6 +4,8 @@ import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import (
     LlamaAttention,
@@ -11,7 +13,6 @@ from sglang.srt.models.llama import (
     LlamaForCausalLM,
     LlamaModel,
 )
-from sglang.srt.utils import add_prefix, make_pp_layers
 
 
 def _get_llama_4_attn_scale(
@@ -59,13 +60,6 @@ class Ministral3Attention(LlamaAttention):
         )
         # Ministral3 specific: llama 4 style scaling beta
         self.llama_4_scaling_beta = config.rope_parameters.get("llama_4_scaling_beta")
-
-        # sliding window
-        self.sliding_window = getattr(config, "sliding_window", None)
-        if self.sliding_window is not None:
-            # Update RadixAttention with sliding window if needed
-            # currently RadixAttention in sglang handles this mostly via logic in forward/flashinfer
-            pass
 
     def forward(
         self,

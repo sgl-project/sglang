@@ -4,7 +4,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.lora.dense.lora_tuning_config import get_lora_shrink_config
 from sglang.srt.environ import envs
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo, csgmv_segment_grid_size
 from sglang.srt.utils import cached_triton_kernel
 
 
@@ -83,7 +83,7 @@ def _chunked_lora_shrink_kernel(
     s_offset_logical = tl.arange(0, BLOCK_M) + seg_start
     s_offset_physical = tl.load(
         permutation + s_offset_logical, mask=s_offset_logical < seg_end, other=0
-    )
+    ).to(tl.int64)
 
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     k_offset = tl.arange(0, BLOCK_K)
@@ -183,7 +183,7 @@ def _chunked_lora_shrink_split_k_kernel(
     s_offset_logical = tl.arange(0, BLOCK_M) + seg_start
     s_offset_physical = tl.load(
         permutation + s_offset_logical, mask=s_offset_logical < seg_end, other=0
-    )
+    ).to(tl.int64)
 
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     split_id = tl.program_id(2)
@@ -302,12 +302,7 @@ def chunked_sgmv_lora_shrink_forward(
     K = weights.shape[2]
     assert x.shape[-1] == K
 
-    num_segments = batch_info.num_segments
-    segment_grid = (
-        batch_info.weight_indices.shape[0]
-        if batch_info.use_cuda_graph
-        else num_segments
-    )
+    segment_grid = csgmv_segment_grid_size(batch_info, num_tokens=S)
     grid = (
         triton.cdiv(N, BLOCK_N),
         segment_grid,

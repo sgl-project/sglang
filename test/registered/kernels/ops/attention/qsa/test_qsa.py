@@ -36,8 +36,9 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.mem_cache_utils import routed
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -106,16 +107,16 @@ def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
     [((12, 0), True), ((12, 1), False), ((10, 0), False)],
 )
 def test_is_sm120_matches_exact_capability(monkeypatch, capability, expected):
-    from sglang.srt.utils import common
+    from sglang.srt.utils import device as device_utils
 
-    common.is_sm120.cache_clear()
-    monkeypatch.setattr(common, "is_cuda", lambda: True)
+    device_utils.is_sm120.cache_clear()
+    monkeypatch.setattr(device_utils, "is_cuda", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
 
     try:
-        assert common.is_sm120() is expected
+        assert device_utils.is_sm120() is expected
     finally:
-        common.is_sm120.cache_clear()
+        device_utils.is_sm120.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -123,16 +124,16 @@ def test_is_sm120_matches_exact_capability(monkeypatch, capability, expected):
     [((12, 1), True), ((12, 0), False), ((10, 0), False)],
 )
 def test_is_sm121_matches_exact_capability(monkeypatch, capability, expected):
-    from sglang.srt.utils import common
+    from sglang.srt.utils import device as device_utils
 
-    common.is_sm121.cache_clear()
-    monkeypatch.setattr(common, "is_cuda", lambda: True)
+    device_utils.is_sm121.cache_clear()
+    monkeypatch.setattr(device_utils, "is_cuda", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
 
     try:
-        assert common.is_sm121() is expected
+        assert device_utils.is_sm121() is expected
     finally:
-        common.is_sm121.cache_clear()
+        device_utils.is_sm121.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -364,7 +365,7 @@ def test_qsa_glue_fetches_indexer_metadata_without_model_unwrap():
         get_indexer_metadata=lambda layer_id, forward_batch: f"meta-{layer_id}",
         token_to_kv_pool=None,
         req_to_token_pool=None,
-        kv_index_translator=None,
+        runner_ids=None,
         needs_cpu_seq_lens=True,
     )
     hybrid = HybridLinearAttnBackend(
@@ -416,8 +417,8 @@ def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
     )
     runner = SimpleNamespace(
         device="cpu",
-        token_to_kv_pool=pool,
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        token_to_kv_pool=routed(pool),
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token, row_width=64),
         model_config=SimpleNamespace(
             context_len=64,
             hf_config=SimpleNamespace(indexer_compress_ratio=COMPRESS_RATIO),
@@ -428,7 +429,7 @@ def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
     )
     full_out_cache_loc = loc_base + torch.arange(bs * steps, dtype=torch.int32)
     forward_batch = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         req_to_token_pool=runner.req_to_token_pool,
         batch_size=bs,
         req_pool_indices=torch.arange(bs, dtype=torch.int32),
@@ -439,6 +440,17 @@ def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
         forward_mode=ForwardMode.DECODE,
     )
     return backend, forward_batch, pool
+
+
+@pytest.mark.parametrize("verify", [False, True], ids=["draft-extend", "target-verify"])
+def test_qsa_speculative_row_bound(verify):
+    from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+    # Draft-extend lengths already include four draft tokens: 16 + 4 = 20.
+    spec = SimpleNamespace(draft_token_num=4) if verify else EagleDraftExtendInput()
+    lengths = torch.tensor([8, 16] if verify else [12, 20], dtype=torch.int32)
+    batch = SimpleNamespace(seq_lens_cpu=lengths, spec_info=spec)
+    assert QwenSparseAttnBackend._speculative_max_row_length(batch, lengths) == 20
 
 
 def test_qsa_cuda_graph_pads_dynamic_draft_extend_rows():
@@ -551,6 +563,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
         )
         indexer = SimpleNamespace(
             layer_id=0,
+            index_n_heads=1,
             project_qk=lambda hidden, rope_positions, **kwargs: (
                 hidden.reshape(-1, 1, 2),
                 hidden.reshape(-1, 1, 2),
@@ -610,7 +623,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
             pass
 
     pool = Pool()
-    backend.token_to_kv_pool = pool
+    backend.token_to_kv_pool = routed(pool)
     layer = SimpleNamespace(tp_q_head_num=1, head_dim=2, layer_id=0, scaling=1.0)
     topk = torch.zeros(15, 3, dtype=torch.int32, device="cuda")
 
@@ -620,7 +633,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
-            token_to_kv_pool=pool,
+            token_to_kv_pool=routed(pool),
             out_cache_loc=torch.arange(num_rows, dtype=torch.int32, device="cuda"),
             extend_seq_lens=torch.tensor([15], dtype=torch.int32, device="cuda"),
             extend_seq_lens_cpu=[15],
@@ -639,6 +652,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
 
 def _make_paged_extend_backend():
     metadata = SimpleNamespace(
+        is_cuda_graph=False,
         token_to_batch_idx=torch.zeros(3, dtype=torch.int32),
         sequence_lengths=torch.tensor([8], dtype=torch.int32),
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
@@ -658,7 +672,7 @@ def _make_paged_extend_backend():
 
     layer = SimpleNamespace(tp_q_head_num=1, head_dim=2, layer_id=0, scaling=1.0)
     pool = Pool()
-    backend.token_to_kv_pool = pool
+    backend.token_to_kv_pool = routed(pool)
     return backend, pool, layer
 
 
@@ -679,7 +693,7 @@ def test_qsa_paged_extend_trims_padding_rows_and_restores_output(monkeypatch):
         values = torch.arange(num_rows * 2, dtype=torch.float32).reshape(num_rows, 2)
         batch = SimpleNamespace(
             forward_mode=mode,
-            token_to_kv_pool=pool,
+            token_to_kv_pool=routed(pool),
             out_cache_loc=torch.arange(num_rows, dtype=torch.int32),
         )
         return backend.forward_extend(
@@ -702,7 +716,7 @@ def test_qsa_paged_extend_trims_padding_rows_and_restores_output(monkeypatch):
     short_q = torch.zeros(2, 2, dtype=torch.float32)
     batch = SimpleNamespace(
         forward_mode=ForwardMode.TARGET_VERIFY,
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         out_cache_loc=torch.arange(2, dtype=torch.int32),
     )
     try:
@@ -739,8 +753,8 @@ def _make_qsa_runner_and_pool(num_reqs=4):
     )
     runner = SimpleNamespace(
         device="cpu",
-        token_to_kv_pool=pool,
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        token_to_kv_pool=routed(pool),
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token, row_width=64),
         model_config=SimpleNamespace(
             context_len=64,
             hf_config=SimpleNamespace(indexer_compress_ratio=COMPRESS_RATIO),
@@ -752,7 +766,7 @@ def _make_qsa_runner_and_pool(num_reqs=4):
 def test_qsa_idle_metadata_builds_empty_rows():
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     idle_batch = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         req_to_token_pool=req_pool,
         req_pool_indices=torch.empty(0, dtype=torch.int32),
         seq_lens=torch.empty(0, dtype=torch.int32),
@@ -787,7 +801,7 @@ def test_qsa_decode_requires_one_query_row_per_request():
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     backend = QwenSparseAttnBackend(runner)
     forward_batch = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         req_to_token_pool=req_pool,
         req_pool_indices=torch.tensor([1, 3], dtype=torch.int32),
         seq_lens=torch.tensor([8, 16], dtype=torch.int32),
@@ -814,13 +828,14 @@ def test_qsa_extend_rope_matrix_uses_mrope_coordinates():
     flat = torch.arange(num_tokens, dtype=torch.int64)
     mrope = torch.stack([flat, flat + 100, flat + 200])
     forward_batch = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         req_to_token_pool=req_pool,
         req_pool_indices=torch.tensor([1], dtype=torch.int32),
         seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
         seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int32),
         forward_mode=ForwardMode.EXTEND,
         extend_seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        extend_seq_lens_cpu=[num_tokens],
         extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
         positions=flat,
         mrope_positions=mrope,
@@ -839,7 +854,7 @@ def test_qsa_speculative_pseudo_extend_is_rejected():
     backend = QwenSparseAttnBackend(runner)
     for original_mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2):
         forward_batch = SimpleNamespace(
-            token_to_kv_pool=pool,
+            token_to_kv_pool=routed(pool),
             req_to_token_pool=req_pool,
             req_pool_indices=torch.tensor([1], dtype=torch.int32),
             seq_lens=torch.tensor([10], dtype=torch.int32),
@@ -1082,7 +1097,7 @@ def test_qsa_prefill_mqa_inputs_gather_all_compressed_keys_at_once(dtype):
         token_to_batch_idx=rows.cuda(),
         token_slot_table=token_slot_table,
         out_cache_loc=torch.empty(0, dtype=torch.int32, device="cuda"),
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         compress_ratio=COMPRESS_RATIO,
         block_topk=BLOCK_TOPK,
         prefill_sequence_lengths_cpu=tuple(lengths),
@@ -1121,13 +1136,14 @@ def test_qsa_extend_metadata_carries_host_sequence_lengths():
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     backend = QwenSparseAttnBackend(runner)
     forward_batch = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         req_to_token_pool=req_pool,
         req_pool_indices=torch.tensor([1, 2], dtype=torch.int32),
         seq_lens=torch.tensor([8, 6], dtype=torch.int32),
         seq_lens_cpu=torch.tensor([8, 6], dtype=torch.int32),
         forward_mode=ForwardMode.EXTEND,
         extend_seq_lens=torch.tensor([4, 6], dtype=torch.int32),
+        extend_seq_lens_cpu=[4, 6],
         extend_prefix_lens=torch.tensor([4, 0], dtype=torch.int32),
         positions=torch.tensor([4, 5, 6, 7, 0, 1, 2, 3, 4, 5]),
         mrope_positions=None,
@@ -1138,6 +1154,70 @@ def test_qsa_extend_metadata_carries_host_sequence_lengths():
     backend.init_forward_metadata(forward_batch)
     indexer = backend.forward_metadata.indexer_metadata
     assert indexer.prefill_sequence_lengths_cpu == (8, 6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_qsa_extend_rows_take_the_host_lens_without_a_sync():
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        _extend_token_to_batch_idx,
+    )
+
+    lens = [4, 0, 7, 1]
+    device_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    want = _extend_token_to_batch_idx(device_lens, None, len(lens), "cuda")
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        got = _extend_token_to_batch_idx(device_lens, lens, len(lens), "cuda")
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert torch.equal(got, want)
+    assert got.tolist() == [0] * 4 + [2] * 7 + [3]
+    # Host lens that do not line up with the device tensor keep the device read.
+    short = _extend_token_to_batch_idx(device_lens, lens[:2], len(lens), "cuda")
+    assert torch.equal(short, want)
+
+
+def test_qsa_mtp_extend_capture_seeds_last_rows_without_a_sync():
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QSAMTPSharedSparseIndices,
+        QwenSparseAttnBackend,
+        _extend_token_to_batch_idx,
+    )
+
+    lens, pool_ids, layer_id = [4, 0, 7, 1], [5, 2, 9, 3], 3
+    rows = sum(lens)
+    topk = torch.arange(rows * 6, dtype=torch.int32, device="cuda").view(rows, 6)
+    seqlens = torch.arange(100, 100 + rows, dtype=torch.int32, device="cuda")
+    row_map = _extend_token_to_batch_idx(
+        torch.tensor(lens, device="cuda"), lens, len(lens), "cuda"
+    )
+    metadata = SimpleNamespace(
+        is_cuda_graph=False,
+        req_pool_indices=torch.tensor(pool_ids, device="cuda"),
+        get_token_to_batch_idx=lambda: row_map,
+        get_seqlens_expanded=lambda: seqlens,
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_draft_extend_v2=lambda: False)
+    )
+    state = QSAMTPSharedSparseIndices(
+        layer_ids=[layer_id], num_requests=16, token_topk=6, tail_width=2, device="cuda"
+    )
+    backend = SimpleNamespace(_mtp_shared_sparse_indices=state)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        QwenSparseAttnBackend.capture_mtp_sparse_indices(
+            backend, topk, forward_batch, layer_id, metadata=metadata
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    # Each request with rows is seeded from its last row; the empty one is untouched.
+    for pool_id, last in ((5, 3), (9, 10), (3, 11)):
+        assert torch.equal(state.indices[0, pool_id, :6], topk[last])
+        assert state.captured_len[0, pool_id].item() == 100 + last
+    assert state.indices[0, 2].eq(0).all() and state.captured_len[0, 2].item() == 1
 
 
 def test_qsa_row_ranges_do_not_cross_sequences():
@@ -1387,7 +1467,7 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
                     (num_rows, 1), dtype=torch.int32, device=device
                 ),
                 out_cache_loc=torch.zeros(num_rows, dtype=torch.int64, device=device),
-                token_to_kv_pool=pool,
+                token_to_kv_pool=routed(pool),
                 compress_ratio=ratio,
                 block_topk=512,
                 req_pool_indices=torch.zeros(
@@ -1544,7 +1624,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail(seq_offset):
                 (num_rows, 1), dtype=torch.int32, device=device
             ),
             out_cache_loc=torch.zeros(num_rows, dtype=torch.int64, device=device),
-            token_to_kv_pool=pool,
+            token_to_kv_pool=routed(pool),
             compress_ratio=ratio,
             block_topk=512,
             req_pool_indices=torch.zeros(num_rows, dtype=torch.int32, device=device),
@@ -2046,7 +2126,7 @@ def _qsa_prefix_case(cache_dtype, prefix_lens, extend_lens, *, heads=(4, 2), dim
         get_value_buffer=lambda layer_id: v_cache,
     )
     backend = QwenSparseAttnBackend()
-    backend.token_to_kv_pool = pool
+    backend.token_to_kv_pool = routed(pool)
     backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
     rows = torch.tensor(req_indices, device=device)
     backend.forward_metadata = SimpleNamespace(
@@ -2106,8 +2186,9 @@ def _qsa_float_reference(case, q, indices, row_requests):
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("prefix_lens", [(200, 75), (0, 75)])
+@pytest.mark.parametrize("prefetch", [False, True])
 def test_qsa_cp_extend_reads_cached_prefix_in_place(
-    monkeypatch, cache_dtype, rank, prefix_lens
+    monkeypatch, cache_dtype, rank, prefix_lens, prefetch
 ):
     """Prefill CP with a cached prefix attends this rank's zigzag rows straight
     off the pool (the gathered new tokens are stored first); with bf16 K/V it
@@ -2155,8 +2236,24 @@ def test_qsa_cp_extend_reads_cached_prefix_in_place(
     local_k = case.new_k[local_rows]
     local_v = case.new_v[local_rows]
 
+    side_stream = qsa_backend_module.get_stream("qsa_cp_kv")
+    release_waits = []
+    wait_stream = torch.cuda.Stream.wait_stream
+
+    def track_wait(stream, other):
+        if stream == side_stream:
+            release_waits.append(other)
+        return wait_stream(stream, other)
+
+    monkeypatch.setattr(torch.cuda.Stream, "wait_stream", track_wait)
+
     def run(save_kv_cache):
-        return QwenSparseAttnBackend._forward_extend_cp(
+        if prefetch:
+            case.backend.prefetch_cp_kv(
+                case.layer, local_k.flatten(1), local_v.flatten(1), batch
+            )
+        release_waits.clear()
+        output = QwenSparseAttnBackend._forward_extend_cp(
             case.backend,
             q.flatten(1),
             local_k.flatten(1),
@@ -2166,6 +2263,9 @@ def test_qsa_cp_extend_reads_cached_prefix_in_place(
             indices,
             save_kv_cache,
         )
+        assert case.backend._cp_kv_pending is None
+        assert release_waits == ([torch.cuda.current_stream()] if prefetch else [])
+        return output
 
     actual = run(save_kv_cache=True)
     expected = _qsa_float_reference(case, q, indices, requests.tolist())

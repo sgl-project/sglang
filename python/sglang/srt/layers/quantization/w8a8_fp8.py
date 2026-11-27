@@ -25,7 +25,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -154,7 +154,6 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         )
 
         weight_loader = extra_weight_attrs.get("weight_loader")
-        self.logical_widths = output_partition_sizes
 
         weight = ModelWeightParameter(
             data=torch.empty(

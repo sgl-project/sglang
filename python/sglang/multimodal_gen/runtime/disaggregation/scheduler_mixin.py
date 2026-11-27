@@ -60,10 +60,12 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
     detach_cuda_tensors,
 )
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
-from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
@@ -540,7 +542,7 @@ class SchedulerDisaggMixin:
         self._preallocated_slots: dict[int, object] = {}
         preallocated_slot_info = []
         if self._disagg_role.is_transfer_receiver:
-            capacity = getattr(sa, "disagg_prealloc_slots", 2)
+            capacity = 2
             typical_size = 64 * 1024 * 1024  # 64 MiB per slot
             for i in range(capacity):
                 slot = buffer.allocate(typical_size, f"prealloc_{i}")
@@ -1118,7 +1120,7 @@ class SchedulerDisaggMixin:
                 frames = self._disagg_recv_work()
 
                 # Transfer dispatch: check on ALL ranks (frames are broadcast)
-                if self._is_transfer_frames(frames):
+                if is_transfer_message(frames):
                     if is_rank0:
                         # Rank 0: handle all transfer messages
                         self._handle_transfer_msg(frames)
@@ -1126,10 +1128,7 @@ class SchedulerDisaggMixin:
                         # Non-rank-0: only participate in transfer_ready compute
                         self._handle_transfer_non_rank0(frames)
                 elif self._disagg_role.is_input_encoder:
-                    self._disagg_encoder_step(
-                        send_tensors,
-                        frames=frames,
-                    )
+                    self._disagg_encoder_step(frames)
 
                 self._consecutive_error_count = 0
 
@@ -1174,11 +1173,6 @@ class SchedulerDisaggMixin:
     # ------------------------------------------------------------------
     # Transfer message handling
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _is_transfer_frames(frames: list) -> bool:
-        """Check if ZMQ multipart frames carry a transfer control message."""
-        return is_transfer_message(frames)
 
     def _handle_transfer_msg(self: Scheduler, frames: list) -> None:
         """Dispatch a transfer control message to the appropriate handler (rank 0)."""
@@ -1625,20 +1619,6 @@ class SchedulerDisaggMixin:
         without hex/JSON overhead.
         """
 
-        # Check for upstream error
-        disagg_error = getattr(req, "_disagg_error", None)
-        if disagg_error:
-            if self._pool_result_push is not None:
-                send_tensors(
-                    self._pool_result_push,
-                    {},
-                    {
-                        "request_id": request_id,
-                        "error": f"Upstream error: {disagg_error}",
-                    },
-                )
-            return
-
         req.save_output = False
         req.return_file_paths_only = False
 
@@ -1672,15 +1652,9 @@ class SchedulerDisaggMixin:
 
         logger.debug("Transfer DECODER: processed %s in %.2f s", request_id, duration_s)
 
-    def _disagg_encoder_step(
-        self: Scheduler,
-        send_tensors_fn,
-        frames=None,
-    ):
+    def _disagg_encoder_step(self: Scheduler, frames: list):
         """Single encoder step in pool mode."""
-        # Receive: [request_id_bytes, pickled_req_bytes]
-        if frames is None:
-            frames = self._pool_work_pull.recv_multipart()
+        # frames: [request_id_bytes, pickled_req_bytes]
         pickled_req = frames[-1]
         reqs = pickle.loads(pickled_req)
         if not isinstance(reqs, list):
@@ -1700,7 +1674,7 @@ class SchedulerDisaggMixin:
             # Error — send error via scalar fields (rank 0 only)
             if self._pool_result_push is not None:
                 error_msg = getattr(req_result, "error", "encoder error")
-                send_tensors_fn(
+                send_tensors(
                     self._pool_result_push,
                     {},
                     {"request_id": request_id, "_disagg_error": str(error_msg)},
@@ -1720,7 +1694,7 @@ class SchedulerDisaggMixin:
                 )
             else:
                 # Fallback: send error (transfer manager not initialized)
-                send_tensors_fn(
+                send_tensors(
                     self._pool_result_push,
                     {},
                     {"request_id": request_id, "_disagg_error": "No transfer manager"},

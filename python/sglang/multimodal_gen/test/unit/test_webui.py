@@ -10,7 +10,7 @@ from sglang.multimodal_gen.apps.webui.minimax_h3 import (
     build_minimax_h3_sampling_params_kwargs,
     minimax_h3_tasks_for_server,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.request_validation import (
     minimax_h3_validate_canonical_request,
 )
@@ -46,6 +46,9 @@ def test_h3_webui_tasks_follow_loaded_partition():
     ) == ("ref2va",)
     assert minimax_h3_tasks_for_server(
         SimpleNamespace(model_variant="hybrid", model_subfolder=None)
+    ) == ("t2va", "fl2va", "ref2va")
+    assert minimax_h3_tasks_for_server(
+        SimpleNamespace(model_variant="fl2va+ref2va", model_subfolder=None)
     ) == ("t2va", "fl2va", "ref2va")
 
 

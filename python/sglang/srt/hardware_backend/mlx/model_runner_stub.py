@@ -297,7 +297,7 @@ class MlxModelRunnerStub(ModelRunner):
                 )
             self.req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
                 size=self.max_running_requests,
-                max_context_len=self.model_config.context_len,
+                row_width=self.model_config.context_len,
                 device="cpu",
                 enable_memory_saver=False,
                 auxiliary_state_size=auxiliary_state_size,
@@ -305,7 +305,7 @@ class MlxModelRunnerStub(ModelRunner):
         else:
             self.req_to_token_pool = ReqToTokenPool(
                 size=self.max_running_requests,
-                max_context_len=self.model_config.context_len,
+                row_width=self.model_config.context_len,
                 device="cpu",
                 enable_memory_saver=False,
             )
@@ -323,6 +323,9 @@ class MlxModelRunnerStub(ModelRunner):
             kvcache=dummy_kv,
             need_sort=False,
         )
+        if isinstance(self.req_to_token_pool, MlxAuxiliaryStateReqToTokenPool):
+            # The radix cache's state component reaches the slots here.
+            self.token_to_kv_pool_allocator.state = self.req_to_token_pool.state
 
         # No CUDA graphs, no attention backend
         self.decode_cuda_graph_runner = None

@@ -24,6 +24,10 @@ def _jit_module() -> Module:
         cuda_wrappers=[
             ("paged_experts_decide", "paged_experts_decide"),
             ("paged_experts_gather", "paged_experts_gather"),
+            ("paged_experts_rows_to_slots", "paged_experts_rows_to_slots"),
+            ("paged_experts_tiered_plan", "paged_experts_tiered_plan"),
+            ("paged_experts_await_rows", "paged_experts_await_rows"),
+            ("paged_experts_precopy_plan", "paged_experts_precopy_plan"),
             (
                 "paged_experts_host_device_pointer",
                 "paged_experts_host_device_pointer",
@@ -77,15 +81,142 @@ def paged_experts_gather(
     src: torch.Tensor,
     dst: torch.Tensor,
     count: torch.Tensor,
+    blocks: int = 256,
 ) -> None:
     """Copy experts ``src[i]`` into slots ``dst[i]`` for ``i < count[0]``, for every paged tensor.
 
     ``hosts``/``gpus``/``row_bytes`` are int64 GPU tensors with one entry per paged tensor: the UVA
     device pointer of its pinned host store (``paged_experts_host_device_pointer``), the address of
     its GPU table, and its size per expert in bytes, even. Rows are copied in 16-byte loads when
-    their size allows, else in 4- or 2-byte loads.
+    their size allows, else in 4- or 2-byte loads, by ``blocks`` blocks of 256 threads (fewer leave
+    the SMs to a kernel running beside the copy).
     """
-    _jit_module().paged_experts_gather(hosts, gpus, row_bytes, src, dst, count)
+    _jit_module().paged_experts_gather(
+        hosts, gpus, row_bytes, src, dst, count, int(blocks)
+    )
+
+
+def paged_experts_precopy_plan(
+    logits: torch.Tensor,
+    top_k: int,
+    margin: float,
+    max_copies: int,
+    step: torch.Tensor,
+    slot_expert: torch.Tensor,
+    expert_slot: torch.Tensor,
+    slot_lastuse: torch.Tensor,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    count: torch.Tensor,
+    last: torch.Tensor,
+    last_stamp: torch.Tensor,
+    counts: torch.Tensor,
+) -> None:
+    """Plan the pre-copy into a layer from its predicted routing (one block, ``E <= 1024``).
+
+    ``logits`` ``[E]`` bfloat16: the layer's softmax router on the previous layer's input. Its top
+    ``top_k + 1``, each one's margin in softmax probability over the ``(top_k + 1)``-th; best first, each predicted expert whose margin
+    beats ``margin`` and that is in none of the layer's slots, at most ``max_copies``, gets the least
+    recently used slot holding no predicted expert. The layer's residency (``step``, ``slot_expert``,
+    ``expert_slot``, ``slot_lastuse``, as ``paged_experts_decide``) moves in place, the slot stamped
+    with ``step`` as it is; the copy plan goes to ``src``/``dst`` ``[K]`` and ``count`` ``[1]`` for
+    ``paged_experts_gather``. ``last`` ``[K]`` / ``last_stamp`` ``[1]`` hold the previous plan, tallied
+    into ``counts`` ``[4]`` int32 (planned, used, wasted, below the margin or resident) before this
+    one.
+    """
+    _jit_module().paged_experts_precopy_plan(
+        logits,
+        int(top_k),
+        float(margin),
+        int(max_copies),
+        step,
+        slot_expert,
+        expert_slot,
+        slot_lastuse,
+        src,
+        dst,
+        count,
+        last,
+        last_stamp,
+        counts,
+    )
+
+
+def paged_experts_rows_to_slots(
+    hosts: torch.Tensor,
+    gpus: torch.Tensor,
+    row_bytes: torch.Tensor,
+    rows: torch.Tensor,
+    slots: torch.Tensor,
+    count: torch.Tensor,
+) -> None:
+    """Copy host row ``rows[i]`` into GPU slot ``slots[i]`` for ``i < count[0]``, for every
+    paged tensor, one way: the row keeps its expert (inclusive host rows). Entries with a
+    negative ``rows`` are skipped. Arguments as for ``paged_experts_gather``."""
+    _jit_module().paged_experts_rows_to_slots(
+        hosts, gpus, row_bytes, rows, slots, count
+    )
+
+
+def paged_experts_tiered_plan(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    count: torch.Tensor,
+    expert_row: torch.Tensor,
+    row_expert: torch.Tensor,
+    row_stamp: torch.Tensor,
+    clock: torch.Tensor,
+    doorbell: torch.Tensor,
+    rows_out: torch.Tensor,
+    publish_row_address: int = 0,
+    publish_flag_address: int = 0,
+    row_len: int = 0,
+) -> None:
+    """A device-planned step's page-in with the experts in host rows (the rest on disk), before
+    its copies: each planned expert ``src[i]`` (``i < count[0]``) found in a host row
+    (``expert_row`` ``[E]``) has that row stamped (``row_stamp`` ``[R]`` with the advanced
+    ``clock`` ``[1]``) and written to ``rows_out`` ``[K]`` (-1: on disk or unused), for
+    ``paged_experts_rows_to_slots(..., rows_out, dst, count)``; experts only on disk are
+    recorded in ``doorbell`` ``[3, K]`` (missing, src, dst ``[K]``) for the host. The maps keep
+    every expert where it is (inclusive rows; ``row_expert`` ``[R]`` completes the state row).
+    With ``publish_row_address`` (pinned host memory, UVA) the same kernel then writes the
+    layer's state row (``row_len`` int32 from ``doorbell``'s first entry: doorbell, maps, the
+    clock last) there and the new clock to ``publish_flag_address``, after the row."""
+    _jit_module().paged_experts_tiered_plan(
+        src,
+        dst,
+        count,
+        expert_row,
+        row_expert,
+        row_stamp,
+        clock,
+        doorbell,
+        rows_out,
+        int(publish_row_address),
+        int(publish_flag_address),
+        int(row_len),
+    )
+
+
+def paged_experts_await_rows(
+    doorbell: torch.Tensor,
+    maps: torch.Tensor,
+    clock: torch.Tensor,
+    reply_address: int,
+    ack_address: int,
+    plan: torch.Tensor,
+    timeout_ns: int,
+) -> None:
+    """In a captured step, after ``paged_experts_tiered_plan``: if the layer left experts on disk
+    (``doorbell`` ``[3, K]``), wait until the host's reply row (UVA address ``reply_address``:
+    ticket, n, rows ``[K]``, slots ``[K]``, maps ``[E + 2R + 1]``) carries the ticket ``clock``
+    ``[1]``, then write its plan to ``plan`` ``[1 + 2K]`` (n, rows, slots; for
+    ``paged_experts_rows_to_slots``), its maps to ``maps``, clear the missing flags and write the
+    ticket to ``ack_address``. Without a reply within ``timeout_ns`` the plan is empty and the
+    flags stay."""
+    _jit_module().paged_experts_await_rows(
+        doorbell, maps, clock, reply_address, ack_address, plan, timeout_ns
+    )
 
 
 def paged_experts_host_device_pointer(pinned: torch.Tensor) -> int:

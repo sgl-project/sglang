@@ -20,19 +20,37 @@ from msgspec import Struct
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_rmsnorm_mean_square,
+    rmsnorm_mean_square_bitexact,
+)
 from sglang.multimodal_gen.configs.models.vaes.nomas import NomasVAEConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_group_coordinator,
     get_decode_parallel_world_size,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.kvcache.nomas_segment_cache import (
+    _block_mask_builder,
+    _flex_kernel,
+)
+from sglang.multimodal_gen.runtime.models.dits.nomas_layers import (
+    _compile_exact,
+    _fused_ok,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
+logger = init_logger(__name__)
+_QK_MROPE_FUSION = BitExactFusionGate("Nomas VAE Q/K norm + MRoPE", per_signature=True)
+_MEAN_SQUARE_FUSION = BitExactFusionGate("Nomas VAE mean-square", per_signature=True)
 TUBELET = (4, 16, 16)
 TUBE_DIM = TUBELET[0] * TUBELET[1] * TUBELET[2] * 3
 LATENT_CHANNELS = 32
 # A DCAE latent cell is (4, 32, 32) pixels: 1 tubelet in time, 2 x 2 in space.
 LATENT_TOKEN_GRID = 2
-# Target FP32 bytes per fused Q/K chunk; only the squares are materialised.
+# Bound the FP32 square buffer used by the mean-square fallback per Q/K chunk.
 _QK_FUSED_CHUNK_BYTES = 256 * 2**20
 
 
@@ -129,21 +147,7 @@ def apply_mrope(
     return x * cos + rotated * sin
 
 
-def _fused_ok(x: torch.Tensor) -> bool:
-    return (
-        x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
-    )
-
-
-def _compile_exact(fn):
-    # emulate_precision_casts keeps every intermediate rounding, so the fused
-    # elementwise kernels are bit-identical to the eager sequences they replace.
-    # Mean-square reductions stay in ATen to keep their summation order.
-    return torch.compile(
-        fn, dynamic=True, fullgraph=True, options={"emulate_precision_casts": True}
-    )
-
-
+# The fallback retains ATen's mean-square summation order.
 def _square(x):
     return x.float().pow(2)
 
@@ -189,14 +193,17 @@ def _compiled_silu_mul():
 
 
 def _mean_square(x):
-    return _compiled_square()(x).mean(-1, keepdim=True)
+    def reference():
+        return _compiled_square()(x).mean(-1, keepdim=True)
 
-
-@lru_cache(maxsize=1)
-def _block_mask_builder():
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    return torch.compile(create_block_mask, dynamic=True, fullgraph=True)
+    if can_use_rmsnorm_mean_square(x):
+        return _MEAN_SQUARE_FUSION.run(
+            lambda: rmsnorm_mean_square_bitexact(x),
+            reference,
+            sig=(x.shape, x.stride(), x.device),
+            logger=logger,
+        )
+    return reference()
 
 
 def local_attention_layout(grid: tuple[int, int, int], tile: int, device):
@@ -253,15 +260,7 @@ def _flex_attention(
 
     if q.device.type != "cuda" or torch.compiler.is_compiling():
         return flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
-    return _compiled_flex()(q, k, v, block_mask=block_mask, enable_gqa=True)
-
-
-@lru_cache(maxsize=1)
-def _compiled_flex():
-    from torch.nn.attention.flex_attention import flex_attention
-
-    # Never allow an eager quadratic-memory fallback after graph specialization.
-    return torch.compile(flex_attention, dynamic=True, fullgraph=True)
+    return _flex_kernel()(q, k, v, block_mask=block_mask, enable_gqa=True)
 
 
 class RMSNorm(nn.Module):
@@ -317,16 +316,29 @@ class GenAttention(nn.Module):
         return apply_mrope(normalized, cos, sin, self.arch.rope_sections).to(dtype)
 
     def _prepare_qk_fused(self, x, cos, sin, norm_t, norm_hw, dtype):
-        """Same values as the eager path: ATen mean squares, one fused kernel for the rest."""
+        """Keep ATen's reduction order and the compiled reference's FP32 rounding."""
         half = x.shape[-1] // 2
         result = torch.empty_like(x, dtype=dtype)
-        # Only the FP32 squares are materialised now, so far larger chunks fit.
+        use_fused = (
+            x.dtype
+            == dtype
+            == norm_t.weight.dtype
+            == norm_hw.weight.dtype
+            == torch.bfloat16
+            and self.arch.rope_sections == (64, 32, 32)
+            and x.stride(-1) == 1
+            and current_arch().is_sm_at_least(10)
+        )
+        if use_fused:
+            from sglang.kernels.ops.diffusion import fused_nomas_qk_norm_mrope
+
+        # First-use verification and unsupported layouts materialize FP32 squares.
         chunk = max(
             1, _QK_FUSED_CHUNK_BYTES // (x.shape[0] * x.shape[2] * x.shape[3] * 4)
         )
         for first in range(0, x.shape[1], chunk):
             part = x[:, first : first + chunk]
-            result[:, first : first + chunk] = _compiled_qk_norm_mrope()(
+            args = (
                 part,
                 _mean_square(part[..., :half]),
                 _mean_square(part[..., half:]),
@@ -335,9 +347,21 @@ class GenAttention(nn.Module):
                 norm_hw.weight,
                 cos[:, first : first + chunk],
                 sin[:, first : first + chunk],
-                self.arch.rope_sections,
-                dtype,
             )
+            reference = lambda: _compiled_qk_norm_mrope()(
+                *args, self.arch.rope_sections, dtype
+            )
+            if use_fused:
+                output = _QK_MROPE_FUSION.run(
+                    lambda: fused_nomas_qk_norm_mrope(*args),
+                    reference,
+                    sig=(part.device, part.shape, part.stride(), norm_t.eps),
+                    logger=logger,
+                    reraise=(ValueError,),
+                )
+            else:
+                output = reference()
+            result[:, first : first + chunk] = output
         return result
 
     def forward(
@@ -649,6 +673,43 @@ class NomasStreamingDecoder:
 
 
 class NomasPixelUMMDecoder(nn.Module):
+    @staticmethod
+    def prepare_checkpoint_load(weight_files, dtype):
+        """Return a meta-model configurator when loading serialized FP8 weights."""
+        from sglang.multimodal_gen.runtime.loader.nomas_weights import (
+            resolve_nomas_vae_checkpoint_configurator,
+        )
+
+        return resolve_nomas_vae_checkpoint_configurator(weight_files, dtype)
+
+    def fp8_quantized_layer_names(self) -> tuple[str, ...]:
+        """Decoder projections serialized as FP8 by the official checkpoint."""
+        projections = (
+            "attn.q_proj",
+            "attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        )
+        return tuple(
+            f"decoder.layers.{i}.{projection}"
+            for i in range(len(self.decoder.layers))
+            for projection in projections
+        )
+
+    @staticmethod
+    def checkpoint_key_filter(name: str) -> bool:
+        """Official VAE checkpoints also contain a DCAE encoder unused by decode."""
+        return not name.startswith("encoder.")
+
+    @staticmethod
+    def checkpoint_key_mapper(name: str) -> str:
+        from sglang.multimodal_gen.runtime.loader.nomas_weights import (
+            map_nomas_vae_checkpoint_key,
+        )
+
+        return map_nomas_vae_checkpoint_key(name)
+
     def __init__(self, config: NomasVAEConfig):
         super().__init__()
         self.config = config

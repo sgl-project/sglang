@@ -20,7 +20,8 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai import video_api, video_progress
-from sglang.multimodal_gen.runtime.entrypoints.openai.stores import AsyncDictStore
+from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VideoJobStore
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import select_output_variant
 from sglang.multimodal_gen.runtime.managers import progress_reporter
 from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     ProgressReporter,
@@ -63,7 +64,7 @@ def test_worker_error_with_output_cannot_complete_video_job(monkeypatch, tmp_pat
 
     job = asyncio.run(run())
     assert job["status"] == "failed"
-    assert "save failed" in job["error"]["message"]
+    assert job["error"]["message"] == "Video generation failed"
     assert job["file_paths"] is None and job["url"] is None
 
 
@@ -369,7 +370,7 @@ def test_temp_output_uploads_every_variant(monkeypatch, tmp_path):
     assert job["url"] == "s3://video_0.mp4"
     assert job["urls"] == ["s3://video_0.mp4", "s3://video_1.mp4"]
     assert job["file_path"] is None and job["file_paths"] is None
-    assert video_api._select_video_variant_url(job, "1") == "s3://video_1.mp4"
+    assert select_output_variant(job, "1", "urls", "url") == "s3://video_1.mp4"
 
 
 def test_persistent_output_reports_only_local_files(monkeypatch, tmp_path):
@@ -384,8 +385,8 @@ def test_persistent_output_reports_only_local_files(monkeypatch, tmp_path):
     assert job["file_path"] is None
     assert job["file_paths"] == [None, paths[1]]
     assert os.path.exists(paths[1])
-    assert video_api._select_video_variant_url(job, "1") is None
-    assert video_api._select_video_variant_path(job, "1") == paths[1]
+    assert select_output_variant(job, "1", "urls", "url") is None
+    assert select_output_variant(job, "1", "file_paths", "file_path") == paths[1]
 
 
 def test_content_variant_serves_lidar_artifacts_by_key(tmp_path):
@@ -408,8 +409,8 @@ def test_content_variant_serves_lidar_artifacts_by_key(tmp_path):
         video_api._select_lidar_artifact_path({"file_paths": [str(video)]}, "rangemap")
         is None
     )
-    assert video_api._select_video_variant_path(job, None) == str(video)
-    assert video_api._select_video_variant_path(job, "rangemap") is None
+    assert select_output_variant(job, None, "file_paths", "file_path") == str(video)
+    assert select_output_variant(job, "rangemap", "file_paths", "file_path") is None
     assert video_api._ARTIFACT_MEDIA_TYPES[".safetensors"] == "application/octet-stream"
 
 
@@ -518,7 +519,7 @@ def test_progress_tracker_averages_outputs():
 
 
 def test_apply_progress_only_moves_running_jobs(monkeypatch):
-    store = AsyncDictStore()
+    store = VideoJobStore()
     monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
 
     async def run_test():
@@ -557,7 +558,7 @@ def test_apply_progress_only_moves_running_jobs(monkeypatch):
     ],
 )
 def test_progress_listener_updates_store(monkeypatch, invalid_message):
-    store = AsyncDictStore()
+    store = VideoJobStore()
     tracker = video_progress.VideoProgressTracker()
     monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
     monkeypatch.setattr(video_progress, "VIDEO_PROGRESS", tracker)
@@ -603,7 +604,7 @@ def test_progress_listener_updates_store(monkeypatch, invalid_message):
 
 def test_progress_reporter_reconnects_after_listener_restart(monkeypatch):
     """Restarting telemetry must not require restarting the generating worker."""
-    store = AsyncDictStore()
+    store = VideoJobStore()
     tracker = video_progress.VideoProgressTracker()
     monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
     monkeypatch.setattr(video_progress, "VIDEO_PROGRESS", tracker)
@@ -643,7 +644,7 @@ def test_progress_reporter_reconnects_after_listener_restart(monkeypatch):
 
 @pytest.mark.parametrize("terminal_status", ["completed", "failed", "deleted"])
 def test_late_progress_cannot_revive_terminal_job(monkeypatch, terminal_status):
-    store = AsyncDictStore()
+    store = VideoJobStore()
     tracker = video_progress.VideoProgressTracker()
     monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
 
@@ -670,7 +671,7 @@ def test_late_progress_cannot_revive_terminal_job(monkeypatch, terminal_status):
 
 @pytest.mark.parametrize("outcome", ["failed", "cancelled"])
 def test_dispatch_always_unregisters_progress(monkeypatch, outcome):
-    store = AsyncDictStore()
+    store = VideoJobStore()
     tracker = video_progress.VideoProgressTracker()
     monkeypatch.setattr(video_api, "VIDEO_STORE", store)
     monkeypatch.setattr(video_api, "VIDEO_PROGRESS", tracker)

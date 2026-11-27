@@ -16,11 +16,11 @@
 from typing import Any, Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.log_utils import create_log_targets, log_json
-from sglang.srt.utils.request_logger import (
+from sglang.srt.observability.request_logger import (
     _dataclass_to_string_truncated,
     _transform_data_for_logging,
 )
+from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 # Core generation knobs logged per record. Prompt text is logged separately,
 # gated by the level, so it is excluded here.
@@ -101,7 +101,8 @@ class DiffusionRequestLogger:
             e2e_latency = getattr(metrics, "total_duration_s", 0.0) or 0.0
         return {
             "meta_info": {"e2e_latency": e2e_latency},
-            "error": getattr(result, "error", None) if result is not None else None,
+            # Backend exception strings can contain input text, media URLs and credentials.
+            "error": "generation failed" if getattr(result, "error", None) else None,
         }
 
     def _emit(self, msg: str) -> None:
