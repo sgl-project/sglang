@@ -4833,7 +4833,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     # the indexer, compressor and engram reuse the leaves wq_b/wkv and are not adapted
     _lora_module_pattern = re.compile(
         r"^model\.layers\.\d+\.(?:self_attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b)"
-        r"|mlp\.shared_experts\.(?:gate_up_proj|down_proj))$"
+        r"|mlp\.shared_experts\.(?:gate_up_proj|down_proj)|mlp\.experts)$"
     )
 
     def should_apply_lora(self, module_name: str) -> bool:
@@ -4842,7 +4842,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     @staticmethod
     def get_lora_target_module_name(name: str) -> str:
         parent, _, leaf = name.rpartition(".")
-        if parent.endswith("shared_experts"):
+        if parent.endswith("experts"):
             return {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}.get(
                 leaf, name
             )
@@ -4863,6 +4863,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             "wo_b": (config.o_groups * config.o_lora_rank, config.hidden_size),
             "gate_up_proj": (config.hidden_size, 2 * shared_inter),
             "down_proj": (shared_inter, config.hidden_size),
+            "gate_up_proj_moe": (config.hidden_size, 2 * config.moe_intermediate_size),
+            "down_proj_moe": (config.moe_intermediate_size, config.hidden_size),
         }[module_name]
 
     @property
