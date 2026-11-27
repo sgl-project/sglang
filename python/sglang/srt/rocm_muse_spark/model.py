@@ -465,6 +465,10 @@ _EXPERT_PLACEMENT = (
 )
 # Target verify: the attention partials' split-KV merge runs inside the output norm-gate kernel.
 _VERIFY_REDUCE_NORM_GATE = envs.SGLANG_ROCM_MUSE_VERIFY_REDUCE_NORM_GATE.get()
+# Decode attention-output norm-gate inside tlx.ops.paged_attention_decode's reduce (see aiter_backend.forward_decode).
+_TLX_PAGED_DECODE_NORM_GATE = envs.SGLANG_USE_TLX_PAGED_DECODE.get()
+if _TLX_PAGED_DECODE_NORM_GATE:
+    from sglang.kernels.ops.attention.tlx import NORM_GATE as TLX_PAGED_DECODE_NORM_GATE
 # Decode-sized fp32 router as one split-K Triton GEMV (+reduce); MUSE_ROUTER_GEMV=0 restores torch.mm.
 _USE_ROUTER_GEMV = (
     os.environ.get("MUSE_ROUTER_GEMV", "1") == "1" and torch.version.hip is not None
@@ -854,13 +858,28 @@ class MuseSpark1xAttention(nn.Module):
             )
             and self._fused_o_norm_gate.merges_verify_partials()
         )
+        offer_gate = (
+            _TLX_PAGED_DECODE_NORM_GATE
+            and forward_batch.forward_mode.is_decode()
+            and self._fused_o_norm_gate.tlx_decode_foldable(o_gate)
+        )
+        if offer_gate:
+            TLX_PAGED_DECODE_NORM_GATE.gate = o_gate
+            TLX_PAGED_DECODE_NORM_GATE.eps = self._fused_o_norm_gate._eps
+            TLX_PAGED_DECODE_NORM_GATE.done = False
         VERIFY_REDUCE_DEFERRAL.requested = defer
         try:
             output = self.attn(q, k, v, forward_batch, save_kv_cache=not kv_written)
         finally:
             VERIFY_REDUCE_DEFERRAL.requested = False
+            if offer_gate:
+                TLX_PAGED_DECODE_NORM_GATE.gate = None
         state = VERIFY_REDUCE_DEFERRAL.take() if defer else None
-        if state is not None:
+        if offer_gate and TLX_PAGED_DECODE_NORM_GATE.done:
+            # The TLX paged decode already applied the norm-gate in its reduce.
+            TLX_PAGED_DECODE_NORM_GATE.done = False
+            output = output.view(output.shape[0], -1)
+        elif state is not None:
             output = self._fused_o_norm_gate.forward_verify_partials(
                 state, output, o_gate
             )

@@ -19,12 +19,20 @@ stock-Triton runtime support in `kernels/jit/utils/tlx_runtime.py`.
 | `kernels/fused/__init__.py` | `87abb3f5a` | none |
 | `kernels/fused/norm_residual_norm/__init__.py`, `gfx950.py` | `87abb3f5a` | none |
 | `kernels/fused/qk_norm_rope_kv_cache/__init__.py`, `gfx950.py` | `87abb3f5a` | none |
+| `kernels/fused/rmsnorm_gate/__init__.py`, `gfx950.py` | `51d7e3cbf` | none |
+| `kernels/paged_attn/__init__.py`, `gfx950_decode.py` | `8af00bbfd` | none |
 | `kernels/norm/__init__.py`, `gfx950.py` | `87abb3f5a` | none |
 | `kernels/router_gemm/__init__.py`, `gfx950.py` | `87abb3f5a` | none |
 
 Upstream's `kernels/moe/routing_gfx950.py` (`tlx.ops.moe_routing`) is not
 vendored: with triton-utlx 3.9.0.post4 its `tl.where` on a `tlx.require_layout`
 tensor and a plain one fails `arith.select` verification on stock Triton.
+
+`qk_norm_rope_kv_cache` and `rmsnorm_gate` are written in plain Triton (no
+`triton.language.extra.tlx` primitives), so they run on stock ROCm Triton
+without fbtriton or the uTLX plugin.
+`paged_attn/gfx950_decode.py` uses TLX primitives and needs Triton with the
+uTLX plugin (SGLang's `BUILD_UTLX=1` ROCm image) or fbtriton.
 
 To re-sync, copy those files from the new upstream commit, re-apply the one
 import edit, and update the commits above. The pre-commit config excludes this
