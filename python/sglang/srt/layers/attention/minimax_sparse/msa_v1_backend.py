@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
+"""MSA-v1 NVFP4 (M3 / M3.1, 128-token block) sparse attention backend."""
+
 from __future__ import annotations
 
 import logging
-from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.configs.model_config import get_minimax_sparse_attention_config
-from sglang.srt.layers.attention.base_attn_backend import (
-    AttentionBackend,
-    SharedReadEnds,
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.layers.attention.minimax_sparse.base import MiniMaxSparseBaseBackend
+from sglang.srt.layers.attention.minimax_sparse.metadata import (
+    MiniMaxSparseForwardMetadata,
 )
 from sglang.srt.layers.attention.minimax_sparse_ops.msa_plan import (
     MSAV1DecodeAttentionPlan,
@@ -25,7 +27,7 @@ from sglang.srt.runtime_context import get_parallel, get_spec
 logger = logging.getLogger(__name__)
 
 
-class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
+class MiniMaxMSAV1AttnBackend(MiniMaxSparseBaseBackend):
     """MSA-v1 Q8KV4 attention with a K-only sparse index."""
 
     needs_cpu_seq_lens: bool = False
@@ -93,27 +95,21 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
         self._max_seqlen_q = self._max_seqlen_k = 1
         self.forward_metadata = None
 
-    def init_cuda_graph_state(self, max_bs, max_num_tokens):
-        pass
-
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
-
     def forward(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
         if forward_batch.forward_mode.is_idle():
             # Follow v, not q: q may already be FP8 from the qk-norm epilogue.
             return None, v.new_zeros(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-        return super().forward(q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
+        return super(MiniMaxSparseBaseBackend, self).forward(
+            q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+        )
 
     def shared_read_ends(self, fm):
+        del fm
         return SharedReadEnds.PRE_REPLAY
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
-        self.forward_metadata = SimpleNamespace(
-            msa_v1_decode_plan=None,
-            msa_v1_attention_plan=None,
-            msa_v1_prefill_plan=None,
-        )
+        del in_capture
+        self.forward_metadata = MiniMaxSparseForwardMetadata()
         mode = forward_batch.forward_mode
         if forward_batch.seq_lens.numel() == 0:
             return
@@ -143,6 +139,7 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
     def _forward(
         self, q, k, v, layer, forward_batch, save_kv_cache, *, idx_q, idx_k, idx_v=None
     ):
+        del idx_v
         if save_kv_cache:
             self.kv_pool.set_fused_kv_index_buffer(
                 layer,
@@ -212,7 +209,11 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
             if forward_batch.forward_mode.is_target_verify()
             else 1
         )
-        max_pages = max(1, (int(max_seq_len) + self.page_size - 1) // self.page_size)
+        # The MSA-v1 indexer kernels address at most 8192 pages; the req_to_token row
+        # runs past the model context by one decode step's reach, so a 1M row exceeds it.
+        max_pages = min(
+            max(1, (int(max_seq_len) + self.page_size - 1) // self.page_size), 8192
+        )
         key = (
             forward_batch.forward_mode,
             batch_size,
@@ -396,3 +397,6 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
             num_index_heads=self._msa_v1_num_index_heads,
         )
         return self.forward_metadata.msa_v1_prefill_plan
+
+
+MiniMaxSparseNvfp4AttnBackend = MiniMaxMSAV1AttnBackend

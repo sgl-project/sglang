@@ -1605,6 +1605,12 @@
                     ]
                   },
                   {
+                    "group": "FireRedTeam",
+                    "pages": [
+                      "cookbook/diffusion/FireRed/FireRed-Image-Edit"
+                    ]
+                  },
+                  {
                     "group": "HiDream",
                     "tag": "NEW",
                     "pages": [
@@ -1626,6 +1632,7 @@
                   {
                     "group": "JD.com",
                     "pages": [
+                      "cookbook/diffusion/JoyAI-Image/JoyAI-Image-Edit",
                       "cookbook/diffusion/JoyEcho/JoyEcho"
                     ]
                   },
@@ -1648,6 +1655,13 @@
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3",
                       "cookbook/diffusion/LTX/LTX2.5"
+                    ]
+                  },
+                  {
+                    "group": "MAGI",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/MAGI/MAGI-2"
                     ]
                   },
                   {
@@ -1704,6 +1718,7 @@
                   {
                     "group": "Tencent",
                     "pages": [
+                      "cookbook/diffusion/Tencent/Hunyuan3D-2",
                       "cookbook/diffusion/Tencent/HunyuanImage3",
                       "cookbook/diffusion/HY-Nomas/HY-Nomas"
                     ]
