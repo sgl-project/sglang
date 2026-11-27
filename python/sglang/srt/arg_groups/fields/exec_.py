@@ -284,6 +284,10 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Enable the AMD monokernels from the sgl-amd-mono package. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
     ] = False
+    enable_xpu_monokernel: A[
+        bool,
+        "Enable the experimental Intel XPU monokernel from sglang-kernel-xpu for supported decode and verification steps.",
+    ] = False
     prefill_attention_backend: A[
         Optional[str],
         Arg(

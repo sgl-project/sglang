@@ -29,6 +29,8 @@ from sglang.kernels.plugin_kernels.amd.spec import (
     spec_registered,
 )
 from sglang.kernels.plugin_kernels.nvidia.spec import FLAG as NVIDIA_FLAG
+from sglang.kernels.plugin_kernels.xpu.spec import BACKEND as XPU_BACKEND
+from sglang.kernels.plugin_kernels.xpu.spec import FLAG as XPU_FLAG
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     model_config_of,
@@ -71,6 +73,12 @@ def msa_serves(architectures: Optional[Sequence[str]]) -> bool:
 
 def selected_monokernel(cfg: Any) -> Optional[tuple[str, str]]:
     """The (backend, flag) a monokernel may serve under this configuration."""
+    if getattr(cfg, "enable_xpu_monokernel", False):
+        if cfg.enable_amd_monokernel or cfg.enable_nvidia_megakernel:
+            raise ValueError(
+                f"{XPU_FLAG} requires the other monokernel flags to be disabled"
+            )
+        return XPU_BACKEND, XPU_FLAG
     if cfg.enable_amd_monokernel:
         return BACKEND, FLAG
     if cfg.enable_nvidia_megakernel:
@@ -89,11 +97,21 @@ def deadline_s(watchdog_timeout: Optional[float]) -> float:
     return min(MAX_DEADLINE_S, 0.5 * float(watchdog_timeout))
 
 
-def device_isa() -> Optional[str]:
-    """Return the GPU ISA without feature suffixes, or None without a GPU."""
-    if not torch.cuda.is_available():
+def _device_module(backend: str):
+    return torch.xpu if backend == XPU_BACKEND else torch.cuda
+
+
+def device_isa(backend: str = BACKEND) -> Optional[str]:
+    """Return the architecture on the accelerator selected by the binding."""
+    device = _device_module(backend)
+    if not device.is_available():
         return None
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if backend == XPU_BACKEND:
+        from sgl_kernel import get_device_capability
+
+        major, _ = get_device_capability()
+        return f"xe{major}"
+    props = device.get_device_properties(device.current_device())
     if torch.version.hip:
         return props.gcnArchName.split(":")[0]
     return f"sm_{props.major}{props.minor}"
@@ -231,10 +249,12 @@ def handle_monokernel(server_args: ServerArgs) -> None:
     if selected is None:
         return
     backend, flag = selected
+    if backend == XPU_BACKEND and cfg.device != "xpu":
+        raise ValueError(f"{flag} requires an XPU server")
     model_config = model_config_of(server_args)
     if backend == MSA_BACKEND and not msa_serves(model_config.hf_config.architectures):
         return  # sgl-nvidia-mega serves this model
-    isa = device_isa()
+    isa = device_isa(backend) if backend == XPU_BACKEND else device_isa()
     spec, reasons = monokernel_disable_reasons(
         cfg=cfg, backend=backend, model_config=model_config, isa=isa
     )
@@ -362,7 +382,7 @@ def install_monokernel_forward(
     backend = _backend()
     if backend is None:
         return
-    isa = device_isa()
+    isa = device_isa(backend) if backend == XPU_BACKEND else device_isa()
     archs = hf_config.architectures
     model_type = getattr(hf_config, "model_type", None)
     spec, why = find_spec(
@@ -423,10 +443,16 @@ def install_monokernel_forward(
             f"{spec.name} keeps weight copies at load, and this load path does not "
             "pass checkpoint tensors through monokernel_weights_iterator"
         )
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    if props.multi_processor_count < spec.devices[isa].resident_blocks:
+    device = _device_module(backend)
+    props = device.get_device_properties(device.current_device())
+    units = (
+        props.gpu_subslice_count
+        if backend == XPU_BACKEND
+        else props.multi_processor_count
+    )
+    if units < spec.devices[isa].resident_blocks:
         reasons.append(
-            f"{Feature.PARTITIONED_GPU.value}: {props.multi_processor_count} compute "
+            f"{Feature.PARTITIONED_GPU.value}: {units} compute "
             f"units, the launch grid needs {spec.devices[isa].resident_blocks}"
         )
     # Collect validation failures before the plugin starts collective setup.
@@ -436,7 +462,11 @@ def install_monokernel_forward(
         for reason in rank_reasons
     ]
     if reasons:
-        raise ValueError(f"{_flag()}: " + "; ".join(reasons))
+        message = "; ".join(reasons)
+        if spec.allow_model_fallback:
+            logger.info("monokernel %s: %s: the normal forward", spec.name, message)
+            return
+        raise ValueError(f"{_flag()}: " + message)
 
     mode, tokens = _server_step()
     if spec.tokens_per_request is not None:
@@ -454,17 +484,26 @@ def install_monokernel_forward(
     if any(other != served for other in _gather_tp(served)):
         raise RuntimeError(f"{_flag()}: the ranks route different graph keys")
     if not served:
+        if spec.allow_model_fallback:
+            logger.info(
+                "monokernel %s has no supported step width: the normal forward",
+                spec.name,
+            )
+            return
         raise ValueError(
             f"{_flag()}: {spec.name} has no width for this "
             f"server's steps ({tokens} tokens a request)"
         )
+    timeout = deadline_s(get_device().watchdog_timeout)
+    if backend == XPU_BACKEND:
+        timeout = min(timeout, 2.0)
     build_context = BuildContext(
         isa=isa,
         widths=widths,
-        deadline_s=deadline_s(get_device().watchdog_timeout),
+        deadline_s=timeout,
         copies=copies,
     )
-    build_start, memory_before = time.perf_counter(), torch.cuda.memory_allocated()
+    build_start, memory_before = time.perf_counter(), device.memory_allocated()
     built = spec.build(model, hf_config, build_context)
     _install_forward(model=model, built=built, served=served, spec=spec)
     # Captured kernels retain weight copies that online updates cannot refresh.
@@ -473,18 +512,20 @@ def install_monokernel_forward(
     )
     logger.info(
         "monokernel %s on %s: widths %s built in %.1f s, %.1f MiB; wait deadline "
-        "%.0f s (a failed wait stops every rank with a GPU fault at address 0x0); "
+        "%.0f s; "
         "weight copies: %s",
         spec.name,
         isa,
         list(widths),
         time.perf_counter() - build_start,
-        (torch.cuda.memory_allocated() - memory_before) / 2**20,
+        (device.memory_allocated() - memory_before) / 2**20,
         build_context.deadline_s,
         _format_weight_copies(copies),
     )
     if capture_keys:
-        capture_tail_hooks.append(_CaptureCheck(spec=spec, isa=isa, served=served))
+        capture_tail_hooks.append(
+            _CaptureCheck(spec=spec, isa=isa, served=served, backend=backend)
+        )
     else:
         # Without CUDA graphs every step runs eagerly, routed by its own key.
         logger.info(
@@ -502,8 +543,11 @@ class _CaptureCheck:
     runner none of whose graphs run them.
     """
 
-    def __init__(self, *, spec: MonoSpec, isa: str, served: frozenset):
+    def __init__(
+        self, *, spec: MonoSpec, isa: str, served: frozenset, backend: str = BACKEND
+    ):
         self.spec, self.isa, self.served = spec, isa, served
+        self.device = _device_module(backend)
         self.captured: dict[int, Optional[ShapeKey]] = {}
         self.is_done = False
 
@@ -514,7 +558,7 @@ class _CaptureCheck:
         forward_batch: ForwardBatch,
         num_tokens: int,
     ) -> None:
-        if self.is_done or not torch.cuda.is_current_stream_capturing():
+        if self.is_done or not self.device.is_current_stream_capturing():
             return  # the runner's warmup runs, and any recapture
         self.captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
         if not set(runner.capture_bs) <= set(self.captured):
@@ -522,6 +566,11 @@ class _CaptureCheck:
         self.is_done = True
         routed = [k for k in self.captured.values() if k in self.served]
         if not routed:
+            if self.spec.allow_model_fallback:
+                logger.info(
+                    "monokernel %s has no supported captured graph", self.spec.name
+                )
+                return
             raise ValueError(
                 f"{_flag()}: none of the "
                 f"{len(self.captured)} captured decode graphs (batch sizes "

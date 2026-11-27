@@ -119,6 +119,36 @@ sglang serve                         \
 
 To run the vision encoder and the language model of a multimodal model as separate servers, see [EPD disaggregation on Intel XPU](/docs/advanced_features/epd_disaggregation#intel-xpu).
 
+## MiniCPM5 monokernel
+
+For a supported MiniCPM5 MoE checkpoint on Intel Arc Pro B60 or B70, enable
+monokernel decode with `--enable-xpu-monokernel`. This flag defaults to off.
+Use an SGLang checkout with native MiniCPM5 support and an
+`sglang-kernel-xpu` wheel built with `USE_MONO_DECODE=ON` for `bmg`.
+In a TP2 container on a host with restricted ptrace, add `--cap-add SYS_PTRACE`
+for PyTorch symmetric memory.
+
+```bash
+python -m sglang.launch_server --model-path "${MODEL_PATH}" --device xpu \
+    --tp 2 --dtype bfloat16 --quantization fp8 --attention-backend intel_xpu \
+    --disable-shared-experts-fusion --page-size 64 --enable-xpu-monokernel \
+    --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 8
+```
+
+Use `--tp 1` for a single GPU. The target path uses BF16 activation and KV
+cache with online FP8 weights. It accepts up to eight token rows per graph
+replay. For DSpark K7, one request uses eight target verification rows. Add
+the following arguments for that configuration.
+
+```bash
+--speculative-algorithm DSPARK --speculative-draft-model-path "${DRAFT_MODEL_PATH}" \
+    --speculative-dspark-block-size 7 --speculative-num-draft-tokens 8
+```
+
+On B70, supported DSpark draft layers can also use a seven-query monokernel
+with BF16 activations. Unsupported draft configurations use the standard
+SGLang draft path.
+
 ## MXFP4 MoE Quantization
 
 Native MXFP4 MoE checkpoints (OCP microscaling FP4: packed `e2m1` weights plus
