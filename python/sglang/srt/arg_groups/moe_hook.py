@@ -867,39 +867,9 @@ def _required_flashinfer_a2a_dispatch_tokens_per_rank(server_args: Any) -> int:
     return max(tokens, graph_bs * tokens_per_req)
 
 
-def _validate_minimax_m3_deepep_ll_token_budget(server_args: Any) -> None:
-    view = resolved_view(server_args)
-    if (
-        view.quantization != "minimax_m3_nvfp4"
-        or view.moe_runner_backend != "flashinfer_cutedsl"
-        or view.moe_a2a_backend != "deepep"
-    ):
-        return
-    if view.disaggregation_mode != "decode" and view.chunked_prefill_size <= 0:
-        raise ValueError(
-            "MiniMax-M3 NVFP4 on flashinfer_cutedsl dispatches prefill through "
-            "DeepEP low-latency mode, which requires chunked prefill "
-            "(--chunked-prefill-size > 0)."
-        )
-    # DeepEP low-latency dispatch serves prefill as well, so every prefill chunk
-    # and captured graph must fit its per-rank buffer.
-    required = _required_flashinfer_a2a_dispatch_tokens_per_rank(server_args)
-    capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-    if required > capacity:
-        raise ValueError(
-            "MiniMax-M3 NVFP4 on flashinfer_cutedsl dispatches every "
-            "forward through DeepEP low-latency mode, whose per-rank "
-            f"buffer holds {capacity} tokens, but this config needs "
-            f"{required} (prefill chunk, prefill graph, or decode graph). "
-            "Raise SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK (<= 1024) "
-            "or lower --chunked-prefill-size / --cuda-graph-max-bs-prefill."
-        )
-
-
 def validate_flashinfer_a2a_token_budget(server_args: Any) -> None:
     """Fail fast if the per-rank FlashInfer A2A workspace cannot hold the
     largest forward; at runtime the dispatcher asserts on the first such batch."""
-    _validate_minimax_m3_deepep_ll_token_budget(server_args)
     view = resolved_view(server_args)
     if view.moe_a2a_backend != "flashinfer_nvlink_one_sided":
         return

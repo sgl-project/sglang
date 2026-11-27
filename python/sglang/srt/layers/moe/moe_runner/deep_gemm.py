@@ -1352,21 +1352,18 @@ def pre_permute_deepep_ll_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
-        dispatch_output
-    )
-
-    running_state["topk_ids"] = topk_ids
-    running_state["topk_weights"] = topk_weights
+    hidden_states = dispatch_output.hidden_states
+    running_state["topk_ids"] = dispatch_output.topk_ids
+    running_state["topk_weights"] = dispatch_output.topk_weights
     running_state["hidden_states_shape"] = hidden_states.shape
     running_state["hidden_states_dtype"] = hidden_states.dtype
     running_state["hidden_states_device"] = hidden_states.device
     return DeepGemmRunnerInput(
         hidden_states=hidden_states,
-        hidden_states_scale=hidden_states_scale,
+        hidden_states_scale=dispatch_output.hidden_states_scale,
         use_masked_gemm=True,
-        masked_m=masked_m,
-        expected_m=expected_m,
+        masked_m=dispatch_output.masked_m,
+        expected_m=dispatch_output.expected_m,
         activation_scale_block_size=128,
     )
 

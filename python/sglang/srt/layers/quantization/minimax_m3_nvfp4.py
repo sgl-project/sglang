@@ -308,6 +308,7 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
                 "NVFP4 output epilogue."
             )
         from flashinfer.fused_moe import interleave_cute_dsl_moe_weights
+
         intermediate = w13.shape[1] // 2
         if intermediate % 64 != 0:
             raise ValueError(

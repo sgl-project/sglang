@@ -9,30 +9,23 @@ from flashinfer import (
 )
 from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 
-
-def supports_masked_gemm_fused_swiglu(device: torch.device) -> bool:
-    """Whether grouped_gemm_nt_masked can fuse SwiGLU and NVFP4 output on `device`."""
-    if device.type != "cuda":
-        return False
-    device_index = torch.cuda.current_device() if device.index is None else device.index
-    return _supports_masked_gemm_fused_swiglu(device_index)
+_HAS_MASKED_GEMM_FUSED_SWIGLU_PARAMS = all(
+    name in inspect.signature(grouped_gemm_nt_masked).parameters
+    for name in (
+        "activation_type",
+        "a_per_token_scale",
+        "out_scale",
+        "out_global_scale",
+    )
+)
 
 
 @lru_cache(maxsize=None)
-def _supports_masked_gemm_fused_swiglu(device_index: int) -> bool:
-    params = inspect.signature(grouped_gemm_nt_masked).parameters
-    return torch.cuda.get_device_capability(device_index) in (
-        (10, 0),
-        (10, 3),
-    ) and all(
-        name in params
-        for name in (
-            "activation_type",
-            "a_per_token_scale",
-            "out_scale",
-            "out_global_scale",
-        )
-    )
+def supports_masked_gemm_fused_swiglu(device: torch.device) -> bool:
+    """Whether grouped_gemm_nt_masked can fuse SwiGLU and NVFP4 output on `device`."""
+    return _HAS_MASKED_GEMM_FUSED_SWIGLU_PARAMS and torch.cuda.get_device_capability(
+        device
+    ) in ((10, 0), (10, 3))
 
 
 def get_cute_dtype(input: torch.Tensor) -> str:
@@ -189,7 +182,9 @@ def flashinfer_cutedsl_moe_masked(
 
         assert gated and w1_alpha_up is not None and swiglu_params is not None
         swiglu_alpha, swiglu_beta, swiglu_limit = swiglu_params
-        diq = torch.empty((num_experts, m, n // 2), dtype=torch.uint8, device=a_q.device)
+        diq = torch.empty(
+            (num_experts, m, n // 2), dtype=torch.uint8, device=a_q.device
+        )
         diq_sf = torch.empty(
             (num_experts, (m + 127) // 128, n // (sf_vec_size * 4), 32, 4, 4),
             dtype=torch.float8_e4m3fn,

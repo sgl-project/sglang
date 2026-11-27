@@ -652,12 +652,21 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
     assert not runner_config.apply_router_weight_on_input, (
         "apply_router_weight_on_input is not supported for Flashinfer"
     )
-    assert (
-        runner_config.swiglu_limit is None
-        or dispatch_output.per_token_scale is not None
-    ), (
+    assert runner_config.swiglu_limit is None, (
         f"CuteDSL masked MoE does not support swiglu_limit, got {runner_config.swiglu_limit}."
     )
+    if dispatch_output.per_token_scale is None:
+        assert (
+            runner_config.gemm1_clamp_limit is None
+            and runner_config.gemm1_alpha is None
+            and runner_config.gemm1_beta is None
+        ), (
+            "CuteDSL masked MoE only supports gemm1_clamp_limit/gemm1_alpha/gemm1_beta "
+            "with per-token NVFP4 dispatch, got "
+            f"gemm1_clamp_limit={runner_config.gemm1_clamp_limit}, "
+            f"gemm1_alpha={runner_config.gemm1_alpha}, "
+            f"gemm1_beta={runner_config.gemm1_beta}."
+        )
 
     hidden_states = dispatch_output.hidden_states
     hidden_states_scale = dispatch_output.hidden_states_scale
