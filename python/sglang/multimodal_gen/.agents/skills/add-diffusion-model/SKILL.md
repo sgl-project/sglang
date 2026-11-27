@@ -121,8 +121,6 @@ integration, and the registry. Checks the guide does not spell out:
   `configs/pipeline_configs/base.py`, not from another model.
 - **Component configs.** Model the DiT and VAE config classes on a neighbor
   under `configs/models/dits/` and `configs/models/vaes/`.
-- **Generator.** `DenoisingStage` also requires `batch.generator`.
-  `InputValidationStage` sets it; a pipeline that skips that stage has to.
 - **Rotary style.** `is_neox_style=True` is the split-half rotation and
   `False` is the interleaved one. Confirm which one the reference uses.
 - **VAE precision.** `vae_precision` defaults to `fp32`. Lower it only after
@@ -228,8 +226,12 @@ A BCG change is validated when:
 - the log has none of `not validated`, `capture failed`,
   `warmup captured no breakable CUDA graphs`, `serving signature MISSED`, or
   `has no captured breakable CUDA graphs`
-- eager and BCG artifacts are byte-identical for the same prompt, seed, shape,
-  steps, guidance, dtype, topology, and `quality`
+- eager and BCG output are compared for the same prompt, seed, shape, steps,
+  guidance, dtype, topology, and `quality`. BCG is not guaranteed to be
+  byte-identical ("Per-model tuning starting points" in
+  `docs/docs/sglang-diffusion/performance-optimization.mdx`). Report whether
+  the hashes match; when they do not, report SSIM and PSNR against eager and
+  name the cause, such as a padder that lengthens the attended sequence
 - short and long prompts exercise every intended bucket, and an over-limit
   prompt falls back deliberately
 - for video, the captured frame count and conditioning shapes match the
@@ -291,7 +293,8 @@ Go through "PR Checklist" in the guide, then confirm:
 - [ ] The model is either marked BCG-validated in full (pipeline config,
       model ID, and registered padder) or not at all.
 - [ ] When BCG is validated, capture and replay are proven at the served
-      `quality` and the artifact matches eager byte for byte.
+      `quality`, and the output is compared against eager: matching hashes, or
+      SSIM and PSNR with the cause of the difference.
 - [ ] Every non-bit-exact fast path is registered at its `quality` level and
       `exact` still runs the reference chain.
 - [ ] For a coupled multimodal model, every output stream is checked and both

@@ -11,6 +11,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
     LingBotVideoTextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.auto_negative import (
+    LingBotVideoAutoNegativeStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter import (
+    LingBotVideoPromptRewriteStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter_backends import (
+    build_rewriter_backend,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -37,6 +46,15 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(InputValidationStage())
+        config = server_args.pipeline_config
+        # One backend for both stages, so an in-process rewriter loads once.
+        rewriter_backend = build_rewriter_backend(
+            config, trust_remote_code=server_args.trust_remote_code
+        )
+        if rewriter_backend is not None:
+            self.add_stage(LingBotVideoPromptRewriteStage(backend=rewriter_backend))
+            if config.rewriter_auto_negative:
+                self.add_stage(LingBotVideoAutoNegativeStage(backend=rewriter_backend))
         self.add_stage(
             LingBotVideoTextEncodingStage(
                 text_encoders=[self.get_module("text_encoder")],
