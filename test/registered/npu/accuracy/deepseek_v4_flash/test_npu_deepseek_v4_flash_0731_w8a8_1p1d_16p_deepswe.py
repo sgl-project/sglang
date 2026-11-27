@@ -157,6 +157,13 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
+    # The DeepSWE agent (mini-swe-agent) drives the model through OpenAI
+    # tool calls; without these parsers the engines return plain text and the
+    # agent gives up after three format errors.
+    "--tool-call-parser",
+    "deepseekv4",
+    "--reasoning-parser",
+    "deepseek-v4",
     *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
@@ -201,6 +208,10 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     4,
     5,
     6,
+    "--tool-call-parser",
+    "deepseekv4",
+    "--reasoning-parser",
+    "deepseek-v4",
     *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
