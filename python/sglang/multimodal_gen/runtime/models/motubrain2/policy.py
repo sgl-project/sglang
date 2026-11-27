@@ -17,11 +17,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.configs.sample.motubrain2 import Motubrain2Observation
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.vla.prefix_cache import (
-    PrefixContext,
-    VLAPrefixCacheManager,
-)
 
 logger = init_logger(__name__)
 
@@ -35,10 +32,6 @@ def _tensor_fingerprint(tensor: torch.Tensor) -> str:
     digest.update(str(tensor.dtype).encode("ascii"))
     digest.update(tensor.numpy().tobytes())
     return digest.hexdigest()
-
-
-def _text_fingerprint(text: str) -> str:
-    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
 
 
 def _native_attention(device: torch.device):
@@ -172,7 +165,7 @@ def _check_native_dit_cache(args: SimpleNamespace) -> None:
 
 
 class Motubrain2PolicyModel(nn.Module):
-    """Real Motubrain-2.0 policy behind the SGLang VLA model contract."""
+    """SGLang worker model backed by the native Motubrain policy."""
 
     runtime_role = "monolithic"
 
@@ -334,98 +327,31 @@ class Motubrain2PolicyModel(nn.Module):
         config.validate_loaded_profile(policy.processor, policy.sampling)
         return cls(model_path, config, policy)
 
-    # ----------------------------------------------------------- prefix path
-    @staticmethod
-    def _native_observation(observation: Any) -> dict[str, Any]:
-        metadata = getattr(observation, "metadata", {}) or {}
-        native = metadata.get("native_observation")
-        if native is not None:
-            return native
-
-        # Fallback for callers that hand-build the batch (tests, tools).
-        prompt = observation.prompt[0] if observation.prompt else ""
-        native = {"instruction": prompt, "cameras": {}}
-        camera_order = tuple(metadata.get("camera_order") or tuple(observation.images))
-        for name in camera_order:
-            native["cameras"][name] = observation.images[name]
-        state = getattr(observation, "state", None)
-        if state is not None:
-            native["state"] = state.reshape(-1)
-        return native
-
     @torch.inference_mode()
-    def encode_prefix(
-        self,
-        observation: Any,
-        *,
-        use_cuda_graph: bool = True,
-        bucket_prompt: bool | None = None,
-    ) -> PrefixContext:
-        del use_cuda_graph, bucket_prompt
-        batch_size = int(getattr(observation, "batch_size", 1))
-        if batch_size != 1:
-            raise ValueError(
-                "Motubrain2Pipeline serves one observation per request; "
-                "keep dynamic batching disabled"
-            )
-        native = self._native_observation(observation)
+    def encode_observation(self, observation: Motubrain2Observation):
         with _native_attention(self.device):
-            example = self.processor.encode(native)
-        return PrefixContext(
-            # Motubrain2 has no autoregressive prefix K/V. The generic stage only
-            # iterates this container for multi-request slicing, so empty is
-            # correct; the encoded inputs travel in ``layout``.
-            past_key_values=[],
-            prefix_pad_masks=torch.ones(
-                batch_size, 1, dtype=torch.bool, device=self.device
+            return self.processor.encode(observation.inputs)
+
+    @staticmethod
+    def observation_key(observation: Motubrain2Observation) -> tuple:
+        inputs = observation.inputs
+        return (
+            inputs["instruction"],
+            tuple(
+                (name, _tensor_fingerprint(clip))
+                for name, clip in inputs["cameras"].items()
             ),
-            prefix_len=int(example["video"].shape[0]),
-            layout={
-                "full_attention": False,
-                "cuda_graph_eligible": False,
-                "native_example": example,
-                "motubrain2": True,
-            },
+            tuple(
+                (name, _tensor_fingerprint(clip))
+                for name, clip in inputs.get("history_cameras", {}).items()
+            ),
+            tuple(
+                (name, _tensor_fingerprint(inputs[name]))
+                for name in ("state", "camera_extrinsic")
+                if name in inputs
+            ),
         )
 
-    def build_prefix_cache_key(
-        self,
-        observation: Any,
-        *,
-        bucket_prompt: bool = False,
-    ) -> str:
-        del bucket_prompt
-        native = self._native_observation(observation)
-        cameras = native.get("cameras") or {}
-        image_hashes = {
-            name: _tensor_fingerprint(clip) for name, clip in cameras.items()
-        }
-        state = native.get("state")
-        extrinsic = native.get("camera_extrinsic")
-        history = native.get("history_cameras") or {}
-        history_digest = ",".join(
-            f"{name}:{_tensor_fingerprint(clip)}" for name, clip in history.items()
-        )
-        positions_version = (
-            f"{self.config.prefix_cache_layout_version}:"
-            f"ext={'' if extrinsic is None else _tensor_fingerprint(extrinsic)}:"
-            f"hist={history_digest}"
-        )
-        return VLAPrefixCacheManager.make_key(
-            model_revision=os.path.basename(os.path.normpath(self.model_path)),
-            tokenizer_id=f"{self.config.text_encoder_name}:{self.config.max_token_len}",
-            camera_order=tuple(cameras),
-            image_hashes=image_hashes,
-            token_digest=_text_fingerprint(native["instruction"]),
-            token_mask_digest="" if state is None else _tensor_fingerprint(state),
-            masks={name: True for name in cameras},
-            positions_version=positions_version,
-            dtype=str(self.dtype).replace("torch.", ""),
-            parallel_layout_version=self.config.parallel_layout_version,
-            cache_namespace="motubrain2",
-        )
-
-    # ----------------------------------------------------------- action path
     def _resolve_generator(
         self,
         generator: Any,
@@ -444,31 +370,20 @@ class Motubrain2PolicyModel(nn.Module):
         )
 
     @torch.inference_mode()
-    def sample_actions(
+    def predict(
         self,
-        observation: Any,
-        prefix_context: PrefixContext,
+        observation: Motubrain2Observation,
+        example: dict[str, Any],
         *,
-        noise: torch.Tensor | None,
         num_steps: int,
-        use_cuda_graph: bool = True,
         generator: Any = None,
-    ) -> torch.Tensor:
-        del use_cuda_graph
-        layout = prefix_context.layout
-        example = layout["native_example"]
-        if noise is not None:
-            raise ValueError(
-                "Motubrain2 accepts a seed to generate joint video and action noise"
-            )
-
-        metadata = getattr(observation, "metadata", {}) or {}
-        session_id = metadata.get("session_id")
+    ) -> tuple[torch.Tensor, dict | None]:
+        session_id = observation.session_id
         if self.rtc_config is not None and (
             not isinstance(session_id, str) or not session_id.strip()
         ):
             raise ValueError("RTC requires a nonempty string session_id")
-        seed = metadata.get("seed")
+        seed = observation.seed
 
         with (
             self._lock,
@@ -479,13 +394,13 @@ class Motubrain2PolicyModel(nn.Module):
         ):
             previous = (
                 self.sessions.get(session_id, _SessionState())
-                if not metadata.get("reset", False)
+                if not observation.reset
                 else _SessionState()
             )
             gen = self._resolve_generator(None if seed is None else generator, seed)
             if seed is None and previous.rng_state is not None:
                 gen.set_state(previous.rng_state)
-            rtc = metadata.get("rtc")
+            rtc = observation.rtc
             if (
                 rtc is None
                 and self.rtc_config is not None
@@ -496,11 +411,10 @@ class Motubrain2PolicyModel(nn.Module):
             request_policy.generator = gen
             request_policy.sampling = {**self.policy.sampling, "steps": int(num_steps)}
             request_policy.processor = _PreparedProcessor(self.processor, example)
-            result = request_policy.predict(
-                self._native_observation(observation), rtc=rtc
-            )
+            result = request_policy.predict(observation.inputs, rtc=rtc)
             decoded, valid = result["decoded_action"], result["decoded_valid"]
-            return_native = metadata.get("return_native_outputs", False)
+            return_native = observation.return_native_outputs
+            native_outputs = None
             if valid.dtype != torch.bool or valid.shape != decoded.shape:
                 raise ValueError("native validity mask does not match decoded actions")
             fully_valid = bool(valid.all())
@@ -523,7 +437,7 @@ class Motubrain2PolicyModel(nn.Module):
                     name: result[name].contiguous()
                     for name in ("video", "action", "decoded_action", "decoded_valid")
                 }
-                observation.metadata["native_outputs"] = {
+                native_outputs = {
                     "format": "safetensors",
                     "encoding": "base64",
                     "data": base64.b64encode(save(tensors)).decode("ascii"),
@@ -542,32 +456,11 @@ class Motubrain2PolicyModel(nn.Module):
                     self.sessions.move_to_end(session_id)
                     if len(self.sessions) > self.max_sessions:
                         self.sessions.popitem(last=False)
-        return actions.unsqueeze(0)
+        return actions, native_outputs
 
     def release_session(self, session_id: str) -> bool:
         with self._lock:
             return self.sessions.pop(session_id, None) is not None
-
-    def warmup_actions(self, batch_size: int = 1) -> torch.Tensor:
-        return torch.zeros(
-            int(batch_size),
-            self.action_horizon,
-            self.canonical_action_dim,
-            device=self.device,
-            dtype=torch.float32,
-        )
-
-    def should_run_action_denoise(self, prefix_context: Any) -> bool:
-        del prefix_context
-        return True
-
-    def action_parallel_info(self, prefix_context: Any) -> dict[str, Any]:
-        del prefix_context
-        return {
-            "split_group": False,
-            "runtime_role": self.runtime_role,
-            "action_sequence_parallel": False,
-        }
 
 
 def _resolve_device() -> torch.device:

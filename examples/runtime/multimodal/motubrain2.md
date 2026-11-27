@@ -2,7 +2,7 @@
 
 Install SGLang Diffusion and the Motubrain2 inference package in the same Python environment. This example requires access to the Motubrain runtime, robot profile, policy weights and the encoders used by the checkpoint. Astribot uses the DA3 DinoV2 geometry encoder. [Motubrain runtime and assets](https://github.com/shengshu-ai/Motubrain-2.0)
 
-Run `sglang serve` on a compute node with the local model directory as its positional argument. Set `--model-type diffusion`, `--pipeline-class-name Motubrain2Pipeline`, `--num-gpus 1` and `--pipeline-config-path` with an absolute path to a JSON configuration. This pipeline ships in SGLang and is discovered automatically.
+Run `sglang serve` on a compute node with the local model directory as its positional argument. Set `--model-type diffusion`, `--pipeline-class-name Motubrain2Pipeline`, `--num-gpus 1` and `--pipeline-config-path` with an absolute path to a JSON configuration. SGLang discovers this pipeline automatically. Its action stage runs the Motubrain observation encoder and native policy. It can reuse encoded inputs when the instruction, camera frames, robot state, camera transform and history are identical.
 
 The JSON fields `wan`, `text_encoder` and `profile` identify the Wan VAE, T5Gemma encoder and robot profile. For Astribot, also provide `da3` and, for standalone weight files, `wan_config` and `da3_config`. Keep the profile's normalization assets beside the profile, or use its native `action_stats` override. The model directory may contain the released policy weights directly or a serving bundle with a `policy` directory and profile. The checkpoint supplies the sampler, diffusion shifts and default step count.
 

@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -316,8 +315,6 @@ class Motubrain2PipelineConfig(PipelineConfig):
         return True
 
     def supports_openpi_endpoint(self) -> bool:
-        # Pi0.5 and FLUX 3 Action both expose the generic /openpi/policy
-        # websocket; it is a thin wrapper over the same action endpoint.
         return True
 
     def supports_dynamic_batching(self) -> bool:
@@ -339,11 +336,7 @@ class Motubrain2PipelineConfig(PipelineConfig):
         )
 
     def action_metadata(self, server_args: Any) -> dict[str, Any]:
-        """Model-owned payload for ``GET /v1/actions/metadata``.
-
-        The field names follow FLUX 3 Action's metadata so the same clients and
-        the generic OpenPI websocket work unchanged.
-        """
+        """Describe the loaded checkpoint and the observation and action wire formats."""
 
         return {
             "object": "action.metadata",
@@ -418,8 +411,6 @@ class Motubrain2PipelineConfig(PipelineConfig):
 
 
 def register():
-    if os.environ.get("SGLANG_EXTERNAL_MODEL_PACKAGE") == "motubrain2_sglang":
-        return
     from sglang.multimodal_gen.configs.sample.motubrain2 import Motubrain2SamplingParams
     from sglang.multimodal_gen.registry import (
         KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS,

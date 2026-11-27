@@ -42,7 +42,7 @@ class NativeOutputValidityTest(unittest.TestCase):
         from sglang.multimodal_gen.configs.pipeline_configs.motubrain2 import (
             Motubrain2PipelineConfig,
         )
-        from sglang.multimodal_gen.runtime.models.vlas.motubrain2_policy import (
+        from sglang.multimodal_gen.runtime.models.motubrain2.policy import (
             Motubrain2PolicyModel,
         )
 
@@ -130,11 +130,76 @@ class NativeOutputValidityTest(unittest.TestCase):
         self.assertFalse(params.enable_cuda_graph)
         self.assertEqual(params.num_inference_steps, 4)
 
+    def test_stage_caches_only_identical_native_inputs(self):
+        import numpy as np
+        import torch
+
+        from sglang.multimodal_gen.configs.pipeline_configs.motubrain2 import (
+            Motubrain2PipelineConfig,
+        )
+        from sglang.multimodal_gen.runtime.models.motubrain2.policy import (
+            Motubrain2PolicyModel,
+        )
+        from sglang.multimodal_gen.runtime.pipelines.motubrain2 import (
+            Motubrain2ActionStage,
+        )
+
+        config = Motubrain2PipelineConfig(
+            image_keys=("head",), state_dim=2, output_action_dim=2, action_horizon=2
+        )
+        args = SimpleNamespace(
+            pipeline_config=config,
+            disable_conditioning_cache=False,
+            conditioning_cache_max_size_mb=1,
+        )
+        model = SimpleNamespace(
+            observation_key=Motubrain2PolicyModel.observation_key,
+            encode_observation=Mock(return_value={"video": torch.zeros(1)}),
+            predict=Mock(return_value=(torch.ones(2, 2), None)),
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args",
+            return_value=args,
+        ):
+            stage = Motubrain2ActionStage(model, config)
+        observation = {
+            "prompt": "test",
+            "images": {"head": np.zeros((4, 4, 3), dtype=np.uint8)},
+            "state": [0, 1],
+        }
+        options = {
+            "enable_prefix_cache": True,
+            "output_format": "list",
+            "return_timing": True,
+        }
+        request = SimpleNamespace(
+            request_id="request",
+            num_inference_steps=4,
+            is_warmup=False,
+            generator=None,
+            metrics=None,
+            extra={"motubrain2": {"observation": observation, "options": options}},
+        )
+
+        def infer():
+            return stage.forward(request, args).output[0]
+
+        self.assertFalse(infer()["cache"]["hit"])
+        self.assertTrue(infer()["cache"]["hit"])
+        observation["images"]["head"][0, 0, 0] = 1
+        self.assertFalse(infer()["cache"]["hit"])
+        observation["state"] = [2, 1]
+        self.assertFalse(infer()["cache"]["hit"])
+        options["enable_prefix_cache"] = False
+        self.assertEqual(infer()["cache"]["mode"], "disabled")
+        self.assertEqual(model.encode_observation.call_count, 4)
+        self.assertEqual(model.predict.call_count, 5)
+
     @requires_motubrain
     def test_legacy_native_cache_uses_the_stored_recipe_for_auto_mode(self):
         from motubrain2.inference.sampling import sampling_options
 
-        from sglang.multimodal_gen.runtime.models.vlas.motubrain2_policy import (
+        from sglang.multimodal_gen.runtime.models.motubrain2.policy import (
             _check_native_dit_cache,
         )
 
@@ -213,7 +278,7 @@ class NativeOutputValidityTest(unittest.TestCase):
         from sglang.multimodal_gen.configs.pipeline_configs.motubrain2 import (
             Motubrain2PipelineConfig,
         )
-        from sglang.multimodal_gen.runtime.models.vlas.motubrain2_policy import (
+        from sglang.multimodal_gen.runtime.models.motubrain2.policy import (
             Motubrain2PolicyModel,
         )
 
@@ -237,18 +302,16 @@ class NativeOutputValidityTest(unittest.TestCase):
         )
         config = Motubrain2PipelineConfig(text_cache_size=0, max_sessions=2)
         model = Motubrain2PolicyModel("tiny", config, policy)
-        prefix = SimpleNamespace(layout={"native_example": {}})
 
         def request(session_id=None, *, seed=None, reset=False, fail=False):
-            observation = SimpleNamespace(
-                metadata=dict(
-                    session_id=session_id,
-                    seed=seed,
-                    reset=reset,
-                    native_observation={"fail": fail},
-                )
+            from sglang.multimodal_gen.configs.sample.motubrain2 import (
+                Motubrain2Observation,
             )
-            return model.sample_actions(observation, prefix, noise=None, num_steps=1)[0]
+
+            observation = Motubrain2Observation(
+                inputs={"fail": fail}, session_id=session_id, seed=seed, reset=reset
+            )
+            return model.predict(observation, {}, num_steps=1)[0]
 
         expected = torch.Generator().manual_seed(0)
         first = torch.rand(2, 2, generator=expected)
@@ -277,7 +340,7 @@ class NativeOutputValidityTest(unittest.TestCase):
         from sglang.multimodal_gen.configs.pipeline_configs.motubrain2 import (
             Motubrain2PipelineConfig,
         )
-        from sglang.multimodal_gen.runtime.models.vlas.motubrain2_policy import (
+        from sglang.multimodal_gen.runtime.models.motubrain2.policy import (
             Motubrain2PolicyModel,
         )
 
@@ -309,20 +372,22 @@ class NativeOutputValidityTest(unittest.TestCase):
         )
         config = Motubrain2PipelineConfig(rtc_enabled=True, text_cache_size=0)
         model = Motubrain2PolicyModel("tiny", config, policy)
-        obs = SimpleNamespace(metadata={"session_id": "left", "native_observation": {}})
-        prefix = SimpleNamespace(layout={"native_example": {}})
+        from sglang.multimodal_gen.configs.sample.motubrain2 import (
+            Motubrain2Observation,
+        )
+
+        obs = Motubrain2Observation(inputs={}, session_id="left")
 
         def request():
-            return model.sample_actions(obs, prefix, noise=None, num_steps=1)
+            return model.predict(obs, {}, num_steps=1)
 
-        request()
-        self.assertNotIn("native_outputs", obs.metadata)
+        self.assertIsNone(request()[1])
         mask[0, 1] = False
         with self.assertRaisesRegex(ValueError, "invalid controller"):
             request()
-        obs.metadata["return_native_outputs"] = True
-        request()
-        result = load(base64.b64decode(obs.metadata["native_outputs"]["data"]))
+        obs.return_native_outputs = True
+        _, native_outputs = request()
+        result = load(base64.b64decode(native_outputs["data"]))
         self.assertTrue(torch.equal(result["decoded_valid"], mask))
         self.assertEqual(result["decoded_valid"].dtype, torch.bool)
         self.assertIsNotNone(observed_rtc[-1])

@@ -8,8 +8,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from sglang.multimodal_gen.configs.sample.motubrain2 import validate_observation_options
-from sglang.multimodal_gen.runtime.vla.observation import VLAObservationBatch
+from sglang.multimodal_gen.configs.sample.motubrain2 import (
+    Motubrain2Observation,
+    validate_observation_options,
+)
 
 
 def _as_float_array(value: Any, name: str) -> np.ndarray:
@@ -147,8 +149,6 @@ def _pose_vector(value: Any, name: str) -> torch.Tensor:
 
 
 class Motubrain2Preprocessor:
-    """Turn an action-API observation dict into ``VLAObservationBatch``."""
-
     def __init__(self, config: Any):
         self.config = config
         self.camera_order = tuple(config.image_keys)
@@ -179,8 +179,8 @@ class Motubrain2Preprocessor:
             )
         return clip
 
-    def _raw_batch(self, observation: dict[str, Any], rtc: Any) -> VLAObservationBatch:
-        """Keep raw uint8 clips for the native Motubrain2 preprocessor."""
+    def __call__(self, observation: dict[str, Any]) -> Motubrain2Observation:
+        rtc = validate_observation_options(observation, self.config)
 
         prompt = observation.get("prompt") or observation.get("task") or ""
         if not prompt:
@@ -244,31 +244,11 @@ class Motubrain2Preprocessor:
                 "sparse history"
             )
 
-        return VLAObservationBatch(
-            prompt=[prompt],
-            images=cameras,
-            image_masks={
-                source: torch.ones(1, dtype=torch.bool) for source in camera_order
-            },
-            state=None if state_tensor is None else state_tensor.unsqueeze(0),
-            noise=None,
-            tokens=torch.empty((1, 0), dtype=torch.long),
-            token_masks=torch.empty((1, 0), dtype=torch.bool),
-            batch_size=1,
-            metadata={
-                "camera_order": camera_order,
-                "native_observation": native,
-                "return_native_outputs": observation.get(
-                    "return_native_outputs", False
-                ),
-                "session_id": observation.get("session_id"),
-                "reset": observation.get("reset", False),
-                "rtc": rtc,
-                "seed": observation.get("_motubrain2_seed", observation.get("seed")),
-            },
+        return Motubrain2Observation(
+            inputs=native,
+            return_native_outputs=observation.get("return_native_outputs", False),
+            session_id=observation.get("session_id"),
+            reset=observation.get("reset", False),
+            rtc=rtc,
+            seed=observation.get("_motubrain2_seed", observation.get("seed")),
         )
-
-    def __call__(self, observation: dict[str, Any]) -> VLAObservationBatch:
-        observation = dict(observation or {})
-        rtc = validate_observation_options(observation, self.config)
-        return self._raw_batch(observation, rtc)

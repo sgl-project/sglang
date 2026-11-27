@@ -378,12 +378,15 @@ def _build_action_model_sampling_params(
     prefix_cache = runtime.get("prefix_cache")
     if prefix_cache is None:
         prefix_cache = observation.get("enable_prefix_cache")
-    if prefix_cache is None:
+    use_legacy_options = getattr(
+        sampling_params_cls, "allow_legacy_runtime_options", True
+    )
+    if prefix_cache is None and use_legacy_options:
         prefix_cache = observation.get("enable_pi_prefix_cache")
     cuda_graph = runtime.get("cuda_graph")
     if cuda_graph is None:
         cuda_graph = observation.get("enable_cuda_graph")
-    if cuda_graph is None:
+    if cuda_graph is None and use_legacy_options:
         cuda_graph = observation.get("enable_pi_cuda_graph")
     output_format = str(
         runtime.get(

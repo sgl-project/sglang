@@ -11,6 +11,16 @@ import numpy as np
 from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 
 
+@dataclass
+class Motubrain2Observation:
+    inputs: dict[str, Any]
+    session_id: str | None = None
+    seed: int | None = None
+    reset: bool = False
+    rtc: Any = None
+    return_native_outputs: bool = False
+
+
 def validate_observation_options(observation: dict[str, Any], config: Any):
     if (
         observation.get("noise") is not None
@@ -94,6 +104,7 @@ class Motubrain2SamplingParams(ActionSamplingParams):
         default=None, metadata={"batch_sig_exclude": True}
     )
     _implicit_seed = False
+    allow_legacy_runtime_options = False
     action_horizon: int | None = None
     action_dim: int | None = None
 
@@ -133,7 +144,6 @@ class Motubrain2SamplingParams(ActionSamplingParams):
             observation["prompt"] = self.prompt
         if self.noise is not None:
             observation["noise"] = self.noise
-        # The generic VLA stages may leave the request's generator unset.
         seed = self.seed
         if isinstance(seed, list):
             seed = seed[0] if seed else None
@@ -144,13 +154,12 @@ class Motubrain2SamplingParams(ActionSamplingParams):
 
     def build_request_extra(self) -> dict[str, Any]:
         extra = super().build_request_extra()
-        extra["vla"] = {
+        extra["motubrain2"] = {
             "observation": self._request_observation(),
             "options": {
                 "output_format": self.output_format,
                 "return_timing": self.return_timing,
                 "enable_prefix_cache": self.enable_prefix_cache,
-                "enable_cuda_graph": self.enable_cuda_graph,
             },
         }
         return extra
