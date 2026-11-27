@@ -5032,7 +5032,7 @@ class TestNemotronDecisionStartup(CustomTestCase):
                         memory_gib * 1024**3 - static_bytes, 20 * 1024**3
                     )
 
-    def test_explicit_memory_fraction_keeps_prefill_defaults(self):
+    def test_explicit_memory_fraction_limits_only_default_prefill(self):
         from pathlib import Path
 
         from transformers import Ministral3Config
@@ -5070,9 +5070,14 @@ class TestNemotronDecisionStartup(CustomTestCase):
             (root / "decision_template.jinja").write_text(
                 "{{ decision_content }}<SPECIAL_100>"
             )
-            for supplied, expected in ((None, 131072), (8192, 8192)):
+            for fraction, supplied, expected in (
+                (None, None, 131072),
+                (0.88, None, 16384),
+                (0.88, 8192, 8192),
+                (0.88, 131072, 131072),
+            ):
                 with (
-                    self.subTest(supplied=supplied),
+                    self.subTest(fraction=fraction, supplied=supplied),
                     override_platform(
                         is_cuda=True,
                         is_hip=False,
@@ -5091,13 +5096,14 @@ class TestNemotronDecisionStartup(CustomTestCase):
                     args = ServerArgs(
                         model_path=directory,
                         device="cuda",
-                        mem_fraction_static=0.8,
+                        mem_fraction_static=fraction,
                         max_prefill_tokens=supplied,
                     )
                     args.resolve_once()
-                    self.assertEqual(
-                        resolution_result(args, "mem_fraction_static"), 0.8
-                    )
+                    if fraction is not None:
+                        self.assertEqual(
+                            resolution_result(args, "mem_fraction_static"), fraction
+                        )
                     self.assertEqual(
                         resolution_result(args, "max_prefill_tokens"), expected
                     )

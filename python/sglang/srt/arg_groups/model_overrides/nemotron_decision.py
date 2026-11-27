@@ -25,8 +25,12 @@ def apply_nemotron_decision_prefill_defaults(
     updates = {"chunked_prefill_size": -1}
     if server_args.max_prefill_tokens is None:
         gpu_mem = get_device_memory_capacity(resolving_view(server_args).device)
-        # Smaller GPUs need a smaller activation reserve for a complete read.
-        if gpu_mem is not None and gpu_mem >= 60 * 1024:
+        # Only automatic memory sizing reserves room for a 128K read.
+        if (
+            gpu_mem is not None
+            and gpu_mem >= 60 * 1024
+            and server_args.mem_fraction_static is None
+        ):
             budget = 131072
         else:
             budget = 16384

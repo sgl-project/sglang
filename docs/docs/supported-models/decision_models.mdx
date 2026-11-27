@@ -24,10 +24,11 @@ For deployment and request examples, see the [Nemotron Decision cookbook](/cookb
 
 [NVIDIA-Nemotron-3.5-Decision-8B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16)
 uses a trained prompt and fully bidirectional attention. Serve it through
-`/v1/systemone` or `/v1/decisions`. The default prefill budget is 128K tokens on GPUs with at least 60 GiB
-of memory, or 16K when memory is smaller or unknown, bounded by the configured context and
-checkpoint input limit. Set `--max-prefill-tokens` to
-change that budget.
+`/v1/systemone` or `/v1/decisions`. With automatic memory sizing, the default prefill budget is
+128K tokens on GPUs with at least 60 GiB of memory, or 16K when memory is smaller or unknown.
+Setting `--mem-fraction-static` makes the default 16K because automatic activation-memory sizing
+is skipped. An explicit `--max-prefill-tokens` overrides this default. Requests are still bounded
+by the configured context and checkpoint input limit.
 
 ```bash Command
 sglang serve \
