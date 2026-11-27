@@ -2997,6 +2997,9 @@ class Scheduler(
             get_total_prefill_busy_us=lambda: self._get_total_prefill_busy_us(),
             get_decode_moment_totals=lambda: self.decode_moment_totals,
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
+            get_storage_metrics_collector=lambda: (
+                self.tree_cache.storage_metrics_collector
+            ),
         )
 
     def _get_total_prefill_busy_us(self) -> int:
@@ -6427,6 +6430,9 @@ class Scheduler(
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
+                if idle:
+                    # Waited, not polled, so every rank agrees on idle.
+                    tc.wait_fenced_writes()
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
 

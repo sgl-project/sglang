@@ -117,7 +117,7 @@ from sglang.srt.mem_cache.allocation import (
     alloc_tracking_slots,
     retire_window,
 )
-from sglang.srt.mem_cache.allocation_sizing import spec_decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import decode_alloc_targets
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -2982,19 +2982,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else [self.reqs[i] for i in selected_indices]
         )
 
-        if self.spec_algorithm.is_none():
-            new_pages = sum(
-                1 for r in requests if r.kv.kv_committed_len % page_size == 0
-            )
-            return new_pages * page_size + num_beam_member_rows(requests)
-
-        cur_kv_lens, nxt_kv_lens, _ = spec_decode_alloc_lens(
+        allocated_lens, target_lens, _ = decode_alloc_targets(
             requests, page_size=page_size
         )
         return sum(
-            ceil_align(nxt, page_size) - ceil_align(cur, page_size)
-            for cur, nxt in zip(cur_kv_lens, nxt_kv_lens)
-        )
+            ceil_align(target, page_size) - ceil_align(allocated, page_size)
+            for allocated, target in zip(allocated_lens, target_lens)
+        ) + num_beam_member_rows(requests)
 
     @capacity_decision
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
