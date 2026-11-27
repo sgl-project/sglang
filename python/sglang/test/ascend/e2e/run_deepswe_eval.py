@@ -64,9 +64,10 @@ def install_eval_env():
 
 
 # pier's mini-swe-agent install step fetches the uv binary from GitHub releases,
-# which this network cannot reach. Swap that download for the OBS mirror and
-# point uv at a reachable PyPI index (via ~/.local/bin/env, which pier sources
-# right after).
+# which this network cannot reach. Swap that download for the OBS mirror, and
+# make `uv tool install` resolve from a reachable PyPI index: the index export
+# in ~/.local/bin/env is not honoured by every uv build, so pass --index-url
+# explicitly too.
 UV_TARBALL_URL = os.environ.get(
     "DEEPSWE_UV_TARBALL_URL",
     "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/ci/tools/uv-x86_64-unknown-linux-gnu.tar.gz",
@@ -82,6 +83,19 @@ _UV_INSTALL_REPLACEMENT = (
     "printf 'export PATH=$HOME/.local/bin:$PATH\\n"
     f"export UV_DEFAULT_INDEX={UV_INDEX_URL}\\n"
     f"export UV_INDEX_URL={UV_INDEX_URL}\\n' > $HOME/.local/bin/env"
+)
+# Without this, uv falls back to files.pythonhosted.org, which the eval pod
+# cannot reach (pip installs would hang and the image build fails).
+_UV_TOOL_INSTALL_PATTERN = re.compile(
+    r"^uv tool install mini-swe-agent(\S*)\s*$", re.MULTILINE
+)
+_UV_TOOL_INSTALL_REPLACEMENT = (
+    f"uv --version && uv tool install --index-url {UV_INDEX_URL} "
+    r"mini-swe-agent\1"
+)
+_UV_PATCHES = (
+    (_UV_INSTALL_PATTERN, _UV_INSTALL_REPLACEMENT),
+    (_UV_TOOL_INSTALL_PATTERN, _UV_TOOL_INSTALL_REPLACEMENT),
 )
 _PATCH_SUFFIXES = (
     ".py",
@@ -111,7 +125,9 @@ def patch_agent_install():
                     try:
                         with open(path, encoding="utf-8", errors="ignore") as f:
                             text = f.read()
-                        new_text = _UV_INSTALL_PATTERN.sub(_UV_INSTALL_REPLACEMENT, text)
+                        new_text = text
+                        for pattern, replacement in _UV_PATCHES:
+                            new_text = pattern.sub(replacement, new_text)
                         if new_text == text:
                             continue
                         with open(path, "w", encoding="utf-8") as f:
