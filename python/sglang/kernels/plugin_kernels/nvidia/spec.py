@@ -386,6 +386,9 @@ class CheckpointCommitView(msgspec.Struct, frozen=True):
 
     Returning False must precede all writes. After taking ownership, failures must
     propagate; the runtime must not replay the stock commit over partial writes.
+
+    The callback may run under CUDA graph capture on the current stream: it must be
+    capture-safe and decide only from values fixed for the graph key, such as shapes.
     """
 
     checkpoint: torch.Tensor

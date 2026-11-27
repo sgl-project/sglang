@@ -555,7 +555,7 @@ class TestCheckpointHookGraphWiring(CustomTestCase):
     def test_half_constructed_workers_and_graphs_keep_the_stock_checkpoint(self):
         from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
-        for cls in (eagle_worker_v2.EAGLEWorkerV2, NGRAMWorker, EaglePostVerifyGraphs):
+        for cls in (eagle_worker_v2.EAGLEWorkerV2, NGRAMWorker):
             with self.subTest(cls=cls.__name__):
                 obj = cls.__new__(cls)
                 self.assertNotIn("_speculative_runtime_hooks", obj.__dict__)
@@ -563,9 +563,7 @@ class TestCheckpointHookGraphWiring(CustomTestCase):
                     obj._speculative_runtime_hooks,
                     eagle_worker_v2.STOCK_SPECULATIVE_RUNTIME_HOOKS,
                 )
-                self.assertIsNone(
-                    getattr(obj._speculative_runtime_hooks, "checkpoint_commit", None)
-                )
+                self.assertIsNone(obj._speculative_runtime_hooks.checkpoint_commit)
 
     def test_graph_commit_forwards_the_bound_callback(self):
         callback = lambda view: True

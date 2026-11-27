@@ -43,8 +43,6 @@ class EaglePostVerifyGraphs:
     """The verify's post-section in SGLang's own CUDA graphs, one set per key: batch
     size, sampling mode, forced acceptance, tracking and the verify logits buffer."""
 
-    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
-
     def __init__(
         self,
         *,
@@ -252,9 +250,7 @@ class EaglePostVerifyGraphs:
             slot.tokens_per_request,
             prepared_step_indices=outputs[6],
             state_slots=state_slots,
-            checkpoint_commit=getattr(
-                self._speculative_runtime_hooks, "checkpoint_commit", None
-            ),
+            checkpoint_commit=self._speculative_runtime_hooks.checkpoint_commit,
         )
 
 
