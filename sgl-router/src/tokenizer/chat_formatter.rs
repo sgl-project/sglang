@@ -755,6 +755,23 @@ fn deepseek_parity_probes() -> Vec<JsonValue> {
             "continue_final_message": true,
             "add_generation_prompt": false
         }),
+        // A task's continued reply encodes with the added vocabulary.
+        serde_json::json!({
+            "messages": [
+                {"role": "user", "content": pieces(" ")},
+                {"role": "assistant", "content": pieces("")}
+            ],
+            "task": "action",
+            "continue_final_message": true
+        }),
+        serde_json::json!({
+            "messages": [
+                {"role": "user", "content": pieces("\n")},
+                {"role": "assistant", "content": pieces(" ")}
+            ],
+            "task": "query",
+            "continue_final_message": true
+        }),
     ]
 }
 /// Message fields the engine's request schema keeps for non-user roles.
