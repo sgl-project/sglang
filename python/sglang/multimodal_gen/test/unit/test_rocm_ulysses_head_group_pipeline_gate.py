@@ -7,9 +7,6 @@ from unittest import mock
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention import layer
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 GROUPS_ENV = "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS"
 
