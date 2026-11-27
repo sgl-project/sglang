@@ -71,12 +71,8 @@ class TestDiffusionBCGZImageTurbo(CustomTestCase):
             str(perf_path),
         ]
 
-        env = os.environ.copy()
-        env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
-
         result = subprocess.run(
             cmd,
-            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

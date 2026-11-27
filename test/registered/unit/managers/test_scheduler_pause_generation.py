@@ -1007,7 +1007,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.mbs = [mb_a, mb_b]
         scheduler.last_mbs = [mb_a, None]
         scheduler.mb_metadata = [None, None]
-        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=True)
         # A pause, then a later input, arrive while b is in flight.
         pause = PauseGenerationReqInput(mode="retract")
         later = MagicMock()
