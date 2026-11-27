@@ -31,7 +31,7 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
         req_to_token = torch.full((1, 16), -1, dtype=torch.int64)
         req_to_token[0, 1] = 63
-        req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+        req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, row_width=16)
         req = SimpleNamespace(kv=ReqKvInfo(kv_allocated_len=2))
         batch = SimpleNamespace(
             device=torch.device("cpu"),

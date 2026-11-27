@@ -667,7 +667,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             self._make_core_metadata(1000), indexer_metadata=None
         )
         backend = object.__new__(DeepseekV4AttnBackend)
-        backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        backend.max_kv_len = 4096
         backend.prefill_candidates = object.__new__(DenseBlocksBackend)
         backend.token_to_kv_pool = SimpleNamespace(
             request_window=None,
@@ -699,7 +699,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
 
         self.assertIs(calls[0][0], static_forward_batch)
-        self.assertEqual(calls[0][1], backend.MAX_SEQ_LEN_FOR_CAPTURE)
+        self.assertEqual(calls[0][1], backend.max_kv_len)
         self.assertTrue(calls[0][2])
         self.assertIs(backend.forward_metadata, capture_metadata)
         self.assertIsNone(capture_metadata.sparse_prefill_cache)

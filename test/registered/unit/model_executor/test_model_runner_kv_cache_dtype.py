@@ -31,9 +31,14 @@ def _resolve(
     is_draft_worker=False,
     algorithm="EAGLE",
     draft_backend="fa3",
+    arch=None,
 ):
     """The (label, dtype) a runner stamps from the given flags."""
     runner = ModelRunner.__new__(ModelRunner)
+    if arch is not None:
+        runner.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[arch], index_topk=2048)
+        )
     runner.model = SimpleNamespace(quant_config=quant_config)
     runner.dtype = torch.bfloat16
     runner.is_draft_worker = is_draft_worker
@@ -93,6 +98,26 @@ class TestRunnerKvCacheDtypeLabel(CustomTestCase):
                     is_draft_worker=True,
                 )
                 self.assertEqual((label, dtype), expected)
+
+    def test_an_int8_draft_resolves_from_its_own_model(self):
+        """INT8 is the packed DSA record: the runner hands its own model to
+        the resolver, so a DSA draft on the Ascend backend keeps it and a
+        dense draft gets its compute dtype instead of unscaled INT8 K/V."""
+        for arch, algorithm, expected in (
+            ("GlmMoeDsaForCausalLMNextN", "EAGLE", ("int8", torch.int8)),
+            ("Qwen3ForCausalLM", "DFLASH", ("auto", torch.bfloat16)),
+        ):
+            with self.subTest(arch=arch):
+                self.assertEqual(
+                    _resolve(
+                        flag="int8",
+                        is_draft_worker=True,
+                        algorithm=algorithm,
+                        draft_backend="ascend",
+                        arch=arch,
+                    ),
+                    expected,
+                )
 
     def test_a_dflash_fa4_draft_is_labelled_unquantized(self):
         self.assertEqual(

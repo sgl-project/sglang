@@ -134,6 +134,8 @@ class ScenarioConfig:
     # rather than by the code under test. VRAM guards keep the profile
     # tolerance -- they are what such a case actually protects.
     timing_tolerance: float | None = None
+    # auto-placement can trade resident weights for faster requests on this GPU
+    min_free_vram_mb: dict[str, float] | None = None
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any]) -> ScenarioConfig:
@@ -141,6 +143,9 @@ class ScenarioConfig:
             value = cfg.get(name)
             return float(value) if value is not None else None
 
+        floors = cfg.get("min_free_vram_mb")
+        if isinstance(floors, (int, float)):
+            floors = dict.fromkeys(("load", "warmup", "serving"), float(floors))
         return cls(
             stages_ms=cfg["stages_ms"],
             denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
@@ -158,6 +163,7 @@ class ScenarioConfig:
             runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
             host_anon_tolerance=optional_float("host_anon_tolerance"),
             timing_tolerance=optional_float("timing_tolerance"),
+            min_free_vram_mb=floors,
         )
 
 
@@ -297,7 +303,7 @@ class DiffusionSamplingParams:
 
     # inputs and conditioning
     prompt: str | None = None  # text prompt for generation
-    image_path: Path | str | None = None  # input image/video for editing (Path or URL)
+    image_path: Path | str | list[Path | str] | None = None  # local paths or URLs
 
     # duration
     seconds: int = 1  # for video: duration in seconds
@@ -325,6 +331,7 @@ class DiffusionSamplingParams:
     # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
     # merged directly into the OpenAI extra_body dict.
     extras: dict = field(default_factory=dict)
+    expect_rgba_layers: bool = False
 
 
 @dataclass(frozen=True)
@@ -628,6 +635,14 @@ class PerformanceSummary:
     avg_frame_time_ms: float | None = None
     denoising_stages: set[str] = field(default_factory=set)
     load_time_ms: float | None = None
+    min_free_vram_by_gpu_mb: dict[str, list[float]] = field(default_factory=dict)
+
+    @property
+    def min_free_vram_mb(self) -> dict[str, float]:
+        return {
+            phase: min(samples)
+            for phase, samples in self.min_free_vram_by_gpu_mb.items()
+        }
 
     @staticmethod
     def from_req_perf_record(
@@ -842,6 +857,7 @@ MULTI_FRAME_I2I_sampling_params = DiffusionSamplingParams(
     num_frames=4,
     direct_url_test=True,
     output_format="png",
+    expect_rgba_layers=True,
 )
 
 T2V_PROMPT = "A curious raccoon"

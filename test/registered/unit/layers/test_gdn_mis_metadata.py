@@ -76,6 +76,7 @@ class TestGDNMISMetadata(CustomTestCase):
     def test_batch_tensor_lifecycle_and_layer_reuse(self):
         backend = object.__new__(gdn_backend.GDNAttnBackend)
         backend.enable_mis = True
+        backend.kernel_dispatcher = SimpleNamespace(extend_kernel=None)
         slots = torch.tensor([1, 3])
         backend.forward_metadata = SimpleNamespace(
             mamba_cache_indices=slots,

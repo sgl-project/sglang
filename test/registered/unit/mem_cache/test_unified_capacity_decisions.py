@@ -7,7 +7,6 @@ from array import array
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
-import torch
 from test_prefill_memory_budget import (
     _cache,
     _shared_allocator,
@@ -256,7 +255,7 @@ class TestSpeculativeHeadroomAsksADemand(CustomTestCase):
         page = allocator.page_size
         batch = SimpleNamespace(
             reqs=[SimpleNamespace(kv=SimpleNamespace(kv_committed_len=need))],
-            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(1, 1024)),
+            req_to_token_pool=SimpleNamespace(row_width=1024),
             hisparse_coordinator=None,
             token_to_kv_pool_allocator=allocator,
         )

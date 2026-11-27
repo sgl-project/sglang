@@ -61,6 +61,8 @@ def backend():
     obj.req_to_token_pool = SimpleNamespace(
         req_to_token=obj.req_to_token, row_width=512
     )
+    obj.max_kv_len = 512
+    obj.max_num_pages = 4
     obj.graph_metadata = {"block_tables": torch.zeros(2, 4, dtype=torch.int32)}
     obj.token_to_kv_pool = SimpleNamespace(
         get_key_buffer=Mock(return_value=torch.zeros(8, 128, 32)),

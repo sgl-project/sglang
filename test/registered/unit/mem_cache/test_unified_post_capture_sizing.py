@@ -234,7 +234,7 @@ def _flashinfer_draft_backend(reader, max_context_len, steps=3):
     multi.speculative_num_steps = steps
     multi.runner_ids = reader
     multi.page_size = 64
-    multi.req_to_token_pool = SimpleNamespace(row_width=max_context_len)
+    multi.max_kv_len = max_context_len
     multi.kv_indptr = torch.zeros((steps, 3), dtype=torch.int32, device="cuda")
     multi.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
     multi.attn_backends = []

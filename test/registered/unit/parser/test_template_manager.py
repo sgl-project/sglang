@@ -1166,50 +1166,60 @@ class TestResolveAutoParsers(CustomTestCase):
         self.assertEqual(_declared(args, "tool_call_parser"), "response_template")
 
     def test_response_template_resolves_only_supported_parser_fields(self):
-        args = self._make_server_args(
-            reasoning_parser="auto",
-            tool_call_parser="auto",
-        )
-        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
-        tokenizer.response_template = {
-            "start_anchor": "<assistant>",
-            "fields": {
-                "thinking": {"open": "<think>", "close": "</think>"},
+        for field_name in ("thinking", "reasoning_content"):
+            with self.subTest(field_name=field_name):
+                args = self._make_server_args(
+                    reasoning_parser="auto",
+                    tool_call_parser="auto",
+                )
+                tokenizer = _DummyTokenizer([], chat_template="unrecognized")
+                tokenizer.response_template = {
+                    "start_anchor": "<assistant>",
+                    "fields": {
+                        field_name: {"open": "<think>", "close": "</think>"},
+                    },
+                }
+
+                with _patch_hf_transformers(Mock(return_value=tokenizer)):
+                    resolve_auto_parsers(args)
+
+                self.assertEqual(
+                    _declared(args, "reasoning_parser"), "response_template"
+                )
+                self.assertIsNone(_declared(args, "tool_call_parser"))
+
+    def test_invalid_response_template_is_ignored(self):
+        unsupported_fields = {
+            "content": {"content": "text"},
+            "metadata": {
+                "open": "<metadata>",
+                "close": "</metadata>",
+                "content": "json",
             },
         }
+        for fields in (unsupported_fields, "reasoning_content"):
+            with self.subTest(fields=fields):
+                args = self._make_server_args(
+                    reasoning_parser="auto",
+                    tool_call_parser="auto",
+                )
+                tokenizer = _DummyTokenizer([], chat_template="unrecognized")
+                tokenizer.response_template = {
+                    "start_anchor": "<assistant>",
+                    "fields": fields,
+                }
 
-        with _patch_hf_transformers(Mock(return_value=tokenizer)):
-            resolve_auto_parsers(args)
+                with (
+                    _patch_hf_transformers(Mock(return_value=tokenizer)),
+                    self.assertLogs(
+                        "sglang.srt.parser.template_detection", level="WARNING"
+                    ) as logs,
+                ):
+                    resolve_auto_parsers(args)
 
-        self.assertEqual(
-            _declared(args, "reasoning_parser"),
-            "response_template",
-        )
-        self.assertIsNone(_declared(args, "tool_call_parser"))
-
-    def test_unsupported_response_template_is_ignored(self):
-        args = self._make_server_args(
-            reasoning_parser="auto",
-            tool_call_parser="auto",
-        )
-        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
-        tokenizer.response_template = {
-            "start_anchor": "<assistant>",
-            "fields": {
-                "content": {"content": "text"},
-                "metadata": {
-                    "open": "<metadata>",
-                    "close": "</metadata>",
-                    "content": "json",
-                },
-            },
-        }
-
-        with _patch_hf_transformers(Mock(return_value=tokenizer)):
-            resolve_auto_parsers(args)
-
-        self.assertIsNone(_declared(args, "reasoning_parser"))
-        self.assertIsNone(_declared(args, "tool_call_parser"))
+                self.assertIn("Ignoring invalid response_template", logs.output[0])
+                self.assertIsNone(_declared(args, "reasoning_parser"))
+                self.assertIsNone(_declared(args, "tool_call_parser"))
 
     def test_response_template_with_undelimited_tool_field_is_ignored(self):
         """A tool field without an opener leaves no text outside the calls, so

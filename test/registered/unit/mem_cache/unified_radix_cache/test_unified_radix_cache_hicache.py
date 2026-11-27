@@ -625,6 +625,37 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         cache.sanity_check()
 
     @requires_mamba
+    def test_hicache_write_through_mamba_path_cap_frees_superseded_host_copy(self):
+        """Cap 1: the state a longer insert supersedes loses its device value and
+        its write-through host copy, and its host slot returns to the Mamba host
+        pool."""
+        # Cap 1 at construction (level 2), which both tree cores read; HiCache init
+        # then turns host counting on.
+        cfg = replace(self.cfg, hybrid_cache_checkpoints_level=2)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        self._init_hicache(cache, write_policy="write_through")
+        cache.write_through_threshold = 1
+        host_pool = cache.mamba_pool_host
+
+        seq_a = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        cache.writing_check(write_back=True)
+        node_a = match_prefix(cache, seq_a).best_match_node
+        self.assertIsNotNone(node_host_value(cache, node_a, ComponentType.MAMBA))
+        free_after_first_backup = host_pool.available_size()
+
+        self._insert(
+            cache, allocator, req_to_token_pool, seq_a + self._make_seq(1000, 2)
+        )
+        cache.writing_check(write_back=True)
+
+        self.assertIsNone(node_device_value(cache, node_a, ComponentType.MAMBA))
+        self.assertIsNone(node_host_value(cache, node_a, ComponentType.MAMBA))
+        # The new tail's backup took one host slot; the superseded state's came back.
+        self.assertEqual(host_pool.available_size(), free_after_first_backup)
+        cache.sanity_check()
+
+    @requires_mamba
     def test_hicache_write_through_internal_mamba_evict_keeps_drop(self):
         """Non-write_back policies tombstone and drop."""
         cache, _, seq_a = self._build_internal_mamba_fixture("write_through")

@@ -596,9 +596,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             server_args=SimpleNamespace(),
             # Wider than the token table, so the table is the binding limit.
             model_config=SimpleNamespace(context_len=4096),
-            req_to_token_pool=SimpleNamespace(
-                req_to_token=torch.empty((1, 32), dtype=torch.int32)
-            ),
+            req_to_token_pool=SimpleNamespace(row_width=32),
         )
 
         self.assertEqual(

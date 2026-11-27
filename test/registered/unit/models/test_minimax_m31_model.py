@@ -601,7 +601,7 @@ class TestMiniMaxM31Forward(CustomTestCase):
 
 class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
     def test_backend_uses_resolved_verify_window(self):
-        from sglang.srt.layers.attention import minimax_sparse_nvfp4_backend as backend
+        from sglang.srt.layers.attention.minimax_sparse import msa_v1_backend as backend
         from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
         from sglang.srt.runtime_context import get_context
 
@@ -635,11 +635,11 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
                 backend, "msa_v1_qmul4_decode_capability", return_value=(True, None)
             ),
         ):
-            attention = backend.MiniMaxSparseNvfp4AttnBackend(runner)
+            attention = backend.MiniMaxMSAV1AttnBackend(runner)
         self.assertEqual(attention.speculative_num_draft_tokens, 8)
 
     def test_verify_replans_after_prefix_growth_without_mutating_input_lengths(self):
-        from sglang.srt.layers.attention import minimax_sparse_nvfp4_backend as backend
+        from sglang.srt.layers.attention.minimax_sparse import msa_v1_backend as backend
         from sglang.srt.model_executor.forward_mode import ForwardMode
 
         class Plan:
@@ -709,6 +709,47 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
             )
         # One refresh per prepare, on the cached plan.
         self.assertEqual((first.refreshes, decode.refreshes), (2, 1))
+
+    def test_decode_plan_pages_stay_within_indexer_limit_at_1m_context(self):
+        """A 1M context with speculative headroom must not size the plan past
+        the 8192 pages the MSA-v1 indexers address (server startup failed)."""
+        from sglang.srt.layers.attention.minimax_sparse import msa_v1_backend as backend
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        class Plan:
+            def __init__(self, **kwargs):
+                self.max_pages = kwargs["max_pages"]
+                self.fp8_attention = None
+                self.page_table = self.final_seq_lens = None
+
+            def refresh(self, **kwargs):
+                pass
+
+        obj = object.__new__(backend.MiniMaxSparseNvfp4AttnBackend)
+        obj.speculative_num_draft_tokens = 8
+        obj.page_size = obj.idx_head_dim = 128
+        obj.req_to_token = None
+        obj._msa_v1_attention_workspace = None
+        obj._msa_v1_qmul4_available = True
+        obj._msa_v1_num_q_heads, obj._msa_v1_num_kv_heads = 32, 2
+        obj._msa_v1_num_index_heads = 2
+        obj._msa_v1_index_fp8_scratch = None
+        obj._msa_v1_cuda_graph_plans = {}
+        obj._msa_v1_cuda_graph_attention_plans = {}
+        obj.forward_metadata = SimpleNamespace()
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            seq_lens=torch.tensor([1]),
+            req_pool_indices=torch.tensor([0]),
+        )
+        with (
+            patch.object(backend, "MSAV1DecodeIndexerPlan", Plan),
+            patch.object(backend, "MSAV1DecodeAttentionPlan", Plan),
+        ):
+            plan = obj._prepare_msa_v1_decode_plan(
+                fb, use_cuda_graph=True, max_seq_len=(1 << 20) + 256
+            )
+        self.assertEqual(plan.max_pages, 8192)
 
 
 if __name__ == "__main__":

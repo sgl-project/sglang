@@ -1,8 +1,10 @@
 """Native bindings report panics as Python errors and reject poisoned reuse."""
 
 import sys
+from array import array
 
 import pytest
+import torch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.rust_tree_core.adapter import RustUnifiedTreeCore
@@ -43,6 +45,7 @@ def _raw_binding(core_class, is_eagle=False, slots=((0, "token"),), **overrides)
         if is_eagle
         else native.RustUnifiedTreeCoreBinding
     )
+    overrides.setdefault("empty_device_indices", torch.empty(0, dtype=torch.int64))
     return binding_class(native.TreeCoreInitParamsBinding(**overrides), list(slots))
 
 
@@ -144,6 +147,53 @@ def test_tlru_inspection_panic_is_runtime_error():
     with pytest.raises(RuntimeError, match="overflowed i128"):
         config.inspect_is_tel_safe(1, 0)
     assert config.inspect_is_tel_safe(0, 0) is False
+
+
+@pytest.mark.parametrize("is_eagle", [False, True])
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_empty_indices_keep_the_prototype_device(core_class, is_eagle, device):
+    prototype = torch.empty(0, dtype=torch.int64, device=device)
+    core = _raw_binding(core_class, is_eagle, empty_device_indices=prototype)
+    for reset in (False, True):
+        if reset:
+            core.reset()
+        root = core.root_node_handle()
+        indices = core.collect_full_device_indices(root, root)
+        assert indices.shape == (0,)
+        assert indices.dtype == torch.int64
+        assert indices.device == prototype.device
+
+
+@pytest.mark.parametrize(
+    "shape,dtype", [((1,), torch.int64), ((0, 1), torch.int64), ((0,), torch.float32)]
+)
+def test_invalid_empty_indices_are_rejected(core_class, shape, dtype):
+    with pytest.raises(ValueError, match="empty 1-D int64"):
+        _raw_binding(core_class, empty_device_indices=torch.empty(shape, dtype=dtype))
+
+
+@pytest.mark.parametrize("is_eagle", [False, True])
+def test_wrong_device_errors_leave_the_core_usable(core_class, is_eagle):
+    core = _raw_binding(core_class, is_eagle)
+    native = core_class._bindings
+    wrong = torch.empty(2, dtype=torch.int64, device="meta")
+    params = native.InsertParamsBinding(key=array("q", [1, 2]), value=wrong)
+    with pytest.raises(ValueError, match="does not match the tree core device"):
+        core.insert(params)
+    with pytest.raises(ValueError, match="does not match the tree core device"):
+        core.set_component_device_value(core.root_node_handle(), 0, wrong)
+    match = native.MatchParamsBinding(array("q", [1, 2]))
+    with pytest.raises(ValueError, match="does not match the tree core device"):
+        core.attach_swa_window(match, 0, 2, wrong)
+    assert core.root_node_handle() == 0
+    assert core.collect_full_device_indices(0, 0).numel() == 0
+    params.value = torch.tensor([10, 11], dtype=torch.int64)
+    core.insert(params)
+    result = core.match_prefix(match)
+    indices = core.collect_full_device_indices(
+        result.last_device_node_id, core.root_node_handle()
+    )
+    assert indices.tolist() == [10, 11][: 1 if is_eagle else 2]
 
 
 if __name__ == "__main__":
