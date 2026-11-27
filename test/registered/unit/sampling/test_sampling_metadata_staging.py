@@ -10,11 +10,16 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from sglang.srt.sampling.logit_bias import LogitBiasEntries, build_logit_bias
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 VOCAB_SIZE = 32
 
