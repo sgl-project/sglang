@@ -1,6 +1,5 @@
 """Per-commit run-ci approval: a ci/run-ci-approved status on the PR head, required by
-pr-gate.yml (approval-mode commit) besides the run-ci label. Needs only PyGithub, so the
-approve workflow installs nothing else.
+pr-gate.yml (approval-mode commit) besides the run-ci label unless the PR's author may approve.
 """
 
 import json
@@ -8,7 +7,7 @@ import os
 import sys
 import time
 
-from github import Auth, Github, GithubException
+from github import GithubException
 
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 # CI selections: name -> workflow files and an optional opt-in label (null selects existing
@@ -26,8 +25,10 @@ APPROVER_REPO_PERMISSIONS = ("write", "maintain", "admin")
 APPROVAL_WORKFLOWS = (
     ".github/workflows/pr-test.yml",
     ".github/workflows/pr-test-extra.yml",
+    ".github/workflows/pr-test-mlu.yml",
+    ".github/workflows/pr-test-sgl-router.yml",
+    ".github/workflows/pr-test-xpu.yml",
 )
-APPROVE_WORKFLOW = ".github/workflows/pr-gate-approve.yml"
 # pr-test.yml runs on every push to a PR, so its newest run at a commit postdates the
 # latest push. GitHub stamps created_at; a commit's own dates are the pusher's.
 PUSH_CLOCK_WORKFLOW = ".github/workflows/pr-test.yml"
@@ -111,10 +112,11 @@ def skipped_at_gate(run):
     return any(job_skipped_tests(job) for job in run.jobs())
 
 
-def can_approve(gh_repo, user_login):
+def can_approve(gh_repo, user_login, user_perms):
     """
-    The one rule for who may approve a commit for CI: write, maintain, or admin
-    access to the repository. Returns (ok, reason).
+    The one rule for who may approve a commit for CI. Returns (ok, reason).
+
+    Write access, or `can_tag_run_ci_label` in CI_PERMISSIONS.json.
     """
     try:
         permission = gh_repo.get_collaborator_permission(user_login)
@@ -124,7 +126,17 @@ def can_approve(gh_repo, user_login):
         permission = None
     if permission in APPROVER_REPO_PERMISSIONS:
         return True, ""
-    return False, f"{user_login} has no write access to {gh_repo.full_name}"
+    if (user_perms or {}).get("can_tag_run_ci_label", False):
+        return True, ""
+    return False, (
+        f"{user_login} has neither write access nor can_tag_run_ci_label "
+        f"in {PERMISSIONS_FILE_PATH}"
+    )
+
+
+def author_may_approve(gh_repo, author):
+    """True if the PR's author passes can_approve: then `run-ci` alone runs CI at every push."""
+    return can_approve(gh_repo, author, load_permissions(author))[0]
 
 
 def head_seen_by(gh_repo, pr, sha, seen_at):
@@ -147,9 +159,17 @@ def record_approval(gh_repo, sha, user_login):
     print(f"Approved {sha} for CI on behalf of {user_login}.")
 
 
-def is_approved(gh_repo, sha, labels):
-    """Python twin of pr-gate.yml's "Check run-ci approval" step; keep the two in step."""
-    return APPROVAL_LABEL in labels and any(
+def is_approved(gh_repo, sha, labels, author):
+    """Python twin of pr-gate.yml's "Check run-ci approval" step; keep the two in step.
+
+    run-ci is enough on a PR whose author may approve; any other PR also needs the
+    approval status on sha.
+    """
+    if APPROVAL_LABEL not in labels:
+        return False
+    if author_may_approve(gh_repo, author):
+        return True
+    return any(
         status.context == APPROVAL_CONTEXT
         and status.state == "success"
         and status.creator is not None
@@ -239,7 +259,8 @@ def rerun_gated_runs(gh_repo, pr, head_sha, workflow_files):
                 results[path] = (
                     False,
                     f"Not re-running {link}: the PR head moved from {head_sha[:8]} "
-                    f"to {current_head[:8]}, which needs its own approval.",
+                    f"to {current_head[:8]}, which needs its own run (and approval, unless "
+                    "its author may approve).",
                 )
                 continue
             try:
@@ -266,31 +287,3 @@ def rerun_gated_runs(gh_repo, pr, head_sha, workflow_files):
             break
         time.sleep(GATE_POLL_SECONDS)
     return [results[path] for path in workflow_files]
-
-
-def main():
-    gh_repo = Github(auth=Auth.Token(os.environ["GITHUB_TOKEN"])).get_repo(
-        os.environ["REPO_FULL_NAME"]
-    )
-    pr = gh_repo.get_pull(int(os.environ["PR_NUMBER"]))
-    head_sha = os.environ["HEAD_SHA"]
-    sender = os.environ["SENDER_LOGIN"]
-
-    ok, reason = can_approve(gh_repo, sender)
-    if not ok:
-        print(
-            f"::warning::{sender} added run-ci but may not approve CI: {reason}. "
-            f"{head_sha} is not approved."
-        )
-        return
-
-    record_approval(gh_repo, head_sha, sender)
-    labels = {label.name for label in pr.get_labels()}
-    for _, message in rerun_gated_runs(
-        gh_repo, pr, head_sha, approval_workflows_for(labels)
-    ):
-        print(message)
-
-
-if __name__ == "__main__":
-    main()

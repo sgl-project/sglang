@@ -25,8 +25,8 @@ class TestLayerWiseLoadSessions(CustomTestCase):
         )
         self.linker.pools = {
             name: Mock(
-                prepare_locations=Mock(side_effect=lambda indices: indices),
-                get_prepared_layer_range_meta=Mock(return_value=None),
+                prepare_locations=Mock(side_effect=list),
+                get_prepared_layers_range_meta=Mock(return_value=None),
             )
             for name in ("kv", "index")
         }
@@ -45,7 +45,7 @@ class TestLayerWiseLoadSessions(CustomTestCase):
         ]
 
     def test_batched_start_and_ordered_ranges_after_fence(self):
-        fence = Mock()
+        fence = Mock(spec=["synchronize_indices", "synchronize"])
 
         def start(keys):
             fence.synchronize.assert_called_once_with()
@@ -56,15 +56,21 @@ class TestLayerWiseLoadSessions(CustomTestCase):
             fence.synchronize.assert_not_called()
             return indices
 
+        def ranges(rows, layers):
+            fence.synchronize_indices.assert_called_once_with()
+            fence.synchronize.assert_not_called()
+            self.assertEqual(list(layers), [0])
+            return (
+                [[100 + int(row) * 3] for row in rows],
+                [[3] for _ in rows],
+                [[0] for _ in rows],
+            )
+
         self.store.batch_get_session_start.side_effect = start
         self.store.batch_get_into_multi_buffer_ranges.return_value = [3, 3]
         for pool in self.linker.pools.values():
             pool.prepare_locations.side_effect = locations
-            pool.get_prepared_layer_range_meta.side_effect = lambda rows, layer: (
-                [[100 + int(row) * 3] for row in rows],
-                [[3], [3]],
-                [[0], [0]],
-            )
+            pool.get_prepared_layers_range_meta.side_effect = ranges
         self.linker.load_layer_wise(7, self.transfers, fence)
 
         self.linker.layer_done_counter.fail.assert_not_called()
@@ -91,6 +97,9 @@ class TestLayerWiseLoadSessions(CustomTestCase):
         self.assertIn(
             "get session start failed",
             str(self.linker.layer_done_counter.fail.call_args.args[1]),
+        )
+        self.store.batch_get_session_start.assert_called_once_with(
+            ["kv-4", "kv-0", "index-4", "index-0"]
         )
         self.store.batch_get_into_multi_buffer_ranges.assert_not_called()
         self.store.batch_get_session_end.assert_called_once_with(

@@ -35,7 +35,7 @@ def _segmented_pack(q_prefix, k_prefix, v_prefix, q_main, k_main, v_main, indice
     ],
     ci_vals=[(1, 64, 4096, 12, 128, 24)],
 )
-@marker.benchmark("provider", ["materialized", "segmented"])
+@marker.benchmark("provider", ["materialized", "segmented"], gate=["segmented"])
 def benchmark(
     batch: int,
     prefix_rows: int,
