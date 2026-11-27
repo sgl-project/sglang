@@ -236,6 +236,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "fp8_gemm_runner_backend",
                     "fp4_gemm_runner_backend",
                     "disable_custom_all_reduce",
+                    "enable_p2p_check",
                     "boundary_reduction",
                     "speculative_boundary_reduction",
                     "enable_aiter_allreduce_fusion",
@@ -1302,9 +1303,19 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         MegaMoE; an explicit backend, BF16 experts, SM90 and TP1 keep theirs."""
         from sglang.srt.arg_groups.model_overrides.inkling import _inkling_overrides
 
-        hf = SimpleNamespace(architectures=["Inkling2ForConditionalGeneration"])
-
-        def backend(sm=100, tp=4, a2a="none", quantization="inkling2"):
+        def backend(
+            sm=100,
+            tp=4,
+            a2a="none",
+            quantization="inkling2",
+            intermediate=2304,
+            arch="Inkling2ForConditionalGeneration",
+        ):
+            text = SimpleNamespace(hidden_size=4608, intermediate_size=intermediate)
+            hf = SimpleNamespace(
+                architectures=[arch],
+                get_text_config=lambda: text,
+            )
             args = SimpleNamespace(
                 tool_call_parser="inkling2",
                 reasoning_parser="inkling",
@@ -1325,7 +1336,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 decode_attention_backend=None,
                 _model_config=SimpleNamespace(quantization=quantization),
             )
-            with override_platform(is_cuda=True, device_sm=sm):
+            with override_platform(is_cuda=True, device_sm=sm, is_sm120=False):
                 out = _inkling_overrides(args, hf)
             return out.get("moe_a2a_backend", a2a), out.get("disable_attn_tp_gather")
 
@@ -1336,6 +1347,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(backend(tp=1), ("none", None))
         self.assertEqual(backend(quantization=None), ("none", None))
         self.assertEqual(backend(a2a="deepep"), ("deepep", None))
+        # Inkling2Experts pads 1152 to 1280 for NVFP4 MegaMoE.
+        self.assertEqual(backend(intermediate=1152)[0], "megamoe")
+        loop = "Inkling2LoopForConditionalGeneration"
+        self.assertEqual(backend(arch=loop), ("megamoe", True))
 
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
@@ -2543,6 +2558,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         with self.assertRaisesRegex(ValueError, r"on the published config"):
             run_post_process_pass(sa, _declares_something)
+
+    def test_model_attention_default_precedes_mlu_fallback(self):
+        """Platform defaults must not suppress Llama4's compatible Triton default."""
+        with patch(
+            "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+            return_value=None,
+        ):
+            args = self._construct("Llama4ForCausalLM", "llama", device="mlu")
+        self.assertEqual(
+            base_module.attention_backends_of(base_module.resolved_view(args)),
+            ("triton", "triton"),
+        )
 
     def test_attention_backend_user_choice_declares_nothing_extra(self):
         sa = self._construct("LlamaForCausalLM", "llama", attention_backend="triton")
@@ -4963,6 +4990,92 @@ class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
                 self._view("triton")
             )
         self.assertEqual(updates, {})
+
+
+def _head_dim_model_config(
+    head_dim, *, swa_head_dim=None, arch="LlamaForCausalLM", mla=False
+):
+    swa_head_dim = head_dim if swa_head_dim is None else swa_head_dim
+    return SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=[arch]),
+        attention_arch=AttentionArch.MLA if mla else AttentionArch.MHA,
+        head_dim=head_dim,
+        v_head_dim=head_dim,
+        swa_head_dim=swa_head_dim,
+        swa_v_head_dim=swa_head_dim,
+        has_attention_sinks=False,
+    )
+
+
+class TestDefaultAttnBackendFlashInferFa2HeadDims(CustomTestCase):
+    """An unset backend must not resolve to flashinfer for head dims its FA2 prefill
+    cannot run (not multiples of 64): they read out of bounds or give wrong results,
+    and FlashInfer 0.7.5 rejects them in plan()."""
+
+    def test_mha_default_off_hopper_and_sm100(self):
+        server_args = SimpleNamespace(
+            speculative_algorithm=None, speculative_eagle_topk=None
+        )
+        cases = {
+            "supported (128)": (_head_dim_model_config(128), "flashinfer"),
+            "unsupported (96, Phi-3-mini)": (_head_dim_model_config(96), "triton"),
+            "unsupported SWA layers only": (
+                _head_dim_model_config(128, swa_head_dim=96),
+                "triton",
+            ),
+        }
+        for label, (model_config, expected) in cases.items():
+            with (
+                self.subTest(label),
+                override_platform(
+                    is_sail=False,
+                    is_hopper_with_cuda_12_3=False,
+                    is_sm100=False,
+                    is_hip=False,
+                    has_flashinfer=True,
+                ),
+                patch.object(base_module, "is_mps", return_value=False),
+            ):
+                self.assertEqual(
+                    base_module.get_default_attn_backend(
+                        server_args, use_mla_backend=False, model_config=model_config
+                    ),
+                    expected,
+                )
+
+    def test_deterministic_default_on_sm100(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+
+        cases = {
+            "supported (128)": (_head_dim_model_config(128), "flashinfer"),
+            "unsupported (96, Phi-3-mini)": (_head_dim_model_config(96), "triton"),
+            # MLA head_dim is a placeholder; Kimi-Linear's real dims are qk 192, vo 128.
+            "MLA placeholder (Kimi-Linear)": (
+                _head_dim_model_config(72, arch="KimiLinearForCausalLM", mla=True),
+                "flashinfer",
+            ),
+        }
+        for label, (model_config, expected) in cases.items():
+            view = ResolvedView(
+                SimpleNamespace(
+                    enable_deterministic_inference=True,
+                    attention_backend=None,
+                    prefill_attention_backend=None,
+                    decode_attention_backend=None,
+                    model_path="org/model",
+                )
+            )
+            with (
+                self.subTest(label),
+                override_platform(is_xpu=False, is_sm100=True, is_sm120=False),
+                patch.object(
+                    overrides_module, "model_config_of", return_value=model_config
+                ),
+            ):
+                self.assertEqual(
+                    overrides_module._deterministic_attention_backend(view),
+                    {"attention_backend": expected},
+                )
 
 
 class TestGlm5NextAgenticMambaPool(CustomTestCase):
