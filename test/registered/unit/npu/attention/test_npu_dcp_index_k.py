@@ -36,14 +36,15 @@ class TestNpuDcpIndexK(unittest.TestCase):
             self.assertFalse(pool_configurator.resolve_kimi_k31_index_k_sharding(kvc))
 
     def test_prefill_page_plan_preserves_request_boundaries(self):
-        pages, block_table = dsa_index_k.plan_index_k_prefill_gather(
+        pages, rows = dsa_index_k.plan_index_k_prefill_gather(
             torch.tensor([[4, 3], [8, 99], [99, 99]], dtype=torch.int32),
             torch.tensor([9, 4, 0]),
+            torch.tensor([7, 2, 0]),
             page_size=4,
             dcp_size=2,
         )
         self.assertEqual(pages.tolist(), [4, 3, 8])
-        self.assertEqual(block_table.tolist(), [[0, 1, 2, 0], [4, 0, 0, 0], [0] * 4])
+        self.assertEqual(rows.tolist(), [0, 1, 2, 3, 4, 5, 6, 16, 17])
 
     def test_verify_preserves_fp32_scores_and_each_query_frontier(self):
         # Rank 1 owns positions 4..7 and sees 0, 1 and 2 keys for these rows.

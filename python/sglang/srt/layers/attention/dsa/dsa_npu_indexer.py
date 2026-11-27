@@ -102,6 +102,7 @@ class _IndexerQueryShard(NamedTuple):
     tp_size: int
     actual_seq_lengths_q: torch.Tensor
     actual_seq_lengths_kv: torch.Tensor
+    key_lens_cpu: torch.Tensor
 
     def take(self, x: torch.Tensor) -> torch.Tensor:
         if self.num_real == self.rows:
@@ -177,6 +178,7 @@ def _build_indexer_query_shard(
         f"across attn_tp_size={parallel.attn_tp_size}"
     )
     device = forward_batch.seq_lens.device
+    key_lens_cpu = torch.tensor(key_lens, dtype=torch.int32, device="cpu")
     return _IndexerQueryShard(
         start=start,
         rows=rows,
@@ -186,7 +188,8 @@ def _build_indexer_query_shard(
         actual_seq_lengths_q=torch.tensor(
             cum_query_lens, dtype=torch.int32, device=device
         ),
-        actual_seq_lengths_kv=torch.tensor(key_lens, dtype=torch.int32, device=device),
+        actual_seq_lengths_kv=key_lens_cpu.to(device=device),
+        key_lens_cpu=key_lens_cpu,
     )
 
 
@@ -629,13 +632,21 @@ class DSANPUIndexerMixin:
                 forward_batch.npu_index_k_gather_plan = plan_index_k_prefill_gather(
                     metadata.dcp_block_tables,
                     forward_batch.seq_lens_cpu,
+                    shard.key_lens_cpu
+                    if shard is not None
+                    else forward_batch.seq_lens_cpu,
                     pool.index_page_size,
                     parallel.attn_dcp_size,
                 )
-            pages, block_table = forward_batch.npu_index_k_gather_plan
-            past_key_states = parallel.dcp_group.all_gather(
-                past_key_states.index_select(0, pages), dim=1
-            ).reshape(-1, *past_key_states.shape[1:])
+            pages, rows = forward_batch.npu_index_k_gather_plan
+            past_key_states = (
+                parallel.dcp_group.all_gather(
+                    past_key_states.index_select(0, pages), dim=1
+                )
+                .flatten(0, 1)
+                .index_select(0, rows)
+            )
+            block_table = None
         if self.num_init_tokens or self.num_local_tokens:
             return self._forward_npu_lsa_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
@@ -670,7 +681,7 @@ class DSANPUIndexerMixin:
             if is_prefill and uses_prefill_cp:
                 weights = weights.contiguous().view(-1, weights.shape[-1])
                 actual_seq_lengths_q = actual_seq_lengths_q.to(q.device)
-            elif is_prefill:
+            elif is_prefill and not shard_index_k:
                 block_table = block_table[: actual_seq_lengths_q.size(0)]
             query = q.view(-1, self.n_heads, self.head_dim)
             # The full width for the gather, NOT query.shape[0] (already cut).
@@ -719,7 +730,16 @@ class DSANPUIndexerMixin:
                     query_quant_mode=0,
                     key_quant_mode=0,
                 ).squeeze(1)
+            elif shard_index_k and past_key_states.shape[0] == 0:
+                # A TP shard with only padding still joins the Top-K gather.
+                topk_indices = query.new_full(
+                    (query.shape[0], self.index_topk), -1, dtype=torch.int32
+                )
             else:
+                if shard_index_k:
+                    actual_seq_lengths_kv = actual_seq_lengths_kv.cumsum(
+                        0, dtype=torch.int32
+                    )
                 topk_indices = torch_npu.npu_lightning_indexer(
                     query=query,
                     key=past_key_states,
@@ -730,7 +750,7 @@ class DSANPUIndexerMixin:
                     ),
                     block_table=block_table,
                     layout_query="TND",
-                    layout_key="PA_BSND",
+                    layout_key="TND" if shard_index_k else "PA_BSND",
                     sparse_count=self.index_topk,
                     sparse_mode=3,
                 )[0].squeeze(1)

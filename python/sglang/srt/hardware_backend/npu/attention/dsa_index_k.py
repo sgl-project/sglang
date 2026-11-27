@@ -4,10 +4,11 @@ import torch
 def plan_index_k_prefill_gather(
     local_block_table: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
+    key_lens_cpu: torch.Tensor,
     page_size: int,
     dcp_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the read list and request page table for the transient Index-K."""
+    """Plan the page gather and the valid rows for this rank's prefill queries."""
     span = page_size * dcp_size
     cycles = (seq_lens_cpu + span - 1) // span
     cycle_ids = torch.arange(local_block_table.shape[1], device=seq_lens_cpu.device)
@@ -15,13 +16,13 @@ def plan_index_k_prefill_gather(
     req_rows, req_cycles = (cycle_ids < cycles[:, None]).nonzero().to(device).unbind(1)
     pages = local_block_table[req_rows, req_cycles]
 
-    first = cycles.cumsum(0) - cycles
-    logical_pages = torch.arange(
-        local_block_table.shape[1] * dcp_size, device=seq_lens_cpu.device
+    gathered_starts = (cycles.cumsum(0) - cycles) * span
+    packed_starts = key_lens_cpu.cumsum(0) - key_lens_cpu
+    num_rows = int(key_lens_cpu.sum())
+    rows = torch.arange(num_rows, device=key_lens_cpu.device) + torch.repeat_interleave(
+        gathered_starts - packed_starts, key_lens_cpu, output_size=num_rows
     )
-    block_table = first[:, None] * dcp_size + logical_pages
-    block_table.masked_fill_(logical_pages * page_size >= seq_lens_cpu[:, None], 0)
-    return pages, block_table.to(device=device, dtype=torch.int32)
+    return pages, rows.to(device=device)
 
 
 def score_sharded_index_k(
