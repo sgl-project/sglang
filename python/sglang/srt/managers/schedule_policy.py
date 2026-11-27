@@ -79,7 +79,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
-from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
+from sglang.srt.mem_cache.common import (
+    match_kv_cache,
+    touch_waiting_prefix,
+    waiting_token_ids,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
@@ -356,7 +360,7 @@ class SchedulePolicy:
             and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
-                match_kv_cache(r, self.tree_cache)
+                match_kv_cache(r, self.tree_cache, waiting_token_ids(r))
 
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
@@ -596,7 +600,7 @@ class SchedulePolicy:
         # share a prefix, only one runs, so the shared prefix is computed once.
         candidates = []
         for r in waiting_queue:
-            prefix_ids = r.origin_input_ids + r.output_ids
+            prefix_ids = waiting_token_ids(r)
             match_kv_cache(r, self.tree_cache, prefix_ids)
             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 # Only the first DEPRIORITIZE_THRESHOLD tokens can decide a match.
@@ -960,7 +964,7 @@ class SchedulePolicy:
             # (new or retracted: last_node is None); its count may go stale.
             for r in waiting_queue:
                 if r.last_node is None:
-                    match_kv_cache(r, self.tree_cache)
+                    match_kv_cache(r, self.tree_cache, waiting_token_ids(r))
             waiting_queue.sort(key=phi)
         window = waiting_queue[:UNIBOOST_MATCH_WINDOW_SIZE]
         deprioritized = self._compute_prefix_matches(window, CacheAwarePolicy.UNIBOOST)
