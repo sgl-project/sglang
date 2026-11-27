@@ -601,7 +601,7 @@ class TestMiniMaxM31Forward(CustomTestCase):
 
 class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
     def test_backend_uses_resolved_verify_window(self):
-        from sglang.srt.layers.attention import minimax_sparse_nvfp4_backend as backend
+        from sglang.srt.layers.attention.minimax_sparse import msa_v1_backend as backend
         from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
         from sglang.srt.runtime_context import get_context
 
@@ -621,7 +621,9 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
         )
         runner = SimpleNamespace(
             token_to_kv_pool=pool,
-            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(1, 128)),
+            req_to_token_pool=SimpleNamespace(
+                row_width=128, req_to_token=torch.zeros(1, 128)
+            ),
             model_config=SimpleNamespace(
                 context_len=128, hf_config=config, hf_text_config=config
             ),
@@ -633,11 +635,11 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
                 backend, "msa_v1_qmul4_decode_capability", return_value=(True, None)
             ),
         ):
-            attention = backend.MiniMaxSparseNvfp4AttnBackend(runner)
+            attention = backend.MiniMaxMSAV1AttnBackend(runner)
         self.assertEqual(attention.speculative_num_draft_tokens, 8)
 
     def test_verify_replans_after_prefix_growth_without_mutating_input_lengths(self):
-        from sglang.srt.layers.attention import minimax_sparse_nvfp4_backend as backend
+        from sglang.srt.layers.attention.minimax_sparse import msa_v1_backend as backend
         from sglang.srt.model_executor.forward_mode import ForwardMode
 
         class Plan:

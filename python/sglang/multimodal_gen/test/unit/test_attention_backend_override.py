@@ -80,6 +80,22 @@ class TestSkipSoftmaxDispatch(unittest.TestCase):
             ):
                 self.assertEqual(impl._request_skip_softmax_threshold(), (True, 500.0))
 
+    def test_cross_attention_skips_the_request_lookup(self):
+        """Cross-attention never uses Skip Softmax, so it must not read the request."""
+        impl = FlashAttentionImpl(
+            num_heads=2,
+            head_size=128,
+            causal=False,
+            softmax_scale=128**-0.5,
+            is_cross_attention=True,
+        )
+        with patch.object(
+            flash_attn_module,
+            "get_request_skip_softmax_params",
+            side_effect=AssertionError("cross-attention read the request"),
+        ):
+            self.assertEqual(impl._request_skip_softmax_threshold(), (False, None))
+
 
 class TestMaybeOverrideAttentionBackend(unittest.TestCase):
     def setUp(self):

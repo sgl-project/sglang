@@ -310,7 +310,6 @@ class WhisperEncoder(torch.nn.Module):
         super().__init__()
 
         embed_dim = config.d_model
-        self.embed_scale = embed_dim**-0.5 if config.scale_embedding else 1.0
 
         self.conv1 = torch.nn.Conv1d(
             config.num_mel_bins, embed_dim, kernel_size=3, padding=1
@@ -365,8 +364,6 @@ class WhisperDecoder(torch.nn.Module):
     ):
         super().__init__()
         self.max_target_positions = config.max_target_positions
-        self.max_source_positions = config.max_source_positions
-        self.embed_scale = config.d_model**-0.5 if config.scale_embedding else 1.0
 
         self.embed_tokens = torch.nn.Embedding(
             config.vocab_size, config.d_model, padding_idx=config.pad_token_id
