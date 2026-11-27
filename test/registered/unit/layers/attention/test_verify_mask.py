@@ -22,7 +22,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _MAX_BS = 4
 _DRAFT = 3
-_MAX_CONTEXT_LEN = 128
+_MAX_KV_LEN = 128
 
 
 def _create(**overrides):
@@ -30,7 +30,7 @@ def _create(**overrides):
         is_draft_runner=False,
         skip_prefill=False,
         max_bs=_MAX_BS,
-        max_context_len=_MAX_CONTEXT_LEN,
+        max_kv_len=_MAX_KV_LEN,
         num_draft_tokens=_DRAFT,
         device="cpu",
         is_read=True,
@@ -46,7 +46,7 @@ class TestVerifyMaskSizing(CustomTestCase):
         mask = _create()
 
         if mask.mode == TreeMaskMode.FULL_MASK:
-            bound = _MAX_BS * _DRAFT * (_MAX_CONTEXT_LEN + _DRAFT)
+            bound = _MAX_BS * _DRAFT * (_MAX_KV_LEN + _DRAFT)
         else:
             bound = _MAX_BS * _DRAFT * _DRAFT
         self.assertEqual(mask.mode, default_tree_mask_mode())
@@ -59,7 +59,7 @@ class TestVerifyMaskSizing(CustomTestCase):
 
         self.assertEqual(mask.mode, TreeMaskMode.QLEN_ONLY)
         self.assertGreaterEqual(mask.buffer.numel(), _MAX_BS * _DRAFT * _DRAFT)
-        self.assertLess(mask.buffer.numel(), _MAX_CONTEXT_LEN)
+        self.assertLess(mask.buffer.numel(), _MAX_KV_LEN)
 
     def test_honors_dtype_override(self):
         self.assertEqual(_create(dtype=torch.uint8).buffer.dtype, torch.uint8)
@@ -84,9 +84,7 @@ class TestVerifyMaskCapacity(CustomTestCase):
         explicitly because default_tree_mask_mode() is host-dependent."""
         mask = VerifyMask(
             buffer=torch.zeros(
-                tree_mask_numel(
-                    TreeMaskMode.FULL_MASK, _MAX_BS, _DRAFT, _MAX_CONTEXT_LEN
-                ),
+                tree_mask_numel(TreeMaskMode.FULL_MASK, _MAX_BS, _DRAFT, _MAX_KV_LEN),
                 dtype=torch.bool,
             ),
             mode=TreeMaskMode.FULL_MASK,
@@ -150,7 +148,7 @@ def _make_hybrid_backend(speculative_attention_mode, prefill_mask, decode_mask):
     model_runner = SimpleNamespace(
         kv_cache_dtype=None,
         token_to_kv_pool=object(),
-        req_to_token_pool=SimpleNamespace(row_width=_MAX_CONTEXT_LEN),
+        req_to_token_pool=SimpleNamespace(row_width=_MAX_KV_LEN),
         runner_ids=None,
         server_args=SimpleNamespace(
             speculative_attention_mode=speculative_attention_mode
@@ -201,7 +199,7 @@ class TestTrtllmMhaVerifyMask(CustomTestCase):
             topk=topk,
             is_draft_runner=draft,
             skip_prefill=False,
-            max_kv_len=_MAX_CONTEXT_LEN,
+            max_kv_len=_MAX_KV_LEN,
             speculative_num_draft_tokens=_DRAFT,
             device="cpu",
         )
@@ -223,9 +221,7 @@ class TestTreeMaskNumel(CustomTestCase):
     def test_rejects_layouts_it_cannot_size(self):
         """A packed layout must raise, not silently take FULL_MASK's size."""
         with self.assertRaises(NotImplementedError):
-            tree_mask_numel(
-                TreeMaskMode.QLEN_ONLY_BITPACKING, 1, _DRAFT, _MAX_CONTEXT_LEN
-            )
+            tree_mask_numel(TreeMaskMode.QLEN_ONLY_BITPACKING, 1, _DRAFT, _MAX_KV_LEN)
 
 
 if __name__ == "__main__":

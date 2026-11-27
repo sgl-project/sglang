@@ -661,7 +661,7 @@ class ModelRunner:
         self.watermark = (
             make_watermark_engine(
                 max_num_reqs=self.req_to_token_pool.req_to_token.shape[0],
-                max_contexts_per_req=self.req_to_token_pool.req_to_token.shape[1],
+                max_contexts_per_req=self.req_to_token_pool.row_width,
                 vocab_size=self.model_config.vocab_size,
                 device=self.device,
             )
