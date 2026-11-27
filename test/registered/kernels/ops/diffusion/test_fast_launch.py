@@ -18,6 +18,10 @@ from triton.runtime.jit import JITFunction
 from sglang.kernels.kda_kernels.layernorm_modulate_triton import (
     fused_layernorm_modulate_raw,
 )
+from sglang.kernels.ops.diffusion.activation.sana_conv_post_triton import (
+    fused_bias_glu,
+    fused_bias_silu,
+)
 from sglang.kernels.ops.diffusion.activation.silu_mul_bitexact import (
     fused_packed_silu_mul_bitexact,
     fused_silu_mul_bitexact,
@@ -25,6 +29,10 @@ from sglang.kernels.ops.diffusion.activation.silu_mul_bitexact import (
 from sglang.kernels.ops.diffusion.common import fast_launch
 from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 from sglang.kernels.ops.diffusion.modulate.head_gate_triton import head_gate_mul
+from sglang.kernels.ops.diffusion.modulate.residual_gate_fp32 import _residual_gate_fp32
+from sglang.kernels.ops.diffusion.modulate.wan_temb_table_slices_triton import (
+    fused_temb_table_slices,
+)
 from sglang.kernels.ops.diffusion.norm.native_bf16_rmsnorm_triton import (
     rmsnorm_scale,
     rmsnorm_tanh_residual,
@@ -38,8 +46,12 @@ from sglang.kernels.ops.diffusion.norm.zimage_qk_rmsnorm_triton import (
 from sglang.kernels.ops.diffusion.rope.flux2_qknorm_rope_triton import (
     flux2_strided_qknorm_rope,
 )
+from sglang.kernels.ops.diffusion.rope.matrix_rope import apply_matrix_rope
 from sglang.kernels.ops.diffusion.rope.rope_rotate_half_bitexact import (
     fused_rope_rotate_half_bitexact,
+)
+from sglang.kernels.ops.diffusion.routing.group_limited_topk_triton import (
+    _group_limited_topk_cuda,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -58,6 +70,10 @@ def enabled(monkeypatch):
 
 def _bf16(*shape):
     return torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+
+
+def _fp32(*shape):
+    return torch.randn(*shape, device="cuda", dtype=torch.float32)
 
 
 def _qkv_slices(tokens, heads):
@@ -124,6 +140,24 @@ WRAPPERS = {
         fused_rope_rotate_half_bitexact,
         (_bf16(2, 64, 8, 128), _bf16(128, 64), _bf16(128, 64)),
     ),
+    "residual_gate_fp32": lambda: (
+        _residual_gate_fp32,
+        (_bf16(2, 64, 3072), _bf16(2, 64, 3072), _bf16(1, 1, 3072)),
+    ),
+    "wan_temb_table_slices": lambda: (
+        fused_temb_table_slices,
+        (_fp32(1, 6, 3072), _bf16(2, 64, 6, 3072)),
+    ),
+    "matrix_rope": lambda: (
+        apply_matrix_rope,
+        (_bf16(2, 64, 8, 64), _fp32(2, 64, 1, 32, 2, 2), None),
+    ),
+    "group_limited_topk": lambda: (
+        _group_limited_topk_cuda,
+        (_fp32(128, 64), 8, 4, 8),
+    ),
+    "bias_silu": lambda: (fused_bias_silu, (_bf16(2, 64, 8, 8), _bf16(64))),
+    "bias_glu": lambda: (fused_bias_glu, (_bf16(2, 64, 8, 8), None)),
 }
 
 

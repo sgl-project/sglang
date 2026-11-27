@@ -58,6 +58,7 @@ class CancellationRetirementRegistry:
 
     def create(self, cancellation_id: str, rid: str, instance_id: str) -> _Receipt:
         self._expire()
+        # Completed results still bind the cancellation ID until expiry.
         if len(self._receipts) >= self.capacity:
             raise ValueError("Cancellation receipt capacity reached; retry later")
         receipt = _Receipt(

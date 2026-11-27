@@ -1,0 +1,57 @@
+name: CUDA Coredump Tracker
+# A workflow of its own so the bot token never shares a job with test code or cache-restored
+# Rust modules: it checks nothing out.
+
+on:
+  workflow_run:
+    workflows: ["PR Test Base", "PR Test Extra", "Nightly Test (Nvidia)", "Weekly Test (Nvidia)"]
+    types: [completed]
+
+permissions:
+  actions: read # list the run's artifacts
+
+jobs:
+  signal:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Signal coredumps to tracker issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+          TRACKER_ISSUE: "26340"
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          STARTED_AT: ${{ github.event.workflow_run.run_started_at }}
+          PR_NUM: ${{ github.event.workflow_run.pull_requests[0].number }}
+          EVENT_NAME: ${{ github.event.workflow_run.event }}
+          # pull_requests is empty for a fork PR; pr-test.yml's run-name is "PR #<n> - <title>".
+          RUN_TITLE: ${{ github.event.workflow_run.display_title }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+        # pipefail: a failed artifact listing (e.g. a rate limit) fails the step instead of posting.
+        shell: bash
+        run: |
+          count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" --paginate \
+            --jq ".artifacts[] | select((.name | startswith(\"cuda-coredumps-\")) and .created_at >= \"${STARTED_AT}\") | .name" \
+            | wc -l)
+          echo "Coredump artifacts in this attempt: ${count}"
+          if [ "${count}" -eq 0 ]; then
+            exit 0
+          fi
+          if [ -z "${PR_NUM}" ] && [ "${WORKFLOW_NAME}" = "PR Test Base" ] \
+              && [[ "${RUN_TITLE}" =~ ^PR\ \#([0-9]+) ]]; then
+            PR_NUM="${BASH_REMATCH[1]}"
+          fi
+          if [ -n "${PR_NUM}" ]; then
+            ref_label="PR #${PR_NUM}"
+          else
+            ref_label="${EVENT_NAME}"
+          fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}"
+          body_json=$(printf '{"body":"@hnyls2002 [Coredump Tracker] %s - %s"}' "${ref_label}" "${run_url}")
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${BOT_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/sgl-project/sglang/issues/${TRACKER_ISSUE}/comments" \
+            -d "${body_json}"

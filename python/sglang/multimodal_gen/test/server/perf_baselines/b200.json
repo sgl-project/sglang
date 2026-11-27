@@ -3,7 +3,8 @@
         "model": "Diffusion Server",
         "hardware": "CI B200 pool",
         "description": "B200 diffusion references with stage, denoise and allocated-memory checks enabled; previously enforced E2E/load references and runner overrides retained.",
-        "last_updated": "2026-10-18",
+        "last_updated": "2026-11-20",
+        "latency_refresh": "Selected request timings: maximum over 10 scheduled main runs from 2026-11-15 to 2026-11-20 plus 5%.",
         "calibration_runs": [
             38482436865,
             38554777367,
@@ -113,8 +114,8 @@
                 "11": 106.87
             },
             "expected_e2e_ms": 1990.84,
-            "expected_avg_denoise_ms": 115.55,
-            "expected_median_denoise_ms": 125.74,
+            "expected_avg_denoise_ms": 94.85,
+            "expected_median_denoise_ms": 104.22,
             "estimated_full_test_time_s": 592.3,
             "load_peak_vram_mb": 26684.2,
             "runtime_peak_vram_mb": 33020.94,
@@ -216,9 +217,9 @@
                 "10": 406.77,
                 "11": 591.1
             },
-            "expected_e2e_ms": 5964.13,
-            "expected_avg_denoise_ms": 478.63,
-            "expected_median_denoise_ms": 443.42,
+            "expected_e2e_ms": 3414.0,
+            "expected_avg_denoise_ms": 208.76,
+            "expected_median_denoise_ms": 212.46,
             "estimated_full_test_time_s": 181.8,
             "load_peak_vram_mb": 25490.0,
             "runtime_peak_vram_mb": 35568.0,
