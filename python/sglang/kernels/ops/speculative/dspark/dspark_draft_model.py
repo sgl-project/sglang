@@ -42,7 +42,20 @@ class MarkovGreedyStep:
         base_logits: torch.Tensor,
         prev_embeds: torch.Tensor,
         w2_weight: torch.Tensor,
+        w2_norms: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (
+            w2_norms is not None
+            and base_logits.is_xpu
+            and base_logits.shape == (1, w2_weight.shape[0])
+            and base_logits.dtype in (torch.bfloat16, torch.float32)
+            and base_logits.is_contiguous()
+        ):
+            from sglang.kernels.ops.speculative.dspark.markov_greedy_xpu import (
+                markov_greedy_xpu,
+            )
+
+            return markov_greedy_xpu(base_logits, prev_embeds, w2_weight, w2_norms)
         if base_logits.is_cuda:
             return cls.triton(
                 base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight

@@ -221,6 +221,7 @@ def _draft_step(
                 base_logits=base_logits,
                 prev_embeds=markov_head.get_prev_embeddings(prev_tokens),
                 w2_weight=w2_weight,
+                w2_norms=getattr(markov_head, "xpu_w2_norms", None),
             )
             return tokens, state
     bias, state = markov_head.step_bias(

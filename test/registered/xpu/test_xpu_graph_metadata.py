@@ -20,6 +20,99 @@ register_xpu_ci(est_time=10, suite="extra-test-1-gpu-xpu")
 
 
 class TestXPUGraphMetadata(CustomTestCase):
+    def test_dspark_stacked_fp8_kv_projection(self):
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
+        from sglang.srt.models.dspark import DSparkDraftMixin, _fp8_quant_per_row
+
+        generator = torch.Generator(device="xpu").manual_seed(3)
+
+        def rand(*shape):
+            return torch.randn(
+                *shape, device="xpu", dtype=torch.bfloat16, generator=generator
+            )
+
+        method = Fp8LinearMethod.__new__(Fp8LinearMethod)
+        method.block_quant = False
+        method.use_per_token_if_dynamic = True
+        q_size, kv_size, hidden = 512, 128, 256
+        layers = []
+        for _ in range(3):
+            weight, scale = _fp8_quant_per_row(rand(q_size + 2 * kv_size, hidden))
+            proj = SimpleNamespace(
+                weight=weight.t(),
+                weight_scale=scale,
+                input_scale=None,
+                quant_method=method,
+                bias=None,
+            )
+            attn = SimpleNamespace(
+                qkv_proj=proj, q_size=q_size, kv_size=kv_size, v_scale=None
+            )
+            layers.append(SimpleNamespace(self_attn=attn))
+
+        project = DSparkDraftMixin._xpu_fp8_kv_projection(layers)
+        self.assertIsNotNone(project)
+        for tokens in (1, 8, 128):
+            x = rand(tokens, hidden)
+            expected = []
+            for layer in layers:
+                proj = layer.self_attn.qkv_proj
+                qkv = apply_fp8_linear(
+                    x,
+                    proj.weight,
+                    proj.weight_scale,
+                    cutlass_fp8_supported=False,
+                    use_per_token_if_dynamic=True,
+                )
+                expected.append(qkv[:, q_size:])
+            torch.testing.assert_close(
+                project(x), torch.cat(expected, dim=1), rtol=0.008, atol=0.03
+            )
+
+        layers[0].self_attn.qkv_proj.input_scale = torch.ones(1, device="xpu")
+        self.assertIsNone(DSparkDraftMixin._xpu_fp8_kv_projection(layers))
+
+    def test_verify_replay_uses_device_lengths(self):
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        device = "xpu"
+        backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
+        backend.device = device
+        backend.needs_cpu_seq_lens = False
+        backend.use_sliding_window_kv_pool = False
+        backend.is_encoder_decoder = False
+        backend.page_size = 64
+        backend.max_kv_len = 256
+        backend.max_num_pages = backend.max_kv_len // backend.page_size
+        backend.req_to_token = torch.arange(128, 384, dtype=torch.int32, device=device)[
+            None
+        ]
+        backend.init_cuda_graph_state(max_bs=1, max_num_tokens=8)
+        batch = SimpleNamespace(
+            batch_size=1,
+            req_pool_indices=torch.tensor([0], device=device),
+            seq_lens=torch.tensor([60], dtype=torch.int32, device=device),
+            seq_lens_cpu=torch.tensor([60], dtype=torch.int32),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=SimpleNamespace(num_tokens_per_req=8),
+        )
+        backend._init_full_cg_decode_metadata(batch, in_capture=True)
+        batch.seq_lens_cpu = None
+        batch.seq_lens.fill_(125)
+        with patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("host read")
+        ):
+            backend._init_full_cg_decode_metadata(batch)
+        metadata = backend.forward_metadata
+        self.assertEqual(metadata.max_seq_len_k, 256)
+        torch.testing.assert_close(
+            metadata.cache_seqlens_int32.cpu(), torch.tensor([133], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            metadata.page_table[0, :3].cpu(), torch.tensor([2, 3, 4], dtype=torch.int32)
+        )
+
     def test_full_prefill_swa_page_table_with_multi_token_page_size_and_boundary_masking(
         self,
     ):
@@ -141,6 +234,25 @@ class TestXPUGraphMetadata(CustomTestCase):
                 torch.zeros(2, dtype=torch.int64),
             )
         )
+
+    def test_score_bounded_markov_greedy(self):
+        from sglang.kernels.ops.speculative.dspark.markov_greedy_xpu import (
+            markov_greedy_xpu,
+        )
+
+        generator = torch.Generator(device="xpu").manual_seed(97)
+        options = {"device": "xpu", "dtype": torch.bfloat16, "generator": generator}
+        weight = torch.randn(8195, 256, **options) * 0.05
+        embed = torch.randn(1, 256, **options)
+        logits = torch.randn(1, weight.shape[0], **options) * 3
+        norms = torch.linalg.vector_norm(weight, dim=-1, dtype=torch.float32)
+        bias = torch.nn.functional.linear(embed, weight)
+        for scores in (logits, logits.float(), torch.full_like(logits, -torch.inf)):
+            result = markov_greedy_xpu(scores, embed, weight, norms)
+            torch.testing.assert_close(result, (scores + bias).argmax(dim=-1))
+        logits[0, 9] = torch.nan
+        result = markov_greedy_xpu(logits, embed, weight, norms)
+        torch.testing.assert_close(result, (logits + bias).argmax(dim=-1))
 
     def test_forward_extend_hybrid_swa_and_irope_rejection(self):
         backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
