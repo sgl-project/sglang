@@ -49,7 +49,12 @@ except ImportError:
     _is_fp8_fnuz = False
 
 register_cuda_ci(est_time=24, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-register_amd_ci(est_time=24, suite="nightly-kernel-test-1-gpu-amd", nightly=True)
+register_amd_ci(
+    est_time=24,
+    stage="base-a-jit-kernel-unit",
+    runner_config="amd",
+    disabled="every case skips on HIP; the fused store kernel is CUDA-only",
+)
 
 PAGE_SIZE = 64
 HEAD_DIM = 128
