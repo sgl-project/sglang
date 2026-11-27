@@ -193,8 +193,8 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         self.contract = None
         self._create_runner(layer)
         self.contract = contract_for(self.runner)
-        self.contract.check_format(self.format)
-        self.contract.validate()
+        self.contract.check_layer(layer, self.format)
+        self.contract.validate(get_exec())
         if (
             self.contract.runner_config(moe_runner_config, self.num_resident)
             is not None
@@ -309,6 +309,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         offset = self._place(layer, num_resident, slab, offset)
         self.num_resident = num_resident
         self._set_num_slots(layer, num_resident)
+        self.contract.resize(layer, num_resident)
         self._create_runner(layer)
         self._build(layer)
         return offset

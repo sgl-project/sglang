@@ -11,7 +11,8 @@ runner:
   wave is the runner's local expert range ``[0, K)``; the entries of other experts get id K and
   are dropped before the grouped GEMM, as expert parallelism drops another rank's experts, and
   the executor adds the waves' outputs in FP32. A step in one wave (every decode step the device
-  plans) is exact; a multi-wave step differs from the unpaged layer only in summation order.
+  plans) is exact; in a multi-wave step each wave's output is rounded to the runner's output
+  dtype before the FP32 sum, so it can differ from the unpaged layer by one rounding per wave.
 
 The contract follows from the runner the base method builds (``contract_for``); supporting a
 new backend means adding a contract here, or registering one from the backend's own module
@@ -72,12 +73,18 @@ class RunnerContract:
         the shared one (``runner_config``: per-expert outputs); None keeps the shared one."""
         return None
 
-    def check_format(self, expert_format) -> None:
-        """Raise if this runner is not known to serve the layer's expert format paged."""
+    def check_layer(self, layer, expert_format) -> None:
+        """Raise if this runner is not known to serve the layer (its expert format, its
+        tensors) paged."""
 
-    def validate(self) -> None:
-        """Raise, before the checkpoint loads, on a server configuration this contract cannot
-        serve (beyond the shared checks), e.g. CUDA graphs on a backend without them."""
+    def validate(self, config) -> None:
+        """Raise, before the checkpoint loads, on a server configuration (``get_exec()``) this
+        contract cannot serve (beyond the shared checks), e.g. CUDA graphs on a backend
+        without them."""
+
+    def resize(self, layer, num_slots: int) -> None:
+        """Rebuild what the runner keeps per local expert outside the paged tensors, for
+        ``num_slots`` slots: the layer had another K when its weights were processed."""
 
     def run_wave(
         self, base_method, layer, dispatch_output, slots, merged, num_entries=None
@@ -143,6 +150,17 @@ class CombiningContract(RunnerContract):
     #: Whether the runner drops ids outside its local experts ``[0, K)`` before its GEMMs.
     drops_outside: bool = True
 
+    def validate(self, config) -> None:
+        """A multi-wave step sums each token's experts in groups that depend on which experts
+        the previous steps left resident, so the same request can round differently."""
+        if config.deterministic.enable_deterministic_inference:
+            raise RuntimeError(
+                "Paged experts: --enable-deterministic-inference needs a MoE runner that "
+                "returns each expert's output (e.g. --moe-runner-backend triton); this one "
+                "sums the top-k outputs itself, in an order that depends on which experts "
+                "are resident"
+            )
+
     @staticmethod
     def combining_config(moe_runner_config, num_slots: int):
         """The shared config with the runner's own combine on, for ``runner_config``."""
@@ -179,10 +197,12 @@ class FlashInferCutlassContract(CombiningContract):
     """FlashInfer's CUTLASS MoE: its experts per rank are the rows of the weight tables (K),
     and ids outside ``[ep_rank * K, (ep_rank + 1) * K)`` are not computed. It always combines
     and reads none of the shared config's per-entry fields, so it is built once. Only unquantized
-    experts so far: the quantized formats' post-load steps repack for this runner, which has
-    not been checked against the host store's rows."""
+    experts without biases so far: the quantized formats' post-load steps repack for this
+    runner, which has not been checked against the host store's rows, and the unquantized
+    method does not pass expert biases to it. Its per-expert SwiGLU parameters (a clamped
+    activation) are rebuilt for the final K."""
 
-    def check_format(self, expert_format) -> None:
+    def check_layer(self, layer, expert_format) -> None:
         from sglang.srt.layers.moe.paged_experts.formats import UnquantizedFormat
 
         if not isinstance(expert_format, UnquantizedFormat):
@@ -190,6 +210,28 @@ class FlashInferCutlassContract(CombiningContract):
                 "Paged experts: the flashinfer_cutlass MoE runner is supported for "
                 f"unquantized experts only, the layer has {type(expert_format).__name__}"
             )
+        biases = [
+            name
+            for name in ("w13_weight_bias", "w2_weight_bias")
+            if getattr(layer, name, None) is not None
+        ]
+        if biases:
+            raise RuntimeError(
+                "Paged experts: the flashinfer_cutlass MoE runner is supported for experts "
+                f"without biases only, the layer has {', '.join(biases)}; use "
+                "--moe-runner-backend triton"
+            )
+
+    def resize(self, layer, num_slots: int) -> None:
+        if getattr(layer, "_cutlass_swiglu_params", None) is None:
+            return
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            materialize_swiglu_params_for_cutlass,
+        )
+
+        layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+            layer.moe_runner_config, num_slots, layer.w13_weight.device
+        )
 
 
 def _padded_hidden(hidden: int) -> int:
@@ -293,6 +335,19 @@ class TritonContract(RunnerContract):
     def __init__(self):
         # Per layer: whether a compacted call computes exactly what the full call does.
         self._exact = weakref.WeakKeyDictionary()
+
+    def validate(self, config) -> None:
+        """On XPU, the unquantized method runs the triton runner only when it is selected by
+        name: otherwise it calls sgl-kernel's fused MoE, which sums the top-k outputs."""
+        from sglang.srt.layers.moe.paged_experts.store import accelerator_type
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        if accelerator_type() == "xpu" and not get_moe_runner_backend().is_triton():
+            raise RuntimeError(
+                "Paged experts: on XPU, select the triton MoE runner with "
+                "--moe-runner-backend triton (the default runs a fused MoE that sums the "
+                "top-k outputs, which paged experts cannot split into waves yet)"
+            )
 
     def compacts(self, base_method, layer, dispatch_output) -> bool:
         if not _unquantized_inputs(dispatch_output):

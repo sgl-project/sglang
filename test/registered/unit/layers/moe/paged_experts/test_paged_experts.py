@@ -201,11 +201,12 @@ def _create(method, layer, contract):
         method.create_moe_runner(layer, SimpleNamespace(routed_scaling_factor=None))
 
 
-def _exec(enable_disk=False):
+def _exec(enable_disk=False, deterministic=False):
     return SimpleNamespace(
         moe=SimpleNamespace(
             paged_experts_enable_disk=enable_disk, paged_experts_host_memory_gb=None
-        )
+        ),
+        deterministic=SimpleNamespace(enable_deterministic_inference=deterministic),
     )
 
 
@@ -633,13 +634,100 @@ class TestContractHooks(CustomTestCase):
         any expert loads. Control: the default accepts."""
 
         class _Refusing(_FakeCombining):
-            def validate(self):
+            def validate(self, config):
                 raise RuntimeError("refused by the contract")
 
         with self.assertRaisesRegex(RuntimeError, "refused by the contract"):
             _paged_layer(_Refusing(), load=False)
         method, _, _ = _paged_layer(_FakeCombining(), load=False)
         self.assertIsNotNone(method.loads)
+
+    def test_a_combining_runner_refuses_deterministic_inference(self):
+        """A multi-wave step of a combining runner sums in groups that depend on residency:
+        refused under --enable-deterministic-inference. Controls: the same contract without
+        it, and a per-entry runner (a fixed top-k sum in any wave split) with it."""
+        with self.assertRaisesRegex(RuntimeError, "enable-deterministic-inference"):
+            FLASHINFER_CUTLASS.validate(_exec(deterministic=True))
+        FLASHINFER_CUTLASS.validate(_exec())
+        TRITON.validate(_exec(deterministic=True))
+
+    def test_triton_on_xpu_must_be_selected_by_name(self):
+        """On XPU the unquantized method runs sgl-kernel's fused MoE, which sums the top-k
+        outputs, unless the triton runner is selected by name: paging refuses the default.
+        Controls: triton selected on XPU, and the default on CUDA."""
+        for device, triton, refused in (
+            ("xpu", False, True),
+            ("xpu", True, False),
+            ("cuda", False, False),
+        ):
+            with self.subTest(device=device, triton=triton):
+                backend = SimpleNamespace(is_triton=lambda triton=triton: triton)
+                with (
+                    patch.object(store_module, "accelerator_type", return_value=device),
+                    patch(
+                        "sglang.srt.layers.moe.utils.get_moe_runner_backend",
+                        return_value=backend,
+                    ),
+                ):
+                    if refused:
+                        with self.assertRaisesRegex(RuntimeError, "on XPU"):
+                            TRITON.validate(_exec())
+                    else:
+                        TRITON.validate(_exec())
+
+    def test_sizing_resizes_the_runners_per_expert_state_before_rebuilding_it(self):
+        """``materialize`` (the final K of an auto-sized layer) has the contract resize what
+        the runner keeps per local expert, before the runner is rebuilt for that K."""
+        events = []
+
+        class _Spy(type(CONTRACTS[0])):
+            def resize(self, layer, num_slots):
+                events.append(("resize", num_slots, layer.num_local_experts))
+
+        method, layer, _ = _paged_layer(
+            _Spy(), num_resident=TOP_K, top_k=TOP_K, auto_size=True
+        )
+        build = method._create_runner
+        method._create_runner = lambda layer: (events.append("runner"), build(layer))
+        slab = torch.empty(_slot_table_bytes(method, K), dtype=torch.uint8)
+        with patch(
+            _METHOD + "runner_config", side_effect=lambda config, num_slots: config
+        ):
+            method.materialize(layer, K, slab, 0)
+        self.assertEqual(events, [("resize", K, K), "runner"])
+
+    def test_cutlass_swiglu_parameters_follow_the_final_k(self):
+        """A clamped activation (Step-3.5, GPT-OSS) gives the CUTLASS runner per-expert
+        SwiGLU tensors, built for the K of the post-load step: ``resize`` rebuilds them for
+        the final K, so a route to a grown slot reads its own entry. Controls: a layer without
+        a clamp keeps (None, None, None), and one without the tensors gets none."""
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            materialize_swiglu_params_for_cutlass,
+        )
+
+        for limit in (7.0, None):
+            with self.subTest(limit=limit):
+                layer = torch.nn.Module()
+                layer.w13_weight = torch.nn.Parameter(
+                    torch.zeros(TOP_K, H, H), requires_grad=False
+                )
+                layer.moe_runner_config = MoeRunnerConfig(
+                    num_experts=E, top_k=TOP_K, hidden_size=H, swiglu_limit=limit
+                )
+                layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+                    layer.moe_runner_config, TOP_K, torch.device("cpu")
+                )
+                FLASHINFER_CUTLASS.resize(layer, K)
+                params = layer._cutlass_swiglu_params
+                if limit is None:
+                    self.assertEqual(params, (None, None, None))
+                else:
+                    self.assertEqual([len(p) for p in params], [K, K, K])
+                    self.assertTrue(bool((params[2] == limit).all()))
+        bare = torch.nn.Module()
+        FLASHINFER_CUTLASS.resize(bare, K)
+        self.assertFalse(hasattr(bare, "_cutlass_swiglu_params"))
 
     def test_the_disk_tier_needs_a_cuda_accelerator(self):
         """The tier registers its host rows with CUDA: another accelerator is refused at
@@ -1484,9 +1572,29 @@ class TestFormats(CustomTestCase):
     def test_the_cutlass_contract_takes_only_unquantized_experts(self):
         """Its quantized formats repack for the runner after loading, which the host store's
         rows are not checked against: such a layer fails at startup. Control: unquantized."""
-        FLASHINFER_CUTLASS.check_format(UnquantizedFormat())
+        layer = torch.nn.Module()
+        FLASHINFER_CUTLASS.check_layer(layer, UnquantizedFormat())
         with self.assertRaisesRegex(RuntimeError, "unquantized experts only"):
-            FLASHINFER_CUTLASS.check_format(formats.Fp8BlockFormat())
+            FLASHINFER_CUTLASS.check_layer(layer, formats.Fp8BlockFormat())
+
+    def test_the_cutlass_contract_refuses_expert_biases(self):
+        """The unquantized method does not pass expert biases (BF16 GPT-OSS) to the CUTLASS
+        runner: a layer with either bias fails at startup, before the checkpoint loads.
+        Control: the same layer without biases is accepted (above), and through
+        ``create_moe_runner`` a bias-free layer is created."""
+        for name in ("w13_weight_bias", "w2_weight_bias"):
+            with self.subTest(name=name):
+                layer = torch.nn.Module()
+                layer.register_parameter(
+                    name, torch.nn.Parameter(torch.zeros(E, H), requires_grad=False)
+                )
+                with self.assertRaisesRegex(RuntimeError, name):
+                    FLASHINFER_CUTLASS.check_layer(layer, UnquantizedFormat())
+        with self.assertRaisesRegex(RuntimeError, "w13_weight_bias"):
+            _paged_layer(
+                FLASHINFER_CUTLASS, extra_params=("w13_weight_bias",), load=False
+            )
+        _paged_layer(FLASHINFER_CUTLASS, load=False)
 
 
 class TestCompat(CustomTestCase):
