@@ -608,7 +608,11 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         def permute(w: torch.Tensor, n_heads: int):
             attn_in = self.language_model.config.head_dim * n_heads
-            attn_out = self.language_model.config.hidden_size
+            if w.dim() != 2 or w.shape[0] != attn_in:
+                return w  # a scalar scale, or a layout without one row per output
+            # Only the rows move. The columns stay as stored: the hidden size, half
+            # of it for packed FP4 weights, a sixteenth of it for their block scales.
+            attn_out = w.shape[-1]
 
             return (
                 w.view(n_heads, attn_in // n_heads // 2, 2, attn_out)
@@ -617,15 +621,21 @@ class Llama4ForConditionalGeneration(nn.Module):
             )
 
         modules = name.split(".")
+        # NVFP4's per-row block scales (FP8) follow the rows of their weight. Other
+        # formats keep their scales as before: compressed-tensors INT4 names its
+        # weight weight_packed, which is not permuted, so its scales stay too.
+        rows = modules[-1] == "weight" or (
+            modules[-1] == "weight_scale" and loaded_weight.dtype == torch.float8_e4m3fn
+        )
 
         # rotary embeds should be sliced
-        if ("wk" in modules or "k_proj" in modules) and modules[-1] == "weight":
+        if ("wk" in modules or "k_proj" in modules) and rows:
             if _is_cpu:
                 dim = self.language_model.config.original_total_num_kv_heads
             else:
                 dim = self.language_model.config.num_key_value_heads
             loaded_weight = permute(loaded_weight, dim)
-        elif ("wq" in modules or "q_proj" in modules) and modules[-1] == "weight":
+        elif ("wq" in modules or "q_proj" in modules) and rows:
             if _is_cpu:
                 dim = self.language_model.config.original_num_attention_heads
             else:
@@ -873,6 +883,24 @@ class Llama4ForConditionalGeneration(nn.Module):
             return True
 
         param = params_dict[transformed_name]
+
+        if not expert_match and loaded_weight.dim() == 3:
+            # A fused checkpoint keeps the per-block scales of all experts in one
+            # tensor laid out like its weights, [num_experts, in, out]: load them
+            # per expert as _handle_expert_weight_params loads the weights.
+            _, _, shard_id_list = self._transform_expert_name(name)
+            chunks = loaded_weight.chunk(len(shard_id_list), dim=-1)
+            for chunk, shard_id in zip(chunks, shard_id_list):
+                for expert_id in range(num_experts):
+                    param.weight_loader(
+                        param,
+                        chunk[expert_id].T,
+                        transformed_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+            loaded_params.add(transformed_name)
+            return True
 
         # Handle scale parameters
         if expert_match:
