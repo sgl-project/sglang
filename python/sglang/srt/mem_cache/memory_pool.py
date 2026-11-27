@@ -138,8 +138,20 @@ if _is_xpu:
     from sgl_kernel import store_cache_xpu
 
 
+def speculative_verify_uses_tree(
+    algorithm: Optional[str], eagle_topk: Optional[int]
+) -> bool:
+    # NGRAM's BFS breadth is not a topology guarantee. Its padded or
+    # corpus-backed proposal can contain siblings even at breadth one.
+    return algorithm == "NGRAM" or (eagle_topk or 0) > 1
+
+
 def conv_window_dedup_enabled(
-    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
+    is_npu: bool,
+    is_cpu: bool,
+    speculative_eagle_topk: Optional[int],
+    is_kda: bool,
+    speculative_algorithm: Optional[str] = None,
 ) -> bool:
     """Whether the deduplicated sliding-window conv-intermediate layout is safe.
 
@@ -152,7 +164,9 @@ def conv_window_dedup_enabled(
         not is_npu
         and not is_cpu
         and not is_kda
-        and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
+        and not speculative_verify_uses_tree(
+            speculative_algorithm, speculative_eagle_topk
+        )
     )
 
 
@@ -676,6 +690,7 @@ class MambaPool:
         enable_linear_replayssm_spec: bool = False,
         replayssm_request_ring: bool = False,
         allocate_intermediate_ssm: bool = True,
+        speculative_algorithm: Optional[str] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -958,15 +973,19 @@ class MambaPool:
                 # view through its strides.
                 #
                 # Dedup the sliding-window conv-intermediate only when it is safe:
-                # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
-                # verify (topk > 1) keep the dense layout -- see
+                # CUDA + a linear draft chain. NPU/CPU and tree verify (including
+                # NGRAM at BFS breadth one) keep the dense layout -- see
                 # `conv_window_dedup_enabled` for the full rationale. The
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = (
                     not cache_params.shape.disable_conv_window_dedup
                     and conv_window_dedup_enabled(
-                        _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
+                        _is_npu,
+                        _is_cpu,
+                        speculative_eagle_topk,
+                        cache_params.is_kda,
+                        speculative_algorithm,
                     )
                 )
                 self._intermediate_conv_window_phys = []
@@ -987,7 +1006,7 @@ class MambaPool:
                         self._intermediate_conv_window_phys.append(phys)
                         intermediate_conv_window_cache.append(view)
                 else:
-                    # Original dense layout (NPU/CPU, or EAGLE tree verify): one
+                    # Original dense layout (NPU/CPU, or tree verify): one
                     # [dim, K-1] window per draft token.
                     # Shape: [num_layers, size+1, draft_tokens, dim, K-1]
                     dense_conv_shapes = [
@@ -1459,6 +1478,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
         replayssm_request_ring: bool = False,
+        speculative_algorithm: Optional[str] = None,
     ):
         super().__init__(
             size=size,
@@ -1499,6 +1519,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
             replayssm_request_ring=replayssm_request_ring,
+            speculative_algorithm=speculative_algorithm,
         )
 
     def _init_mamba_pool(
@@ -1521,6 +1542,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
         replayssm_request_ring: bool = False,
+        speculative_algorithm: Optional[str] = None,
     ):
         self.state = StateStorage.empty(self.state_sub_pool)
         self.mamba_pool = self.mamba_pool_cls(
@@ -1538,6 +1560,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
             replayssm_request_ring=replayssm_request_ring,
             allocate_intermediate_ssm=allocate_intermediate_ssm,
+            speculative_algorithm=speculative_algorithm,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

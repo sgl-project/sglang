@@ -24,6 +24,15 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    fused_conv_window_scatter_with_mask,
+)
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateDType,
+    Mamba2StateShape,
+)
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import empty_gpu_cache
 
@@ -643,6 +652,100 @@ def test_causal_conv1d_update_dedup_window_matches_per_token(
     assert torch.equal(state_tile, state_ref)
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (1e-2, 5e-2)
     torch.testing.assert_close(out_tile[real], out_ref[real], rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize(
+    "tree",
+    [(-1, 0, 1, 2), (-1, 0, 0, 0), (-1, 0, 0, 1, 1, 2), (-1, 0, 0, 1, 1, 2, 3, 5)],
+    ids=["chain", "siblings", "uneven", "depth-four"],
+)
+def test_ngram_breadth_one_preserves_conv_windows_for_siblings(batch, tree):
+    device = get_device()
+    dtype = torch.bfloat16
+    dim, width, draft_tokens = 32, 4, len(tree)
+    params = Mamba2CacheParams(
+        dtype=Mamba2StateDType(conv=dtype, temporal=torch.float32),
+        layers=[0],
+        shape=Mamba2StateShape(
+            conv=[(dim, width - 1)],
+            temporal=(1, 1, 1),
+            intermediate_size=dim,
+            conv_dim=dim,
+            ssm_state_size=1,
+            num_heads=1,
+            head_dim=1,
+            state_size=1,
+            conv_kernel=width,
+        ),
+    )
+    # A model's NGRAM search may emit one root and three sibling nodes
+    # even with BFS breadth one, including when it pads unmatched drafts.
+    pool = MambaPool(
+        size=batch,
+        spec_state_size=batch,
+        cache_params=params,
+        mamba_layer_ids=[0],
+        device=device,
+        speculative_num_draft_tokens=draft_tokens,
+        speculative_eagle_topk=1,
+        speculative_algorithm="NGRAM",
+    )
+    cache = pool.mamba2_layer_cache(0)
+    offsets = torch.arange(batch, device=device, dtype=dtype)[:, None] * 16
+    prior = offsets + torch.arange(1, width, device=device, dtype=dtype)
+    cache.conv[0][1 : batch + 1].copy_(prior[:, None, :].expand(-1, dim, -1))
+    projections = offsets + torch.arange(
+        width, width + draft_tokens, device=device, dtype=dtype
+    )
+    x = projections[:, :, None].expand(-1, -1, dim).contiguous().transpose(1, 2)
+    weights = torch.ones(dim, width, device=device, dtype=dtype)
+    branches = [[] for _ in tree]
+    for node, parent in enumerate(tree[1:], start=1):
+        branches[parent].append(node)
+    first = [branch[0] if branch else -1 for branch in branches]
+    following = [-1] * draft_tokens
+    for branch in branches:
+        for node, sibling in zip(branch, branch[1:]):
+            following[node] = sibling
+    children, siblings = (
+        torch.tensor([links] * batch, device=device, dtype=torch.int32)
+        for links in (first, following)
+    )
+    parents = torch.empty_like(children)
+    window = cache.intermediate_conv_window[0]
+    slots = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
+    scratch = slots - 1
+    out = causal_conv1d_update(
+        x,
+        cache.conv[0],
+        weights,
+        conv_state_indices=slots,
+        intermediate_conv_window=window,
+        intermediate_state_indices=scratch,
+        retrieve_next_token=children,
+        retrieve_next_sibling=siblings,
+        retrieve_parent_token=parents,
+    )
+    history = []
+    for node, parent in enumerate(tree):
+        before = prior if parent < 0 else history[parent][:, 1:]
+        history.append(torch.cat((before, projections[:, node : node + 1]), dim=1))
+    oracle = torch.stack(history, dim=1)
+    expected_window = oracle[:, :, None, 1:].expand(-1, -1, dim, -1)
+    assert torch.equal(window[:batch], expected_window)
+    assert torch.equal(out, oracle.sum(-1)[:, None, :].expand(-1, dim, -1))
+
+    # Commit different depths, including the root and a last sibling. The same
+    # slots become the starting windows for the next verify in each request.
+    accepted_steps = scratch * (draft_tokens - 1) // max(1, batch - 1)
+    fused_conv_window_scatter_with_mask(
+        cache.conv[0].unsqueeze(0), window.unsqueeze(0), slots, accepted_steps, scratch
+    )
+    assert torch.equal(
+        cache.conv[0][1 : batch + 1],
+        expected_window[scratch.long(), accepted_steps.long()],
+    )
 
 
 def test_causal_conv1d_oot_dispatch(monkeypatch):

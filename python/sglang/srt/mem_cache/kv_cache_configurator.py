@@ -1708,6 +1708,7 @@ class KVCacheConfigurator:
             mamba_layer_ids=self._get_mamba_layer_ids_for_req_pool(),
             speculative_num_draft_tokens=max_speculative_num_draft_tokens(),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
+            speculative_algorithm=get_spec().speculative_algorithm,
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
             pre_alloc_size=pre_alloc_size,
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
@@ -1782,6 +1783,7 @@ class KVCacheConfigurator:
                 else max_speculative_num_draft_tokens()
             ),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
+            speculative_algorithm=get_spec().speculative_algorithm,
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             start_layer=self.layer_info.start_layer,
             enable_linear_replayssm=get_exec().mamba.enable_linear_replayssm,

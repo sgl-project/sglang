@@ -37,7 +37,10 @@ from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.mem_cache.kv.router import KVLayer
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    speculative_verify_uses_tree,
+)
 from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -89,7 +92,11 @@ class MambaAttnBackendBase(AttentionBackend):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
-        self.topk = get_spec().speculative_eagle_topk or 0
+        spec = get_spec()
+        self.topk = spec.speculative_eagle_topk or 0
+        self.verify_uses_tree = speculative_verify_uses_tree(
+            spec.speculative_algorithm, spec.speculative_eagle_topk
+        )
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -361,7 +368,7 @@ class MambaAttnBackendBase(AttentionBackend):
                         device=forward_batch.input_ids.device,
                     )
 
-                if self.topk > 1:
+                if self.verify_uses_tree:
                     retrieve_next_token = forward_batch.spec_info.retrieve_next_token
                     retrieve_next_sibling = (
                         forward_batch.spec_info.retrieve_next_sibling
@@ -463,7 +470,7 @@ class MambaAttnBackendBase(AttentionBackend):
         # stream, racing the draft — re-copy after the stream join. Eager
         # verify reads the spec_info tensors directly; parent links are
         # derived from these buffers at execution time.
-        if self.topk <= 1 or cuda_graph_bs is None:
+        if not self.verify_uses_tree or cuda_graph_bs is None:
             return
         if (
             not isinstance(spec_info, EagleVerifyInput)
@@ -830,7 +837,7 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         replayssm_ring_indices = self._fill_replayssm_ring_indices(bs, req_pool_indices)
 
-        if forward_mode.is_target_verify() and self.topk > 1:
+        if forward_mode.is_target_verify() and self.verify_uses_tree:
             # retrieve_* are None during capture, so skip the copy.
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
@@ -1020,7 +1027,7 @@ class MambaAttnBackendBase(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         qsl_buf = self.query_start_loc_list[bs - 1]
 
-        if is_target_verify and self.topk > 1:
+        if is_target_verify and self.verify_uses_tree:
             if (
                 spec_info is not None
                 and getattr(spec_info, "retrieve_next_token", None) is not None
