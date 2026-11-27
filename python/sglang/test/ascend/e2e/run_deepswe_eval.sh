@@ -126,44 +126,25 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 docker compose version || echo "WARNING: docker compose plugin is still unavailable"
 
-# The official ubuntu:24.04 image lacks the Ubuntu archive signing key in this
-# environment, so pier's egress-proxy build fails at `apt-get update` with
-# "NO_PUBKEY 871920D1991BC93C". This eval image (Ubuntu 22.04) ships a keyring
-# that has the key, so build a patched local image and retag it as
-# ubuntu:24.04; compose's `FROM ubuntu:24.04` then uses it instead of pulling.
+# pier's egress-proxy Dockerfile builds FROM ubuntu:24.04 and runs
+# `apt-get update`; inside this pod's old dind (18.06) that fails signature
+# checks with "NO_PUBKEY 871920D1991BC93C", even though a plain `docker run` of
+# the same image works. The proxy only needs squid/apache2-utils, so retag
+# ubuntu:22.04 as ubuntu:24.04 and let compose build on 22.04 (verified working
+# here). A short diagnostic first records whether `docker run` + apt works.
 seed_ubuntu_base() {
-    local work
-    work="$(mktemp -d)"
-    local keys="${work}/ubuntu-archive-keyring.gpg"
-    : > "${keys}"
-    # Merge the keyrings this eval image actually uses for apt (Ubuntu 22.04,
-    # where apt verifies archive.ubuntu.com fine). The single
-    # /usr/share/keyrings file here is often a tiny placeholder, so include the
-    # trusted.gpg.d fragments too.
-    local f
-    for f in /usr/share/keyrings/ubuntu-archive-keyring.gpg /etc/apt/trusted.gpg.d/*.gpg; do
-        if [ -f "${f}" ]; then
-            cat "${f}" >> "${keys}"
-        fi
-    done
-    local size
-    size="$(wc -c < "${keys}" | tr -d ' ')"
-    if [ "${size:-0}" -lt 1024 ]; then
-        echo "WARNING: merged keyring is only ${size:-0} bytes; skip patching ubuntu:24.04"
-        rm -rf "${work}"
-        return 0
-    fi
-    cat > "${work}/Dockerfile" <<'EOF'
-FROM ubuntu:24.04
-COPY ubuntu-archive-keyring.gpg /usr/share/keyrings/ubuntu-archive-keyring.gpg
-EOF
-    echo "Patching ubuntu:24.04 with the archive signing key (${size} bytes) ..."
-    if docker build -t ubuntu:24.04 "${work}"; then
-        echo "Patched ubuntu:24.04 base ready."
+    docker pull ubuntu:24.04 || true
+    if docker run --rm ubuntu:24.04 sh -c 'apt-get update -qq >/dev/null 2>&1'; then
+        echo "Diagnostic: apt-get update works in ubuntu:24.04 (docker run)."
     else
-        echo "WARNING: failed to patch ubuntu:24.04; apt in the build may fail"
+        echo "Diagnostic: apt-get update fails in ubuntu:24.04 (docker run)."
     fi
-    rm -rf "${work}"
+    echo "Retagging ubuntu:22.04 as ubuntu:24.04 for the egress-proxy build ..."
+    if docker pull ubuntu:22.04 && docker tag ubuntu:22.04 ubuntu:24.04; then
+        echo "ubuntu:24.04 now resolves to Ubuntu 22.04."
+    else
+        echo "WARNING: failed to retag ubuntu:22.04 as ubuntu:24.04"
+    fi
 }
 seed_ubuntu_base
 
