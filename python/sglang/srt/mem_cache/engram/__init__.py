@@ -7,7 +7,7 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheEngramStorage
 
 
 def _parse_config(config: str | None) -> dict:
-    """Validate user options; worker identity and caller counts are runtime-owned."""
+    """Validate user options; identity, caller counts and lookup capacity are runtime-owned."""
     try:
         options = {} if config is None else json.loads(config)
     except (TypeError, json.JSONDecodeError) as exc:
@@ -27,7 +27,6 @@ def _parse_config(config: str | None) -> dict:
             "group_id",
             "shard_id",
             "timeout",
-            "max_lookup_rows",
         }
     )
     unknown = options.keys() - allowed
@@ -53,10 +52,6 @@ def _parse_config(config: str | None) -> dict:
         or not 0 <= options["shard_id"] < size
     ):
         raise ValueError("Manual assignment requires group_id and a valid shard_id")
-    if "max_lookup_rows" in options and (
-        type(options["max_lookup_rows"]) is not int or options["max_lookup_rows"] < 1
-    ):
-        raise ValueError("max_lookup_rows must be a positive integer")
     if "timeout" in options and (
         isinstance(options["timeout"], bool)
         or not isinstance(options["timeout"], (int, float))

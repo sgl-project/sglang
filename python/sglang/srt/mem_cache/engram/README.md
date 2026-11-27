@@ -113,9 +113,9 @@ order, with no topology optimization or total-node-count setting.
 SGLang automatically supplies the node/model identity, dense `caller_id`,
 `num_callers`, and a conservative `max_lookup_rows` bound including graph
 padding and speculative/attention-DP expansion. User JSON rejects caller,
-identity, Master-address and session fields. Optional user overrides are
-`timeout` and a sufficiently large `max_lookup_rows`. Remote JSON does not use
-`local_dir` or `persistent`.
+identity, lookup-capacity, Master-address and session fields. The only optional
+remote override is `timeout`. Remote JSON does not use `local_dir` or
+`persistent`.
 
 To restrict NIC selection, set `NCCL_IB_HCA` before launch, for example
 `export NCCL_IB_HCA='=mlx5_0'`. This is the worker's NCCL configuration for both
@@ -126,8 +126,11 @@ The Engram adapter constructs `EngramStoreConfig` and `EngramStore`, obtains
 placement before allocating the local weight buffer, then translates Qwen head
 boundaries/byte rows into `populate_and_sync(local_tables, table_owners=...)`.
 Head placement remains contiguous by head count. Hashing, scaling, masking,
-collectives and prefetch stay in the model. Same-node callers share the final
-CPU allocation; checkpoint staging can still temporarily hold extra copies.
+collectives and prefetch stay in the model. Each participating rank holds one
+Store per Engram embedding, managing all of that embedding's hash heads.
+Same-node callers share its final CPU allocation, while each caller owns its
+communicator and lookup workspace. Checkpoint staging can still temporarily
+hold extra copies.
 
 Current scope is PP1 with one model replica per engine, uniform caller counts
 and identical table layouts. Attention-DP within a TP group remains supported.

@@ -190,6 +190,7 @@ class TestEngramRemoteConfig(CustomTestCase):
         for name, value in (
             ("caller_id", 0),
             ("num_callers", 4),
+            ("max_lookup_rows", 4096),
             ("node_id", "node"),
             ("model_key", "weights"),
             ("master_addr", "host:50051"),
@@ -267,8 +268,6 @@ class TestEngramRemoteConfig(CustomTestCase):
             with mock.patch.dict(os.environ, {"NCCL_IB_HCA": "=existing"}):
                 make_remote_config(options, 24)
                 self.assertEqual(os.environ["NCCL_IB_HCA"], "=existing")
-            with self.assertRaisesRegex(ValueError, "cover"):
-                make_remote_config(dict(options, max_lookup_rows=1), 24)
             patches["get_schedule"].chunked_prefill_size = -1
             self.assertEqual(
                 make_remote_config(options, 24).max_lookup_rows, 131072 * 24

@@ -60,13 +60,6 @@ def make_remote_config(options, heads):
         tokens = max(tokens, prefill + decode_tokens)
     # Global-TP Engram lookup gathers attention-DP token IDs before lookup.
     capacity = tokens * max(parallel.attn_dp_size, 1) * heads
-    configured = options.get("max_lookup_rows", capacity)
-    if configured < capacity:
-        raise ValueError(
-            f"max_lookup_rows must cover at least {capacity} submitted IDs"
-        )
-    settings = dict(options)
-    settings["max_lookup_rows"] = configured
     if os.environ.get("NCCL_CUMEM_ENABLE") != "1":
         raise ValueError(
             "deepep_rdma requires NCCL_CUMEM_ENABLE=1 before SGLang launch"
@@ -77,5 +70,6 @@ def make_remote_config(options, heads):
         model_key=model_key,
         caller_id=caller,
         num_callers=callers,
-        **settings,
+        max_lookup_rows=capacity,
+        **options,
     )
