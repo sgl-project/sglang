@@ -118,6 +118,18 @@ _SHARDED_VERIFY_TARGET_MODEL_CLASSES = frozenset(
         "Qwen3_5MoeForConditionalGeneration",
     }
 )
+_HIP_SHARDED_VERIFY_TARGET_MODEL_CLASSES = frozenset(
+    {"Glm5NextForConditionalGeneration"}
+)
+
+
+def _sharded_verify_target(model) -> bool:
+    from sglang.srt.speculative.sharded_verify import hip_argmax_verify
+
+    name = type(model).__name__
+    return name in _SHARDED_VERIFY_TARGET_MODEL_CLASSES or (
+        hip_argmax_verify() and name in _HIP_SHARDED_VERIFY_TARGET_MODEL_CLASSES
+    )
 
 
 def bind_eagle_runtime_hooks(
@@ -146,7 +158,7 @@ def bind_eagle_runtime_hooks(
     ]
     if (
         supports_sharded_verify
-        and type(model).__name__ in _SHARDED_VERIFY_TARGET_MODEL_CLASSES
+        and _sharded_verify_target(model)
         and len(processors) == 1
     ):
         # Only callers whose post-verify consumer understands the shard marker

@@ -801,7 +801,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
-                if draft_probs is not None:
+                if (
+                    draft_probs is not None
+                    and getattr(self.cuda_graph_runner, "draft_probs_out", None) is None
+                ):
                     # draft_probs is the one graph output read after the target
                     # forward rather than by it, and it points into the graph's
                     # private memory pool. The pool recycles that block in the
@@ -882,8 +885,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and not forward_batch.sampling_info.is_all_greedy
         )
         draft_probs_list: Optional[List[torch.Tensor]] = None
+        draft_probs_out = None
         if needs_draft_probs:
             draft_probs_list = [spec_info.draft_probs]
+            draft_probs_out = spec_info.draft_probs_out
 
         topk1_chain_fits = (
             self.topk == 1
@@ -897,7 +902,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk1_chain_fits
             and (_is_cuda or _is_hip)
             and self.hot_token_id is None
-            and not needs_draft_probs
+            and (not needs_draft_probs or _is_hip)
         ):
             draft_tokens_topk1 = torch.empty(
                 (topk_index.shape[0], self.speculative_num_steps),
@@ -910,6 +915,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         captured_fold = fold = forward_batch.draft_step_fold
         if (
             draft_tokens_topk1 is None
+            or needs_draft_probs
             or forward_batch.mm_input_embeds is not None
             or forward_batch.return_logprob
         ):
@@ -975,7 +981,30 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if needs_draft_probs:
+                if needs_draft_probs and draft_tokens_topk1 is not None:
+                    sampling_seed = forward_batch.sampling_info.sampling_seed
+                    probs, topk_p, topk_index = sample_draft_proposal(
+                        logits_output.next_token_logits,
+                        forward_batch.sampling_info.temperatures,
+                        forward_batch.sampling_info.top_ks,
+                        sampling_seed=sampling_seed,
+                        positions=(
+                            forward_batch.positions + 1
+                            if sampling_seed is not None
+                            else None
+                        ),
+                        draft_step=i + 1,
+                        advance_positions=forward_batch.positions,
+                        draft_tokens=draft_tokens_topk1,
+                        draft_token_column=i + 1,
+                        probs_out=(
+                            draft_probs_out[:, i + 1]
+                            if draft_probs_out is not None
+                            else None
+                        ),
+                    )
+                    draft_probs_list.append(probs)
+                elif needs_draft_probs:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
@@ -1044,7 +1073,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 score_list, token_list, parents_list, self.speculative_num_draft_tokens
             )
 
-        draft_probs = self._build_verify_draft_probs(draft_probs_list, draft_tokens)
+        if draft_probs_out is not None and draft_tokens_topk1 is not None:
+            draft_probs = draft_probs_out
+        else:
+            draft_probs = self._build_verify_draft_probs(draft_probs_list, draft_tokens)
         return parent_list, top_scores_index, draft_tokens, draft_probs
 
     def _build_verify_draft_probs(

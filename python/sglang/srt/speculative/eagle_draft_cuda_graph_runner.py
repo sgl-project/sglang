@@ -309,8 +309,25 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk=dsa_seed_topk,
         )
+        # The draft loop writes every step's q into its slot of this buffer, so
+        # the verify reads it without an in-graph stack or a post-replay clone.
+        # It stays out of the shared pool: the verify reads it after replay.
+        self.draft_probs_out = None
+        share_exclude = _relay_private_inputs()
+        if (
+            draft_probs is not None
+            and torch.version.hip
+            and not getattr(self.eagle_worker, "draft_probs_need_vocab_scatter", False)
+        ):
+            self.draft_probs_out = torch.zeros(
+                (self.max_bs, self.speculative_num_steps, draft_probs.shape[1]),
+                dtype=torch.float32,
+                device=draft_probs.device,
+            )
+            self.buffers.draft_probs = self.draft_probs_out[:, 0]
+            share_exclude = share_exclude | {"draft_probs"}
         # Relay outputs survive other runners until the next draft consumes them.
-        self.buffers.share_buffers(exclude=_relay_private_inputs())
+        self.buffers.share_buffers(exclude=share_exclude)
         # Resolve the always-present graph dispatch before capture. Specialized
         # batch sizes are used only to select compatible graph variants.
         self.draft_runtime = eagle_worker.draft_runtime
@@ -508,6 +525,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_p=topk_p,
             topk_index=topk_index,
             draft_probs=draft_probs,
+            draft_probs_out=(
+                self.draft_probs_out[:num_seqs]
+                if self.draft_probs_out is not None
+                else None
+            ),
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
         )
@@ -748,6 +770,18 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
             copy_srcs.append(forward_batch.bootstrap_room_ids_int)
+        sampling_info = forward_batch.sampling_info
+        copy_sampling_params = (
+            get_spec().speculative_use_rejection_sampling and sampling_info is not None
+        )
+        group_sampling_params = (
+            copy_sampling_params
+            and sampling_info.temperatures.shape == self.temperatures[:raw_bs].shape
+            and sampling_info.top_ks.shape == self.top_ks[:raw_bs].shape
+        )
+        if group_sampling_params:
+            copy_dsts += [self.temperatures[:raw_bs], self.top_ks[:raw_bs]]
+            copy_srcs += [sampling_info.temperatures, sampling_info.top_ks]
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
@@ -773,18 +807,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.dsa_seed_topk[:raw_bs].zero_()
         # Only rejection sampling reads temperatures (renorm_draft_probs); skip
         # the copy otherwise to keep the non-RS path free of extra work.
-        if (
-            get_spec().speculative_use_rejection_sampling
-            and forward_batch.sampling_info is not None
-        ):
-            self.temperatures[:raw_bs].copy_(
-                forward_batch.sampling_info.temperatures[:raw_bs]
-            )
+        if copy_sampling_params:
+            if not group_sampling_params:
+                self.temperatures[:raw_bs].copy_(sampling_info.temperatures[:raw_bs])
+                self.top_ks[:raw_bs].copy_(sampling_info.top_ks[:raw_bs])
             if self.buffers.sampling_seed is not None:
                 self.buffers.sampling_seed[:raw_bs].copy_(
-                    forward_batch.sampling_info.sampling_seed[:raw_bs]
+                    sampling_info.sampling_seed[:raw_bs]
                 )
-            self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

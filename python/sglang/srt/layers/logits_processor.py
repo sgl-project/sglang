@@ -120,7 +120,9 @@ _autotune_run_lm_head: Optional[bool] = None
 
 
 def _runtime_optimized_vocab_shards_enabled() -> bool:
-    return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+    from sglang.srt.speculative.sharded_verify import hip_argmax_verify
+
+    return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get() or hip_argmax_verify()
 
 
 # Target-verify logits formats a graph runner captures for a sharded-verify processor.
