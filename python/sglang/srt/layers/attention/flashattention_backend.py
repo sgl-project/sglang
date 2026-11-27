@@ -218,7 +218,6 @@ class FlashAttentionBackend(AttentionBackend):
         self.forward_metadata: FlashAttentionMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
-        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
@@ -237,11 +236,10 @@ class FlashAttentionBackend(AttentionBackend):
                 "MXFP8 KV cache on SM120 requires --page-size 128, got "
                 f"{self.page_size}."
             )
+        self.max_kv_len = self.req_to_token_pool.row_width
         # Static page-table width (upper bound). The device-side page-table build
         # sizes to this constant, so no runtime host max is needed.
-        self.max_num_pages = (
-            self.max_context_len + self.page_size - 1
-        ) // self.page_size
+        self.max_num_pages = (self.max_kv_len + self.page_size - 1) // self.page_size
         # Page table is built on-device (build_trtllm_mha_page_table) and the
         # tree mask is preallocated (see VerifyMask), so no
         # seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
@@ -503,7 +501,7 @@ class FlashAttentionBackend(AttentionBackend):
         return LocalAttentionMetadataBuilder(
             attention_chunk_size=model_runner.attention_chunk_size,
             page_size=self.page_size,
-            max_context_len=self.max_context_len,
+            req_to_token_row_width=self.max_kv_len,
             device=self.device,
             swa_translate=(
                 functools.partial(self.runner_ids.ids_in, IdSpaceKind.SLIDING_WINDOW)
@@ -699,7 +697,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def stage_draft_extend_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self.draft_extend_metadata[forward_batch.batch_size]
-        self.forward_metadata.max_seq_len_k = self.max_context_len
+        self.forward_metadata.max_seq_len_k = self.max_kv_len
         self.forward_metadata_spec_decode_expand = None
         self.init_forward_metadata_in_graph(forward_batch)
 
@@ -858,7 +856,7 @@ class FlashAttentionBackend(AttentionBackend):
                     # the graph. Capture against the full replay bound, not the
                     # padded seq-len fill value (1), or a later long-context
                     # replay would leave K/V tiles uncovered.
-                    metadata.max_seq_len_k = self.max_context_len
+                    metadata.max_seq_len_k = self.max_kv_len
                 if self.local_attn_builder is not None:
                     metadata.local_attn_metadata = (
                         self.local_attn_builder.build_for_capture(
@@ -917,7 +915,7 @@ class FlashAttentionBackend(AttentionBackend):
           aliases it to cu_seqlens_k — under capture that would permanently
           weld q to the k buffer and break prefix replays);
         - max_seq_len_q / max_seq_len_k are baked at capture as upper bounds
-          (the bucket's num_tokens / max_context_len): the kernel reads real
+          (the bucket's num_tokens / max_kv_len): the kernel reads real
           work extents from the cu_seqlens / cache_seqlens device buffers.
         """
         bs = forward_batch.batch_size
@@ -928,15 +926,15 @@ class FlashAttentionBackend(AttentionBackend):
             m.cu_seqlens_q = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             m.cu_seqlens_k = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             # Block table sized in PAGES. For page_size == 1 max_num_pages ==
-            # max_context_len, so this reduces to the per-token layout.
+            # max_kv_len, so this reduces to the per-token layout.
             m.page_table = torch.zeros(
                 (bs, self.max_num_pages), dtype=torch.int32, device=device
             )
             # Page-start token offsets for the strided block-table gather. For
-            # page_size == 1 this is arange(max_context_len) and the gather + //1
+            # page_size == 1 this is arange(max_kv_len) and the gather + //1
             # below reduces to the plain per-token req_to_token copy.
             self.full_cg_prefill_strided_indices = torch.arange(
-                0, self.max_context_len, self.page_size, device=device
+                0, self.max_kv_len, self.page_size, device=device
             )
             # SWA (hybrid sliding-window) buffers, mirroring the eager extend
             # path: a page-strided SWA block table + SWA-translated write
@@ -1025,7 +1023,7 @@ class FlashAttentionBackend(AttentionBackend):
         if in_capture:
             # Baked into the captured kernel launches; upper bounds only.
             m.max_seq_len_q = forward_batch.positions.numel()
-            m.max_seq_len_k = self.max_context_len
+            m.max_seq_len_k = self.max_kv_len
         self.forward_metadata = m
 
     def set_draft_kv_ring(self, ring: DFlashDraftKVRing) -> None:
@@ -1104,13 +1102,13 @@ class FlashAttentionBackend(AttentionBackend):
         # Eager (non-cuda-graph) path: max_seq_len_k only feeds Python-side
         # page-table slicing and the scheduler_metadata heuristic -- never the
         # kernel. Use the CPU mirror when published; otherwise the static
-        # max_context_len bound (over-wide page table, slightly suboptimal
+        # max_kv_len bound (over-wide page table, slightly suboptimal
         # split heuristic, but no D2H sync).
         seq_lens_cpu = forward_batch.seq_lens_cpu
         eager_max_k = (
             seq_lens_cpu.max().item()
             if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0
-            else self.max_context_len
+            else self.max_kv_len
         )
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -1412,7 +1410,7 @@ class FlashAttentionBackend(AttentionBackend):
                     max_pf = int(seq_lens_cpu[:batch_size].max().item())
                 else:
                     # Ratchet needs a true upper bound; a local D2H beats
-                    # poisoning it with max_context_len forever.
+                    # poisoning it with max_kv_len forever.
                     max_pf = int(forward_batch.seq_lens[:batch_size].max().item())
                 if max_pf > self._pa_swa_max_prefill_len:
                     self._pa_swa_max_prefill_len = max_pf
@@ -2848,8 +2846,6 @@ class FlashAttentionBackend(AttentionBackend):
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
-        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
-
         # This is being used by normal decode and draft decode when topk == 1
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
@@ -2861,12 +2857,12 @@ class FlashAttentionBackend(AttentionBackend):
             ),
             "page_table": torch.zeros(
                 max_bs,
-                max_num_pages,
+                self.max_num_pages,
                 dtype=torch.int32,
                 device=self.device,
             ),
             "strided_indices": torch.arange(
-                0, self.max_context_len, self.page_size, device=self.device
+                0, self.max_kv_len, self.page_size, device=self.device
             ),
         }
         # Pre-allocate scheduler_metadata buffer for CUDA graph
@@ -2887,7 +2883,7 @@ class FlashAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             self.decode_cuda_graph_metadata["swa_page_table"] = torch.zeros(
                 max_bs,
-                max_num_pages,
+                self.max_num_pages,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -2917,7 +2913,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    self.max_context_len,
+                    self.max_kv_len,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -2960,7 +2956,7 @@ class FlashAttentionBackend(AttentionBackend):
             # "page_table_draft_decode" will be set only when spec decoding enabled to save memory
             self.decode_cuda_graph_metadata["page_table_draft_decode"] = torch.zeros(
                 max_bs,
-                max_num_pages,
+                self.max_num_pages,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -2981,12 +2977,15 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    max_num_pages,
+                    self.max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
                 "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
+                    0,
+                    self.max_kv_len,
+                    self.page_size,
+                    device=self.device,
                 ),
             }
 
@@ -2995,7 +2994,7 @@ class FlashAttentionBackend(AttentionBackend):
                 is_draft_runner=self.is_draft_runner,
                 skip_prefill=self.skip_prefill,
                 max_bs=max_bs,
-                max_context_len=self.max_context_len,
+                max_kv_len=self.max_kv_len,
                 num_draft_tokens=self.speculative_num_draft_tokens,
                 device=self.device,
                 is_read=self.topk > 1,
@@ -3015,25 +3014,28 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    max_num_pages,
+                    self.max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
                 "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
+                    0,
+                    self.max_kv_len,
+                    self.page_size,
+                    device=self.device,
                 ),
             }
 
             if self.use_sliding_window_kv_pool:
                 self.target_verify_metadata["swa_page_table"] = torch.zeros(
                     max_bs,
-                    max_num_pages,
+                    self.max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 )
                 self.draft_extend_metadata["swa_page_table"] = torch.zeros(
                     max_bs,
-                    max_num_pages,
+                    self.max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -3055,7 +3057,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    self.max_context_len,
+                    self.max_kv_len,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -3108,7 +3110,7 @@ class FlashAttentionBackend(AttentionBackend):
                     # columns (checked by assert_buffer_fits at the merge).
                     "page_table": torch.zeros(
                         max_bs * self.speculative_num_draft_tokens,
-                        self.max_context_len + self.speculative_num_draft_tokens,
+                        self.max_kv_len + self.speculative_num_draft_tokens,
                         dtype=torch.int32,
                         device=self.device,
                     ),
@@ -3119,7 +3121,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.encoder_metadata = {
                 "encoder_page_table": torch.zeros(
                     max_bs,
-                    self.max_context_len,
+                    self.max_kv_len,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -3440,7 +3442,7 @@ class FlashAttentionBackend(AttentionBackend):
         """
         seq_lens = seq_lens[:bs]
         # The sync-free path passes seq_lens_cpu=None; branches that still need a
-        # host max fall back to the static max_context_len, so no D2H is forced here.
+        # host max fall back to the static max_kv_len, so no D2H is forced here.
         seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
         req_pool_indices = req_pool_indices[:bs]
         device = seq_lens.device
@@ -3481,7 +3483,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.max_seq_len_k = (
                         seq_lens_cpu.max().item()
                         if seq_lens_cpu is not None
-                        else self.max_context_len
+                        else self.max_kv_len
                     )
                     max_seq_pages = (
                         metadata.max_seq_len_k + self.page_size - 1
@@ -3559,7 +3561,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.max_seq_len_k = (
                         seq_lens_cpu.max().item()
                         if seq_lens_cpu is not None
-                        else self.max_context_len
+                        else self.max_kv_len
                     )
                     self._set_decode_page_metadata(
                         plan,
@@ -3625,7 +3627,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # Page table built on-device (self-guards on cache_seqlens).
                 # max_seq_len_k stays the static bound; its only replay reader
                 # is the SWA-merge capacity assert, capture-sized to match.
-                metadata.max_seq_len_k = self.max_context_len
+                metadata.max_seq_len_k = self.max_kv_len
                 # metadata.cu_seqlens_q already set in capture
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
@@ -3674,7 +3676,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.max_seq_len_k = (
                 seq_lens_cpu.max().item()
                 if seq_lens_cpu is not None
-                else self.max_context_len
+                else self.max_kv_len
             )
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
