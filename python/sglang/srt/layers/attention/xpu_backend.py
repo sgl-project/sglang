@@ -334,6 +334,8 @@ class XPUAttentionBackend(AttentionBackend):
             and self.page_size not in (1, 64, 128)
         ):
             self.page_size = 1
+        self.max_kv_len = self.req_to_token_pool.row_width
+        self.max_num_pages = (self.max_kv_len + self.page_size - 1) // self.page_size
 
         # Gemma-3 multimodal: per-token image-block id over whole sequences, set by
         # prepare_attn_masks each image EXTEND forward, consumed by forward_extend.
@@ -765,7 +767,7 @@ class XPUAttentionBackend(AttentionBackend):
 
         if self.use_mla:
             workspace_kwargs = dict(
-                max_seq_len=self.req_to_token_pool.row_width,
+                max_seq_len=self.max_kv_len,
                 num_batches=batch_size,
                 num_heads=self.num_local_heads,
                 page_size=self.page_size,
@@ -1769,7 +1771,7 @@ class XPUAttentionBackend(AttentionBackend):
 
     def _get_decode_tier_limits(self) -> tuple[tuple[str, int], ...]:
         return _decode_context_tier_limits(
-            self.req_to_token_pool.row_width,
+            self.max_kv_len,
             self.page_size,
             getattr(self, "_decode_layer_shapes", ((0, -1),)),
         )
@@ -1800,9 +1802,6 @@ class XPUAttentionBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Pre-allocate fixed-size tensors reused across XPU graph captures."""
-        max_num_pages = (
-            self.req_to_token_pool.row_width + self.page_size - 1
-        ) // self.page_size
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "cu_seqlens_q": torch.arange(
@@ -1812,15 +1811,15 @@ class XPUAttentionBackend(AttentionBackend):
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
             "page_table": torch.zeros(
-                max_bs, max_num_pages, dtype=torch.int32, device=self.device
+                max_bs, self.max_num_pages, dtype=torch.int32, device=self.device
             ),
             "strided_indices": torch.arange(
-                0, self.req_to_token_pool.row_width, self.page_size, device=self.device
+                0, self.max_kv_len, self.page_size, device=self.device
             ),
         }
         if self.use_sliding_window_kv_pool:
             self.decode_cuda_graph_metadata["swa_page_table"] = torch.zeros(
-                max_bs, max_num_pages, dtype=torch.int32, device=self.device
+                max_bs, self.max_num_pages, dtype=torch.int32, device=self.device
             )
             self.decode_cuda_graph_metadata["swa_out_cache_loc"] = torch.zeros(
                 max_num_tokens, dtype=torch.int64, device=self.device
@@ -1829,7 +1828,7 @@ class XPUAttentionBackend(AttentionBackend):
             self.encoder_metadata = {
                 "encoder_page_table": torch.zeros(
                     max_bs,
-                    self.req_to_token_pool.row_width,
+                    self.max_kv_len,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -2042,9 +2041,7 @@ class XPUAttentionBackend(AttentionBackend):
             tier_dict = dict(self._get_decode_tier_limits())
             if variant is not None and variant != "long" and variant not in tier_dict:
                 raise ValueError(f"Unknown XPU decode graph variant {variant!r}")
-            metadata.max_seq_len_k = tier_dict.get(
-                variant, self.req_to_token_pool.row_width
-            )
+            metadata.max_seq_len_k = tier_dict.get(variant, self.max_kv_len)
 
         self.forward_metadata = metadata
 
@@ -2114,14 +2111,15 @@ class XPUAttentionBackend(AttentionBackend):
                 "Full prefill graph does not support models with "
                 f"attention_chunk_size ({self.attention_chunk_size})."
             )
-        row_width = self.req_to_token_pool.row_width
         max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
-        effective_context_len = (
-            min(max_seq_len_override, row_width)
-            if max_seq_len_override is not None and max_seq_len_override > 0
-            else row_width
-        )
-        max_num_pages = (effective_context_len + self.page_size - 1) // self.page_size
+        if max_seq_len_override is not None and max_seq_len_override > 0:
+            effective_context_len = min(max_seq_len_override, self.max_kv_len)
+            max_num_pages = (
+                effective_context_len + self.page_size - 1
+            ) // self.page_size
+        else:
+            effective_context_len = self.max_kv_len
+            max_num_pages = self.max_num_pages
         existing_metadata = getattr(self, "full_cg_prefill_metadata", None)
         if (
             in_capture

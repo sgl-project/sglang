@@ -44,7 +44,8 @@ class TestXPUGraphMetadata(CustomTestCase):
         backend.attention_chunk_size = None
         backend.use_sliding_window_kv_pool = True
         backend.page_size = page_size
-        backend.req_to_token_pool = SimpleNamespace(row_width=max_context_len)
+        backend.max_kv_len = max_context_len
+        backend.max_num_pages = -(-max_context_len // page_size)
 
         # Pool setup: 2 requests, stride indices at 0, 16, 32, 48.
         # Req 0 has length 32 (needs 2 pages: pos 0 and 16).
@@ -230,6 +231,7 @@ class TestXPUGraphMetadata(CustomTestCase):
                     req_to_token_pool = SimpleNamespace(
                         size=16,
                         req_to_token=torch.zeros((16, 64), dtype=torch.int32),
+                        row_width=64,
                     )
                     model_config = SimpleNamespace(
                         is_multimodal=False,
@@ -280,7 +282,8 @@ class TestXPUGraphMetadata(CustomTestCase):
         backend.attention_chunk_size = None
         backend.use_sliding_window_kv_pool = False
         backend.page_size = page_size
-        backend.req_to_token_pool = SimpleNamespace(row_width=configured_max_context)
+        backend.max_kv_len = configured_max_context
+        backend.max_num_pages = -(-configured_max_context // page_size)
         backend.full_cg_prefill_metadata = None
         backend.req_to_token = torch.zeros((1, override_max_context), dtype=torch.int32)
 
@@ -382,7 +385,8 @@ class TestXPUGraphMetadata(CustomTestCase):
         backend.attention_chunk_size = None
         backend.use_sliding_window_kv_pool = False
         backend.page_size = page_size
-        backend.req_to_token_pool = SimpleNamespace(row_width=max_context_len)
+        backend.max_kv_len = max_context_len
+        backend.max_num_pages = -(-max_context_len // page_size)
         backend.is_encoder_decoder = False
         backend.device = "cpu"
 
@@ -450,11 +454,11 @@ class TestXPUGraphMetadata(CustomTestCase):
         backend.is_encoder_decoder = False
 
         # 1. Short context (<= 4096): single default tier (None returned -> 1 graph)
-        backend.req_to_token_pool = SimpleNamespace(row_width=4096)
+        backend.max_kv_len = 4096
         self.assertIsNone(backend.get_decode_graph_variants(ForwardMode.DECODE, 1))
 
         # 2. Long context (> 4096): 2-tier short (<= 32 * page_size) and long (fallback)
-        backend.req_to_token_pool = SimpleNamespace(row_width=32768)
+        backend.max_kv_len = 32768
         variants_large = backend.get_decode_graph_variants(ForwardMode.DECODE, 1)
         self.assertIsNotNone(variants_large)
         self.assertEqual(variants_large.capture_labels, ("short", "long"))
@@ -476,7 +480,7 @@ class TestXPUGraphMetadata(CustomTestCase):
         # 5. MLA, encoder-decoder, and fixed num_splits (1 or >1) opt out of tiers.
         backend.use_mla = True
         backend.page_size = 128
-        backend.req_to_token_pool = SimpleNamespace(row_width=32768)
+        backend.max_kv_len = 32768
         self.assertIsNone(backend.get_decode_graph_variants(ForwardMode.DECODE, 1))
 
         backend.use_mla = False
@@ -522,7 +526,7 @@ class TestXPUGraphMetadata(CustomTestCase):
 
         # Gemma 4-style hybrid (SWA d_v=256/win=1023 + Full d_v=512/win=-1):
         # SWA layers already stay <= 1024 (<= 4096) and Full layers have d_v=512 -> opts out!
-        backend.req_to_token_pool = SimpleNamespace(row_width=262144)
+        backend.max_kv_len = 262144
         backend._decode_layer_shapes = _decode_layer_shapes(
             SimpleNamespace(model=DummyHybridModel(full_v_dim=512, swa_window=1023))
         )
@@ -538,7 +542,7 @@ class TestXPUGraphMetadata(CustomTestCase):
         )
 
         # Asymmetric KV (head_dim=192, v_head_dim=128) -> uses v_head_dim (128 < 512) -> enabled
-        backend.req_to_token_pool = SimpleNamespace(row_width=32768)
+        backend.max_kv_len = 32768
         backend._decode_layer_shapes = _decode_layer_shapes(
             SimpleNamespace(model=DummyHybridModel(full_v_dim=128))
         )
@@ -624,7 +628,8 @@ class TestXPUGraphMetadata(CustomTestCase):
         backend.attention_chunk_size = None
         backend.use_sliding_window_kv_pool = False
         backend.page_size = page_size
-        backend.req_to_token_pool = SimpleNamespace(row_width=1024)
+        backend.max_kv_len = 1024
+        backend.max_num_pages = -(-1024 // page_size)
         backend.full_cg_prefill_metadata = None
         backend.req_to_token = torch.zeros((2, 128), dtype=torch.int32)
 
