@@ -1238,6 +1238,117 @@ class TestEagleConfigurator(CustomTestCase):
                 self.assertEqual(padded.copy_sfa_query_heads, 16)
                 self.assertEqual(padded.managed_hbm_bytes, unpadded.managed_hbm_bytes)
 
+    def test_a5_c8_sparse_mtp_prices_packed_rows_compact_scales_and_native_draft(
+        self,
+    ):
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+            C8_ROW_BYTES,
+        )
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        page_size = 128
+        mr = _make_model_runner(
+            self,
+            num_layers=4,
+            use_mla_backend=True,
+            page_size=page_size,
+            max_running_requests=4,
+            disaggregation_mode="decode",
+            disaggregation_decode_extra_slots=3,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            speculative_eagle_topk=1,
+        )
+        _configure_dsa_model(mr)
+        mr.model_config.num_attention_heads = 4
+        mr.model_config.hf_config.indexer_types = [
+            "normal",
+            "shared",
+            "normal",
+            "shared",
+        ]
+        mr.kv_cache_dtype = torch.float8_e4m3fn
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+
+        with (
+            get_context().override_server_args(
+                attention_backend="ascend",
+                disaggregation_mode="decode",
+                disaggregation_transfer_backend="ascend",
+                disaggregation_decode_extra_slots=3,
+                max_running_requests=4,
+                page_size=page_size,
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=2,
+                speculative_num_draft_tokens=3,
+                speculative_eagle_topk=1,
+            ),
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
+            envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(8192),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
+                return_value=True,
+            ),
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
+                return_value=True,
+            ),
+            mock_cpu_env(kv_size=1),
+        ):
+            cfg = DefaultPoolConfigurator(mr)
+
+            # Two compact target Indexer-K owners retain one FP32 scale per
+            # token. The native one-layer draft keeps a packed 656-byte KV row
+            # and its own full 132-byte quantized Indexer-K row.
+            target_indexer_bytes = 2 * (128 + torch.float32.itemsize)
+            draft_bytes = C8_ROW_BYTES + 128 + torch.float32.itemsize
+            self.assertEqual(cfg._cell_size, target_indexer_bytes + draft_bytes)
+            self.assertEqual(
+                cfg._fixed_overhead_bytes,
+                128 * 128 * torch.bfloat16.itemsize
+                + page_size * 2 * torch.float32.itemsize,
+            )
+
+            cfg.calculate_pool_sizes(1 << 30, page_size)
+            plan = mr.sparse_kv_budget_plan
+            self.assertTrue(plan.packed_c8)
+            self.assertEqual(plan.copy_sfa_query_heads, 8)
+            self.assertEqual(plan.request_rows, 8)
+            self.assertEqual(plan.resident_rows, 5)
+            self.assertEqual(
+                plan.resident_buffers["device_k_buffer"].shape,
+                (5, 8192, 1, C8_ROW_BYTES),
+            )
+            self.assertEqual(plan.resident_buffers["device_k_buffer"].dtype, torch.int8)
+            self.assertNotIn("device_v_buffer", plan.resident_buffers)
+            self.assertEqual(plan.device_kv_bytes, 5 * 4 * 8192 * C8_ROW_BYTES)
+
+            index_pages = 3
+            index_k = torch.empty(
+                (index_pages, page_size, 1, 128), dtype=torch.float8_e4m3fn
+            )
+            index_pool = SimpleNamespace(
+                start_layer=0,
+                indexer_layer_ids=(0, 2),
+                get_index_k_buffer=lambda layer_id: index_k,
+            )
+            plan.bind_index_k_pool(index_pool)
+            self.assertEqual(
+                plan.host_kv_spec.shape,
+                (1, index_pages * page_size, 1, C8_ROW_BYTES),
+            )
+            self.assertEqual(plan.host_kv_spec.dtype, torch.int8)
+            self.assertEqual(
+                plan.host_kv_bytes,
+                index_pages * page_size * 4 * C8_ROW_BYTES,
+            )
+
     def test_sparse_mtp_budget_rows_follow_attention_dp_worker_capacity(self):
         """Budget the target manager per attention-DP worker, including PD slots."""
         from sglang.srt.environ import envs

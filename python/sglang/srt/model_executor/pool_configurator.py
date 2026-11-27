@@ -367,6 +367,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             use_mla_backend=kvc.use_mla_backend,
             is_draft_worker=kvc.is_draft_worker,
         )
+        packed_c8_sparse_kv = (
+            self._fused_sparse_kv and kvc.kv_cache_dtype == torch.float8_e4m3fn
+        )
+        if packed_c8_sparse_kv:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                get_sparsity_driven_kv_offload_indexer_layer_count,
+            )
+
+            indexer_layers = get_sparsity_driven_kv_offload_indexer_layer_count(
+                model_config=kvc.model_config,
+                num_layers=num_layers,
+                start_layer=kvc.layer_info.start_layer,
+                is_draft_worker=kvc.is_draft_worker,
+            )
+            scale_bytes_per_token = indexer_layers * torch.float32.itemsize
+            self._cell_size += scale_bytes_per_token
+            # The quantized Indexer-K pool owns one shared Hadamard matrix and
+            # one padded page of per-token FP32 scales outside its logical size.
+            self._fixed_overhead_bytes += (
+                128 * 128 * torch.bfloat16.itemsize
+                + get_schedule().page_size * scale_bytes_per_token
+            )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.

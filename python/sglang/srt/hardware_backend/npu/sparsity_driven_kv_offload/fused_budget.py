@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 # Fixed native LIM ABI dimensions, independent of model geometry.
 MISS_CAPACITY = 32768
 MAX_QUERY_WIDTH = 14
+C8_ROW_BYTES = 656
 
 _SLOT_MAP_DTYPE = torch.int32
 _SLOT_MAP_EXTRA_ROWS = 1
@@ -70,12 +71,14 @@ class BudgetPlan:
         index_head_dim: int,
         prefill_workspace_tokens: int = 0,
         resident_rows: int | None = None,
+        packed_c8: bool = False,
     ) -> None:
         resident_rows = request_rows if resident_rows is None else resident_rows
         if not 1 <= resident_rows <= request_rows:
             raise ValueError("Resident rows must be between 1 and request rows.")
         self.request_rows = request_rows
         self.resident_rows = resident_rows
+        self.packed_c8 = packed_c8
         self.context_len = context_len
         self.num_layers = num_layers
         self.top_k = top_k
@@ -110,6 +113,13 @@ class BudgetPlan:
             ),
             "last_prefix": BufferSpec((resident_rows + 1,), metadata_dtype),
         }
+        if packed_c8:
+            self.resident_buffers["device_k_buffer"] = BufferSpec(
+                (resident_rows, cache_tokens, 1, C8_ROW_BYTES),
+                torch.int8,
+                num_layers,
+            )
+            del self.resident_buffers["device_v_buffer"]
         if resident_rows < request_rows:
             self.resident_buffers["request_to_resident"] = BufferSpec(
                 (request_rows,), metadata_dtype
@@ -161,6 +171,7 @@ class BudgetPlan:
         self.device_kv_bytes = sum(
             self.resident_buffers[n].nbytes
             for n in ("device_k_buffer", "device_v_buffer")
+            if n in self.resident_buffers
         )
         self.slot_map_bytes = self.resident_buffers["device_slot_map"].nbytes
         self.prefill_workspace_bytes = sum(
@@ -198,9 +209,11 @@ class BudgetPlan:
             context_len=self.context_len,
             resident_kv_bytes_per_token=(
                 self.num_layers
-                * self.kv_head_num
-                * self.kv_cache_dim
-                * self.kv_dtype.itemsize
+                * (
+                    C8_ROW_BYTES
+                    if self.packed_c8
+                    else self.kv_head_num * self.kv_cache_dim * self.kv_dtype.itemsize
+                )
             ),
             index_k_and_draft_bytes_per_token=index_k_and_draft_bytes_per_token,
             slot_map_bytes_per_request=_slot_map_row_bytes(
@@ -236,7 +249,7 @@ class BudgetPlan:
             raise ValueError("Native LIM requires at least one indexer K layer.")
         key = index_k_pool.get_index_k_buffer(indexer_layer_ids[0])
         if (
-            key.dtype != torch.bfloat16
+            key.dtype != (torch.float8_e4m3fn if self.packed_c8 else torch.bfloat16)
             or key.ndim != 4
             or tuple(key.shape[1:])
             != (self.page_size, self.kv_head_num, self.index_head_dim)
@@ -247,11 +260,18 @@ class BudgetPlan:
         # The page count already includes the Indexer K allocator's dummy page.
         host_token_capacity = key.shape[0] * self.page_size
         self.host_token_capacity = host_token_capacity
-        self.host_kv_spec = BufferSpec(
-            (self.host_token_capacity, self.kv_head_num, self.kv_cache_dim),
-            self.kv_dtype,
-            self.num_layers,
-        )
+        if self.packed_c8:
+            self.host_kv_spec = BufferSpec(
+                (1, self.host_token_capacity, 1, C8_ROW_BYTES),
+                torch.int8,
+                self.num_layers,
+            )
+        else:
+            self.host_kv_spec = BufferSpec(
+                (self.host_token_capacity, self.kv_head_num, self.kv_cache_dim),
+                self.kv_dtype,
+                self.num_layers,
+            )
         return self
 
 
@@ -276,11 +296,23 @@ def resolve_sparse_kv_budget(
     kv_lora_rank = model_config.kv_lora_rank
     qk_rope_head_dim = model_config.qk_rope_head_dim
     index_head_dim = model_config.index_head_dim
+    packed_c8 = kv_dtype == torch.float8_e4m3fn
     if context_len > 2**21:
         raise ValueError("Native LIM requires context length <= 2**21.")
     if not (1 <= copy_sfa_query_heads <= 64 or copy_sfa_query_heads == 128):
         raise ValueError("Invalid native LIM query geometry.")
-    if (
+    if packed_c8:
+        if (
+            kv_head_num != 1
+            or (kv_lora_rank, qk_rope_head_dim, index_head_dim, page_size, top_k)
+            != (512, 64, 128, 128, 2048)
+            or kv_bytes_per_token != C8_ROW_BYTES
+            or context_len > 262144
+            or copy_sfa_query_heads not in (8, 16, 32, 64, 128)
+        ):
+            raise ValueError("Invalid A5 packed C8 geometry.")
+        prefill_workspace_tokens = 0
+    elif (
         kv_dtype != torch.bfloat16
         or kv_bytes_per_token
         != kv_head_num * (kv_lora_rank + qk_rope_head_dim) * kv_dtype.itemsize
@@ -311,6 +343,7 @@ def resolve_sparse_kv_budget(
         qk_rope_head_dim=qk_rope_head_dim,
         index_head_dim=index_head_dim,
         prefill_workspace_tokens=prefill_workspace_tokens,
+        packed_c8=packed_c8,
     )
 
 

@@ -14,6 +14,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+    C8_ROW_BYTES,
     BudgetPlan,
     fit_sparse_running_requests,
     get_sparse_kv_cache_tokens,
@@ -204,6 +205,23 @@ def get_sparsity_driven_kv_offload_cell_size(
     index_head_dim = get_sparsity_driven_kv_offload_index_head_dim(
         model_config=model_config
     )
+    num_indexer_layers = get_sparsity_driven_kv_offload_indexer_layer_count(
+        model_config=model_config,
+        num_layers=num_layers,
+        start_layer=start_layer,
+        is_draft_worker=is_draft_worker,
+    )
+    return index_head_dim * num_indexer_layers * element_size
+
+
+def get_sparsity_driven_kv_offload_indexer_layer_count(
+    *,
+    model_config: ModelConfig,
+    num_layers: int,
+    start_layer: int = 0,
+    is_draft_worker: bool = False,
+) -> int:
+    """Return the physical Indexer-K owner count for sparse pool sizing."""
     from sglang.srt.mem_cache.kv_cache_configurator import (
         _should_elide_dsa_index_k,
     )
@@ -215,7 +233,7 @@ def get_sparsity_driven_kv_offload_cell_size(
         )
     else:
         num_indexer_layers = num_layers
-    return index_head_dim * num_indexer_layers * element_size
+    return num_indexer_layers
 
 
 def build_sparse_kv_budget_options(
@@ -233,9 +251,13 @@ def build_sparse_kv_budget_options(
         top_k=get_sparsity_driven_kv_offload_sparse_context_len(
             model_config=model_config
         ),
-        kv_bytes_per_token=model_config.get_total_num_kv_heads(compressed_mla=True)
-        * (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-        * torch._utils._element_size(kv_dtype),
+        kv_bytes_per_token=(
+            C8_ROW_BYTES
+            if kv_dtype == torch.float8_e4m3fn
+            else model_config.get_total_num_kv_heads(compressed_mla=True)
+            * (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+            * torch._utils._element_size(kv_dtype)
+        ),
         num_layers=num_layers,
         kv_dtype=kv_dtype,
     )
@@ -287,6 +309,8 @@ def get_sparse_kv_budget(
     query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
     # Native SFA accepts 1..64 or 128 query heads per KV head.
     copy_sfa_query_heads = 128 if 64 < query_heads < 128 else query_heads
+    if kv_dtype == torch.float8_e4m3fn:
+        copy_sfa_query_heads = max(8, 1 << (query_heads - 1).bit_length())
     return resolve_sparse_kv_budget(
         model_config=model_config,
         page_size=page_size,
