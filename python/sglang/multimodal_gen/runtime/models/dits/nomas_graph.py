@@ -38,8 +38,8 @@ class _SegmentPrediction(nn.Module):
         encoder_hidden_states,
         text_mask,
         rope,
-        camera_embedding=None,
-        camera_has_mask=None,
+        camera_embedding,
+        camera_has_mask,
     ):
         context = NomasSegmentContext(
             self.attend, rope, tuple(hidden_states.shape[2:]), 0, 0
@@ -67,11 +67,9 @@ class NomasGraphRunner(BaseBreakableCudaGraphRunner):
             encoder_hidden_states=condition.text_states,
             text_mask=condition.text_mask,
             rope=context.rope,
+            camera_embedding=condition.camera_embedding,
+            camera_has_mask=condition.camera_has_mask,
         )
-        if condition.camera_embedding is not None:
-            inputs["camera_embedding"] = condition.camera_embedding
-        if condition.camera_has_mask is not None:
-            inputs["camera_has_mask"] = condition.camera_has_mask
         token = self.transformer.attention.set(context.attention)
         try:
             if warmup:

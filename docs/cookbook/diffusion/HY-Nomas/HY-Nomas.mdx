@@ -67,7 +67,7 @@ sglang serve --model-path tencent/Hy-Nomas --num-gpus 1 \
   --warmup-steps 8 --warmup-sampling-params '{"segments":[{"frames":61,"caption":"A fox in a forest."}],"prompt_format":"plain","guidance_scale":1.0}'
 ```
 
-Use the same event geometry in the request. The graph reuses the padded text shape and reads the current event’s attention mask on each replay. Realtime sessions, camera-conditioned and multi-event requests, and shapes omitted from warmup run eagerly. Use the unquantized DiT and keep Cache-DiT, LoRA and compilation disabled for this configuration.
+Use the same event geometry in the request. The graph reuses the padded text shape and reads the current event’s attention mask on each replay. For camera-conditioned events, include the normalized pose matrices in the warmup’s `norm_extrinsics` field. Later requests with the same geometry can change the poses and caption. Switching between camera and camera-free inputs uses eager execution when the corresponding graph was not captured. Realtime sessions, multi-event requests and shapes omitted from warmup also run eagerly. Use the unquantized DiT and keep Cache-DiT, LoRA and compilation disabled for this configuration.
 
 ### Weights
 

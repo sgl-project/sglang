@@ -979,6 +979,7 @@ def test_pixelumm_mrope_fusion_matches_compiled_reference_and_fallback(monkeypat
 
 
 def test_scheduler_loader_uses_effective_shift(tmp_path):
+
     from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
         SchedulerLoader,
     )
@@ -1279,6 +1280,7 @@ def _fp8_linear(in_features, out_features, device=None):
 @pytest.mark.parametrize("tokens", [1, 127, 128, 129, 257])
 @torch.inference_mode()
 def test_pixelumm_fp8_linear_quantized_reference(tokens):
+
     torch.manual_seed(17)
     layer = _fp8_linear(256, 256, device="cuda").eval()
     weight = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16) / 16
