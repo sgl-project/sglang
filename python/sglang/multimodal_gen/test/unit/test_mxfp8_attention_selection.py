@@ -2,6 +2,7 @@
 """CPU tests for opt-in Ascend MXFP8 attention backend selection."""
 
 import os
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -41,6 +42,23 @@ class TestMXFP8AttentionSelection(unittest.TestCase):
             npu_dynamic_mx_quant=object(), npu_fused_infer_attention_score_v2=object()
         )
         self.enterContext(patch.object(torch.ops, "npu", self.ops))
+        self.quant = SimpleNamespace(dynamic_mx_quant=object())
+        self.fia = SimpleNamespace(fused_infer_attention_score_v2=object())
+        self.enterContext(
+            patch.dict(
+                sys.modules,
+                {
+                    "sgl_kernel_npu.operators.quant": self.quant,
+                    "sgl_kernel_npu.operators.attention": self.fia,
+                },
+            )
+        )
+        self.capability = self.enterContext(
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_npu_op_supported",
+                return_value=True,
+            )
+        )
         self.server_args = SimpleNamespace(attention_backend=None)
         self.enterContext(
             patch.object(
@@ -91,6 +109,15 @@ class TestMXFP8AttentionSelection(unittest.TestCase):
     def test_missing_operator_keeps_platform_default(self):
         del self.ops.npu_fused_infer_attention_score_v2
         self.assertIs(self._resolve(), AttentionBackendEnum.TORCH_SDPA)
+
+    def test_missing_registration_keeps_platform_default(self):
+        for missing in (
+            self.quant.dynamic_mx_quant,
+            self.fia.fused_infer_attention_score_v2,
+        ):
+            with self.subTest(missing=missing):
+                self.capability.side_effect = lambda op: op is not missing
+                self.assertIs(self._resolve(), AttentionBackendEnum.TORCH_SDPA)
 
     def test_unsupported_device_keeps_platform_default(self):
         with patch(

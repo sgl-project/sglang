@@ -7,13 +7,14 @@ hardware integration tests when an NPU job is available.
 
 import sys
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.moe.mega_moe import prepare_mega_moe_arch22_weights
 from sglang.srt.hardware_backend.npu.moe.routing import (
     MXFP8_QUANT_MODE,
     RoutedTokens,
@@ -39,6 +40,107 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+@contextmanager
+def _mock_operator_modules(modules):
+    # Restore only the operator keys; torch may lazily load modules in this scope.
+    missing = object()
+    original = {name: sys.modules.get(name, missing) for name in modules}
+    sys.modules.update(modules)
+    try:
+        yield
+    finally:
+        for name, module in original.items():
+            if module is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+class TestMegaMoeArch22Weights(CustomTestCase):
+    def test_per_expert_nz_and_refresh_preserve_canonical_storage(self):
+        for packed_int4 in (False, True):
+            with self.subTest(packed_int4=packed_int4):
+                layer = SimpleNamespace(
+                    dispatcher=SimpleNamespace(
+                        moe_ascend_ops_config=SimpleNamespace(uses_fused_op=True)
+                    )
+                )
+                # Transpose to ensure the adapter makes each expert contiguous.
+                weight = (
+                    torch.arange(48, dtype=torch.uint8).reshape(2, 8, 3).transpose(1, 2)
+                )
+                data_move = SimpleNamespace(
+                    format_cast=lambda expert, fmt: expert.clone()
+                )
+                with (
+                    patch(
+                        "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                        return_value=False,
+                    ),
+                    _mock_operator_modules(
+                        {"sgl_kernel_npu.operators.data_move": data_move}
+                    ),
+                    patch.object(
+                        data_move, "format_cast", wraps=data_move.format_cast
+                    ) as cast,
+                ):
+                    self.assertTrue(
+                        prepare_mega_moe_arch22_weights(
+                            layer, "w13", weight, packed_int4=packed_int4
+                        )
+                    )
+                    original = layer._mega_moe_w13_weights
+                    pointers = [expert.data_ptr() for expert in original]
+                    self.assertEqual(cast.call_count, 2)
+                    for call, expected, actual in zip(
+                        cast.call_args_list, weight, original, strict=True
+                    ):
+                        self.assertEqual(call.args[1], 29)
+                        self.assertTrue(call.args[0].is_contiguous())
+                        expected = expected.contiguous()
+                        if packed_int4:
+                            expected = expected.view(torch.int32)
+                        torch.testing.assert_close(actual, expected)
+                    self.assertTrue(
+                        prepare_mega_moe_arch22_weights(
+                            layer, "w13", weight + 1, packed_int4=packed_int4
+                        )
+                    )
+                    self.assertIs(layer._mega_moe_w13_weights, original)
+                    self.assertEqual(
+                        [expert.data_ptr() for expert in original], pointers
+                    )
+                    for actual, expected in zip(original, weight + 1, strict=True):
+                        expected = expected.contiguous()
+                        if packed_int4:
+                            expected = expected.view(torch.int32)
+                        torch.testing.assert_close(actual, expected)
+
+    def test_inactive_and_arch35_paths_skip_format_conversion(self):
+        weight = torch.ones(2, 4, 8, dtype=torch.uint8)
+        data_move = SimpleNamespace(format_cast=lambda *args: None)
+        with (
+            _mock_operator_modules({"sgl_kernel_npu.operators.data_move": data_move}),
+            patch.object(data_move, "format_cast", wraps=data_move.format_cast) as cast,
+        ):
+            self.assertFalse(
+                prepare_mega_moe_arch22_weights(SimpleNamespace(), "w13", weight)
+            )
+            layer = SimpleNamespace(
+                dispatcher=SimpleNamespace(
+                    moe_ascend_ops_config=SimpleNamespace(uses_fused_op=False)
+                )
+            )
+            self.assertFalse(prepare_mega_moe_arch22_weights(layer, "w13", weight))
+            layer.dispatcher.moe_ascend_ops_config.uses_fused_op = True
+            with patch(
+                "sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=True
+            ):
+                self.assertFalse(prepare_mega_moe_arch22_weights(layer, "w13", weight))
+            cast.assert_not_called()
+            self.assertFalse(hasattr(layer, "_mega_moe_w13_weights"))
 
 
 class TestAscendOpsConfig(CustomTestCase):
@@ -213,12 +315,14 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
             patch(f"{module}.dist.get_world_size", return_value=1),
             patch(f"{module}.dist.get_rank", return_value=0),
             patch(f"{module}.dist.all_gather_into_tensor", side_effect=gather),
-            patch(
-                f"{module}.torch_npu",
-                SimpleNamespace(
-                    npu_dynamic_mx_quant=lambda *args, **kwargs: (payload, scales)
-                ),
-                create=True,
+            _mock_operator_modules(
+                {
+                    "sgl_kernel_npu.operators": SimpleNamespace(
+                        quant=SimpleNamespace(
+                            dynamic_mx_quant=lambda *args, **kwargs: (payload, scales)
+                        )
+                    )
+                },
             ),
         ):
             result = dispatcher._dispatch_allgather(

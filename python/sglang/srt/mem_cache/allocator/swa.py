@@ -20,8 +20,6 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 if _is_npu:
-    import torch_npu
-
     from sglang.srt.hardware_backend.npu.allocator_npu import (
         NPUPagedTokenToKVPoolAllocator,
     )
@@ -456,6 +454,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: Optional[torch.Tensor],  # last_loc for full layers
         req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
+        from sgl_kernel_npu.operators.mem_cache import scatter_nd_update_
+
         assert self.page_size > 1
         if req_to_token_write is not None:
             return self.full_attn_allocator.alloc_decode(
@@ -485,7 +485,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if _is_npu:
             indices_2d = alloc_full_indices.to(torch.int64).unsqueeze(-1)
-            torch_npu.npu_scatter_nd_update_(
+            scatter_nd_update_(
                 self.full_to_swa_index_mapping,
                 indices_2d,
                 alloc_swa_indices.to(torch.int64),

@@ -36,11 +36,13 @@ def test_srt_gemma_residual_reuses_precomputed_weight(
     output, residual_sum = torch.empty_like(x), torch.empty_like(x)
     fused_op = MagicMock(return_value=(output, None, residual_sum))
 
-    with patch.object(
-        layernorm_module,
-        "torch_npu",
-        SimpleNamespace(npu_add_rms_norm=fused_op),
-        create=True,
+    with patch.dict(
+        sys.modules,
+        {
+            "sgl_kernel_npu.operators": SimpleNamespace(
+                norm=SimpleNamespace(add_rms_norm=fused_op)
+            )
+        },
     ):
         result = layer.forward_npu(x, residual, post_residual)
 

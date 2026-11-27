@@ -280,8 +280,18 @@ def test_non_speculative_decode_keeps_default_operators(backend, graph, use_fia)
         patch.object(mod, "is_mla_preprocess_enabled", return_value=False),
         patch.object(mod, "is_fia_nz", return_value=False),
         patch.object(mod, "torch_npu", npu_ops),
-        patch.object(
-            torch.ops.npu, "npu_fused_infer_attention_score", eager_fia, create=True
+        patch.dict(
+            sys.modules,
+            {
+                "sgl_kernel_npu.operators.attention": SimpleNamespace(
+                    fused_infer_attention_score=eager_fia,
+                    fused_infer_attention_score_v2=Mock(),
+                    fused_infer_attention_score_get_max_workspace=Mock(return_value=0),
+                    fused_infer_attention_score_out=graph_fia,
+                    paged_attention=Mock(),
+                    paged_attention_mla=paged_mla,
+                )
+            },
         ),
     ):
         output = backend.forward_decode(
@@ -552,11 +562,13 @@ def test_merged_cache_preserves_split_views_and_page_boundary_writes(
     def scatter(destination, indices, updates):
         destination.index_copy_(0, indices.flatten().long(), updates)
 
-    with patch.object(
-        pool_mod,
-        "torch_npu",
-        SimpleNamespace(npu_scatter_nd_update_=scatter),
-        create=True,
+    with patch.dict(
+        sys.modules,
+        {
+            "sgl_kernel_npu.operators.mem_cache": SimpleNamespace(
+                scatter_nd_update_=scatter
+            )
+        },
     ):
         pool.set_kv_buffer(SimpleNamespace(layer_id=0), locations, key, rope)
     combined = pool.get_combined_kv_buffer(0).view(-1, 1, 576)

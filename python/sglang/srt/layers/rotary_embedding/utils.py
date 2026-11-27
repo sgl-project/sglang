@@ -43,8 +43,6 @@ def apply_rotary_pos_emb_cpu(
 
 
 if _is_npu:
-    import torch_npu
-
     NPU_ROTARY_MUL_MAX_NUM_HEADS = 1000
     NPU_ROTARY_MUL_MAX_HEAD_SIZE = 896
 
@@ -160,8 +158,11 @@ def apply_rotary_pos_emb_npu(
     sin = sin.unsqueeze(unsqueeze_dim).unsqueeze(0)
     q = q.unsqueeze(0)
     k = k.unsqueeze(0)
-    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
-    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
+    from sgl_kernel_npu.operators import rope as npu_rope_ops
+
+    q_embed = npu_rope_ops.rotary_mul(q, cos, sin)
+
+    k_embed = npu_rope_ops.rotary_mul(k, cos, sin)
     q_embed = q_embed.squeeze(0)
     k_embed = k_embed.squeeze(0)
     return q_embed, k_embed

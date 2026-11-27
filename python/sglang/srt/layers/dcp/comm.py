@@ -138,7 +138,7 @@ def cp_lse_ag_out_rs_mla_npu(
     if cp_group.world_size == 1:
         return cp_attn_out
 
-    import torch_npu
+    from sgl_kernel_npu.operators.attention import attention_update
 
     batch_size, total_heads, head_dim = cp_attn_out.shape
     world_size = cp_group.world_size
@@ -158,9 +158,7 @@ def cp_lse_ag_out_rs_mla_npu(
         .view(world_size, batch_size * local_heads, head_dim + 1)
     )
     out_flat, lse_flat = torch.split(gathered, [head_dim, 1], dim=-1)
-    merged, _ = torch_npu.npu_attention_update(
-        lse_flat.squeeze(-1).unbind(0), out_flat.unbind(0), 0
-    )
+    merged, _ = attention_update(lse_flat.squeeze(-1).unbind(0), out_flat.unbind(0), 0)
     return merged.view(batch_size, local_heads, head_dim).to(cp_attn_out.dtype)
 
 

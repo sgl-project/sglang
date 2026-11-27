@@ -12,7 +12,9 @@ import torch
 
 
 def _quantize_input(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.npu.npu_dynamic_block_quant(
+    from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+    return npu_quant_ops.dynamic_block_quant(
         x, dst_type=torch.float8_e4m3fn, row_block_size=1, col_block_size=128
     )
 
@@ -28,7 +30,9 @@ def npu_w8a8_block_fp8_linear(
     output_shape = (*input.shape[:-1], weight.shape[0])
     x = input.reshape(-1, input.shape[-1]).contiguous()
     qx, x_scale = _quantize_input(x)
-    output = torch.ops.npu.npu_quant_matmul(
+    from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+    output = npu_matmul_ops.quant_matmul(
         qx,
         weight.t(),
         scale=weight_scale.t(),

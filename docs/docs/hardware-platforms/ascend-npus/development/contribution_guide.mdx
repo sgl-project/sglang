@@ -207,6 +207,30 @@ Since SGLang and sgl-kernel-npu are separate Python packages, dependency updates
    - Update the `SGLANG_KERNEL_NPU_TAG` argument in [`docker/npu.Dockerfile`](https://github.com/sgl-project/sglang/blob/main/docker/npu.Dockerfile) to the new sgl-kernel-npu release tag.
    - Use the new operator in SGLang code.
 
+### Building the unified operator wheel
+
+SGLang requires a kernel wheel containing [sgl-kernel-npu #1091](https://github.com/sgl-project/sgl-kernel-npu/pull/1091) for text MRoPE on Ascend 950. On A5, low-head MLA decode uses FIA. The ATB `paged_attention_mla` operator is registered only on arch22.
+
+Until a release contains the merge, build a wheel from commit `60c6762119af841895ec6197af5adff3aa465b37` or a descendant. Run the following in a clean sgl-kernel-npu checkout on Linux with matching CANN, Torch and torch_npu versions. Use `2201` for A3 or `3510` for A5. See the [build guide](https://github.com/sgl-project/sgl-kernel-npu/blob/60c6762119af841895ec6197af5adff3aa465b37/python/sgl_kernel_npu/README.md#refactor-builds) for prerequisites.
+
+```bash
+git checkout --detach 60c6762119af841895ec6197af5adff3aa465b37
+git submodule update --init --recursive
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+python3 setup.py --arch-version 3510 --artifact wheel
+python3 -m pip install --force-reinstall --no-deps ./output/sgl_kernel_npu-*.whl
+```
+
+PR CI installs the per-device release selected by `SGLANG_KERNEL_NPU_TAG`. To validate a source-built A5 wheel, install it in a test image and dispatch `nightly-test-npu.yml` with the SGLang `ref`, `image_a5`, and `job_filter=nightly-acc-test-4-npu-a5`. The nightly job uses the kernel installed in that image.
+
+To run the two accuracy tests directly on A5, start a new Python process from the SGLang checkout. The MLA test covers 1–8 query heads per KV head for BF16 and ModelSlim FP8. The MRoPE test compares two text model configurations with native RoPE.
+
+```bash
+python3 -m pytest -v \
+  test/registered/npu/accuracy/test_npu_mla_fia_low_heads.py \
+  test/registered/rotary/test_mrope_text_npu_a5.py
+```
+
 ## Tips for newcomers
 
 If you want to contribute but don’t have a specific idea in mind, pick issues labeled ["good first issue" or "help wanted"](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22). These tasks typically have lower complexity and provide an excellent introduction to the codebase.

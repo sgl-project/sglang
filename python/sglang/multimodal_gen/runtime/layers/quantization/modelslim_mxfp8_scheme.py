@@ -100,12 +100,16 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         x_2d = x.reshape(-1, x.shape[-1])
 
         # Dynamic MXFP8 activation quantisation
-        qx, input_scale = torch_npu.npu_dynamic_mx_quant(
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        qx, input_scale = npu_quant_ops.dynamic_mx_quant(
             x_2d, dst_type=torch_npu.float8_e4m3fn
         )
 
         # MXFP8 matmul
-        output = torch_npu.npu_quant_matmul(
+        from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+        output = npu_matmul_ops.quant_matmul(
             qx,
             layer.weight.transpose(0, 1),
             layer.weight_scale.transpose(0, 1),

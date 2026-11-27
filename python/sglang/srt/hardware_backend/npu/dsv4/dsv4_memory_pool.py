@@ -20,11 +20,7 @@ from __future__ import annotations
 from typing import List, Optional, Tuple
 
 import torch
-import torch_npu
-from sgl_kernel_npu.operators.mem_cache import (
-    kv_compress_epilog,
-    kv_compress_epilog_v2,
-)
+from sgl_kernel_npu.operators.mem_cache import kv_compress_epilog, kv_compress_epilog_v2
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
@@ -364,17 +360,19 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         index_k: torch.Tensor,
         index_k_scale: Optional[torch.Tensor],
     ) -> None:
+        from sgl_kernel_npu.operators.mem_cache import scatter_nd_update_
+
         d = self.index_head_dim
         loc_long = loc.view(-1, 1).long()
         index_k_cache = self.index_k_buffer[layer_id]
-        torch_npu.npu_scatter_nd_update_(
+        scatter_nd_update_(
             index_k_cache.view(-1, 1, d),
             loc_long,
             index_k.to(index_k_cache.dtype).view(-1, 1, d),
         )
         if index_k_scale is not None:
             index_scale_cache = self.index_scale_buffer[layer_id]
-            torch_npu.npu_scatter_nd_update_(
+            scatter_nd_update_(
                 index_scale_cache.view(-1, 1, 1),
                 loc_long,
                 index_k_scale.to(index_scale_cache.dtype).view(-1, 1, 1),
@@ -999,7 +997,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        kv_out = torch_npu.npu_rms_norm(kv, kv_weight, eps)[0]
+        from sgl_kernel_npu.operators.norm import rms_norm
+
+        kv_out = rms_norm(kv, kv_weight, eps)[0]
 
         rope_dim = freqs_cis.shape[-1] * 2
 

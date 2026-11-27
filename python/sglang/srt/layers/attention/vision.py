@@ -74,14 +74,10 @@ if _is_cpu and _is_cpu_amx_available:
 if _is_musa:
     from flash_attn_interface import flash_attn_varlen_func
 
-if _is_npu:
-    import torch_npu
 if _is_xpu:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-from sglang.kernels.ops.attention.prefill_attention import (
-    context_attention_fwd,
-)
+from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
@@ -983,7 +979,9 @@ class VisionAscendAttention(nn.Module):
                 k = k[valid_indices]
                 v = v[valid_indices]
 
-        attn_output = torch_npu.npu_fused_infer_attention_score(
+        from sgl_kernel_npu.operators.attention import fused_infer_attention_score
+
+        attn_output = fused_infer_attention_score(
             query=q,
             key=k,
             value=v,

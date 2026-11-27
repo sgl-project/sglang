@@ -709,7 +709,9 @@ class CompressorAscendBackendMixin:
         # produced inside indexer_quant_cache rather than here.
         fused_fp8_indexer_write = li_kv_dtype == "float8" and compressor.is_in_indexer
         if li_kv_dtype == "int8" and compressor.is_in_indexer:
-            kv, kv_scale = torch_npu.npu_dynamic_quant(kv)
+            from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+            kv, kv_scale = npu_quant_ops.dynamic_quant(kv)
             kv_scale = kv_scale.to(torch.float16)
 
         if override_loc is not None:
@@ -1202,13 +1204,17 @@ class C4IndexerAscendBackendMixin:
         if k.dtype == torch.float8_e4m3fn:
             # Ascend 950: block-quantize Q to FP8 so it matches the FP8 K buffer; scales
             # stay fp32 and the kernel wants one scale per (token, head).
-            q_quant, q_scale = torch_npu.npu_dynamic_block_quant(
+            from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+            q_quant, q_scale = npu_quant_ops.dynamic_block_quant(
                 q.view(-1, q.shape[-1]), dst_type=k.dtype
             )
             q_quant = q_quant.view(-1, c4_indexer.n_heads, c4_indexer.head_dim)
             q_scale = q_scale.view(-1, c4_indexer.n_heads)
         else:
-            q_quant, q_scale = torch_npu.npu_dynamic_quant(q)
+            from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+            q_quant, q_scale = npu_quant_ops.dynamic_quant(q)
             q_scale = q_scale.to(torch.float16)
 
         fm = self.forward_metadata
@@ -1375,7 +1381,9 @@ class LowRatioCompressAscendBackendMixin:
                 state_block_table=fm.dsv4_cycle_state_block_table,
             )
         out_dim = kv.shape[-1]
-        kv = torch_npu.npu_rms_norm(kv, compressor.norm.weight, compressor.norm.eps)[0]
+        from sgl_kernel_npu.operators import norm as npu_norm_ops
+
+        kv = npu_norm_ops.rms_norm(kv, compressor.norm.weight, compressor.norm.eps)[0]
         latent = kv.clone()
 
         from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
@@ -1504,9 +1512,11 @@ class LowRatioCompressAscendBackendMixin:
         # Keep the NZ cast inside the traced region: hoisting it into a cached
         # attribute makes aclgraph clone an NZ graph input back to ND.
         # Both storage modes share every argument but the destination.
+        from sgl_kernel_npu.operators import data_move as npu_data_move_ops
+
         common = dict(
             latent=latent.reshape(-1, latent.shape[-1]),
-            wk=torch_npu.npu_format_cast(
+            wk=npu_data_move_ops.format_cast(
                 indexer.wk.weight, torch_npu.Format.FRACTAL_NZ
             ),
             norm_weight=indexer.k_norm.weight.to(torch.float32),
@@ -1567,7 +1577,9 @@ class LowRatioCompressAscendBackendMixin:
         )
         if not is_npu_arch35():
             return q, None, indexer.head_weights(x).view(-1, indexer.n_heads).float()
-        q_packed, q_scale = torch_npu.npu_dynamic_mx_quant(
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        q_packed, q_scale = npu_quant_ops.dynamic_mx_quant(
             q, dst_type=torch_npu.float4_e2m1fn_x2
         )
         q_packed = q_packed.view(torch.uint8).view(t, indexer.n_heads, packed_dim)

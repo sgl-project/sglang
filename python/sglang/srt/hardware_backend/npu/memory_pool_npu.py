@@ -349,6 +349,12 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
+        from sgl_kernel_npu.operators.mem_cache import (
+            reshape_and_cache,
+            scatter_nd_update_,
+            scatter_pa_kv_cache,
+        )
+
         loc, _, _ = unwrap_write_loc(loc_info)
         if layer_id_override is not None:
             layer_id = layer_id_override
@@ -371,9 +377,12 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         # Both FIA and paged-attention buffers share the same physical layout.
         # Opt in at pool initialization, keeping environment reads outside graph
         # capture. Otherwise retain the original writers and their memory usage.
+        from sglang.srt.hardware_backend.npu.utils import is_npu_op_supported
+
         use_scatter_pa = (
             self.use_scatter_pa_kv_cache
-            and hasattr(torch_npu, "npu_scatter_pa_kv_cache")
+            and callable(getattr(torch_npu, "npu_scatter_pa_kv_cache", None))
+            and is_npu_op_supported(scatter_pa_kv_cache)
             and self.store_dtype in (torch.float16, torch.bfloat16, torch.int8)
         )
         if self.use_fia or use_scatter_pa or self.is_modelslim_mxfp8:
@@ -395,7 +404,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 )
 
             if use_scatter_pa:
-                torch_npu.npu_scatter_pa_kv_cache(
+                scatter_pa_kv_cache(
                     cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
                     cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
                     k_buffer_layer.view(
@@ -414,18 +423,18 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 # 3-D view; the underlying KV storage and attention layout stay
                 # unchanged.
                 loc_indices = loc.contiguous().view(-1, 1)
-                torch_npu.npu_scatter_nd_update_(
+                scatter_nd_update_(
                     k_buffer_layer.view(-1, self.head_num, self.head_dim),
                     loc_indices,
                     cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
                 )
-                torch_npu.npu_scatter_nd_update_(
+                scatter_nd_update_(
                     v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
                     loc_indices,
                     cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
                 )
                 if self.is_modelslim_mxfp8:
-                    torch_npu.npu_scatter_nd_update_(
+                    scatter_nd_update_(
                         self.k_scale_buffer[layer_id - self.start_layer].view(
                             -1, self.head_num, self.head_dim // 32
                         ),
@@ -436,7 +445,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     )
         else:
             loc = loc.to(torch.int32)
-            torch_npu._npu_reshape_and_cache(
+            reshape_and_cache(
                 key=cache_k,
                 value=cache_v,
                 key_cache=self.k_buffer[layer_id - self.start_layer].view(
@@ -650,6 +659,8 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
         loc_info,
         cache_k: torch.Tensor,
     ) -> None:
+        from sgl_kernel_npu.operators.mem_cache import scatter_nd_update_
+
         loc, _, _ = unwrap_write_loc(loc_info)
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
@@ -660,7 +671,7 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
             -1, self.head_num, self.head_dim
         )
         loc = loc.to(device=cache_k.device, dtype=torch.int32).contiguous()
-        torch_npu.npu_scatter_nd_update_(
+        scatter_nd_update_(
             k_buffer_layer,
             loc.view(-1, 1),
             cache_k.contiguous().view(-1, self.head_num, self.head_dim),
@@ -1297,10 +1308,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
+        from sgl_kernel_npu.operators.mem_cache import scatter_nd_update_
+
         assert scale.dtype == self.index_k_scale_dtype, (
             f"input scale has to be {scale.dtype=} but it is {self.index_k_scale_dtype=}"
         )
-        torch_npu.npu_scatter_nd_update_(
+        scatter_nd_update_(
             self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
             loc.view(-1, 1),
             scale.view(-1, 1),
@@ -1370,8 +1383,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
     def _pack_dsa_quant_kv_cache(self, cache_k, cache_v):
+        from sgl_kernel_npu.operators.quant import dynamic_quant
+
         latent = cache_k.reshape(-1, self.kv_lora_rank)
-        quantized, scale = torch_npu.npu_dynamic_quant(
+        quantized, scale = dynamic_quant(
             latent.reshape(-1, self.quant_block_size), dst_type=self.dtype
         )
         rows = latent.shape[0]
@@ -1413,13 +1428,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         cache_v: Optional[torch.Tensor],
     ):
         """Write a layer's KV on the separated/combined/NZ ascend layouts."""
+        from sgl_kernel_npu.operators.mem_cache import scatter_nd_update_
+
         if self.dsa_kv_cache_store_c8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
             packed = self._pack_dsa_quant_kv_cache(cache_k, cache_v)
-            torch_npu.npu_scatter_nd_update_(
+            scatter_nd_update_(
                 self.k_buffer[self._kv_local_offset(layer_id)].view(
                     -1, 1, self.kv_cache_dim
                 ),
@@ -1445,7 +1462,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_v = cache_v.view(self.store_dtype)
 
         if self.use_combined_kv_buffer:
-            torch_npu.npu_scatter_nd_update_(
+            scatter_nd_update_(
                 self.get_combined_kv_buffer(layer_id).view(
                     -1, 1, self.kv_cache_dim + self.kr_cache_dim
                 ),
@@ -1460,7 +1477,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
             return
 
-        torch_npu.npu_scatter_nd_update_(
+        scatter_nd_update_(
             self.k_buffer[self._kv_local_offset(layer_id)].view(
                 -1, 1, self.kv_lora_rank
             ),
@@ -1468,7 +1485,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_k.view(-1, 1, self.kv_lora_rank),
         )
         if self.qk_rope_head_dim > 0:
-            torch_npu.npu_scatter_nd_update_(
+            scatter_nd_update_(
                 self.v_buffer[self._kv_local_offset(layer_id)].view(
                     -1, 1, self.qk_rope_head_dim
                 ),
@@ -1503,6 +1520,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         """Store MLA latent and RoPE KV tensors in FIA's NZ tile order."""
 
         def scatter(cache: torch.Tensor, values: torch.Tensor, head_dim: int):
+            from sgl_kernel_npu.operators.mem_cache import scatter_nd_update_
+
             if head_dim == 0:
                 return
             tile_size = 32 // cache.element_size()
@@ -1517,7 +1536,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 -1, tile_size
             )
             src = values.contiguous().view(-1, num_tiles, tile_size).view(-1, tile_size)
-            torch_npu.npu_scatter_nd_update_(dst, indices, src)
+            scatter_nd_update_(dst, indices, src)
 
         offset = self._kv_local_offset(layer_id)
         scatter(self.k_buffer[offset], cache_k, self.kv_lora_rank)
@@ -1530,6 +1549,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
     ):
         # The indexer writes at the raw, untranslated loc.
+        from sgl_kernel_npu.operators.mem_cache import scatter_nd_update_
+
         maybe_detect_oob(
             loc,
             0,
@@ -1554,7 +1575,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             if self.store_dtype != self.dtype:
                 index_k = index_k.view(self.store_dtype)
 
-        torch_npu.npu_scatter_nd_update_(
+        scatter_nd_update_(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
                 -1, 1, self.index_head_dim
             ),

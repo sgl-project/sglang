@@ -42,14 +42,12 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
-    is_npu,
     is_xpu,
 )
 from sglang.srt.utils.common import dynamic_import
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
-_is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_hip = is_hip()
@@ -123,8 +121,6 @@ elif _is_musa:
 if _use_aiter:
     from aiter import silu_and_mul as _aiter_silu_and_mul
 
-if is_npu():
-    import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +162,9 @@ class SiluAndMul(BaseFusedOp):
             return self.forward_native(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        out = torch_npu.npu_swiglu(x)
+        from sgl_kernel_npu.operators import activation as npu_activation_ops
+
+        out = npu_activation_ops.swiglu(x)
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
@@ -260,7 +258,9 @@ class GeluAndMul(BaseFusedOp):
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         if envs.SGLANG_NPU_FORWARD_NATIVE_GELUTANH.get():
             return self.forward_native(x)
-        y_npu, gelu_npu = torch_npu.npu_geglu(
+        from sgl_kernel_npu.operators import activation as npu_activation_ops
+
+        y_npu, gelu_npu = npu_activation_ops.geglu(
             x,
             dim=-1,
             approximate=1 if self.approximate == "tanh" else 0,
@@ -310,7 +310,9 @@ class QuickGELU(BaseFusedOp):
         return out
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        return torch_npu.npu_fast_gelu(x)
+        from sgl_kernel_npu.operators import activation as npu_activation_ops
+
+        return npu_activation_ops.fast_gelu(x)
 
 
 class XIELU(BaseFusedOp):

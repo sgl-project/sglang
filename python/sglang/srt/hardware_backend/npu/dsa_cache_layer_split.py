@@ -23,10 +23,6 @@ from sglang.srt.hardware_backend.npu.memory_pool_npu import (
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.device import is_npu
-
-if is_npu():
-    import torch_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -557,6 +553,8 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         cache_v: torch.Tensor,
     ) -> None:
         """Cache a CP-gathered full-sequence copy into the remote scratch."""
+        from sgl_kernel_npu.operators.mem_cache import scatter_nd_update_
+
         if self.use_combined_kv_buffer or self.use_fia_nz:
             return
         loc, _, _ = unwrap_write_loc(loc_info)
@@ -566,7 +564,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
             packed = self._pack_dsa_quant_kv_cache(cache_k, cache_v)
-            torch_npu.npu_scatter_nd_update_(
+            scatter_nd_update_(
                 self.remote_k_buffer.view(-1, 1, self.kv_cache_dim),
                 loc.view(-1, 1),
                 packed.view(-1, 1, self.kv_cache_dim),
@@ -587,12 +585,12 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             if self.store_dtype != self.dtype:
                 cache_k = cache_k.view(self.store_dtype)
                 cache_v = cache_v.view(self.store_dtype)
-            torch_npu.npu_scatter_nd_update_(
+            scatter_nd_update_(
                 self.remote_k_buffer.view(-1, 1, self.kv_lora_rank),
                 loc.view(-1, 1),
                 cache_k.view(-1, 1, self.kv_lora_rank),
             )
-            torch_npu.npu_scatter_nd_update_(
+            scatter_nd_update_(
                 self.remote_v_buffer.view(-1, 1, self.qk_rope_head_dim),
                 loc.view(-1, 1),
                 cache_v.view(-1, 1, self.qk_rope_head_dim),
@@ -648,11 +646,13 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         scratch, so the follow-up get_index_k_buffer read hits
         ``remote_index_layer_id`` instead of issuing a synchronous owner
         broadcast."""
+        from sgl_kernel_npu.operators.mem_cache import scatter_nd_update_
+
         if index_k.dtype != self.dtype:
             index_k = index_k.to(self.dtype)
         if self.store_dtype != self.dtype:
             index_k = index_k.view(self.store_dtype)
-        torch_npu.npu_scatter_nd_update_(
+        scatter_nd_update_(
             self.remote_index_k_buffer.view(-1, 1, self.index_head_dim),
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),

@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn.functional as F
-import torch_npu
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUWNA16Int4MoEMethod,
@@ -160,7 +159,9 @@ class AWQAscendLinearKernel:
             #   out = (x @ qweight_dequantized) + bias
             # where qweight_dequantized = (qweight_unsigned - offset) * scales
             # with group-wise scaling applied.
-            out = torch_npu.npu_weight_quant_batchmatmul(
+            from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+            out = npu_matmul_ops.weight_quant_batchmatmul(
                 reshaped_x,
                 qweight,
                 antiquant_scale=scales,

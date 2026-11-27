@@ -3,6 +3,7 @@ import sys
 import types
 from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -99,12 +100,37 @@ def _load_npu_memory_pool_module():
         "sglang",
         "sglang.srt",
         "sglang.srt.constants",
+        "sglang.srt.environ",
+        "sglang.srt.hardware_backend.npu.kv_capability",
+        "sglang.srt.layers.dcp.layout",
+        "sglang.srt.mem_cache.kv_cache_dtype",
+        "sglang.srt.runtime_context",
+        "sglang.srt.utils.async_probe",
         "sglang.srt.mem_cache",
         "sglang.srt.mem_cache.memory_pool",
         "sglang.srt.utils",
         "sglang.srt.utils.device",
     ):
         sys.modules.setdefault(name, types.ModuleType(name))
+
+    capability = sys.modules["sglang.srt.hardware_backend.npu.kv_capability"]
+    capability.DSA_KV_QUANT_BLOCK_SIZE = 128
+    capability.PackedQuantKvCapability = object
+    capability.resolve_npu_kv_capability = lambda **kwargs: None
+    sys.modules["sglang.srt.environ"].envs = types.SimpleNamespace()
+    sys.modules["sglang.srt.layers.dcp.layout"].localize_dcp_indices = (
+        lambda x, **kwargs: x
+    )
+    sys.modules["sglang.srt.mem_cache.kv_cache_dtype"].QUANT_MODE_TOKEN_INT8 = 1
+    sys.modules["sglang.srt.runtime_context"].get_memory = lambda: (
+        types.SimpleNamespace()
+    )
+    sys.modules["sglang.srt.runtime_context"].get_parallel = lambda: (
+        types.SimpleNamespace()
+    )
+    sys.modules["sglang.srt.utils.async_probe"].maybe_detect_oob = (
+        lambda *args, **kwargs: None
+    )
 
     constants = sys.modules["sglang.srt.constants"]
     constants.GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
@@ -170,7 +196,15 @@ def test_npu_minimax_k_only_index_cache_uses_scatter_writer():
     loc = torch.tensor([1, 3], dtype=torch.int64)
     cache_k = torch.randn((2, 1, 4), dtype=torch.bfloat16)
 
-    pool.set_k_buffer(0, loc, cache_k)
+    with patch.dict(
+        sys.modules,
+        {
+            "sgl_kernel_npu.operators.mem_cache": types.SimpleNamespace(
+                scatter_nd_update_=FakeTorchNpu.npu_scatter_nd_update_
+            )
+        },
+    ):
+        pool.set_k_buffer(0, loc, cache_k)
 
     assert len(calls) == 1
     k_size, v_size = pool.get_kv_size_bytes()

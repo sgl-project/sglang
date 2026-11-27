@@ -514,8 +514,14 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
             updates.append((len(lses), len(outputs)))
             return outputs[0], lses[0]
 
-        fake_torch_npu = types.SimpleNamespace(npu_attention_update=fake_update)
-        with patch.dict(sys.modules, {"torch_npu": fake_torch_npu}):
+        with patch.dict(
+            sys.modules,
+            {
+                "sgl_kernel_npu.operators.attention": types.SimpleNamespace(
+                    attention_update=fake_update
+                )
+            },
+        ):
             got = cp_lse_ag_out_rs_mla_npu(out, lse, group)
         self.assertEqual(updates, [(2, 2)])
         self.assertEqual(group.calls[0][0], group.calls[0][1])

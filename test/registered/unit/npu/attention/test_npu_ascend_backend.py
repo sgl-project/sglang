@@ -979,11 +979,11 @@ class TestMlaPrefixFia(unittest.TestCase):
         with (
             patch(f"{module_name}.is_mla_preprocess_enabled", return_value=False),
             patch(
-                f"{module_name}.torch_npu.npu_fused_infer_attention_score_v2",
+                "sgl_kernel_npu.operators.attention.fused_infer_attention_score_v2",
                 side_effect=self._fia_reference,
             ) as fia,
             patch(
-                f"{module_name}.torch_npu.npu_attention_update",
+                "sgl_kernel_npu.operators.attention.attention_update",
                 side_effect=self._update_reference,
             ) as update,
             patch(f"{module_name}.torch_npu.atb", None),
@@ -1158,6 +1158,72 @@ class TestAscendKPoolPrefillCP(CustomTestCase):
         self.assertIsNotNone(write.call_args)
         torch.testing.assert_close(write.call_args.kwargs["key"], key)
         torch.testing.assert_close(write.call_args.kwargs["gate_score"], score)
+
+
+class TestA5LowHeadMlaDispatch(unittest.TestCase):
+    def setUp(self):
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        self.enterContext(patch(f"{module}.is_npu_arch35", return_value=True))
+        self.enterContext(
+            patch(f"{module}.is_mla_preprocess_enabled", return_value=False)
+        )
+        self.nz = self.enterContext(patch(f"{module}.is_fia_nz", return_value=False))
+        self.backend = object.__new__(AscendAttnBackend)
+        self.backend.use_mla = True
+        self.backend.use_fia = True
+        self.backend.graph_mode = False
+        self.backend.enable_torch_compile = False
+        self.backend.dense_mla_dcp_target = False
+        self.backend.page_size = 128
+        self.backend.kv_lora_rank = 512
+        self.backend.qk_rope_head_dim = 64
+        self.backend.token_to_kv_pool = MagicMock()
+        self.backend.token_to_kv_pool.get_key_buffer.return_value = torch.zeros(
+            128, 1, 1, 512, dtype=torch.bfloat16
+        )
+        self.backend.token_to_kv_pool.get_value_buffer.return_value = torch.zeros(
+            128, 1, 1, 64, dtype=torch.bfloat16
+        )
+        self.layer = SimpleNamespace(tp_q_head_num=4, tp_k_head_num=1, layer_id=0)
+        self.batch = SimpleNamespace(batch_size=1, out_cache_loc=torch.tensor([0]))
+        self.q = torch.zeros(1, 4, 512, dtype=torch.bfloat16)
+        self.rope = torch.zeros(1, 4, 64, dtype=torch.bfloat16)
+
+    def _decode(self, **kwargs):
+        return self.backend.forward_decode(
+            self.q, None, None, self.layer, self.batch, q_rope=self.rope, **kwargs
+        )
+
+    def test_explicit_fia_required_before_cache_write(self):
+        self.backend.use_fia = False
+        with self.assertRaisesRegex(RuntimeError, "ASCEND_USE_FIA=1"):
+            self._decode()
+        self.backend.token_to_kv_pool.set_kv_buffer.assert_not_called()
+
+    def test_unvalidated_new_path_rejected_before_cache_write(self):
+        for option in ("nz", "page", "lse", "cache_dtype", "scheme"):
+            with self.subTest(option=option):
+                self.nz.return_value = option == "nz"
+                self.backend.page_size = 64 if option == "page" else 128
+                self.layer.scheme = object() if option == "scheme" else None
+                self.backend.token_to_kv_pool.get_key_buffer.return_value = torch.zeros(
+                    128,
+                    1,
+                    1,
+                    512,
+                    dtype=torch.float16 if option == "cache_dtype" else torch.bfloat16,
+                )
+                with self.assertRaisesRegex(RuntimeError, "A5"):
+                    self._decode(return_softmax_lse=option == "lse")
+                self.backend.token_to_kv_pool.set_kv_buffer.assert_not_called()
+
+    def test_existing_graph_route_remains_first(self):
+        self.backend.graph_mode = True
+        self.backend.forward_decode_graph = MagicMock(return_value=self.q)
+        actual = self._decode()
+        self.assertIs(actual, self.q)
+        self.backend.forward_decode_graph.assert_called_once()
+        self.backend.token_to_kv_pool.set_kv_buffer.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -15,8 +15,6 @@ from .utils import (
 )
 
 if current_platform.is_npu():
-    import torch_npu
-
     from sglang.kernels.ops.diffusion.common.fallback_npu import (
         NPU_ROTARY_MUL_MAX_HEAD_SIZE,
         NPU_ROTARY_MUL_MAX_NUM_HEADS,
@@ -241,8 +239,11 @@ class RotaryEmbedding(CustomOp):
                     cos_prepared = torch.cat((cos_prepared, cos_prepared), dim=-1)
                     sin_prepared = torch.cat((sin_prepared, sin_prepared), dim=-1)
 
-                q_rotated = torch_npu.npu_rotary_mul(q_rot, cos_prepared, sin_prepared)
-                k_rotated = torch_npu.npu_rotary_mul(k_rot, cos_prepared, sin_prepared)
+                from sgl_kernel_npu.operators import rope as npu_rope_ops
+
+                q_rotated = npu_rope_ops.rotary_mul(q_rot, cos_prepared, sin_prepared)
+
+                k_rotated = npu_rope_ops.rotary_mul(k_rot, cos_prepared, sin_prepared)
                 return self._combine_rotated_and_pass(
                     q_rotated, k_rotated, q_pass, k_pass
                 )

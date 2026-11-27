@@ -1,5 +1,6 @@
 """CPU-only tests for Ascend sampling dispatch and mask export contracts."""
 
+import sys
 import unittest
 from itertools import product
 from types import SimpleNamespace
@@ -18,7 +19,30 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-class TestAscendSamplerDispatch(unittest.TestCase):
+class AscendPublicOperatorTest(unittest.TestCase):
+    def setUp(self):
+        # Import the public namespace only inside the NPU execution branch.
+        # Forward through the SDK stub so existing mask/seed cases keep their
+        # distinct filtered logits while exercising the migrated lookup.
+        operators = SimpleNamespace(
+            sampler=SimpleNamespace(
+                top_k_top_p=lambda *args: sampler_module.torch_npu.npu_top_k_top_p(
+                    *args
+                )
+            )
+        )
+        modules = patch.dict(sys.modules, {"sgl_kernel_npu.operators": operators})
+        modules.start()
+        self.addCleanup(modules.stop)
+        support = patch(
+            "sglang.srt.hardware_backend.npu.utils.is_npu_op_supported",
+            return_value=True,
+        )
+        self.op_supported = support.start()
+        self.addCleanup(support.stop)
+
+
+class TestAscendSamplerDispatch(AscendPublicOperatorTest):
     @torch.random.fork_rng(devices=[])
     def test_top_k_dispatch_does_not_read_device_values_on_cpu(self):
         logits = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
@@ -27,14 +51,23 @@ class TestAscendSamplerDispatch(unittest.TestCase):
         min_ps = torch.zeros(1)
         positions = torch.zeros(1, dtype=torch.int64)
 
-        for eligible in (True, False):
-            with self.subTest(eligible=eligible):
+        for eligible, supported, sdk_available in product((True, False), repeat=3):
+            with self.subTest(
+                eligible=eligible, supported=supported, sdk_available=sdk_available
+            ):
+                self.op_supported.return_value = supported
+                self.op_supported.reset_mock()
                 npu_top_k_top_p = MagicMock(return_value=logits)
+                sdk = (
+                    SimpleNamespace(npu_top_k_top_p=npu_top_k_top_p)
+                    if sdk_available
+                    else SimpleNamespace()
+                )
                 with (
                     patch.object(
                         sampler_module,
                         "torch_npu",
-                        SimpleNamespace(npu_top_k_top_p=npu_top_k_top_p),
+                        sdk,
                         create=True,
                     ),
                     patch.object(
@@ -58,7 +91,37 @@ class TestAscendSamplerDispatch(unittest.TestCase):
 
                 self.assertEqual(tuple(result.shape), (1,))
                 self.assertIsNone(filtered_probs)
-                self.assertEqual(npu_top_k_top_p.called, eligible)
+                self.assertEqual(
+                    npu_top_k_top_p.called, eligible and supported and sdk_available
+                )
+                self.assertEqual(self.op_supported.called, eligible and sdk_available)
+
+    def test_dflash_unsupported_generation_preserves_fallback(self):
+        from sglang.srt.speculative import dflash_utils
+
+        probs = MagicMock(device=SimpleNamespace(type="npu"))
+        self.op_supported.return_value = False
+        with (
+            patch.object(dflash_utils, "is_npu", return_value=True),
+            patch.dict(
+                sys.modules, {"torch_npu": SimpleNamespace(npu_top_k_top_p=MagicMock())}
+            ),
+        ):
+            self.assertIsNone(dflash_utils._dflash_npu_top_k_top_p_renorm_prob(probs))
+        probs.log.assert_not_called()
+        self.op_supported.assert_called_once()
+
+    def test_dflash_missing_sdk_preserves_fallback(self):
+        from sglang.srt.speculative import dflash_utils
+
+        probs = MagicMock(device=SimpleNamespace(type="npu"))
+        with (
+            patch.object(dflash_utils, "is_npu", return_value=True),
+            patch.dict(sys.modules, {"torch_npu": SimpleNamespace()}),
+        ):
+            self.assertIsNone(dflash_utils._dflash_npu_top_k_top_p_renorm_prob(probs))
+        probs.log.assert_not_called()
+        self.op_supported.assert_not_called()
 
     @torch.random.fork_rng(devices=[])
     def test_min_p_filters_the_fused_top_k_top_p_output(self):
@@ -95,8 +158,9 @@ class TestAscendSamplerDispatch(unittest.TestCase):
 
 
 @patch.object(sampler_module, "torch_npu", SimpleNamespace(), create=True)
-class TestAscendSamplingMaskCapture(unittest.TestCase):
+class TestAscendSamplingMaskCapture(AscendPublicOperatorTest):
     def setUp(self):
+        super().setUp()
         self.sampler = Sampler.__new__(Sampler)
         torch.nn.Module.__init__(self.sampler)
         self.sampler.use_ascend_backend = True

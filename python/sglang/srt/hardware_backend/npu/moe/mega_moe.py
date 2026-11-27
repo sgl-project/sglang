@@ -102,12 +102,12 @@ def prepare_mega_moe_arch22_weights(
     if config is None or not config.uses_fused_op:
         return False
 
-    import torch_npu
-
     from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, is_npu_arch35
 
     if is_npu_arch35():
         return False
+
+    from sgl_kernel_npu.operators.data_move import format_cast
 
     # Slice the original ND tensor before the grouped matmul path casts the
     # entire stack to NZ. Each expert needs its own NZ storage descriptor.
@@ -115,7 +115,7 @@ def prepare_mega_moe_arch22_weights(
     previous = getattr(layer, name, None)
     experts = []
     for expert in weight.unbind(0):
-        expert = torch_npu.npu_format_cast(
+        expert = format_cast(
             expert.contiguous(), int(NPUACLFormat.ACL_FORMAT_FRACTAL_NZ)
         )
         if packed_int4:

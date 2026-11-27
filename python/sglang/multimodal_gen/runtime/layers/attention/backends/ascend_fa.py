@@ -55,7 +55,7 @@ def resolve_mx_fa_scheme(quant_config) -> str | None:
     if type(quant_config).__name__ not in ("MXFP8Config", "ModelSlimConfig"):
         return None
 
-    from sglang.srt.hardware_backend.npu.utils import is_ascend_950
+    from sglang.srt.hardware_backend.npu.utils import is_ascend_950, is_npu_op_supported
 
     if not is_ascend_950():
         logger.warning_once(
@@ -77,6 +77,17 @@ def resolve_mx_fa_scheme(quant_config) -> str | None:
             "MXFP8 attention is disabled because the installed torch_npu does not "
             f"provide the required APIs: {', '.join(missing_features)}. "
             "Please install torch==2.10.0, torch_npu>=2.10.0.post4, and CANN>=9.1.1."
+        )
+        return None
+    from sgl_kernel_npu.operators.attention import fused_infer_attention_score_v2
+    from sgl_kernel_npu.operators.quant import dynamic_mx_quant
+
+    if not all(
+        is_npu_op_supported(op)
+        for op in (dynamic_mx_quant, fused_infer_attention_score_v2)
+    ):
+        logger.warning_once(
+            "MXFP8 attention requires registered MX quantization and FIA V2 on this NPU."
         )
         return None
     return "MXFP8"
@@ -193,7 +204,9 @@ def fused_infer_attention_varlen(
         else:
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
-    output, lse = torch.ops.npu.npu_fused_infer_attention_score(
+    from sgl_kernel_npu.operators.attention import fused_infer_attention_score
+
+    output, lse = fused_infer_attention_score(
         q,
         k,
         v,
@@ -437,7 +450,9 @@ class AscendFAImpl(AttentionImpl):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
-        output, lse = torch.ops.npu.npu_fused_infer_attention_score(
+        from sgl_kernel_npu.operators.attention import fused_infer_attention_score
+
+        output, lse = fused_infer_attention_score(
             query,
             key,
             value,
@@ -597,21 +612,24 @@ class AscendFAImpl(AttentionImpl):
         actual_seq_qlen: Sequence[int],
         actual_seq_kvlen: Sequence[int],
     ) -> torch.Tensor:
+        from sgl_kernel_npu.operators.attention import fused_infer_attention_score_v2
+        from sgl_kernel_npu.operators.quant import dynamic_mx_quant
+
         quant_dtype = torch.float8_e4m3fn
         scale_dtype = torch.float8_e8m0fnu
         query = query.contiguous()
         key = key.contiguous()
         value = value.contiguous()
-        query_fp8, query_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        query_fp8, query_scale = dynamic_mx_quant(
             query, dst_type=quant_dtype, axis=self._MXFP8_QK_QUANT_AXIS
         )
-        key_fp8, key_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        key_fp8, key_scale = dynamic_mx_quant(
             key, dst_type=quant_dtype, axis=self._MXFP8_QK_QUANT_AXIS
         )
-        value_fp8, value_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        value_fp8, value_scale = dynamic_mx_quant(
             value, dst_type=quant_dtype, axis=self._MXFP8_V_QUANT_AXIS
         )
-        return torch.ops.npu.npu_fused_infer_attention_score_v2(
+        return fused_infer_attention_score_v2(
             query_fp8,
             key_fp8,
             value_fp8,

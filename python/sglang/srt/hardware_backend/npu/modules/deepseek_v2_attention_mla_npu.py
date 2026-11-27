@@ -2,7 +2,6 @@ from dataclasses import fields
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
-import torch_npu
 from sgl_kernel_npu.operators.matmul import batch_matmul_transpose
 from sgl_kernel_npu.operators.norm import fused_split_qk_norm
 
@@ -86,6 +85,9 @@ def forward_mha_prepare_npu(
     zero_allocator: "BumpAllocator",
     input_on_attn_tp_slices: bool,
 ):
+    from sgl_kernel_npu.operators.mem_cache import kv_rmsnorm_rope_cache
+    from sgl_kernel_npu.operators.rope import interleave_rope
+
     kv_quant_scheme = getattr(m.attn_mqa, "scheme", None)
     if m.q_lora_rank is not None:
         q, latent_cache = (
@@ -131,7 +133,7 @@ def forward_mha_prepare_npu(
         cos, sin = m.rotary_emb.get_cos_sin_cache(
             positions, hidden_states.dtype, offsets=None
         )
-        q_pe = torch_npu.npu_interleave_rope(
+        q_pe = interleave_rope(
             q_pe.reshape(B, -1, S, m.qk_rope_head_dim),
             cos,
             sin,
@@ -139,7 +141,7 @@ def forward_mha_prepare_npu(
         q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
         ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
-        _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
+        _, _, k_pe, kv_a = kv_rmsnorm_rope_cache(
             latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
             m.kv_a_layernorm.weight,
             cos,
@@ -395,6 +397,8 @@ def forward_mla_core_npu(
 # region DSA
 def _apply_interleaved_rope_with_half_output(rotary_emb, positions, q_pe, k_pe):
     """Apply RoPE to interleaved Q/K and return half-layout outputs."""
+    from sgl_kernel_npu.operators.rope import interleave_rope
+
     rotary_emb.get_cos_sin_with_position(positions)
     cos = rotary_emb.position_cos.to(device=q_pe.device, dtype=q_pe.dtype).view(
         -1, 1, 1, q_pe.shape[-1]
@@ -402,8 +406,8 @@ def _apply_interleaved_rope_with_half_output(rotary_emb, positions, q_pe, k_pe):
     sin = rotary_emb.position_sin.to(device=q_pe.device, dtype=q_pe.dtype).view(
         -1, 1, 1, q_pe.shape[-1]
     )
-    q_pe = torch_npu.npu_interleave_rope(q_pe.unsqueeze(2), cos, sin).squeeze(2)
-    k_pe = torch_npu.npu_interleave_rope(k_pe.unsqueeze(2), cos, sin).squeeze(2)
+    q_pe = interleave_rope(q_pe.unsqueeze(2), cos, sin).squeeze(2)
+    k_pe = interleave_rope(k_pe.unsqueeze(2), cos, sin).squeeze(2)
     return q_pe, k_pe
 
 

@@ -25,7 +25,9 @@ class BaseActivation(ABC):
 # =============================================================================
 class NPUSwiglu(BaseActivation):
     def _apply_activation(self, hidden_states: torch.Tensor):
-        return torch.ops.npu.npu_swiglu(hidden_states), None
+        from sgl_kernel_npu.operators import activation as npu_activation_ops
+
+        return npu_activation_ops.swiglu(hidden_states), None
 
 
 class NPUSwigluWithLimit(BaseActivation):
@@ -273,7 +275,9 @@ class NPUSwigluStepAndMul(BaseActivation):
     def _apply_activation(self, hidden_states: torch.Tensor):
         if self._clamp_limit is not None:
             return self._swiglustep_and_mul(hidden_states, self._clamp_limit), None
-        return torch.ops.npu.npu_swiglu(hidden_states), None
+        from sgl_kernel_npu.operators import activation as npu_activation_ops
+
+        return npu_activation_ops.swiglu(hidden_states), None
 
     @staticmethod
     def _swiglustep_and_mul(x: torch.Tensor, limit: float = 7.0) -> torch.Tensor:

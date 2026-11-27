@@ -699,11 +699,15 @@ class RMSNorm(BaseFusedOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            out, _, residual_out = torch_npu.npu_add_rms_norm(
+            from sgl_kernel_npu.operators import norm as npu_norm_ops
+
+            out, _, residual_out = npu_norm_ops.add_rms_norm(
                 residual, x, self.weight.data, self.variance_epsilon
             )
             return out, residual_out
-        return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
+        from sgl_kernel_npu.operators import norm as npu_norm_ops
+
+        return npu_norm_ops.rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 
     def forward_mlu(
         self,
@@ -1423,7 +1427,9 @@ class GemmaRMSNorm(BaseFusedOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            norm_out, _, residual = torch_npu.npu_add_rms_norm(
+            from sgl_kernel_npu.operators import norm as npu_norm_ops
+
+            norm_out, _, residual = npu_norm_ops.add_rms_norm(
                 residual, x, self.gemma_weight.to(x.dtype), self.variance_epsilon
             )
             return norm_out, residual

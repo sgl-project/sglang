@@ -23,18 +23,14 @@ from sglang.srt.runtime_context import attention_backends
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_hip,
-    is_npu,
     is_xpu,
     support_triton,
 )
 
 _is_hip = is_hip()
-_is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
-if _is_npu:
-    import torch_npu
 
 if _is_xpu:
     try:
@@ -306,7 +302,9 @@ class MRotaryEmbedding(RotaryEmbedding):
             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half" if self.is_neox_style else "interleave"
         mrope_section = [0, 0, 0]
-        query_out, key_out = torch_npu.npu_mrope(
+        from sgl_kernel_npu.operators import rope as npu_rope_ops
+
+        query_out, key_out = npu_rope_ops.mrope(
             positions,
             query,
             key,

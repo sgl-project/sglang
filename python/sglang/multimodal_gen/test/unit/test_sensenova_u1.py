@@ -2,6 +2,7 @@
 import asyncio
 import json
 import math
+import sys
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -356,15 +357,16 @@ def test_sensenova_u1_fused_dense_mlp_matches_original(monkeypatch):
         expected = mlp(hidden_states)
 
     monkeypatch.setattr(mlp, "_use_npu_fused_mlp", lambda _x: True)
-    monkeypatch.setattr(
-        torch.ops,
-        "npu",
+    monkeypatch.setitem(
+        sys.modules,
+        "sgl_kernel_npu.operators",
         SimpleNamespace(
-            npu_swiglu=lambda x, dim=-1: (
-                F.silu(x.chunk(2, dim=dim)[0]) * x.chunk(2, dim=dim)[1]
+            activation=SimpleNamespace(
+                swiglu=lambda x, dim=-1: (
+                    F.silu(x.chunk(2, dim=dim)[0]) * x.chunk(2, dim=dim)[1]
+                )
             )
         ),
-        raising=False,
     )
     actual = mlp(hidden_states)
 
@@ -1372,3 +1374,43 @@ def test_sensenova_u1_timestep_frequencies_are_built_once():
         for _ in range(3):
             torch.testing.assert_close(embed(t, 2 * half), expected, atol=0, rtol=0)
     assert exp.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "supported,sdk_available", [(True, True), (False, True), (True, False)]
+)
+@torch.no_grad()
+def test_sensenova_u1_fused_mlp_checks_public_capability(
+    monkeypatch, supported, sdk_available
+):
+    from sglang.srt.hardware_backend.npu import utils as npu_utils
+
+    mlp = (
+        Qwen3MLP(
+            SimpleNamespace(hidden_size=16, intermediate_size=24, hidden_act="silu")
+        )
+        .to(torch.bfloat16)
+        .eval()
+    )
+    hidden_states = SimpleNamespace(
+        device=SimpleNamespace(type="npu"), dtype=torch.bfloat16
+    )
+    public_swiglu = object()
+    monkeypatch.setitem(
+        sys.modules,
+        "sgl_kernel_npu.operators",
+        SimpleNamespace(activation=SimpleNamespace(swiglu=public_swiglu)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(npu_swiglu=lambda x: x) if sdk_available else SimpleNamespace(),
+    )
+    with patch.object(
+        npu_utils, "is_npu_op_supported", return_value=supported
+    ) as capability:
+        assert mlp._use_npu_fused_mlp(hidden_states) == (supported and sdk_available)
+    if sdk_available:
+        capability.assert_called_once_with(public_swiglu)
+    else:
+        capability.assert_not_called()

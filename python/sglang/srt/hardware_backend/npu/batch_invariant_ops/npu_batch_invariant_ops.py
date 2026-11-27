@@ -2,7 +2,6 @@
 
 import batch_invariant_ops  # noqa: F401
 import torch
-import torch_npu
 from sgl_kernel_npu.operators.batch_invariant import (
     fused_infer_attention_score_batch_invariant,
     fused_infer_attention_score_batch_invariant_get_max_workspace,
@@ -68,7 +67,9 @@ def npu_add_rms_norm_batch_invariant(
     """
     x_ = x + residual
     residual_ = x_
-    x_, _ = torch_npu.npu_rms_norm(x_, weight, eps)
+    from sgl_kernel_npu.operators import norm as npu_norm_ops
+
+    x_, _ = npu_norm_ops.rms_norm(x_, weight, eps)
     return x_, None, residual_
 
 

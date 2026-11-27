@@ -1,6 +1,8 @@
 """CPU contracts for online W4A8 Linear/MoE and shared ModelSlim preparation."""
 
+import sys
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
@@ -36,6 +38,22 @@ FP4_DTYPE = 296  # torch_npu's FP4 scalar-type enum.
 WEIGHT_POLICY = dict(
     dst_type=FP4_DTYPE, round_mode="rint", scale_alg=2, dst_type_max=7.25
 )
+
+
+@contextmanager
+def _mock_operator_modules(modules):
+    # Restore only the operator keys; torch may lazily load modules in this scope.
+    missing = object()
+    original = {name: sys.modules.get(name, missing) for name in modules}
+    sys.modules.update(modules)
+    try:
+        yield
+    finally:
+        for name, module in original.items():
+            if module is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 class TestW4A8Linear(unittest.TestCase):
@@ -141,10 +159,12 @@ class TestW4A8Linear(unittest.TestCase):
                             property(lambda _: True),
                             create=True,
                         ),
-                        patch.object(
-                            torch.ops,
-                            "npu",
-                            SimpleNamespace(npu_dynamic_mx_quant=quantize),
+                        _mock_operator_modules(
+                            {
+                                "sgl_kernel_npu.operators": SimpleNamespace(
+                                    quant=SimpleNamespace(dynamic_mx_quant=quantize)
+                                )
+                            }
                         ),
                         patch.object(
                             linear_method_npu,
@@ -180,10 +200,13 @@ class TestW4A8Linear(unittest.TestCase):
         )
         matmul = Mock(return_value=torch.zeros(3, 16, dtype=torch.bfloat16))
         with (
-            patch.object(
-                torch.ops,
-                "npu",
-                SimpleNamespace(npu_dynamic_mx_quant=quantize, npu_quant_matmul=matmul),
+            _mock_operator_modules(
+                {
+                    "sgl_kernel_npu.operators": SimpleNamespace(
+                        quant=SimpleNamespace(dynamic_mx_quant=quantize),
+                        matmul=SimpleNamespace(quant_matmul=matmul),
+                    )
+                }
             ),
             patch.object(
                 linear_method_npu, "_get_float4_e2m1fn_x2_dtype", return_value=FP4_DTYPE
@@ -455,10 +478,12 @@ class TestW4A8MoE(unittest.TestCase):
                             property(lambda _: True),
                             create=True,
                         ),
-                        patch.object(
-                            torch.ops,
-                            "npu",
-                            SimpleNamespace(npu_dynamic_mx_quant=quantize),
+                        _mock_operator_modules(
+                            {
+                                "sgl_kernel_npu.operators": SimpleNamespace(
+                                    quant=SimpleNamespace(dynamic_mx_quant=quantize)
+                                )
+                            }
                         ),
                         patch.object(
                             moe_methods,
@@ -523,10 +548,10 @@ class TestW4A8MoE(unittest.TestCase):
 
     def test_dynamic_quant_resolves_only_when_called(self):
         for dtype, use_mx, name in (
-            (torch.float8_e4m3fn, False, "npu_dynamic_mx_quant"),
-            (torch.int8, False, "npu_dynamic_quant"),
-            (torch.quint4x2, False, "npu_dynamic_quant"),
-            (FP4_DTYPE, True, "npu_dynamic_mx_quant"),
+            (torch.float8_e4m3fn, False, "dynamic_mx_quant"),
+            (torch.int8, False, "dynamic_quant"),
+            (torch.quint4x2, False, "dynamic_quant"),
+            (FP4_DTYPE, True, "dynamic_mx_quant"),
         ):
             with self.subTest(dtype=dtype, use_mx=use_mx):
                 with patch.object(torch.ops, "npu", SimpleNamespace()):
@@ -534,7 +559,19 @@ class TestW4A8MoE(unittest.TestCase):
                 x = torch.ones(2, 64)
                 expected = (x, torch.ones(2, 2))
                 op = Mock(return_value=expected)
-                with patch.object(torch.ops, "npu", SimpleNamespace(**{name: op})):
+                with _mock_operator_modules(
+                    {
+                        "sgl_kernel_npu.operators": SimpleNamespace(
+                            quant=SimpleNamespace(
+                                **{
+                                    "dynamic_mx_quant": Mock(),
+                                    "dynamic_quant": Mock(),
+                                    name: op,
+                                }
+                            )
+                        )
+                    }
+                ):
                     actual = quantizer(x)
                 self.assertIs(actual[0], expected[0])
                 self.assertIs(actual[1], expected[1])

@@ -314,7 +314,14 @@ class TestNpuMlaPoolLayout(CustomTestCase):
                 self.assertEqual(pool.index_k_buffer.dtype, stored_dtype)
                 self.assertEqual(pool.get_index_k_buffer(0).dtype, read_dtype)
                 torch_npu = MagicMock(name="torch_npu")
-                with patch.object(memory_pool_npu, "torch_npu", torch_npu, create=True):
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "sgl_kernel_npu.operators.mem_cache": SimpleNamespace(
+                            scatter_nd_update_=torch_npu.npu_scatter_nd_update_
+                        )
+                    },
+                ):
                     pool.set_index_k_buffer(
                         0,
                         torch.tensor([1, 2]),
@@ -779,6 +786,21 @@ class _MockedNpuOpsTestCase(CustomTestCase):
             p = patch.object(module, "torch_npu", self.torch_npu, create=True)
             p.start()
             self.addCleanup(p.stop)
+        public_ops = {
+            "sgl_kernel_npu.operators.mem_cache": SimpleNamespace(
+                scatter_nd_update_=self.torch_npu.npu_scatter_nd_update_
+            ),
+            "sgl_kernel_npu.operators.quant": SimpleNamespace(
+                dynamic_quant=self.torch_npu.npu_dynamic_quant
+            ),
+            "sgl_kernel_npu.operators.rope": SimpleNamespace(
+                rotary_mul=self.torch_npu.npu_rotary_mul
+            ),
+            "sgl_kernel_npu.operators.indexer": SimpleNamespace(
+                lightning_indexer=self.torch_npu.npu_lightning_indexer
+            ),
+        }
+        self.enterContext(patch.dict(sys.modules, public_ops))
         self.pool = _build_pool(INT8, arch35=False)
         self.out_cache_loc = torch.tensor([5, 6])
 
@@ -890,8 +912,15 @@ class TestPackedKvWriteAndSparseRead(_MockedNpuOpsTestCase):
         with (
             patch.multiple(
                 "sglang.srt.hardware_backend.npu.attention.ascend_backend.torch_npu",
-                npu_kv_quant_sparse_flash_attention=quant_attn,
                 npu_sparse_flash_attention=bf16_attn,
+            ),
+            patch.dict(
+                sys.modules,
+                {
+                    "sgl_kernel_npu.operators.attention": SimpleNamespace(
+                        kv_quant_sparse_flash_attention_torch_npu=quant_attn
+                    )
+                },
             ),
             # Decode never takes a token-shard plan.
             patch(

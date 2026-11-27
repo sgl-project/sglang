@@ -912,9 +912,18 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     """
     filtered_probs = None
     # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
-    if hasattr(torch_npu, "npu_top_k_top_p") and npu_top_k_top_p_eligible:
+    use_npu_top_k_top_p = (
+        hasattr(torch_npu, "npu_top_k_top_p") and npu_top_k_top_p_eligible
+    )
+    if use_npu_top_k_top_p:
+        from sgl_kernel_npu.operators import sampler as npu_sampler_ops
+
+        from sglang.srt.hardware_backend.npu.utils import is_npu_op_supported
+
+        use_npu_top_k_top_p = is_npu_op_supported(npu_sampler_ops.top_k_top_p)
+    if use_npu_top_k_top_p:
         top_ps = top_ps.to(logits.dtype)
-        logits_top_k_top_p = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
+        logits_top_k_top_p = npu_sampler_ops.top_k_top_p(logits, top_ps, top_ks)
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 
         if need_min_p_sampling:

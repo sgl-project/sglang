@@ -159,9 +159,11 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         weight = layer.weight.data
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
-        weight = torch_npu.npu_dtype_cast(weight, torch_npu.float4_e2m1fn_x2)
+        from sgl_kernel_npu.operators import data_move as npu_data_move_ops
+
+        weight = npu_data_move_ops.dtype_cast(weight, torch_npu.float4_e2m1fn_x2)
         # npu_dual_level_quant_matmul requires x2 in FRACTAL_NZ format (format 29).
-        weight = torch_npu.npu_format_cast(
+        weight = npu_data_move_ops.format_cast(
             weight.view(torch.int8), 29, customize_dtype=torch.int8
         )
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
@@ -226,12 +228,16 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             x_2d = x_2d * mul_scale.to(x_2d.dtype)
 
         # Dual-level MXFP4 activation quantization
-        x1, l0_scale, l1_scale = torch_npu.npu_dynamic_dual_level_mx_quant(
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        x1, l0_scale, l1_scale = npu_quant_ops.dynamic_dual_level_mx_quant(
             x_2d, smooth_scale=None
         )
 
         # Dual-level MXFP4 matmul
-        output = torch_npu.npu_dual_level_quant_matmul(
+        from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+        output = npu_matmul_ops.dual_level_quant_matmul(
             x1,
             layer.weight,
             l0_scale,

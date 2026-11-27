@@ -25,7 +25,15 @@ def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):
     This affects the time spent in prefetch:
         time ≈ PREFETCH_MAX_SIZE / system_bandwidth
     """
-    import torch_npu
+    if cache is None:
+        return
+
+    from sgl_kernel_npu.operators import data_move as npu_data_move_ops
+
+    from sglang.srt.hardware_backend.npu.utils import is_npu_op_supported
+
+    if not is_npu_op_supported(npu_data_move_ops.prefetch):
+        return
 
     stream = get_cmo_stream()
     if stream is None:
@@ -35,13 +43,13 @@ def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):
     with torch.npu.stream(stream):
         if isinstance(cache, list):
             for weight in cache:
-                torch_npu.npu_prefetch(
+                npu_data_move_ops.prefetch(
                     weight,
                     handle,
                     PREFETCH_MAX_SIZE,
                 )
         else:
-            torch_npu.npu_prefetch(
+            npu_data_move_ops.prefetch(
                 cache,
                 handle,
                 PREFETCH_MAX_SIZE,

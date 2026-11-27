@@ -47,8 +47,6 @@ if _is_cuda:
     from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
 
 if _is_npu:
-    import torch_npu
-
     # `fused_rope_qk_mqa` is an optional fast-path kernel shipped with
     # `sgl_kernel_npu`. Older NPU CANN / sgl_kernel_npu builds may not include
     # it. If we let the ImportError propagate, importing this module fails,
@@ -410,7 +408,9 @@ class RotaryEmbedding(BaseFusedOp):
         query = query.reshape(query.shape[0], -1)
         key = key.reshape(key.shape[0], -1)
 
-        query_out, key_out = torch_npu.npu_mrope(
+        from sgl_kernel_npu.operators import rope as npu_rope_ops
+
+        query_out, key_out = npu_rope_ops.mrope(
             positions,
             query,
             key,

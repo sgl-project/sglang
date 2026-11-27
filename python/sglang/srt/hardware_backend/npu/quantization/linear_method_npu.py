@@ -107,7 +107,9 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
             quant_bias = None
         else:
             quant_bias = layer.quant_bias
-        out = torch.ops.npu.npu_quant_matmul(
+        from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+        out = npu_matmul_ops.quant_matmul(
             x_2d,
             layer.weight,
             layer.deq_scale,
@@ -136,7 +138,9 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             quant_out, dynamic_scale = x
             if quant_out.numel() == 0:
                 return _empty_quant_matmul_output(quant_out, layer, original_dtype)
-            return torch.ops.npu.npu_quant_matmul(
+            from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+            return npu_matmul_ops.quant_matmul(
                 quant_out,
                 layer.weight,
                 layer.weight_scale,
@@ -151,10 +155,14 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         original_dtype = x.dtype
         original_shape = x.shape
         x_2d = x.reshape(-1, original_shape[-1]) if x.ndim > 2 else x
-        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x_2d)
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        quant_out, dynamic_scale = npu_quant_ops.dynamic_quant(x_2d)
         if quant_out.numel() == 0:
             return _empty_quant_matmul_output(quant_out, layer, original_dtype)
-        out = torch.ops.npu.npu_quant_matmul(
+        from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+        out = npu_matmul_ops.quant_matmul(
             quant_out,
             layer.weight,
             layer.weight_scale,
@@ -231,7 +239,9 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
                 weight = weight.to(f"npu:{torch.npu.current_device()}")
             # Online MXFP8 quantisation of weights (block_size=32).
             # qw: [out, in] float8_e4m3fn, w_scale: [out, in//64, 2] uint8.
-            qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+            qw, w_scale = npu_quant_ops.dynamic_mx_quant(
                 weight, dst_type=torch.float8_e4m3fn
             )
             layer.weight = Parameter(qw.transpose(0, 1), requires_grad=False)
@@ -277,7 +287,9 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
             x_2d = x.reshape(-1, x.shape[-1])
 
             # Dynamic MXFP8 activation quantisation
-            qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+            qx, input_scale = npu_quant_ops.dynamic_mx_quant(
                 x_2d, dst_type=torch.float8_e4m3fn
             )
 
@@ -287,7 +299,9 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         quant_bias = get_linear_bias_fp32(layer, bias)
 
         e8m0_dtype = _get_float8_e8m0fnu_dtype()
-        output = torch.ops.npu.npu_quant_matmul(
+        from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+        output = npu_matmul_ops.quant_matmul(
             qx,
             layer.weight,
             layer.weight_scale_inv,
@@ -333,7 +347,9 @@ def npu_w8a8_mxfp8_linear(
     orig_shape = input.shape
     input_2d = input.view(-1, orig_shape[-1]).contiguous()
 
-    x_fp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+    from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+    x_fp8, x_scale = npu_quant_ops.dynamic_mx_quant(
         input_2d, dst_type=torch.float8_e4m3fn
     )
     e8m0_dtype = _get_float8_e8m0fnu_dtype()
@@ -342,7 +358,9 @@ def npu_w8a8_mxfp8_linear(
         if bias is not None and bias.dtype != torch.float32
         else bias
     )
-    output_2d = torch.ops.npu.npu_quant_matmul(
+    from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+    output_2d = npu_matmul_ops.quant_matmul(
         x_fp8,
         weight,
         scale=weight_scale,
@@ -378,10 +396,14 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
         tp_rank: Optional[int] = 0,
     ) -> torch.Tensor:
         original_dtype = x.dtype
-        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        quant_out, dynamic_scale = npu_quant_ops.dynamic_quant(
             x, dst_type=torch.quint4x2
         )
-        return torch.ops.npu.npu_quant_matmul(
+        from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+        return npu_matmul_ops.quant_matmul(
             quant_out,
             layer.weight,
             layer.weight_scale,
@@ -435,7 +457,8 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
     def _quantize_weights(self, layer: torch.nn.Module) -> None:
         # Online single-level MXFP4 weight quant, then lay the weight out exactly
         # like the offline W4A8 path so the same npu_quant_matmul(x2_dtype=fp4)
-        # kernel accepts it. All NPU ops go through torch.ops.npu.* (no torch_npu).
+        # kernel accepts it. Quantization and matmul ops resolve lazily
+        # through sgl-kernel-npu.
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
 
         weight_fp = layer.weight.data
@@ -448,7 +471,9 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         # BF16 -> packed FP4 (float4_e2m1fn_x2, [out, in//2]) + UE8M0 block scale.
         # npu_dynamic_mx_quant returns the scale as [out, in//64, 2] (3D); older
         # builds may return [out, in//32] (2D) — handle both before the transpose.
-        qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        qw, w_scale = npu_quant_ops.dynamic_mx_quant(
             weight_fp,
             dst_type=fp4_dtype,
             round_mode="rint",
@@ -492,14 +517,18 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         x_2d = x.reshape(-1, x.shape[-1])
 
         # Dynamic MXFP8 activation quantisation (A8 — FP8, not FP4).
-        quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        quantized_x, dynamic_scale = npu_quant_ops.dynamic_mx_quant(
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
         quant_bias = _prepare_mxfp4_w4a8_bias(bias)
 
         # True W4(weight)A8(activation) matmul, identical to the offline path.
-        output = torch.ops.npu.npu_quant_matmul(
+        from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+        output = npu_matmul_ops.quant_matmul(
             quantized_x,
             layer.weight,
             layer.weight_scale,
@@ -565,7 +594,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Cast the packed-FP4 weight to FRACTAL_NZ then transpose. All NPU ops go
-        # through torch.ops.npu.* (no torch_npu). A recent torch_npu build is
+        # through sgl-kernel-npu. A recent torch_npu build is
         # required (see class docstring): older builds reject the NZ weight
         # ("x2 ... it is 2").
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
@@ -604,14 +633,18 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         x_2d = x.reshape(-1, x.shape[-1])
 
         # Dynamic MXFP8 activation quantisation (A8).
-        quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        quantized_x, dynamic_scale = npu_quant_ops.dynamic_mx_quant(
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
         quant_bias = _prepare_mxfp4_w4a8_bias(bias)
 
         # W4(weight)A8(activation) matmul.
-        output = torch.ops.npu.npu_quant_matmul(
+        from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+        output = npu_matmul_ops.quant_matmul(
             quantized_x,
             layer.weight,
             layer.weight_scale,
@@ -634,8 +667,9 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
     True W4(weight) A4(activation): both weights and activations are quantised to
     single-level MXFP4 (``float4_e2m1fn_x2``), unlike the W4A8 path which keeps FP8
-    activations. All NPU ops go through ``torch.ops.npu.*`` (no top-level
-    ``torch_npu``) and the fp4 dtype comes from ``_get_float4_e2m1fn_x2_dtype()``.
+    activations. Quantization and matmul ops resolve lazily through
+    sgl-kernel-npu; the fp4 dtype comes from
+    ``_get_float4_e2m1fn_x2_dtype()``.
 
     Weight quantization (process_weights_after_loading):
         BF16/FP16 weight → npu_dynamic_mx_quant(dst=float4_e2m1fn_x2)
@@ -676,7 +710,7 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Online single-level MXFP4 weight quant. All NPU ops go through
-        # torch.ops.npu.* (no torch_npu); the fp4 dtype comes from the shared
+        # sgl-kernel-npu; the fp4 dtype comes from the shared
         # _get_float4_e2m1fn_x2_dtype() helper (the torch_npu int enum).
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
 
@@ -688,7 +722,9 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
             weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
 
         # BF16 -> packed FP4 (float4_e2m1fn_x2, [out, in//2]) + UE8M0 block scale.
-        qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        qw, w_scale = npu_quant_ops.dynamic_mx_quant(
             weight_fp, dst_type=fp4_dtype, round_mode="round"
         )
         # Pre-transpose the weight to [in//2, out] for npu_quant_matmul; use
@@ -727,13 +763,17 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         x_2d = x.reshape(-1, x.shape[-1])
 
         # Dynamic single-level MXFP4 activation quantisation (A4 — FP4).
-        qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        qx, input_scale = npu_quant_ops.dynamic_mx_quant(
             x_2d, dst_type=fp4_dtype, round_mode="round"
         )
 
         # Single-level MXFP4 matmul (weight & scale already transposed at load
         # time): x1_dtype = x2_dtype = fp4, group_sizes=[1, 1, block].
-        output = torch.ops.npu.npu_quant_matmul(
+        from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+        output = npu_matmul_ops.quant_matmul(
             qx,
             layer.weight,
             layer.weight_scale,
@@ -794,7 +834,7 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
     :class:`NPUSingleLevelMXFP4LinearMethod` is retained only as the offline path's
     base — msmodelslim checkpoints ship single-level UE8M0 scales.)
 
-    All NPU ops go through ``torch.ops.npu.*`` (no top-level ``torch_npu``). Only
+    Quantization and matmul ops resolve lazily through sgl-kernel-npu. Only
     ``create_weights`` (the BF16/FP16 placeholder) is shared with the single-level
     base; weight post-processing and the matmul are fully dual-level.
 
@@ -821,7 +861,9 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
 
         # Dual-level MXFP4 weight quant: packed FP4 weight + L0 (fine, FP8 E4M3)
         # and L1 (coarse) block scales.
-        qw, w_l0_scale, w_l1_scale = torch.ops.npu.npu_dynamic_dual_level_mx_quant(
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        qw, w_l0_scale, w_l1_scale = npu_quant_ops.dynamic_dual_level_mx_quant(
             weight_fp, smooth_scale=None
         )
 
@@ -856,13 +898,17 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
         x_2d = x.reshape(-1, x.shape[-1])
 
         # Dynamic dual-level MXFP4 activation quant (A4): packed FP4 + L0/L1 scales.
-        qx, act_l0_scale, act_l1_scale = torch.ops.npu.npu_dynamic_dual_level_mx_quant(
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        qx, act_l0_scale, act_l1_scale = npu_quant_ops.dynamic_dual_level_mx_quant(
             x_2d, smooth_scale=None
         )
 
         # Dual-level matmul. Arg order (act, weight, act_l0, w_l0, act_l1, w_l1);
         # the weight is NOT transposed here (unlike the single-level path).
-        output = torch.ops.npu.npu_dual_level_quant_matmul(
+        from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+        output = npu_matmul_ops.dual_level_quant_matmul(
             qx,
             layer.weight,
             act_l0_scale,
