@@ -305,7 +305,7 @@ Docker images for Ascend NPU are available in two types:
 
 {/* TODO: Interim explanation (CANN 9.2.0 has no stable release yet). Remove it and update the example image to the stable release once it is published. */}
 CANN 9.2.0 has no stable release yet, so use the latest validated build instead, e.g.,
-`swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050`. These
+`swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051`. These
 `cann9.2.0-<device>-B<NN>` tags are validated builds, not stable releases.
 
 If you encounter issues with a stable release, try switching to a daily build to see if the issue has been resolved in the latest development version.
@@ -330,7 +330,7 @@ model-weights or cache mounts from the original command, and drop `-e ASCEND_VIS
 # ============================================================
 
 NAME=sglang
-IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
+IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
 
 # A full A3 Series node exposes /dev/davinci0 through /dev/davinci15 (ids are DIE-level)
 docker run -itd --shm-size=16g --name "$NAME" \
@@ -373,7 +373,7 @@ docker run -itd --shm-size=16g --name "$NAME" \
 # ============================================================
 
 NAME=sglang
-IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B050
+IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B051
 
 # A full 950PR/DT Series node exposes /dev/davinci0 through /dev/davinci7
 docker run -itd --shm-size=16g --name "$NAME" \

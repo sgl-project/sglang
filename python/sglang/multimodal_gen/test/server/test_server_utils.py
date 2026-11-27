@@ -17,7 +17,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
@@ -60,6 +60,9 @@ from sglang.multimodal_gen.test.test_utils import (
     validate_video_file,
 )
 from sglang.test.test_utils import ADMIN_LAUNCH_ARGS_FOR_TEST
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.test.server.common.gpu_headroom import GpuHeadroomSampler
 
 logger = init_logger(__name__)
 
@@ -191,6 +194,14 @@ class ServerContext:
     _stdout_fh: Any = field(repr=False)
     _log_thread: threading.Thread | None = field(default=None, repr=False)
     load_time_ms: float | None = None
+    load_finished_ns: int | None = None
+    server_ready_ns: int | None = None
+    headroom_sampler: GpuHeadroomSampler | None = None
+
+    def minimum_free_vram(self) -> dict[str, list[float]]:
+        assert self.headroom_sampler is not None, "GPU headroom sampler missing"
+        assert self.load_finished_ns is not None and self.server_ready_ns is not None
+        return self.headroom_sampler.minima(self.load_finished_ns, self.server_ready_ns)
 
     def log_tail(self, lines: int = 200) -> str:
         """Return recent server output for failure diagnostics."""
@@ -491,9 +502,11 @@ class ServerManager:
         )
         try:
             self._wait_for_ready(process, stdout_path)
+            context.server_ready_ns = time.monotonic_ns()
             # health includes warmup; the worker marker's clock excludes it
             load_ready.wait(timeout=5)
             if load_finished_ns is not None:
+                context.load_finished_ns = load_finished_ns
                 context.load_time_ms = (load_finished_ns - load_started_ns) / 1e6
         except BaseException:
             context.cleanup()
@@ -617,14 +630,30 @@ class PerformanceValidator:
     ) -> None:
         assert summary.load_peak_vram_mb > 0, "Load peak VRAM metric missing"
         assert summary.runtime_peak_vram_mb > 0, "Runtime peak VRAM metric missing"
-        self._assert_peak_vram(
-            "Load Peak VRAM",
-            reserved=summary.load_peak_vram_mb,
-            allocated=summary.load_peak_allocated_mb,
-            expected_reserved=expected_load_peak_vram_mb,
-            expected_allocated=expected_load_peak_allocated_mb,
-            tolerance=self.tolerances.load_peak_vram,
-        )
+        floors = self.scenario.min_free_vram_mb
+        if floors is None:
+            self._assert_peak_vram(
+                "Load Peak VRAM",
+                reserved=summary.load_peak_vram_mb,
+                allocated=summary.load_peak_allocated_mb,
+                expected_reserved=expected_load_peak_vram_mb,
+                expected_allocated=expected_load_peak_allocated_mb,
+                tolerance=self.tolerances.load_peak_vram,
+            )
+        else:
+            # auto placement may keep more weights resident to reduce request time
+            assert {"load", "serving"} <= floors.keys(), (
+                "Missing load or serving GPU headroom floor"
+            )
+            minima = summary.min_free_vram_mb
+            for phase, floor in floors.items():
+                assert math.isfinite(floor) and floor > 0, (
+                    f"Invalid {phase} GPU headroom floor"
+                )
+                assert phase in minima, f"Missing {phase} GPU headroom measurement"
+                assert minima[phase] >= floor, (
+                    f"{phase} minimum free VRAM: {minima[phase]:.0f} MiB, need {floor:.0f} MiB"
+                )
         self._assert_peak_vram(
             "Runtime Peak VRAM",
             reserved=summary.runtime_peak_vram_mb,

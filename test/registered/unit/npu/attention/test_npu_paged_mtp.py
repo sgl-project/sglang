@@ -53,13 +53,16 @@ def backend():
     obj.needs_cpu_seq_lens = False
     obj.device = "cpu"
     obj.page_size, obj.speculative_num_draft_tokens = 128, 7
-    obj.max_context_len = 512
     obj.graph_mode = obj.enable_torch_compile = False
     obj.enable_sparsity_driven_kv_offload = False
     obj.is_hybrid_swa = obj.use_sliding_window_kv_pool = False
     obj.q_head_num_padding = None
     obj.req_to_token = torch.arange(1024, dtype=torch.int32).reshape(2, 512)
-    obj.req_to_token_pool = SimpleNamespace(req_to_token=obj.req_to_token)
+    obj.req_to_token_pool = SimpleNamespace(
+        req_to_token=obj.req_to_token, row_width=512
+    )
+    obj.max_kv_len = 512
+    obj.max_num_pages = 4
     obj.graph_metadata = {"block_tables": torch.zeros(2, 4, dtype=torch.int32)}
     obj.token_to_kv_pool = SimpleNamespace(
         get_key_buffer=Mock(return_value=torch.zeros(8, 128, 32)),
