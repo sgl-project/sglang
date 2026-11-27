@@ -1730,14 +1730,12 @@
                   "cookbook/vla/intro",
                   {
                     "group": "Black Forest Labs",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/vla/FLUX/FLUX-3-Action"
                     ]
                   },
                   {
                     "group": "OpenPI",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/vla/OpenPI/Pi0.5"
                     ]
