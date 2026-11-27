@@ -4346,6 +4346,67 @@ class ServingChatTestCase(CustomTestCase):
                 task="bogus",
             )
 
+    @staticmethod
+    def _openai_stream_event(*, text, status_code=None):
+        finish_reason = None
+        if status_code is not None:
+            finish_reason = {
+                "type": "abort",
+                "status_code": status_code,
+                "message": "grammar failed",
+            }
+        return {
+            "text": text,
+            "index": 0,
+            "meta_info": {
+                "id": "chatcmpl-abort-test",
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "finish_reason": finish_reason,
+            },
+        }
+
+    def _handle_openai_stream(self, events):
+        async def _generate():
+            for event in events:
+                yield event
+
+        self.tm.generate_request = Mock(return_value=_generate())
+        self.tm.create_abort_task = Mock(return_value=None)
+        return get_or_create_event_loop().run_until_complete(
+            self.chat._handle_streaming_request(
+                Mock(), self.stream_req, self.fastapi_request
+            )
+        )
+
+    def test_default_client_abort_before_first_token_is_an_http_error(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._handle_openai_stream(
+                [self._openai_stream_event(text="", status_code=HTTPStatus.BAD_REQUEST)]
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(ctx.exception.detail, "grammar failed")
+
+    def test_default_client_abort_after_first_chunk_remains_sse_error(self):
+        response = self._handle_openai_stream(
+            [
+                self._openai_stream_event(text="partial"),
+                self._openai_stream_event(text="", status_code=HTTPStatus.BAD_REQUEST),
+            ]
+        )
+        self.assertEqual(response.status_code, 200)
+
+        async def _collect():
+            return [chunk async for chunk in response.body_iterator]
+
+        chunks = get_or_create_event_loop().run_until_complete(_collect())
+        error = json.loads(
+            next(chunk for chunk in chunks if '"error"' in chunk)[len("data: ") :]
+        )["error"]
+        self.assertEqual(error["message"], "grammar failed")
+        self.assertEqual(error["code"], 400)
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"
