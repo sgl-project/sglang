@@ -1520,6 +1520,28 @@ def test_activation_scale_is_shared_across_token_blocks(block_m, tail):
         torch.testing.assert_close(scales[:, 0], torch.full((tokens,), 0.5))
 
 
+@pytest.mark.skipif(
+    not is_nvidia_cuda or torch.cuda.get_device_capability() != (10, 3),
+    reason="requires the SM103 block activation quantizer",
+)
+def test_block_fp8_activation_matches_torch_on_partial_strided_blocks():
+    values = torch.linspace(-2, 2, 256 * 129, device="cuda").bfloat16().view(256, 129).T
+    values[0, 0] = (
+        2.03125  # Multiplying by 1/448 and dividing by 448 round differently.
+    )
+    values[:128, 128:] = 0
+    values[-1, 0] = float("nan")
+    values[-1, 128] = float("inf")
+    quant, scales = _quantize_block_fp8_activation(values)
+    # FP32 inputs use the torch path with the same values and scale arithmetic.
+    ref_quant, ref_scales = _quantize_block_fp8_activation(values.float())
+    assert torch.equal(quant[:128].view(torch.uint8), ref_quant[:128].view(torch.uint8))
+    torch.testing.assert_close(
+        quant[-1].float(), ref_quant[-1].float(), rtol=0, atol=0, equal_nan=True
+    )
+    torch.testing.assert_close(scales, ref_scales, rtol=0, atol=0, equal_nan=True)
+
+
 @pytest.fixture
 def int8_layer():
     layer = QuantoInt8Linear(
