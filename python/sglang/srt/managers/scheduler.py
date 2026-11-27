@@ -4368,7 +4368,13 @@ class Scheduler(
             # The request moved to another scheduler queue after abort_request
             # deferred it, so retry against its current location.
             self._pending_chunked_abort_req = None
-            self.abort_request(AbortReq(rid=req.rid))
+            self.abort_request(
+                AbortReq(
+                    rid=req.rid,
+                    finished_reason=abort_reason and abort_reason.to_json(),
+                    abort_message=abort_reason and abort_reason.message,
+                )
+            )
             return
 
         sent_reason = req.discard_output_reason or abort_reason
@@ -6804,6 +6810,9 @@ class Scheduler(
             if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req
                 reason = recv_req.finished_reason
+                if recv_req.rid != chunked_req.rid:
+                    # Matched by prefix only: the reason belongs to another request.
+                    reason = None
                 self._pending_chunked_abort_reason = reason and FINISH_ABORT(
                     message=reason.get("message"),
                     status_code=reason.get("status_code"),
