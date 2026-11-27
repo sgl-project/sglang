@@ -1,4 +1,3 @@
-import os
 import sys
 import unittest
 from pathlib import Path
@@ -25,14 +24,6 @@ from sglang.test.test_utils import (
 TEST_ROOT = Path(__file__).resolve().parents[2]
 if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
-
-# The manual recovery fixture defaults to the private CI DSV3 checkpoint. The
-# registered job has no HF credentials, so use the public MLA checkpoint that
-# the sibling NIXL CI test already exercises unless CI supplies an override.
-if is_in_ci():
-    os.environ.setdefault(
-        "SGLANG_ELASTIC_RECOVER_TEST_MODEL", "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
-    )
 
 from manual.ep.test_elastic_scale import (
     TestElasticScaleUp4To6 as _TestElasticScaleUp4To6,
