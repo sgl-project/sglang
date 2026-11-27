@@ -261,7 +261,7 @@ class TestSpeculativeHeadroomAsksADemand(CustomTestCase):
         )
         aligned = -(-need // page) * page
         with patch(
-            "sglang.srt.mem_cache.allocation_sizing.get_spec_decode_reserve",
+            "sglang.srt.mem_cache.allocation_sizing.get_decode_reserve",
             return_value=0,
         ):
             return add_spec_decode_headroom_pages(batch, [aligned], page)
