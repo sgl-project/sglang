@@ -255,6 +255,180 @@ def _dequantize_k_cache_paged_kernel(
         tl.store(dst_ptr, data, mask=mask)
 
 
+def dequantize_k_cache_selected(
+    quant_k_cache: torch.Tensor, indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stands in for dequantize_k_cache_paged_dsa, with its per-slot arithmetic, for speed: that one dequantizes every
+    occurrence, while a speculative verify selects mostly the same slots for a request's draft rows.
+
+    Gather selected slots once, returning BF16 storage and remapped indices.
+
+    Indices must be contiguous int32 on the cache device. Negative entries are
+    padding; every nonnegative entry must be below physical cache capacity.
+    The caller owns that value-level invariant (no host sync during graphs).
+
+    Duplicates map to their first flattened occurrence. Only owner rows are
+    written; consumers must use the returned indices, never the original ones.
+    Storage has indices.numel() rows, not the number of unique slots. Ownership
+    is rebuilt on every call/replay, so cache contents and selections may change.
+    """
+    if (
+        quant_k_cache.dtype != torch.float8_e4m3fn
+        or quant_k_cache.ndim not in (3, 4)
+        or quant_k_cache.shape[-2:] != (1, 656)
+        or not quant_k_cache.is_contiguous()
+        or not quant_k_cache.is_cuda
+    ):
+        raise ValueError("Selected KV requires contiguous CUDA FP8 cache [..., 1, 656]")
+    if (
+        indices.dtype != torch.int32
+        or indices.device != quant_k_cache.device
+        or not indices.is_contiguous()
+    ):
+        raise ValueError(
+            "Selected KV indices must be contiguous int32 on the cache device"
+        )
+    flat = quant_k_cache.view(-1, 656)
+    count = indices.numel()
+    if count >= 2**31:
+        raise ValueError(
+            "Selected KV occurrence count exceeds int32 ownership capacity"
+        )
+    output = torch.empty((count, 1, 576), device=flat.device, dtype=torch.bfloat16)
+    mapped = torch.empty_like(indices)
+    if count == 0:
+        return output, mapped
+    owners = torch.full((flat.shape[0],), count, device=flat.device, dtype=torch.int32)
+    _selected_k_cache_owners[(triton.cdiv(count, 256),)](
+        indices,
+        owners,
+        count,
+        num_warps=4,
+    )
+    # Same-stream launch order makes all integer atomic-min owners visible.
+    owned = torch.empty((count,), device=flat.device, dtype=torch.int32)
+    num_owned = torch.zeros((1,), device=flat.device, dtype=torch.int32)
+    _map_and_list_owners[(triton.cdiv(count, _OWNER_LIST_BLOCK),)](
+        indices,
+        owners,
+        mapped,
+        owned,
+        num_owned,
+        count,
+        BLOCK=_OWNER_LIST_BLOCK,
+        num_warps=4,
+    )
+    nope = flat[:, :512]
+    scales = flat[:, 512:528].view(torch.float32)
+    rope = flat[:, 528:].view(torch.bfloat16)
+    programs = _owned_gather_programs(flat.device)
+    _gather_owned_k_cache[(programs,)](
+        output,
+        nope,
+        scales,
+        rope,
+        indices,
+        owned,
+        num_owned,
+        output.stride(0),
+        nope.stride(0),
+        scales.stride(0),
+        rope.stride(0),
+        ROWS=_OWNED_GATHER_ROWS,
+        PROGRAMS=programs,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    return output, mapped
+
+
+# Occurrences per program of the owner-list pass, and owner rows per step of the persistent gather. Speculative verify
+# selects nearly the same slots for a request's draft rows, so most occurrences are duplicates: gathering only the
+# listed owners, from a persistent grid, avoids one index -> owner -> payload load chain per occurrence.
+_OWNER_LIST_BLOCK = 1024
+_OWNED_GATHER_ROWS = 8
+_OWNED_GATHER_PROGRAMS_PER_SM = 16
+
+
+def _owned_gather_programs(device):
+    return (
+        torch.cuda.get_device_properties(device).multi_processor_count
+        * _OWNED_GATHER_PROGRAMS_PER_SM
+    )
+
+
+@triton.jit
+def _selected_k_cache_owners(indices, owners, count):
+    row = tl.program_id(0) * 256 + tl.arange(0, 256)
+    slot = tl.load(indices + row, mask=row < count, other=-1)
+    tl.atomic_min(owners + slot, row, mask=(row < count) & (slot >= 0), sem="relaxed")
+
+
+@triton.jit
+def _map_and_list_owners(
+    indices, owners, mapped, owned, num_owned, count, BLOCK: tl.constexpr
+):
+    """Map every occurrence to its owner; append the owner occurrences to ``owned`` (any order)."""
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = rows < count
+    slots = tl.load(indices + rows, mask=live, other=-1)
+    owner = tl.load(owners + slots, mask=live & (slots >= 0), other=-1)
+    tl.store(mapped + rows, owner, mask=live)
+    is_owner = live & (slots >= 0) & (owner == rows)
+    flags = is_owner.to(tl.int32)
+    base = tl.atomic_add(num_owned, tl.sum(flags, axis=0), sem="relaxed")
+    tl.store(owned + base + tl.cumsum(flags, axis=0) - 1, rows, mask=is_owner)
+
+
+@triton.jit
+def _gather_owned_k_cache(
+    output,
+    nope,
+    scales,
+    rope,
+    indices,
+    owned,
+    num_owned,
+    output_stride,
+    nope_stride,
+    scale_stride,
+    rope_stride,
+    ROWS: tl.constexpr,
+    PROGRAMS: tl.constexpr,
+):
+    """Dequantize each listed owner occurrence into its own output row (the same arithmetic as the paged gather)."""
+    n = tl.load(num_owned)
+    cols = tl.arange(0, 512)
+    rope_cols = tl.arange(0, 64)
+    for start in range(tl.program_id(0) * ROWS, n, PROGRAMS * ROWS):
+        at = start + tl.arange(0, ROWS)
+        live = at < n
+        rows = tl.load(owned + at, mask=live, other=0)
+        slots = tl.load(indices + rows, mask=live, other=0).to(tl.int64)
+        value = tl.load(
+            nope + slots[:, None] * nope_stride + cols[None, :],
+            mask=live[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        scale = tl.load(
+            scales + slots[:, None] * scale_stride + cols[None, :] // 128,
+            mask=live[:, None],
+            other=0.0,
+        )
+        out_rows = output + rows[:, None].to(tl.int64) * output_stride
+        tl.store(
+            out_rows + cols[None, :],
+            (value * scale).to(tl.bfloat16),
+            mask=live[:, None],
+        )
+        rotary = tl.load(
+            rope + slots[:, None] * rope_stride + rope_cols[None, :],
+            mask=live[:, None],
+            other=0.0,
+        )
+        tl.store(out_rows + 512 + rope_cols[None, :], rotary, mask=live[:, None])
+
+
 # Tokens handled by one program of the vectorized gather kernel.  4 tokens
 # x 512 fp8 nope elements = 2048 elements per program: with num_warps=4
 # (128 threads) that is 16 fp8 elements per thread, which Triton emits as

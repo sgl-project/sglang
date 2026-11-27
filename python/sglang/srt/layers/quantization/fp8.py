@@ -98,6 +98,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
+from sglang.srt.true_on_policy import fp8 as top_fp8
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -436,7 +437,10 @@ class Fp8Config(QuantizationConfig):
             )
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
-                assert get_moe_runner_backend().is_auto(), (
+                # TOP DeepSeek-V4.1 runs the cast experts on the DeepGEMM runner by name (validate_ep_runtime).
+                assert get_moe_runner_backend().is_auto() or (
+                    top_fp8.enabled_b32() and get_moe_runner_backend().is_deep_gemm()
+                ), (
                     f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
                 )
                 return fp8_method
@@ -859,14 +863,20 @@ class Fp8LinearMethod(LinearMethodBase):
             return
         else:
             # Requantize block scales to UE8M0 when DeepGEMM is the active runner.
-            requant_block_scale_ue8m0_for_deepgemm(
-                layer.weight,
-                layer.weight_scale_inv,
-                getattr(self.quant_config, "weight_block_size", None),
-                use_deepgemm_runner=use_deepgemm_runner,
-                output_dtype=getattr(layer, "orig_dtype", None),
-                weight_shape=layer.weight.shape,
-            )
+            # A layer the model reads directly (DS4 wo_a) keeps its loaded form; its forward owns the scale format.
+            top_requant = not getattr(layer, "keep_plain_weight_layout", False)
+            if not (
+                top_requant
+                and top_fp8.requant_ue8m0(layer.weight, layer.weight_scale_inv)
+            ):
+                requant_block_scale_ue8m0_for_deepgemm(
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    getattr(self.quant_config, "weight_block_size", None),
+                    use_deepgemm_runner=use_deepgemm_runner,
+                    output_dtype=getattr(layer, "orig_dtype", None),
+                    weight_shape=layer.weight.shape,
+                )
             weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
         layer.weight.data = weight.data
@@ -1335,6 +1345,11 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # The stock block-FP8 dispatch picks DeepGEMM or Triton by backend and block shape; TOP runs the full-K
+        # DeepGEMM program the trainer runs on the checkpoint's bytes.
+        if (top_output := top_fp8.maybe_linear(self, layer, x, bias)) is not None:
+            return top_output
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
@@ -2303,15 +2318,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     (layer.w13_weight, layer.w13_weight_scale_inv),
                     (layer.w2_weight, layer.w2_weight_scale_inv),
                 ):
-                    requant_block_scale_ue8m0_for_deepgemm(
-                        weight,
-                        weight_scale,
-                        weight_block_size,
-                        use_deepgemm_runner=will_use_deepgemm,
-                        output_dtype=torch.bfloat16,
-                        weight_shape=weight.shape[-2:],
-                        grouped_moe=True,
-                    )
+                    # TOP requantizes in the weight's own storage: a replacement tensor would strand torch_memory_saver
+                    # pool memory (top_fp8._requant_ue8m0_in_place).
+                    if not top_fp8.requant_ue8m0_experts(weight, weight_scale):
+                        requant_block_scale_ue8m0_for_deepgemm(
+                            weight,
+                            weight_scale,
+                            weight_block_size,
+                            use_deepgemm_runner=will_use_deepgemm,
+                            output_dtype=torch.bfloat16,
+                            weight_shape=weight.shape[-2:],
+                            grouped_moe=True,
+                        )
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.mxfp8_block_convert import (

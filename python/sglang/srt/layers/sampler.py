@@ -25,6 +25,7 @@ from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.true_on_policy import resolve_true_on_policy_runtime_policy
+from sglang.srt.true_on_policy.sampling import scale_logits_for_sampling
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -126,6 +127,10 @@ class Sampler(nn.Module):
                 self.cp_sync_group = get_parallel().attn_cp_group.device_group
 
         true_on_policy = resolve_true_on_policy_runtime_policy(get_server_args())
+        if true_on_policy.enabled and SGLANG_RETURN_ORIGINAL_LOGPROB:
+            raise ValueError(
+                "TOP requires temperature-adjusted logprobs; unset SGLANG_RETURN_ORIGINAL_LOGPROB"
+            )
         # In RL on-policy mode, deterministic inference is automatically enabled.
         self.enable_deterministic = (
             get_exec().deterministic.enable_deterministic_inference
@@ -238,7 +243,10 @@ class Sampler(nn.Module):
                 original_logprobs = torch.log_softmax(logits, dim=-1)
 
             # Post process logits
-            logits.div_(sampling_info.temperatures)
+            if self.use_log_softmax_logprob:
+                logits = scale_logits_for_sampling(logits, sampling_info.temperatures)
+            else:
+                logits.div_(sampling_info.temperatures)
 
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
@@ -634,15 +642,17 @@ class Sampler(nn.Module):
         sampling_info: SamplingBatchInfo,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Sample from log-probabilities using the Gumbel trick.
+        """Request-local exponential-race sampling (no top-k/top-p/min-p).
 
-        Used for deterministic sampling with simple cases (no top-k/top-p/min-p).
+        Seeded exponential race; a draw depends only on the request seed and the position.
         Requires sampling_seed to be set in sampling_info.
         """
         assert sampling_info.sampling_seed is not None, (
             "sampling_seed is required for sampling from logprobs"
         )
-        sampled_index = multinomial_with_seed(
+        from sglang.srt.true_on_policy.exponential_race import sample_from_logprobs
+
+        sampled_index = sample_from_logprobs(
             logprobs, sampling_info.sampling_seed, positions
         )
         return sampled_index.view(-1).to(torch.int32)

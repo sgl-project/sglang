@@ -814,6 +814,10 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
 
 def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
+    from sglang.srt.true_on_policy.dsv4 import top_mhc_pre_num_splits
+
+    if (pinned := top_mhc_pre_num_splits()) is not None:
+        return pinned
     block_m, block_k = 64, 64
     grid_size = (num_tokens + block_m - 1) // block_m
     num_block_k = (hc_hidden_size + block_k - 1) // block_k
@@ -1693,7 +1697,11 @@ def mhc_fused_post_pre(
 
     # The scalar-FMA kernel wins only for small batches where launch
     # overhead dominates; beyond the threshold DeepGEMM's tensor-core path wins.
-    fma_token_threshold = 32
+    from sglang.srt.true_on_policy.dsv4 import top_mhc_pre_num_splits
+
+    # TOP keeps the unfused path's kernels (post, pinned-split DeepGEMM, big_fuse) at every
+    # token count; the scalar-FMA GEMM rounds unlike DeepGEMM and serves only small batches.
+    fma_token_threshold = 0 if top_mhc_pre_num_splits() is not None else 32
     if num_tokens <= fma_token_threshold:
         tile_n = 2 if num_tokens < 8 else 3
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4

@@ -674,7 +674,16 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
+        # TOP (DeepSeek-V4.1) runs its experts over DeepEP under attention DP and admits DSpark there: the draft's
+        # low-latency calls use the target's buffer layout (_DeepEPDispatcherImplLowLatency._buffer_layout).
+        if (
+            not _is_npu
+            and cfg.moe_a2a_backend not in ("none", "megamoe", "mori")
+            and not (
+                cfg.true_on_policy_contract is not None
+                and cfg.moe_a2a_backend == "deepep"
+            )
+        ):
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend 'none' "
                 "(built-in TP MoE), 'megamoe', or 'mori', got "
@@ -1132,8 +1141,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
         "HYV4ForCausalLM",
-        # Qwen4-Exp ships its NEXTN draft layer inside the target checkpoint.
+        # Qwen4-Exp and GLM-5.3-Flash ship their NEXTN draft layer inside the target checkpoint.
         "Qwen4ExpForConditionalGeneration",
+        "Glm5NextForConditionalGeneration",
     ]:
         if cfg.speculative_draft_model_path is None:
             declare_resolution(

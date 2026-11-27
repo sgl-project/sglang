@@ -24,6 +24,7 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.true_on_policy import is_true_on_policy_enabled
+from sglang.srt.true_on_policy import vision as top_vision
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -1380,6 +1381,36 @@ class VisionAttention(nn.Module):
             )
         return q, k
 
+    def _top_attention(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        forward_metadata: Optional[VisionAttentionMetadata],
+        s_aux: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if (
+            not self.use_qkv_parallel
+            or forward_metadata is None
+            or attention_mask is not None
+            or s_aux is not None
+            or self.qk_normalization
+            or self.qk_normalization_by_head_size
+        ):
+            raise NotImplementedError(
+                "[top] the vision tower program is packed, unmasked, full self-attention over a fused QKV projection"
+            )
+        return top_vision.attention(
+            q,
+            k,
+            v,
+            cu_seqlens=forward_metadata.cu_seqlens,
+            max_seqlen=forward_metadata.max_seqlen,
+            softmax_scale=self.softmax_scale,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1402,12 +1433,23 @@ class VisionAttention(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
-        if is_true_on_policy_enabled() and position_embeddings is not None:
+        # TOP runs the tower program of true_on_policy.vision: its projections, rotary and attention.
+        top = is_true_on_policy_enabled()
+        # A customized applier owns its tables' precision (DeepSeek-V4.1 rotates in FP32).
+        if (
+            top
+            and position_embeddings is not None
+            and self.customized_position_embedding_applier is None
+        ):
             assert isinstance(position_embeddings, tuple), (
                 "expected position_embeddings to be a tuple of two tensors,\n"
                 f"but got {type(position_embeddings)}, change if needed"
             )
             position_embeddings = tuple(p.to(x.dtype) for p in position_embeddings)
+        if top and self.tp_size != 1:
+            raise NotImplementedError(
+                "[top] the vision tower runs unsharded: every projection must see its full K"
+            )
         x_shape = x.shape
         bsz, s, _ = x_shape
         head = self.num_attention_heads_per_partition
@@ -1420,7 +1462,10 @@ class VisionAttention(nn.Module):
         )
         if self.use_qkv_parallel:
             # [b, s, embed_dim] --> [b, s, embed_dim]
-            qkv, _ = self.qkv_proj(x)
+            if top:
+                qkv = top_vision.linear(x, self.qkv_proj.weight, self.qkv_proj.bias)
+            else:
+                qkv, _ = self.qkv_proj(x)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
             # [b, s, embed_dim] --> [b * s, head, head_size]
@@ -1490,6 +1535,8 @@ class VisionAttention(nn.Module):
                 if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
                 else apply_rotary_pos_emb
             )
+            if top:
+                rotary_fn = top_vision.rotate
             q, k = rotary_fn(q, k, cos, sin)
             q = q.view(original_q_shape)
             k = k.view(original_k_shape)
@@ -1536,22 +1583,33 @@ class VisionAttention(nn.Module):
             q_head_end = (self.tp_rank + 1) * self.num_attention_heads_per_partition
             s_aux = self.sinks[q_head_start:q_head_end]
 
-        output = self.qkv_backend.forward(
-            q=q,
-            k=k,
-            v=v,
-            bsz=bsz,
-            seq_len=s,
-            cu_seqlens=cu_seqlens,
-            attention_mask=attention_mask,
-            forward_metadata=forward_metadata,
-            sequence_lengths=sequence_lengths,
-            max_seqlen=max_seqlen,
-            output_ws=attn_output_ws,
-            softmax_scale=self.softmax_scale,
-            window_size=effective_window_size,
-            s_aux=s_aux,
-        )
+        if top:
+            # The --mm-attention-backend kernels are other programs; the trainer's tower calls this noncausal FA4 forward.
+            output = self._top_attention(
+                q=q,
+                k=k,
+                v=v,
+                attention_mask=attention_mask,
+                forward_metadata=forward_metadata,
+                s_aux=s_aux,
+            )
+        else:
+            output = self.qkv_backend.forward(
+                q=q,
+                k=k,
+                v=v,
+                bsz=bsz,
+                seq_len=s,
+                cu_seqlens=cu_seqlens,
+                attention_mask=attention_mask,
+                forward_metadata=forward_metadata,
+                sequence_lengths=sequence_lengths,
+                max_seqlen=max_seqlen,
+                output_ws=attn_output_ws,
+                softmax_scale=self.softmax_scale,
+                window_size=effective_window_size,
+                s_aux=s_aux,
+            )
 
         assert output.dim() == 3, output.shape
 
@@ -1560,7 +1618,10 @@ class VisionAttention(nn.Module):
             output = output.reshape(bsz, s, -1)
 
             # [b, s, h * head_size] --> [b, s, h * head_size]
-            output, _ = self.proj(output)
+            if top:
+                output = top_vision.linear(output, self.proj.weight, self.proj.bias)
+            else:
+                output, _ = self.proj(output)
         else:
             # [b * s, h, head_size] --> [s, b, h * head_size]
             context_layer = rearrange(

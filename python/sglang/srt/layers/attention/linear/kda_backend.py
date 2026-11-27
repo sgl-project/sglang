@@ -1246,7 +1246,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # skips the write (CACHE_INTERMEDIATE_STATES=False); the output is unaffected.
         replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
         replayssm_on = replayssm_rawv is not None
-        if intermediate_state_cache is None and not replayssm_on:
+        if (
+            intermediate_state_cache is None
+            and not replayssm_on
+            and getattr(
+                self.kernel_dispatcher.verify_kernel,
+                "verify_needs_intermediate_states",
+                True,
+            )
+        ):
             raise RuntimeError(
                 "KDA target_verify requires a speculative mamba cache "
                 "(MambaPool.SpeculativeState); none found."

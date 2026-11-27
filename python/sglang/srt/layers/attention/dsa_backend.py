@@ -563,10 +563,18 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
+        from sglang.srt.true_on_policy import is_true_on_policy_enabled
+        from sglang.srt.true_on_policy.fp8 import enabled as top_fp8
+
+        self.top_fp8_storage = top_fp8()
         # Dense MHA expands prefix KV outside the DSA metadata path. Keep
         # sharded prefill on the sparse kernels with explicit scratch addresses.
+        # TOP prefills on the sparse kernels the trainer and graph replay run;
+        # the dense one-shot is a different function of the same tokens.
         self.supports_mha_one_shot: bool = (
-            self.dcp_size == 1 and self._kv_shard_pool is None
+            self.dcp_size == 1
+            and self._kv_shard_pool is None
+            and not is_true_on_policy_enabled()
         )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
@@ -698,6 +706,11 @@ class DeepseekSparseAttnBackend(
 
         # Q8KV8 per-call device-tensor caches, populated lazily on the first
         # Q8KV8 dispatch (no-ops for other backends).
+        if self.top_fp8_storage:
+            from sglang.srt.true_on_policy.dsa import flashmla_fp8
+
+            flashmla_fp8.validate_backend(self)
+
         self._q8kv8_identity_scale: Optional[torch.Tensor] = None
         self._q8kv8_qpad_buf: Optional[torch.Tensor] = None
         # Grow-only -1-filled top-k pad buffer; see _pad_topk_width_buffered.
@@ -2306,9 +2319,14 @@ class DeepseekSparseAttnBackend(
                     if topk_indices_offset.ndim == 1
                     else topk_indices_offset
                 )
-                topk_indices = torch.where(
-                    mask, topk_indices + topk_indices_offset, topk_indices
-                )
+                if self.top_fp8_storage:
+                    from sglang.srt.true_on_policy.dsa.flashmla_fp8 import offset_ragged
+
+                    topk_indices = offset_ragged(topk_indices, topk_indices_offset)
+                else:
+                    topk_indices = torch.where(
+                        mask, topk_indices + topk_indices_offset, topk_indices
+                    )
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(
@@ -2449,6 +2467,10 @@ class DeepseekSparseAttnBackend(
                     )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
+                    if self.top_fp8_storage:
+                        from sglang.srt.true_on_policy.dsa import flashmla_fp8
+
+                        kv_cache = flashmla_fp8.roundtrip_cold_prefill_kv(kv_cache)
 
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2637,6 +2659,19 @@ class DeepseekSparseAttnBackend(
             )
 
         if dsa_impl == "flashmla_sparse":
+            if self.top_fp8_storage and kv_cache.dtype == torch.float8_e4m3fn:
+                from sglang.srt.true_on_policy.dsa.flashmla_fp8 import (
+                    sparse_from_fp8_split,
+                )
+
+                return sparse_from_fp8_split(
+                    q_nope,
+                    q_rope,
+                    kv_cache,
+                    page_table_1,
+                    layer.scaling,
+                    layer.v_head_dim,
+                )
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
@@ -2812,71 +2847,33 @@ class DeepseekSparseAttnBackend(
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.flash_mla_interface import (
-            flash_mla_sparse_fwd,
-        )
+        if self.top_fp8_storage and kv_cache.dtype == torch.float8_e4m3fn:
+            from sglang.srt.true_on_policy.dsa.flashmla_fp8 import sparse_from_fp8
 
-        # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
-        # When using TP, num_heads might be smaller (e.g., 256//8=32)
-        num_tokens, num_heads, head_dim = q_all.shape
+            return sparse_from_fp8(q_all, kv_cache, page_table_1, sm_scale, v_head_dim)
 
-        # Determine required padding based on GPU architecture (use cached value)
-        required_padding = 128 if self.device_sm_major >= 10 else 64
-
-        need_padding = num_heads % required_padding != 0
-
-        if need_padding:
-            assert required_padding % num_heads == 0, (
-                f"num_heads {num_heads} cannot be padded to {required_padding}. "
-                f"TP size may be too large for this model."
+        if self.top_fp8_storage:
+            from sglang.srt.true_on_policy.dsa.flashmla_fp8 import (
+                sparse_from_bf16_by_passes,
             )
 
-            # Pad q to required size
-            q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
-            q_padded[:, :num_heads, :] = q_all
-            q_input = q_padded
-        else:
-            q_input = q_all
+            return sparse_from_bf16_by_passes(
+                q_all, kv_cache, page_table_1, sm_scale, v_head_dim, topk_length
+            )
 
-        sink_input = attn_sink
-        if need_padding and attn_sink is not None:
-            key = (attn_sink.data_ptr(), required_padding)
-            sink_input = self._sink_pad_cache.get(key)
-            if sink_input is None:
-                sink_input = attn_sink.new_zeros(required_padding)
-                self._sink_pad_cache[key] = sink_input
-            sink_input[:num_heads].copy_(attn_sink)
+        from sglang.srt.layers.attention.dsa.flashmla import flashmla_sparse_bf16
 
-        # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
-        indices_input = page_table_1.unsqueeze(1)
-
-        # topk_length is the per-row count of valid indices
-        # (`dsa_cache_seqlens_int32` = seqlens clipped to `index_topk`). Rows
-        # whose context is shorter than `index_topk` have their indices
-        # tail-padded with -1; passing the valid length lets the kernel skip
-        # the padded tail instead of scanning the full topk width. The output
-        # is unchanged: the kernel masks -1 indices either way.
-        if topk_length is not None and topk_length.shape[0] != num_tokens:
-            # Metadata rows are expected to match q rows (the DP/CP padding
-            # helpers keep them aligned); fall back to full-width compute if
-            # they ever diverge.
-            topk_length = None
-
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_input,
-            kv=kv_cache,
-            indices=indices_input,
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-            attn_sink=sink_input,
+        return flashmla_sparse_bf16(
+            q_all,
+            kv_cache,
+            v_head_dim,
+            page_table_1,
+            sm_scale,
+            device_sm_major=self.device_sm_major,
             topk_length=topk_length,
+            attn_sink=attn_sink,
+            sink_pad_cache=self._sink_pad_cache,
         )
-
-        # Trim output back to original num_heads if we padded
-        if need_padding:
-            o = o[:, :num_heads, :]
-
-        return o
 
     def q8kv8_born_fp8_q_eligible(
         self, forward_batch: ForwardBatch, num_heads: int

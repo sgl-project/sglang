@@ -111,6 +111,8 @@ class MRotaryEmbedding(RotaryEmbedding):
             # A lane-to-axis lookup derived from mrope_section, not a weight: the RL
             # weight checker must neither poison nor compare it.
             self.axis_map._skip_weight_check = True
+        # forward_cuda picks the Triton kernel or forward_native by the positions' layout; TOP keeps the eager
+        # program (the rope op's M-RoPE rounding) at every layout.
         if self._force_native:
             self._forward_method = self.forward_native
 

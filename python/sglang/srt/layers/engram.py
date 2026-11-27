@@ -65,6 +65,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
 )
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -1328,6 +1329,8 @@ class Engram(nn.Module):
         )
         self.q_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
         self.k_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
+        # TOP: serving's fused gate at every row count (true_on_policy.dsv41_engram).
+        self.top = is_true_on_policy_enabled()
 
     def forward(
         self,
@@ -1359,6 +1362,20 @@ class Engram(nn.Module):
             return x
         kv, _ = self.wkv(emb.flatten(-2))
         image_ids = input_ids if self.image_token_id is not None else None
+        # engram_gate falls back to torch on non-contiguous or off-dtype inputs; TOP always runs the fused gate.
+        if self.top:
+            from sglang.srt.true_on_policy import dsv41_engram
+
+            return dsv41_engram.gate(
+                x,
+                kv,
+                self.q_weight,
+                self.k_weight,
+                self.eps,
+                self.clamp_value,
+                image_ids,
+                self.image_token_id,
+            )
         return engram_gate(
             x,
             kv,

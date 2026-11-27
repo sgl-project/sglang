@@ -3291,9 +3291,28 @@ class KVCacheConfigurator:
         extra_per_slot = replayssm_ring_per_slot + int(
             self.extra_mamba_cache_bytes_per_req * pp_layer_scale
         )
+        from sglang.srt.true_on_policy.gdn_chunked import (
+            row_cache_bytes_per_request,
+            top_gdn_chunked_active,
+        )
+
+        # TOP GDN: a row cache per req-pool row (fixed-size request scratch, as the
+        # ReplaySSM ring) and no intermediate_ssm under speculation.
+        top_gdn_chunked = (
+            self.hybrid_gdn_config is not None and top_gdn_chunked_active()
+        )
+        if top_gdn_chunked:
+            if get_schedule().max_running_requests is None:
+                raise ValueError(
+                    "TOP GDN sizes its per-request row cache by --max-running-requests; set it"
+                )
+            replayssm_fixed_bytes += row_cache_bytes_per_request(
+                self.model_config.hf_text_config, max_stage_mamba_layers
+            ) * (get_schedule().max_running_requests // self.attn_dp_size + 1)
         reserves_spec_state = (
             has_spec_dec
             and not replayssm_active
+            and not top_gdn_chunked
             and not _pd_prefill_skips_mamba_spec_state()
         )
         if has_spec_dec:

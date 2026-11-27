@@ -175,6 +175,7 @@ def _matmul_persistent_triton(
     b: torch.Tensor,
     out_dtype: torch.dtype,
     bias: torch.Tensor | None = None,
+    config: dict | None = None,
 ):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -244,7 +245,8 @@ def _matmul_persistent_triton(
         B_LARGE=b.numel() > 2**31,
         C_LARGE=c.numel() > 2**31,
         HAS_BIAS=bias is not None,
-        **configs[a.dtype],
+        # A fixed config keeps every row's reduction independent of M; callers may pick one for their shape.
+        **(config if config is not None else configs[a.dtype]),
     )
     return c
 
@@ -291,6 +293,10 @@ def matmul_persistent(
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
 ):
+    # TOP runs DeepGEMM only: the dispatch below falls back to Triton or einsum by layout, N and env,
+    # so serving and the trainer could land on different kernels.
+    if _is_true_on_policy():
+        return _matmul_persistent_top(a, b, out_dtype=out_dtype or a.dtype, bias=bias)
     K, N = b.shape
     out_dtype = out_dtype or a.dtype
 
@@ -337,6 +343,82 @@ def matmul_persistent(
         return out
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias, out_dtype=out_dtype)
+
+
+def _is_true_on_policy() -> bool:
+    """TOP processes run the strict DeepGEMM-only program; other batch-invariant users keep the DeepGEMM/Triton
+    dispatch above. A process that never published server args is not serving TOP."""
+    from sglang.srt.true_on_policy import is_true_on_policy_enabled
+
+    try:
+        return is_true_on_policy_enabled()
+    except ValueError:
+        return False
+
+
+def _matmul_persistent_top(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """TOP's BI GEMM: DeepGEMM only; a call it cannot run raises instead of changing kernels."""
+    if not _ENABLE_MM_DEEPGEMM or not ENABLE_JIT_DEEPGEMM:
+        raise RuntimeError(
+            "TOP BI matmul requires enabled DeepGEMM; no fallback is supported"
+        )
+    if type(a) not in (torch.Tensor, torch.nn.Parameter) or type(b) not in (
+        torch.Tensor,
+        torch.nn.Parameter,
+    ):
+        raise NotImplementedError(
+            "TOP BI matmul requires plain tensors; quantized tensor wrappers are unsupported"
+        )
+    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
+        raise ValueError(
+            f"TOP BI matmul requires compatible 2D inputs, got {a.shape=} and {b.shape=}"
+        )
+    if (
+        not a.is_cuda
+        or not b.is_cuda
+        or a.device != b.device
+        or a.dtype != torch.bfloat16
+        or b.dtype != torch.bfloat16
+        or out_dtype not in (torch.bfloat16, torch.float32)
+    ):
+        raise NotImplementedError(
+            "TOP BI matmul requires same-device CUDA BF16 inputs and BF16 or FP32 output; "
+            f"got {a.device=}, {b.device=}, {a.dtype=}, {b.dtype=}, {out_dtype=}. "
+            "FP8 requires a separately qualified dispatch."
+        )
+    if bias is not None:
+        raise NotImplementedError(
+            "TOP BI matmul does not support fused bias; no rounding-changing fallback is allowed"
+        )
+    M, K = a.shape
+    N = b.shape[1]
+    # Zero output rows leave every real column's arithmetic unchanged; only widths DeepGEMM would reject are padded.
+    pad_n = -N % 16
+    if pad_n and a.is_contiguous() and b.transpose(0, 1).is_contiguous():
+        b = torch.nn.functional.pad(b.transpose(0, 1), (0, 0, 0, pad_n)).transpose(0, 1)
+        return _matmul_persistent_top(a, b, out_dtype=out_dtype)[:, :N].contiguous()
+    if (
+        not a.is_contiguous()
+        or not b.transpose(0, 1).is_contiguous()
+        or K < 128
+        or K % 128 != 0
+        or N < 16
+        or N % 16 != 0
+    ):
+        raise NotImplementedError(
+            "TOP BI DeepGEMM requires contiguous A, transpose-contiguous B, "
+            "M >= 0, K >= 128 divisible by 128, and N >= 16 divisible by 16; "
+            f"got {M=}, {N=}, {K=}, A stride={a.stride()}, B stride={b.stride()}"
+        )
+    if M == 0:
+        return torch.empty((0, N), device=a.device, dtype=out_dtype)
+    return _matmul_persistent_deepgemm(a=a, b=b, out_dtype=out_dtype)
 
 
 @triton.jit
@@ -434,6 +516,18 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     input_2d = input_2d.contiguous()
 
     n_rows, n_cols = input_2d.shape
+
+    # The tiled path is limited to the 151,936-entry Qwen vocabulary. Both trainer
+    # and serving use this dispatcher; the seeded sampler is unaffected.
+    if (
+        _is_true_on_policy()
+        and input.is_cuda
+        and input.dtype == torch.bfloat16
+        and n_cols == 151936
+    ):
+        from sglang.srt.true_on_policy.log_softmax import tiled_log_softmax
+
+        return tiled_log_softmax(input_2d).reshape(original_shape)
 
     # Allocate output tensor
     output = torch.empty_like(input_2d)
@@ -995,7 +1089,14 @@ def _rms_norm_aten_compat(input, normalized_shape, weight=None, eps=None):
 
 
 def _mm_dtype_compat(self, mat2, out_dtype):
-    return matmul_persistent(self.contiguous(), mat2.contiguous(), out_dtype=out_dtype)
+    if not _is_true_on_policy():
+        return matmul_persistent(
+            self.contiguous(), mat2.contiguous(), out_dtype=out_dtype
+        )
+    # TOP's matmul reads B as a transpose-contiguous [K, N] view, e.g. weight.t().
+    if not mat2.transpose(0, 1).is_contiguous():
+        mat2 = mat2.transpose(0, 1).contiguous().transpose(0, 1)
+    return matmul_persistent(self.contiguous(), mat2, out_dtype=out_dtype)
 
 
 _batch_invariant_MODE = False

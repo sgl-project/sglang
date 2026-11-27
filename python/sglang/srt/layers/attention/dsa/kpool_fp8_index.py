@@ -1830,6 +1830,7 @@ def _kpool_write_tail_and_maybe_compress_kernel(
     ROUND_SCALE: tl.constexpr,
     HAS_EFFECTIVE_N: tl.constexpr,
     MAX_CLOSED_POOLS: tl.constexpr,
+    TWO_PASS: tl.constexpr,
 ):
     b = tl.program_id(0)
     cache_loc_0 = tl.load(out_cache_loc_ptr + b * N)
@@ -1866,6 +1867,21 @@ def _kpool_write_tail_and_maybe_compress_kernel(
             m = tl.full((BLOCK_D,), -float("inf"), tl.float32)
             acc = tl.full((BLOCK_D,), 0.0, tl.float32)
             denom = tl.full((BLOCK_D,), 0.0, tl.float32)
+            if TWO_PASS:
+                # The decode kernel's two-pass softmax (max first, then the weighted sum in slot order), so a group a
+                # verify window completes is the group decode would write (TOP).
+                for slot in tl.static_range(0, POOL_SIZE):
+                    phys = (base + slot) % TAIL_SIZE
+                    off = req * tail_stride_0 + phys * tail_stride_1 + offs
+                    score = tl.load(tail_score_ptr + off, mask=dim_mask, other=0.0).to(
+                        tl.float32
+                    )
+                    score += tl.load(
+                        ape_ptr + slot * ape_stride_0 + offs,
+                        mask=dim_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    m = tl.maximum(m, score)
             for slot in tl.static_range(0, POOL_SIZE):
                 phys = (base + slot) % TAIL_SIZE
                 off = req * tail_stride_0 + phys * tail_stride_1 + offs
@@ -1880,12 +1896,17 @@ def _kpool_write_tail_and_maybe_compress_kernel(
                     mask=dim_mask,
                     other=0.0,
                 ).to(tl.float32)
-                new_m = tl.maximum(m, score)
-                rescale = tl.exp(m - new_m)
-                prob = tl.exp(score - new_m)
-                denom = denom * rescale + prob
-                acc = acc * rescale + k_ld * prob
-                m = new_m
+                if TWO_PASS:
+                    prob = tl.exp(score - m)
+                    denom += prob
+                    acc += k_ld * prob
+                else:
+                    new_m = tl.maximum(m, score)
+                    rescale = tl.exp(m - new_m)
+                    prob = tl.exp(score - new_m)
+                    denom = denom * rescale + prob
+                    acc = acc * rescale + k_ld * prob
+                    m = new_m
 
             quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE)
             loc = tl.load(write_loc_ptr + b * write_loc_stride_0 + p)
@@ -1924,6 +1945,7 @@ def kpool_write_tail_and_maybe_compress(
     num_draft_tokens: int,
     round_scale: bool,
     effective_n_per_batch: Optional[torch.Tensor] = None,
+    two_pass: bool = False,
 ) -> None:
     assert num_draft_tokens > 0
     assert key.dim() == 2 and key.shape[1] == INDEX_HEAD_DIM
@@ -1992,4 +2014,5 @@ def kpool_write_tail_and_maybe_compress(
         ROUND_SCALE=round_scale,
         HAS_EFFECTIVE_N=effective_n_per_batch is not None,
         MAX_CLOSED_POOLS=max_closed_pools,
+        TWO_PASS=two_pass,
     )

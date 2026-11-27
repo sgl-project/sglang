@@ -74,11 +74,15 @@ def configure_aux_hidden_state_capture(
 
 def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
     """Init attention kernel backend."""
-    from sglang.srt.configs.model_config import AttentionArch
-
     # TODO: Refactor device-specific init branches into platform interface (separate PR).
     # Must run before the SSM early-return below; Mamba mixers still issue GEMMs.
-    if model_runner.device in ("cuda", "musa"):
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    from sglang.srt.configs.model_config import AttentionArch
+
+    if (
+        model_runner.device in ("cuda", "musa")
+        and not is_batch_invariant_mode_enabled()
+    ):
         init_cublas()
 
     # SSM models use the Mamba backend, not attention. Import inside the branch so

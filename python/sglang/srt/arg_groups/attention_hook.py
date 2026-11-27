@@ -37,6 +37,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.true_on_policy.contracts import (
     resolve_true_on_policy_runtime_policy,
+    top_keeps_radix_cache,
     validate_true_on_policy_contract,
 )
 from sglang.srt.utils.common import (
@@ -586,6 +587,10 @@ def handle_deterministic_inference(server_args: Any):
         RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
     )
 
+    absorbed_mla_backends = RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND + [
+        "dsa",
+        "nsa",
+    ]
     cfg = resolving_view(server_args)
     validate_true_on_policy_contract(cfg)
 
@@ -680,9 +685,9 @@ def handle_deterministic_inference(server_args: Any):
 
         attention_backend = resolved_view(server_args).attention_backend
         if is_deepseek_model:
-            if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
+            if attention_backend not in absorbed_mla_backends:
                 raise ValueError(
-                    f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with absorbed-MLA models. But you're using {attention_backend}."
+                    f"Currently only {absorbed_mla_backends} attention backends are supported for deterministic inference with absorbed-MLA models. But you're using {attention_backend}."
                 )
             if attention_backend == "fa4" and not get_platform().is_sm100_or_sm110:
                 raise ValueError(
@@ -692,7 +697,10 @@ def handle_deterministic_inference(server_args: Any):
                     "implements on those archs."
                 )
 
-        if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
+        if (
+            attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+            and not top_keeps_radix_cache(cfg, attention_backend)
+        ):
             # Currently, only certain backends support radix cache. Support for other backends is in progress
             declare_resolution(
                 server_args,

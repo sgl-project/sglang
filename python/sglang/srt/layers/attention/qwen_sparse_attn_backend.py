@@ -274,6 +274,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         # (layer_id, k_full, v_full) of the prefill-CP K/V gather prefetch_cp_kv
         # started; that layer's _forward_extend_cp joins it.
         self._cp_kv_pending: Optional[Tuple[int, torch.Tensor, torch.Tensor]] = None
+        from sglang.srt.true_on_policy import is_true_on_policy_enabled
+
+        # TOP reads every path's K/V from the pool with one kernel; see true_on_policy/qsa.py.
+        self.top_enabled = is_true_on_policy_enabled()
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -531,11 +535,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         valid = entries < ends[-1] if counts.numel() else entries < 0
         rows = torch.where(valid, rows.clamp_max(max(counts.numel() - 1, 0)), 0)
         blocks = torch.where(valid, start_blocks[rows] + entries - starts[rows], 0)
-        write_locs = torch.where(
-            valid,
-            token_slot_table[rows, blocks * compress_ratio].long() // compress_ratio,
-            torch.zeros_like(blocks),
-        ).to(torch.int32)
+        if token_slot_table.numel() == 0:
+            # An idle DP-attention rank padded to a graph batch has rows but no slot table: nothing to write.
+            write_locs = torch.zeros_like(blocks, dtype=torch.int32)
+        else:
+            write_locs = torch.where(
+                valid,
+                token_slot_table[rows, blocks * compress_ratio].long()
+                // compress_ratio,
+                torch.zeros_like(blocks),
+            ).to(torch.int32)
         group_end_positions = blocks * compress_ratio + (compress_ratio - 1)
         member_rows = None
         if row_token_starts is not None:
@@ -581,7 +590,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         torch._assert_async((prefix_lens % ratio == 0).all())
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
-        capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
+        # A rank with no rows (DP attention padding) writes nothing; its padded input ids index no table row.
+        capacity = (
+            int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
+            if lengths.numel()
+            else 0
+        )
         row_token_starts = torch.cumsum(extend_lens, 0) - extend_lens
         return self._qsa_write_plan(
             token_slot_table=token_slot_table,
@@ -1363,8 +1377,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def _can_defer_block_expansion(self, forward_mode):
+        # TOP's attention reads expanded token indices.
         return (
-            self._fused_kv_pool_eligible
+            not self.top_enabled
+            and self._fused_kv_pool_eligible
             and self.qsa_profile is not None
             and self.compress_ratio == 4
             and self.qsa_profile.block_topk == 512
@@ -1390,7 +1406,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices):
-        if not self._fused_kv_pool_eligible or not q.is_cuda or k is None or v is None:
+        # TOP decode reads K/V with its own sparse-attention program after the plain KV write.
+        if (
+            self.top_enabled
+            or not self._fused_kv_pool_eligible
+            or not q.is_cuda
+            or k is None
+            or v is None
+        ):
             return None
         mode = forward_batch.forward_mode
         if mode.is_decode():
@@ -1495,6 +1518,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         # DP attention may pad q beyond the indexer's query rows.
         # The kernels see only valid rows; the output is zero-padded to q's row count.
         q = q[:num_valid_rows]
+        if self.top_enabled:
+            output = self._forward_top(
+                q, layer, forward_batch, topk_indices, decode=False
+            )
+            return self._pad_extend_output(output, num_output_rows)
         if self._is_speculative_paged_mode(forward_batch.forward_mode):
             output = self._forward_paged_attention(
                 q, layer, forward_batch, topk_indices
@@ -1910,7 +1938,41 @@ class QwenSparseAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        if self.top_enabled:
+            return self._forward_top(
+                q, layer, forward_batch, topk_indices, decode=True
+            ).reshape(q.shape[0], -1)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
+
+    def _forward_top(self, q, layer, forward_batch, topk_indices, *, decode: bool):
+        from sglang.srt.true_on_policy import qsa as top_qsa
+
+        metadata = self._resolve_metadata(forward_batch)
+        rows = topk_indices.shape[0]
+        # Verify and draft rows carry their own request and length, as decode rows do: a verify row reads the
+        # keys its own decode would, through the request's req_to_token row.
+        if decode or self._is_speculative_paged_mode(forward_batch.forward_mode):
+            row_req = (
+                metadata.row_req_pool_indices
+                if metadata.row_req_pool_indices is not None
+                else forward_batch.req_pool_indices
+            )[:rows]
+        else:
+            row_req = forward_batch.req_pool_indices.index_select(
+                0, metadata.token_to_batch_idx.long()
+            )
+        pool = self.token_to_kv_pool
+        output, _, _ = top_qsa.sparse_attention(
+            q[:rows],
+            pool.get_key_buffer(layer.layer_id),
+            pool.get_value_buffer(layer.layer_id),
+            topk_indices,
+            layer.scaling,
+            table=self.req_to_token_pool.req_to_token,
+            table_rows=row_req,
+            aux=False,
+        )
+        return output
 
     def _forward_paged_attention(
         self,

@@ -422,9 +422,19 @@ def compute_spec_logprobs(
             max_accept,
             dim=0,
         )
-        gathered_logprobs = torch.nn.functional.log_softmax(
-            gathered_logits / temperatures, dim=-1
-        )
+        from sglang.srt.true_on_policy.config import is_true_on_policy_enabled
+
+        if is_true_on_policy_enabled():
+            from sglang.srt.true_on_policy.sampling import scale_logits_for_sampling
+
+            # Match ordinary TOP scoring's BF16 temperature boundary while
+            # preserving the logits retained by the speculative worker.
+            scaled_logits = scale_logits_for_sampling(
+                gathered_logits.clone(), temperatures
+            )
+        else:
+            scaled_logits = gathered_logits / temperatures
+        gathered_logprobs = torch.nn.functional.log_softmax(scaled_logits, dim=-1)
     gathered_logprobs.clamp_(min=torch.finfo(gathered_logprobs.dtype).min)
 
     logits_output.next_token_logprobs = gathered_logprobs.gather(

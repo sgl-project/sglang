@@ -143,6 +143,8 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
+from sglang.srt.true_on_policy.dsv4_attention import pool_sparse_attention
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 from sglang.srt.utils.common import async_h2d
 
@@ -1321,6 +1323,9 @@ class DeepseekV4AttnBackend(
         self._source_proj_bufs: Dict[int, list] = {}
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
+        self.top_sparse_attention = is_true_on_policy_enabled()
+        # TOP V4.1: the candidate source layer's mask, read by the later index layers of the same forward.
+        self.top_candidates = None
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
             if not get_platform().is_sm90:
                 raise ValueError(
@@ -3420,6 +3425,10 @@ class DeepseekV4AttnBackend(
         """Runs on every ratio 1/2 layer before its attention."""
         if forward_batch.forward_mode.is_idle():
             return
+        # The stock compressor and indexer pick kernels by forward mode and row count (true_on_policy.dsv41_attention).
+        if self.top_sparse_attention:
+            self._top_low_ratio_sources(layer, x, q_lora, positions, forward_batch)
+            return
         if forward_batch.encoder_swa_replay:
             run_compressor = False
         if layer.layer_id == self.tail_source_kv_layer_id:
@@ -3508,6 +3517,57 @@ class DeepseekV4AttnBackend(
             self._low_ratio_compress(layer, x, req, pos, forward_batch)
         if run_indexer and layer.indexer is not None:
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
+
+    def _top_low_ratio_sources(self, layer, x, q_lora, positions, forward_batch):
+        """TOP: one compressor and indexer program for every forward mode (true_on_policy.dsv41_attention)."""
+        from sglang.srt.true_on_policy import dsv41_attention
+
+        req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
+        if layer.compressor is not None:
+            self._low_ratio_compress_torch(
+                layer,
+                x,
+                req,
+                positions,
+                projected=dsv41_attention.compressor_project(layer.compressor, x),
+            )
+        if layer.indexer is None:
+            return
+        ratio = layer.compress_ratio
+        core = self.forward_metadata.core_metadata
+        mode = forward_batch.forward_mode
+        if mode.is_decode() or mode.is_target_verify():
+            metadata = (
+                self.forward_metadata.c1_indexer_metadata
+                if ratio == 1
+                else self.forward_metadata.c2_indexer_metadata
+            )
+            width = metadata.max_compressed_seq_len
+        else:
+            width = max(_as_int_list(forward_batch.seq_lens_cpu)) // ratio
+        req_to_token = self.req_to_token
+        width = min(width, req_to_token.shape[1] // ratio)
+        if layer.indexer.is_candidate_source:
+            self.top_candidates = None
+        published = dsv41_attention.select(
+            indexer=layer.indexer,
+            x=x,
+            q_lora=q_lora,
+            freqs_cis=layer.freqs_cis,
+            positions=positions,
+            req_rows=req,
+            req_to_token=req_to_token,
+            index_k_table=self.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer.layer_id
+            ),
+            ratio=ratio,
+            width=width,
+            candidates=self.top_candidates if layer.indexer.uses_candidates else None,
+            out_page_indices=core.sparse_page_indices(ratio),
+            out_raw_indices=core.sparse_raw_indices(ratio),
+        )
+        if published is not None:
+            self.top_candidates = published
 
     def _forward_low_ratio_sources_cp(
         self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
@@ -4217,6 +4277,23 @@ class DeepseekV4AttnBackend(
             swa_topk_lengths = match_num_queries(swa_topk_lengths, value=1)
             extra_indices = match_num_queries(extra_indices, value=-1)
             extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
+            # The FlashMLA paged path below splits each row's KV by a plan over the whole batch.
+            if self.top_sparse_attention:
+                return pool_sparse_attention(
+                    q,
+                    token_to_kv_pool=token_to_kv_pool,
+                    layer_id=layer_id,
+                    compress_ratio=compress_ratio,
+                    swa_indices=swa_page_indices,
+                    swa_lengths=swa_topk_lengths,
+                    extra_indices=extra_indices,
+                    extra_lengths=extra_topk_lengths,
+                    attn_sink=attn_sink,
+                    scale=self.softmax_scale,
+                    d_v=self.head_dim_v,
+                    # Verify / extend rows of one request share their slots.
+                    shared_rows=not forward_batch.forward_mode.is_decode(),
+                )
 
             if self.trtllm_attn:
                 # The uniform-FP8 pool is readable only by trtllm-gen.

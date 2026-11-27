@@ -482,7 +482,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
                 )
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
-            linear_attn_backend = GDNAttnBackend(runner)
+            from sglang.srt.true_on_policy.gdn_backend import top_gdn_attn_backend
+
+            linear_attn_backend = top_gdn_attn_backend(runner) or GDNAttnBackend(runner)
             from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
 
             if is_qwen_qsa(runner.model_config.hf_config):
@@ -545,7 +547,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             else:
                 linear_attn_backend = KDAAttnBackend(runner)
         elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = KDAAttnBackend(runner)
+            from sglang.srt.true_on_policy.kda_chunked import top_kda_attn_backend
+
+            linear_attn_backend = top_kda_attn_backend(runner) or KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:

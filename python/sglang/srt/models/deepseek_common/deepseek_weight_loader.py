@@ -62,6 +62,7 @@ from sglang.srt.models.deepseek_common.utils import (
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
 )
+from sglang.srt.true_on_policy import fp8 as top_fp8
 from sglang.srt.utils import bind_or_assign, log_info_on_rank0
 
 if _use_aiter_gfx95:
@@ -693,8 +694,9 @@ class DeepseekV2WeightLoaderMixin:
                         should_deepgemm_weight_requant_ue8m0(
                             weight_block_size=weight_block_size
                         )
-                        and weight_scale.format_ue8m0
-                    ):
+                        # TOP FP8 keeps packed UE8M0 scales on SM90 too; a weight sync delivers them packed.
+                        or top_fp8.enabled()
+                    ) and weight_scale.format_ue8m0:
                         weight_scale = inverse_transform_scale_ue8m0(
                             weight_scale, mn=weight.shape[-2]
                         )

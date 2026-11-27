@@ -21,6 +21,27 @@ else:
     _MERGE_DOT_PRECISION = tl.constexpr("ieee")
 
 
+# H200's autotuned pick; TOP chunked GDN pins it (see _kkt_solve_configs).
+TOP_CHUNKED_KKT_CONFIG = (64, 1)
+
+
+def _kkt_solve_configs():
+    """The kkt kernel's configs. BK and num_warps set its reduction order, so under TOP chunked GDN (whose decode row
+    engine replays this kernel's arithmetic with the same BK and num_warps) one config is pinned: rollout prefill,
+    rollout decode and the trainer's prefill then agree on every GPU, whatever an autotune would pick."""
+    from sglang.srt.environ import envs
+
+    # One config: BK and num_warps set the reduction order, and TOP's decode row engine replays it.
+    if envs.SGLANG_TOP_GDN_MODE.get() == "chunked":
+        bk, num_warps = TOP_CHUNKED_KKT_CONFIG
+        return [triton.Config({"BK": bk}, num_warps=num_warps)]
+    return [
+        triton.Config({"BK": BK}, num_warps=num_warps)
+        for BK in [32, 64]
+        for num_warps in [1, 2, 4]
+    ]
+
+
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -28,11 +49,7 @@ else:
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
-    ],
+    configs=_kkt_solve_configs(),
     key=["H", "Hg", "K", "BC"],
     **autotune_cache_kwargs,
 )

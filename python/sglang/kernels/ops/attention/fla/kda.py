@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.ops.attention.fla import kda_top
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
@@ -755,13 +756,17 @@ def recompute_w_u_fwd(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=kda_top.out_configs(
+        [
+            triton.Config(
+                {"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages
+            )
+            for BK in [32, 64]
+            for BV in [64, 128]
+            for num_warps in [2, 4, 8]
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=["BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -936,11 +941,13 @@ def softplus_fwd(x):
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BS": BS}, num_warps=num_warps)
-        for BS in BS_LIST
-        for num_warps in [2, 4, 8]
-    ],
+    configs=kda_top.gate_configs(
+        [
+            triton.Config({"BS": BS}, num_warps=num_warps)
+            for BS in BS_LIST
+            for num_warps in [2, 4, 8]
+        ]
+    ),
     key=["H", "S", "BT", "IS_VARLEN", "HAS_BETA"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -1216,7 +1223,11 @@ def chunk_kda_fwd(
     )
     _H_pr = q.shape[-2]
     _B = q.shape[0]
-    _small_grid = _B * _NT_pr * _H_pr <= 256
+    # TOP pins the fused intra kernel: its diagonal blocks take the gate reference at each block's first row, so
+    # the program is prefix-stable and the decode row engine (kda_rows) can follow it; it needs the safe gate.
+    _small_grid = _B * _NT_pr * _H_pr <= 256 or (
+        kda_top.top_kda_chunked() and lower_bound is not None
+    )
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,

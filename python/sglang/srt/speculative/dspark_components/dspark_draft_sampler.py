@@ -14,6 +14,7 @@ from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
+    DraftRaceKey,
     draft_markov_block,
     resolve_draft_params,
     select_draft_hidden_without_anchor,
@@ -42,6 +43,7 @@ class DsparkDraftSampler:
         noise: DraftNoise,
         tp_sync: SpecTpSync,
         greedy_draft: bool,
+        race_draft: bool = False,
         out=None,
         megakernel_sampler: Optional[Callable] = None,
     ):
@@ -89,10 +91,25 @@ class DsparkDraftSampler:
                 (self.max_bs,), dtype=torch.float32, device=device
             ),
         )
+        # TOP: the race key each replay draws with; zeros (uncoupled drafts) when unstaged.
+        self.race_key = (
+            DraftRaceKey(
+                seeds=torch.zeros((self.max_bs,), dtype=torch.int64, device=device),
+                positions=torch.zeros(
+                    (self.max_bs, self.gamma), dtype=torch.int64, device=device
+                ),
+            )
+            if race_draft and not greedy_draft
+            else None
+        )
         # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
         self._megakernel_steps = None
+        if megakernel_sampler is not None and self.race_key is not None:
+            raise NotImplementedError(
+                "[top] DSpark's raced draft runs SGLang's markov block, not a megakernel sampler"
+            )
         if megakernel_sampler is not None:
             self._megakernel_steps = self._build_megakernel_steps(megakernel_sampler)
 
@@ -139,9 +156,14 @@ class DsparkDraftSampler:
             )
         return self.step_logits
 
-    def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
+    def stage_sampling_params(
+        self, *, bs: int, sampling_info, race_key: Optional[DraftRaceKey] = None
+    ) -> None:
         """Must run before the draft graph replay that reads these buffers."""
         resolve_draft_params(sampling_info=sampling_info, bs=bs, out=self.params)
+        if self.race_key is not None and race_key is not None:
+            self.race_key.seeds[:bs].copy_(race_key.seeds)
+            self.race_key.positions[:bs].copy_(race_key.positions)
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
@@ -192,6 +214,12 @@ class DsparkDraftSampler:
             if self.greedy_draft
             else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
+            race_key=None
+            if self.race_key is None
+            else DraftRaceKey(
+                seeds=self.race_key.seeds[:bs],
+                positions=self.race_key.positions[:bs],
+            ),
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         return draft_tokens, confidence_features
@@ -212,6 +240,7 @@ def maybe_build_draft_sampler(
     noise: DraftNoise,
     greedy_draft: bool,
     tp_sync: SpecTpSync,
+    race_draft: bool = False,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
@@ -241,6 +270,7 @@ def maybe_build_draft_sampler(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
+        race_draft=race_draft,
         out=out,
         megakernel_sampler=megakernel_sampler,
     )

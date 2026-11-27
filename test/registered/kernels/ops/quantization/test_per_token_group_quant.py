@@ -1004,6 +1004,150 @@ def test_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
     assert torch.equal(_as_int32(s_auto), _as_int32(s_buf)), "scales differ"
 
 
+# --------------------------------------------------------------------------- #
+# quantize_rows entry points: SwiGLU clamp and DeepEP amax floor.
+# --------------------------------------------------------------------------- #
+# kAmaxFloor of the DeepEP entry points (kFP8Margin in DeepEP's low-latency cast).
+DEEPEP_FLOOR = 1e-4
+
+
+def _scale_exponents(s: torch.Tensor, ng: int) -> torch.Tensor:
+    """quantize_rows' scales as UE8M0 exponent bytes [..., ng]: packed int32 on
+    Blackwell, FP32 2^(e-127) values on Hopper (e=0 stored as 2^-127, whose
+    exponent field is 0, so the field is the byte either way)."""
+    if s.dtype == torch.int32:
+        return _decode_packed_exp(s, ng)
+    return ((s.contiguous().view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
+
+
+def _ref_ue8m0_floored(x: torch.Tensor, floor: float):
+    """The kernel's UE8M0 row quant with amax floored at ``floor``:
+    raw = max(amax, floor) * (1/448) in FP32, ceil-UE8M0 of raw, codes x * 2^-(e-127)."""
+    xf = x.float().unflatten(-1, (-1, G))
+    amax = torch.maximum(
+        xf.abs().amax(-1), torch.tensor(floor, dtype=torch.float32, device=x.device)
+    )
+    raw = (amax * torch.tensor(1.0 / FMAX, dtype=torch.float32)).contiguous()
+    bits = raw.view(torch.int32)
+    exp = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    quant_scale = ((127 + 127 - exp) << 23).view(torch.float32)
+    q = _quantize(x, G, quant_scale, fp8_dtype, -FMAX, FMAX)
+    return q, exp.to(torch.uint8)
+
+
+def _valid_rows(t: torch.Tensor, masked_m):
+    """Rows the quantizer writes: all of a flat [T, ...] tensor, or rows
+    < masked_m[e] of each expert of an [E, T, ...] tensor, concatenated."""
+    if masked_m is None:
+        return t
+    return torch.cat([t[e, :m] for e, m in enumerate(masked_m.tolist())])
+
+
+@pytest.mark.parametrize("masked", [False, True], ids=["flat", "masked"])
+@pytest.mark.parametrize("swiglu_limit", [7.0, 6.9])
+def test_quantize_rows_swiglu_clamp(masked, swiglu_limit):
+    """The fused SwiGLU clamp (kClampSwiglu) equals clamping in BF16 first:
+    gate (first half) clamped from above at the BF16-rounded limit, up (second
+    half) clamped to [-limit, limit], then the unclamped fused quantizer. 6.9 is
+    not a BF16 value, so the wrapper's BF16 rounding of the limit is pinned."""
+    from sglang.srt.true_on_policy.fp8.fp8_expert_forward import quantize_rows
+
+    torch.manual_seed(31 + int(masked))
+    hidden = 512
+    if masked:
+        x = torch.randn(3, 24, 2 * hidden, device="cuda", dtype=torch.bfloat16) * 5
+        masked_m = torch.tensor([24, 0, 11], device="cuda", dtype=torch.int32)
+    else:
+        x = torch.randn(19, 2 * hidden, device="cuda", dtype=torch.bfloat16) * 5
+        masked_m = None
+    lim = float(torch.tensor(swiglu_limit, dtype=torch.bfloat16))
+    gate, up = x[..., :hidden], x[..., hidden:]
+    clamped = torch.cat((gate.clamp(max=lim), up.clamp(-lim, lim)), dim=-1)
+    assert not torch.equal(clamped, x), "the limit must bind on this input"
+
+    q, s = quantize_rows(
+        x, fused_swiglu=True, masked_m=masked_m, swiglu_limit=swiglu_limit
+    )
+    q_ref, s_ref = quantize_rows(
+        clamped.contiguous(), fused_swiglu=True, masked_m=masked_m
+    )
+    q_raw, _ = quantize_rows(x, fused_swiglu=True, masked_m=masked_m)
+    torch.cuda.synchronize()
+
+    ng = hidden // G
+    valid_q = _valid_rows(q.view(torch.uint8), masked_m)
+    assert torch.equal(valid_q, _valid_rows(q_ref.view(torch.uint8), masked_m))
+    assert torch.equal(
+        _valid_rows(_scale_exponents(s, ng), masked_m),
+        _valid_rows(_scale_exponents(s_ref, ng), masked_m),
+    )
+    assert not torch.equal(valid_q, _valid_rows(q_raw.view(torch.uint8), masked_m))
+
+
+@pytest.mark.parametrize("masked", [False, True], ids=["flat", "masked"])
+def test_quantize_rows_deepep_amax_floor(masked):
+    """deepep_amax_floor floors amax at 1e-4: all-zero groups and groups with
+    amax < 1e-4 get the ceil-UE8M0 exponent of 1e-4 * (1/448) and codes scaled
+    by it; groups with amax > 1e-4 (including the BF16 value just above 1e-4)
+    are bit-identical to the default 1e-10 floor."""
+    from sglang.srt.true_on_policy.fp8.fp8_expert_forward import quantize_rows
+
+    torch.manual_seed(41 + int(masked))
+    hidden = 1024  # 8 groups
+    shape = (3, 16, hidden) if masked else (21, hidden)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    rows = x.view(-1, hidden // G, G)
+    # The BF16 neighbours of 1e-4: 209 and 210 * 2^-21.
+    below, above = 209 * 2.0**-21, 210 * 2.0**-21
+    assert below < DEEPEP_FLOOR < above
+    # Floored groups: zeros, tiny noise, and amax at the BF16 value just below
+    # 1e-4. Group 3 has amax at the BF16 value just above it: not floored.
+    floored = torch.zeros(rows.shape[:2], dtype=torch.bool, device="cuda")
+    rows[:, 0] = 0
+    rows[:, 1] *= 1e-6
+    rows[:, 2] = rows[:, 2].sign() * 1e-5
+    rows[:, 2, 0] = below
+    floored[:, :3] = True
+    rows[:, 3] = rows[:, 3].sign() * 1e-5
+    rows[:, 3, 5] = -above
+    floored = floored.view(*shape[:-1], hidden // G)
+    masked_m = (
+        torch.tensor([16, 0, 7], device="cuda", dtype=torch.int32) if masked else None
+    )
+
+    q, s = quantize_rows(x, masked_m=masked_m, deepep_amax_floor=True)
+    q_dflt, s_dflt = quantize_rows(x, masked_m=masked_m)
+    torch.cuda.synchronize()
+
+    ng = hidden // G
+    q_ref, exp_ref = _ref_ue8m0_floored(x, DEEPEP_FLOOR)
+    exp = _valid_rows(_scale_exponents(s, ng), masked_m)
+    exp_dflt = _valid_rows(_scale_exponents(s_dflt, ng), masked_m)
+    keep = _valid_rows(floored, masked_m)
+    # The floor exponent, from the formula: ceil-UE8M0 of fp32(1e-4) * fp32(1/448).
+    raw = torch.tensor(DEEPEP_FLOOR, dtype=torch.float32) * torch.tensor(
+        1.0 / FMAX, dtype=torch.float32
+    )
+    bits = int(raw.view(torch.int32))
+    floor_exp = ((bits >> 23) & 0xFF) + int((bits & 0x7FFFFF) != 0)
+
+    assert torch.equal(exp, _valid_rows(exp_ref, masked_m))
+    assert torch.equal(
+        _valid_rows(q.view(torch.uint8), masked_m),
+        _valid_rows(q_ref.view(torch.uint8), masked_m),
+    )
+    assert (exp[keep] == floor_exp).all(), "floored groups take the 1e-4 scale"
+    # Zero and tiny groups would scale lower without the floor; just below 1e-4
+    # the ceil already lands on the floor's power of two.
+    assert (exp_dflt[:, :2] < floor_exp).all(), "the floor must change their scale"
+    assert torch.equal(exp[~keep], exp_dflt[~keep])
+    q_groups = _valid_rows(q.view(torch.uint8), masked_m).unflatten(-1, (ng, G))
+    q_dflt_groups = _valid_rows(q_dflt.view(torch.uint8), masked_m).unflatten(
+        -1, (ng, G)
+    )
+    assert torch.equal(q_groups[~keep], q_dflt_groups[~keep])
+
+
 if __name__ == "__main__":
     import sys
 

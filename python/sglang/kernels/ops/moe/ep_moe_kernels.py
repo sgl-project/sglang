@@ -693,8 +693,11 @@ def _silu_and_mul_kernel(
     stride_output_2,
     masked_m_ptr,
     size_n,
+    swiglu_limit,
     BLOCK_N: tl.constexpr,
     NUM_STAGE: tl.constexpr,
+    PRECISE: tl.constexpr,
+    CLAMP: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -726,7 +729,16 @@ def _silu_and_mul_kernel(
             mask=offs_in_d < size_n,
             other=0.0,
         ).to(tl.float32)
-        gate = gate / (1 + tl.exp(-gate))
+        if CLAMP:
+            # gate <= limit, |up| <= limit on the BF16 values (exact in FP32), as silu_and_mul_clamp.
+            gate = tl.minimum(gate, swiglu_limit)
+            up = tl.minimum(tl.maximum(up, -swiglu_limit), swiglu_limit)
+        if PRECISE:
+            # Match the CUDA activation's expf and round-to-nearest division.
+            # Approximate exp/div can cross the final BF16 rounding midpoint.
+            gate = tl.div_rn(gate, 1 + tl.extra.cuda.libdevice.exp(-gate))
+        else:
+            gate = gate / (1 + tl.exp(-gate))
         gate_up = up * gate
         # Compute SiLU in fp32 for better precision, then cast back to the
         # input dtype.
@@ -742,6 +754,9 @@ def silu_and_mul_masked_fwd(
     input: torch.Tensor,
     output: torch.Tensor,
     masked_m: torch.Tensor,
+    *,
+    precise: bool = False,
+    swiglu_limit: Optional[float] = None,
 ):
     """
     input shape [expert_num, token_num_padded, hidden_dim], dtype bf16
@@ -784,8 +799,11 @@ def silu_and_mul_masked_fwd(
         *output.stride(),
         masked_m,
         size_n,
+        0.0 if swiglu_limit is None else float(swiglu_limit),
         BLOCK_N=BLOCK_N,
         NUM_STAGE=NUM_STAGES,
+        PRECISE=precise,
+        CLAMP=swiglu_limit is not None,
         num_warps=num_warps,
     )
     return output

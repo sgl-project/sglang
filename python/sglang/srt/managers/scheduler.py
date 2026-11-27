@@ -4120,6 +4120,7 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            self.policy.refresh_waiting_prefixes(self.waiting_queue)
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -4134,6 +4135,7 @@ class Scheduler(
                 ),
             )
         ):
+            self.policy.refresh_waiting_prefixes(self.waiting_queue)
             return None, running_batch
 
         # A chunked request skips this check: it keeps its req_to_token row across
@@ -4145,6 +4147,7 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            self.policy.refresh_waiting_prefixes(self.waiting_queue)
             return None, running_batch
 
         # Get priority queue

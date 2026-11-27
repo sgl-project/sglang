@@ -188,6 +188,14 @@ class DraftNoise(msgspec.Struct, frozen=True):
     offset: torch.Tensor
 
 
+class DraftRaceKey(NamedTuple):
+    """TOP: request seeds [bs] and the verify rows' input positions [bs, gamma];
+    step j draws with column j's key (true_on_policy.dsv41_dspark.race_draft)."""
+
+    seeds: torch.Tensor
+    positions: torch.Tensor
+
+
 def step_logits_width(markov_head: BaseDSparkMarkovHead, base_width: int) -> int:
     # Kept step logits are gathered whole over a sharded vocab.
     return base_width if markov_head.vocab_shard is None else markov_head.vocab_size
@@ -204,6 +212,7 @@ def _draft_step(
     noise: DraftNoise,
     step: int,
     logits_out: Optional[torch.Tensor],
+    race_key: Optional[DraftRaceKey] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if logits_out is None and len(prev_tokens) == 1:
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
@@ -238,10 +247,22 @@ def _draft_step(
         step=step,
         step_dtype=markov_head.step_logits_dtype(base_logits.dtype),
         logits_out=logits_out,
-        # Rows sample at their temperatures only when the step logits are kept.
-        has_sampled_rows=None if logits_out is not None else False,
+        # Rows sample at their temperatures only when the step logits are kept;
+        # raced rows sample below, from the kept logits.
+        has_sampled_rows=None if logits_out is not None and race_key is None else False,
         **sharded,
     )
+    # Drafts raced under the verify rows' keys match TOP's race targets far more often; emitted tokens are unchanged.
+    if race_key is not None:
+        from sglang.srt.true_on_policy.dsv41_dspark import race_draft
+
+        tokens = race_draft(
+            step_logits=logits_out[:, : markov_head.vocab_size],
+            step_temperatures=temperatures,
+            argmax_tokens=tokens,
+            seeds=race_key.seeds,
+            positions=race_key.positions[:, step],
+        )
     return tokens, state
 
 
@@ -256,9 +277,11 @@ def draft_markov_block(
     tp_sync: SpecTpSync,
     logits_out: Optional[torch.Tensor] = None,
     greedy_draft: bool = False,
+    race_key: Optional[DraftRaceKey] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
     written to ``logits_out`` or allocated here; a greedy draft keeps none."""
+    assert race_key is None or not greedy_draft
     bs, gamma = base_logits.shape[:2]
     if not greedy_draft and logits_out is None:
         logits_out = torch.empty(
@@ -280,6 +303,7 @@ def draft_markov_block(
             noise=noise,
             step=step,
             logits_out=None if greedy_draft else logits_out[:, step],
+            race_key=race_key,
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
@@ -300,6 +324,7 @@ def sample_draft_block(
     device: torch.device,
     tp_sync: SpecTpSync,
     greedy_draft: bool,
+    race_key: Optional[DraftRaceKey] = None,
 ) -> DraftBlockResult:
     params = resolve_draft_params(
         sampling_info=sampling_info, bs=base_logits.shape[0], device=device
@@ -313,6 +338,7 @@ def sample_draft_block(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
+        race_key=race_key,
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
@@ -343,6 +369,7 @@ class DraftBlockProposer:
         random_seed: int,
         greedy_draft: bool,
         dp_moe_sync: bool = False,
+        race_draft: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -353,6 +380,8 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._tp_sync = tp_sync
         self._greedy_draft = greedy_draft
+        # TOP: drafts are raced under the verify rows' keys (true_on_policy.dsv41_dspark).
+        self._race_draft = race_draft and not greedy_draft
         self._noise = DraftNoise(
             key=draft_noise_key(random_seed),
             offset=torch.zeros(
@@ -391,12 +420,34 @@ class DraftBlockProposer:
     def noise(self) -> DraftNoise:
         return self._noise
 
+    def race_key(
+        self, sampling_info, positions_2d, *, bs: int
+    ) -> Optional[DraftRaceKey]:
+        if (
+            not self._race_draft
+            or sampling_info is None
+            or sampling_info.sampling_seed is None
+        ):
+            return None
+        return DraftRaceKey(
+            seeds=sampling_info.sampling_seed[:bs],
+            positions=positions_2d[:bs, : self.gamma],
+        )
+
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
 
-    def _stage_sampling_params(self, draft_sampler, *, bs: int, sampling_info) -> None:
+    def _stage_sampling_params(
+        self,
+        draft_sampler,
+        *,
+        bs: int,
+        sampling_info,
+        race_key: Optional[DraftRaceKey] = None,
+    ) -> None:
         """The draft graph's sampling params, restaged only when the sampler, bs or
-        the batch's temperature / top-k tensors changed since the last stage."""
+        the batch's temperature / top-k tensors changed since the last stage. A TOP
+        race key holds this step's positions, so it is staged on every call."""
         key = (
             draft_sampler,
             bs,
@@ -417,9 +468,11 @@ class DraftBlockProposer:
                 self.num_staged_params_skips,
                 self.num_staged_params_calls,
             )
-        if skip:
+        if skip and race_key is None:
             return
-        draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+        draft_sampler.stage_sampling_params(
+            bs=bs, sampling_info=sampling_info, race_key=race_key
+        )
         self._staged_params_key = key
 
     def _base_logits_context(self):
@@ -494,6 +547,9 @@ class DraftBlockProposer:
                 device=device,
                 tp_sync=self._tp_sync,
                 greedy_draft=self._greedy_draft,
+                race_key=self.race_key(
+                    sampling_info, verify_window.positions_2d, bs=bs
+                ),
             )
             if self.draft_model.confidence_head is not None:
                 confidence, confidence_raw = self.draft_model.compute_confidence(
@@ -631,7 +687,10 @@ class DraftBlockProposer:
         )
         if draft_sampler is not None and runs_graph:
             self._stage_sampling_params(
-                draft_sampler, bs=bs, sampling_info=sampling_info
+                draft_sampler,
+                bs=bs,
+                sampling_info=sampling_info,
+                race_key=self.race_key(sampling_info, positions_2d, bs=bs),
             )
         commit = self.deferred_commit
         if commit is not None:

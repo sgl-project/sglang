@@ -186,11 +186,10 @@ from sglang.srt.models.deepseek_v4_replay_tail import (
     bcg_tail_kv_store,
     in_replay_tail_graph,
 )
-from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
+from sglang.srt.models.deepseek_v41_vit import Aligner, ViT, image_span
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
-    image_token_types,
     materialize_image_gpu,
 )
 from sglang.srt.runtime_context import (
@@ -201,6 +200,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
+from sglang.srt.true_on_policy import vision as top_vision
+from sglang.srt.true_on_policy.dsv4 import validate_top_dsv4
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -674,6 +676,9 @@ def hc_head_torch(
     hc_eps: float,
 ) -> torch.Tensor:
     shape, dtype = x.size(), x.dtype
+    if x.numel() == 0:
+        # Idle DP ranks: no rows, and batch-invariant mode admits no FP32 GEMM.
+        return x.new_empty((*shape[:-2], shape[-1]))
     x = x.flatten(-2).float()
     rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
     mixes = F.linear(x, hc_fn) * rsqrt
@@ -1501,6 +1506,10 @@ class MQALayer(MqaAttentionBase):
                     quant_config=quant_config,
                     prefix=add_prefix("indexer", prefix),
                 )
+        # TOP V4.1: one attention program for every forward mode and row count (true_on_policy.dsv41_attention).
+        self.top_v41 = self.is_dsv41 and is_true_on_policy_enabled()
+        if self.top_v41 and self.indexer is not None:
+            self.indexer.top = True
 
         self.attn_mqa = RadixAttention(
             self.n_local_heads,
@@ -1538,6 +1547,8 @@ class MQALayer(MqaAttentionBase):
         # in forward, after weights have loaded.
         self.use_fused_wo_a = (
             self.is_dsv41
+            # The fused RoPE + wo_a kernel takes only batches of up to 32 tokens.
+            and not self.top_v41
             and envs.SGLANG_DSV41_FUSED_WO_A.get()
             and _fused_wo_a_arch_supported()
             and not self.wo_a_fp8
@@ -1801,6 +1812,14 @@ class MQALayer(MqaAttentionBase):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if self.top_v41:
+            # One RoPE kernel whether or not the heads are padded for the attention kernel.
+            if q_out is None:
+                q_out = torch.empty_like(q)
+            if q_out.dtype != q.dtype:
+                raise NotImplementedError("[top] V4.1 queries stay BF16")
+            fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
+            return q_out
         if self.use_mega_attention:
             return q
         if not self.q_head_norm:
@@ -3063,21 +3082,28 @@ class MQALayer(MqaAttentionBase):
                         wo_a = wo_a_weight.view(
                             self.n_local_groups, self.o_lora_rank, -1
                         )
-                        o = _apply_wo_a_bf16_matmul(
-                            o,
-                            wo_a,
-                            is_decode=forward_batch.forward_mode.is_decode(),
-                            is_target_verify=forward_batch.forward_mode.is_target_verify(),
-                            is_prefill=forward_batch.forward_mode.is_extend_without_speculative(),
-                            fast_path=self.is_dsv41,
-                            fuse_mxfp8_quant=fuse_mxfp8_quant,
-                            fp8_grid=_is_hip
-                            and not wo_a_lora
-                            and _hip.wo_a_emits_fp8_grid(self),
-                            emit_fp8=_is_hip
-                            and not wo_a_lora
-                            and _hip.wo_b_emits_mxfp8(self, o.shape[0]),
-                        )
+                        if self.top_v41:
+                            from sglang.srt.true_on_policy.dsv41_attention import (
+                                wo_a as top_wo_a,
+                            )
+
+                            o = top_wo_a(o, wo_a)
+                        else:
+                            o = _apply_wo_a_bf16_matmul(
+                                o,
+                                wo_a,
+                                is_decode=forward_batch.forward_mode.is_decode(),
+                                is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                                is_prefill=forward_batch.forward_mode.is_extend_without_speculative(),
+                                fast_path=self.is_dsv41,
+                                fuse_mxfp8_quant=fuse_mxfp8_quant,
+                                fp8_grid=_is_hip
+                                and not wo_a_lora
+                                and _hip.wo_a_emits_fp8_grid(self),
+                                emit_fp8=_is_hip
+                                and not wo_a_lora
+                                and _hip.wo_b_emits_mxfp8(self, o.shape[0]),
+                            )
                 else:
                     o = _apply_gguf_grouped_wo_a(
                         o,
@@ -3236,6 +3262,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             hidden=config.hidden_size,
             pre_from_prev=self.hc_pre_from_prev_sublayer,
             cp_prefill=self.dsa_enable_prefill_cp,
+            top=self.hc_pre_from_prev_sublayer and is_true_on_policy_enabled(),
         )
         self.attn_hc: Optional[mhc.HcSubLayer] = None
         self.ffn_hc: Optional[mhc.HcSubLayer] = None
@@ -3318,6 +3345,8 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
             and getattr(self.config, "model_type", None) == "deepseek_v41"
             and not is_batch_invariant_mode_enabled()
+            # TOP V4.1 runs true_on_policy.dsv41_mhc, which reads the FP32 parameters only.
+            and not self.hc_cfg.top
         ):
             from sglang.kernels.ops.layernorm.mhc import split_bf16_hc_weight
 
@@ -4618,7 +4647,14 @@ class DeepseekV4Model(nn.Module):
 
         pre_hc_head = hidden_states.flatten(1)
 
-        if self.hc_pre_from_prev_sublayer:
+        if (
+            self.hc_pre_from_prev_sublayer
+            and self.layers[self.end_layer - 1].hc_cfg.top
+        ):
+            from sglang.srt.true_on_policy import dsv41_mhc
+
+            hidden_states = dsv41_mhc.collapse(hidden_states, last_pre)
+        elif self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
             # The kernel widens each element to fp32 as it loads it.
@@ -4677,6 +4713,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        validate_top_dsv4(config, quant_config)
         # DeepseekV4 enables, by default, the CK w8a8-block GEMM (MLA proj) and the
         # batched/contiguous-load rope kernels (faster on gfx95; .
         # Module-level toggles default OFF; flipped True here for DSV4
@@ -4717,6 +4754,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                 or not (
                     get_moe_a2a_backend().is_none()
                     or (_is_cuda and get_moe_a2a_backend().is_megamoe())
+                    # TOP routes image rows over DeepEP (true_on_policy.dsv41).
+                    or (
+                        get_moe_a2a_backend().is_deepep()
+                        and is_true_on_policy_enabled()
+                    )
                 )
             ):
                 raise ValueError(
@@ -4730,6 +4772,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.image_start = nn.Parameter(torch.empty(config.hidden_size))
             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
+            self.top_admitted = False
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -4875,6 +4918,9 @@ class DeepseekV4ForCausalLM(nn.Module):
     def get_image_feature(self, items):
         """Return complete spans for the shared MM cache and chunk scheduler."""
 
+        if is_true_on_policy_enabled() and not self.top_admitted:
+            top_vision.refuse_unqualified_serving(deepstack=False)
+            self.top_admitted = True
         spans = []
         device, dtype = self.image_start.device, self.image_start.dtype
         for item in items:
@@ -4887,17 +4933,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if plan is not None
                 else pixels.to(dtype)
             )
-            features = self.aligner(self.vision(patches, h, w), h, w)
-            r = self.config.vision_downsample_ratio
-            types = image_token_types((h + r - 1) // r, (w + r - 1) // r).to(device)
-            span = torch.empty(
-                (len(types), self.config.hidden_size), device=device, dtype=dtype
+            spans.append(
+                image_span(
+                    self.aligner(self.vision(patches, h, w), h, w),
+                    n_vit_h=h,
+                    n_vit_w=w,
+                    ratio=self.config.vision_downsample_ratio,
+                    start=self.image_start,
+                    newline=self.image_newline,
+                    end=self.image_end,
+                )
             )
-            span[types == 0] = self.image_start
-            span[types == 1] = features.to(dtype)
-            span[types == 2] = self.image_newline
-            span[types == 3] = self.image_end
-            spans.append(span)
         return spans
 
     def _prepare_mm_embeddings(self, input_ids, forward_batch):
@@ -5110,6 +5156,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = True
                 continue
 
+            # post_load_weights runs after every weight update; a scale already in the
+            # grouped layout (3-D) was loaded as processed and must not be transformed again.
+            if attn.wo_a.weight_scale_inv.dim() == 3:
+                continue
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
             if _FP8_WO_A_UE8M0:
                 attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
@@ -5389,6 +5439,17 @@ class DeepseekV4ForCausalLM(nn.Module):
             futures = []
             weight_names = []
             for name, loaded_weight in weights:
+                if (
+                    not self.wo_a_fp8
+                    and name.endswith(".wo_a.weight")
+                    and loaded_weight.dtype == torch.float8_e4m3fn
+                    and is_true_on_policy_enabled()
+                ):
+                    # The trainer runs an FP8 wo_a as the FP8 GEMM (true_on_policy.dsv4.fp8_wo_a_program).
+                    raise NotImplementedError(
+                        "[top] DeepSeek-V4 requires the FP8 wo_a GEMM for an FP8 wo_a; "
+                        "set SGLANG_OPT_FP8_WO_A_GEMM=1 (explicitly on SM90)"
+                    )
                 if (
                     self.wo_a_fp8
                     and name.endswith(".wo_a.weight")

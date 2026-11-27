@@ -35,10 +35,26 @@ def _jit_module(
     use_pdl: bool,
     sorted_layout: bool = False,
     silu_and_mul_mode: str = "legacy",
+    ue8m0_fp32: bool = False,
+    clamp_swiglu: bool = False,
+    deepep_amax_floor: bool = False,
 ) -> Module:
+    """``ue8m0_fp32``: UE8M0 (power-of-two) scales stored as FP32 values in an
+    FP32 ``output_s`` instead of packed exponent bytes (SM90 DeepGEMM's format).
+    ``deepep_amax_floor``: amax floored at 1e-4, DeepEP's low-latency FP8 cast margin
+    (kFP8Margin, csrc/kernels/legacy/utils.cuh; kAmaxFloor in the kernel), instead of 1e-10."""
     assert in_dtype in _SUPPORTED_INPUT_DTYPES
     assert out_dtype in _SUPPORTED_OUTPUT_DTYPES
     assert group_size in _SUPPORTED_GROUP_SIZES
+    assert scale_ue8m0 or not ue8m0_fp32
+    # The flat and masked launchers carry the floor flag, for UE8M0 row quant only.
+    assert not deepep_amax_floor or (
+        scale_ue8m0 and not fuse_silu_and_mul and not sorted_layout
+    )
+    # clamp_swiglu: the PerTokenGroupQuant{Flat,Masked}ClampKernel entry points (legacy fused SiLU, BF16/FP16 input).
+    assert not clamp_swiglu or (
+        fuse_silu_and_mul and silu_and_mul_mode == "legacy" and not sorted_layout
+    )
     if silu_and_mul_mode not in ("legacy", "dense"):
         raise ValueError(f"Unknown silu_and_mul_mode: {silu_and_mul_mode}")
     dense = silu_and_mul_mode == "dense"
@@ -53,25 +69,51 @@ def _jit_module(
         raise ValueError(
             "dense mode requires flat BF16/FP16 SiLU+mul, FP8 output and group_size=128"
         )
-    # Only the flat dense variant adds a flag; legacy launcher arguments stay intact.
-    trait_args = make_cpp_args(
-        in_dtype,
-        out_dtype,
-        group_size,
-        scale_ue8m0,
-        row_major,
-        aligned,
-        fuse_silu_and_mul,
-        use_pdl,
-        *([True] if dense else []),
-    )
+    # Trailing flags are appended only when set, so every existing instantiation
+    # keeps its name: the flat launcher takes (dense, ue8m0_fp32, deepep_amax_floor),
+    # the masked launcher (ue8m0_fp32, deepep_amax_floor), the sorted one (ue8m0_fp32).
+    if clamp_swiglu:
+        # The clamp launchers take no fuse/dense flags: (..., aligned, use_pdl[, ue8m0_fp32]).
+        trait_args = make_cpp_args(
+            in_dtype,
+            out_dtype,
+            group_size,
+            scale_ue8m0,
+            row_major,
+            aligned,
+            use_pdl,
+            *((True,) if ue8m0_fp32 else ()),
+        )
+    else:
+        if deepep_amax_floor:
+            trailing = (
+                (ue8m0_fp32, True) if masked_layout else (dense, ue8m0_fp32, True)
+            )
+        elif ue8m0_fp32:
+            trailing = (
+                (dense, True) if not (masked_layout or sorted_layout) else (True,)
+            )
+        else:
+            trailing = (True,) if dense else ()
+        trait_args = make_cpp_args(
+            in_dtype,
+            out_dtype,
+            group_size,
+            scale_ue8m0,
+            row_major,
+            aligned,
+            fuse_silu_and_mul,
+            use_pdl,
+            *trailing,
+        )
     assert not (masked_layout and sorted_layout)
     layout = "masked" if masked_layout else ("sorted" if sorted_layout else "flat")
-    launcher = f"PerTokenGroupQuant{layout.capitalize()}Kernel"
+    launcher = f"PerTokenGroupQuant{layout.capitalize()}{'Clamp' if clamp_swiglu else ''}Kernel"
     return load_jit(
         "per_token_group_quant",
         *trait_args,
         layout,
+        *(("clamp",) if clamp_swiglu else ()),
         cuda_files=["gemm/per_token_group_quant.cuh"],
         cuda_wrappers=[("per_token_group_quant", f"{launcher}<{trait_args}>::run")],
         extra_cuda_cflags=get_activation_cuda_cflags()

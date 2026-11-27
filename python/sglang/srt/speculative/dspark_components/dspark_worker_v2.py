@@ -366,6 +366,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._sim_draw_ahead = sim_draw_ahead_enabled(self._simulated_correct_len)
         self.num_sim_draws_ahead = 0
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
+        from sglang.srt.true_on_policy.dsv41_dspark import draft_races
+
+        self._race_draft = draft_races()
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
@@ -376,6 +379,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             random_seed=target_worker.random_seed,
             greedy_draft=self._greedy_draft,
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
+            race_draft=self._race_draft,
         )
         self._verify_epilogue = None
         self._sampling_accept_graph: Optional[DsparkSamplingAcceptGraph] = None
@@ -703,6 +707,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             noise=self._proposer.noise,
             greedy_draft=self._greedy_draft,
             tp_sync=self._tp_sync,
+            race_draft=self._race_draft,
             out=(
                 self._verify_epilogue.draft_tokens_buf
                 if self._verify_epilogue is not None

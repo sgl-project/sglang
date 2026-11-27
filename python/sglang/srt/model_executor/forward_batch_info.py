@@ -62,7 +62,6 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
-from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
@@ -1616,11 +1615,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
         has_multimodal_input = any(mm is not None for mm in mm_inputs)
 
-        if (
-            rl_on_policy_target is not None
-            or is_true_on_policy_enabled()
-            or not has_multimodal_input
-        ):
+        # A true-on-policy contract keeps the model's image positions: its trainer rotates by the same ones.
+        if rl_on_policy_target is not None or not has_multimodal_input:
             # Text-only
             positions_1d = seq_lens_int64 - 1
             self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
@@ -1681,11 +1677,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mm_input = mm_inputs[batch_idx]
             extend_seq_len = extend_lens[batch_idx]
             extend_prefix_len = prefix_lens[batch_idx]
-            if (
-                mm_input is None
-                or rl_on_policy_target is not None
-                or is_true_on_policy_enabled()
-            ):
+            if mm_input is None or rl_on_policy_target is not None:
                 # text only
                 mrope_positions = (
                     torch.arange(

@@ -179,6 +179,8 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         elif (
             forward_batch.extend_seq_lens is not None
             and hc_hidden_states.shape[0] != forward_batch.extend_seq_lens.shape[0]
+            # A DP-attention rank with no local rows has nothing to select.
+            and hc_hidden_states.shape[0] > 0
         ):
             last_index = (
                 torch.cumsum(forward_batch.extend_seq_lens.to(torch.int64), dim=0) - 1
@@ -202,7 +204,9 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
                 input_ids, forward_batch, input_embeds
             )
             hidden_states = forward_batch.spec_info.hidden_states
-            if not forward_batch.forward_mode.is_idle():
+            # A DP-attention rank can run a non-idle draft batch with no local rows; the norm kernels reject an
+            # empty launch.
+            if not forward_batch.forward_mode.is_idle() and input_embeds.shape[0] > 0:
                 hidden_states = self._mtp_input_fusion(input_embeds, hidden_states)
 
             with get_global_expert_distribution_recorder().disable_this_region():

@@ -235,12 +235,20 @@ class DeepseekV41Indexer(nn.Module):
                 head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16
             )
             self.k_norm = RMSNorm(self.index_head_dim, config.rms_norm_eps)
+        # TOP: wk and weights_proj run the batch-invariant matmul at every row count (true_on_policy.dsv41_attention).
+        self.top = False
 
     def forward_wk(self, latent: torch.Tensor) -> torch.Tensor:
         from sglang.kernels.ops.gemm.small_gemm_bf16 import (
             can_use_n128k512_gemm,
             n128k512_gemm_bf16,
         )
+
+        # The small-M JIT GEMM serves only some row counts; TOP runs the batch-invariant matmul at every one.
+        if self.top:
+            from sglang.srt.true_on_policy.dsv41_attention import project_bf16
+
+            return project_bf16(latent, self.wk.weight)
 
         # The JIT kernel raises rather than falling back on an unsupported shape.
         if can_use_n128k512_gemm(
@@ -268,6 +276,10 @@ class DeepseekV41Indexer(nn.Module):
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""
+        if self.top:
+            from sglang.srt.true_on_policy.dsv41_attention import project_bf16
+
+            return project_bf16(x, self.weights_proj.weight)
         if 0 < x.shape[0] <= self.weights_proj_small_max_m and x.is_cuda:
             from sglang.kernels.ops.gemm.small_gemm_bf16 import n32k5120_gemm_bf16
 

@@ -98,6 +98,10 @@ from sglang.srt.runtime_context import (
     get_stream,
 )
 from sglang.srt.true_on_policy import get_on_policy_rms_norm_kwargs
+from sglang.srt.true_on_policy.qwen_moe_router import (
+    gated_shared_output,
+    top_qwen_router,
+)
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -179,6 +183,7 @@ class Qwen2MoeMLP(nn.Module):
         prefix: str = "",
         *,
         parallel_group: LinearParallelGroup = "tp",
+        top_eager_rounding: bool = True,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -202,7 +207,7 @@ class Qwen2MoeMLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        self.act_fn = SiluAndMul(top_eager_rounding=top_eager_rounding)
         # Set externally (see qwen3_5.py) when both projections are NVFP4 and
         # the FlashInfer fused SiLU+mul+FP4-quant kernel is available. The
         # fused path replaces act_fn + the down_proj input quantization with a
@@ -268,6 +273,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         super().__init__()
         # False when a stage boundary completes this output's sum.
         self.reduce_results = reduce_results
+        top_router = top_qwen_router(config, quant_config)
+        self._top = top_router is not None
         self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
         self.alt_stream = alt_stream
@@ -305,7 +312,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
 
-        self.topk = TopK(
+        # TopQwenRouter is the stock CUDA softmax router (moe_fused_gate) behind one function the trainer calls
+        # with its backward (true_on_policy.qwen_route); TopK's env-selected packed and aiter variants never run.
+        self.topk = (top_router or TopK)(
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
             layer_id=layer_id,
@@ -367,6 +376,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
+                # TOP: the shared expert runs the experts' fused SwiGLU.
+                top_eager_rounding=not self._top,
                 **(
                     dict(parallel_group="replicated")
                     if (
@@ -522,7 +533,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None and apply_gate:
-                if use_intel_amx_backend(self.shared_expert_gate):
+                # The one-column gate is narrower than the batch-invariant dispatcher's DeepGEMM widths;
+                # TOP runs it on fixed narrow BI tiles in serving and the trainer (shared_gate_linear).
+                if self._top:
+                    shared_output = gated_shared_output(
+                        hidden_states, self.shared_expert_gate.weight, shared_output
+                    )
+                elif use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
                         hidden_states,
                         self.shared_expert_gate.weight,

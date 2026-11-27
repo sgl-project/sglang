@@ -242,6 +242,9 @@ class IndexerKPool(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        from sglang.srt.true_on_policy import is_true_on_policy_enabled
+
+        self.top = is_true_on_policy_enabled()
 
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
@@ -262,6 +265,16 @@ class IndexerKPool(MultiPlatformOp):
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     def _resolve_head_gate_weights(self, x, q_scale, head_weights):
+        if self.top:
+            from sglang.srt.true_on_policy.glm5_next_dsa import head_gate
+
+            return head_gate(
+                x,
+                self.weights_proj.weight,
+                q_scale,
+                n_heads=self.n_heads,
+                softmax_scale=self.softmax_scale,
+            )
         if head_weights is not None:
             return self._apply_q_scale_and_softmax_scale(head_weights, q_scale)
         return self._get_logits_head_gate(x, q_scale)
@@ -469,7 +482,22 @@ class IndexerKPool(MultiPlatformOp):
                             f"{min_tail_chunk=}, {max_tail_chunk=}, "
                             f"{min_tail_req=}, {max_tail_req=}"
                         )
-            if not writes.is_empty:
+            if not writes.is_empty and self.top:
+                from sglang.srt.true_on_policy.glm5_next_dsa import (
+                    write_extend_groups,
+                )
+
+                write_extend_groups(
+                    pool=pool,
+                    buf=pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                    key=key,
+                    score=gate_score,
+                    ape=self.index_kpool_compress_ape,
+                    writes=writes,
+                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                )
+            elif not writes.is_empty:
                 buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
                 kpool_assemble_softmax_rotate_write_cache(
                     pool=pool,
@@ -773,11 +801,26 @@ class IndexerKPool(MultiPlatformOp):
         page_table_row_index: Optional[torch.Tensor] = None,
         topk_v2_plan: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        n_rows = logits.shape[0]
+        # The stock pooled top-k tries the v2 kernel with a batch plan, else another kernel by width;
+        # TOP selects with FlashInfer's deterministic top-k, ties to the smaller group, as the trainer does.
+        if self.top:
+            from sglang.srt.true_on_policy.glm5_next_dsa import select_serving_tokens
+
+            return select_serving_tokens(
+                logits,
+                pool_lens,
+                seq_lens,
+                row_starts=row_starts,
+                out_rows=out_rows,
+                page_table=page_table,
+                page_table_row_index=page_table_row_index,
+                topk_offsets=topk_offsets,
+            )
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             topk_from_pooled_history_logits,
         )
 
-        n_rows = logits.shape[0]
         if (
             page_table is not None
             and page_table_row_index is None
@@ -1637,6 +1680,7 @@ class IndexerKPool(MultiPlatformOp):
                 num_draft_tokens=num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
                 effective_n_per_batch=plan.effective_n_per_batch,
+                two_pass=self.top,
             )
 
         if enable_dual_stream:
@@ -1727,8 +1771,10 @@ class IndexerKPool(MultiPlatformOp):
 
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
+        # TOP computes the head gate on the main stream with its own GEMM.
         enable_dual_stream = (
-            self.alt_stream is not None
+            not self.top
+            and self.alt_stream is not None
             and get_is_capture_mode()
             and q_lora.shape[0] > 0
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
@@ -1775,7 +1821,8 @@ class IndexerKPool(MultiPlatformOp):
         if forward_batch.forward_mode.is_extend_without_speculative():
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
-                skip_logits_computation = max_kv_len <= self.index_topk
+                # The skip keys on the batch's longest row, so TOP selects short rows from the logits too.
+                skip_logits_computation = not self.top and max_kv_len <= self.index_topk
 
         if skip_logits_computation:
             return self._forward_cuda_skip_logits(

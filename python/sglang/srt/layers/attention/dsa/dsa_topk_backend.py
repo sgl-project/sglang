@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.true_on_policy.fp8 import enabled as top_fp8
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -107,6 +108,28 @@ class DSATopKBackend(Enum):
         force_unfused_topk: bool = False,
         return_raw_indices: bool = False,
     ) -> torch.Tensor:
+        if top_fp8():
+            # Lazy: ordered_topk imports flashinfer, which native platforms may lack.
+            from sglang.srt.true_on_policy.dsa.fp8_transform import (
+                ordered_transform,
+            )
+
+            return ordered_transform(
+                logits,
+                lengths,
+                topk,
+                topk_transform_method,
+                attn_metadata,
+                cu_seqlens_q=cu_seqlens_q_topk,
+                offsets=topk_indices_offset,
+                row_starts=row_starts,
+                batch_idx_list=batch_idx_list,
+                force_unfused=(
+                    force_unfused_topk or not envs.SGLANG_DSA_FUSE_TOPK.get()
+                ),
+                return_raw=return_raw_indices,
+            )
+
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             result = self.topk_func(logits, lengths, topk, row_starts=row_starts)
             return (result, result) if return_raw_indices else result
@@ -322,6 +345,12 @@ def _topk_unfused(
     topk_local_indices = topk_local_indices.masked_fill(
         topk_scores == float("-inf"), -1
     )
+    from sglang.srt.true_on_policy.moe import should_use_slot_order_moe_combine
+
+    if should_use_slot_order_moe_combine():
+        from sglang.srt.true_on_policy.glm_dsa import canonical_slot_order
+
+        topk_local_indices = canonical_slot_order(topk_local_indices)
     topk_indices[:, :valid_topk] = topk_local_indices
 
     return topk_indices

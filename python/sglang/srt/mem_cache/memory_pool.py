@@ -877,7 +877,20 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                # TOP chunked GDN and KDA verify without per-draft states too (the row
+                # cache keeps the open chunk; commit is the next step's position).
+                from sglang.srt.true_on_policy.gdn_chunked import (
+                    top_gdn_chunked_active,
+                )
+                from sglang.srt.true_on_policy.kda_chunked import (
+                    top_kda_chunked_active,
+                )
+
+                if (
+                    enable_linear_replayssm_spec
+                    or top_gdn_chunked_active()
+                    or (cache_params.is_kda and top_kda_chunked_active())
+                ):
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(

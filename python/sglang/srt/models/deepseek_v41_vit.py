@@ -12,11 +12,27 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.multimodal.deepseek_v41_image_processing import image_token_types
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
+from sglang.srt.true_on_policy import vision as top_vision
 
 
 def _rms_norm(dim: int) -> RMSNorm:
     # The fused CUDA kernels do not take an fp32 weight with a bf16 input.
     return RMSNorm(dim, eps=1e-6, weight_dtype=torch.float32, force_native=True)
+
+
+def _norm(norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
+    # One function on bare weights, the one the trainer's tower calls (true_on_policy.vision.rms_norm).
+    if is_true_on_policy_enabled():
+        return top_vision.rms_norm(x, norm.weight, norm.variance_epsilon)
+    return norm(x)
+
+
+def _linear(layer: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    if is_true_on_policy_enabled():
+        return top_vision.linear(x, layer.weight, layer.bias)
+    return layer(x)
 
 
 @lru_cache(8)
@@ -41,7 +57,7 @@ class PatchEmbed(nn.Module):
         self.proj = nn.Linear(3 * args.vision_patch_size**2, args.vision_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x.flatten(1))
+        return _linear(self.proj, x.flatten(1))
 
 
 def apply_vision_rotary(q, k, position_embeddings, x_shape):
@@ -86,8 +102,8 @@ class MLP(nn.Module):
         self.w2 = nn.Linear(args.vision_inter_dim, args.vision_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, up = self.w1(x).chunk(2, dim=-1)
-        return self.w2(F.silu(gate) * up)
+        gate, up = _linear(self.w1, x).chunk(2, dim=-1)
+        return _linear(self.w2, F.silu(gate) * up)
 
 
 class Block(nn.Module):
@@ -105,8 +121,8 @@ class Block(nn.Module):
         sin: torch.Tensor,
         metadata: VisionAttentionMetadata,
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), cos, sin, metadata)
-        return x + self.mlp(self.norm2(x))
+        x = x + self.attn(_norm(self.norm1, x), cos, sin, metadata)
+        return x + self.mlp(_norm(self.norm2, x))
 
 
 class ViT(nn.Module):
@@ -132,7 +148,7 @@ class ViT(nn.Module):
         )
         for block in self.blocks:
             x = block(x, cos, sin, metadata)
-        return self.norm(x)
+        return _norm(self.norm, x)
 
 
 class Aligner(nn.Module):
@@ -144,8 +160,34 @@ class Aligner(nn.Module):
         self.w2 = nn.Linear(args.dim, args.dim)
 
     def forward(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
-        r = self.downsample_ratio
-        x = x.view(n_h, n_w, -1).permute(2, 0, 1)
-        x = F.pad(x, (0, -n_w % r, 0, -n_h % r))
-        x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
-        return self.w2(F.gelu(self.w1(x)))
+        x = downsample(x, n_h=n_h, n_w=n_w, ratio=self.downsample_ratio)
+        return _linear(self.w2, F.gelu(_linear(self.w1, x)))
+
+
+def downsample(x: torch.Tensor, *, n_h: int, n_w: int, ratio: int) -> torch.Tensor:
+    """ViT rows [n_h * n_w, D] -> [ceil(n_h / ratio) * ceil(n_w / ratio), D * ratio**2], zero-padded windows."""
+    x = x.view(n_h, n_w, -1).permute(2, 0, 1)
+    x = F.pad(x, (0, -n_w % ratio, 0, -n_h % ratio))
+    return F.unfold(x.unsqueeze(0), ratio, stride=ratio).squeeze(0).transpose(0, 1)
+
+
+def image_span(
+    features: torch.Tensor,
+    *,
+    n_vit_h: int,
+    n_vit_w: int,
+    ratio: int,
+    start: torch.Tensor,
+    newline: torch.Tensor,
+    end: torch.Tensor,
+) -> torch.Tensor:
+    """One image's LLM rows: aligner rows in reading order between the start, newline and end embeddings."""
+    types = image_token_types(-(-n_vit_h // ratio), -(-n_vit_w // ratio)).to(
+        features.device
+    )
+    span = features.new_empty((len(types), start.shape[0]), dtype=start.dtype)
+    span[types == 0] = start
+    span[types == 1] = features.to(start.dtype)
+    span[types == 2] = newline
+    span[types == 3] = end
+    return span

@@ -45,6 +45,9 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
     inplace_update: bool = True,
+    fixed_output_tile: bool = False,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -70,6 +73,8 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         inplace_update=inplace_update,
+        track_state=track_state,
+        track_chunk_idx=track_chunk_idx,
     )
     o = chunk_fwd_o(
         q=q,
@@ -79,6 +84,7 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        fixed_tile=fixed_output_tile,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, None, h, None
@@ -103,6 +109,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
         inplace_update: bool = True,
+        fixed_output_tile: bool = False,
+        track_state: Optional[torch.Tensor] = None,
+        track_chunk_idx: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -128,6 +137,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             inplace_update=inplace_update,
+            fixed_output_tile=fixed_output_tile,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
         )
         return o.to(q.dtype), h
 
@@ -146,6 +158,9 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     inplace_update: bool = True,
+    fixed_output_tile: bool = False,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -176,6 +191,14 @@ def chunk_gated_delta_rule(
             Default: `False`.
         inplace_update (Optional[bool]):
             Whether to write final states back to `initial_state`. Default: `True`.
+        fixed_output_tile (Optional[bool]):
+            Run the output kernel on the full chunk tile even for calls shorter than one chunk,
+            so a sequence's output bytes do not depend on the call's total length. Default: `False`.
+        track_state (Optional[torch.Tensor]):
+            FP32 buffer `[N, H, V, K]` (rows follow the batch) that receives each tracked sequence's state at the chunk
+            boundary named by `track_chunk_idx`: radix track snapshots without the BF16 rounding of `h`. Pass together with `track_chunk_idx`. Default: `None`.
+        track_chunk_idx (Optional[torch.Tensor]):
+            Per-sequence chunk index of the tracked boundary (local to each sequence), `-1` for untracked rows. Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -263,6 +286,9 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         inplace_update,
+        fixed_output_tile,
+        track_state,
+        track_chunk_idx,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

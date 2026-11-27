@@ -74,6 +74,16 @@ struct WeightTrait<int8_t> {
 template <bool kUe8m0>
 using scale_t = std::conditional_t<kUe8m0, uint8_t, float>;
 
+// A UE8M0 exponent byte as the FP32 scale SM90 DeepGEMM reads: 2^(e - 127),
+// with 0 -> 2^-127 (subnormal) and 255 -> NaN. These are the bits an unpack of
+// the packed byte yields, so both scale formats feed the GEMM the same value.
+SGL_DEVICE float ue8m0_to_fp32(const uint8_t e) {
+  uint32_t bits = static_cast<uint32_t>(e) << 23;
+  if (e == 0) bits = 0x00400000u;
+  if (e == 255) bits = 0x7FC00000u;
+  return __uint_as_float(bits);
+}
+
 // Scale output accessor. Strides are host-verified; units are scale elements
 // (float) for the fp32 layouts and BYTES for the ue8m0 layouts. Stores must
 // stay pure functions of (expert, token, group, scale_inv): tail-duplicated
@@ -195,6 +205,7 @@ struct QuantKernelParams {
   detail::ScaleStoreArgs scale;
   uint32_t num_tokens;   // tokens_pad for the masked kernel
   uint32_t hidden_size;  // = num_groups * kGroupSize
+  float swiglu_limit;    // read only by kClampSwiglu traits; +inf otherwise
 };
 
 struct MaskedQuantKernelParams {
@@ -239,7 +250,10 @@ template <
     bool kRowMajor_,
     bool kAligned_,
     bool kFuseSiluAndMul_,
-    bool kDenseSiluAndMul = false>
+    bool kUe8m0Fp32_ = false,
+    bool kDenseSiluAndMul = false,
+    bool kClampSwiglu_ = false,
+    bool kDeepEPAmaxFloor_ = false>
 struct QuantTrait {
   // rename
   using InputType = InputType_;
@@ -249,6 +263,17 @@ struct QuantTrait {
   static constexpr bool kRowMajor = kRowMajor_;
   static constexpr bool kAligned = kAligned_;
   static constexpr bool kFuseSiluAndMul = kFuseSiluAndMul_;
+  // kUe8m0Fp32: UE8M0 (power-of-two) scales stored as FP32 values instead of
+  // packed exponent bytes. kPacked selects the storage; kUe8m0 the arithmetic.
+  static constexpr bool kUe8m0Fp32 = kUe8m0Fp32_;
+  static constexpr bool kPacked = kUe8m0 && !kUe8m0Fp32;
+  // kClampSwiglu: DeepSeek-V4's SwiGLU limit on the BF16 gate (max) and up (+-) halves,
+  // each clamped value rounded back to the input type before the activation.
+  static constexpr bool kClampSwiglu = kClampSwiglu_;
+  // kDeepEPAmaxFloor: floor amax at DeepEP's low-latency FP8 cast margin (kFP8Margin, csrc/kernels/legacy/utils.cuh),
+  // so these bytes and scales equal what that fused cast sends; the default floor is 1e-10.
+  static constexpr bool kDeepEPAmaxFloor = kDeepEPAmaxFloor_;
+  static constexpr float kAmaxFloor = kDeepEPAmaxFloor ? 1e-4f : 1e-10f;
   static constexpr uint32_t kBlockSize = 256;
   static constexpr uint32_t kVecSize = 32u / 2;
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
@@ -258,6 +283,10 @@ struct QuantTrait {
   static_assert(16 <= kGroupSize && kGroupSize <= 256, "supported group sizes are 16..256");
   static_assert(kGroupSize % kVecSize == 0 && 1 <= kNumLanes && kNumLanes <= device::kWarpThreads);
   static_assert(!kUe8m0 || std::is_same_v<QuantType, fp8_e4m3_t>, "ue8m0 scales imply fp8 output");
+  static_assert(kUe8m0 || !kUe8m0Fp32, "fp32-stored ue8m0 scales imply ue8m0");
+  static_assert(
+      !kClampSwiglu || (kFuseSiluAndMul && !kDenseSiluAndMul), "the SwiGLU clamp needs the legacy fused silu");
+  static_assert(!kDeepEPAmaxFloor || (kUe8m0 && !kFuseSiluAndMul), "the DeepEP amax floor is for UE8M0 row quant");
 
   SGL_DEVICE static void
   run(const QuantKernelParams& params,
@@ -303,6 +332,13 @@ struct QuantTrait {
       up.load(token_in + group_offset + params.hidden_size, lane_id);
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+        if constexpr (kClampSwiglu) {
+          const float lim = params.swiglu_limit;
+          const auto g = cast<float2>(in[i]);
+          const auto u = cast<float2>(up[i]);
+          in[i] = cast<T2>(float2{fminf(g.x, lim), fminf(g.y, lim)});
+          up[i] = cast<T2>(float2{fminf(fmaxf(u.x, -lim), lim), fminf(fmaxf(u.y, -lim), lim)});
+        }
         const auto gate = cast<float2>(in[i]);
         if constexpr (kDenseSiluAndMul) {
           // Match dense activation.cuh: round the product, not SiLU, to T.
@@ -323,16 +359,20 @@ struct QuantTrait {
       local_amax2 = math::max(local_amax2, math::abs(in[i]));
     }
     const auto amax2 = cast<float2>(warp::reduce_max<kNumLanes>(local_amax2));
-    const auto amax = math::max(math::max(amax2.x, amax2.y), 1e-10f);
+    const auto amax = math::max(math::max(amax2.x, amax2.y), kAmaxFloor);
     const float raw_scale = amax * kMaxValueInv;  // the dequant scale the GEMM consumes
 
     out_vec_t out;
-    detail::scale_t<kUe8m0> scale_inv;
+    detail::scale_t<kPacked> scale_inv;
     if constexpr (kUe8m0) {
       // ue8m0 scale: pow-2 quant multiplier is exact in float16/bfloat16 type
       static_assert(std::is_same_v<Q, fp8_e4m3_t>, "ue8m0 scales imply fp8 quantization");
       const auto exp = cast_to_ue8m0(raw_scale);
-      scale_inv = static_cast<uint8_t>(exp);
+      if constexpr (kPacked) {
+        scale_inv = static_cast<uint8_t>(exp);
+      } else {
+        scale_inv = detail::ue8m0_to_fp32(static_cast<uint8_t>(exp));
+      }
       const float quant_scale = inv_scale_ue8m0(exp);
       const auto scale2 = cast<T2>(float2{quant_scale, quant_scale});
       // BF16 can represent the multiplier, so preserve NaNs instead of hiding
@@ -367,7 +407,7 @@ struct QuantTrait {
     }
 
     out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);
-    params.scale.store<kUe8m0, kRowMajor, kAligned>(expert_idx, token_idx, group_idx, scale_inv);
+    params.scale.store<kPacked, kRowMajor, kAligned>(expert_idx, token_idx, group_idx, scale_inv);
   }
 
   SGL_DEVICE static void run_fp32(
@@ -404,16 +444,20 @@ struct QuantTrait {
     for (uint32_t i = 1; i < kVecSize; ++i) {
       local_amax = math::max(local_amax, fabsf(in(i)));
     }
-    const auto amax = math::max(warp::reduce_max<kNumLanes>(local_amax), 1e-10f);
+    const auto amax = math::max(warp::reduce_max<kNumLanes>(local_amax), kAmaxFloor);
     const float raw_scale = amax * kMaxValueInv;
 
     out_vec_t out;
-    detail::scale_t<kUe8m0> scale_inv;
+    detail::scale_t<kPacked> scale_inv;
     float quant_scale;
     if constexpr (kUe8m0) {
       static_assert(std::is_same_v<Q, fp8_e4m3_t>, "ue8m0 scales imply fp8 quantization");
       const auto exp = cast_to_ue8m0(raw_scale);
-      scale_inv = static_cast<uint8_t>(exp);
+      if constexpr (kPacked) {
+        scale_inv = static_cast<uint8_t>(exp);
+      } else {
+        scale_inv = detail::ue8m0_to_fp32(static_cast<uint8_t>(exp));
+      }
       quant_scale = inv_scale_ue8m0(exp);
     } else {
       scale_inv = raw_scale;
@@ -426,7 +470,7 @@ struct QuantTrait {
     }
 
     out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);
-    params.scale.store<kUe8m0, kRowMajor, kAligned>(expert_idx, token_idx, group_idx, scale_inv);
+    params.scale.store<kPacked, kRowMajor, kAligned>(expert_idx, token_idx, group_idx, scale_inv);
   }
 };
 
@@ -518,7 +562,7 @@ QuantHostContext<Trait> build_quant_context( //
   using namespace host;
   using T = typename Trait::InputType;
   using Q = typename Trait::QuantType;
-  using S = std::conditional_t<Trait::kUe8m0, int32_t, float>;
+  using S = std::conditional_t<Trait::kPacked, int32_t, float>;
   constexpr int64_t kSiluFactor = Trait::kFuseSiluAndMul ? 2 : 1;
 
   auto device = SymbolicDevice{};
@@ -556,12 +600,12 @@ QuantHostContext<Trait> build_quant_context( //
   const uint32_t num_scale_groups = G.unwrap();
   CHECK_HOST(hidden_size % Trait::kGroupSize == 0);
   CHECK_HOST(input.size(-1) == hidden_size * kSiluFactor);
-  CHECK_HOST(num_scale_groups == (Trait::kUe8m0 ? div_ceil(num_groups, 4) : num_groups));
+  CHECK_HOST(num_scale_groups == (Trait::kPacked ? div_ceil(num_groups, 4) : num_groups));
   // Pack-tail alignment only exists for the 4-per-int32 ue8m0 layouts; fp32
   // scales are unpacked (kAligned is fixed true by the static_assert). Exact
   // match: kAligned = false with an aligned num_groups would make
   // fill_unaligned zero bytes past the row.
-  if constexpr (Trait::kUe8m0) {
+  if constexpr (Trait::kPacked) {
     CHECK_HOST(Trait::kAligned == (num_groups % 4 == 0));
   }
   auto scale_args = detail::ScaleStoreArgs{
@@ -573,13 +617,13 @@ QuantHostContext<Trait> build_quant_context( //
   };
   if constexpr (Trait::kRowMajor) {
     CHECK_HOST(scale_args.group_stride == 1);
-    if constexpr (Trait::kUe8m0) {
+    if constexpr (Trait::kPacked) {
       scale_args.expert_stride *= 4;  // i32 -> u8
       scale_args.token_stride *= 4;   // i32 -> u8
     }
   } else {  // col major
     CHECK_HOST(scale_args.token_stride == 1);
-    if constexpr (Trait::kUe8m0) {
+    if constexpr (Trait::kPacked) {
       scale_args.expert_stride *= 4;  // i32 -> u8
       scale_args.group_stride *= 4;   // i32 -> u8
       // The device store hardcodes token_idx * 4 bytes in this layout (it
@@ -607,6 +651,7 @@ QuantHostContext<Trait> build_quant_context( //
               .scale = scale_args,
               .num_tokens = num_tokens,
               .hidden_size = hidden_size,
+              .swiglu_limit = std::numeric_limits<float>::infinity(),
           },
       .num_experts = num_experts,
       .device = device.unwrap(),
@@ -633,10 +678,22 @@ template <
     bool kAligned,
     bool kFuseSiluAndMul,
     bool kUsePDL,
-    bool kDenseSiluAndMul = false>
+    bool kDenseSiluAndMul = false,
+    bool kUe8m0Fp32 = false,
+    bool kDeepEPAmaxFloor = false>
 struct PerTokenGroupQuantFlatKernel {
-  using Trait =
-      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kDenseSiluAndMul>;
+  using Trait = QuantTrait<
+      InputType,
+      QuantType,
+      kGroupSize,
+      kUe8m0,
+      kRowMajor,
+      kAligned,
+      kFuseSiluAndMul,
+      kUe8m0Fp32,
+      kDenseSiluAndMul,
+      false,
+      kDeepEPAmaxFloor>;
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
@@ -652,9 +709,10 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kUe8m0Fp32 = false>
 struct PerTokenGroupQuantSortedKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kUe8m0Fp32>;
 
   /// \brief Flat quantization over the sorted, block-padded MoE layout.
   /// \param sorted_token_ids moe_align_block_size output; entries >= num_valid_tokens are padding.
@@ -692,9 +750,22 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kUe8m0Fp32 = false,
+    bool kDeepEPAmaxFloor = false>
 struct PerTokenGroupQuantMaskedKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait = QuantTrait<
+      InputType,
+      QuantType,
+      kGroupSize,
+      kUe8m0,
+      kRowMajor,
+      kAligned,
+      kFuseSiluAndMul,
+      kUe8m0Fp32,
+      false,
+      false,
+      kDeepEPAmaxFloor>;
 
   // expected_m: optional host-side expected-tokens-per-expert hint (the same
   // hint SGLang passes to deep_gemm's masked grouped GEMM); <= 0 means
@@ -706,9 +777,23 @@ struct PerTokenGroupQuantMaskedKernel {
       tvm::ffi::TensorView output_s,
       tvm::ffi::TensorView masked_m,
       int32_t expected_m) {
+    launch<Trait>(input, output_q, output_s, masked_m, expected_m, std::numeric_limits<float>::infinity());
+  }
+
+  // Shared with PerTokenGroupQuantMaskedClampKernel, which passes its own trait and limit.
+  template <typename LaunchTrait>
+  static void launch(
+      tvm::ffi::TensorView input,
+      tvm::ffi::TensorView output_q,
+      tvm::ffi::TensorView output_s,
+      tvm::ffi::TensorView masked_m,
+      int32_t expected_m,
+      float swiglu_limit) {
     using namespace host;
     using device::kWarpThreads;
-    const auto ctx = build_quant_context<Trait, /*kMasked=*/true>(input, output_q, output_s);
+    using Trait = LaunchTrait;
+    auto ctx = build_quant_context<Trait, /*kMasked=*/true>(input, output_q, output_s);
+    ctx.params.swiglu_limit = swiglu_limit;
     auto E = SymbolicSize{"num_experts"};
     E.set_value(ctx.num_experts);
     TensorMatcher({E}).with_dtype<int32_t, int64_t>().with_device(ctx.device).verify(masked_m);
@@ -734,6 +819,63 @@ struct PerTokenGroupQuantMaskedKernel {
     }();
     LaunchKernel({num_blocks, ctx.num_experts}, Trait::kBlockSize, ctx.device)
         .config({.use_pdl = kUsePDL})(per_token_group_quant_masked_kernel<Trait, kUsePDL>, params);
+  }
+};
+
+// Fused SiLU-and-mul with the SwiGLU clamp (kClampSwiglu): separate entry points, so the existing launchers keep their
+// names and signatures. swiglu_limit is passed already rounded to the input type by the caller.
+template <
+    typename InputType,
+    typename QuantType,
+    uint32_t kGroupSize,
+    bool kUe8m0,
+    bool kRowMajor,
+    bool kAligned,
+    bool kUsePDL,
+    bool kUe8m0Fp32 = false>
+struct PerTokenGroupQuantFlatClampKernel {
+  using Trait =
+      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, true, kUe8m0Fp32, false, true>;
+
+  static void
+  run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s, double swiglu_limit) {
+    auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
+    ctx.params.swiglu_limit = static_cast<float>(swiglu_limit);
+    launch_flat_kernel<Trait, kUsePDL, /*kSortedRows=*/false>(ctx, ctx.params);
+  }
+};
+
+template <
+    typename InputType,
+    typename QuantType,
+    uint32_t kGroupSize,
+    bool kUe8m0,
+    bool kRowMajor,
+    bool kAligned,
+    bool kUsePDL,
+    bool kUe8m0Fp32 = false>
+struct PerTokenGroupQuantMaskedClampKernel {
+  using Trait =
+      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, true, kUe8m0Fp32, false, true>;
+  using Base = PerTokenGroupQuantMaskedKernel<
+      InputType,
+      QuantType,
+      kGroupSize,
+      kUe8m0,
+      kRowMajor,
+      kAligned,
+      true,
+      kUsePDL,
+      kUe8m0Fp32>;
+
+  static void
+  run(tvm::ffi::TensorView input,
+      tvm::ffi::TensorView output_q,
+      tvm::ffi::TensorView output_s,
+      tvm::ffi::TensorView masked_m,
+      int32_t expected_m,
+      double swiglu_limit) {
+    Base::template launch<Trait>(input, output_q, output_s, masked_m, expected_m, static_cast<float>(swiglu_limit));
   }
 };
 

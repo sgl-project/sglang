@@ -245,6 +245,24 @@ def init_tokenizer_manager(
     return tokenizer_manager, template_manager
 
 
+def _admit_true_on_policy_serving(server_args: ServerArgs) -> None:
+    # Serving engines only: the TOP trainer publishes its pinned program without a serving topology.
+    if server_args.true_on_policy_contract is None:
+        return
+    from sglang.srt.arg_groups.model_override_base import model_config_of
+    from sglang.srt.true_on_policy.fp8 import is_block_fp8
+    from sglang.srt.true_on_policy.gdn_chunked import select_chunked_programs
+    from sglang.srt.true_on_policy.registry import admit_serving
+
+    hf_config = model_config_of(server_args).hf_config
+    family = admit_serving(
+        server_args,
+        model_type=hf_config.model_type,
+        fp8=is_block_fp8(getattr(hf_config, "quantization_config", None)),
+    )
+    select_chunked_programs(family.ops)
+
+
 class Engine(EngineScoreMixin, EngineBase):
     """
     The entry point to the inference engine.
@@ -1151,6 +1169,7 @@ class Engine(EngineScoreMixin, EngineBase):
         # Configure global environment
         configure_logger(server_args)
         server_args.resolve_once()
+        _admit_true_on_policy_serving(server_args)
 
         _set_envs_and_config(server_args)
 

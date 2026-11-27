@@ -565,6 +565,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # avoiding an expensive FP8-to-bf16 dequantization.
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
+        from sglang.srt.true_on_policy import is_true_on_policy_enabled
+
+        if is_true_on_policy_enabled():
+            from sglang.srt.true_on_policy.dsa_head_gate import project_head_gate
+
+            return project_head_gate(x, self.weights_proj.weight)
         if _is_cuda:
             return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
 

@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 
 
 @lru_cache(None)
@@ -127,6 +128,16 @@ class GatedResidual(HyperConnectionBase):
         role: Optional[str] = None,
     ):
         super().__init__(config, use_mix, use_combine, role)
+        # TOP pins one program at every token count; see true_on_policy/hyper_connection.py.
+        self.top_enabled = is_true_on_policy_enabled()
+        if self.top_enabled and not (
+            use_mix
+            and config.hc_per_branch_norm
+            and config.params_dtype == torch.bfloat16
+        ):
+            raise NotImplementedError(
+                "[top] Gated Residual requires the mix path, per-branch norm and BF16 params"
+            )
 
         norm_dim = (
             self.config.hidden_size * self.hc_count
@@ -239,6 +250,9 @@ class GatedResidual(HyperConnectionBase):
         normalized_input: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
+        # The stock mix picks its kernel by row count, and fused_hc_mix accumulates with atomics (hyper_connection.hc_mix).
+        if self.top_enabled:
+            return self._mix_top(hyper_input)
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
@@ -315,6 +329,32 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed.record_stream(stream)
         return mixed_input, (hyper_input, hyper_input_normed, partials)
 
+    def _mix_top(self, hyper_input: torch.Tensor):
+        from sglang.srt.true_on_policy import hyper_connection as top_hc
+
+        mixed_input, hyper_input_normed, _ = top_hc.hc_mix(
+            hyper_input,
+            norm_weight=self.hc_norm.weight,
+            w_down=self.input_mix_weight_down.weight,
+            w_up=self.input_mix_weight_up.weight,
+            n=self.hc_count,
+            eps=self.config.rms_norm_eps,
+        )
+        # No decode gate partials: combine_and_normalize falls back to combine().
+        return mixed_input, (hyper_input, hyper_input_normed, None)
+
+    def _combine_top(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
+        from sglang.srt.true_on_policy import hyper_connection as top_hc
+
+        hyper_input, hyper_input_normed, _ = residuals
+        return top_hc.hc_inject_combine(
+            hyper_input,
+            y2d=block_output,
+            normed=hyper_input_normed,
+            w_inject=self.block_inject_weight.weight,
+            n=self.hc_count,
+        )
+
     def combine_and_normalize(
         self,
         block_output: torch.Tensor,
@@ -367,6 +407,9 @@ class GatedResidual(HyperConnectionBase):
             return hc_combine_apply(block_output, hyper_input, partials)
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size
+        # The stock JIT hc_combine keeps the inject dot in FP32; the trainer's write gate rounds it to BF16.
+        if self.top_enabled:
+            return self._combine_top(block_output, residuals)
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
 

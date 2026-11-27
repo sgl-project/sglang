@@ -277,6 +277,24 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Select version
         self.fa_impl_ver = fa_impl_ver
+        self.top_enabled = model_runner.server_args.true_on_policy_contract is not None
+        self.top_decode_kv_split = 0
+        if self.top_enabled:
+            from sglang.srt.true_on_policy.attention import decode_kv_split
+
+            self.top_decode_kv_split = decode_kv_split(
+                model_runner.model_config.hf_text_config.model_type
+            )
+        # TOP chunked GDN: the trainer scores every row as a prefill, so prefill attention takes the decode's key
+        # split too (a row's bytes do not depend on whether it was prefilled or decoded).
+        self.top_split_prefill = False
+        # Decode / verify split plan of the current forward, built at its first attention layer (top_split_plan_layer).
+        self.top_split_plan = None
+        self.top_split_plan_layer = None
+        if self.top_decode_kv_split:
+            from sglang.srt.true_on_policy.gdn_chunked import top_gdn_chunked
+
+            self.top_split_prefill = top_gdn_chunked(model_runner.server_args)
         device_capability = get_device_capability()
         if self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
@@ -288,6 +306,8 @@ class FlashAttentionBackend(AttentionBackend):
             self._get_scheduler_metadata = get_scheduler_metadata
             self._get_fa_runtime_policy = None
         elif self.fa_impl_ver == 4:
+            if self.top_enabled and device_capability[0] not in (9, 10):
+                raise NotImplementedError("TOP FA4 forward supports SM90 and SM10x")
             if device_capability[0] == 12:
                 from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
                     flash_attn_varlen_func,
@@ -1717,6 +1737,7 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
                         ver=self.fa_impl_ver,
+                        true_on_policy=self.top_enabled,
                         **kwargs,
                     )
 
@@ -1786,24 +1807,63 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
-                result = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn or return_lse,
-                    num_splits=self.num_splits,
-                    out=_fa_out,
-                    ver=self.fa_impl_ver,
-                    **kwargs,
+                top_split = None
+                if (
+                    self.top_enabled
+                    and forward_batch.forward_mode.is_target_verify()
+                    and not (use_cascade_attn or use_local_attn or return_lse)
+                    and tuple(window_size) == (-1, -1)
+                    and not layer.logit_cap
+                    and not (set(kwargs) - {"max_seqlen_k"})
+                ):
+                    # Chain verify: draft row j of a request is the decode of position prefix + j, so it takes
+                    # that decode's key split; the request's rows share each piece's read.
+                    rows = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                    bs, d = cache_seqlens.shape[0], max_seqlen_q
+                    if rows.shape[0] == bs * d:
+                        top_split = self._top_split_verify(
+                            rows,
+                            key_cache,
+                            value_cache,
+                            page_table,
+                            cache_seqlens,
+                            d,
+                            layer,
+                        )
+                elif (
+                    self.top_split_prefill
+                    and forward_batch.forward_mode == ForwardMode.EXTEND
+                    and not (use_cascade_attn or use_local_attn or return_lse)
+                    and tuple(window_size) == (-1, -1)
+                    and not layer.logit_cap
+                    and not (set(kwargs) - {"max_seqlen_k"})
+                ):
+                    top_split = self._top_split_extend(
+                        q, key_cache, value_cache, page_table, forward_batch, layer
+                    )
+                result = (
+                    top_split
+                    if top_split is not None
+                    else flash_attn_with_kvcache(
+                        q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        return_softmax_lse=use_cascade_attn or return_lse,
+                        num_splits=self.num_splits,
+                        out=_fa_out,
+                        ver=self.fa_impl_ver,
+                        true_on_policy=self.top_enabled,
+                        **kwargs,
+                    )
                 )
 
             if return_lse and not use_cascade_attn:
@@ -1860,6 +1920,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
+                    true_on_policy=self.top_enabled,
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -1901,6 +1962,7 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=True,
                         out=_fa_out,
                         ver=self.fa_impl_ver,
+                        true_on_policy=self.top_enabled,
                         **kwargs,
                     )
                 else:
@@ -1928,6 +1990,7 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=forward_batch.mha_return_lse,
                         out=_fa_out,
                         ver=self.fa_impl_ver,
+                        true_on_policy=self.top_enabled,
                         **kwargs,
                     )
                 if forward_batch.mha_return_lse:
@@ -1997,6 +2060,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=fa_v_descale,
                             num_splits=self.num_splits,
                             ver=self.fa_impl_ver,
+                            true_on_policy=self.top_enabled,
                         )
 
                     cp_strategy = get_cp_strategy()
@@ -2027,6 +2091,7 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
                         ver=self.fa_impl_ver,
+                        true_on_policy=self.top_enabled,
                     )
                     if use_cascade_attn:
                         o, softmax_lse, *rest = result
@@ -2050,6 +2115,7 @@ class FlashAttentionBackend(AttentionBackend):
                                 return_softmax_lse=True,
                                 num_splits=self.num_splits,
                                 ver=self.fa_impl_ver,
+                                true_on_policy=self.top_enabled,
                             )
                         )
                         o, _ = merge_state_v2_wrapper(
@@ -2067,6 +2133,122 @@ class FlashAttentionBackend(AttentionBackend):
                 raise RuntimeError("This extend path does not return an LSE.")
             return o, extend_lse
         return o
+
+    def _top_split_extend(
+        self, q, key_cache, value_cache, page_table, forward_batch, layer
+    ):
+        """TOP chunked GDN prefill: every extend row through its decode's key split
+        (true_on_policy.attention.split_prefill_paged). The plan is built once per forward."""
+        from sglang.srt.true_on_policy.attention import (
+            SplitPrefillPlan,
+            split_prefill_paged,
+        )
+
+        metadata = self.forward_metadata
+        plan = getattr(metadata, "top_split_prefill_plan", None)
+        if plan is None:
+            plan = SplitPrefillPlan(
+                prefix=[int(x) for x in forward_batch.extend_prefix_lens_cpu],
+                lens=[int(x) for x in forward_batch.extend_seq_lens_cpu],
+                split=self.top_decode_kv_split,
+                page_size=self.page_size,
+                page_table=page_table,
+                device=q.device,
+            )
+            metadata.top_split_prefill_plan = plan
+        rows = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        out = split_prefill_paged(
+            rows[: plan.rows], key_cache, value_cache, plan, layer.scaling
+        )
+        if rows.shape[0] > plan.rows:
+            # A prefill CUDA graph pads the token dim to its bucket; padded rows attend nothing.
+            out = torch.cat(
+                (out, out.new_zeros(rows.shape[0] - plan.rows, *out.shape[1:]))
+            )
+        return out
+
+    def _top_split_decode(
+        self, q, key_cache, value_cache, page_table, cache_seqlens, layer
+    ):
+        """TOP decode with the keys split at fixed positions (true_on_policy.attention.decode_kv_split): one entry per
+        request and piece, the shared FA4 forward over each piece's pages, FA's combine across pieces. Static shapes
+        (pieces follow the page table's width), so it captures in decode CUDA graphs. None when off or one piece."""
+        from sglang.srt.true_on_policy.attention import SplitDecodePlan, split_decode
+
+        pieces = self._top_decode_pieces(page_table)
+        if pieces is None:
+            return None
+        plan = self._top_forward_plan(
+            layer,
+            SplitDecodePlan,
+            lambda: SplitDecodePlan(
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                split=self.top_decode_kv_split,
+                pieces=pieces,
+                page_size=self.page_size,
+            ),
+        )
+        return split_decode(q, key_cache, value_cache, plan, layer.scaling)
+
+    def _top_split_verify(
+        self, rows, key_cache, value_cache, page_table, cache_seqlens, d, layer
+    ):
+        """Chain verify through the decode KV split, the d draft rows of a request sharing its pieces
+        (true_on_policy.attention.split_verify): each row's bytes are those of its own split decode."""
+        from sglang.srt.true_on_policy.attention import SplitVerifyPlan, split_verify
+
+        pieces = self._top_decode_pieces(page_table)
+        if pieces is None:
+            return None
+        plan = self._top_forward_plan(
+            layer,
+            SplitVerifyPlan,
+            lambda: SplitVerifyPlan(
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                rows_per_request=d,
+                split=self.top_decode_kv_split,
+                pieces=pieces,
+                page_size=self.page_size,
+            ),
+        )
+        return split_verify(rows, key_cache, value_cache, plan, layer.scaling)
+
+    def _top_forward_plan(self, layer, kind, build):
+        """The split plan depends only on the forward's page table and lengths, so the forward's first attention layer
+        builds it and the others reuse it. Rebuilding at that layer every forward (not on metadata identity) keeps it
+        inside each captured CUDA graph: warm-up runs and graph replays reuse one metadata object."""
+        if self.top_split_plan_layer is None:
+            self.top_split_plan_layer = layer.layer_id
+        plan = self.top_split_plan
+        if layer.layer_id == self.top_split_plan_layer or not isinstance(plan, kind):
+            plan = self.top_split_plan = build()
+        return plan
+
+    def _top_decode_pieces(self, page_table):
+        """Pieces of the TOP decode KV split over this page table's width; None when the split is off or one piece."""
+        from sglang.srt.true_on_policy.attention import MAX_DECODE_KV_PIECES
+
+        split = self.top_decode_kv_split
+        if not split:
+            return None
+        if split % self.page_size:
+            raise ValueError(
+                f"[top] decode KV split {split} must be a multiple of the page size {self.page_size}"
+            )
+        per = split // self.page_size
+        pieces = -(-page_table.shape[1] // per)
+        if pieces <= 1:
+            return None
+        if pieces > MAX_DECODE_KV_PIECES:
+            # The pieces follow the page table's width (static for CUDA graphs).
+            raise ValueError(
+                f"[top] decode KV split {split} cuts a {page_table.shape[1] * self.page_size}-token context into "
+                f"{pieces} pieces; FA's combine merges at most {MAX_DECODE_KV_PIECES}: "
+                "raise SGLANG_TOP_DECODE_KV_SPLIT or lower --context-length"
+            )
+        return pieces
 
     def forward_decode(
         self,
@@ -2221,6 +2403,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
+                    true_on_policy=self.top_enabled,
                     **kwargs,
                 )
             elif use_local_attn:
@@ -2242,6 +2425,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
+                    true_on_policy=self.top_enabled,
                     **kwargs,
                 )
             else:
@@ -2282,30 +2466,61 @@ class FlashAttentionBackend(AttentionBackend):
                     sched_meta = metadata.scheduler_metadata
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.max_seq_len_k
-                result = flash_attn_with_kvcache(
-                    q=q_reshaped,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn or return_lse,
-                    num_splits=(
-                        self.decode_num_splits
-                        if not is_swa_layer
-                        and not use_cascade_attn
-                        and not pa_swa_active
-                        else self.num_splits
-                    ),
-                    out=_fa_out,
-                    ver=self.fa_impl_ver,
-                    scheduler_metadata=sched_meta,
-                    **kwargs,
+                top_split = None
+                if self.top_decode_kv_split:
+                    # The trainer splits every decoded row; a one-pass decode would differ past one piece.
+                    extra = set(kwargs) - {"max_seqlen_k"}
+                    if (
+                        is_swa_layer
+                        or use_cascade_attn
+                        or pa_swa_active
+                        or return_lse
+                        or max_seqlen_q != 1
+                        or tuple(window_size) != (-1, -1)
+                        or layer.logit_cap
+                        or extra
+                    ):
+                        raise NotImplementedError(
+                            "[top] this decode (SWA, cascade, LSE, window, soft cap, multi-row query or "
+                            f"extra FA arguments {sorted(extra)}) has no TOP decode KV split"
+                        )
+                    top_split = self._top_split_decode(
+                        q_reshaped,
+                        key_cache,
+                        value_cache,
+                        page_table,
+                        cache_seqlens,
+                        layer,
+                    )
+                result = (
+                    top_split
+                    if top_split is not None
+                    else flash_attn_with_kvcache(
+                        q=q_reshaped,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        return_softmax_lse=use_cascade_attn or return_lse,
+                        num_splits=(
+                            self.decode_num_splits
+                            if not is_swa_layer
+                            and not use_cascade_attn
+                            and not pa_swa_active
+                            else self.num_splits
+                        ),
+                        out=_fa_out,
+                        ver=self.fa_impl_ver,
+                        true_on_policy=self.top_enabled,
+                        scheduler_metadata=sched_meta,
+                        **kwargs,
+                    )
                 )
                 if return_lse and not use_cascade_attn:
                     o, softmax_lse, *_ = result
@@ -2334,6 +2549,7 @@ class FlashAttentionBackend(AttentionBackend):
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
                             ver=self.fa_impl_ver,
+                            true_on_policy=self.top_enabled,
                             **kwargs,
                         )
                     )
@@ -2381,6 +2597,7 @@ class FlashAttentionBackend(AttentionBackend):
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
                 ver=self.fa_impl_ver,
+                true_on_policy=self.top_enabled,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -2403,6 +2620,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
+                    true_on_policy=self.top_enabled,
                 )
                 o, _ = merge_state_v2(
                     o,

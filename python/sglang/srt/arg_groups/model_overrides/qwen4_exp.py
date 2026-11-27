@@ -48,9 +48,11 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         )
 
     text_config = getattr(hf_config, "text_config", hf_config)
+    # The TOP contract keeps the dense MLP at TP1 on every DP rank (contracts._no_split_reductions).
     if (
         getattr(text_config, "num_experts", None) is not None
         and cfg.moe_dense_tp_size == 1
+        and cfg.true_on_policy_contract is None
     ):
         overrides["moe_dense_tp_size"] = None
 

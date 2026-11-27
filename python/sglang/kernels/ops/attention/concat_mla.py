@@ -25,8 +25,8 @@ def _jit_concat_mla_k_module() -> Module:
 
 
 @cache_once
-def _jit_concat_mla_absorb_q_module() -> Module:
-    args = make_cpp_args(is_arch_support_pdl())
+def _jit_concat_mla_absorb_q_module(pad_head_groups=False) -> Module:
+    args = make_cpp_args(is_arch_support_pdl(), pad_head_groups)
     return load_jit(
         "concat_mla_absorb_q",
         *args,
@@ -51,22 +51,29 @@ def concat_mla_k(k: torch.Tensor, k_nope: torch.Tensor, k_rope: torch.Tensor) ->
     module.concat_mla_k(k, k_nope, k_rope)
 
 
-def concat_mla_absorb_q(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def concat_mla_absorb_q(
+    a: torch.Tensor, b: torch.Tensor, *, pad_head_groups: bool = False
+) -> torch.Tensor:
     """
     Concatenate tensors a and b for MLA absorbed Q computation.
 
     Args:
         a: Input tensor of shape [dim_0, dim_1, a_last_dim], dtype=bfloat16
         b: Input tensor of shape [dim_0, dim_1, b_last_dim], dtype=bfloat16
+        pad_head_groups: Place each 16-head group in a separate 32-head block of
+            a 128-head tensor. Supports 16, 32, 48, or 64 live heads.
 
     Returns:
-        Output tensor of shape [dim_0, dim_1, a_last_dim + b_last_dim], dtype=bfloat16
+        BF16 tensor with concatenated channels. The head dimension is dim_1,
+        or 128 when pad_head_groups is enabled.
     """
+    # Isolate each live group in its own warp-wide rescaling domain.
+    heads = 128 if pad_head_groups else a.shape[1]
     out = torch.empty(
-        (*a.shape[:-1], a.shape[-1] + b.shape[-1]),
+        (a.shape[0], heads, a.shape[-1] + b.shape[-1]),
         dtype=a.dtype,
         device=a.device,
     )
-    module = _jit_concat_mla_absorb_q_module()
+    module = _jit_concat_mla_absorb_q_module(pad_head_groups)
     module.concat_mla_absorb_q(a, b, out)
     return out

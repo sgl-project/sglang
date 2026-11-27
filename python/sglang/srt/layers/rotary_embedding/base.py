@@ -156,6 +156,16 @@ class RotaryEmbedding(BaseFusedOp):
         # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
         if self._force_native or _is_musa:
             self._forward_method = self.forward_native
+        # TOP's trainer calls this same fused kernel (per token and head, FP32 cos/sin from the
+        # CPU-derived cache, one BF16 rounding); other variants keep forward_native.
+        if (
+            self._force_native
+            and _is_cuda
+            and type(self) is RotaryEmbedding
+            and not self.use_fallback_kernel
+            and self.dtype == torch.bfloat16
+        ):
+            self._forward_method = self.forward_cuda
         self.position_cos, self.position_sin = None, None
 
     def try_bf16_rope_store(
