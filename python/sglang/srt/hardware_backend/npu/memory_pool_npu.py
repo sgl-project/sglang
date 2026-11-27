@@ -858,13 +858,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             and get_memory().enable_hierarchical_cache
             and not (
                 indexer_quant_mode == QUANT_MODE_TOKEN_INT8
-                and index_kpool > 1
                 and dtype in (torch.bfloat16, torch.int8)
             )
         ):
             raise ValueError(
                 "A quantized indexer cache with --enable-hierarchical-cache "
-                "requires INT8 KPool with BF16 or INT8 main KV."
+                "requires an INT8 indexer with BF16 or INT8 main KV."
             )
         # The recipe applies wherever the main KV does not already quantize the
         # indexer: the arch35 FP8 record does, the INT8 record does not.

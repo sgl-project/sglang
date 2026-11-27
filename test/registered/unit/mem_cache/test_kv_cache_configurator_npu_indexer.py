@@ -16,7 +16,8 @@ from sglang.srt.mem_cache.kv_cache_dtype import (
     QUANT_MODE_TOKEN_MXFP8,
     resolve_indexer_quant_mode,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel, override_platform
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -168,11 +169,7 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
     ):
         with (
             get_context().override_server_args(enable_hierarchical_cache=hierarchical),
-            patch.object(
-                memory_pool_npu,
-                "get_parallel",
-                return_value=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
-            ),
+            get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0),
         ):
             page_size = 128 * index_kpool
             return memory_pool_npu.NPUMLATokenToKVPool(
@@ -192,25 +189,33 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
                 max_running_requests=4 if index_kpool > 1 else None,
             )
 
-    def test_int8_mode_rejects_hierarchical_cache_in_server_args(self):
+    def test_int8_mode_supports_hierarchical_cache_in_server_args(self):
         from sglang.srt.arg_groups import kv_cache_hook
 
-        cfg = SimpleNamespace(
-            indexer_kv_cache_dtype="int8", enable_hierarchical_cache=True
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="int8",
+            indexer_kv_cache_dtype="int8",
+            enable_hierarchical_cache=True,
         )
         with (
-            patch.object(kv_cache_hook, "resolving_view", return_value=cfg),
-            self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"),
+            override_platform(is_npu=True),
+            patch.object(
+                kv_cache_hook,
+                "model_config_of",
+                return_value=SimpleNamespace(index_head_dim=128),
+            ),
         ):
-            kv_cache_hook.handle_indexer_kv_cache_compatibility(object())
+            kv_cache_hook.handle_indexer_kv_cache_compatibility(args)
 
-    def test_int8_mode_rejects_hierarchical_cache_in_pool(self):
-        with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
-            self._build_pool(
-                torch.bfloat16,
-                indexer_quant_mode=QUANT_MODE_TOKEN_INT8,
-                hierarchical=True,
-            )
+    def test_int8_mode_supports_hierarchical_cache_in_pool(self):
+        pool = self._build_pool(
+            torch.bfloat16,
+            indexer_quant_mode=QUANT_MODE_TOKEN_INT8,
+            hierarchical=True,
+        )
+        self.assertEqual(pool.index_k_buffer.dtype, torch.int8)
+        self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
 
     def test_int8_mode_swaps_only_the_bf16_indexer_cache(self):
         fp8_kv_cache_dim = 512 + 512 // 128 * 4 + 64 * 2

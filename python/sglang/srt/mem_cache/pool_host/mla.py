@@ -377,6 +377,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return super().get_mapping_lengths()
         native = self._native_buffers
         k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
+        v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
         lengths = [
             self.page_num
             * self.page_size
@@ -386,7 +387,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.page_num
             * self.page_size
             * self.layer_num
-            * self.qk_rope_head_dim
+            * v_width
             * self._v_dtype.itemsize,
         ]
         index_layers = len(native.index_layer_indices)
