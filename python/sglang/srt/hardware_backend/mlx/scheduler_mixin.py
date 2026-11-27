@@ -153,7 +153,7 @@ class SchedulerMlxOverlapMixin:
 
         def _launch_fresh(batch: ScheduleBatch) -> MlxPendingJob:
             self._prepare_mlx_launch(batch)
-            # Build the sampling stages' step state, as Scheduler.run_batch does.
+            # As Scheduler.run_batch does before each launch.
             if self.is_generation:
                 batch.sampling_info.set_step_state(batch.reqs)
             # Materialize batch.input_ids from CPU staging (prefill) or the

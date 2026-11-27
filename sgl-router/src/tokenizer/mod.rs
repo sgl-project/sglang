@@ -26,6 +26,16 @@ pub enum ForwardingScope {
     AllText,
 }
 
+/// Whether a chat request can forward rendered `input_ids` to the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputIdsForwarding {
+    Forwarded,
+    Disabled,
+    Ineligible,
+    IneligibleMultimodal,
+    TokenizeFailed,
+}
+
 /// A model's chat formatter plus its fallback-logging state.
 struct ChatFormatterEntry {
     formatter: ChatFormatter,

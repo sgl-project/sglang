@@ -21,13 +21,11 @@ export SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY='{
     "overlay_revision": "main"
   }
 }'
-
-sglang generate \
-  --model-path Wan-AI/Wan2.2-S2V-14B \
-  --config configs/wan_s2v.yaml
 ```
 
-The overlay repo should be a complete diffusers-style/componentized repo
+Use a trusted overlay: it can run a custom materializer when preparing the model.
+See the [Wan2.2 speech-to-video example](/cookbook/diffusion/Wan/Wan2.2#speech-to-video-offline)
+for a pinned overlay and a complete offline generation command.
 
 You can also pass the overlay repo itself as `--model-path` if it contains `_overlay/overlay_manifest.json`.
 
@@ -234,10 +232,69 @@ families and examples.
 
 ### Request logging
 
-- `--log-requests`: Log user-facing fields of all requests (default: `False`). The verbosity is decided by `--log-requests-level`.
-- `--log-requests-level &#123;0|1|2|3&#125;`: Verbosity level for request logging (default: `2`). 0: Log metadata (request id). 1: Log metadata and sampling config (seed, steps, guidance, resolution, frames, fps, ...). 2: Log metadata, sampling config and prompt (truncated to 2 KiB). 3: Log metadata, sampling config and full prompt.
-- `--log-requests-format &#123;text|json&#125;`: Format for request logging (default: `text`). `text` is human-readable; `json` outputs structured JSON lines.
-- `--log-requests-target &#123;TARGET...&#125;`: Target(s) for request logging. Use `stdout` for console output and/or directory path(s) for file output. Can specify multiple targets, e.g., `--log-requests-target stdout /my/log/dir`.
+Request logging is **off by default**. To enable it, pass `--log-requests`.
+`--log-requests-level` controls which fields are included; setting a level alone
+does not enable logging. This is independent of the server's `--log-level`.
+
+| Request log level | What is recorded |
+| --- | --- |
+| `0` (default) | Request IDs, with latency and error status on completion. |
+| `1` | Level 0 plus sampling parameters, including the seed, resolution and step count. |
+| `2` | Level 1 plus prompt and negative prompt. For text longer than 2,048 characters, only the first and last 1,024 are kept. |
+| `3` | Level 2 with full prompt text. |
+
+No level includes raw embeddings. For production, leave request logging off or
+use level 0. To record the seed without the prompt on synthetic test requests,
+pass `--log-requests --log-requests-level 1`.
+Choose `--log-requests-format text|json` (default: `text`) and
+`--log-requests-target` (e.g. `stdout` or a log directory) as needed.
+
+### Private media serving
+
+**What the server enforces.** By default, callers of the same HTTP worker share
+its media jobs. For example, two clients of `GET /v1/videos` see the same job
+list. This is intended for one trusted service, not unrelated customers.
+
+With `--media-gateway-key-file /run/secrets/media-gateway-key`, each job belongs
+to the tenant identified by the gateway. If tenant A creates a video, tenant B
+cannot list, retrieve, download or delete it through this API. Looking up A's ID
+returns the same 404 as an unknown ID. Clients in the *same* tenant still share
+jobs. Records are local to the worker process: route follow-up requests to the
+replica that created the job.
+
+**What the deployer must configure.** The worker authenticates the gateway, not
+end users. On every HTTP replica and on the gateway, mount the same random
+32-byte key encoded as 64 hex digits. The gateway must authenticate the caller,
+strip incoming `X-SGLang-Gateway-Key` and `X-SGLang-Tenant` headers, and set its
+own key and stable tenant ID (1–128 letters, digits, underscores or hyphens).
+Keep the key out of logs, use TLS, restrict worker access to the gateway, and
+roll replicas on key rotation.
+
+Only the OpenAI image, video and mesh routes are exposed in this mode, plus
+unauthenticated health and liveness probes. Publish only the routes you need;
+keep scheduler, admin, profiling, metrics and realtime endpoints private.
+The listener accepts sampling options and media uploads, not client-selected
+paths, remote media URLs, diagnostics or backend-specific kwargs. Set limits
+on upload size, decoded dimensions, runtime and concurrency at ingress.
+Tenant checks do not protect direct access to stored files or cloud URLs:
+restrict storage access separately. Use separate deployments and credentials
+for mutually untrusted workloads unless the other data and control paths are isolated.
+
+**What is retained.** Tenant isolation controls *who* can access a job, not *how
+long* its data exists.
+
+- **Synchronous images:** With `--input-save-path "" --output-path ""`, cloud
+  upload disabled and `response_format="b64_json"`, the image API returns the
+  generated image in the response without saving an output file. Uploaded edit
+  inputs may use temporary storage during the request. The worker still keeps
+  job metadata in memory.
+- **Async video and mesh:** Successful delivery requires a persistent output
+  directory or a successful cloud upload. Deleting the API job removes its
+  record, not the published files, objects or backups. Configure their lifetimes
+  in your storage system.
+- **Outside the worker:** Disable request-body capture in gateways, traces and
+  error reporting. Keep buckets private. `Cache-Control: private, no-store`
+  is not access control or an end-to-end zero-retention guarantee.
 
 ## Configuration Files
 
@@ -475,6 +532,33 @@ Use `--async-output-save` to overlap output saving with the next request during
 native NVIDIA CUDA serving. It is disabled by default. See
 [Asynchronous output saving](/docs/sglang-diffusion/performance-optimization#asynchronous-output-saving)
 for an example, eligible requests, and the response latency and memory tradeoffs.
+
+### Temporary media
+
+For ephemeral media, set `TMPDIR` to an existing, writable, absolute directory
+private to the service instance. The HTTP temporary media helper, remote video
+loader and Wan S2V input downloads use that directory or fail; they do not
+silently switch volumes. Wan S2V no longer caches downloads between requests.
+For repeated offline runs, pass a local file you own. Explicitly configured
+input and output directories and cloud objects are persistent, not scratch.
+
+Request cleanup cannot run after a process is killed. Let the supervisor own
+the scratch volume; do not sweep a shared directory while another replica
+might still be using it. For example, in a systemd template service:
+
+```ini
+[Service]
+RuntimeDirectory=sgld-media-%i
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+Environment=TMPDIR=/run/sgld-media-%i
+```
+
+[systemd](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#RuntimeDirectoryPreserve=)
+removes the directory when the unit stops. On Kubernetes, a per-Pod
+[`emptyDir`](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir)
+survives container restarts and is removed when the Pod is removed. Neither
+mechanism expires objects in external storage or guarantees secure erasure.
 
 ### Graceful shutdown
 

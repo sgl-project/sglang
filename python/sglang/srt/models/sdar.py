@@ -172,33 +172,6 @@ class SDARAttention(nn.Module):
         )
         self.alt_stream = alt_stream
 
-    def forward_prepare_native(self, positions, hidden_states, forward_batch):
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
-        )
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
-                )
-                if enable_fused_set_kv_buffer(forward_batch)
-                else None
-            ),
-        )
-        return q, k, v
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -433,7 +406,7 @@ class SDARForCausalLM(nn.Module):
         super().__init__()
         self.pp_group = get_parallel().pp_group
         assert self.pp_group.world_size == 1, (
-            f"SDARMoeForCausalLM does not support pipeline parallel (pp_size={self.pp_group.world_size}). "
+            f"SDARForCausalLM does not support pipeline parallel (pp_size={self.pp_group.world_size}). "
             "Please set pp_size=1."
         )
 

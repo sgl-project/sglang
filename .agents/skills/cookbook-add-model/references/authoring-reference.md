@@ -51,6 +51,7 @@ the full contract):
 | `accuracyLabels` | `[key, label, unit][]` | The eval set rendered in the benchmark card and the "⚡ Reproduce" modal — **the engine ships no default**, every config declares its own (e.g. DSv4: GPQA/AIME25/GSM8K; Qwen3.5: GSM8K/MMMU). Required whenever the benchmarks carry accuracy data; without it the accuracy rows silently don't render. Every key used in `benchmarks[].accuracy`, `defaultAccuracy`, and `benchmarkCommands.accuracy` must appear here. |
 | `latencyPercentile` | `"Mean" \| "P50"` | Optional, **temporary**; the percentile the benchmark TTFT/TPOT values are. **Default `"P50"`** — the card renders `TTFT (<pct>)` / `TPOT (<pct>)`. Set `"Mean"` only for legacy data recorded as Mean (being re-measured to P50). A benchmarks entry may carry its own `latencyPercentile` to override the page value per cell (entry → config → `"P50"`). `tokens_per_sec_per_gpu` is stored as **total (in+out)/GPU** = `output tok/s/GPU × (isl+osl)/osl`, shown by the card as-is. |
 | `github` | `{owner?, repo?, issueTemplate?, cookbookModel?}` | Overrides for the "Submit verified cell" CTA in the playground. Defaults: `sgl-project/sglang` + `3-playground-verified-cell.yml` + `"deepseek-ai/deepseek-v4"`. Set `cookbookModel` to the model's HF id (`<hf-org>/<model-slug>`); it prefills the issue template's free-form `model` input when the issue opens. **Don't prune this block** — without it the engine falls back to `deepseek-ai/deepseek-v4` and submissions from your page get mislabeled. |
+| `ratings` | `false` | Optional. Hides the per-recipe 👍/👎 row under the command (on by default; always off for `commandBuilder` pages and redirect cells). Set it only for a page whose recipes should not collect feedback. |
 
 ## 2.1b Custom dimensions (`matchDims` / `overlayDims`)
 
@@ -82,6 +83,13 @@ launch line cannot express on its own.
 on them with its own `showWhen(base)` — an axis whose feature the Deploy panel never
 switched on is not rendered at all. Changing the Deploy selection resets every
 playground axis back to inherit-from-base.
+
+Overlay dims do not key the cell lookup, but they **do** key the recipe ratings:
+a recipe is the page path plus `hw`, every match dim and every overlay dim whose
+pick applies, i.e. its row is showing and the pick is not disabled (`ratingKey`
+in `_deployment.jsx`, same test as `overlayPick`), so a speculative-decoding
+overlay's on and off states are rated apart. See *Ids are rating keys* under
+Pitfalls.
 
 > The overlay resolution rule is written in BOTH engines (snippets can't import each
 > other); each copy is marked `MIRROR`. Change both or neither, or the Deploy command
@@ -308,6 +316,13 @@ catalog and the hash names an impossible combination, `_deployment.jsx`'s
 `validateSelection` snaps to the nearest real cell. The Playground reads
 the hash too — make sure cookbook removals don't leave dangling shared
 links pointing at hardware/quant combos that no longer exist.
+
+**Ids are rating keys** — Readers rate each recipe 👍/👎, stored under
+`<page path>|hw=…&<dim>=<option id>…`. Renaming a hardware id, a dim id or an
+option id, or moving/renaming the MDX page, starts every affected recipe's
+ratings from zero (the old rows stay but no page reads them). Pick stable ids
+when adding a model; for a rename on a live page, say in the PR which recipes
+it resets. `node docs/scripts/export_rating_ids.mjs` lists every current key.
 
 **Mintlify constraints** — Module-level statements are stripped. The config
 MUST be a single `export const config = { ... }` literal — no function calls,

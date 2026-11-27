@@ -1093,6 +1093,9 @@ def test_lifespan_starts_and_stops_the_cancel_publisher(monkeypatch):
         probe.unbind(probe.last_endpoint)
     args = SimpleNamespace(
         enable_metrics=False,
+        media_gateway_key_file=None,
+        api_key=None,
+        admin_api_key=None,
         warmup_mode="off",
         progress_endpoint=None,
         cancel_endpoint="ipc:///tmp/sglang-cancel-lifespan",

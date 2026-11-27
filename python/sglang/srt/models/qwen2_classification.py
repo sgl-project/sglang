@@ -47,8 +47,6 @@ class Qwen2ForSequenceClassification(nn.Module):
         self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 
-        self.eos_token_id = config.eos_token_id
-
     @torch.no_grad()
     def forward(
         self,
