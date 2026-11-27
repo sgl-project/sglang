@@ -24,7 +24,7 @@ This page is the **entry point** for Ascend NPU deployment knowledge in SGLang. 
 | Pick card count / deploy mode | [Hardware sizing map](#hardware-sizing-map) |
 | Choose quantization | [Quantization decision guide](#quantization-decision-guide) |
 | A specific model's launch commands | [Model catalog](#model-catalog) |
-| Graph mode tuning | [NPU Graph (`--cuda-graph-bs`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#batching-graphs-and-memory) |
+| Graph mode tuning | [NPU Graph (`--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#batching-graphs-and-memory) |
 | Profiling bottlenecks | [Performance Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling) |
 | Accuracy / perf methodology | [Accuracy Evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation), [Performance Testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing) |
 | Errors during serving | [Troubleshooting and FAQ](/docs/hardware-platforms/ascend-npus/faq) + [Common issues index](#common-issues-index) |
@@ -37,7 +37,7 @@ Use this order when standing up a new model on Ascend NPU:
 2. **Pick deploy mode** — PD Mixed (simpler ops) vs PD Disaggregation (scale prefill/decode independently). Large MoE models (DeepSeek-R1 / V3.2 class) usually need PD Disaggregation for published low-latency points.
 3. **Start from the model Best Practices row** that matches your **dataset shape** (e.g. 3.5k+1.5k) and latency target — do not copy GPU-only flags.
 4. **Choose quantization** with the [decision guide](#quantization-decision-guide): BF16 for accuracy baselines; W8A8 for most production latency; W4A8 when memory/throughput dominates on supported MoE paths.
-5. **Enable NPU Graph** with a **small** `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill` list from the model page (often ≤10 sizes). See [NPU Graph (`--cuda-graph-bs`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#batching-graphs-and-memory).
+5. **Enable NPU Graph** with a **small** `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill` list from the model page (often ≤10 sizes). See [NPU Graph (`--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#batching-graphs-and-memory).
 6. **Validate** with [Performance Testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing) and, for correctness-sensitive changes, [Accuracy Evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
 7. **Profile** only after functional smoke: [Performance Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling).
 
@@ -46,7 +46,7 @@ Use this order when standing up a new model on Ascend NPU:
 | Workload class | Typical hardware (A2 / A3 Series) | Cards (published examples) | Deploy mode | Notes |
 | --- | --- | --- | --- | --- |
 | Dense ≤8B low latency | Atlas 800I A3 | **1** | PD Mixed | e.g. Qwen3-8B W8A8 — see model Best Practices for published points |
-| Dense ~30B MoE-A3B | Atlas 800I A3 | **1** | PD Mixed | e.g. Qwen3-30B-A3B W8A8 — low-latency vs throughput rows on Best Practices |
+| MoE ~30B-A3B | Atlas 800I A3 | **1** | PD Mixed | e.g. Qwen3-30B-A3B W8A8 — low-latency vs throughput rows on Best Practices |
 | Dense 32B | Atlas 800I A2/A3 | **2** (throughput) / **8** (ultra-low latency) | PD Mixed | Prefer 2-card W8A8 for throughput; scale cards for ultra-low latency (see Best Practices) |
 | Large MoE ~235B | Atlas 800I A3 | **8** | PD Mixed | Qwen3-235B-A22B: BF16 low-latency or W8A8 throughput rows |
 | Frontier MoE (DeepSeek-R1) | Atlas 800I A3 | **8 / 16 / 32** | PD Mixed or PD Disaggregation | 8-card mixed throughput; 16–32-card PD for published low-latency points |
@@ -86,17 +86,21 @@ Each row links to the **tutorial** (deployment steps) and **best practices** (fu
 | --- | :---: | :---: | --- |
 | DeepSeek-R1 | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_r1) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) | MoE, MLA, PD, speculative |
 | DeepSeek-V3.2 | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v3_2) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v3_2) | MoE, MLA, DeepEP |
+| DeepSeek-V4-Flash | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v4_flash) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v4_flash) | MoE, MLA |
 | GLM-5.1 | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_1) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_1) | MoE, large scale |
-| GLM-5.2 | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2) | — | MoE |
+| GLM-5.2 | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_2) | MoE |
+| GLM-5.3 | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3) | — | MoE |
+| GLM-5.3-Flash | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3_flash) | — | MoE |
 | Kimi-K2.6 | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/kimi_k2_6) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6) | MoE, multimodal |
 | MiniMax-M2.5 | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5) | MoE |
 | MiMo-V2-Flash | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/mimo_v2_flash) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_flash) | MoE |
+| MiMo-V2.5-Pro | — | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_5_pro) | MoE |
 | Qwen3-8B | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8b) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b) | dense, low latency |
-| Qwen3-8-Max | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8_max) | — | dense |
+| Qwen3.8-Max | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8_max) | — | dense |
 | Qwen3-32B | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_32b) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b) | dense |
 | Qwen3-30B-A3B | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_30b_a3b) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b) | MoE |
 | Qwen3-235B-A22B | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_235b_a22b) | MoE, large scale |
-| Qwen3.5-397B | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_5_397b) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_5_397b) | MoE |
+| Qwen3.5-397B-A17B | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_5_397b) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_5_397b) | MoE |
 | Qwen3.6-27B | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_6_27b) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b) | dense |
 | Qwen3.6-35B-A3B | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_6_35b_a3b) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b) | MoE |
 | Qwen3-Next-80B-A3B-Instruct | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_next_80b_a3b_instruct) | [✅](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_next_80b_a3b_instruct) | MoE, Next |
@@ -116,7 +120,7 @@ Each row links to the **tutorial** (deployment steps) and **best practices** (fu
 
 | Switch / env | Purpose | Deep dive |
 | --- | --- | --- |
-| `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill` | NPU Graph capture sizes | [NPU Graph (`--cuda-graph-bs`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#batching-graphs-and-memory) |
+| `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill` | NPU Graph capture sizes | [NPU Graph (`--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#batching-graphs-and-memory) |
 | `--disable-radix-cache` | Prefix cache control | [Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning) |
 | `SGLANG_NPU_USE_MLAPO=1` | MLA fusion for DeepSeek-style models | Parameter Tuning |
 | `SGLANG_NPU_USE_MULTI_STREAM=1` | MoE shared/routed overlap | Parameter Tuning |
@@ -177,4 +181,4 @@ When adding a new model:
 - [Supported Features](/docs/hardware-platforms/ascend-npus/reference/support_features)
 - [Environment Variables](/docs/hardware-platforms/ascend-npus/reference/environment_variables)
 - [Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning)
-- [NPU Graph (`--cuda-graph-bs`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#batching-graphs-and-memory)
+- [NPU Graph (`--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#batching-graphs-and-memory)
