@@ -101,7 +101,6 @@ from sglang.srt.runtime_context import (
     spawn_world_rank,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.sampling_params_pool import SamplingParamsPool
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -510,9 +509,7 @@ def extend(reqs, model_runner):
         spec_algorithm=SpeculativeAlgorithm.NONE,
     )
     batch.prepare_for_extend()
-    sampling_params_pool = SamplingParamsPool(
-        model_runner.req_to_token_pool.sampling_params_table
-    )
+    sampling_params_pool = model_runner.sampling_params_pool
     sampling_params_pool.write(reqs)
     batch.sampling_info.set_rows(
         sampling_params_pool.gather(batch.req_pool_indices, batch.req_pool_indices_cpu)

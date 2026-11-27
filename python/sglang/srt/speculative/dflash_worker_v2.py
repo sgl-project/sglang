@@ -1265,7 +1265,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None:
             return _eager("no target lm_head")
-        sampling_params_table = target_runner.req_to_token_pool.sampling_params_table
+        sampling_params_table = target_runner.sampling_params_pool.table
 
         # A gate-admitted quantized head is capture-safe: the target's own
         # logits path already runs the same kernel under CUDA graphs.

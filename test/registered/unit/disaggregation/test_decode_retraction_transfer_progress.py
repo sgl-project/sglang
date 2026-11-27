@@ -186,7 +186,7 @@ class _DecodeNode:
             req_to_token_pool=self.req_to_token_pool,
             penalty_status_pool=idle_penalty_status_pool(),
             sampling_params_pool=SamplingParamsPool(
-                self.req_to_token_pool.sampling_params_table
+                num_rows=self.req_to_token_pool.req_to_token.shape[0], device="cpu"
             ),
             token_to_kv_pool_allocator=self.allocator,
             spec_algorithm=SpeculativeAlgorithm.NONE,

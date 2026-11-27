@@ -721,7 +721,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             greedy_draft=self._greedy_draft,
             tp_sync=self._tp_sync,
             sampling_params_table=(
-                self.target_worker.model_runner.req_to_token_pool.sampling_params_table
+                self.target_worker.model_runner.sampling_params_pool.table
             ),
             sharded_accept=self._sharded_accept,
             out=(

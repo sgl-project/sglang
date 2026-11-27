@@ -290,8 +290,9 @@ class TestDraftParamsBySlot(CustomTestCase):
         request admitted into a reused slot, with the same batch shape, drafts with
         its own params, and the greedy switch overrides every row."""
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        table = _table(4, device)
-        pool = SamplingParamsPool(table)
+        with patch.object(sp_pool, "num_watermark_fields", return_value=0):
+            pool = SamplingParamsPool(num_rows=4, device=device)
+        table = pool.table
         _admit(pool, 1, temperature=0.7, top_k=50)
         _admit(pool, 2, temperature=0.5, top_k=1)
         slots = torch.tensor([1, 2], dtype=torch.int64, device=device)

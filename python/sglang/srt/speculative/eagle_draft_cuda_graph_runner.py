@@ -444,7 +444,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     def _read_sampling_params(self, slots: torch.Tensor) -> None:
         """Rejection sampling's params, read in the graph from the batch's slots of
         the sampling table, so a replay stages none of them."""
-        table = self.model_runner.req_to_token_pool.sampling_params_table
+        table = self.eagle_worker.target_worker.model_runner.sampling_params_pool.table
         num_seqs = slots.shape[0]
         self.temperatures[:num_seqs, 0].copy_(table.temperatures(slots))
         self.top_ks[:num_seqs].copy_(table.top_ks(slots))

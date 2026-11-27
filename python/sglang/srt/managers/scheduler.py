@@ -400,7 +400,6 @@ from sglang.srt.rust_server.server import (
 )
 from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params_pool import SamplingParamsPool
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -1400,10 +1399,8 @@ class Scheduler(
         )
 
     def init_sampling_params_pool(self) -> None:
-        self.sampling_params_pool = SamplingParamsPool(
-            self.req_to_token_pool.sampling_params_table,
-            penalty_status_pool=self.penalty_status_pool,
-        )
+        # Built by the model runner before graph capture: draft graphs read its table.
+        self.sampling_params_pool = self.tp_worker.model_runner.sampling_params_pool
 
     def init_running_status(self):
         self.tp_size = get_parallel().tp_size
@@ -5463,6 +5460,7 @@ class Scheduler(
                 self.sampling_params_pool.gather(
                     batch.req_pool_indices[:num_reqs],
                     batch.req_pool_indices_cpu[:num_reqs],
+                    self.penalty_status_pool,
                 )
             )
             batch.sampling_info.set_step_state(batch.reqs)

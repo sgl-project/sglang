@@ -449,8 +449,11 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             table.values[table.SEED_LO, slot] = lo
             table.values[table.SEED_HI, slot] = hi
         runner = EAGLEDraftCudaGraphRunner.__new__(EAGLEDraftCudaGraphRunner)
-        runner.model_runner = SimpleNamespace(
-            req_to_token_pool=SimpleNamespace(sampling_params_table=table)
+        target_runner = SimpleNamespace(
+            sampling_params_pool=SimpleNamespace(table=table)
+        )
+        runner.eagle_worker = SimpleNamespace(
+            target_worker=SimpleNamespace(model_runner=target_runner)
         )
         runner.temperatures = torch.ones((CAPTURE_BS, 1))
         runner.top_ks = torch.zeros((CAPTURE_BS,), dtype=torch.int32)

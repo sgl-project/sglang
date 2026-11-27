@@ -91,9 +91,9 @@ class SamplingRows(NamedTuple):
 
 class SamplingParamsTable:
     """Each request slot's sampling state on the device, one column per slot,
-    addressed by its `req_pool_idx`. The request table owns it, so it exists
-    before any graph capture: a graph reads its rows by slot index, and
-    `SamplingParamsPool` writes them at admission."""
+    addressed by its `req_pool_idx`. The model runner builds its
+    `SamplingParamsPool` before any graph capture: a graph reads its rows by slot
+    index, and the pool writes them at admission."""
 
     # One row per field, floats as fp32 bits and int64 values as (low, high)
     # int32 halves: one int32 gather reads them all, top_k exact.
@@ -130,15 +130,8 @@ class SamplingParamsTable:
 
 
 class SamplingParamsPool:
-    def __init__(
-        self,
-        table: SamplingParamsTable,
-        penalty_status_pool: Optional[PenaltyStatusPool] = None,
-    ):
-        self.table = table
-        # The pool the penalty indices point into; None where no request takes one.
-        self.penalty_status_pool = penalty_status_pool
-        num_rows = table.values.shape[1]
+    def __init__(self, num_rows: int, device):
+        self.table = SamplingParamsTable(num_rows, device)
         self.top_ks_host = np.full(num_rows, TOP_K_ALL, dtype=np.int64)
         self.uses_top_p_host = np.zeros(num_rows, dtype=bool)
         self.uses_min_p_host = np.zeros(num_rows, dtype=bool)
@@ -186,7 +179,11 @@ class SamplingParamsPool:
         self.table.values.index_copy_(1, values[-1].long(), values[:-1])
 
     def gather(
-        self, req_pool_indices: torch.Tensor, req_pool_indices_cpu: torch.Tensor
+        self,
+        req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+        # The pool the penalty indices point into; None where no request takes one.
+        penalty_status_pool: Optional[PenaltyStatusPool] = None,
     ) -> SamplingRows:
         slots = req_pool_indices_cpu.numpy()
         if slots.size == 0:
@@ -215,7 +212,7 @@ class SamplingParamsPool:
             max_top_k=hi if lo >= 1 and hi < TOP_K_ALL else None,
             sampling_seed=seeds,
             step_penalties=StepPenalties.build(
-                self.penalty_status_pool,
+                penalty_status_pool,
                 values[self.table.PENALTY_INDEX],
                 self.penalty_indices_host[slots],
             ),

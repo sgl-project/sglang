@@ -319,7 +319,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         _target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(
                 model=SimpleNamespace(lm_head=quant_head),
-                req_to_token_pool=SimpleNamespace(sampling_params_table=object()),
+                sampling_params_pool=SimpleNamespace(table=object()),
             )
         ),
     )
