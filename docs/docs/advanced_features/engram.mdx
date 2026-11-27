@@ -22,6 +22,7 @@ defaults:
 | `placement` | Where do the rows live? | `gpu` (default): device memory. `cpu`: pinned host memory, which the GPU reads in place; the HBM goes to the KV cache. |
 | `replication` | How many copies are there? | `none` (default): one table, its rows split across the TP group. `per_node`: each node holds the whole table, mapped by all of its ranks. `group_shards`: one table split across the GPUs of several servers (for example every prefill server of a disaggregated deployment), in their GPU or host memory (`placement`); each rank reads its tokens' rows in place. |
 | `lookup` | How does a rank get rows another rank holds? Only with `replication` `none`; `group_shards` always reads in place. | `auto` (default): `peer_read` for GPU tables whose TP group is one NVLink domain, otherwise a collective SGLang picks for each step. `all_reduce`, `reduce_scatter`, `all_to_all`: that collective (see below). `peer_read`: each rank reads its tokens' rows straight from the owning GPU's shard over NVLink, with no collective. |
+| `table_path` | With `placement` `cpu`: what backs the host tables? | Omitted (default): anonymous host memory, pinned per rank or per node (`replication`). A path: one file or dev-dax device that the whole TP group maps, each table at its own aligned offset. See [Backing the tables with a file or DAX region](#backing-the-tables-with-a-file-or-dax-region). |
 
 The configuration is logged at startup as `DeepSeek-V4.1 Engram tables: ...`, and the lookup
 `auto` resolves to, once the model is built, as `Engram lookup auto -> ...`.
@@ -43,6 +44,53 @@ sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 4 \
 - **Wide TP groups and memory to spare** (8 GPUs and more, including DP attention across nodes):
   the default. The shard per GPU is small, and over NVLink each rank reads its rows in place,
   with no collective.
+
+## Backing the tables with a file or DAX region
+
+With `placement` `cpu` and `table_path`, the tables live in one file that the whole TP group
+maps, instead of anonymous host memory. Each table gets its own 2 MiB-aligned slice, laid out in
+ascending layer id order, so every rank computes the same offsets without communicating.
+
+The path can be:
+
+- a **dev-dax char device** such as `/dev/dax0.0`, a slice of CXL pooled memory. The device is
+  sized by the kernel, so SGLang maps it as is and never grows it.
+- a **regular file** on tmpfs (`/dev/shm/...`) or a DAX filesystem, for a host with no CXL
+  hardware, or to try the layout before allocating a region. SGLang grows the file to fit and
+  pre-faults it so the pages can be collapsed into huge pages.
+
+```bash
+# One dev-dax region backing both tables: 189 GiB of CXL memory instead of host DRAM.
+sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 4 \
+  --engram-config '{"placement": "cpu", "table_path": "/dev/dax0.0"}'
+
+# The same layout on a plain file, to reproduce it without CXL hardware.
+sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 4 \
+  --engram-config '{"placement": "cpu", "table_path": "/dev/shm/engram.bin"}'
+```
+
+The mapping is logged at load time as `engram host table <layer>: replication=... store=<path>
+offset=<bytes> ...`, which is what to check when a rank maps the wrong region.
+
+Requirements and limits:
+
+- **The path must be absolute**, so every rank maps the same store. A missing file is created and
+  grown on first use; a dev-dax device must already exist.
+- **A regular file must be on tmpfs or a DAX filesystem.** CUDA pins the mapping, and it cannot
+  pin pages backed by disk. A file on disk fails at `cudaHostRegister` with a message naming the
+  path.
+- **A dev-dax device must be mapped from a process in `system.slice`.** Touching a dev-dax
+  mapping from a `session-*.scope` unit raises `SIGBUS`; start the server as a systemd service
+  rather than from an interactive session.
+- **`table_path` is not supported with `replication` `group_shards`**, whose slices are already
+  shared through `group_store`.
+- **Huge pages decide lookup speed.** Without them each row lookup takes a TLB miss; the table's
+  log line reports the coverage, and a 0% line carries a warning. A dev-dax mapping is huge-page
+  backed by construction; on a file, enable transparent huge pages for shmem
+  (`/sys/kernel/mm/transparent_hugepage/shmem_enabled`).
+- **The whole group maps the same file**, so the file must be large enough for every table
+  together. With `replication` `none` each rank maps only its own shard, but the offsets still
+  reserve the largest shard per table so that the ranks cannot overlap.
 
 ## How `auto` picks
 

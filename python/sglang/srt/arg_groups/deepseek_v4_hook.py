@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.engram_config import (
@@ -98,6 +99,22 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
         raise ValueError(
             "--engram-config: replication 'per_node' needs the TP group on one node."
         )
+    if config.table_path:
+        if not os.path.isabs(config.table_path):
+            raise ValueError(
+                "--engram-config: 'table_path' must be an absolute path, so that "
+                f"every rank maps the same store; got {config.table_path!r}."
+            )
+        # A missing path is fine (a regular file is created and grown on first
+        # use); a path that exists must be writable by this rank, which is what
+        # catches a store shared with a server running as another user.
+        if os.path.exists(config.table_path) and not os.access(
+            config.table_path, os.R_OK | os.W_OK
+        ):
+            raise ValueError(
+                f"--engram-config: 'table_path' {config.table_path!r} is not "
+                "readable and writable by this process."
+            )
     if config.replication == EngramReplication.GROUP_SHARDS:
         if config.group_size < cfg.tp_size:
             raise ValueError(
