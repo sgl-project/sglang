@@ -163,7 +163,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             return cache_seqlens + self.speculative_step_id + 1
         return cache_seqlens
 
-    def _max_kv_len(self, forward_batch: ForwardBatch) -> int:
+    def _batch_max_kv_len(self, forward_batch: ForwardBatch) -> int:
         """Return the effective maximum KV length from the existing CPU mirror."""
         max_seq_len = int(
             forward_batch.seq_lens_cpu[: forward_batch.batch_size].max().item()
@@ -183,13 +183,13 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         assert isinstance(metadata, AscendDSAForwardMetadata)
         cache_lens = self._cache_lens_device(forward_batch)  #
         query_lens = self._query_lens_device(forward_batch)
-        max_kv_len = self._max_kv_len(forward_batch)
+        batch_max_kv_len = self._batch_max_kv_len(forward_batch)
         batch = forward_batch.batch_size
         device = cache_lens.device
 
         # prepare page table
         token_table = self.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices[:batch], : max(1, max_kv_len)
+            forward_batch.req_pool_indices[:batch], : max(1, batch_max_kv_len)
         ]
         page_table = (token_table[:, :: self.page_size] // self.page_size).to(
             torch.int32
@@ -200,7 +200,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         if capture:
             max_num_pages = max(
                 page_table.shape[1],
-                self.req_to_token_pool.req_to_token.shape[1] // self.page_size,
+                self.max_kv_len // self.page_size,
             )
             metadata.real_page_table = torch.zeros(
                 (batch, max_num_pages), dtype=torch.int32, device=device
@@ -256,12 +256,12 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         metadata = self.forward_metadata
         cache_lens = self._cache_lens_device(forward_batch)
         query_lens = self._query_lens_device(forward_batch)
-        max_kv_len = self._max_kv_len(forward_batch)
+        batch_max_kv_len = self._batch_max_kv_len(forward_batch)
         batch = forward_batch.batch_size
 
         # prepare page table
         token_table = self.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices[:batch], : max(1, max_kv_len)
+            forward_batch.req_pool_indices[:batch], : max(1, batch_max_kv_len)
         ]
         page_table = (token_table[:, :: self.page_size] // self.page_size).to(
             torch.int32

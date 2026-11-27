@@ -58,6 +58,16 @@ if _use_aiter:
 
 logger = logging.getLogger(__name__)
 
+# compressed-tensors keeps the actorder string as written, so its alias-aware
+# enum equality never runs here; map the aliases to the forms compared below.
+_ACTORDER_ALIASES = {"weight": "static", "dynamic": "group"}
+
+
+def _normalize_actorder(actorder: str | None) -> str | None:
+    if actorder is None:
+        return None
+    return _ACTORDER_ALIASES.get(actorder, actorder)
+
 
 class GPTQMarlinState(Enum):
     REPACK = enum.auto()
@@ -79,7 +89,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         self.packed_factor = 32 // config.num_bits
         self.strategy = config.strategy
         self.group_size = config.group_size
-        self.actorder = config.actorder
+        self.actorder = _normalize_actorder(config.actorder)
         self.sym = config.symmetric
 
         if not (
@@ -466,9 +476,12 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
-        )
+        activation = self.moe_runner_config.activation
+        assert self.moe_runner_config.is_gated and activation in (
+            "silu",
+            "gelu",
+            "gelu_tanh",
+        ), f"Only gated SiLU and GELU activations are supported, got {activation}."
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -506,6 +519,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
             clamp_limit=self.moe_runner_config.swiglu_limit,
+            activation=activation,
             workspace=layer.workspace,
         )
         return StandardCombineInput(hidden_states=output)
@@ -570,10 +584,6 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
-        )
-
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
 
