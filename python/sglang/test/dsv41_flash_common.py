@@ -1,6 +1,6 @@
 """Shared DeepSeek-V4.1-Flash + DSPARK accuracy recipe for the GB300 tests.
 
-Each server configuration lives in its own file under
+Server configurations and the base TP2/EP2 evaluation datasets live in separate files under
 ``test/registered/e2e/models/test_deepseek_v41_flash_gb300_*.py`` so the
 configurations partition independently across GB300 runners. All use default
 decoder bounded replay and explicitly enabled breakable prefill graphs.
@@ -13,11 +13,11 @@ remaining weights (~143 GiB/GPU) leave room for KV cache, graphs and DSPARK.
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin, _run_accuracy_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     try_cached_model,
 )
 
@@ -27,7 +27,7 @@ MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 TP2_EP2_ARGS = ["--attn-dp-size", "1", "--ep-size", "2"]
 
 
-class DSV41FlashAccuracyMixin(GSM8KMixin):
+class DSV41FlashServerMixin:
     # Use the zero-shot chat evaluator, not the legacy five-shot completion path.
     gsm8k_backend = "sgl_eval"
     gsm8k_score_threshold = 0.95
@@ -90,7 +90,7 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
                 *cls.graph_args,
             ],
         )
-        cls.addClassCleanup(kill_process_tree, cls.process.pid)
+        cls.addClassCleanup(terminate_and_kill_process_tree, cls.process)
 
     def assert_dspark_accepts_draft_tokens(self):
         response = requests.get(self.base_url + "/server_info", timeout=30)
@@ -104,10 +104,14 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
             f"DSPARK accepted no draft tokens: {accept_lengths}",
         )
 
+
+class DSV41FlashGSM8KMixin(DSV41FlashServerMixin, GSM8KMixin):
     def test_gsm8k(self):
         super().test_gsm8k()
         self.assert_dspark_accepts_draft_tokens()
 
+
+class DSV41FlashMMMUProMixin(DSV41FlashServerMixin):
     def test_mmmu_pro(self):
         _run_accuracy_eval(
             self,
@@ -120,3 +124,7 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
             max_tokens=self.mmmu_pro_max_tokens,
         )
         self.assert_dspark_accepts_draft_tokens()
+
+
+class DSV41FlashAccuracyMixin(DSV41FlashGSM8KMixin, DSV41FlashMMMUProMixin):
+    """Run both evaluations with one server for the extra-tier configurations."""

@@ -173,7 +173,7 @@ def forward_extend_vectorized_5d(
 
     kv_indptr_lin = backend.forward_metadata.kv_indptr[:bs0]
     kv_indices_lin = torch.arange(total_kv, dtype=torch.int32, device=k_lin.device)
-    max_kv = int(backend.forward_metadata.max_kv_len)
+    max_kv = int(backend.forward_metadata.batch_max_kv_len)
     max_q = int(backend.forward_metadata.max_q_len)
 
     o = mha_batch_prefill_func(

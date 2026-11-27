@@ -93,7 +93,7 @@ class GroupedGemmaRMSNorm(nn.Module):
         return (x_norm * (1.0 + self.weight.float())).to(input_dtype)
 
 
-class HyperConnectionBase(nn.Module):
+class GatedResidual(nn.Module):
     def __init__(
         self,
         config: HyperConnectionConfig,
@@ -109,38 +109,6 @@ class HyperConnectionBase(nn.Module):
             self.hc_count = self.hc_count + 1
         self.hidden_size = config.hidden_size
         self.params_dtype = config.params_dtype
-
-    def mix(self, hyper_input: torch.Tensor):
-        assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
-        mixed_input = hyper_input.view(
-            *hyper_input.shape[:-1], self.hc_count, self.hidden_size
-        ).mean(dim=-2)
-        return mixed_input, hyper_input
-
-    def combine(
-        self, block_output: torch.Tensor, residual: torch.Tensor
-    ) -> torch.Tensor:
-        assert residual.shape[-1] == self.hc_count * self.hidden_size
-        assert block_output.shape[-1] == self.hidden_size
-        residual_reshaped = residual.view(
-            *residual.shape[:-1], self.hc_count, self.hidden_size
-        )
-        combined_output = residual_reshaped + block_output.unsqueeze(-2)
-        combined_output = combined_output.view(
-            *residual.shape[:-1], self.hc_count * self.hidden_size
-        )
-        return combined_output
-
-
-class GatedResidual(HyperConnectionBase):
-    def __init__(
-        self,
-        config: HyperConnectionConfig,
-        use_mix: bool = True,
-        use_combine: bool = True,
-        role: Optional[str] = None,
-    ):
-        super().__init__(config, use_mix, use_combine, role)
 
         norm_dim = (
             self.config.hidden_size * self.hc_count

@@ -313,7 +313,7 @@ sgl-eval run gsm8k \\
   // template parser detection (#38297) that `--*-parser auto` needs; the old
   // glm-5.3-flash dev image (2026-09-03) predates #38297 and misdetects.
   dockerImages: {
-    a3: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-glm5.3-flash",
+    a3: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051",
     gb300: "lmsysorg/sglang:latest",
     h100: "lmsysorg/sglang:latest",
     h200: "lmsysorg/sglang:latest",
@@ -512,7 +512,7 @@ sgl-eval run gsm8k \\
     const router = { port: 30000, command: config.npuRouterCommand };
     if (s.pdMode === "router") return { ...cell, pd: true, pdMode: "router",
       nnodes: 1, verified: false, env: [], flags: [], warn: undefined,
-      commands: { python: config.npuRouterCommand, docker: `docker run --network host --rm swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-glm5.3-flash ${config.npuRouterCommand}` }, router };
+      commands: { python: config.npuRouterCommand, docker: `docker run --network host --rm swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051 ${config.npuRouterCommand}` }, router };
     const recipe = config.npuPdRecipes.find((r) => r.hw === s.hw && r.pdMode === s.pdMode);
     if (!recipe) return cell;
     const flags = recipe.flags.map((flag) => flag.startsWith("--port ")

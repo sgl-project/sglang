@@ -391,8 +391,11 @@ class NGRAMWorker(BaseSpecWorker):
             draft_token_num=self.draft_token_num,
         )
 
-    def _insert_extend_prompt_tails(self, batch: ScheduleBatch) -> None:
-        """Seed the trie with each request's context once its prefill finishes."""
+    def insert_prompt_tails(self, batch: ScheduleBatch) -> None:
+        """Seed the trie with each request's context once its prefill finishes.
+
+        Also called by PD decode on a prebuilt batch, which never runs an extend.
+        """
         batch_tokens = []
         for req in batch.reqs:
             # A middle chunk would re-insert the same tail on every chunk.
@@ -409,7 +412,7 @@ class NGRAMWorker(BaseSpecWorker):
             self.ngram_corpus.batch_put(batch_tokens)
 
     def _update_ngram_corpus(self, batch: ScheduleBatch):
-        # Prompt context is inserted at extend by _insert_extend_prompt_tails.
+        # Prompt context is inserted by insert_prompt_tails.
         batch_tokens = []
         i, stride = 0, self.draft_token_num
         for req in batch.reqs:
@@ -525,7 +528,7 @@ class NGRAMWorker(BaseSpecWorker):
                 batch, pp_proxy_tensors=pp_proxy_tensors
             )
             if batch.forward_mode.is_extend():
-                self._insert_extend_prompt_tails(batch)
+                self.insert_prompt_tails(batch)
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
