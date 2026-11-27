@@ -935,6 +935,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             buckets=exponential_buckets(start=0.001, width=1.62, length=30),
             labelnames=list(labels.keys()) + ["stage"],
         )
+        # Observed for every request at every stage; `labels()` rebuilds and
+        # stringifies the label tuple on each call.
+        self._per_stage_req_latency_children: Dict[str, Any] = {}
 
         # =================================================================
         # Grammar
@@ -1526,8 +1529,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
-        labels_with_stage = {**self.labels, "stage": stage}
-        self.per_stage_req_latency_seconds.labels(**labels_with_stage).observe(latency)
+        child = self._per_stage_req_latency_children.get(stage)
+        if child is None:
+            child = self.per_stage_req_latency_seconds.labels(
+                **{**self.labels, "stage": stage}
+            )
+            self._per_stage_req_latency_children[stage] = child
+        child.observe(latency)
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)

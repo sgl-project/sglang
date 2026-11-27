@@ -23,7 +23,10 @@ Before running any benchmark, profiler, or kernel-validation command:
 - use `scripts/diffusion_skill_env.py` to derive the repo root from `sglang.__file__`
 - verify the repo is writable
 - export `HF_TOKEN` before using gated Hugging Face models such as `black-forest-labs/FLUX.*`
-- export `FLASHINFER_DISABLE_VERSION_CHECK=1`
+- leave FlashInfer's version check on; if it reports a mismatch, align
+  `flashinfer-python`, `flashinfer-cubin`, and `flashinfer-jit-cache` to the
+  version pinned in `python/pyproject.toml` instead of disabling the check,
+  because mismatched packages can change which kernels run
 - set `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` when comparing stage-level
   denoise/decode timings; the preset helper sets it by default unless the
   caller explicitly overrides it
@@ -65,7 +68,7 @@ Always rule out these existing families first:
 - Z-Image bf16-native Triton RMSNorm scale/tanh-residual modulation
 - SANA packed self-attention Q/K/V and cross-attention K/V GEMMs
 - SANA-Video's packed projections and request-scoped BF16-input linear
-  attention at `quality=lossless` or `quality=high`; keep the second attention GEMM in FP32 and
+  attention at `quality=high`; keep the second attention GEMM in FP32 and
   compare against `quality=exact` before changing its precision further
 - SANA-Video reuse of SANA's bit-exact bias/activation, residual-gate, and
   LayerNorm-modulation fast paths before adding video-only kernels
@@ -121,7 +124,7 @@ misses only into the isolated cache, and removes links plus new downloads in
 its normal cleanup finally block without modifying the seed cache.
 
 Keep prompt, negative prompt, seed, shape, steps, guidance, dtype, topology,
-and residency fixed. Lossless comparisons require byte-identical artifacts.
+and residency fixed. `quality=exact` comparisons require byte-identical artifacts.
 For `quality=lossless` and `quality=high`, report aggregate and worst-frame SSIM/PSNR; the repository
 defaults are 0.95/28 dB for images and 0.92/24 dB for video unless the model's
 checked-in consistency metadata defines a different threshold. A performance
