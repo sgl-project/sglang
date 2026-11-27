@@ -243,8 +243,6 @@ class ModelSlimConfig(QuantizationConfig):
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
-        # Checkpoint-to-runtime rules, kept to tell mapper aliases from conflicts.
-        self._weight_name_mapper = None
 
         if any("norm.bias" in name for name in self.quant_description.keys()):
             _patch_rmsnorm_with_bias()
@@ -463,7 +461,6 @@ class ModelSlimConfig(QuantizationConfig):
             updated_description[name] = value
         # Save only after all checks pass.
         self.quant_description = updated_description
-        self._weight_name_mapper = hf_to_sglang_mapper
 
     def update_packed_modules_mapping(
         self, mapping: Dict[str, List[str] | Dict[str, List[str]]]
@@ -547,29 +544,6 @@ class ModelSlimConfig(QuantizationConfig):
             if candidate + ".weight" in self.quant_description:
                 return candidate
         return prefix
-
-    def _is_mapper_alias(self, whole_prefix: str, component_prefix: str) -> bool:
-        """Check whether two described names are one tensor under the model rules.
-
-        apply_weight_name_mapper keeps checkpoint keys and adds their runtime
-        names, so a renamed tensor is described twice.
-
-        Args:
-            whole_prefix: The runtime fused layer path, e.g.
-                model.layers.0.self_attn.f_a_proj.
-            component_prefix: The checkpoint component path, e.g.
-                model.language_model.layers.0.self_attn.forget_gate.f_a_proj.
-
-        Returns:
-            True when mapping the component .weight entry yields the whole
-            .weight entry, e.g. GLM-5.3-Flash forget_gate.f_a_proj -> f_a_proj.
-            False when no mapper was applied or the names differ after mapping.
-        """
-        mapper = self._weight_name_mapper
-        if mapper is None or whole_prefix == component_prefix:
-            return False
-        mapped = mapper.apply_list([component_prefix + ".weight"])
-        return mapped == [whole_prefix + ".weight"]
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -759,20 +733,13 @@ class ModelSlimConfig(QuantizationConfig):
 
         # Reject whole + split descriptions: qkv_proj and separate q/k/v.
         # A single part equal to the whole name is the same entry, not a conflict.
-        # A single part that maps onto the whole name is also the same tensor:
-        # the mapper describes a renamed tensor under both checkpoint and
-        # runtime names, e.g. GLM-5.3-Flash forget_gate.f_a_proj -> f_a_proj.
         if any(present):
             if whole_quant_prefix is not None and components != [whole_quant_prefix]:
-                if not (
-                    len(components) == 1
-                    and self._is_mapper_alias(whole_quant_prefix, components[0])
-                ):
-                    raise ValueError(
-                        f"Ambiguous ModelSlim layout for {prefix}: whole tensor "
-                        f"{whole_quant_prefix}.weight and component tensors "
-                        f"{[p + '.weight' for p in components]} are both described"
-                    )
+                raise ValueError(
+                    f"Ambiguous ModelSlim layout for {prefix}: whole tensor "
+                    f"{whole_quant_prefix}.weight and component tensors "
+                    f"{[p + '.weight' for p in components]} are both described"
+                )
             return components
         if whole_quant_prefix is not None:
             return [whole_quant_prefix]
