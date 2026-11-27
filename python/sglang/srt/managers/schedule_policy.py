@@ -59,8 +59,6 @@ from typing import (
     Union,
 )
 
-import torch
-
 from sglang.srt.beam_search.batch_tail import beam_decode_budget
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.managers.schedule_batch import (
@@ -74,9 +72,6 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InitLoadBackParams,
-    InsertParams,
-    MatchPrefixParams,
-    zero_match_result,
 )
 from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
 from sglang.srt.mem_cache.common import (
@@ -84,7 +79,7 @@ from sglang.srt.mem_cache.common import (
     prefill_load_tokens,
     touch_waiting_prefix,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
 
@@ -260,9 +255,6 @@ class SchedulePolicy:
         self.shortest_prefill_class_boundary = math.inf
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
-
-        # It is used to find the matching prefix for in-batch prefix caching.
-        self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
         # UniBoost state; inert unless the schedule policy is "uniboost".
         self.uniboost_gamma = uniboost_gamma
@@ -593,8 +585,7 @@ class SchedulePolicy:
     def _compute_prefix_matches(
         self, waiting_queue: List[Req], policy: CacheAwarePolicy
     ) -> Set[int]:
-        temporary_deprioritized: Set[int] = set()
-        self.waiting_queue_radix_tree.reset()
+        threshold = IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
 
         # In-batch prefix caching: of the requests with almost nothing cached that
         # share a prefix, only one runs, so the shared prefix is computed once.
@@ -602,10 +593,17 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             match_kv_cache(r, self.tree_cache, prefix_ids)
-            if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                # Only the first DEPRIORITIZE_THRESHOLD tokens can decide a match.
-                key_ids = prefix_ids[:IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD]
-                candidates.append((r, key_ids))
+            if (
+                r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD
+                and len(prefix_ids) >= threshold
+            ):
+                candidates.append((r, prefix_ids[: max(0, threshold)]))
+
+        # A zero-length match satisfies a nonpositive threshold, even on a forced miss.
+        if threshold <= 0:
+            return {r.rid for r, _ in candidates}
+        if envs.SGLANG_RADIX_FORCE_MISS.get():
+            return set()
 
         if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
             # The first of a shared-prefix group runs: make it the shortest, or a
@@ -619,39 +617,16 @@ class SchedulePolicy:
                 )
             )
 
+        # Only equality over the first threshold tokens matters. A shorter
+        # partial match can never cause another request to be deferred.
+        seen = set()
+        temporary_deprioritized = set()
         for r, key_ids in candidates:
-            extra_key = r.extra_key
-            cache_salt = r.cache_salt
-            match_result = self.waiting_queue_radix_tree.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(
-                        token_ids=key_ids,
-                        extra_key=extra_key,
-                        cache_salt=cache_salt,
-                    )
-                )
-            )
-            if envs.SGLANG_RADIX_FORCE_MISS.get():
-                match_result = zero_match_result(
-                    self.waiting_queue_radix_tree, match_result, extra_key=extra_key
-                )
-            if (
-                match_result.device_prefix_len
-                >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
-            ):
+            key = (r.extra_key, r.cache_salt or None, tuple(key_ids))
+            if key in seen:
                 temporary_deprioritized.add(r.rid)
             else:
-                # Insert with a dummy key
-                self.waiting_queue_radix_tree.insert(
-                    InsertParams(
-                        key=RadixKey(
-                            token_ids=key_ids,
-                            extra_key=extra_key,
-                            cache_salt=cache_salt,
-                        ),
-                        value=torch.empty(len(key_ids), dtype=torch.bool),
-                    )
-                )
+                seen.add(key)
         return temporary_deprioritized
 
     def poll_storage_prefetches(self, waiting_queue: Iterable[Req]) -> None:
