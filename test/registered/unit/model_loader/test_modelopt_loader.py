@@ -17,8 +17,12 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+)
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.fp8 import (
@@ -39,6 +43,7 @@ from sglang.srt.layers.quantization.nvfp4_online import (
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     ModelOptModelLoader,
+    built_quant_config,
     get_model_loader,
 )
 from sglang.srt.model_loader.weight_utils import (
@@ -394,6 +399,69 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_decision_fused_projections_keep_checkpoint_quantization(self):
+        """Split checkpoint layers must not create BF16 fused runtime weights."""
+        layers = {}
+        for index, (qkv, mlp) in enumerate((("FP8", "NVFP4"), ("NVFP4", "FP8"))):
+            for area, projections, algorithm in (
+                ("self_attn", ("q_proj", "k_proj", "v_proj"), qkv),
+                ("mlp", ("gate_proj", "up_proj"), mlp),
+            ):
+                for projection in projections:
+                    layers[f"encoder.layers.{index}.{area}.{projection}"] = {
+                        "quant_algo": algorithm,
+                        "group_size": 16,
+                    }
+        config = SimpleNamespace(
+            hf_config=PretrainedConfig(
+                architectures=["NemotronForDecision"],
+                quantization_config={
+                    "quant_method": "modelopt_mixed",
+                    "quant_algo": "MIXED_PRECISION",
+                    "kv_cache_quant_algo": None,
+                    "quantized_layers": layers,
+                    "ignore": ["diffusion_head", "encoder.embed_tokens"],
+                },
+            ),
+            quantization="modelopt_mixed",
+            model_impl=ModelImpl.SGLANG,
+            dtype=torch.bfloat16,
+            is_draft_model=False,
+        )
+        quant_config = built_quant_config(config, LoadConfig())
+        for index, (qkv_dtype, mlp_dtype) in enumerate(
+            ((torch.float8_e4m3fn, torch.uint8), (torch.uint8, torch.float8_e4m3fn))
+        ):
+            with self.subTest(layer=index):
+                qkv = QKVParallelLinear(
+                    hidden_size=16,
+                    head_size=8,
+                    total_num_heads=2,
+                    total_num_kv_heads=2,
+                    bias=False,
+                    parallel_group="replicated",
+                    quant_config=quant_config,
+                    params_dtype=torch.bfloat16,
+                    prefix=f"model.layers.{index}.self_attn.qkv_proj",
+                )
+                mlp = MergedColumnParallelLinear(
+                    input_size=16,
+                    output_sizes=[16, 16],
+                    bias=False,
+                    parallel_group="replicated",
+                    quant_config=quant_config,
+                    params_dtype=torch.bfloat16,
+                    prefix=f"model.layers.{index}.mlp.gate_up_proj",
+                )
+                self.assertEqual(qkv.weight.dtype, qkv_dtype)
+                self.assertEqual(mlp.weight.dtype, mlp_dtype)
+                self.assertEqual(
+                    qkv.weight.shape, (48, 8 if qkv_dtype == torch.uint8 else 16)
+                )
+                self.assertEqual(
+                    mlp.weight.shape, (32, 8 if mlp_dtype == torch.uint8 else 16)
+                )
+
     def test_nemotron_h_omni_resolves_fused_qkv_from_split_layers(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(
             {

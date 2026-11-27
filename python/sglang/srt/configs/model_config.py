@@ -38,6 +38,10 @@ from sglang.srt.configs.ernie55 import (
 )
 from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
+from sglang.srt.configs.nemotron_decision import (
+    is_nemotron_decision,
+    load_nemotron_decision_config,
+)
 from sglang.srt.configs.unlimited_ocr_v2 import (
     FALLBACK_CONTEXT_LENGTH,
     UocrDocumentConfig,
@@ -785,6 +789,11 @@ class ModelConfig:
                 num_passes=inkling2_loop_num_passes,
                 share_cache=inkling2_loop_share_cache,
             )
+        self.nemotron_decision_config = (
+            load_nemotron_decision_config(self.model_path, revision)
+            if is_nemotron_decision(self.hf_config)
+            else None
+        )
         self.decision_config = None
         if self.hf_config.architectures == ["Qwen3_5Model"]:
             self.decision_config = load_decision_config(self.model_path, revision)
