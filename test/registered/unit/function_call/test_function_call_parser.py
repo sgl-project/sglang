@@ -13,6 +13,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
@@ -4818,6 +4819,27 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "search")
 
+    def test_streaming_tool_index_is_call_ordinal(self):
+        """Streamed calls are numbered in emission order. Two calls to one
+        tool must not share an index (a client would merge them), in JSON
+        form and across separate blocks."""
+        self.detector = Lfm2Detector()
+
+        json_block = (
+            '<|tool_call_start|>[{"name": "calculator", "arguments": '
+            '{"expression": "1+1"}}, {"name": "calculator", "arguments": '
+            '{"expression": "2+2"}}]<|tool_call_end|>'
+        )
+        result1 = self.detector.parse_streaming_increment(json_block, self.tools)
+        pythonic_block = '<|tool_call_start|>[search(query="hotels")]<|tool_call_end|>'
+        result2 = self.detector.parse_streaming_increment(pythonic_block, self.tools)
+
+        calls = result1.calls + result2.calls
+        self.assertEqual(
+            [call.name for call in calls], ["calculator", "calculator", "search"]
+        )
+        self.assertEqual([call.tool_index for call in calls], [0, 1, 2])
+
     # ==================== recovery tests (dropped-call regressions) ====================
 
     def test_multiline_string_argument_recovered(self):
@@ -5071,6 +5093,42 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(info.begin, "<|tool_call_start|>[get_weather(")
         self.assertEqual(info.end, ")]<|tool_call_end|>")
         self.assertEqual(info.trigger, "<|tool_call_start|>")
+
+
+class TestCohereCommand4Detector(unittest.TestCase):
+    def test_streaming_tool_index_is_call_ordinal(self):
+        """Streamed calls are numbered in emission order. Two calls to one
+        tool must not share an index (a client would merge them), and the
+        numbering continues across action blocks."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name=name, parameters={"type": "object", "properties": {}}
+                ),
+            )
+            for name in ("get_weather", "search", "calculator")
+        ]
+        detector = CohereCommand4Detector()
+
+        result1 = detector.parse_streaming_increment(
+            '<|START_ACTION|>[{"tool_call_id": "0", "tool_name": "calculator", '
+            '"parameters": {"expression": "1+1"}}, {"tool_call_id": "1", '
+            '"tool_name": "calculator", "parameters": {"expression": "2+2"}}]'
+            "<|END_ACTION|>",
+            tools,
+        )
+        result2 = detector.parse_streaming_increment(
+            '<|START_ACTION|>[{"tool_call_id": "2", "tool_name": "search", '
+            '"parameters": {"query": "hotels"}}]<|END_ACTION|>',
+            tools,
+        )
+
+        calls = result1.calls + result2.calls
+        self.assertEqual(
+            [call.name for call in calls], ["calculator", "calculator", "search"]
+        )
+        self.assertEqual([call.tool_index for call in calls], [0, 1, 2])
 
 
 class TestGigaChat3Detector(unittest.TestCase):
