@@ -341,6 +341,16 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     "sampling_seed must be in [-2**63, 2**63 - 1], got "
                     f"{self.sampling_seed}."
                 )
+        if self.custom_params is not None:
+            # The scheduler decodes this field against its declared type under
+            # msgpack IPC, and custom logit processors read it as a dict.
+            try:
+                msgspec.convert(self.custom_params, Dict[str, CustomParamValue])
+            except msgspec.ValidationError as e:
+                raise ValueError(
+                    "custom_params must be an object whose values are scalars, "
+                    f"lists of scalars, or objects of scalars: {e}"
+                ) from None
 
         get_request_reasoning_end_token_ids(
             self.custom_params,

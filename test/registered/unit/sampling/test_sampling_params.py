@@ -157,6 +157,42 @@ class TestSamplingParamsVerify(CustomTestCase):
                     custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: value}
                 ).verify(self.VOCAB_SIZE)
 
+    def test_custom_params_must_match_the_declared_type(self):
+        """A custom_params the scheduler cannot decode or read as a dict is a 400,
+        not a scheduler crash that takes the server down."""
+        valid_values = [
+            {},
+            {"thinking_budget": 512},
+            {"token_ids": [1, 2]},
+            {REQUEST_REASONING_END_TOKEN_IDS_KEY: [17, 18]},
+            {"simulation": {"created_time_ms": 1.0, "total_request": 3}},
+            {"uocr_doc_after": "rid", "uocr_doc_budget": None, "page_stop_only": True},
+        ]
+        for value in valid_values:
+            with self.subTest(value=value):
+                sp = self._make(custom_params=value)
+                sp.verify(self.VOCAB_SIZE)
+                decoded = msgspec.msgpack.decode(
+                    msgspec.msgpack.encode(sp), type=SamplingParams
+                )
+                self.assertEqual(decoded.custom_params, value)
+
+        invalid_values = [
+            [1],
+            "x",
+            7,
+            True,
+            {"a": {"b": {"c": 1}}},
+            {"a": [[1]]},
+            {"a": [{"b": 1}]},
+        ]
+        for value in invalid_values:
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "custom_params must be an object"),
+            ):
+                self._make(custom_params=value).verify(self.VOCAB_SIZE)
+
     def test_negative_temperature_raises(self):
         """Test that verify() rejects negative temperature (must be >= 0)."""
         sp = self._make(temperature=-0.5)
