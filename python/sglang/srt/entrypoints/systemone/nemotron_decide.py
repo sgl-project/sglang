@@ -7,8 +7,6 @@ import json
 import math
 import re
 
-from tokenizers import Tokenizer
-
 from sglang.srt.configs.nemotron_decision import is_nemotron_decision
 from sglang.srt.entrypoints.openai.protocol import (
     DecisionChoiceQuestion,
@@ -38,31 +36,29 @@ class NemotronDecideEncoder:
                     f"Nemotron Decision {kind} labels must use distinct single tokens"
                 )
             self.label_ids[kind] = [item[0] for item in ids]
-        control_tokens = tuple(
-            token.content
-            for token in tokenizer.added_tokens_decoder.values()
-            if token.special
-            or (
-                token.content in metadata["chat_template"]
-                and not token.content.isspace()
+        controls = sorted(
+            tokenizer.get_added_vocab(), key=lambda token: (-len(token), token)
+        )
+        self.control_tokens = re.compile("|".join(map(re.escape, controls)) or "(?!)")
+        self.state_end_token_id = vars(config).get("state_end_token_id")
+        self.state_end_token = ""
+        if self.state_end_token_id is not None:
+            token_id = self.state_end_token_id
+            added = {
+                value: token for token, value in tokenizer.get_added_vocab().items()
+            }
+            if (
+                type(token_id) is not int
+                or token_id not in added
+                or token_id == self.mask_token_id
+            ):
+                raise ValueError(
+                    "state_end_token_id must name an added tokenizer token other than the mask token"
+                )
+            self.state_end_token = added[token_id]
+            self._check_prompt(
+                self._encode_content(dict(state=None, question="", options=[]))
             )
-        )
-        self.control_tokens = re.compile(
-            "|".join(
-                re.escape(token)
-                for token in sorted(control_tokens, key=len, reverse=True)
-            )
-            or "(?!)"
-        )
-        self.markers = re.compile(
-            "\U000f0000("
-            + self.control_tokens.pattern
-            + ")\U000f0001|[\U000f0000\U000f0001]"
-        )
-        # Splitting control tokens must not mutate the shared tokenizer during concurrent requests.
-        self.text_tokenizer = Tokenizer.from_str(tokenizer.backend_tokenizer.to_str())
-        self.text_tokenizer.encode_special_tokens = True
-        self.newline_ids = tokenizer.encode("\n", add_special_tokens=False)
 
     def validate_request(self, request):
         if len(request.questions) > self.metadata["max_questions"]:
@@ -111,31 +107,10 @@ class NemotronDecideEncoder:
             dict(code=code, label=name, meaning=description)
             for code, (name, description) in zip(labels, entries)
         ]
-        content = json.dumps(
-            dict(state=state, question=question.instructions, options=options),
-            ensure_ascii=False,
-            allow_nan=False,
+        ids = self._encode_content(
+            dict(state=state, question=question.instructions, options=options)
         )
-        content = content.replace("\U000f0000", "").replace("\U000f0001", "")
-        marked = self.control_tokens.sub(
-            lambda match: "\U000f0000" + match[0] + "\U000f0001", content
-        )
-        rendered = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": ""}],
-            chat_template=self.metadata["chat_template"],
-            decision_content=marked,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        ids = self._encode_marked_prompt(rendered)
-        if (
-            not ids
-            or ids[-1] != self.mask_token_id
-            or ids.count(self.mask_token_id) != 1
-        ):
-            raise ValueError(
-                "The Decision template must produce exactly one trailing mask token"
-            )
+        self._check_prompt(ids)
         if len(ids) > self.max_prompt_tokens:
             raise ValueError(
                 f"the prompt has {len(ids)} tokens, limit {self.max_prompt_tokens}; a bidirectional read cannot be chunked"
@@ -192,28 +167,66 @@ class NemotronDecideEncoder:
         total = math.fsum(weights)
         return [weight / total for weight in weights]
 
-    def _encode_marked_prompt(self, rendered):
-        # Match Transformers' sanitization while leaving template-owned control tokens intact.
-        pieces = self.markers.split(rendered)
-        ids = self.tokenizer.encode(pieces[0], add_special_tokens=False)
-        for index, piece in enumerate(pieces[1:], start=1):
-            if not piece:
-                continue
-            as_text = index % 2 == 1
-            encoded = self._encode_piece("\n" + piece, as_text)
-            if encoded[: len(self.newline_ids)] == self.newline_ids:
-                encoded = encoded[len(self.newline_ids) :]
-            else:
-                encoded = self._encode_piece(piece, as_text)
-            if as_text and self.tokenizer.convert_tokens_to_ids(piece) in encoded:
-                raise ValueError(f"Cannot encode {piece!r} as plain text")
-            ids.extend(encoded)
-        return ids
+    def _json_content(self, value):
+        text = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        if self.control_tokens.search(text) is None:
+            return text
+        return re.sub(r'"((?:[^"\\]|\\.)*)"', self._escape_literal, text)
 
-    def _encode_piece(self, text, as_text):
-        if as_text:
-            return self.text_tokenizer.encode(text, add_special_tokens=False).ids
-        return self.tokenizer.encode(text, add_special_tokens=False)
+    def _escape_literal(self, literal):
+        text = literal[1]
+        while True:
+            escapes = list(re.finditer(r"\\(?:u[0-9a-fA-F]{4}|.)", text))
+            pieces, last, position = [], 0, 0
+            for match in self.control_tokens.finditer(text):
+                start = match.start()
+                while position < len(escapes) and escapes[position].end() <= start:
+                    position += 1
+                if position < len(escapes) and escapes[position].start() <= start:
+                    continue
+                # JSON escapes preserve the value without producing a control token.
+                pieces.extend(
+                    (
+                        text[last:start],
+                        f"\\u{ord(text[start]):04x}",
+                        text[start + 1 : match.end()],
+                    )
+                )
+                last = match.end()
+            if not pieces:
+                return '"' + text + '"'
+            text = "".join((*pieces, text[last:]))
+
+    def _encode_content(self, content):
+        state = self._json_content(dict(state=content["state"]))[:-1]
+        question = self._json_content(
+            {key: value for key, value in content.items() if key != "state"}
+        )[1:]
+        rendered = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": ""}],
+            chat_template=self.metadata["chat_template"],
+            decision_content=state + self.state_end_token + ", " + question,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        return self.tokenizer.encode(rendered, add_special_tokens=False)
+
+    def _check_prompt(self, ids):
+        if (
+            not ids
+            or ids[-1] != self.mask_token_id
+            or ids.count(self.mask_token_id) != 1
+        ):
+            raise ValueError(
+                "The Decision template must produce exactly one trailing mask token"
+            )
+        if (
+            self.state_end_token_id is not None
+            and ids.count(self.state_end_token_id) != 1
+        ):
+            raise ValueError(
+                "The Decision template must preserve exactly one state-end token"
+            )
 
 
 def create_decision_encoder(model_config, tokenizer, max_prompt_tokens):

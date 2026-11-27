@@ -14,6 +14,22 @@ def is_nemotron_decision(config: PretrainedConfig) -> bool:
     return "NemotronForDecision" in (config.architectures or [])
 
 
+def nemotron_decision_attention_layout(config: PretrainedConfig) -> str:
+    layout = vars(config).get("decision_attention_layout", "state_sees_own_question")
+    if layout not in ("state_sees_own_question", "state_sees_no_questions"):
+        raise ValueError(
+            "Nemotron Decision decision_attention_layout must be "
+            "'state_sees_own_question' or 'state_sees_no_questions', "
+            f"got {layout!r}"
+        )
+    state_end = vars(config).get("state_end_token_id")
+    if state_end is not None and (type(state_end) is not int or state_end < 0):
+        raise ValueError("state_end_token_id must be a nonnegative integer")
+    if layout == "state_sees_no_questions" and state_end is None:
+        raise ValueError("state_sees_no_questions requires state_end_token_id")
+    return layout
+
+
 def load_nemotron_decision_config(model_path: str, revision: str | None) -> dict:
     config_path = cached_file(model_path, "decision.json", revision=revision)
     template_path = cached_file(

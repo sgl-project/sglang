@@ -5027,6 +5027,27 @@ class TestNemotronDecisionStartup(CustomTestCase):
                     [],
                 )
 
+    def test_registered_guard_rejects_packing_without_implementation(self):
+        config = SimpleNamespace(
+            is_causal=False,
+            sliding_window=None,
+            state_end_token_id=101,
+            decision_attention_layout="state_sees_own_question",
+        )
+        args = SimpleNamespace(dllm_algorithm=None, speculative_algorithm=None)
+        self.assertEqual(
+            collect_model_override_declarations("NemotronForDecision", args, config), []
+        )
+        config.decision_attention_layout = "state_sees_no_questions"
+        with self.assertRaisesRegex(
+            ValueError, "requires shared-state packing support"
+        ):
+            collect_model_override_declarations("NemotronForDecision", args, config)
+        self.assertEqual(
+            collect_model_override_declarations("Ministral3ForCausalLM", args, config),
+            [],
+        )
+
     def test_registered_guard_rejects_generation_modes(self):
         config = SimpleNamespace(is_causal=False, sliding_window=None)
         args = SimpleNamespace(dllm_algorithm=None, speculative_algorithm=None)

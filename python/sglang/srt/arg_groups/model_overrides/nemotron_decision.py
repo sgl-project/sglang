@@ -4,7 +4,10 @@ from sglang.srt.arg_groups.model_override_base import (
     register_model_override,
     resolving_view,
 )
-from sglang.srt.configs.nemotron_decision import is_nemotron_decision
+from sglang.srt.configs.nemotron_decision import (
+    is_nemotron_decision,
+    nemotron_decision_attention_layout,
+)
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.device import get_device_memory_capacity
 
@@ -55,6 +58,10 @@ def nemotron_decision_activation_reserve_mb(
 @register_model_override("NemotronForDecision")
 def _nemotron_decision_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
+    if nemotron_decision_attention_layout(hf_config) == "state_sees_no_questions":
+        raise ValueError(
+            "Nemotron Decision state_sees_no_questions requires shared-state packing support"
+        )
     if get_platform().is_hip:
         # The default ROCm backend ignores encoder-only attention.
         raise ValueError("Nemotron Decision is not supported on ROCm.")

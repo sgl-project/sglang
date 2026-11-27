@@ -70,6 +70,11 @@ for this checkpoint. The BF16 checkpoint allows up to
 available KV capacity can impose a smaller limit. Longer inputs are rejected
 without truncation or compaction.
 
+For Nemotron Decision, `config.json` supplies `state_end_token_id` for the prompt
+separator and `decision_attention_layout` for the server's attention pattern.
+`state_sees_own_question` is the default; `state_sees_all_questions` is unsupported.
+
+
 Each question gets a separate complete read, including its state. Prefix caching
 and chunked prefill are disabled for this model because every input token must
 attend to the whole question. No output tokens are generated. Images, shared-state
