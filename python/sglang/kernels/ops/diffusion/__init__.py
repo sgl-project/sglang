@@ -718,6 +718,7 @@ _EXPORTS: dict[str, str] = {
     "fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
     "apply_matrix_rope": "rope.matrix_rope",
     "residual_gate_fp32": "modulate.residual_gate_fp32",
+    "quantize_block_fp8_activation": "quantization.fp8_block_activation_triton",
     "can_use_fp8_rowwise": "quantization.fp8_rowwise_triton",
     "fp8_rowwise": "quantization.fp8_rowwise_triton",
     "fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",

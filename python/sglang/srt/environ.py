@@ -1544,6 +1544,8 @@ class Envs:
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvInt(32)
+    # Reshuffle experts in the elastic scale finalizer, not the next EPLB tick.
+    SGLANG_ENABLE_ELASTIC_SCALE_REBALANCE = EnvBool(True)
 
     # ===================================================================
     # DeepGEMM
@@ -1683,6 +1685,8 @@ class Envs:
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
+    # Unset, mooncake sends fp8, which cannot feed a deep_gemm runner on BF16 weights.
+    SGLANG_MOONCAKE_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)

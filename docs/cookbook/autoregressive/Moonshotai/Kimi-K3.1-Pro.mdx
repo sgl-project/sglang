@@ -1,6 +1,6 @@
 ---
 title: Kimi-K3.1-Pro
-description: "Deploy Moonshot AI's Kimi K3.1 Pro with SGLang: 2.8T parameters (104B active) and a 1M context, on NVIDIA Vera Rubin, Blackwell and Hopper, AMD Instinct, PPU and Google TPU."
+description: "Deploy Moonshot AI's Kimi K3.1 Pro with SGLang: 2.8T parameters (104B active) and a 1M context, on NVIDIA Vera Rubin, Blackwell and Hopper, AMD Instinct, PPU, Ascend NPUs and Google TPU."
 tag: NEW
 ---
 
@@ -32,6 +32,18 @@ Use the Kimi K3.1 Pro image `lmsysorg/sglang:dev-kimi-k31-pro` (`lmsysorg/sglang
 <Tab title="PPU (M890 / 810E)">
 
 Use the PPU image `egslingjun-registry.cn-wulanchabu.cr.aliyuncs.com/egslingjun-tmp/inference-xpu-pytorch:kimi-k3.1-pro-sglang0.5.22-cuda13.0-pytorch2.13.0-20261103` with a prepared [SAIL environment](/docs/hardware-platforms/sail), and run the command panel's **Python** output inside the container on each worker node.
+
+</Tab>
+
+<Tab title="NPU (A3 Series)">
+
+```bash Command
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
+```
+
+The A3 Series image is a CANN 9.2.0 build (tag `B050`); use a build whose SGLang carries Kimi K3.1 Pro support. For the host driver, CANN and container setup, follow the [Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) and the [quick start guide](/docs/hardware-platforms/ascend-npus/getting-started/quick_start), then run the command panel's output on all four nodes (see [Ascend A3 Series](#npu-tips)). Replace `/path/to/Kimi-K3.1-Pro-w4a8` with the directory where the checkpoint is mounted on every node.
+
+**Weights (NPU):** [Kimi-K3.1-Pro-w4a8](https://www.modelscope.cn/models/Eco-Tech/Kimi-K3.1-Pro-w4a8) (A3 Series, ModelSlim W4A8).
 
 </Tab>
 
@@ -74,7 +86,7 @@ Each command carries a badge:
 
 ### Mamba ratio calculator
 
-On `Unified`, `--mamba-full-memory-ratio` follows your average request length. The prefill and MI350X / MI355X High-Throughput recipes pin the ratio they were measured with; the decode and MI350X / MI355X Low-Latency recipes size the KDA pool directly, so the ratio does not apply.
+On `Unified`, `--mamba-full-memory-ratio` follows your average request length. The prefill and MI350X / MI355X High-Throughput recipes pin the ratio they were measured with; the decode and MI350X / MI355X Low-Latency recipes size the KDA pool directly, so the ratio does not apply. On the Ascend A3 Series the ratio does not apply either: the cell pins `--max-mamba-cache-size 64` and the Ascend path takes no ratio.
 
 <KimiK31MambaRatioCalculator />
 
@@ -87,6 +99,8 @@ Turn on additional knobs on top of whichever cell the Deploy panel is showing:
 - **Serving:** parsers, the PD transfer, HiCache storage and write policy, DFLASH proposed tokens, the prefill CUDA graph and the PD decode radix cache.
 - **WideEP Decode** (GB300 `Decode`): one decode server on four trays, attention DP2 with TP8 · DCP8 in each 8-GPU group and MegaMoE EP16 across all 16 GPUs. In a fixed-batch survey it beat 8-GPU decode workers from 8 concurrent requests up, by 15% at 64. That survey ran without the radix cache; turning the PD decode radix cache on still keeps one KDA state slot per request, since the decode tree caches KV only. Not Verified on the current code.
 - **Tuning:** the DSA attention backend and the MoE runner (B300, GB300, B200, GB200), the DCP communication backend, the KDA state slot count, KDA states per radix path, the MegaMoE token cap (when MoE Runner is MegaMoE) and the PP layer partition (PP4 × PCP2 prefill).
+
+On the Ascend A3 Series cell only the **Parsers** card applies: the recipe runs Non-Spec, without HiCache, and its MoE runner and graph come from the deployment script.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -118,7 +132,7 @@ import { agentxMi355x } from "/src/snippets/agentx/moonshotai/kimi-k3.1-pro-mi35
 
 ## 1. Model Introduction
 
-**Kimi K3.1 Pro** is Moonshot AI's open-weight, natively multimodal agentic model and the first model in the K3.1 series, post-trained from Kimi-K3 with large-scale joint reinforcement learning. It is a **2.8T-parameter Mixture-of-Experts model with 104B activated**: 93 layers (1 dense) combining **69 KDA + 24 Gated Sparse-MLA (DSA)** attention layers, **896 experts with 16 selected per token plus 2 shared**, SiTU-GLU activations, a 160K vocabulary, the MoonViT-V2 vision encoder (401M) for image input, and a **1,048,576-token** context. Weights are **MXFP4 with MXFP8 activations** (quantization-aware training). SGLang serves it as `KimiK31ForConditionalGeneration` and forces FP8 KV with page size 64.
+**Kimi K3.1 Pro** is Moonshot AI's open-weight, natively multimodal agentic model and the first model in the K3.1 series, post-trained from Kimi-K3 with large-scale joint reinforcement learning. It is a **2.8T-parameter Mixture-of-Experts model with 104B activated**: 93 layers (1 dense) combining **69 KDA + 24 Gated Sparse-MLA (DSA)** attention layers, **896 experts with 16 selected per token plus 2 shared**, SiTU-GLU activations, a 160K vocabulary, the MoonViT-V2 vision encoder (401M) for image input, and a **1,048,576-token** context. Weights are **MXFP4 with MXFP8 activations** (quantization-aware training). SGLang serves it as `KimiK31ForConditionalGeneration` and forces FP8 KV with page size 64. The Ascend A3 Series recipe serves a ModelSlim **W4A8** build instead (`--quantization modelslim`).
 
 Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort` field: `low`, `high` or `max` (default `max`). For multi-turn conversations and tool calls, pass the complete assistant message back in `messages` as-is, including `reasoning_content` and `tool_calls`, not just `content`.
 
@@ -134,6 +148,7 @@ Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort`
 
 - **GB300**: every recipe runs on two trays (2×4 GPUs over MNNVL); the command adds the multi-node flags.
 - **MI350X / MI355X**: one 8-GPU node per server; the 1P1D runs on two nodes (see [AMD MI350X / MI355X](#amd-tips)).
+- **A3 Series (NPU)**: four nodes, each an 8-card / 16-die A3 node, run as one 64-die engine; Unified only (see [Ascend A3 Series](#npu-tips)).
 - **PD Mode**
   - `Unified` serves prefill and decode together.
   - `Prefill` / `Decode` split them (see [PD disaggregation](#pd-disaggregation)).
@@ -144,6 +159,7 @@ Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort`
   - `Low-Latency (TP8)` (B300, GB300, MI350X, MI355X) is flat TP8.
   - `High-Concurrency (DCP8)` (B300, GB300) is TP8 · DCP8 · EP2.
   - `High-Throughput (DCP8)` (MI350X, MI355X) is TP8 · DCP8 over the a2a backend.
+  - `Balanced (TP16 · PP4 · EP16)` (A3 Series) is one PP stage per node over four nodes.
   - `Balanced` (other platforms) is the placeholder shape for each platform; the parentheses give its layout: TP8 on Vera Rubin, TP16 · DCP16 on B200 and GB200, TP16 · EP16 on H200, TP32 · EP32 on H100, TP32 · EP8 on TPU7x.
 - **Decode strategy**
   - `Balanced (DCP8 · EP2)` is TP8 · DCP8 · EP2.
@@ -160,6 +176,7 @@ Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort`
 - **Spec Decode**
   - DFLASH with the [Kimi-K3.1-Dflash2-Preview](https://huggingface.co/RadixArk/Kimi-K3.1-Dflash2-Preview) draft.
   - Block 8; block 6 on the High-Throughput (DCP8) decode.
+  - Not offered on the A3 Series: its recipe runs Non-Spec.
 - **HiCache**
   - Off by default; L2 and L3 keep DCP on Kimi K3.1 Pro.
   - On a PD decode server HiCache also turns on the decode radix cache.
@@ -181,6 +198,18 @@ Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort`
 - **By agent count.** 1-4: `Unified` `Low-Latency`, on the monokernel (no HiCache); at 1 agent run 1 request. 8-56: `Unified` `High-Throughput` with HiCache, at its 48-agent shape; at 56 agents run 56 requests, and below 48 use 16k chunks with 6, 8, 13 and 20 requests at 8, 16, 24 and 32 agents. Beyond that, the 1P1D (see [On AMD MI355X](#pd-amd)).
 - **DFLASH.** Triton draft attention and block verification; block 8 at 1-4 agents, 6 at 8, and 5 from 16 agents and on both PD roles.
 - **HiCache.** The pinned host pools share the node's GTT limit (1511 GiB on MI355X); larger ratios fail at startup.
+
+<a id="npu-tips" />
+
+### Ascend A3 Series
+
+- **Shape.** Four 8-card nodes (16 dies each) as one 64-die engine: `--tp-size 16 --ep-size 16 --pp-size 4`, so each node is one PP stage. Unified only — prefill and decode share the four nodes.
+- **Checkpoint.** A local ModelSlim **W4A8** build of [`Eco-Tech/Kimi-K3.1-Pro-w4a8`](https://www.modelscope.cn/models/Eco-Tech/Kimi-K3.1-Pro-w4a8) (`--quantization modelslim`), mounted on every node. The command shows `/path/to/Kimi-K3.1-Pro-w4a8`; replace it with your mount point — it must hold the config, tokenizer and quantization metadata, and it doubles as the served model name. `--mem-fraction-static 0.72` caps the static memory and leaves headroom for the KDA state pool and the a2a workspaces.
+- **MoE.** `--moe-a2a-backend ascend_ops` with `--moe-ascend-ops-config '{"prefill":"alltoallv","decode":"low_latency"}'` picks the communication mode per phase on the same engine.
+- **State pool.** `--max-mamba-cache-size 64` sizes the KDA state pool directly; `--mamba-full-memory-ratio` and the [Mamba ratio calculator](#mamba-ratio-calculator) do not apply.
+- **No speculation, no HiCache.** The cell runs Non-Spec and without HiCache. The `SGLANG_ENABLE_SPEC_V2`, `SGLANG_RAGGED_VERIFY_MODE=static` and `SGLANG_DSPARK_*` environment is carried from the deployment script and is inert without a speculative algorithm.
+- **Startup.** `--skip-server-warmup` skips the warm-up request, and `--cuda-graph-max-bs-decode 16` sizes the decode graph.
+- **Network.** On every node, point `GLOO_SOCKET_IFNAME`, `HCCL_SOCKET_IFNAME` and `TP_SOCKET_IFNAME` at the cross-node NIC. `--node-rank` runs 0-3 and `--dist-init-addr` is the head node on port 20000; source both `set_env.sh` scripts (toolkit and ATB) before launching outside the image.
 
 ## 3. Advanced Usage
 
@@ -263,6 +292,7 @@ Pending update...
 - **Transfer**: Mooncake (DCP rejects other backends on either role). Prefill listens on `30000`, decode on `30100`.
 - **When using DFLASH, run it on both roles**: with the draft KV ring on, the prefill writes the ring that decode reads, so set `SGLANG_ENABLE_DFLASH_DRAFT_KV_RING` the same on both.
 - **Restart the prefill role whenever the decode role restarts**: prefill keeps the old decode's Mooncake mapping.
+- **Not on the A3 Series**: its recipe is Unified only, so there are no NPU prefill / decode roles here.
 
 <Accordion title="Router">
 

@@ -1,6 +1,11 @@
 {
   "_comment": "Manual overrides read by list_stage_models.py. by_suite ADDS models the static scan cannot see to a whole suite. A test file drops models it names but does not load with declare_models(skip_models=...) next to its register_cuda_ci call, not here. suite_labels maps legacy suite= registrations (no runner_config) to the GH runner label(s) their dispatching workflow hardcodes in runs-on -- a list, because one suite can run on several labels. $b200_runner is the dynamic-b200 placeholder from runner_configs.yml. Suites registered with stage=/runner_config= need no entry: their label resolves through runner_configs.yml. Anything unmappable stays visible in unmapped_suites.",
-  "by_suite": {},
+  "by_suite": {
+    "base-b-diffusion-test-4-gpu-b200": [
+      "black-forest-labs/FLUX.2-dev",
+      "ideogram-ai/ideogram-4-fp8"
+    ]
+  },
   "suite_labels": {
     "stress": ["8-gpu-h200"]
   }
