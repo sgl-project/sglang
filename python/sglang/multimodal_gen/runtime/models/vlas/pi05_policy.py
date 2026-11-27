@@ -159,22 +159,12 @@ class Pi05PolicyModel(nn.Module):
             )
 
             components = validate_quantization_config(quantization_config)
-            if (
-                self.runtime_role != "all"
-                or prefix_tensor_parallel
-                or (
-                    model_parallel_is_initialized()
-                    and get_sequence_parallel_world_size() > 1
-                )
-                or any(
-                    value
-                    for key, value in vars(config).items()
-                    if key.startswith("offload_") and not key.endswith("empty_cache")
-                )
-                or device.type != "cuda"
-                or current_platform.is_rocm()
-                or torch.cuda.get_device_capability(device) < (8, 9)
-                or dtype != torch.bfloat16
+            if not self._supports_resident_quantization(
+                config=config,
+                device=device,
+                dtype=dtype,
+                prefix_tensor_parallel=prefix_tensor_parallel,
+                min_capability=(8, 9),
             ):
                 raise ValueError(
                     "Pi0.5 ModelOpt FP8 requires single-GPU resident BF16 inference"
@@ -204,6 +194,12 @@ class Pi05PolicyModel(nn.Module):
             )
 
             finalize_fp8_weights(self.core_model, self._fp8_projection_names)
+        self._int8_projection_names = self._quantize_int8_projections(
+            config=config,
+            device=device,
+            dtype=dtype,
+            prefix_tensor_parallel=prefix_tensor_parallel,
+        )
         if self.runtime_role != "all":
             logger.info("Pi05 split runtime role on rank: %s", self.runtime_role)
         self.action_expert = Pi05ActionExpert(config, self.core_model)
@@ -218,6 +214,62 @@ class Pi05PolicyModel(nn.Module):
             max_entries=config.action_cuda_graph_max_entries,
             evict_on_miss=evict_graphs_on_miss,
         )
+
+    def _supports_resident_quantization(
+        self,
+        *,
+        config: Pi05PipelineConfig,
+        device: torch.device,
+        dtype: torch.dtype,
+        prefix_tensor_parallel: bool,
+        min_capability: tuple[int, int],
+    ) -> bool:
+        return not (
+            self.runtime_role != "all"
+            or prefix_tensor_parallel
+            or (
+                model_parallel_is_initialized()
+                and get_sequence_parallel_world_size() > 1
+            )
+            or any(
+                value
+                for key, value in vars(config).items()
+                if key.startswith("offload_") and not key.endswith("empty_cache")
+            )
+            or device.type != "cuda"
+            or current_platform.is_rocm()
+            or torch.cuda.get_device_capability(device) < min_capability
+            or dtype != torch.bfloat16
+        )
+
+    def _quantize_int8_projections(
+        self,
+        *,
+        config: Pi05PipelineConfig,
+        device: torch.device,
+        dtype: torch.dtype,
+        prefix_tensor_parallel: bool,
+    ) -> list[str]:
+        if not config.int8_components:
+            return []
+        if self._fp8_projection_names:
+            raise ValueError("Pi0.5 INT8 cannot be combined with a ModelOpt FP8 checkpoint")
+        if not self._supports_resident_quantization(
+            config=config,
+            device=device,
+            dtype=dtype,
+            prefix_tensor_parallel=prefix_tensor_parallel,
+            min_capability=(8, 0),
+        ):
+            raise ValueError("Pi0.5 INT8 requires single-GPU resident BF16 inference on sm80+")
+        from sglang.multimodal_gen.runtime.vla.pi05_int8 import quantize_projections_int8
+
+        names = quantize_projections_int8(self.core_model, config.int8_components)
+        torch.cuda.empty_cache()
+        logger.info(
+            "Pi05 INT8 W8A8: quantized %d projections in %s", len(names), config.int8_components
+        )
+        return names
 
     def _should_use_prefix_tensor_parallel(self) -> bool:
         if self.runtime_role not in ("all", "prefix"):
