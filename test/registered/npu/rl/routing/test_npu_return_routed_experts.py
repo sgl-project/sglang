@@ -1,4 +1,4 @@
-"""Phase 2 NPU tests for DP-local routed-expert slicing (attention TP=1)."""
+"""Phase 2 NPU tests for DP-local slicing and cross-rank routed-expert gathering."""
 
 import json
 import os
@@ -17,6 +17,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=600, suite="extra-b-test-2-npu-a3")
 register_npu_ci(est_time=600, suite="nightly-test-2-npu-a3", nightly=True)
+register_npu_ci(est_time=600, suite="extra-b-test-4-npu-a3")
+register_npu_ci(est_time=600, suite="nightly-test-4-npu-a3", nightly=True)
 
 
 CASE = weights.GLM52_CASE
@@ -105,6 +107,19 @@ class RoutedExpertsTestMixin:
 
     @classmethod
     def setUpClass(cls):
+        from torch_npu import npu
+
+        # CI schedules the entire file. Visible devices select the topology.
+        visible_npus = npu.device_count()
+        if visible_npus not in (2, 4):
+            raise RuntimeError(
+                f"R3 tests require exactly 2 or 4 visible NPUs, found {visible_npus}"
+            )
+        if visible_npus != cls.tp_size:
+            raise unittest.SkipTest(
+                f"TP={cls.tp_size} runs on its own CI lane ({visible_npus} NPUs visible)"
+            )
+
         cls.checkpoint = weights.ensure_checkpoint(CASE)
         config = _model_config(cls.checkpoint)
         cls.num_layers = int(config["num_hidden_layers"])
@@ -140,6 +155,7 @@ class RoutedExpertsTestMixin:
         self.assertEqual(num_layers, self.num_layers, "unexpected layer count")
         self.assertEqual(topk, self.topk, "unexpected top-k width")
         moe = experts[:, self.moe_start :, :]
+        self.assertGreater(moe.size, 0, "no routed expert IDs returned")
         self.assertTrue(
             ((moe >= 0) & (moe < self.num_experts)).all(),
             f"expert ids out of [0, {self.num_experts}): "
@@ -270,6 +286,36 @@ class TestNpuReturnRoutedExperts(RoutedExpertsTestMixin, CustomTestCase):
             results[1].get("meta_info", {}),
             "return_routed_experts=True must return the field",
         )
+
+
+@unittest.skipUnless(weights.case_available(CASE), f"model not found: {CASE.model}")
+class TestNpuRoutedExpertsAttentionTP(RoutedExpertsTestMixin, CustomTestCase):
+    tp_size = 4
+    # DeepEP scatters tokens across attention TP ranks.
+    moe_a2a_backend = "deepep"
+    extra_server_args = ("--deepep-mode", "low_latency", "--disable-radix-cache")
+
+    def test_gathered_experts_preserve_request_rows(self):
+        start_len = 2
+        for dp_rank in range(ATTN_DP_SIZE):
+            with self.subTest(dp_rank=dp_rank):
+                prompt = LONG_PROMPT * (dp_rank + 3)
+                full = generate(self.base_url, prompt, routed_dp_rank=dp_rank)
+                cropped = generate(
+                    self.base_url,
+                    prompt,
+                    routed_dp_rank=dp_rank,
+                    routed_experts_start_len=start_len,
+                )
+                experts = self._experts(full)
+                self._check_shape_and_ids(experts)
+                self.assertEqual(experts.shape[0], seqlen(full) - 1)
+                self.assertEqual(full["output_ids"], cropped["output_ids"])
+                np.testing.assert_array_equal(
+                    self._experts(cropped)[:, self.moe_start :, :],
+                    experts[start_len:, self.moe_start :, :],
+                    err_msg=f"incorrect routed-expert crop on DP rank {dp_rank}",
+                )
 
 
 if __name__ == "__main__":
