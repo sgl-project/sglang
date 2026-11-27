@@ -24,6 +24,8 @@ class TestSamplingMaskValidation(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         self.manager = TokenizerManager.__new__(TokenizerManager)
+        self.manager.is_single_token_read = False
+        self.manager.is_packed_decision = False
         self.manager.context_len = 128
         self.manager.num_reserved_tokens = 0
         self.manager.allow_auto_truncate = False
@@ -75,6 +77,95 @@ class TestSamplingMaskValidation(CustomTestCase):
                 else:
                     with self.assertRaisesRegex(ValueError, "top_logprobs"):
                         self.manager._validate_one_request(req, req.input_ids)
+
+    def test_packed_decision_layout_rejects_misaligned_reads_before_scheduling(self):
+        self.manager.model_config.hf_config = SimpleNamespace(
+            mask_token_id=100, state_end_token_id=101
+        )
+        self.manager.model_config.nemotron_decision_config = {"max_questions": 2}
+        self.manager.model_config.vocab_size = 128
+        self.manager.model_config.token_id_vocab_size = 128
+        self.manager.max_req_input_len = 128
+        self.manager.single_read_max_input_tokens = 128
+        ids = [1, 101, 3, 100, 4, 100]
+
+        def request(**updates):
+            values = dict(
+                input_ids=ids,
+                decision_layout=[2, 2, 2],
+                token_indices_to_pool=[3, 5],
+                token_ids_logprob=[10, 11],
+                return_logprob=True,
+                logprob_start_len=0,
+                sampling_params={"max_new_tokens": 0},
+            )
+            values.update(updates)
+            return GenerateReqInput(**values)
+
+        with self.assertRaisesRegex(ValueError, "requires Nemotron"):
+            self.manager._validate_one_request(request(), ids)
+        self.manager.is_single_token_read = True
+        with self.assertRaisesRegex(ValueError, "state_sees_no_questions"):
+            self.manager._validate_one_request(request(), ids)
+        self.manager.is_packed_decision = True
+        self.manager._validate_one_request(request(), ids)
+        for updates, error in (
+            ({"decision_layout": [2, 2, 1]}, "decision_layout"),
+            ({"decision_layout": [True, 2, 3]}, "decision_layout"),
+            ({"decision_layout": [1, 1, 2, 2]}, "decision_layout"),
+            ({"decision_layout": [2, 1, 3]}, "mask token"),
+            ({"input_ids": [1, 2, 3, 100, 4, 100]}, "state-end token"),
+            ({"input_ids": [101, 2, 3, 100, 4, 100]}, "state-end token"),
+            ({"input_ids": [101, 101, 3, 100, 4, 100]}, "state-end token"),
+            ({"token_indices_to_pool": [5]}, "packed Decision reads"),
+            ({"session_id": "session"}, "packed Decision reads"),
+        ):
+            with (
+                self.subTest(updates=updates),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                req = request(**updates)
+                self.manager._validate_one_request(req, req.input_ids)
+        batch = GenerateReqInput(
+            input_ids=[ids, ids],
+            decision_layout=[[2, 2, 1], None],
+            token_indices_to_pool=[[3, 5], None],
+            token_ids_logprob=[[10, 11], None],
+            logprob_start_len=[0, None],
+            return_logprob=[True, False],
+            sampling_params={"max_new_tokens": 0},
+        )
+        batch.normalize_batch_and_arguments()
+        with self.assertRaisesRegex(ValueError, "decision_layout"):
+            self.manager._validate_one_request(batch[0], ids)
+        self.manager._validate_one_request(batch[1], ids)
+
+    def test_packed_layouts_stay_with_their_inputs_during_normalization(self):
+        ids = [1, 101, 3, 100]
+        valid = GenerateReqInput(
+            input_ids=[ids, ids],
+            decision_layout=[[2, 2], None],
+            sampling_params={"max_new_tokens": 0},
+        )
+        valid.normalize_batch_and_arguments()
+        self.assertEqual(valid[0].decision_layout, [2, 2])
+        self.assertIsNone(valid[1].decision_layout)
+        for layout in ([[2, 2]], [2, None]):
+            with (
+                self.subTest(layout=layout),
+                self.assertRaisesRegex(ValueError, "one layout per input"),
+            ):
+                GenerateReqInput(
+                    input_ids=[ids, ids],
+                    decision_layout=layout,
+                    sampling_params={"max_new_tokens": 0},
+                ).normalize_batch_and_arguments()
+        with self.assertRaisesRegex(ValueError, "parallel sampling"):
+            GenerateReqInput(
+                input_ids=ids,
+                decision_layout=[2, 2],
+                sampling_params={"n": 2},
+            ).normalize_batch_and_arguments()
 
     def test_token_indices_to_pool_must_be_prompt_positions(self):
         prompt_only = {"max_new_tokens": 0}
