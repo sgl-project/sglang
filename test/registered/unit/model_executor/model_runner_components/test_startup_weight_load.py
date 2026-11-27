@@ -831,6 +831,45 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         )
         return trace
 
+    def test_dsv41_int8_hccl_prewarm_precedes_attention(self):
+        """A3 INT8 CSA needs an initialized collective when its probe runs."""
+        tp_group = SimpleNamespace(
+            rank_in_group=0, device="npu", device_group=object(), device_module=object()
+        )
+        for int8, expected in (
+            (True, ["memory_pool", "hccl", "attention"]),
+            (False, ["memory_pool", "attention", "hccl"]),
+        ):
+            with self.subTest(int8=int8):
+                trace = []
+                worker = _SchedulerWorker(trace)
+                worker.model_runner.model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+                )
+                worker.model_runner.token_to_kv_pool.dsv41_int8_kv = int8
+                scheduler = self._scheduler(worker, trace, mode="serial")
+
+                def init_attention():
+                    trace.append("attention")
+                    raise RuntimeError("stop at attention initialization")
+
+                scheduler.init_all_attention_backends = init_attention
+                with (
+                    patch("sglang.srt.managers.scheduler._is_npu", True),
+                    patch(
+                        "sglang.srt.managers.scheduler.get_parallel",
+                        return_value=SimpleNamespace(tp_group=tp_group, dp_rank=None),
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler._prewarm_hccl_group",
+                        side_effect=lambda **_: trace.append("hccl"),
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "stop at attention"):
+                        scheduler.init_model_worker()
+                    scheduler.maybe_init_hccl_dp_prewarm()
+                self.assertEqual(trace, expected)
+
     def test_serial_path_skips_overlap_hooks(self):
         self.assertEqual(
             self._run_startup("serial"),

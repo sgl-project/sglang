@@ -848,11 +848,14 @@ class Scheduler(
         if self.rust_server is not None:
             self.rust_server.set_startup_time(self.startup_time)
 
-    def maybe_init_hccl_dp_prewarm(self) -> None:
-        if not (
-            _is_npu
-            and is_deepseek_v4(self.tp_worker.model_runner.model_config.hf_config)
-        ):
+    def maybe_init_hccl_dp_prewarm(
+        self, *, before_attention_backends: bool = False
+    ) -> None:
+        model_runner = self.tp_worker.model_runner
+        if not (_is_npu and is_deepseek_v4(model_runner.model_config.hf_config)):
+            return
+        uses_int8_csa = getattr(model_runner.token_to_kv_pool, "dsv41_int8_kv", False)
+        if uses_int8_csa != before_attention_backends:
             return
 
         parallel = get_parallel()
@@ -1218,6 +1221,10 @@ class Scheduler(
             # before graph capture and KV sizing account for its memory.
             self.tp_worker.model_runner.token_to_kv_pool_allocator.prewarm_compaction()
 
+        # Initialize the TP collective before the INT8 backend runs its CANN
+        # AICPU metadata probe. A cold HCCL AICPU launch after that probe can
+        # fail on A3 with CANN 9.2.
+        self.maybe_init_hccl_dp_prewarm(before_attention_backends=True)
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
 

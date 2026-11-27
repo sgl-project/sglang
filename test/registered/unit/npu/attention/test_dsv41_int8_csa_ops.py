@@ -5,11 +5,12 @@ import torch
 
 from sglang.srt.hardware_backend.npu.dsv4 import dsv41_int8_ops
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestInt8CsaOps(unittest.TestCase):
+class TestInt8CsaOps(CustomTestCase):
     def test_writer_masks_reserved_page_and_preserves_physical_view(self):
         backing = torch.zeros((3, 4 * 608 + 32), dtype=torch.int8)
         cache = backing[:, :-32].view(3, 4, 1, 608)
@@ -45,3 +46,7 @@ class TestInt8CsaOps(unittest.TestCase):
             dsv41_int8_ops.int8_csa_attention(q, cmp_ratio=2)
         metadata.assert_called_once_with(1, 1, 512, cmp_ratio=2)
         attention.assert_called_once_with(q, cmp_ratio=2)
+
+
+if __name__ == "__main__":
+    unittest.main()
