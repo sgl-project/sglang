@@ -4,21 +4,19 @@ import os
 import tempfile
 import unittest
 
-from sglang.test.ascend.npu_rl_lora_fixture import (
-    MODEL,
-    PROMPTS,
-    SERVER_ARGS,
-    adapter_config,
-    adapter_tensors,
-    write_adapter,
-)
+from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH as MODEL
 from sglang.test.ascend.test_npu_rl_utils import (
+    LORA_TEST_PROMPTS,
+    LORA_TEST_SERVER_ARGS,
     assert_logprob_signature_equal,
     load_lora_adapter,
     load_lora_adapter_from_tensors,
     logprob_signature,
+    lora_adapter_config,
+    lora_adapter_tensors,
     npu_rl_env,
     npu_server,
+    write_lora_adapter,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,22 +31,24 @@ TP_SIZE = 2
 @unittest.skipUnless(HAVE_MODEL, f"model not found: {MODEL}")
 class TestNpuLoraLoadFromTensorTP2(CustomTestCase):
     def test_tensor_payloads_match_disk_adapter(self):
-        tensors = adapter_tensors(MODEL)
-        config = adapter_config()
+        tensors = lora_adapter_tensors(MODEL)
+        config = lora_adapter_config(MODEL)
         with (
             tempfile.TemporaryDirectory(prefix="npu-lora-tp2-") as temp_dir,
             npu_server(
                 MODEL,
-                extra_args=(*SERVER_ARGS, "--tp-size", str(TP_SIZE)),
+                extra_args=(*LORA_TEST_SERVER_ARGS, "--tp-size", str(TP_SIZE)),
                 env=npu_rl_env(),
             ) as base_url,
         ):
-            adapter_dir = write_adapter(
+            adapter_dir = write_lora_adapter(
                 os.path.join(temp_dir, "adapter"), tensors, config
             )
-            baseline = logprob_signature(base_url, PROMPTS)
+            baseline = logprob_signature(base_url, LORA_TEST_PROMPTS)
             load_lora_adapter(base_url, "disk-adapter", adapter_dir)
-            from_disk = logprob_signature(base_url, PROMPTS, lora_path="disk-adapter")
+            from_disk = logprob_signature(
+                base_url, LORA_TEST_PROMPTS, lora_path="disk-adapter"
+            )
             self.assertNotEqual(
                 [item[0] for item in from_disk],
                 [item[0] for item in baseline],
@@ -68,7 +68,7 @@ class TestNpuLoraLoadFromTensorTP2(CustomTestCase):
                     tp_size=TP_SIZE,
                 )
                 assert_logprob_signature_equal(
-                    logprob_signature(base_url, PROMPTS, lora_path=name),
+                    logprob_signature(base_url, LORA_TEST_PROMPTS, lora_path=name),
                     from_disk,
                     f"{name} does not match the disk adapter on TP=2",
                 )

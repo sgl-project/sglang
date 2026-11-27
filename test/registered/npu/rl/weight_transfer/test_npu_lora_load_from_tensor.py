@@ -11,22 +11,20 @@ import os
 import tempfile
 import unittest
 
-from sglang.test.ascend.npu_rl_lora_fixture import (
-    MODEL,
-    PROMPTS,
-    SERVER_ARGS,
-    adapter_config,
-    adapter_tensors,
-    write_adapter,
-)
+from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH as MODEL
 from sglang.test.ascend.test_npu_rl_utils import (
+    LORA_TEST_PROMPTS,
+    LORA_TEST_SERVER_ARGS,
     assert_logprob_signature_equal,
     load_lora_adapter,
     load_lora_adapter_from_tensors,
     logprob_signature,
+    lora_adapter_config,
+    lora_adapter_tensors,
     npu_rl_env,
     npu_server,
     unload_lora_adapter,
+    write_lora_adapter,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,15 +39,17 @@ HAVE_MODEL = os.path.isfile(os.path.join(MODEL, "config.json"))
 class TestNpuLoraLoadFromTensor(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tensors = adapter_tensors(MODEL)
-        cls.config = adapter_config()
+        cls.tensors = lora_adapter_tensors(MODEL)
+        cls.config = lora_adapter_config(MODEL)
         cls._adapter_dir = tempfile.TemporaryDirectory(prefix="npu-lora-adapter-")
-        cls.adapter_dir = write_adapter(
+        cls.adapter_dir = write_lora_adapter(
             os.path.join(cls._adapter_dir.name, "adapter"), cls.tensors, cls.config
         )
-        cls._server = npu_server(MODEL, extra_args=SERVER_ARGS, env=npu_rl_env())
+        cls._server = npu_server(
+            MODEL, extra_args=LORA_TEST_SERVER_ARGS, env=npu_rl_env()
+        )
         cls.base_url = cls._server.__enter__()
-        cls.baseline = logprob_signature(cls.base_url, PROMPTS)
+        cls.baseline = logprob_signature(cls.base_url, LORA_TEST_PROMPTS)
 
     @classmethod
     def tearDownClass(cls):
@@ -71,7 +71,7 @@ class TestNpuLoraLoadFromTensor(CustomTestCase):
         load_lora_adapter(self.base_url, lora_name, self.adapter_dir)
 
     def _signature(self, lora_name: str):
-        return logprob_signature(self.base_url, PROMPTS, lora_path=lora_name)
+        return logprob_signature(self.base_url, LORA_TEST_PROMPTS, lora_path=lora_name)
 
     def test_01_tensor_load_matches_disk_adapter(self):
         self._load_disk_adapter("disk-adapter")
@@ -100,7 +100,7 @@ class TestNpuLoraLoadFromTensor(CustomTestCase):
             "unloading the disk adapter changed the tensor-loaded adapter",
         )
         assert_logprob_signature_equal(
-            logprob_signature(self.base_url, PROMPTS),
+            logprob_signature(self.base_url, LORA_TEST_PROMPTS),
             self.baseline,
             "requests without lora_path changed while an adapter was loaded",
         )
