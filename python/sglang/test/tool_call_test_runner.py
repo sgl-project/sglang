@@ -340,8 +340,9 @@ def run_tool_call_test(
     model: ModelLaunchSettings,
     params: ToolCallTestParams,
     base_url: Optional[str] = None,
+    skip_server_launch: bool = False,
 ) -> ToolCallTestResult:
-    """Launch server, run enabled test cases, return results."""
+    """Run enabled tests, optionally reusing a caller-owned server."""
     base_url = base_url or DEFAULT_URL_FOR_TEST
 
     print(f"\n{'=' * 60}")
@@ -352,13 +353,14 @@ def run_tool_call_test(
 
     process = None
     try:
-        process = popen_launch_server(
-            model.model_path,
-            base_url,
-            other_args=model.extra_args,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env=model.env,
-        )
+        if not skip_server_launch:
+            process = popen_launch_server(
+                model.model_path,
+                base_url,
+                other_args=model.extra_args,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                env=model.env,
+            )
         client = openai.Client(api_key="sk-test", base_url=base_url + "/v1")
 
         passed_list = []
