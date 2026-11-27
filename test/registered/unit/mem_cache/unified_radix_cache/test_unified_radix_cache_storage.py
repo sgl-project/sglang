@@ -1174,6 +1174,53 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
         cache.sanity_check()
 
+    def test_buffer_only_child_of_a_split_in_flight_node_is_written(self):
+        storage_dir = self._make_storage_dir()
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            storage_dir
+        )
+        pipeline = cache.buffer_pipeline
+        controller = cache.cache_controller
+        ps = self.cfg.page_size
+
+        seq = self._buffer_swa_seq(min_pages=4)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = match_prefix(cache, seq).last_device_node
+        chain = self._path_chain(cache, leaf)
+        write_backup(cache, leaf)
+        pipeline.flush_pending_writes()
+        for ack in controller.ack_write_queue:
+            ack.finish_event.synchronize()
+        # D2H done: the chain's storage writes are submitted, their acks not drained.
+        cache.writing_check(finish_count=len(controller.ack_write_queue))
+        self.assertTrue(pipeline.ongoing_backup)
+
+        end = len(seq)
+        for node in reversed(chain):
+            node_len = node_key_length(cache, node)
+            if node_len >= 2 * ps:
+                break
+            end -= node_len
+        else:
+            self.fail("no node of two pages to split")
+        child_seq = seq[: end - node_len + ps] + self._make_seq(9000, 2)
+        self._insert(cache, allocator, req_to_token_pool, child_seq)
+        child = match_prefix(cache, child_seq).last_device_node
+        # The split head is a new node; its pages ride the original node's write.
+        self.assertNotIn(node_parent(cache, child), chain)
+
+        write_backup(cache, child)
+        self.assertIn(child, pipeline.inflight_backup_node_ids)
+        self._drain_buffer_writes(cache)
+        child_hashes = self._all_page_hashes(cache, child)
+        self.assertEqual(
+            self._storage_exists_count(
+                cache, child_hashes, aux_storage_key_transfers(cache, child)
+            ),
+            len(child_hashes),
+        )
+        cache.sanity_check()
+
     @requires(
         lambda cfg: cfg.components == (ComponentType.FULL,),
         "only FULL-only caches split the leaf at the prompt",

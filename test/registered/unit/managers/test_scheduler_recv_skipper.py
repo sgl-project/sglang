@@ -107,6 +107,7 @@ class TestSchedulerInputBlockerSwitch(CustomTestCase):
                 scheduler = scheduler_module.Scheduler.__new__(
                     scheduler_module.Scheduler
                 )
+                scheduler.server_args = SimpleNamespace(elastic_ep_backend=None)
                 scheduler.init_watch_dog_memory_saver_input_blocker()
                 self.assertEqual(
                     isinstance(scheduler.input_blocker, SchedulerInputBlocker),
