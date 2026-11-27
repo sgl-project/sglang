@@ -7,8 +7,8 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 
-# "ahead" = allocated tokens past kv_committed_len (a count, not a position);
-# *_lens and row_width are positions in the req_to_token row.
+# "ahead" is a count of tokens past kv_committed_len; *_lens and row_width are
+# positions in the req_to_token row.
 
 
 def get_mamba_tracking_slots(
@@ -30,12 +30,11 @@ def get_alloc_page_size() -> int:
 
 def get_decode_ahead() -> int:
     """Tokens a decode allocation runs ahead of kv_committed_len, before page
-    rounding. A non-speculative step writes one slot and commits it at
-    allocation; a speculative step commits after verify, so twice one step's
-    write, a double buffer for the overlap-mode commit lag.
+    rounding: one for a non-speculative step, twice one step's write for a
+    speculative one (a double buffer for the overlap-mode commit lag).
 
-    Reads the bags: adaptive speculative decoding moves the step count and the
-    draft-token bound after publish, and this runs per decode batch.
+    Reads the bags because adaptive speculative decoding changes the step count
+    after publish.
     """
     spec = get_spec()
     if spec.speculative_algorithm is None:
@@ -68,13 +67,11 @@ def get_decode_ahead() -> int:
 
 
 def decode_alloc_targets(reqs, *, page_size: int):
-    """Whole-page decode alloc targets: each target rounds kv_committed_len +
-    get_decode_ahead() up to a page so a speculative step's allocated ==
-    recorded (unaligned tails leak at ps>1). A non-speculative step allocates
-    one slot; its demand is the page-aligned allocated..target gap, not
-    num_new_tokens.
-
-    Returns (allocated_lens, target_lens, num_new_tokens)."""
+    """Per-request decode alloc targets, rounded up to a whole page (an
+    unaligned tail leaks at page_size > 1). Returns (allocated_lens,
+    target_lens, num_new_tokens); a non-speculative step allocates only one
+    slot, so its demand is the page-aligned allocated..target gap, not
+    num_new_tokens."""
     ahead = get_decode_ahead()
     allocated_lens = [0] * len(reqs)
     target_lens = [0] * len(reqs)
@@ -97,11 +94,9 @@ def get_max_decode_ahead(page_size: int) -> int:
 
 
 def get_req_to_token_row_width(context_len: int) -> int:
-    """The req_to_token row width for a model context of context_len: columns
-    past the context length, which admission keeps the committed length within,
-    cover the furthest decode_alloc_targets reaches past it (for a
-    non-speculative step, the rest of its page). Derived from the same bag
-    leaves as the pools beside the row, so the two agree after a post-publish
-    override.
+    """Row width for a model context: admission keeps the committed length
+    within context_len, and the columns past it cover the furthest
+    decode_alloc_targets reaches. Reads the same bag leaves as the pools beside
+    the row, so the two agree after a post-publish override.
     """
     return context_len + get_max_decode_ahead(get_alloc_page_size())
