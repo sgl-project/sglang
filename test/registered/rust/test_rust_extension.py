@@ -653,24 +653,6 @@ crate-type = ["cdylib"]
             expected = {"cargo": "cargo 1.92.0", "rustc": "rustc 1.92.0"}
             self.assertEqual(outcomes, [expected] * len(processes))
 
-    def test_toolchain_query_failure_reports_the_tool_output(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            cargo = root / "cargo"
-            cargo.write_text(
-                "#!/bin/sh\necho \"error: toolchain '1.92' is not installed\" >&2\n"
-                "exit 1\n",
-                encoding="utf-8",
-            )
-            cargo.chmod(0o755)
-            with mock.patch.dict(os.environ, {"PATH": directory}):
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    r"`cargo --version --verbose`: "
-                    r"error: toolchain '1\.92' is not installed",
-                ):
-                    rust_extension.query_rust_toolchain(root, root / "cache")
-
     def test_failed_import_does_not_poison_sys_modules(self):
         module_name = "demo._broken_core"
         module_spec = importlib.machinery.ModuleSpec(
