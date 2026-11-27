@@ -112,6 +112,28 @@ def test_norm_residual_matches_native(
         torch.testing.assert_close(out[2], ref[2], rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_norm_residual_follows_in_place_weight_update(backend):
+    """A weight update written into the Parameters in place reaches the fused kernel."""
+    torch.manual_seed(0)
+    hidden = 4096
+    op = _boundary(post_input_scale=True, hidden=hidden)
+    stream = torch.randn(7, hidden, device="cuda", dtype=torch.float32)
+    branch = torch.randn(7, hidden, device="cuda", dtype=torch.bfloat16)
+    op(stream, branch, router_dtype=None, backend=backend)
+
+    with torch.no_grad():
+        for module in (op._post_norm, op._pre_norm, op._residual_add):
+            for p in module.parameters():
+                p.copy_(0.1 * torch.randn_like(p))
+    op.refresh_cached_weights(branch.dtype)
+
+    ref = op.forward_native(stream, branch, router_dtype=None)
+    out = op(stream, branch, router_dtype=None, backend=backend)
+    torch.testing.assert_close(out[0], ref[0], rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out[1], ref[1], rtol=1e-2, atol=1e-2)
+
+
 if __name__ == "__main__":
     import sys
 

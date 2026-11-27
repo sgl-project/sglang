@@ -224,6 +224,7 @@ def _get_quantization_config(
 
         if isinstance(quant_config, Fp8Config):
             quant_config.is_fp4_experts = model_config.is_fp4_experts
+            quant_config.is_mxfp8_experts = model_config.is_mxfp8_experts
             from sglang.srt.configs.model_config import is_deepseek_v4
 
             quant_config.is_dsv4_fp4_experts = is_deepseek_v4(model_config.hf_config)

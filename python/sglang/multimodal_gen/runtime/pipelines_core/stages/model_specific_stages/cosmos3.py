@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels import get_kernel
+from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     quality_allows,
@@ -78,7 +79,10 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
+    pipeline_config_sp_fns,
     prepare_rollout_if_enabled,
+    publish_rollout_if_enabled,
+    rollout_scope,
     rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
@@ -1599,7 +1603,6 @@ class Cosmos3DenoisingStage(PipelineStage):
         action_raw_dim = batch.extra.get("raw_action_dim")
         action_start_frame_offset = batch.extra.get("action_start_frame_offset", 1)
         action_fps = getattr(batch.sampling_params, "action_fps", None)
-        timesteps = batch.timesteps
         guidance_scale = batch.guidance_scale
 
         # Seed the scheduler's stochastic (SDE) noise from the request seed so it
@@ -1640,9 +1643,19 @@ class Cosmos3DenoisingStage(PipelineStage):
                 raise ValueError(
                     "Cosmos3 rollout does not support action/sound modalities."
                 )
-        prepare_rollout_if_enabled(
-            batch=batch, pipeline_config=server_args.pipeline_config
+        shard_for_sp, gather_for_sp = pipeline_config_sp_fns(
+            server_args.pipeline_config
         )
+        prepare_rollout_if_enabled(
+            batch=batch,
+            stream=PRIMARY_STREAM,
+            scheduler=batch.scheduler,
+            timesteps=batch.timesteps,
+            latents=batch.latents,
+            shard_for_sp=shard_for_sp,
+            gather_for_sp=gather_for_sp,
+        )
+        timesteps = batch.timesteps
         init_rollout_env_if_enabled(
             batch=batch,
             image_kwargs={},
@@ -1928,7 +1941,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 t,
                 latents,
                 generator=generator,
-                **rollout_step_kwargs(batch),
+                **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
                 return_dict=False,
             )[0]
 
@@ -1981,10 +1994,13 @@ class Cosmos3DenoisingStage(PipelineStage):
 
         finalize_rollout_if_enabled(
             batch=batch,
+            stream=PRIMARY_STREAM,
             latents=latents,
             num_inference_steps=len(timesteps),
             final_timestep=timesteps.new_zeros(()),
-            pipeline_config=server_args.pipeline_config,
+        )
+        publish_rollout_if_enabled(
+            batch=batch, pipeline_config=server_args.pipeline_config
         )
 
         batch.latents = latents
@@ -1996,14 +2012,15 @@ class Cosmos3DenoisingStage(PipelineStage):
         return batch
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if batch.extra.get("transfer_plan") is not None:
-            return self._forward_transfer(batch, server_args)
-        with self.use_declared_component(
-            component_name="transformer",
-            module=self.transformer,
-            phase="denoise",
-        ):
-            return self._denoise_once(batch, server_args)
+        with rollout_scope(batch):
+            if batch.extra.get("transfer_plan") is not None:
+                return self._forward_transfer(batch, server_args)
+            with self.use_declared_component(
+                component_name="transformer",
+                module=self.transformer,
+                phase="denoise",
+            ):
+                return self._denoise_once(batch, server_args)
 
     def _predict_noise_cfg(
         self,

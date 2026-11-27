@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training import (
     rollout_api,
     weights_api,
 )
+from sglang.multimodal_gen.runtime.entrypoints.post_training.output_store import (
+    rollout_output_store,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
@@ -140,6 +143,7 @@ async def lifespan(app: FastAPI):
     server_args = app.state.server_args
     build_route_request_models(app)
     async_scheduler_client.initialize(server_args)
+    rollout_output_store.initialize(server_args)
     warmup_done = asyncio.Event()
     app.state.server_warmup_done = warmup_done
 
@@ -194,6 +198,7 @@ async def lifespan(app: FastAPI):
             with suppress(asyncio.CancelledError):
                 await progress_task
         async_scheduler_client.close()
+        rollout_output_store.close()
 
 
 # Health router
@@ -254,9 +259,7 @@ async def get_models(request: Request):
         Use /v1/models instead for OpenAI-compatible model discovery.
         This endpoint will be removed in a future version.
     """
-    from sglang.multimodal_gen.runtime.entrypoints.openai.common_api import (
-        get_served_pipeline_class,
-    )
+    from sglang.multimodal_gen.registry import get_served_pipeline_class
 
     server_args: ServerArgs = request.app.state.server_args
     pipeline_cls = get_served_pipeline_class(server_args)
@@ -305,9 +308,7 @@ async def model_info_endpoint(request: Request):
     Returns fields compatible with the LLM engine's /model_info so that
     the model gateway can detect capabilities for diffusion workers.
     """
-    from sglang.multimodal_gen.runtime.entrypoints.openai.common_api import (
-        get_served_pipeline_class,
-    )
+    from sglang.multimodal_gen.registry import get_served_pipeline_class
 
     server_args: ServerArgs = request.app.state.server_args
     task_type = server_args.pipeline_config.task_type

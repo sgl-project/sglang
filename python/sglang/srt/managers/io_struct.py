@@ -255,6 +255,12 @@ class GenerateReqInput:
     return_flat_raw_output_top_logprobs: bool = False
     # Base64-encode the flat arrays. Requires one of the two flags above.
     return_flat_raw_top_logprobs_b64: bool = False
+    # Return output sampling masks as flat arrays plus row lengths instead of the
+    # nested per-token lists, on the finished response only. Requires
+    # return_sampling_mask.
+    return_flat_raw_sampling_mask: bool = False
+    # Base64-encode those arrays. Requires return_flat_raw_sampling_mask.
+    return_flat_raw_sampling_mask_b64: bool = False
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -273,6 +279,9 @@ class GenerateReqInput:
     # Return routed experts, indexer top-k, and sampling mask via --output-store-backend
     # as meta_info.output_store_ref; one prompt, n=1, no streaming or beam search.
     return_outputs_via_store: bool = False
+    # Ascending layer ids in (0, num_hidden_layers) at which the stored routed experts
+    # and indexer top-k are cut into one field per layer block; tokenizer-only.
+    replay_layer_splits: Optional[List[int]] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -505,6 +514,18 @@ class GenerateReqInput:
             raise ValueError(
                 "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs "
                 "or return_flat_raw_output_top_logprobs."
+            )
+        if self.return_flat_raw_sampling_mask and self.stream:
+            raise ValueError(
+                "return_flat_raw_sampling_mask is only set on the finished response "
+                "and does not support stream=True."
+            )
+        if (
+            self.return_flat_raw_sampling_mask_b64
+            and not self.return_flat_raw_sampling_mask
+        ):
+            raise ValueError(
+                "return_flat_raw_sampling_mask_b64 requires return_flat_raw_sampling_mask."
             )
 
     def _determine_batch_size(self):
@@ -1040,6 +1061,8 @@ class GenerateReqInput:
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
             return_flat_raw_output_top_logprobs=self.return_flat_raw_output_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
+            return_flat_raw_sampling_mask=self.return_flat_raw_sampling_mask,
+            return_flat_raw_sampling_mask_b64=self.return_flat_raw_sampling_mask_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(
@@ -1051,6 +1074,7 @@ class GenerateReqInput:
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
             return_outputs_via_store=self.return_outputs_via_store,
+            replay_layer_splits=self.replay_layer_splits,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,

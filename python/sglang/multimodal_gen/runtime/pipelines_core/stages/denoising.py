@@ -44,6 +44,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     quality_allows,
     resolve_skip_softmax_params,
@@ -147,7 +148,10 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
+    pipeline_config_sp_fns,
     prepare_rollout_if_enabled,
+    publish_rollout_if_enabled,
+    rollout_scope,
     rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -1235,9 +1239,23 @@ class DenoisingStage(PipelineStage):
             if uses_boundary_transformer_2
             else None
         )
-        # Get timesteps and calculate warmup steps
+        shard_for_sp, gather_for_sp = pipeline_config_sp_fns(
+            server_args.pipeline_config
+        )
+        prepare_rollout_if_enabled(
+            batch=batch,
+            stream=PRIMARY_STREAM,
+            scheduler=scheduler,
+            timesteps=batch.timesteps,
+            latents=batch.latents,
+            shard_for_sp=shard_for_sp,
+            gather_for_sp=gather_for_sp,
+        )
         timesteps = batch.timesteps
-        num_inference_steps = batch.num_inference_steps
+        # A stopped rollout runs fewer steps than the request asked for.
+        num_inference_steps = (
+            len(timesteps) if batch.rollout else batch.num_inference_steps
+        )
         num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
 
         if uses_boundary_transformer_2:
@@ -1257,17 +1275,13 @@ class DenoisingStage(PipelineStage):
         if freshly_loaded:
             register_loaded_transformer(self, server_args, pipeline)
 
-        prepare_rollout_if_enabled(
-            batch=batch, pipeline_config=server_args.pipeline_config
-        )
-
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             scheduler.step,
             {
                 "generator": batch.generator,
                 "eta": batch.eta,
-                **rollout_step_kwargs(batch),
+                **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
             },
         )
 
@@ -2027,7 +2041,7 @@ class DenoisingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        with self._offload_for_torch_compile_warmup(batch):
+        with rollout_scope(batch), self._offload_for_torch_compile_warmup(batch):
             return self._denoise(batch, server_args)
 
     @torch.no_grad()
@@ -2052,12 +2066,15 @@ class DenoisingStage(PipelineStage):
         # collect rollout outputs before finalization gathers or replaces latents
         finalize_rollout_if_enabled(
             batch=batch,
+            stream=PRIMARY_STREAM,
             latents=ctx.latents,
             num_inference_steps=len(timesteps_cpu),
             final_timestep=ctx.timesteps.new_zeros(()),
-            pipeline_config=server_args.pipeline_config,
         )
         self._finalize_denoising_loop(ctx, batch, server_args)
+        publish_rollout_if_enabled(
+            batch=batch, pipeline_config=server_args.pipeline_config
+        )
         return batch
 
     def _run_denoising_loop(

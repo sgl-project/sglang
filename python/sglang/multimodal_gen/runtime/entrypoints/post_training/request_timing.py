@@ -26,6 +26,7 @@ MARKS = (
     "forward_end",
     "build_start",
     "build_end",
+    "store_end",
     "dump_end",
     "msgpack_end",
 )

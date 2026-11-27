@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.lora.dense.kernel_utils import _resolve_token_positions
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo, check_lora_token_rows
 
 
 @triton.jit
@@ -141,6 +141,7 @@ def sgemm_lora_a_fwd(
     R = weights.shape[-2]
     K = weights.shape[-1]
     assert x.shape[-1] == K
+    check_lora_token_rows(x, batch_info)
 
     # Block shapes
     BLOCK_S = 16

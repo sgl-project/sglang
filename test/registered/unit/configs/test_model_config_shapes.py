@@ -6,6 +6,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     _quant_config_to_dict,
+    _routed_experts_quant_method,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -156,6 +157,23 @@ class TestModelConfigShapes(CustomTestCase):
         quant_config = SimpleNamespace(to_dict=lambda: {"quant_method": "test"})
 
         self.assertEqual(_quant_config_to_dict(quant_config), {"quant_method": "test"})
+
+    def test_unknown_routed_expert_formats_are_rejected(self):
+        self.assertIsNone(_routed_experts_quant_method({}))
+        for method in (None, "mxfp4", "mxfp8"):
+            with self.subTest(method=method):
+                self.assertEqual(
+                    _routed_experts_quant_method(
+                        {"routed_experts_quant_method": method}
+                    ),
+                    method,
+                )
+        for method in ("MXFP8", "fp8", "nvfp4"):
+            with self.subTest(method=method):
+                with self.assertRaisesRegex(ValueError, repr(method)):
+                    _routed_experts_quant_method(
+                        {"routed_experts_quant_method": method}
+                    )
 
 
 if __name__ == "__main__":

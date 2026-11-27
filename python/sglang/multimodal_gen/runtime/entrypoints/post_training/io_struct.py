@@ -79,6 +79,11 @@ class RolloutRequest(BaseModel):
     fps: Optional[int] = None
 
     rollout: bool = True
+    # Streams to roll out besides the primary one, e.g. ["audio"].
+    rollout_extra_streams: list[str] = []
+    # Per extra stream, the SDE kernel fields that differ from the top-level ones, e.g.
+    # {"audio": {"rollout_sde_type": "ode", "rollout_log_prob_no_const": True}}.
+    rollout_extra_stream_sde_args: dict[str, dict[str, Any]] = {}
     # "uint8": quantise the video engine-side; None: ship unchanged
     rollout_video_dtype: Optional[str] = None
     rollout_sde_type: str = "sde"
@@ -88,10 +93,17 @@ class RolloutRequest(BaseModel):
 
     rollout_return_denoising_env: bool = False
     rollout_return_dit_trajectory: bool = False
+    # The latents, debug and cond tensors and the generated output go to the server's output store;
+    # the response carries the ref.
+    rollout_return_outputs_via_store: bool = False
+    # False skips the VAE decode: the response carries only the rollout trajectory.
+    rollout_return_generated_output: bool = True
 
     # 0-indexed denoising-loop step filters. None = all steps.
     rollout_sde_step_indices: Optional[list[int]] = None
     rollout_return_step_indices: Optional[list[int]] = None
+    # last denoising step to run; it steps straight to the terminal sigma
+    rollout_stop_step_index: Optional[int] = None
 
     image_path: Optional[list[str]] = None
 
@@ -112,9 +124,12 @@ class RolloutResponse(BaseModel):
     rollout_debug_tensors: Optional[dict[str, Any]] = None
     denoising_env: Optional[dict[str, Any]] = None
     dit_trajectory: Optional[dict[str, Any]] = None
+    # Other streams by name, keyed like the top-level fields; log-probs are per-stream means.
+    extra_streams: Optional[dict[str, dict[str, Any]]] = None
 
     inference_time_s: Optional[float] = None
     peak_memory_mb: Optional[float] = None
+    output_store_ref: Optional[dict[str, Any]] = None
 
 
 @dataclass

@@ -171,6 +171,9 @@ class CausalVaeDecodingStage(DecodingStage):
 
         return (image / 2 + 0.5).clamp(0, 1)
 
+    # forward advances the session's causal decode state.
+    skip_decode_supported = False
+
     @torch.no_grad()
     def forward(
         self,

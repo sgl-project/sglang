@@ -1146,6 +1146,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 return m3_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
             return "return_flat_raw_output_top_logprobs requires return_meta_info=true."
+        if request.return_flat_raw_sampling_mask and not request.return_meta_info:
+            return "return_flat_raw_sampling_mask requires return_meta_info=true."
 
         media_error = self._validate_media_content(request)
         if media_error:
@@ -1405,6 +1407,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.return_flat_raw_output_top_logprobs
                 and request.return_flat_raw_top_logprobs_b64
             ),
+            return_flat_raw_sampling_mask=request.return_flat_raw_sampling_mask,
+            return_flat_raw_sampling_mask_b64=(
+                request.return_flat_raw_sampling_mask
+                and request.return_flat_raw_sampling_mask_b64
+            ),
             modalities=processed_messages.modalities,
             lora_path=lora_path,
             bootstrap_host=request.bootstrap_host,
@@ -1417,6 +1424,7 @@ class OpenAIServingChat(OpenAIServingBase):
             routed_experts_start_len=request.routed_experts_start_len,
             return_indexer_topk=request.return_indexer_topk,
             return_outputs_via_store=request.return_outputs_via_store,
+            replay_layer_splits=request.replay_layer_splits,
             rid=request.rid,
             session_id=request.session_id,
             extra_key=request.extra_key,

@@ -437,6 +437,11 @@ class SamplingParams:
     save_output: bool = True
     return_frames: bool = field(default=False, metadata={"batch_sig_exclude": True})
     rollout: bool = False
+    rollout_extra_streams: tuple[str, ...] = ()
+    # Per extra stream, the SDE kernel fields that differ from the top-level ones.
+    rollout_extra_stream_sde_args: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
     rollout_log_prob_no_const: bool = False  # exclude constants in rollout logprob
@@ -447,9 +452,12 @@ class SamplingParams:
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
     rollout_return_denoising_env: bool = False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
     rollout_return_dit_trajectory: bool = False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
+    # False skips the VAE decode; only the rollout trajectory is returned.
+    rollout_return_generated_output: bool = True
     # 0-indexed denoising-loop step filters; None = all steps.
     rollout_sde_step_indices: list[int] | None = None
     rollout_return_step_indices: list[int] | None = None
+    rollout_stop_step_index: int | None = None
     # if True, disallow user params to override subclass-defined protected fields
     no_override_protected_fields: bool = field(
         default=False, metadata={"batch_sig_exclude": True}

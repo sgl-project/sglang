@@ -83,6 +83,11 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    SKIP_DECODE_UNSUPPORTED_ERROR,
+    DecodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
@@ -251,6 +256,30 @@ def fit_auto_residency_probe(
         if lighter is None or _probe_workload_units(lighter) >= units:
             return fitted, estimate, steps
         fitted, steps = lighter, steps + 1
+
+
+def _skip_decode_error(
+    stages: list[PipelineStage], batch: list[Req], *, disagg_mode: bool
+) -> str | None:
+    """Reject a skip request up front when this server cannot honor it."""
+    if all(req.rollout_return_generated_output for req in batch):
+        return None
+    if disagg_mode:
+        # the skip signal is not forwarded between the disaggregated roles yet
+        return SKIP_DECODE_UNSUPPORTED_ERROR
+    last_stage = stages[-1]
+    if isinstance(last_stage, DecodingStage) and last_stage.skip_decode_supported:
+        return None
+    return SKIP_DECODE_UNSUPPORTED_ERROR
+
+
+def _releases_cache_after(output_batch: OutputBatch, req: Req) -> bool:
+    """Whether the decoded tensor left ``output`` (saved to files) so the pool can shrink."""
+    return (
+        output_batch.output is None
+        and not output_batch.generated_output_skipped
+        and not req.return_raw_frames
+    )
 
 
 def _probe_workload_units(req: Req) -> int:
@@ -588,6 +617,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 retrieve via take_deferred_finalize() and run off the event loop.
         """
         assert self.pipeline is not None
+        skip_decode_error = _skip_decode_error(
+            self.pipeline.stages, batch, disagg_mode=self.server_args.disagg_mode
+        )
+        if skip_decode_error is not None:
+            return OutputBatch(error=skip_decode_error)
         # request boundary: the IPC watchdog flag is a device read, illegal
         # inside a graph capture and too costly per exchange
         IPC_A2A.check_timeout()
@@ -633,6 +667,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
         """Yield grouped results after each request finishes its terminal stage."""
         assert self.pipeline is not None
+        skip_decode_error = _skip_decode_error(
+            self.pipeline.stages, batch, disagg_mode=self.server_args.disagg_mode
+        )
+        if skip_decode_error is not None:
+            for _ in batch:
+                yield OutputBatch(error=skip_decode_error)
+            return
         if not any(
             req.is_warmup or req.extra.get("server_internal_prewarm") for req in batch
         ):
@@ -918,11 +959,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         ):
             self.do_mem_analysis(output_batch)
 
-        if (
-            not current_platform.is_cpu()
-            and output_batch.output is None
-            and not req.return_raw_frames
-        ):
+        if not current_platform.is_cpu() and _releases_cache_after(output_batch, req):
             if self.defer_cache_release:
                 # Between back-to-back requests a release only makes the next
                 # one grow the pool back, so wait until the scheduler idles.
