@@ -13,6 +13,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+    get_batch_result_processor_class,
 )
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -28,7 +29,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_exec
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import release_only_retirer
@@ -72,11 +73,15 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     return req, batch
 
 
-def _make_processor() -> SchedulerBatchResultProcessor:
+def _make_processor(
+    processor_class: type[
+        SchedulerBatchResultProcessor
+    ] = SchedulerBatchResultProcessor,
+) -> SchedulerBatchResultProcessor:
     metrics_reporter = MagicMock()
     metrics_reporter.num_generated_tokens = 0
     metrics_reporter.forward_ct_decode = 0
-    return SchedulerBatchResultProcessor(
+    return processor_class(
         is_generation=True,
         disaggregation_mode=None,
         model_config=SimpleNamespace(
@@ -112,6 +117,61 @@ def _make_result():
         next_token_ids=[4],
         speculative_num_draft_tokens=0,
     )
+
+
+class TestMambaDecodeTrackingPolicy(unittest.TestCase):
+    def test_extra_buffer_uses_standard_result_processor(self):
+        with get_context().override_server_args(
+            mamba_radix_cache_strategy="extra_buffer"
+        ):
+            self.assertIs(
+                get_batch_result_processor_class(), SchedulerBatchResultProcessor
+            )
+
+    def test_prefill_extra_buffer_remains_enabled_when_decode_tracking_is_disabled(
+        self,
+    ) -> None:
+        with get_context().override_server_args(
+            mamba_radix_cache_strategy="extra_buffer",
+            disable_mamba_decode_tracking=True,
+        ):
+            self.assertTrue(get_exec().mamba.enable_mamba_extra_buffer)
+            self.assertFalse(get_exec().mamba.enable_mamba_decode_tracking)
+
+    def test_first_decode_preserves_prompt_checkpoint(self):
+        req, batch = _make_batch()
+        # Reuse the prefill batch intact, including its tracked device row.
+        batch.mamba_track_indices = torch.tensor([4])
+        batch.mamba_track_mask = torch.tensor([True])
+        batch.mamba_track_seqlens = torch.tensor([TRACK_INTERVAL])
+        batch.mamba_track_mask_cpu = [True]
+        req.kv.mamba_ping_pong_track_buffer = torch.tensor([4])
+        req.kv.mamba_last_track_seqlen = TRACK_INTERVAL
+        result = _make_result()
+
+        with (
+            get_context().override_server_args(
+                mamba_radix_cache_strategy="extra_buffer",
+                disable_mamba_decode_tracking=True,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                return_value=torch.tensor([3]),
+            ),
+            patch.object(
+                SchedulerBatchResultProcessor, "_mamba_check_track_boundary"
+            ) as check_boundary,
+        ):
+            processor = _make_processor(get_batch_result_processor_class())
+            batch.prepare_for_decode()
+            self.assertIsNone(batch.mamba_track_mask)
+            self.assertIsNone(batch.mamba_track_indices)
+            self.assertIsNone(batch.mamba_track_seqlens)
+            processor.process_batch_result_decode(batch, result)
+            check_boundary.assert_not_called()
+
+        self.assertEqual(req.output_ids[-1], 4)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
 
 
 class TestMambaBoundaryMaskReuse(unittest.TestCase):
