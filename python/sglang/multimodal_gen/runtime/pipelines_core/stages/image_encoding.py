@@ -90,7 +90,7 @@ class ImageVAEEncodingFingerprint:
     encode_sample_mode: str
     vae_precision: Any
     vae_tiling: bool
-    use_fast_encode: bool = False
+    use_fast_encode: bool
 
 
 def _freeze_image_source_value(value):
@@ -951,7 +951,10 @@ class ImageVAEEncodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
-            encode_kwargs = {"use_fast_path": True} if self._use_fast_encode(batch) else {}
+            # The encode cache includes kwargs in the posterior key.
+            encode_kwargs = (
+                {"use_fast_path": True} if self._use_fast_encode(batch) else {}
+            )
             for image in images:
                 image = self.preprocess(
                     image,

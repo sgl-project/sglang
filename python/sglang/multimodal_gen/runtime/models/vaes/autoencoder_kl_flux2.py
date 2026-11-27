@@ -138,6 +138,7 @@ class AutoencoderKLFlux2(AutoencoderKLMixin, ParallelTiledVAE):
 
         Args:
             x (`torch.Tensor`): Input batch of images.
+            use_fast_path (`bool`): Allow the installed BF16 high-quality encoder fusion.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether to return a [`~models.autoencoder_kl.AutoencoderKLOutput`] instead of a plain tuple.
 
@@ -150,7 +151,7 @@ class AutoencoderKLFlux2(AutoencoderKLMixin, ParallelTiledVAE):
             assert x.shape[2] == 1
             x = x.squeeze(2)
 
-        with use_vae_fast_path(self.encoder, use_fast_path):
+        with use_vae_fast_path(self.encoder, use_fast_path and x.dtype == torch.bfloat16):
             if self.use_slicing and x.shape[0] > 1:
                 encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
                 h = torch.cat(encoded_slices)

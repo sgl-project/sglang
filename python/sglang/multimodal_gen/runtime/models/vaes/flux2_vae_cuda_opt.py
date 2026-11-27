@@ -396,13 +396,14 @@ def maybe_optimize_flux2_vae(vae: nn.Module) -> nn.Module:
     from diffusers.models.autoencoders.vae import Decoder, Encoder
     from diffusers.models.resnet import ResnetBlock2D
 
+    from sglang.kernels.arch import current_arch
     from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_flux2 import (
         AutoencoderKLFlux2,
     )
 
     if not isinstance(vae, AutoencoderKLFlux2) or type(vae.decoder) is not Decoder:
         return vae
-    if _HAS_TRITON and type(vae.encoder) is Encoder:
+    if _HAS_TRITON and type(vae.encoder) is Encoder and current_arch().is_sm(12, 0):
         gate = VaeFastPathGate()
         if _install_norm_silu(vae.encoder, ResnetBlock2D, gate):
             register_vae_fast_path_gate(vae.encoder, gate)
