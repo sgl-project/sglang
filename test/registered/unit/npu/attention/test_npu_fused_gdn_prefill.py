@@ -117,7 +117,7 @@ class TestNPUFusedGDNPrefill950PR(CustomTestCase):
         import torch_npu
 
         torch.manual_seed(123)
-        for nk, nv in [(16, 48), (16, 32)]:
+        for nk, nv in [(16, 48), (16, 32), (16, 16), (8, 32)]:
             d = 128
             seq_lens = [733, 129, 64, 15]
             b_size = len(seq_lens)
@@ -378,6 +378,178 @@ class TestNPUFusedGDNPrefill950PR(CustomTestCase):
         ).item()
         self.assertGreater(cos_o, 0.999, f"Correlated-key o cos={cos_o}")
         self.assertGreater(cos_h, 0.999, f"Correlated-key ht cos={cos_h}")
+
+        # Verify strict FP64 recurrent reference accuracy bar (<= CANN 9.2 error)
+        q64 = q_all.cpu().double()
+        k64 = k_all.cpu().double()
+        v64 = v_raw.view(seq_len, nv, d).cpu().double()
+        g64 = g_all.cpu().double()
+        b64 = beta_all.cpu().double()
+        h64 = torch.zeros((nv, d, d), dtype=torch.float64)
+        o64 = torch.zeros((seq_len, nv, d), dtype=torch.float64)
+        gqa = nv // nk
+        scale = d**-0.5
+        for t in range(seq_len):
+            for vh in range(nv):
+                kh = vh // gqa
+                h64[vh] = h64[vh] * torch.exp(g64[t, vh])
+                delta = (v64[t, vh] - h64[vh] @ k64[t, kh]) * b64[t, vh]
+                h64[vh] = h64[vh] + torch.outer(delta, k64[t, kh])
+                o64[t, vh] = (h64[vh] @ q64[t, kh]) * scale
+        o_rel_fp64 = (o_opt.cpu().double() - o64).norm().item() / o64.norm().item()
+        ht_rel_fp64 = (
+            ssm_opt[0].cpu().double() - h64
+        ).norm().item() / h64.norm().item()
+        self.assertLessEqual(
+            o_rel_fp64, 0.025, f"Correlated-key o_rel_fp64={o_rel_fp64}"
+        )
+        self.assertLessEqual(
+            ht_rel_fp64, 0.015, f"Correlated-key ht_rel_fp64={ht_rel_fp64}"
+        )
+
+    @unittest.skipUnless(
+        _is_arch35_hardware(), "Requires Ascend 950 (arch35) NPU hardware"
+    )
+    def test_decode_conv1d_gating_and_rmsnorm_strided_z_parity(self):
+        import triton
+
+        from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
+            _fused_conv1d_decode_packed_gating_kernel,
+            fused_rmsnorm_gated_strided_z,
+        )
+
+        torch.manual_seed(42)
+        d = 128
+        for nk, nv in [(16, 48), (16, 32)]:
+            qkv_dim = (2 * nk + nv) * d
+            qkvz_dim = qkv_dim + nv * d
+            nv_pad = triton.next_power_of_2(nv)
+            w_t = torch.randn((4, qkv_dim), device="npu", dtype=torch.bfloat16) * 0.1
+            a_log = torch.randn((nv,), device="npu", dtype=torch.float32) * 0.2 - 1.0
+            dt_bias = torch.randn((nv,), device="npu", dtype=torch.bfloat16) * 0.1
+
+            # Verify conv1d+gating parity across bs=1 (bd=1024), bs=4/8 (bd=2048), including pad slot -1
+            for bs, block_d in [(1, 1024), (4, 2048), (8, 2048)]:
+                qkvz = torch.randn((bs, qkvz_dim), device="npu", dtype=torch.bfloat16)
+                ba = torch.randn((bs, 2 * nv), device="npu", dtype=torch.bfloat16)
+                state_ref = (
+                    torch.randn((16, 3, qkv_dim), device="npu", dtype=torch.bfloat16)
+                    * 0.1
+                )
+                state_opt = state_ref.clone()
+                cache_idx = torch.arange(bs, device="npu", dtype=torch.int32)
+                if bs >= 4:
+                    cache_idx[-1] = -1
+                m_out = torch.empty((bs, qkv_dim), device="npu", dtype=torch.bfloat16)
+                g_out = torch.empty((bs, nv), device="npu", dtype=torch.float32)
+                b_out = torch.empty((bs, nv), device="npu", dtype=torch.bfloat16)
+
+                _fused_conv1d_decode_packed_gating_kernel[(bs * (qkv_dim // block_d),)](
+                    qkvz,
+                    ba,
+                    w_t,
+                    state_opt,
+                    cache_idx,
+                    a_log,
+                    dt_bias,
+                    m_out,
+                    g_out,
+                    b_out,
+                    bs,
+                    qkvz_dim,
+                    qkv_dim,
+                    nv,
+                    nv_pad,
+                    block_d,
+                )
+                torch.npu.synchronize()
+
+                # Reference in PyTorch
+                b_ref = ba[:, :nv]
+                a_ref = ba[:, nv:].float()
+                g_ref = -torch.exp(a_log) * F.softplus(a_ref + dt_bias.float())
+                self.assertLess((g_out - g_ref).abs().max().item(), 1e-4)
+                self.assertEqual((b_out - b_ref).abs().max().item(), 0.0)
+                for bi in range(bs):
+                    slot = int(cache_idx[bi].item())
+                    x0 = qkvz[bi, :qkv_dim]
+                    if slot >= 0:
+                        s_old = state_ref[slot]
+                        acc = (
+                            s_old[0].float() * w_t[0].float()
+                            + s_old[1].float() * w_t[1].float()
+                            + s_old[2].float() * w_t[2].float()
+                            + x0.float() * w_t[3].float()
+                        )
+                        y_ref = (acc * torch.sigmoid(acc)).to(torch.bfloat16)
+                        self.assertLess(
+                            (m_out[bi].float() - y_ref.float()).abs().max().item(),
+                            1e-2,
+                        )
+                        self.assertEqual(
+                            (state_opt[slot, 0] - s_old[1]).abs().max().item(), 0.0
+                        )
+                        self.assertEqual(
+                            (state_opt[slot, 1] - s_old[2]).abs().max().item(), 0.0
+                        )
+                        self.assertEqual(
+                            (state_opt[slot, 2] - x0).abs().max().item(), 0.0
+                        )
+                    else:
+                        self.assertEqual((m_out[bi] - x0).abs().max().item(), 0.0)
+
+            # Verify fused_rmsnorm_gated_strided_z parity across decode and prefill T
+            rms_w = torch.randn((d,), device="npu", dtype=torch.bfloat16)
+            for T in [1, 4, 16, 32, 512]:
+                qkvz = torch.randn((T, qkvz_dim), device="npu", dtype=torch.bfloat16)
+                core = torch.randn((T, nv, d), device="npu", dtype=torch.bfloat16)
+                y_opt = fused_rmsnorm_gated_strided_z(
+                    core, qkvz, rms_w, qkv_dim, nv, d, 1e-6
+                )
+                torch.npu.synchronize()
+                x_f = core.float()
+                rstd = torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+                z_f = qkvz[:, qkv_dim:].view(T, nv, d).float()
+                y_ref = (
+                    ((x_f * rstd) * rms_w.float() * F.silu(z_f))
+                    .to(torch.bfloat16)
+                    .view(T, nv * d)
+                )
+                self.assertLess(
+                    (y_opt.float() - y_ref.float()).abs().max().item(),
+                    2e-2,
+                    f"rmsnorm_z mismatch for nv={nv}, T={T}",
+                )
+
+    def test_decode_ones_cache_persistent_across_batch_sizes(self):
+        from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
+            AscendGDNAttnBackend,
+        )
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        backend = AscendGDNAttnBackend.__new__(AscendGDNAttnBackend)
+        cached = {}
+        for bs in [1, 2, 4, 8]:
+            backend.forward_metadata = SimpleNamespace(
+                mamba_cache_indices=torch.arange(bs, dtype=torch.int32)
+            )
+            backend.prepare_gdn_inputs(bs, ForwardMode.DECODE, None)
+            t = backend._decode_ones_cache[bs]
+            self.assertEqual(t.shape, (bs,))
+            self.assertEqual(t.dtype, torch.int32)
+            self.assertEqual(t.tolist(), [1] * bs)
+            cached[bs] = (t, t.data_ptr())
+
+        # Re-preparing another bs must preserve earlier bs tensor identities/addresses
+        # so multi-bs NPU Decode Graph captures never reference freed tensors.
+        for bs in [4, 1, 8, 2]:
+            backend.forward_metadata = SimpleNamespace(
+                mamba_cache_indices=torch.arange(bs, dtype=torch.int32)
+            )
+            backend.prepare_gdn_inputs(bs, ForwardMode.DECODE, None)
+            for k, (orig_t, orig_ptr) in cached.items():
+                self.assertIs(backend._decode_ones_cache[k], orig_t)
+                self.assertEqual(backend._decode_ones_cache[k].data_ptr(), orig_ptr)
 
 
 if __name__ == "__main__":

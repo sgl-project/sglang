@@ -141,7 +141,7 @@ def _fused_conv1d_decode_packed_gating_kernel(
     pid = tl.program_id(0)
     b = pid // n_chunks
     c = pid % n_chunks
-    slot = tl.load(CACHE_IDX + b)
+    slot = tl.load(CACHE_IDX + b).to(tl.int64)
     if c == 0:
         offs_nv = tl.arange(0, NV_PAD)
         mask_nv = offs_nv < NV
@@ -167,7 +167,7 @@ def _fused_conv1d_decode_packed_gating_kernel(
     offs = c * BLOCK_D + tl.arange(0, BLOCK_D)
     x0 = tl.load(QKVZ + b * QKVZ_DIM + offs)
     if slot >= 0:
-        s_base_slot = slot * 3 * QKV_DIM
+        s_base_slot = slot * (3 * QKV_DIM)
         s0 = tl.load(STATE + s_base_slot + offs)
         s1 = tl.load(STATE + s_base_slot + QKV_DIM + offs)
         s2 = tl.load(STATE + s_base_slot + 2 * QKV_DIM + offs)
@@ -237,7 +237,9 @@ def fused_rmsnorm_gated_strided_z(
     out = torch.empty(
         (T, v_dim), dtype=core_attn_out.dtype, device=core_attn_out.device
     )
-    if T <= 4 and num_v_heads % 4 == 0:
+    if T >= 56 and num_v_heads <= 64:
+        hpp = num_v_heads
+    elif T <= 4 and num_v_heads % 4 == 0:
         hpp = 4
     elif T <= 16 and num_v_heads % 8 == 0:
         hpp = 8
@@ -296,6 +298,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         decode_backend = backends.decode
         prefill_backend = backends.prefill
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        # Persistent per-bs static ones buffers safe for NPU decode graph capture/replay.
+        self._decode_ones_cache: dict[int, torch.Tensor] = {}
 
     def _prepare_mamba_track_metadata(self, forward_batch: ForwardBatch):
         if self.forward_metadata.has_mamba_track_mask:
@@ -408,6 +412,14 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             self._cached_chunk_indices = None
         else:
             self._cached_chunk_indices = None
+            ones_cache = getattr(self, "_decode_ones_cache", None)
+            if ones_cache is None:
+                ones_cache = {}
+                self._decode_ones_cache = ones_cache
+            if bs not in ones_cache or ones_cache[bs].device != cache_indices.device:
+                ones_cache[bs] = torch.ones(
+                    (bs,), dtype=torch.int32, device=cache_indices.device
+                )
 
     def init_forward_metadata_out_graph(
         self,
@@ -473,7 +485,12 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 and ba.is_contiguous()
                 and qkv_dim % 512 == 0
             ):
-                block_d = 512 if (bs <= 4 or qkv_dim % 1024 != 0) else 1024
+                if bs >= 2 and qkv_dim % 2048 == 0:
+                    block_d = 2048
+                elif qkv_dim % 1024 == 0:
+                    block_d = 1024
+                else:
+                    block_d = 512
                 nv_pad = triton.next_power_of_2(nv)
                 mixed_out = torch.empty(
                     (bs, qkv_dim), dtype=qkvz.dtype, device=qkvz.device
@@ -498,7 +515,16 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     nv_pad,
                     block_d,
                 )
-                ones = torch.ones((bs,), dtype=torch.int32, device=cache_indices.device)
+                ones_cache = getattr(self, "_decode_ones_cache", None)
+                if ones_cache is None:
+                    ones_cache = {}
+                    self._decode_ones_cache = ones_cache
+                ones = ones_cache.get(bs)
+                if ones is None or ones.device != cache_indices.device:
+                    ones = torch.ones(
+                        (bs,), dtype=torch.int32, device=cache_indices.device
+                    )
+                    ones_cache[bs] = ones
                 scale = layer.head_k_dim**-0.5
                 core_attn_out = recurrent_gated_delta_rule(
                     mixed_out.view(bs, 1, qkv_dim),
