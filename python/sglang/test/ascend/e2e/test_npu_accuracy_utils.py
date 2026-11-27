@@ -76,11 +76,14 @@ REMOTE_EVAL_DATASETS = frozenset({"deep_swe"})
 # The eval image is the multi-arch sglang image (pulls the amd64 variant on the
 # eval node) which ships Python 3.12 and evalscope, so datacurve-pier is added
 # into a --system-site-packages venv without reinstalling evalscope. The dind
-# sidecar is pulled from Docker Hub.
+# sidecar is a recent docker:27-dind from SWR (an old 18.06 daemon failed apt
+# signature verification in every container it launched).
 DEEPSWE_EVAL_IMAGE = (
     "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050"
 )
-DEEPSWE_DIND_IMAGE = "docker:dind"
+DEEPSWE_DIND_IMAGE = (
+    "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/library/docker:27-dind"
+)
 # The dind daemon cannot reach Docker Hub directly, so give it docker.io
 # registry mirrors (tried in order).
 DEEPSWE_DIND_REGISTRY_MIRRORS = ("https://docker.m.daocloud.io",)
