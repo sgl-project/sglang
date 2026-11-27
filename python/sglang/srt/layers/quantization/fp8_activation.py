@@ -34,6 +34,8 @@ def aiter_takes_fp8_group_input(linear) -> bool:
 
     method = getattr(linear, "quant_method", None)
     weight = getattr(linear, "weight", None)
+    if aiter_gfx942_takes_fp8_group_input(linear):
+        return True
     return (
         getattr(linear, "aiter_bpreshuffled", False)
         and type(method) is Fp8LinearMethod
@@ -44,12 +46,45 @@ def aiter_takes_fp8_group_input(linear) -> bool:
     )
 
 
+def aiter_gfx942_takes_fp8_group_input(linear) -> bool:
+    """gfx942: whether ``linear`` runs aiter_w8a8_block_fp8_linear's blockscale
+    GEMM (CK or Triton) on the plain row-major 128x128 block-FP8 weight, which
+    takes a pre-quantized ``(fp8 fnuz, row-major (M, K/128) fp32 scale)`` input,
+    the same operand its own per-1x128 quant would produce."""
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+    from sglang.srt.layers.quantization.fp8_utils import (
+        _use_aiter_gfx942,
+        aiter_w8a8_block_fp8_linear,
+    )
+
+    if not _use_aiter_gfx942:
+        return False
+    method = getattr(linear, "quant_method", None)
+    weight = getattr(linear, "weight", None)
+    return (
+        type(method) is Fp8LinearMethod
+        and getattr(method, "block_quant", False)
+        and method.weight_block_size == [128, 128]
+        and method.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+        and not (method.use_marlin or method.use_mxfp8 or method.block_fp8_as_mxfp8)
+        and not getattr(linear, "aiter_bpreshuffled", False)
+        and weight is not None
+        and getattr(weight, "_ptpc_weight", None) is None
+        and getattr(weight, "_mxscale_w_scale", None) is None
+        and getattr(linear, "_block_fp8_bf16_weight", None) is None
+        and getattr(linear, "bias", None) is None
+        and not hasattr(linear, "base_layer")
+    )
+
+
 def aiter_prefers_bf16_input(linear, num_tokens: int) -> bool:
     """Whether ``linear`` runs ``num_tokens`` rows faster on the gfx950 small-M
     GEMM, which quantizes its bf16 input itself, than on a pre-quantized input;
     a producer then keeps its output in bf16."""
     from sglang.kernels.ops.gemm import smallm_fp8_blockscale_gfx950 as smallm
 
+    if not is_gfx95_supported():
+        return False
     n, k = linear.weight.shape
     return linear.bias is None and smallm.prefers_bf16_input(num_tokens, n, k)
 
@@ -253,6 +288,7 @@ class DenseSiluAndMulQuant:
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from sglang.srt.layers.activation import SiluAndMul
         from sglang.srt.layers.quantization.fp8_utils import (
+            _use_aiter_bpreshuffle_gfx95,
             emit_transposed_bpreshuffle_scale,
             view_aiter_fused_rms_transposed_fp8_scale,
         )
@@ -281,8 +317,15 @@ class DenseSiluAndMulQuant:
             silu_mul_fp8_group_quant,
         )
 
+        if aiter_gfx942_takes_fp8_group_input(down_proj):
+            # gfx942 blockscale GEMM: fnuz fp8 and a row-major (M, K/128) scale.
+            import aiter
+
+            return silu_mul_fp8_group_quant(
+                x, transpose_scale=False, dtype=aiter.dtypes.fp8
+            )
         transpose = emit_transposed_bpreshuffle_scale(
-            x.shape[0], on_bpreshuffle_gfx95=True
+            x.shape[0], on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95
         )
         q, scale = silu_mul_fp8_group_quant(x, transpose_scale=transpose)
         if transpose:

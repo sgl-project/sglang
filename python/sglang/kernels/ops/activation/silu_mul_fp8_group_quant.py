@@ -42,7 +42,10 @@ def _silu_mul_fp8_group_quant_kernel(
 
 
 def silu_mul_fp8_group_quant(
-    x: torch.Tensor, transpose_scale: bool, group_size: int = 128
+    x: torch.Tensor,
+    transpose_scale: bool,
+    group_size: int = 128,
+    dtype: torch.dtype = torch.float8_e4m3fn,
 ):
     """``x`` is [M, 2 * D] (gate | up). Returns fp8 [M, D] and its fp32 group
     scale [M, D / group_size]. With ``transpose_scale`` the scale bytes are in
@@ -51,7 +54,6 @@ def silu_mul_fp8_group_quant(
     M, D2 = x.shape
     D = D2 // 2
     assert D % group_size == 0 and x.stride(1) == 1
-    dtype = torch.float8_e4m3fn
     q = torch.empty((M, D), dtype=dtype, device=x.device)
     s = torch.empty((M, D // group_size), dtype=torch.float32, device=x.device)
     if M == 0:
