@@ -829,6 +829,10 @@ class Envs:
     # - Source builds with a missing or unusable Rust toolchain.
     # This also applies when Rust is explicitly selected.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
+    # The "zmq" KV event publisher: "python" or "rust". "rust" falls back to
+    # Python on non-Linux platforms, for inproc, abstract-namespace ipc, host-name
+    # or connect-style endpoints, and when the Rust extension is unavailable.
+    SGLANG_KV_EVENT_PUBLISHER_BACKEND = EnvStr("python")
     # Once decode passes the sliding window, drop the SWA part of the prefill's
     # tree lock; its SWA KV becomes evictable rather than freed.
     SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBool(False)

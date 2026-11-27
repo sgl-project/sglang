@@ -627,6 +627,13 @@ crate-type = ["cdylib"]
                 (),
             ),
             (
+                "sglang.srt.rust_extensions._kv_events",
+                "sglang-kv-events",
+                "sglang_kv_events",
+                ("python",),
+                (),
+            ),
+            (
                 "sglang.srt.mem_cache.rust_tree_core.mem_cache",
                 "sglang-radix-tree",
                 "mem_cache",
