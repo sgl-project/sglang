@@ -1,8 +1,0 @@
-SGLANG_TOPK_V2_MODE 2
-width 8192 k 512: paged: set same, order differs, raw: set same, order differs, ragged: set same, order differs, blocks: set same, order differs
-width 65536 k 2048: paged: set same, order differs, raw: set same, order differs, ragged: set same, order differs, blocks: set same, order differs
-width 131072 k 512: paged: set same, order differs, raw: set same, order differs, ragged: set same, order differs, blocks: set same, order differs
-SGLANG_TOPK_V2_MODE 1
-width 8192 k 512: paged: set differs, order differs, raw: set differs, order differs, ragged: set differs, order differs, blocks: set differs, order differs
-width 65536 k 2048: paged: set differs, order differs, raw: set differs, order differs, ragged: set differs, order differs, blocks: set differs, order differs
-width 131072 k 512: paged: set differs, order differs, raw: set differs, order differs, ragged: set differs, order differs, blocks: set differs, order differs
