@@ -606,6 +606,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
+    media_gateway_key_file: str | None = None
 
     # Client-supplied media URL policy, as in the LLM server; the default size
     # limit is larger because requests carry videos.
@@ -660,7 +661,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Logging
     log_level: str = "info"
     log_requests: bool = False
-    log_requests_level: int = 2
+    log_requests_level: int = 0
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
@@ -3423,6 +3424,11 @@ class ServerArgs(DisaggServerArgsMixin):
             "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang-diffusion'.",
         )
         parser.add_argument(
+            "--media-gateway-key-file",
+            help="Require a trusted gateway for OpenAI image, video and mesh jobs. "
+            "Read its 64-digit hex key from this file; scope jobs by its verified X-SGLang-Tenant.",
+        )
+        parser.add_argument(
             "--log-requests",
             action="store_true",
             help="Log user-facing fields of all requests (default: False). "
@@ -3436,7 +3442,7 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Verbosity level for request logging. "
             "0: Log request metadata only (request_id). "
             "1: Log metadata + sampling config (seed, steps, guidance, resolution, frames, fps, ...). "
-            "2: Log metadata + sampling config + prompt/negative prompt (truncated to 2 KiB). "
+            "2: Also log prompt/negative prompt (first and last 1,024 characters of long text). "
             "3: Log metadata + sampling config + full prompt/negative prompt.",
         )
         parser.add_argument(

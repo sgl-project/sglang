@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import hashlib
 import os
-import tempfile
+from contextlib import ExitStack
 
 import PIL.Image
 import torch
@@ -13,7 +12,6 @@ from torchvision import transforms
 from sglang.srt.multimodal.media_io import (
     media_url_timeout,
     open_remote_media,
-    validate_remote_media_url,
 )
 
 try:
@@ -40,6 +38,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.image_io import temporary_media_directory
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_component_precision,
@@ -90,7 +89,7 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
             ),
         ]
 
-    def _get_single_path(self, value, field_name: str) -> str:
+    def _get_single_path(self, value, field_name: str, files: ExitStack) -> str:
         if isinstance(value, list):
             if len(value) != 1:
                 raise ValueError(f"Wan S2V expects exactly one {field_name}")
@@ -98,39 +97,25 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         if not isinstance(value, str) or not value:
             raise ValueError(f"Wan S2V expects {field_name} as a non-empty string")
         if value.lower().startswith(("http://", "https://")):
-            return self._download_remote_input(value, field_name)
+            directory = files.enter_context(temporary_media_directory())
+            suffix = {
+                "image_path": ".jpg",
+                "audio_path": ".wav",
+                "pose_video_path": ".mp4",
+            }[field_name]
+            path = os.path.join(directory, "input" + suffix)
+            with (
+                open_remote_media(
+                    value, media_url_timeout(_REMOTE_INPUT_TIMEOUT_S)
+                ) as (_, chunks),
+                open(path, "xb") as output,
+            ):
+                for chunk in chunks:
+                    output.write(chunk)
+            return path
         if not os.path.exists(value):
             raise FileNotFoundError(f"{field_name} not found: {value}")
         return value
-
-    def _download_remote_input(self, url: str, field_name: str) -> str:
-        url = validate_remote_media_url(url)
-        # Loaders probe the content; a client-chosen suffix must not steer them.
-        ext = {"audio_path": ".wav", "pose_video_path": ".mp4"}.get(field_name, ".jpg")
-        cache_dir = os.path.join(tempfile.gettempdir(), "sglang_wan_s2v_remote_inputs")
-        os.makedirs(cache_dir, exist_ok=True)
-        target_path = os.path.join(
-            cache_dir,
-            f"{field_name}_{hashlib.sha256(url.encode()).hexdigest()[:16]}{ext}",
-        )
-        if os.path.exists(target_path):
-            return target_path
-        # Renamed in only when complete, so a failed download never leaves a truncated
-        # file for the cache check above to return.
-        with tempfile.NamedTemporaryFile(dir=cache_dir, delete=False) as fout:
-            partial_path = fout.name
-            try:
-                with open_remote_media(
-                    url, media_url_timeout(_REMOTE_INPUT_TIMEOUT_S)
-                ) as (_, chunks):
-                    for chunk in chunks:
-                        fout.write(chunk)
-                fout.close()
-                os.replace(partial_path, target_path)
-            finally:
-                if os.path.exists(partial_path):
-                    os.unlink(partial_path)
-        return target_path
 
     def _generate_seed_and_generator(self, batch: Req) -> None:
         seed = batch.seed if batch.seed is not None else 42
@@ -333,12 +318,24 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
                 "Wan S2V standard denoising path requested, but transformer does not support it"
             )
 
-        image_path = self._get_single_path(batch.image_path, "image_path")
-        audio_path = self._get_single_path(batch.audio_path, "audio_path")
-        pose_video_path = batch.pose_video_path
-        if pose_video_path is not None:
-            pose_video_path = self._get_single_path(pose_video_path, "pose_video_path")
+        with ExitStack() as files:
+            image = self._get_single_path(batch.image_path, "image_path", files)
+            audio = self._get_single_path(batch.audio_path, "audio_path", files)
+            pose = (
+                self._get_single_path(batch.pose_video_path, "pose_video_path", files)
+                if batch.pose_video_path is not None
+                else None
+            )
+            return self._encode_local_inputs(batch, server_args, image, audio, pose)
 
+    def _encode_local_inputs(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        image_path: str,
+        audio_path: str,
+        pose_video_path: str | None,
+    ) -> Req:
         self._generate_seed_and_generator(batch)
         if batch.num_clip not in (None, 1):
             raise NotImplementedError(

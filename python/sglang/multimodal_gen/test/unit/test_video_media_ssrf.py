@@ -13,6 +13,7 @@ import http.server
 import threading
 import unittest.mock as mock
 import wave
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import pytest
@@ -450,10 +451,11 @@ class TestModelSpecificFetchPaths:
     def test_wan_s2v_remote_input_is_checked(self, tmp_path):
         stage = object.__new__(WanS2VBeforeDenoisingStage)
         with (
-            mock.patch("tempfile.tempdir", str(tmp_path)),
+            mock.patch.dict("os.environ", {"TMPDIR": str(tmp_path)}),
+            ExitStack() as files,
             pytest.raises(ValueError, match="non-public IP"),
         ):
-            stage._get_single_path(PRIVATE_URL, "image_path")
+            stage._get_single_path(PRIVATE_URL, "image_path", files)
 
     def test_wan_animate_2_audio_does_not_hand_av_a_url(self):
         fake_av = _fake_av()

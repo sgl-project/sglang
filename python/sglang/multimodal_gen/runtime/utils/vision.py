@@ -20,6 +20,7 @@ import torch
 from packaging import version
 
 from sglang.kernels import get_kernel
+from sglang.multimodal_gen.runtime.utils.image_io import temporary_media_directory
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import get_image_bytes as srt_get_image_bytes
 from sglang.srt.multimodal.media_io import media_url_timeout, open_remote_media
@@ -314,7 +315,7 @@ def local_video_path(video: str) -> Iterator[str]:
     # FFmpeg probes the content; a client-chosen suffix such as .m3u8
     # would let it read the file as a playlist of further URLs.
     suffix = ".gif" if file_name.lower().endswith(".gif") else ".mp4"
-    with tempfile.TemporaryDirectory() as temp_dir:
+    with temporary_media_directory() as temp_dir:
         video_path = os.path.join(temp_dir, f"video{suffix}")
         with open(video_path, "wb") as output:
             call_with_sanitized_media_errors(download_video_to_stream, video, output)

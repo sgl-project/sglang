@@ -25,7 +25,6 @@ dependencies = [
   "build",
   "compressed-tensors",
   "datasets",
-  "deepseek-recipe==0.2.0 ; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin'",
   "easydict",
   "einops",
   "fastapi",
@@ -63,6 +62,7 @@ dependencies = [
   "scipy",
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
+  "sgl-deepseek-recipe==0.2.1 ; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin'",
   "sglang-kernel-xpu==0.6.0",
   "soundfile==0.13.1",
   "tiktoken",
