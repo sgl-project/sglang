@@ -16,3 +16,6 @@ class MultimodalProcessorConfig(msgspec.Struct, frozen=True, kw_only=True):
     allow_local_media_files: bool = True
     # Keep preprocessed features on the GPU; serving sets it for GPU transports.
     keep_mm_features_on_device: bool = False
+    # Run an auto-sized single processor worker on a thread instead of inline,
+    # so a slow request does not block the caller's event loop.
+    run_single_worker_on_thread: bool = False

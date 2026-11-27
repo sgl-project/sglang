@@ -204,6 +204,43 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         self.assertEqual(proc.mm_processor_worker_num, 1)
         self.assertIsNone(proc.mm_processor_executor)
 
+    def test_auto_single_worker_moves_off_the_event_loop_when_enabled(self):
+        """An inline single worker blocks the tokenizer's event loop for a whole
+        preprocessing call (a CPU fallback included), stalling every request.
+        With the flag the auto-sized worker gets its own thread; an explicit
+        count of 1 still runs inline."""
+        from transformers import BaseImageProcessor
+
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        # (flag, requested workers, processor supports threads, executor)
+        cases = {
+            "flag off": (False, 0, True, False),
+            "flag on, auto": (True, 0, True, True),
+            "flag on, explicit 1": (True, 1, True, False),
+            "flag on, not thread-safe": (True, 0, False, False),
+        }
+        for name, (flag, requested, supported, threaded) in cases.items():
+            with (
+                self.subTest(name),
+                envs.SGLANG_MM_PROCESSOR_THREAD_FOR_SINGLE_WORKER.override(flag),
+                patch.object(
+                    BaseMultimodalProcessor,
+                    "supports_mm_processor_concurrency",
+                    supported,
+                ),
+                self._patch_platform(cuda_alike=True, device_type="cuda"),
+            ):
+                proc = self._make_processor(
+                    {},
+                    mm_processor_worker_num=requested,
+                    image_processor=MagicMock(spec=BaseImageProcessor),
+                )
+                self.assertEqual(proc.mm_processor_worker_num, 1)
+                self.assertEqual(proc.mm_processor_executor is not None, threaded)
+
     def test_non_accelerator_fast_processor_gets_two_workers(self):
         from transformers import BaseImageProcessor
 
