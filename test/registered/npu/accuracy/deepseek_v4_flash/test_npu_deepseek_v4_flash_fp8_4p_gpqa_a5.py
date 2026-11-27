@@ -110,9 +110,9 @@ DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
     "--speculative-dspark-block-size",
     5,
     "--moe-a2a-backend",
-    "deepep",
-    "--deepep-mode",
-    "auto",
+    "ascend_ops",
+    "--moe-ascend-ops-config",
+    '{"prefill":"allgather","decode":"low_latency"}',
     "--quantization",
     "fp8",
 ]
