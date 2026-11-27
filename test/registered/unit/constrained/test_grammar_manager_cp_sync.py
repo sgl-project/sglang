@@ -23,12 +23,20 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
-def _manager(tp_group, cp_group, cp_size, dp_enabled=True):
+def _manager(
+    tp_group,
+    cp_group,
+    cp_size,
+    dp_enabled=True,
+    pp_rank=0,
+    pp_size=1,
+    pp_group=None,
+):
     parallel = SimpleNamespace(
         attn_dp_enabled=dp_enabled,
         attn_cp_size=cp_size,
-        pp_rank=0,
-        pp_size=1,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
         pp_async_batch_depth=0,
     )
     scheduler = SimpleNamespace(
@@ -36,7 +44,7 @@ def _manager(tp_group, cp_group, cp_size, dp_enabled=True):
         dp_tp_group=tp_group,
         dp_tp_cpu_group=tp_group.cpu_group,
         attn_cp_group=cp_group,
-        pp_group=None,
+        pp_group=pp_group,
     )
     with (
         patch(
@@ -185,6 +193,39 @@ def _worker(rank, rendezvous):
             # DPA shards intentionally use different IDs; synchronizing them
             # together would be incorrect even though their queue lengths match.
             assert all(r.rid.startswith(f"dp{rank // 4}-") for r in first + second)
+            assert not manager._resolved_futures
+
+            # Later PP stages receive PP0's admitted indices and still resolve
+            # local futures; verify TP/CP outcome agreement before caching/prefill.
+            pp_group = SimpleNamespace(recv_object=lambda src, tag: ({0, 1, 2}, set()))
+            pp1_mgr = _manager(
+                own_tp, own_cp, cp_size, pp_rank=1, pp_size=2, pp_group=pp_group
+            )
+            pp1_reqs = [_Request(f"dp{rank // 4}-pp1-{i}") for i in range(3)]
+            pp1_reqs[0].grammar.set_result(BaseGrammarObject())
+            if rank % 4 == 3:
+                pp1_reqs[1].grammar.set_exception(
+                    RuntimeError("pp1 rank-local failure")
+                )
+            else:
+                pp1_reqs[1].grammar.set_result(BaseGrammarObject())
+            pp1_reqs[2].grammar.set_result(InvalidGrammarObject("pp1 bad schema"))
+            pp1_mgr.grammar_queue = pp1_reqs[:]
+            pp1_out = pp1_mgr.get_ready_grammar_requests()
+            assert [r.rid for r in pp1_out] == [
+                pp1_reqs[0].rid,
+                pp1_reqs[2].rid,
+                pp1_reqs[1].rid,
+            ]
+            assert not pp1_reqs[0].finished()
+            assert pp1_reqs[0].grammar_key in pp1_mgr.grammar_backend.cache
+            assert pp1_reqs[1].finished()
+            assert isinstance(pp1_reqs[1].grammar, InvalidGrammarObject)
+            assert "pp1 rank-local failure" in pp1_reqs[1].abort_reason
+            assert pp1_reqs[1].grammar_key not in pp1_mgr.grammar_backend.cache
+            assert pp1_reqs[2].finished()
+            assert pp1_reqs[2].grammar_key in pp1_mgr.grammar_backend.cache
+            assert not pp1_mgr._resolved_futures
             dist.barrier()
     finally:
         dist.destroy_process_group()
@@ -199,6 +240,80 @@ class TestGrammarCpSync(unittest.TestCase):
         self.assertIs(_manager(tp, cp, 4).grammar_sync_cp_group, cp)
         self.assertIsNone(_manager(tp, cp, 1).grammar_sync_cp_group)
         self.assertIsNone(_manager(tp, cp, 4, dp_enabled=False).grammar_sync_cp_group)
+
+    def test_ready_future_resolved_once_across_poll_rounds(self):
+        """A ready peer must not repeatedly resolve the same Future while waiting."""
+        tp = SimpleNamespace(
+            cpu_group=object(), world_size=2, first_rank=0, is_first_rank=True
+        )
+        mgr = _manager(tp, None, 1, dp_enabled=False)
+
+        class _CountingFuture(Future):
+            def __init__(self):
+                super().__init__()
+                self.result_calls = 0
+
+            def result(self, timeout=None):
+                self.result_calls += 1
+                return super().result(timeout)
+
+        req = _Request("r0")
+        req.grammar = _CountingFuture()
+        req.grammar.set_result(BaseGrammarObject())
+        mgr.grammar_queue = [req]
+
+        peer_ready = False
+
+        def fake_all_gather(output_list, local_obj, group=None):
+            output_list[0] = local_obj
+            output_list[1] = ({0} if peer_ready else set(), set(), {}, set())
+
+        with patch(
+            "sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object",
+            side_effect=fake_all_gather,
+        ):
+            self.assertEqual(mgr.get_ready_grammar_requests(), [])
+            self.assertEqual(mgr.get_ready_grammar_requests(), [])
+            self.assertEqual(req.grammar.result_calls, 1)
+            peer_ready = True
+            self.assertEqual(mgr.get_ready_grammar_requests(), [req])
+        self.assertNotIn(req.grammar, mgr._resolved_futures)
+        self.assertEqual(len(mgr._resolved_futures), 0)
+
+    def test_staggered_cacheable_invalid_grammar_waits_for_peer_and_caches(self):
+        """A peer that returns InvalidGrammarObject early waits for peers and caches."""
+        tp = SimpleNamespace(
+            cpu_group=object(), world_size=2, first_rank=0, is_first_rank=True
+        )
+        mgr = _manager(tp, None, 1, dp_enabled=False)
+
+        req = _Request("r_invalid")
+        req.grammar.set_result(InvalidGrammarObject("deterministic invalid schema"))
+        mgr.grammar_queue = [req]
+
+        peer_done = False
+
+        def fake_all_gather(output_list, local_obj, group=None):
+            output_list[0] = local_obj
+            if peer_done:
+                output_list[1] = ({0}, set(), {0: "deterministic invalid schema"}, {0})
+            else:
+                output_list[1] = (set(), set(), {}, set())
+
+        with patch(
+            "sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object",
+            side_effect=fake_all_gather,
+        ):
+            self.assertEqual(mgr.get_ready_grammar_requests(), [])
+            self.assertFalse(req.finished())
+            self.assertNotIn(req.grammar_key, mgr.grammar_backend.cache)
+
+            peer_done = True
+            self.assertEqual(mgr.get_ready_grammar_requests(), [req])
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.grammar, InvalidGrammarObject)
+        self.assertIn(req.grammar_key, mgr.grammar_backend.cache)
+        self.assertEqual(len(mgr._resolved_futures), 0)
 
     def test_real_gloo_admission_timeout_and_dpa_isolation(self):
         with tempfile.TemporaryDirectory(prefix="grammar-cp-sync-") as folder:
