@@ -137,6 +137,15 @@ git clone -b v0.5.23 https://github.com/sgl-project/sglang.git
 cd sglang
 ```
 
+**Install Rust**
+
+A source build compiles SGLang's Rust extensions, so it needs `cargo`. Without it, installation fails with `cargo is required to discover the Rust extension modules`. Install a minimal Rust toolchain and make `cargo` available in the current shell:
+
+```bash
+curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+source "$HOME/.cargo/env"
+```
+
 **Install SGLang**
 
 Install the Python package in editable mode so local source changes are reflected in your environment:
