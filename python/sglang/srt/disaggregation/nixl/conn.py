@@ -60,6 +60,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.aiter import pin_aiter_hip_runtime
 from sglang.srt.utils.common import run_with_deadline
 
 try:
@@ -623,6 +624,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             num_threads=num_threads,
             sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
         )
+        pin_aiter_hip_runtime()
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
@@ -1102,13 +1104,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         threading.Thread(target=decode_listener_thread, daemon=True).start()
 
-    def _prefetch_staging_reqs(self, room: int):
-        """Send STAGING_REQ for all chunks before the prefill forward starts.
-
-        Idempotent per room: the first call for a given room does the full
-        fan-out (one STAGING_REQ per chunk per peer); subsequent calls return
-        immediately, so the caller can invoke this on every chunk.
-        """
+    def _prefetch_staging_reqs(self, room: int, upto_tokens: Optional[int] = None):
+        """Reserve staging for chunks up to the prefill bound, or the whole room."""
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return
         if room in self._staging_ctx.prefetched_rooms:
@@ -1138,8 +1135,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
+            upto_tokens=upto_tokens,
         )
-        self._staging_ctx.prefetched_rooms.add(room)
+        if upto_tokens is None:
+            self._staging_ctx.prefetched_rooms.add(room)
 
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
@@ -3519,11 +3518,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_item_lens=dst_lens,
                 )
             elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
-                # Compacted layer lists require equal TP and PP=1 on both peers.
-                if self.pp_size is not None and self.pp_size > 1:
-                    raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax state yet."
-                    )
+                # Compacted per-stage layer lists pair by global layer id; under
+                # PP, build_transfer_entry_pairs rejects a peer without ids.
                 if self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         "PD disagg: heterogeneous TP not supported for MiniMax "
@@ -3542,7 +3538,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     prefill_data_indices=np.array(src_indices, dtype=np.int32),
                     dst_data_indices=np.array(dst_indices, dtype=np.int32),
                     dst_gpu_id=dst_gpu_id,
+                    state_type=st,
                     force_flat=True,
+                    src_layer_ids=src_lids,
+                    dst_layer_ids=dst_lids,
+                    dst_item_lens=dst_lens,
                 )
             else:
                 raise RuntimeError(
@@ -3579,8 +3579,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # already allocated staging by the time the worker picks up the
         # chunk. Internally a no-op when staging is disabled or no peer
         # in this room needs heterogeneous-TP staging.
-        if self.enable_staging:
-            self._prefetch_staging_reqs(bootstrap_room)
+        if self.enable_staging and self.kv_buffer_tensors is not None:
+            upto_tokens = None
+            if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+                upto_tokens = index_slice.stop * self.kv_buffer_tensors["page_size"]
+            self._prefetch_staging_reqs(bootstrap_room, upto_tokens=upto_tokens)
 
         # Shard by destination (mirror mooncake): same dst endpoint(s) -> same
         # worker, keeping a room's chunks on one private staging buffer.

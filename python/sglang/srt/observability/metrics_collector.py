@@ -337,7 +337,6 @@ class SchedulerMetricsCollectorContext:
     enable_metrics: bool
     is_stats_logging_rank: bool
     current_scheduler_metrics_enabled: bool
-    enable_kv_cache_events: bool
     collector: Optional[SchedulerMetricsCollector]
 
 
@@ -936,6 +935,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             buckets=exponential_buckets(start=0.001, width=1.62, length=30),
             labelnames=list(labels.keys()) + ["stage"],
         )
+        # Observed for every request at every stage; `labels()` rebuilds and
+        # stringifies the label tuple on each call.
+        self._per_stage_req_latency_children: Dict[str, Any] = {}
 
         # =================================================================
         # Grammar
@@ -1419,12 +1421,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             is_stats_logging_rank
             or get_observability().enable_metrics_for_all_schedulers
         )
-        enable_kv_cache_events = bool(
-            get_observability().kv_events_config
-            and get_parallel().pp_rank == 0
-            and parallel.attn_tp_rank == 0
-            and parallel.attn_cp_rank == 0
-        )
         collector: Optional[SchedulerMetricsCollector] = None
         if enable_metrics:
             # Keep one metric series across role flips.
@@ -1460,7 +1456,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             enable_metrics=enable_metrics,
             is_stats_logging_rank=is_stats_logging_rank,
             current_scheduler_metrics_enabled=current_scheduler_metrics_enabled,
-            enable_kv_cache_events=enable_kv_cache_events,
             collector=collector,
         )
 
@@ -1534,8 +1529,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
-        labels_with_stage = {**self.labels, "stage": stage}
-        self.per_stage_req_latency_seconds.labels(**labels_with_stage).observe(latency)
+        child = self._per_stage_req_latency_children.get(stage)
+        if child is None:
+            child = self.per_stage_req_latency_seconds.labels(
+                **{**self.labels, "stage": stage}
+            )
+            self._per_stage_req_latency_children[stage] = child
+        child.observe(latency)
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
@@ -2432,6 +2432,37 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_bandwidth,
         )
 
+        # Enqueue-to-ack spans include IO-thread queue wait, so like the D->H
+        # backup histogram the range runs to tens of seconds. Keep the
+        # boundaries to a coarse, widely supported set: downstream metrics
+        # gateways with a fixed bucket preset drop the series when a boundary
+        # is not in it.
+        bucket_backup_storage_duration = [
+            0.001,
+            0.005,
+            0.01,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+            30.0,
+            60.0,
+        ]
+
+        self.backup_storage_duration_seconds = Histogram(
+            name="sglang:hicache_backup_storage_duration_seconds",
+            documentation="End-to-end time of a host (L2) to storage backend "
+            "(L3) backup, from write enqueue to completion ack, including "
+            "IO-thread queue wait. Distinct from the GPU-to-host "
+            "sglang:hicache_backup_duration_seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_backup_storage_duration,
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -2439,6 +2470,11 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def observe_backup_storage_duration(self, duration_seconds: float) -> None:
+        self.backup_storage_duration_seconds.labels(**self.labels).observe(
+            duration_seconds
+        )
 
     def log_storage_prefetch_hit_tokens(self, num_tokens: int) -> None:
         if num_tokens > 0:
