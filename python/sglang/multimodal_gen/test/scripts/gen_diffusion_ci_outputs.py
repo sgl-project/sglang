@@ -23,6 +23,7 @@ from sglang.multimodal_gen.test.partitioning import (
 )
 from sglang.multimodal_gen.test.runner.diffusion_suite_runner import (
     SUITES,
+    _get_dynamic_suite_cases,
     _maybe_pin_update_weights_model_pair,
     get_case_est_time,
     get_suite_files_rel,
@@ -75,6 +76,11 @@ def main():
         nargs="*",
         required=False,
         help="Specific case IDs to run (space-separated). If provided, only these cases will be run.",
+    )
+    parser.add_argument(
+        "--consistency-only",
+        action="store_true",
+        help="Generate GT only for consistency-enabled cases unless case IDs are supplied.",
     )
     parser.add_argument(
         "--partition-plan-json",
@@ -204,6 +210,19 @@ def main():
 
         partitions = partition_items_by_lpt(partition_items, total_partitions)
         my_items = [item.item_id for item in partitions[partition_id]]
+
+    # Keep the partition assignment stable while excluding cases without GT checks.
+    if args.consistency_only and not args.case_ids:
+        consistency_case_ids = {
+            case.id
+            for case in _get_dynamic_suite_cases(args.suite)
+            if case.run_consistency_check
+        }
+        my_items = [
+            item
+            for item in my_items
+            if item[item.index("[") + 1 : item.rindex("]")] in consistency_case_ids
+        ]
 
     logger.info(
         f"Partition {partition_id}/{total_partitions}: "
