@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -164,10 +165,11 @@ def compute_partitions(
     result = {}
     for suite, group in suite_tests.items():
         live_est = est_table.get(suite, {})
-        total = 0.0
-        for t in group:
-            relpath = os.path.relpath(t.filename, repo_root)
-            total += live_est.get(relpath, t.est_time)
+        file_ests = [
+            live_est.get(os.path.relpath(t.filename, repo_root), t.est_time)
+            for t in group
+        ]
+        total = sum(file_ests)
 
         fit = fit_table.get(suite) or {}
         coeff = fit.get("coeff", 1.0)
@@ -191,14 +193,26 @@ def compute_partitions(
                     "Investigate the fit or raise the stage's run_timeout_minutes."
                 )
             ideal_size = math.ceil(coeff * total / budget)
-            # ideal_size > len(group) -> slowest single file alone exceeds
-            # the per-shard budget; surface via raise instead of empty shard.
+            # One file per shard is the finest split, and LPT's 0.75 margin is moot
+            # then; raise only when a lone file's fitted wall time exceeds the timeout.
             if ideal_size > len(group):
-                raise RuntimeError(
-                    f"Suite {suite!r}: needs {ideal_size} shards but has only "
-                    f"{len(group)} test file(s). target={target:.0f}s, "
-                    f"coeff={coeff}, bias={bias}s, total_est={total:.0f}s."
+                timeout = run_timeouts[suite] * 60
+                slowest_wall = coeff * max(file_ests) + bias
+                if slowest_wall > timeout:
+                    raise RuntimeError(
+                        f"Suite {suite!r}: needs {ideal_size} shards but has only "
+                        f"{len(group)} test file(s), and its slowest file alone "
+                        f"needs {slowest_wall:.0f}s > timeout={timeout:.0f}s. "
+                        f"coeff={coeff}, bias={bias}s, total_est={total:.0f}s."
+                    )
+                print(
+                    f"::warning::Suite {suite!r}: needs {ideal_size} shards but has "
+                    f"only {len(group)} test file(s); using one shard per file. "
+                    f"Slowest file needs {slowest_wall:.0f}s of the "
+                    f"{timeout:.0f}s timeout (target={target:.0f}s).",
+                    file=sys.stderr,
                 )
+                ideal_size = len(group)
             size = max(1, ideal_size)
             # The throttle rations scarce self-hosted GPU runners; hosted
             # ubuntu-latest is elastic, so capping CPU shards only serializes
