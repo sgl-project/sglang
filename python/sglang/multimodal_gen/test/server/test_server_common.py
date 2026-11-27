@@ -22,10 +22,12 @@ import openai
 import pytest
 import requests
 from openai import OpenAI
+from PIL import ImageOps
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.runtime.utils.vision import load_image
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     RealtimeChunkStats,
     pop_realtime_e2e_ms,
@@ -83,6 +85,7 @@ from sglang.multimodal_gen.test.test_utils import (
     load_consistency_gt,
     save_audio_gt_artifact,
     save_consistency_failure_artifact,
+    save_generated_artifact_images,
     save_missing_consistency_gt_artifact,
     wait_for_req_perf_record,
 )
@@ -945,12 +948,29 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         else:
             output_frames = [image_bytes_to_numpy(content)]
 
-        result = compare_with_gt(
-            output_frames=output_frames,
-            gt_data=gt_data,
-            thresholds=thresholds,
-            case_id=case.id,
-        )
+        try:
+            result = compare_with_gt(
+                output_frames=output_frames,
+                gt_data=gt_data,
+                thresholds=thresholds,
+                case_id=case.id,
+            )
+        except ValueError:
+            # A shape or frame count mismatch can fail before metrics exist.
+            artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
+            if artifact_dir:
+                try:
+                    save_generated_artifact_images(
+                        out_dir=Path(artifact_dir) / "consistency_failures",
+                        case_id=case.id,
+                        num_gpus=num_gpus,
+                        output_frames=output_frames,
+                        is_video=is_video,
+                        output_format="png",
+                    )
+                except (OSError, ValueError):
+                    logger.exception("Could not save generated frames for %s", case.id)
+            raise
 
         if not result.passed:
             failed_frames = []
@@ -1910,6 +1930,19 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                     diffusion_server, case, perf_record, request_index
                 ),
             )
+
+        if case.min_input_first_frame_psnr is not None:
+
+            def check_first_frame():
+                frame = extract_key_frames_from_video(content)[0]
+                source = load_image(str(case.sampling_params.image_path))
+                reference = ImageOps.fit(source, (frame.shape[1], frame.shape[0]))
+                psnr = compute_psnr(frame, np.asarray(reference))
+                assert psnr >= case.min_input_first_frame_psnr, (
+                    f"input vs first frame: {psnr:.2f} dB, expected >= {case.min_input_first_frame_psnr} dB"
+                )
+
+            run_case_check("first-frame conditioning", check_first_frame)
 
         if case.server_args.custom_validator == "mesh":
             from sglang.multimodal_gen.test.server.test_server_utils import (

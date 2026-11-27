@@ -1515,6 +1515,10 @@ available for EAGLE3 and NEXTN with `--speculative-use-rejection-sampling` and r
 `--speculative-eagle-topk 1`. Rejection sampling uses the draft proposal distribution and cannot be combined with
 non-default speculative acceptance thresholds or deterministic inference.
 
+Kimi K3.1 additionally supports DFLASH speculative decoding. The DFLASH sliding-window draft layers run through the
+ascend draft attention backend, which expresses each per-layer window as an attention band, and idle DP attention ranks
+replay the active ranks' verify graph instead of forcing an eager fallback.
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "16.7%"}} />

@@ -12,6 +12,7 @@ from sglang.kernels.arch._cuda import CudaArch
 from sglang.kernels.arch._hip import HipArch
 from sglang.kernels.arch.base import DeviceArch
 from sglang.kernels.ops.gemm import bf16_fp32, hopper_bf16_gemv
+from sglang.kernels.ops.moe import inkling2_moe_lowm_sm120
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -97,6 +98,33 @@ def test_hopper_bf16_gemv_sm12x_tuning_is_family_12_only(fake_arch, arch, expect
     not inherit them through a ``major >= 12`` test."""
     fake_arch(arch)
     assert hopper_bf16_gemv._is_sm12x() is expected
+
+
+@pytest.mark.parametrize(
+    "arch,expected",
+    [
+        ("sm90", False),
+        ("sm100", False),
+        ("sm120", True),
+        ("sm121", True),
+        ("sm130", False),
+        ("gfx950", False),
+        ("cpu", False),
+    ],
+)
+def test_inkling2_low_m_moe_is_family_12_only(fake_arch, arch, expected):
+    """The low-M MoE kernels are SM12x-only JIT sources: every other
+    architecture has to stay on its general expert path."""
+    fake_arch(arch)
+    usable = inkling2_moe_lowm_sm120.can_use_lowm_moe(
+        tokens=8,
+        experts=128,
+        top_k=8,
+        hidden_size=2304,
+        intermediate_size=1152,
+        device=torch.device("cuda"),
+    )
+    assert usable is expected
 
 
 if __name__ == "__main__":

@@ -1020,12 +1020,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if not _is_hip:
                 return False
             if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
-                max_kv_len = int(fb.seq_lens_cpu.max().item())
+                batch_max_kv_len = int(fb.seq_lens_cpu.max().item())
             elif fb.seq_lens is not None and fb.seq_lens.numel() > 0:
-                max_kv_len = int(fb.seq_lens.max().item())
+                batch_max_kv_len = int(fb.seq_lens.max().item())
             else:
                 return False
-            return max_kv_len <= self.index_topk
+            return batch_max_kv_len <= self.index_topk
 
         return False
 
