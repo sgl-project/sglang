@@ -152,6 +152,7 @@ def _breakable_qsa_indexer(layer, hidden_states, positions, output):
         hidden_states=hidden_states,
         positions=positions,
         forward_batch=forward_batch,
+        out=output,
     )
     if output is None:
         # Separate buffers cost up to buckets * max_tokens * block_topk * 4B * QSA
@@ -159,8 +160,11 @@ def _breakable_qsa_indexer(layer, hidden_states, positions, output):
         # shared. Graphs captured on a smaller bridge keep writing and reading it.
         output = topk.new_empty((hidden_states.shape[0], topk.shape[1]))
         layer._qsa_prefill_topk_bridges.insert(0, output)
-    output.fill_(0)
-    output[: topk.shape[0]].copy_(topk)
+        output[: topk.shape[0]].copy_(topk)
+    elif topk.data_ptr() != output.data_ptr():
+        output[: topk.shape[0]].copy_(topk)
+    if topk.shape[0] < output.shape[0]:
+        output[topk.shape[0] :].zero_()
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -199,6 +203,7 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     query_start_loc: torch.Tensor | None
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+    all_tokens_valid: bool = False
 
 
 class _BreakablePLEBatch:
@@ -238,16 +243,18 @@ def _breakable_ple_forward(ple, hidden_states, batch, output):
         ple.forward_idle(forward_batch)
         output.copy_(hidden_states)
         return
-    # PLE pads its output to the token bucket after applying the live layout.
-    torch.add(
-        hidden_states,
-        ple(
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            batch=batch.batch,
-        ),
-        out=output,
+    # Add directly over the processed prefix and copy untouched padding rows
+    # instead of allocating a full-bucket zero-padded delta tensor.
+    delta = ple(
+        hidden_states=hidden_states,
+        forward_batch=forward_batch,
+        batch=batch.batch,
+        pad_to_physical=False,
     )
+    n = delta.shape[0]
+    torch.add(hidden_states[:n], delta, out=output[:n])
+    if n < output.shape[0]:
+        output[n:].copy_(hidden_states[n:])
 
 
 @eager_on_graph(True)
@@ -353,13 +360,26 @@ def _prepare_ple_batch(
         token_offsets = positions - query_start_loc.index_select(0, req_indices)
 
     sequence_count = lengths.shape[0]
+    all_tokens_valid = False
     if use_decode_fast_path:
         # One token per decode row: every offset is valid, no index-select needed.
+        all_tokens_valid = True
         valid_tokens = torch.ones(
             processed_tokens, dtype=torch.bool, device=tokens.device
         )
     else:
-        valid_tokens = token_offsets < lengths.index_select(0, req_indices)
+        if (
+            not mode.is_target_verify()
+            and not mode.is_decode()
+            and forward_batch.extend_seq_lens_cpu is not None
+            and sum(forward_batch.extend_seq_lens_cpu) == processed_tokens
+        ):
+            all_tokens_valid = True
+            valid_tokens = torch.ones(
+                processed_tokens, dtype=torch.bool, device=tokens.device
+            )
+        else:
+            valid_tokens = token_offsets < lengths.index_select(0, req_indices)
 
     # The forward's resolved slots: the request table may already be reused here.
     # Graph replay marks padded rows -1; the clamp sends them to dummy slot 0.
@@ -378,7 +398,7 @@ def _prepare_ple_batch(
             state_indices = torch.where(
                 out_cache_loc[:sequence_count].ne(0),
                 state_indices,
-                torch.zeros_like(state_indices),
+                0,
             )
     else:
         valid = lengths.ne(0)
@@ -388,9 +408,7 @@ def _prepare_ple_batch(
             valid = valid & out_cache_loc[:processed_tokens].reshape(
                 sequence_count, row_width
             ).ne(0).any(dim=1)
-        state_indices = torch.where(
-            valid, state_indices, torch.zeros_like(state_indices)
-        )
+        state_indices = torch.where(valid, state_indices, 0)
 
     ngram_context = None
     if ngram_size is not None:
@@ -399,14 +417,19 @@ def _prepare_ple_batch(
             # One token per decode row:
             # this view is the padded tensor the general path would materialize.
             padded = tokens.unsqueeze(1)
+        elif all_tokens_valid and sequence_count == 1 and row_width == processed_tokens:
+            padded = tokens.unsqueeze(0)
         else:
             padded = tokens.new_full((sequence_count, row_width), ngram_eos_token_id)
             if processed_tokens:
-                padded[req_indices, token_offsets] = torch.where(
-                    valid_tokens,
-                    tokens,
-                    tokens.new_full((), ngram_eos_token_id),
-                )
+                if all_tokens_valid:
+                    padded[req_indices, token_offsets] = tokens
+                else:
+                    padded[req_indices, token_offsets] = torch.where(
+                        valid_tokens,
+                        tokens,
+                        tokens.new_full((), ngram_eos_token_id),
+                    )
         # Read once, before the layer loop: wait for the layer whose host
         # load-back restores the context.
         router = get_token_to_kv_pool().layer_router
@@ -433,6 +456,7 @@ def _prepare_ple_batch(
         query_start_loc=packed_query_start_loc,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
+        all_tokens_valid=all_tokens_valid,
     )
 
 
@@ -833,8 +857,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     def _hash_contexts(
         self, contexts: torch.Tensor, *, decode_sized: bool = False
     ) -> torch.Tensor:
+        del decode_sized
         contexts = contexts.to(torch.long)
-        if self.enable_ple_fusion and decode_sized:
+        if self.enable_ple_fusion:
             from sglang.kernels.ops.embeddings.qwen4_ngram import (
                 can_fuse_qwen4_ngram_hash,
                 fused_qwen4_ngram_hash,
@@ -1534,6 +1559,8 @@ class Qwen4ExpPLELayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         batch: _PLEBatch,
+        *,
+        pad_to_physical: bool = True,
     ) -> torch.Tensor:
         sp_active = layernorm_sp.runs_sp(_get_ple_forward_mode(forward_batch))
         hidden_rows = hidden_states.shape[0] if sp_active else batch.processed_tokens
@@ -1568,7 +1595,7 @@ class Qwen4ExpPLELayer(nn.Module):
 
         fused_gate_reduce = (
             self.ple_embedding.enable_ple_fusion
-            and batch.mode.is_target_verify()
+            and not batch.use_decode_fast_path
             and can_fuse_qwen4_gate_reduce(key_normed, query_normed, value)
         )
         if fused_gate_reduce:
@@ -1619,7 +1646,11 @@ class Qwen4ExpPLELayer(nn.Module):
             )
             if can_fuse_qwen4_verify_conv(*conv_args):
                 output = fused_qwen4_verify_conv(*conv_args)
-                return _pad_token_rows(output, batch.physical_tokens)
+                return (
+                    _pad_token_rows(output, batch.physical_tokens)
+                    if pad_to_physical
+                    else output
+                )
         if sp_active:
             full_conv_input = layernorm_sp.all_gather_token_rows(
                 gated_value_normed,
@@ -1631,29 +1662,25 @@ class Qwen4ExpPLELayer(nn.Module):
                 _pad_token_rows(conv_output, batch.physical_tokens),
                 group=get_parallel().tp_group,
             )
-            output = gated_value + conv_output
-            if not batch.use_decode_fast_path:
+            output = gated_value.add_(conv_output)
+            if not batch.use_decode_fast_path and not batch.all_tokens_valid:
                 valid_tokens = layernorm_sp.shard_token_rows(
                     _pad_token_rows(
                         batch.valid_tokens.unsqueeze(-1), batch.physical_tokens
                     ),
                     group=get_parallel().tp_group,
                 )
-                output = torch.where(
-                    valid_tokens,
-                    output,
-                    torch.zeros_like(output),
-                )
+                output = torch.where(valid_tokens, output, 0)
             return output
         conv_output = self._short_conv(gated_value_normed, forward_batch, batch)
-        output = gated_value + conv_output
-        if not batch.use_decode_fast_path:
-            output = torch.where(
-                batch.valid_tokens.unsqueeze(-1),
-                output,
-                torch.zeros_like(output),
-            )
-        return _pad_token_rows(output, batch.physical_tokens)
+        output = gated_value.add_(conv_output)
+        if not batch.use_decode_fast_path and not batch.all_tokens_valid:
+            output = torch.where(batch.valid_tokens.unsqueeze(-1), output, 0)
+        return (
+            _pad_token_rows(output, batch.physical_tokens)
+            if pad_to_physical
+            else output
+        )
 
 
 class _MixStreams:
@@ -2124,6 +2151,7 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -2152,6 +2180,8 @@ class Qwen4ExpAttentionDecoderLayer(
                 if positions.ndim == 2
                 else forward_batch.positions
             )
+        elif out is not None and _is_cuda:
+            indexer_kwargs["out"] = out
         topk_indices = self.indexer(
             hidden_states,
             positions,

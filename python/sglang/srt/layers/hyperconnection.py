@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
@@ -153,6 +154,8 @@ class GatedResidual(nn.Module):
             self._mix_flydsl_weight_key = None
 
         self._gate_stream = None
+        self._fused_down_gate_weight = None
+        self._jit_combine_logits_ok = False
         if use_combine:
             self.block_inject_weight = nn.Linear(
                 self.hidden_size * self.hc_count,
@@ -164,6 +167,9 @@ class GatedResidual(nn.Module):
             self._jit_combine_ok = (
                 self.hidden_size % 8 == 0
                 and (self.hc_count * self.hidden_size) % 2048 == 0
+            )
+            self._jit_combine_logits_ok = (
+                not _is_npu and use_mix and self.hidden_size % 8 == 0
             )
             vecs = self.hc_count * self.hidden_size // 8
             self._split_combine_ok = (
@@ -200,6 +206,26 @@ class GatedResidual(nn.Module):
             ).mean(dim=-2)
             return output
 
+        def _mix_and_gate_compute(
+            hyper_input_normed: torch.Tensor,
+            fused_down_gate_weight: torch.Tensor,
+            input_mix_weight_up: torch.Tensor,
+            lowrank: int,
+            hc: int,
+            hs: int,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            down_and_gate = F.linear(hyper_input_normed, fused_down_gate_weight)
+            down_out = down_and_gate[:, :lowrank]
+            gate_logits = down_and_gate[:, lowrank : lowrank + hc]
+            input_mix_weight = F.silu(down_out / hc)
+            input_mix_weight = F.linear(input_mix_weight, input_mix_weight_up)
+            input_mix_weight = torch.sigmoid(input_mix_weight)
+            input_mix_weight = input_mix_weight.unflatten(-1, (hc, hs))
+            output = (
+                input_mix_weight * hyper_input_normed.unflatten(-1, (hc, hs))
+            ).mean(dim=-2)
+            return output, gate_logits
+
         def _combine_compute(
             block_output: torch.Tensor,
             residual: torch.Tensor,
@@ -224,7 +250,43 @@ class GatedResidual(nn.Module):
         # TODO: Re-enable after both fresh-cache and cached-restart tests pass
         # on NPU with compatible dependencies.
         self._mix_compute = torch.compile(_mix_compute, disable=_is_npu)
+        self._mix_and_gate_compute = torch.compile(
+            _mix_and_gate_compute, disable=_is_npu
+        )
         self._combine_compute = torch.compile(_combine_compute, disable=_is_npu)
+
+    def _get_fused_down_gate_weight(self) -> torch.Tensor:
+        w_down = self.input_mix_weight_down.weight
+        w_gate = self.block_inject_weight.weight
+        lowrank = w_down.shape[0]
+        hc = w_gate.shape[0]
+        cached = self._fused_down_gate_weight
+        if (
+            cached is not None
+            and cached.device == w_down.device
+            and cached.dtype == w_down.dtype
+            and w_gate.dtype == w_down.dtype
+            and w_down.untyped_storage().data_ptr()
+            == cached.untyped_storage().data_ptr()
+            and w_gate.untyped_storage().data_ptr()
+            == cached.untyped_storage().data_ptr()
+            and w_down.storage_offset() == 0
+            and w_gate.storage_offset() == w_down.numel()
+        ):
+            return cached
+
+        total_out = lowrank + hc
+        padded_out = ((total_out + 15) // 16) * 16
+        fused = w_down.new_zeros((padded_out, w_down.shape[1]))
+        fused[:lowrank].copy_(w_down)
+        fused[lowrank:total_out].copy_(w_gate)
+        if not torch.cuda.is_current_stream_capturing():
+            # Alias both parameter tensors onto the shared backing buffer so
+            # in-place weight hot reloads (param.data.copy_) update `fused`.
+            w_down.data = fused[:lowrank]
+            w_gate.data = fused[lowrank:total_out]
+            self._fused_down_gate_weight = fused
+        return fused
 
     def _flydsl_mix_ok(self) -> bool:
         if self._mix_flydsl_ok is None:
@@ -257,6 +319,7 @@ class GatedResidual(nn.Module):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
+        gate_state = None
         if _is_npu:
             from sgl_kernel_npu.operators.hyper_conn import hc_mix
 
@@ -313,6 +376,29 @@ class GatedResidual(nn.Module):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
+        elif (
+            self._jit_combine_logits_ok
+            and hyper_input_normed.is_cuda
+            and hyper_input_normed.ndim == 2
+            and hyper_input_normed.shape[0] > 256
+            and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
+            and self.input_mix_weight_down.weight.dtype == hyper_input_normed.dtype
+            and self.block_inject_weight.weight.dtype == hyper_input_normed.dtype
+            and not is_batch_invariant_mode_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            # Fuse block_inject_weight into the down-projection TensorCore GEMM
+            # inside the compiled mix graph so combine_and_normalize avoids
+            # re-reading hyper_input_normed on prefill batches.
+            mixed_input, gate_state = self._mix_and_gate_compute(
+                hyper_input_normed,
+                self._get_fused_down_gate_weight(),
+                self.input_mix_weight_up.weight,
+                self.input_mix_weight_down.weight.shape[0],
+                self.hc_count,
+                self.hidden_size,
+            )
+            mixed_input = mixed_input.to(self.params_dtype)
         else:
             mixed_input = self._mix_compute(
                 hyper_input_normed,
@@ -321,10 +407,10 @@ class GatedResidual(nn.Module):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
-        partials = None
         stream = self._gate_stream
         if (
-            stream is not None
+            gate_state is None
+            and stream is not None
             and hyper_input.shape[0] == 1
             and hyper_input.dtype == torch.bfloat16
             and not torch.compiler.is_compiling()
@@ -333,11 +419,38 @@ class GatedResidual(nn.Module):
 
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
-                partials = hc_combine_gate(
+                gate_state = hc_combine_gate(
                     hyper_input_normed, self.block_inject_weight.weight
                 )
             hyper_input_normed.record_stream(stream)
-        return mixed_input, (hyper_input, hyper_input_normed, partials)
+        return mixed_input, (hyper_input, hyper_input_normed, gate_state)
+
+    def _can_use_jit_combine_logits(
+        self,
+        block_output: torch.Tensor,
+        hyper_input: torch.Tensor,
+        gate_state: Optional[torch.Tensor],
+        next_norm: Optional[GroupedGemmaRMSNorm] = None,
+    ) -> bool:
+        if (
+            gate_state is None
+            or gate_state.ndim != 2
+            or block_output.shape[0] == 0
+            or not (block_output.is_contiguous() and hyper_input.is_contiguous())
+            or block_output.dtype != hyper_input.dtype
+            or block_output.dtype != gate_state.dtype
+            or block_output.data_ptr() % 32 != 0
+            or hyper_input.data_ptr() % 32 != 0
+        ):
+            return False
+        if next_norm is not None:
+            return (
+                next_norm.group_size == self.hidden_size
+                and next_norm.weight.dtype == block_output.dtype
+                and next_norm.weight.is_contiguous()
+                and next_norm.weight.data_ptr() % 32 == 0
+            )
+        return True
 
     def combine_and_normalize(
         self,
@@ -350,28 +463,44 @@ class GatedResidual(nn.Module):
         The BF16 combine result is retained before calculating the next norm.
         Callers must only pass the norm when no PLE or other update intervenes.
         """
-        hyper_input, _, partials = residuals
-        if (
-            partials is not None
-            and next_norm is not None
-            and next_norm.group_size == self.hidden_size
-            and next_norm.weight.dtype == torch.bfloat16
-            and block_output.dtype == torch.bfloat16
-        ):
-            from sglang.kernels.ops.elementwise.hc_combine_decode import (
-                hc_combine_apply_norm,
-            )
+        hyper_input, _, gate_state = residuals
+        if gate_state is not None and next_norm is not None:
+            if (
+                gate_state.ndim == 3
+                and next_norm.group_size == self.hidden_size
+                and next_norm.weight.dtype == torch.bfloat16
+                and block_output.dtype == torch.bfloat16
+            ):
+                from sglang.kernels.ops.elementwise.hc_combine_decode import (
+                    hc_combine_apply_norm,
+                )
 
-            current = torch.cuda.current_stream()
-            current.wait_stream(self._gate_stream)
-            partials.record_stream(current)
-            return hc_combine_apply_norm(
-                block_output,
-                hyper_input,
-                partials,
-                next_norm.weight,
-                next_norm.variance_epsilon,
-            )
+                current = torch.cuda.current_stream()
+                current.wait_stream(self._gate_stream)
+                gate_state.record_stream(current)
+                return hc_combine_apply_norm(
+                    block_output,
+                    hyper_input,
+                    gate_state,
+                    next_norm.weight,
+                    next_norm.variance_epsilon,
+                )
+            if self._can_use_jit_combine_logits(
+                block_output, hyper_input, gate_state, next_norm
+            ):
+                from sglang.kernels.ops.elementwise.hc_combine import (
+                    hc_combine_logits_norm,
+                )
+
+                return hc_combine_logits_norm(
+                    block_output,
+                    hyper_input,
+                    gate_state,
+                    next_norm.weight,
+                    next_norm.variance_epsilon,
+                    self.hc_count,
+                    self.hidden_size,
+                )
         return self.combine(block_output, residuals), None
 
     def combine(
@@ -379,20 +508,31 @@ class GatedResidual(nn.Module):
         block_output: torch.Tensor,
         residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
     ) -> torch.Tensor:
-        hyper_input, hyper_input_normed, partials = residuals
-        if partials is not None:
+        hyper_input, hyper_input_normed, gate_state = residuals
+        if gate_state is not None and gate_state.ndim == 3:
             from sglang.kernels.ops.elementwise.hc_combine_decode import (
                 hc_combine_apply,
             )
 
             current = torch.cuda.current_stream()
             current.wait_stream(self._gate_stream)
-            partials.record_stream(current)
-            return hc_combine_apply(block_output, hyper_input, partials)
+            gate_state.record_stream(current)
+            return hc_combine_apply(block_output, hyper_input, gate_state)
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
+
+        if self._can_use_jit_combine_logits(block_output, hyper_input, gate_state):
+            from sglang.kernels.ops.elementwise.hc_combine import hc_combine_logits
+
+            return hc_combine_logits(
+                block_output,
+                hyper_input,
+                gate_state,
+                self.hc_count,
+                self.hidden_size,
+            )
 
         if _is_npu:
             from sgl_kernel_npu.operators.hyper_conn import hc_combine

@@ -316,6 +316,35 @@ class QSAIndexer(MultiPlatformOp):
             self._compress_decode_cuda_graph(metadata)
             return
 
+        # Boundary-crossing groups for unaligned prefixes (e.g. mixed-chunk decode rows)
+        # have their members in the pending ring after the store above.
+        mixed_ring_write_locs = getattr(metadata, "mixed_ring_write_locs", None)
+        mixed_ring_group_locs = getattr(metadata, "mixed_ring_group_locs", None)
+        if (
+            mixed_ring_write_locs is not None
+            and mixed_ring_write_locs.numel() > 0
+            and mixed_ring_group_locs is not None
+        ):
+            if self._use_fused_compress(pool):
+                self._fused_compress_store(
+                    pool,
+                    mixed_ring_group_locs,
+                    mixed_ring_write_locs,
+                )
+            else:
+                ring_locs = mixed_ring_group_locs.long()
+                key_groups = pool.get_qsa_key_state_buffer(self.layer_id)[ring_locs]
+                pooled = average_pool_qsa_keys(key_groups)
+                compressed_rope_positions = self._rope_from_matrix(
+                    pool.qsa_rope_position_buffer[ring_locs[:, 0]]
+                )
+                normalized = self.normalize_compressed_keys(
+                    pooled, compressed_rope_positions
+                )
+                pool.set_qsa_compressed_k_buffer(
+                    self.layer_id, mixed_ring_write_locs, normalized
+                )
+
         if metadata.write_locs is None:
             raise RuntimeError(
                 "QSA metadata is missing the precomputed write plan; the "
@@ -323,17 +352,23 @@ class QSAIndexer(MultiPlatformOp):
             )
         if metadata.write_locs.numel() == 0:
             return
-        group_end_positions = metadata.compress_group_positions.long()
-        compressed_locs = metadata.write_locs
+        write_locs_int32 = getattr(metadata, "write_locs_int32", None)
+        compressed_locs = (
+            write_locs_int32 if write_locs_int32 is not None else metadata.write_locs
+        )
         if is_extend:
             # Extend chunks are group-aligned; each planned group lies in this forward,
             # so read its members from the packed chunk tensors.
-            member_rows = metadata.compress_member_rows.long()
-            group_locs = member_rows[:, None] + torch.arange(
-                self.compress_ratio, device=member_rows.device, dtype=torch.long
-            )
             source_keys = token_k
-            group_locs = group_locs.clamp_max(source_keys.shape[0] - 1)
+            prefill_group_locs = getattr(metadata, "prefill_compress_group_locs", None)
+            if prefill_group_locs is not None:
+                group_locs = prefill_group_locs
+            else:
+                member_rows = metadata.compress_member_rows.long()
+                group_locs = member_rows[:, None] + torch.arange(
+                    self.compress_ratio, device=member_rows.device, dtype=torch.long
+                )
+                group_locs = group_locs.clamp_max(source_keys.shape[0] - 1)
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:
                 source_rope = build_rope_position_matrix(
@@ -344,6 +379,7 @@ class QSAIndexer(MultiPlatformOp):
             # group each; its members are exactly the pending ring window.
             group_locs = metadata.compress_group_ring_locs
             if group_locs is None:
+                group_end_positions = metadata.compress_group_positions.long()
                 group_locs = self._group_ring_slots(
                     metadata,
                     group_end_positions,
@@ -360,10 +396,11 @@ class QSAIndexer(MultiPlatformOp):
                 source_rope=source_rope,
             )
             return
-        key_groups = source_keys[group_locs]
+        group_locs_long = group_locs.long()
+        key_groups = source_keys[group_locs_long]
         pooled = average_pool_qsa_keys(key_groups)
         compressed_rope_positions = self._rope_from_matrix(
-            source_rope[group_locs[:, 0]]
+            source_rope[group_locs_long[:, 0]]
         )
         normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
         pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
@@ -433,6 +470,14 @@ class QSAIndexer(MultiPlatformOp):
         )
         return torch.cat([rotated, tensor[..., rotary_dim:]], dim=-1)
 
+    @staticmethod
+    def prefill_min_scored_len(block_topk: int) -> int:
+        # fast_topk (k = 512) writes 0..length-1 for rows that fit k without
+        # reading their scores, and reads nothing past a row's length.
+        if block_topk == 512 and not is_batch_invariant_mode_enabled():
+            return block_topk
+        return 0
+
     def select_prefill_tokens(
         self,
         q: torch.Tensor,
@@ -442,6 +487,9 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths_for_rows: torch.Tensor,
         max_row_keys: Optional[int] = None,
+        *,
+        out: Optional[torch.Tensor] = None,
+        prefill_row_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Top-k token selection for packed prefill rows.
 
@@ -453,13 +501,11 @@ class QSAIndexer(MultiPlatformOp):
         top-k reads only each row's own section and returns indices relative to
         the row's start either way."""
         rows = q.shape[0]
-        output = torch.empty(
-            (rows, self.token_topk + self.compress_ratio - 1),
-            dtype=torch.int32,
-            device=q.device,
-        )
+        final_topk = self.token_topk + self.compress_ratio - 1
         if rows == 0:
-            return output
+            if out is not None:
+                return out[:0]
+            return torch.empty((0, final_topk), dtype=torch.int32, device=q.device)
 
         relative = (
             not _is_npu
@@ -468,11 +514,21 @@ class QSAIndexer(MultiPlatformOp):
             and q.is_cuda
             and HAS_TILELANG
         )
+        min_scored_len = self.prefill_min_scored_len(self.block_topk)
+        use_fast_topk = relative and min_scored_len > 0
         row_chunk_size = _qsa_prefill_row_chunk_size(
             rows,
             max_row_keys if relative else compressed_keys.shape[0],
             q.shape[1],
         )
+        single_chunk = row_chunk_size >= rows
+        output = out
+        if output is None and not single_chunk:
+            output = torch.empty(
+                (rows, final_topk),
+                dtype=torch.int32,
+                device=q.device,
+            )
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
             chunk_slice = slice(row_start, row_end)
@@ -486,20 +542,37 @@ class QSAIndexer(MultiPlatformOp):
                 logits = None
             elif relative:
                 chunk_starts = row_starts[chunk_slice]
-                chunk_lengths = row_ends[chunk_slice] - chunk_starts
+                if prefill_row_lengths is not None:
+                    chunk_lengths = prefill_row_lengths[chunk_slice]
+                else:
+                    chunk_lengths = (row_ends[chunk_slice] - chunk_starts).to(
+                        device=q.device, dtype=torch.int32
+                    )
                 logits = qsa_mqa_prefill_relative(
                     q[chunk_slice],
                     compressed_keys,
                     chunk_starts,
                     row_ends[chunk_slice],
                     max_row_keys,
+                    None,
+                    min_scored_len if use_fast_topk else 0,
                 )
-                block_indices = qsa_fast_topk(
-                    logits,
-                    torch.zeros_like(chunk_starts),
-                    chunk_lengths,
-                    topk=self.block_topk,
-                )
+                if use_fast_topk:
+                    from sglang.kernels.ops.attention.fast_topk import fast_topk
+
+                    block_indices = fast_topk(
+                        logits,
+                        chunk_lengths,
+                        topk=self.block_topk,
+                        row_starts=None,
+                    )
+                else:
+                    block_indices = qsa_fast_topk(
+                        logits,
+                        torch.zeros_like(chunk_starts),
+                        chunk_lengths,
+                        topk=self.block_topk,
+                    )
             else:
                 logits = qsa_mqa_prefill(
                     q[chunk_slice],
@@ -513,14 +586,17 @@ class QSAIndexer(MultiPlatformOp):
                     row_ends[chunk_slice],
                     topk=self.block_topk,
                 )
+            chunk_out = output[chunk_slice] if output is not None else None
             selected = expand_qsa_block_indices(
                 block_indices,
                 query_positions[chunk_slice],
                 sequence_lengths_for_rows[chunk_slice],
                 compress_ratio=self.compress_ratio,
                 token_topk=self.token_topk,
+                out=chunk_out,
             )
-            output[chunk_slice].copy_(selected)
+            if single_chunk:
+                return selected
             del logits, block_indices, selected
         return output
 
@@ -673,6 +749,7 @@ class QSAIndexer(MultiPlatformOp):
         forward_batch,
         indexer_metadata,
         cp_global_rope_positions: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Portable orchestration shared by different platforms.
         Fast paths are gated per platforms inside kernel calls.
@@ -739,21 +816,22 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
+        is_decode_or_spec = (
+            forward_mode.is_decode() or is_target_verify or is_draft_extend
+        )
         # The tilelang decode MQA kernel needs query heads in multiples of 8.
-        q_heads_padded = ((self.index_n_heads + 7) // 8) * 8
-        if is_gfx95_supported():
-            # Pad to the kernel's 16-wide MFMA here so the decode wrapper need not copy Q.
-            q_heads_padded = ((self.index_n_heads + 15) // 16) * 16
+        q_heads_padded = None
+        if is_decode_or_spec:
+            q_heads_padded = ((self.index_n_heads + 7) // 8) * 8
+            if is_gfx95_supported():
+                # Pad to the kernel's 16-wide MFMA here so the decode wrapper need not copy Q.
+                q_heads_padded = ((self.index_n_heads + 15) // 16) * 16
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,
             pool=indexer_metadata.token_to_kv_pool,
             cache_loc=state_slots,
-            q_heads_padded=(
-                q_heads_padded
-                if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
-                else None
-            ),
+            q_heads_padded=q_heads_padded,
         )
         self.update_key_state_and_compress(
             token_k,
@@ -763,7 +841,7 @@ class QSAIndexer(MultiPlatformOp):
             state_slots=state_slots,
             state_stored=state_stored,
         )
-        if forward_mode.is_decode() or is_target_verify or is_draft_extend:
+        if is_decode_or_spec:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
             )
@@ -781,9 +859,18 @@ class QSAIndexer(MultiPlatformOp):
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
         )
-        query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
-        row_sequence_lengths = sequence_lengths.index_select(
-            0, query_sequence_ids.long()
+        row_sequence_lengths = getattr(
+            indexer_metadata, "prefill_row_sequence_lengths", None
+        )
+        if row_sequence_lengths is None:
+            query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
+            row_sequence_lengths = sequence_lengths.index_select(
+                0, query_sequence_ids.long()
+            )
+        prefill_out = (
+            out[:num_valid_tokens]
+            if out is not None and out.shape[0] >= num_valid_tokens
+            else None
         )
         return self.select_prefill_tokens(
             q,
@@ -795,6 +882,8 @@ class QSAIndexer(MultiPlatformOp):
             max_row_keys=indexer_metadata.prefill_max_row_keys(
                 getattr(forward_batch, "seq_lens_cpu", None)
             ),
+            out=prefill_out,
+            prefill_row_lengths=getattr(indexer_metadata, "prefill_row_lengths", None),
         )
 
     def forward_cuda(
@@ -804,7 +893,17 @@ class QSAIndexer(MultiPlatformOp):
         forward_batch,
         indexer_metadata,
         cp_global_rope_positions: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if out is not None:
+            return self._forward_impl(
+                hidden_states,
+                positions,
+                forward_batch,
+                indexer_metadata,
+                cp_global_rope_positions,
+                out=out,
+            )
         return self._forward_impl(
             hidden_states,
             positions,

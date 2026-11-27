@@ -674,6 +674,8 @@ def fused_qkv_split_gdn_prefill_kernel(
     BLOCK_V: tl.constexpr,
     FUSE_GATING: tl.constexpr,
     BLOCK_GATE_HEADS: tl.constexpr,
+    HAS_TOKEN_INDICES: tl.constexpr = True,
+    EXP_G: tl.constexpr = False,
 ):
     i_t = tl.program_id(0).to(tl.int64)
     offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
@@ -752,7 +754,10 @@ def fused_qkv_split_gdn_prefill_kernel(
         tl.store(v + i_t * v_dim + v_offsets, values, mask=v_mask)
 
     if FUSE_GATING:
-        source_token = tl.load(token_indices + i_t).to(tl.int64)
+        if HAS_TOKEN_INDICES:
+            source_token = tl.load(token_indices + i_t).to(tl.int64)
+        else:
+            source_token = i_t
         gate_heads = tl.arange(0, BLOCK_GATE_HEADS).to(tl.int64)
         gate_mask = gate_heads < NUM_V_HEADS
         gate_a = tl.load(
@@ -772,6 +777,8 @@ def fused_qkv_split_gdn_prefill_kernel(
         gate_g, gate_beta = _gdn_gating_values(
             gate_A_log, gate_a, gate_b, gate_bias, 1.0, 20.0
         )
+        if EXP_G:
+            gate_g = tl.exp(gate_g)
         tl.store(g + i_t * NUM_V_HEADS + gate_heads, gate_g, mask=gate_mask)
         # Standalone gating rounds sigmoid to b's dtype before the FP32 store.
         tl.store(
@@ -828,15 +835,19 @@ def fused_qkv_gating_gdn_prefill(
     a: torch.Tensor,
     b: torch.Tensor,
     dt_bias: torch.Tensor,
-    token_indices: torch.Tensor,
+    token_indices: torch.Tensor | None = None,
+    exp_g: bool = False,
 ):
-    """Split/normalize post-conv QKV and compute mapped gates in one Triton launch.
+    """Split/normalize post-conv QKV and compute gates in one Triton launch.
 
     QKV has compact [T, Q + K + V] rows; gates have [source_T, Hv] rows.
-    Device int32/int64 indices map each compact row to an in-range source
-    gate row. CUDA/HIP callers retain the split's <=8192 channel gate.
-    Strided inputs are supported. Outputs are contiguous Q/K/V plus FP32 g/beta,
-    with sigmoid rounded through b's dtype as in standalone gating.
+    When ``token_indices`` is given, device int32/int64 indices map each compact
+    row to an in-range source gate row; when ``None``, ``source_T`` must match
+    ``T`` and rows are indexed directly. When ``exp_g=True``, ``g`` stores
+    ``exp(gate_g)`` directly (matching FlashInfer's ``alpha`` input). CUDA/HIP
+    callers retain the split's <=8192 channel gate. Strided inputs are
+    supported. Outputs are contiguous Q/K/V plus FP32 g/beta, with sigmoid
+    rounded through b's dtype as in standalone gating.
     """
     if (
         mixed_qkv.ndim != 2
@@ -856,7 +867,12 @@ def fused_qkv_gating_gdn_prefill(
             torch.float32,
         ):
             raise ValueError("GDN preparation requires same-device floating inputs")
-    if (
+    if token_indices is None:
+        if a.shape[0] != mixed_qkv.shape[0]:
+            raise ValueError(
+                "GDN preparation without token_indices requires matching token counts"
+            )
+    elif (
         token_indices.shape != (mixed_qkv.shape[0],)
         or token_indices.device != mixed_qkv.device
         or token_indices.dtype not in (torch.int32, torch.int64)
@@ -874,6 +890,7 @@ def fused_qkv_gating_gdn_prefill(
         normalize_qk=True,
         gating=(A_log, a, b, dt_bias),
         token_indices=token_indices,
+        exp_g=exp_g,
     )
 
 
@@ -889,6 +906,7 @@ def _prepare_gdn_prefill(
     normalize_qk: bool,
     gating: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     token_indices: torch.Tensor | None = None,
+    exp_g: bool = False,
 ):
     seq_len = mixed_qkv.shape[0]
     q = torch.empty(
@@ -952,6 +970,8 @@ def _prepare_gdn_prefill(
         BLOCK_V=triton.next_power_of_2(num_v_heads * head_v),
         FUSE_GATING=gating is not None,
         BLOCK_GATE_HEADS=triton.next_power_of_2(num_v_heads),
+        HAS_TOKEN_INDICES=token_indices is not None,
+        EXP_G=exp_g,
         num_warps=8,
         num_stages=3,
     )

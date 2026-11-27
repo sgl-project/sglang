@@ -19,6 +19,7 @@ from sglang.kernels.ops.mamba.gdn_prefill_track import (
     gdn_track_conv_window,
     gdn_track_ssm_state,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -742,6 +743,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if get_exec().mamba.enable_mamba_extra_buffer
             else 0
         )
+        device = torch.device(self.device)
+        io_dtype = self._model_runner.dtype
+        state_indices_dtype = self._translate_mamba_indices(
+            torch.zeros(1, dtype=torch.int32, device=device)
+        ).dtype
         tic = time.perf_counter()
         num_runs = sum(
             kernel.prewarm_extend(
@@ -749,13 +755,183 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 num_v_heads=num_v_heads,
                 head_k_dim=head_k_dim,
                 head_v_dim=head_v_dim,
-                io_dtype=self._model_runner.dtype,
+                io_dtype=io_dtype,
                 pool_state_dtype=self.state_pool.mamba_cache.temporal.dtype,
                 checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-                device=torch.device(self.device),
+                device=device,
+                state_indices_dtype=state_indices_dtype,
             )
             for num_qk_heads, num_v_heads, head_k_dim, head_v_dim in geometries
         )
+        # Also prewarm the Triton prefill helpers (causal_conv1d_fn and fused
+        # QKV+gating+norm) so serving batches do not stall on lazy Triton JIT.
+        conv_prewarmed = {}
+        prep_prewarmed = set()
+        conv_state_len = self.conv_states_shape[-1]
+        conv_state_dtype = self.state_pool.mamba_cache.conv[0].dtype
+        for layer in model.modules():
+            if not isinstance(layer, RadixLinearAttention):
+                continue
+            qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+            conv_key = (
+                qkv_dim,
+                tuple(layer.conv_weights.shape),
+                layer.conv_weights.dtype,
+                layer.bias is not None,
+                layer.activation,
+            )
+            if conv_key not in conv_prewarmed:
+                conv_pool = self.state_layer_cache(layer.layer_id).conv[0]
+                if conv_pool.stride(1) == 1:
+                    conv_states_tmp = torch.zeros(
+                        (2, conv_state_len, qkv_dim),
+                        dtype=conv_state_dtype,
+                        device=device,
+                    ).transpose(1, 2)
+                else:
+                    conv_states_tmp = torch.zeros(
+                        (2, qkv_dim, conv_state_len),
+                        dtype=conv_state_dtype,
+                        device=device,
+                    )
+                conv_fn = (
+                    causal_conv1d_fn_triton
+                    if not conv_states_tmp.is_contiguous() and not is_cpu()
+                    else causal_conv1d_fn
+                )
+                has_init = torch.zeros((1,), dtype=torch.bool, device=device)
+                cache_idx = torch.ones((1,), dtype=state_indices_dtype, device=device)
+                conv_outs = {}
+                # Warm both cu_seqlen % 16 == 0 and != 0 (Triton divisibility
+                # specialization) and both block_table=None / non-None.
+                for seq_len in (64, 65):
+                    mixed_tmp = torch.zeros(
+                        (seq_len, qkv_dim), dtype=io_dtype, device=device
+                    )
+                    cu_q = torch.tensor(
+                        [0, seq_len], dtype=torch.int32, device=device
+                    )
+                    conv_out = conv_fn(
+                        mixed_tmp.transpose(0, 1),
+                        layer.conv_weights,
+                        layer.bias,
+                        activation=layer.activation,
+                        conv_states=conv_states_tmp,
+                        has_initial_state=has_init,
+                        cache_indices=cache_idx,
+                        query_start_loc=cu_q,
+                        seq_lens_cpu=[seq_len],
+                    ).transpose(0, 1)[:seq_len]
+                    conv_outs[seq_len] = conv_out
+                    num_blocks = (
+                        seq_len + CAUSAL_CONV1D_FWD_BLOCK_M - 1
+                    ) // CAUSAL_CONV1D_FWD_BLOCK_M
+                    block_table = torch.tensor(
+                        [[0, b] for b in range(num_blocks)],
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    conv_fn(
+                        mixed_tmp.transpose(0, 1),
+                        layer.conv_weights,
+                        layer.bias,
+                        activation=layer.activation,
+                        conv_states=conv_states_tmp,
+                        has_initial_state=has_init,
+                        cache_indices=cache_idx,
+                        query_start_loc=cu_q,
+                        seq_lens_cpu=[seq_len],
+                        block_table=block_table,
+                    )
+                conv_prewarmed[conv_key] = conv_outs
+            if (is_cuda() or _is_hip) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+                prep_key = (
+                    layer.num_q_heads,
+                    layer.num_k_heads,
+                    layer.num_v_heads,
+                    layer.head_q_dim,
+                    layer.head_k_dim,
+                    layer.head_v_dim,
+                    layer.A_log.dtype,
+                    layer.dt_bias.dtype,
+                )
+                if prep_key not in prep_prewarmed:
+                    prep_prewarmed.add(prep_key)
+                    conv_outs = conv_prewarmed[conv_key]
+                    # Match production post-conv QKV strides and both strided
+                    # [T, 2*Hv] projection views and contiguous [T, Hv] gates.
+                    for seq_len in (64, 65):
+                        mixed_post_conv = conv_outs[seq_len]
+                        ba_packed = torch.zeros(
+                            (seq_len, 2 * layer.num_v_heads),
+                            dtype=io_dtype,
+                            device=device,
+                        )
+                        b_strided = ba_packed[:, : layer.num_v_heads]
+                        a_strided = ba_packed[:, layer.num_v_heads :]
+                        a_contig = torch.zeros(
+                            (seq_len, layer.num_v_heads),
+                            dtype=io_dtype,
+                            device=device,
+                        )
+                        b_contig = torch.zeros_like(a_contig)
+                        for a_tmp, b_tmp in (
+                            (a_strided, b_strided),
+                            (a_contig, b_contig),
+                        ):
+                            fused_qkv_gating_gdn_prefill(
+                                mixed_post_conv,
+                                layer.num_q_heads,
+                                layer.num_k_heads,
+                                layer.num_v_heads,
+                                layer.head_q_dim,
+                                layer.head_k_dim,
+                                layer.head_v_dim,
+                                A_log=layer.A_log,
+                                a=a_tmp,
+                                b=b_tmp,
+                                dt_bias=layer.dt_bias,
+                                token_indices=None,
+                                exp_g=kernel.wants_exp_g,
+                            )
+        # Prewarm gated RMSNorm (_layer_norm_fwd_1pass_kernel) across rows_per_block buckets,
+        # covering both 2D contiguous z and 3D strided prefill z (Z_IS_3D=True).
+        from sglang.kernels.ops.attention.fla.layernorm_gated import (
+            RMSNorm as RMSNormGated,
+        )
+
+        norm_prewarmed = set()
+        first_v_heads = next((g[1] for g in geometries), 1)
+        for module in model.modules():
+            if isinstance(module, RMSNormGated) and module.weight is not None:
+                dim = module.weight.shape[0]
+                norm_key = (
+                    dim,
+                    module.weight.dtype,
+                    module.bias is not None,
+                    module.group_size,
+                    module.norm_before_gate,
+                    module.activation,
+                )
+                if norm_key not in norm_prewarmed:
+                    norm_prewarmed.add(norm_key)
+                    for n_tok in (1, 16, 64, 256):
+                        m_rows = n_tok * first_v_heads
+                        x_tmp = torch.zeros((m_rows, dim), dtype=io_dtype, device=device)
+                        z_2d = torch.zeros_like(x_tmp)
+                        module(x_tmp, z_2d)
+                        # Strided 3D z slice mimicking projected_states_qkvz[..., -nv*D:].
+                        z_parent = torch.zeros(
+                            (n_tok, (first_v_heads + 1) * dim),
+                            dtype=io_dtype,
+                            device=device,
+                        )
+                        z_3d = z_parent[:, : first_v_heads * dim].view(
+                            n_tok, first_v_heads, dim
+                        )
+                        module(x_tmp, z_3d)
+        if conv_prewarmed or prep_prewarmed or norm_prewarmed:
+            torch.cuda.current_stream(device).synchronize()
         if num_runs:
             rank0_log(
                 f"Prewarmed FlashInfer GDN prefill with {num_runs} runs in "
@@ -952,6 +1128,52 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     ),
                 )
         self._init_prefill_conv_block_table(forward_batch)
+        self._init_prefill_batch_cache(forward_batch)
+
+    def _init_prefill_batch_cache(self, forward_batch: ForwardBatch) -> None:
+        metadata = self.forward_metadata
+        metadata.query_start_loc_i64 = None
+        metadata.extend_has_initial_state = None
+        metadata.max_extend_seq_len = None
+        metadata.can_use_direct_state_indices = False
+        if (
+            forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            or self.mis_metadata is not None
+        ):
+            return
+        if (
+            self.kernel_dispatcher.extend_kernel.wants_int64_query_start_loc
+            and metadata.query_start_loc is not None
+        ):
+            metadata.query_start_loc_i64 = metadata.query_start_loc.to(torch.int64)
+        if forward_batch.extend_prefix_lens is not None:
+            metadata.extend_has_initial_state = forward_batch.extend_prefix_lens > 0
+        bs = (
+            metadata.query_start_loc.numel() - 1
+            if metadata.query_start_loc is not None
+            else 0
+        )
+        seq_lens = forward_batch.extend_seq_lens_cpu
+        if (
+            seq_lens
+            and len(seq_lens) == bs
+            and forward_batch.tbo_parent_token_range is None
+        ):
+            metadata.max_extend_seq_len = max(seq_lens)
+        req_ids_cpu = getattr(forward_batch, "req_pool_indices_cpu", None)
+        if (
+            bs > 0
+            and req_ids_cpu is not None
+            and req_ids_cpu.numel() == bs
+            and forward_batch.tbo_parent_token_range is None
+            and getattr(forward_batch, "num_padding", 0) in (0, None)
+        ):
+            req_ids = req_ids_cpu.tolist()
+            # Every real request has a distinct req_pool_idx > 0 (slot 0 is the
+            # reserved padding sink) and owns a distinct positive mamba slot.
+            metadata.can_use_direct_state_indices = (
+                all(r > 0 for r in req_ids) and len(set(req_ids)) == bs
+            )
 
     def _init_prefill_conv_block_table(self, forward_batch: ForwardBatch) -> None:
         metadata = self.forward_metadata
@@ -1319,13 +1541,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if not conv_states.is_contiguous() and not is_cpu()
             else causal_conv1d_fn
         )
+        has_initial_state = self.forward_metadata.extend_has_initial_state
+        if has_initial_state is None:
+            has_initial_state = forward_batch.extend_prefix_lens > 0
         return conv_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
             layer.bias,
             activation=layer.activation,
             conv_states=conv_states,
-            has_initial_state=forward_batch.extend_prefix_lens > 0,
+            has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=self.forward_metadata.query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
@@ -1554,7 +1779,37 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        use_fused_qkv_gating = (
+            not is_target_verify
+            and (is_cuda() or _is_hip)
+            and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+            and not extend_kernel.defers_prefill_gates
+            and extend_kernel.supports_pre_normalized_qk
+            and not is_batch_invariant_mode_enabled()
+        )
+        qk_normalized = False
+        g_is_exp = False
+        g = beta = None
+        if use_fused_qkv_gating:
+            g_is_exp = extend_kernel.wants_exp_g
+            query, key, value, g, beta = fused_qkv_gating_gdn_prefill(
+                mixed_qkv,
+                layer.num_q_heads,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_q_dim,
+                layer.head_k_dim,
+                layer.head_v_dim,
+                A_log=layer.A_log,
+                a=a,
+                b=b,
+                dt_bias=layer.dt_bias,
+                token_indices=None,
+                exp_g=g_is_exp,
+            )
+            qk_normalized = True
+        elif (
             (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and not self._use_strided_target_verify_qkv
@@ -1639,10 +1894,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     stable_rows=pp_spec_stable_rows_enabled(),
                 )
         else:
-            if self.kernel_dispatcher.extend_kernel.defers_prefill_gates:
-                g = beta = None
-            else:
-                g, beta = self._prefill_gates(layer, a, b)
+            if not use_fused_qkv_gating:
+                if self.kernel_dispatcher.extend_kernel.defers_prefill_gates:
+                    g = beta = None
+                else:
+                    g, beta = self._prefill_gates(layer, a, b)
             h_track_buf = None
             if (
                 forward_metadata.has_mamba_track_mask
@@ -1666,6 +1922,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                query_start_loc_i64=forward_metadata.query_start_loc_i64,
+                max_seqlen=forward_metadata.max_extend_seq_len,
+                can_use_direct_state_indices=(
+                    forward_metadata.can_use_direct_state_indices
+                    and not needs_state_gather
+                ),
+                qk_normalized=qk_normalized,
+                g_is_exp=g_is_exp,
+                use_qk_l2norm_in_kernel=not qk_normalized,
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
                 ),

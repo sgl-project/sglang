@@ -48,6 +48,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
     supports_strided_target_verify_qkv: bool = True
     # The chunk kernel steps slots by the pool's stride(0) in int64.
     extend_honors_slot_pitch: bool = True
+    supports_pre_normalized_qk: bool = True
 
     def __init__(self, *, round_beta_to_input_dtype: bool = False):
         self._recurrent_kwargs = (

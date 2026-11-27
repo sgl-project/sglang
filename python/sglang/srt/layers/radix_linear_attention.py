@@ -203,7 +203,8 @@ def _linear_attention_with_output_impl(
         logical_output.copy_(ret)
     # Physical padding participates in following residual, router, expert/MoE,
     # and collective operations. Keep those inputs finite and deterministic.
-    output[:, real_num_tokens:].zero_()
+    if real_num_tokens < output.shape[1]:
+        output[:, real_num_tokens:].zero_()
 
 
 def _linear_extend_in_graph() -> bool:

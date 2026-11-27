@@ -131,6 +131,16 @@ class TestEnginePrompt(unittest.TestCase):
             self.assertEqual(key, "input_ids")
             self.assertEqual(value, [1, 3, 4])
 
+    def test_non_lossy_multimodal_text_only_with_skipped_decode_sends_ids(self):
+        # When _process_messages skips tokenizer.decode for a text-only request
+        # on a multimodal model, prompt is "" and _engine_prompt (used by
+        # /v1/responses) must pass prompt_ids instead of "".
+        key, value = engine_prompt(
+            self._server(False), _messages([1, 3, 4], prompt=""), is_multimodal=True
+        )
+        self.assertEqual(key, "input_ids")
+        self.assertEqual(value, [1, 3, 4])
+
 
 if __name__ == "__main__":
     unittest.main()

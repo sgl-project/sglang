@@ -293,6 +293,12 @@ class BaseRunner(ABC):
 
             prewarm_gdn_prefill_kernels(attn_backend=mr.attn_backend, model=mr.model)
 
+        from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+            prewarm_qsa_prefill_kernels,
+        )
+
+        prewarm_qsa_prefill_kernels(attn_backend=mr.attn_backend, model=mr.model)
+
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
             assert buffers is not None, (

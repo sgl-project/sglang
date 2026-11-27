@@ -784,7 +784,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             else None
         )
 
-        _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
+        if self._can_reuse_text_only_prompt_ids(processed_messages, is_multimodal):
+            engine_prompt = processed_messages.prompt_ids
+        else:
+            _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
         request_prompts = [engine_prompt]
         engine_prompts = [engine_prompt]
 
