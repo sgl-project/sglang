@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 from contextlib import asynccontextmanager, contextmanager, suppress
@@ -69,6 +70,105 @@ def _validate_positive_int(kwargs: dict[str, Any], name: str) -> None:
     value = kwargs.get(name)
     if value is not None and int(value) <= 0:
         raise _bad_request(f"{name} must be positive")
+
+
+# Upper bound for the text-encoder sequence length accepted from HTTP
+# clients. The largest in-tree model caps are 4096 (Anima, Cosmos3) and the
+# largest text length is 8192, so this leaves headroom while bounding the
+# padding allocation a single request can force.
+_MAX_SEQUENCE_LENGTH = 16384
+
+# diffusers_kwargs keys that duplicate validated top-level request fields.
+# The diffusers backend forwards the validated batch values for these names,
+# so accepting them inside diffusers_kwargs would silently override the
+# validated request (e.g. num_inference_steps=0 or width=8192). Clients must
+# pass them as top-level fields instead. Pipeline-specific extras such as
+# SANA-WM camera controls (action, intrinsics, ...) and the documented
+# output_type pass-through are not listed and stay allowed.
+_DIFFUSERS_KWARGS_RESERVED_KEYS = frozenset(
+    {
+        "prompt",
+        "negative_prompt",
+        "num_inference_steps",
+        "guidance_scale",
+        "true_cfg_scale",
+        "width",
+        "height",
+        "num_frames",
+        "generator",
+        "seed",
+        "image",
+        "num_images_per_prompt",
+        "num_outputs_per_prompt",
+    }
+)
+
+
+def _validate_max_sequence_length(value: Any, source: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _bad_request(f"{source} must be an int, got {value!r}")
+    if not 1 <= value <= _MAX_SEQUENCE_LENGTH:
+        raise _bad_request(
+            f"{source} must be between 1 and {_MAX_SEQUENCE_LENGTH}, got {value!r}"
+        )
+
+
+def _validate_flow_shift(value: Any, source: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _bad_request(f"{source} must be a number, got {value!r}")
+    if not 0 < value <= sys.float_info.max:
+        raise _bad_request(f"{source} must be positive and finite")
+
+
+def _validate_diffusers_kwargs(kwargs: dict[str, Any]) -> None:
+    """Validate diffusers_kwargs and the fields it can promote.
+
+    Only network entry points call this (via build_sampling_params); the CLI
+    and Python API are operator-controlled and keep accepting free-form
+    pipeline kwargs.
+    """
+    _validate_max_sequence_length(
+        kwargs.get("max_sequence_length"), "max_sequence_length"
+    )
+    _validate_flow_shift(kwargs.get("flow_shift"), "flow_shift")
+
+    diffusers_kwargs = kwargs.get("diffusers_kwargs")
+    if diffusers_kwargs is None:
+        return
+    if not isinstance(diffusers_kwargs, dict):
+        raise _bad_request(
+            f"diffusers_kwargs must be an object, got {type(diffusers_kwargs).__name__}"
+        )
+    if any(not isinstance(key, str) for key in diffusers_kwargs):
+        raise _bad_request("diffusers_kwargs keys must be strings")
+    reserved = sorted(
+        key for key in diffusers_kwargs if key in _DIFFUSERS_KWARGS_RESERVED_KEYS
+    )
+    if reserved:
+        raise _bad_request(
+            "diffusers_kwargs must not override validated request fields "
+            f"({', '.join(reserved)}); pass them as top-level fields instead"
+        )
+    for name in ("max_sequence_length", "flow_shift"):
+        if (
+            name in diffusers_kwargs
+            and kwargs.get(name) is not None
+            and diffusers_kwargs[name] != kwargs[name]
+        ):
+            raise _bad_request(
+                f"Conflicting top-level and diffusers_kwargs values for {name}"
+            )
+    _validate_max_sequence_length(
+        diffusers_kwargs.get("max_sequence_length"),
+        "diffusers_kwargs.max_sequence_length",
+    )
+    _validate_flow_shift(
+        diffusers_kwargs.get("flow_shift"), "diffusers_kwargs.flow_shift"
+    )
 
 
 def flatten_extra_params(payload: Any) -> dict[str, Any]:
@@ -345,6 +445,7 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
 
     _reject_remote_model_paths(kwargs)
     _validate_remote_media_paths(kwargs)
+    _validate_diffusers_kwargs(kwargs)
     has_explicit_compression = kwargs.get("output_compression") is not None
 
     # parse "WxH" size string if provided

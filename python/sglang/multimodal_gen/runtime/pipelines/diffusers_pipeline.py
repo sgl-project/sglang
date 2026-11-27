@@ -293,11 +293,24 @@ class DiffusersExecutionStage(PipelineStage):
         if batch.num_outputs_per_prompt > 1:
             kwargs["num_images_per_prompt"] = batch.num_outputs_per_prompt
 
-        # Extra diffusers-specific kwargs
+        # Extra diffusers-specific kwargs. Validated batch values above win:
+        # diffusers_kwargs is for pipeline-specific extras and must not
+        # silently override the validated request fields.
         if batch.extra:
             diffusers_kwargs = batch.extra.get("diffusers_kwargs", {})
-            if diffusers_kwargs:
-                kwargs.update(diffusers_kwargs)
+            if isinstance(diffusers_kwargs, dict) and diffusers_kwargs:
+                ignored = []
+                for key, value in diffusers_kwargs.items():
+                    if key in kwargs:
+                        ignored.append(key)
+                    else:
+                        kwargs[key] = value
+                if ignored:
+                    logger.warning(
+                        "Ignoring diffusers_kwargs keys that duplicate "
+                        "validated request fields: %s",
+                        ", ".join(sorted(ignored)),
+                    )
 
         return kwargs
 

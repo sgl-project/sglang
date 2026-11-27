@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import math
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
@@ -26,8 +27,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    _MAX_SEQUENCE_LENGTH,
     _parse_size_or_raise,
     _save_upload_to_path,
+    _validate_diffusers_kwargs,
     _validate_positive_int,
     build_sampling_params,
     process_generation_batch,
@@ -357,3 +360,155 @@ def test_build_sampling_params_resolves_size_and_explicit_dimensions(monkeypatch
         build_sampling_params("request-id", **request_fields)
 
         assert (captured["width"], captured["height"]) == expected
+
+
+def _assert_bad_request(kwargs, *fragments):
+    try:
+        _validate_diffusers_kwargs(kwargs)
+    except Exception as exc:
+        assert exc.status_code == 400
+        for fragment in fragments:
+            assert fragment in exc.detail
+    else:
+        raise AssertionError(f"expected bad request for {kwargs!r}")
+
+
+def test_diffusers_kwargs_rejects_reserved_overrides():
+    # Values the top level rejects (or bounds) must not sneak back in
+    # through diffusers_kwargs and override the validated request.
+    _assert_bad_request(
+        {"diffusers_kwargs": {"num_inference_steps": 0}},
+        "num_inference_steps",
+        "top-level",
+    )
+    _assert_bad_request(
+        {"diffusers_kwargs": {"width": 8192, "height": 8192}}, "height", "width"
+    )
+    for key in (
+        "prompt",
+        "negative_prompt",
+        "guidance_scale",
+        "true_cfg_scale",
+        "num_frames",
+        "generator",
+        "seed",
+        "image",
+        "num_images_per_prompt",
+        "num_outputs_per_prompt",
+    ):
+        _assert_bad_request({"diffusers_kwargs": {key: 1}}, key)
+
+
+def test_diffusers_kwargs_allows_pipeline_specific_keys():
+    # Model-owned extras and the documented output_type pass-through stay
+    # allowed; only validated-field duplicates are reserved.
+    _validate_diffusers_kwargs(
+        {
+            "diffusers_kwargs": {
+                "action": "w-80,wl-80",
+                "intrinsics": "/tmp/intrinsics.npy",
+                "camera_to_world_path": "/tmp/cam.npy",
+                "skip_refiner": True,
+                "output_type": "latent",
+                "max_sequence_length": 512,
+                "flow_shift": 5.0,
+            }
+        }
+    )
+    _validate_diffusers_kwargs({})
+    _validate_diffusers_kwargs({"diffusers_kwargs": None})
+    _validate_diffusers_kwargs({"diffusers_kwargs": {}})
+
+
+def test_max_sequence_length_bounds():
+    for source in ("top", "nested"):
+        for bad in (0, -1, 100000, _MAX_SEQUENCE_LENGTH + 1, True, 512.5, "512"):
+            kwargs = (
+                {"max_sequence_length": bad}
+                if source == "top"
+                else {"diffusers_kwargs": {"max_sequence_length": bad}}
+            )
+            _assert_bad_request(kwargs, "max_sequence_length")
+        for good in (1, 512, _MAX_SEQUENCE_LENGTH):
+            kwargs = (
+                {"max_sequence_length": good}
+                if source == "top"
+                else {"diffusers_kwargs": {"max_sequence_length": good}}
+            )
+            _validate_diffusers_kwargs(kwargs)
+
+
+def test_flow_shift_must_be_positive_finite():
+    for source in ("top", "nested"):
+        for bad in (0, -1, -0.5, math.nan, math.inf, -math.inf, True, "5"):
+            kwargs = (
+                {"flow_shift": bad}
+                if source == "top"
+                else {"diffusers_kwargs": {"flow_shift": bad}}
+            )
+            _assert_bad_request(kwargs, "flow_shift")
+        for good in (1, 1.0, 5.0, 17):
+            kwargs = (
+                {"flow_shift": good}
+                if source == "top"
+                else {"diffusers_kwargs": {"flow_shift": good}}
+            )
+            _validate_diffusers_kwargs(kwargs)
+
+
+def test_diffusers_kwargs_must_be_object():
+    _assert_bad_request({"diffusers_kwargs": "num_inference_steps=0"}, "object")
+    _assert_bad_request({"diffusers_kwargs": [("width", 8192)]}, "object")
+
+
+def test_build_sampling_params_rejects_diffusers_override(monkeypatch):
+    server_args = SimpleNamespace(model_path="zai-org/GLM-Image")
+    monkeypatch.setattr(openai_utils, "get_global_server_args", lambda: server_args)
+    captured = {}
+
+    def fake_from_user_sampling_params_args(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        SamplingParams,
+        "from_user_sampling_params_args",
+        fake_from_user_sampling_params_args,
+    )
+
+    try:
+        build_sampling_params(
+            "request-id",
+            num_inference_steps=1,
+            diffusers_kwargs={"num_inference_steps": 0},
+        )
+    except Exception as exc:
+        assert exc.status_code == 400
+        assert "num_inference_steps" in exc.detail
+    else:
+        raise AssertionError("expected bad request")
+    assert captured == {}
+
+    build_sampling_params(
+        "request-id",
+        max_sequence_length=512,
+        diffusers_kwargs={"action": "w-8", "flow_shift": 5.0},
+    )
+    assert captured["max_sequence_length"] == 512
+    assert captured["diffusers_kwargs"] == {"action": "w-8", "flow_shift": 5.0}
+
+
+@pytest.mark.parametrize(
+    "name,top,nested", [("max_sequence_length", 128, 256), ("flow_shift", 1.0, 0.5)]
+)
+def test_promoted_diffusers_fields_have_one_value(name, top, nested):
+    _validate_diffusers_kwargs({name: top, "diffusers_kwargs": {name: top}})
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_diffusers_kwargs({name: top, "diffusers_kwargs": {name: nested}})
+    assert exc_info.value.status_code == 400
+
+
+def test_flow_shift_must_fit_a_backend_float():
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_diffusers_kwargs({"flow_shift": 10**309})
+    assert exc_info.value.status_code == 400

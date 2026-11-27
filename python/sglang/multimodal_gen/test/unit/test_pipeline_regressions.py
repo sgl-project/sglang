@@ -132,6 +132,54 @@ def test_ernie_absent_pe_component_is_not_detected(monkeypatch, pe_entry, expect
     )
 
 
+def test_diffusers_kwargs_do_not_override_validated_batch_fields():
+    """diffusers_kwargs must not replace validated batch values.
+
+    The HTTP layer rejects these keys, but the pipeline stage is the last
+    line of defense for other ingress paths (e.g. the CLI): validated
+    fields win, genuine pipeline extras still pass through, and a
+    non-dict payload is ignored instead of crashing.
+    """
+    stage = DiffusersExecutionStage.__new__(DiffusersExecutionStage)
+    batch = SimpleNamespace(
+        prompt="a red cube",
+        negative_prompt=None,
+        num_inference_steps=1,
+        guidance_scale=5.0,
+        true_cfg_scale=None,
+        height=256,
+        width=256,
+        num_frames=9,
+        generator=None,
+        seed=42,
+        generator_device="cpu",
+        condition_image=None,
+        pixel_values=None,
+        image_path=None,
+        num_outputs_per_prompt=1,
+        extra={
+            "diffusers_kwargs": {
+                "num_inference_steps": 30,
+                "width": 8192,
+                "height": 8192,
+                "max_sequence_length": 512,
+            }
+        },
+    )
+
+    kwargs = stage._build_pipeline_kwargs(batch)
+
+    assert kwargs["num_inference_steps"] == 1
+    assert kwargs["width"] == 256
+    assert kwargs["height"] == 256
+    assert kwargs["max_sequence_length"] == 512
+
+    batch.extra = {"diffusers_kwargs": "not-a-dict"}
+    kwargs = stage._build_pipeline_kwargs(batch)
+    assert kwargs["num_inference_steps"] == 1
+    assert "max_sequence_length" not in kwargs
+
+
 @pytest.mark.parametrize("legacy_order", [False, True])
 def test_diffusers_pipeline_add_stage_accepts_both_argument_orders(legacy_order):
     pipeline = DiffusersPipeline.__new__(DiffusersPipeline)
