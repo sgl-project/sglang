@@ -132,28 +132,25 @@ class GrammarManager:
         self._resolved_futures[req.grammar] = outcome
         return outcome
 
-    def _sync_compile_outcomes(
+    def _sync_compile_errors(
         self,
         sync_groups: list[tuple[object, int]],
         compile_errors: dict[int, str],
-        cacheable_invalid: set[int],
-    ) -> tuple[dict[int, str], set[int]]:
+    ) -> dict[int, str]:
         synced_errors = compile_errors
-        synced_cacheable = cacheable_invalid
         for sync_group, sync_size in sync_groups:
             all_gather_output = [None] * sync_size
             torch.distributed.all_gather_object(
                 all_gather_output,
-                (synced_errors, synced_cacheable),
+                synced_errors,
                 group=sync_group,
             )
             merged_errors: dict[int, str] = {}
             for x in all_gather_output:
-                for idx, msg in x[0].items():
+                for idx, msg in x.items():
                     merged_errors.setdefault(idx, msg)
             synced_errors = merged_errors
-            synced_cacheable = set.intersection(*[x[1] for x in all_gather_output])
-        return synced_errors, synced_cacheable
+        return synced_errors
 
     def has_waiting_grammars(self) -> bool:
         return len(self.grammar_queue) > 0
@@ -314,6 +311,8 @@ class GrammarManager:
         ready_req_idxs: set[int] = set()
         failed_req_idxs: set[int] = set()
         sync_groups = self._active_sync_groups()
+        pp_sync_enabled = self.pp_size > 1 and self.pp_group is not None
+        need_pre_resolve = bool(sync_groups) or pp_sync_enabled
         compile_error_msgs: dict[int, str] = {}
         cacheable_invalid_idxs: set[int] = set()
 
@@ -334,7 +333,7 @@ class GrammarManager:
                     assert isinstance(req.grammar, futures.Future), f"{req=}"
                     if req.grammar.done():
                         ready_req_idxs.add(i)
-                        if sync_groups:
+                        if need_pre_resolve:
                             _, err_msg, is_cacheable = self._resolve_future(req)
                             if err_msg is not None:
                                 compile_error_msgs[i] = err_msg
@@ -398,6 +397,9 @@ class GrammarManager:
                     synced_cacheable_invalid = set()
                 synced_ready_req_idxs -= synced_failed_req_idxs
 
+            if synced_failed_req_idxs:
+                synced_ready_req_idxs -= synced_failed_req_idxs
+
             # Route rank-divergent invalid outcomes through the failed path so
             # every rank (including PP peers) aborts in lockstep without
             # polluting the grammar cache, while staggered cacheable invalid
@@ -423,31 +425,34 @@ class GrammarManager:
         )
 
         # On later PP stages, peers resolve their own futures after PP0 admits
-        # the request. Agree on compilation outcomes across TP/CP before caching
+        # the request. Agree on compilation errors across TP/CP before caching
         # or starting prefill, keeping synced_ready_req_idxs intact so queue
-        # ordering matches PP0.
-        pp_non_cacheable_errors: set[int] = set()
+        # ordering matches PP0. Because PP0 already cached every key in
+        # synced_ready_req_idxs, PP1+ caches the agreed outcome too so retries
+        # take the same cache-hit path on every stage and never hang in
+        # recv_object.
         if self.pp_rank > 0 and sync_groups and synced_ready_req_idxs:
             pp_compile_errors: dict[int, str] = {}
-            pp_cacheable_invalid: set[int] = set()
             for i in synced_ready_req_idxs:
                 req = grammar_queue[i]
                 if req.finished() or req.grammar is None:
                     continue
-                _, err_msg, is_cacheable = self._resolve_future(req)
+                _, err_msg, _ = self._resolve_future(req)
                 if err_msg is not None:
                     pp_compile_errors[i] = err_msg
-                    if is_cacheable:
-                        pp_cacheable_invalid.add(i)
-            synced_compile_errors, synced_cacheable_invalid = (
-                self._sync_compile_outcomes(
-                    sync_groups, pp_compile_errors, pp_cacheable_invalid
-                )
-            )
-            if synced_compile_errors:
-                pp_non_cacheable_errors = (
-                    set(synced_compile_errors) - synced_cacheable_invalid
-                )
+            synced_pp_errors = self._sync_compile_errors(sync_groups, pp_compile_errors)
+            for i, err_msg in synced_pp_errors.items():
+                req = grammar_queue[i]
+                if req.finished() or req.grammar is None:
+                    continue
+                resolved = self._resolved_futures.get(req.grammar)
+                local_obj = resolved[0] if resolved is not None else None
+                if not isinstance(local_obj, InvalidGrammarObject):
+                    self._resolved_futures[req.grammar] = (
+                        InvalidGrammarObject(err_msg),
+                        err_msg,
+                        False,
+                    )
 
         # Return ready requests
         return_reqs: List[Req] = []
@@ -462,15 +467,7 @@ class GrammarManager:
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
             resolved = self._resolved_futures.pop(req.grammar, None)
             should_cache = True
-            if i in pp_non_cacheable_errors:
-                local_obj = resolved[0] if resolved is not None else None
-                req.grammar = (
-                    local_obj
-                    if isinstance(local_obj, InvalidGrammarObject)
-                    else InvalidGrammarObject(synced_compile_errors[i])
-                )
-                should_cache = False
-            elif resolved is not None:
+            if resolved is not None:
                 req.grammar = resolved[0]
             else:
                 try:
@@ -483,7 +480,10 @@ class GrammarManager:
                     req.grammar = InvalidGrammarObject(
                         f"Grammar compilation failed: {e}"
                     )
-                    should_cache = False
+                    # On PP1+, PP0 already admitted and cached this key; keep the
+                    # cache-hit path aligned across stages so retries cannot
+                    # leave PP1+ blocked in recv_object.
+                    should_cache = self.pp_rank > 0
             if should_cache:
                 self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
             self._apply_request_reasoning_config(req)

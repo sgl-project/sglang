@@ -223,7 +223,13 @@ def _worker(rank, rendezvous):
             assert pp1_reqs[1].finished()
             assert isinstance(pp1_reqs[1].grammar, InvalidGrammarObject)
             assert "pp1 rank-local failure" in pp1_reqs[1].abort_reason
-            assert pp1_reqs[1].grammar_key not in pp1_mgr.grammar_backend.cache
+            # PP0 already admitted and cached index 1, so every PP1+ peer
+            # caches the agreed InvalidGrammarObject to keep retry admission
+            # paths aligned across stages (avoiding a PP1 recv_object hang).
+            assert isinstance(
+                pp1_mgr.grammar_backend.cache.get(pp1_reqs[1].grammar_key),
+                InvalidGrammarObject,
+            )
             assert pp1_reqs[2].finished()
             assert pp1_reqs[2].grammar_key in pp1_mgr.grammar_backend.cache
             assert not pp1_mgr._resolved_futures
@@ -332,6 +338,60 @@ class TestGrammarCpSync(unittest.TestCase):
         self.assertIsInstance(req.grammar, InvalidGrammarObject)
         self.assertIn("transient compiler error", req.abort_reason)
         self.assertNotIn(req.grammar_key, mgr.grammar_backend.cache)
+
+    def test_pp0_single_rank_exception_propagates_as_failed_so_both_stages_retry(self):
+        """With PP>1 and TP=1/CP=1, a PP0 exception goes via failed so neither stage caches."""
+        tp = SimpleNamespace(
+            cpu_group=object(), world_size=1, first_rank=0, is_first_rank=True
+        )
+        sent = []
+        pp0_group = SimpleNamespace(
+            send_object=lambda data, dst, async_send, tag: (
+                sent.append(data) or [SimpleNamespace(wait=lambda: None)]
+            )
+        )
+        pp0 = _manager(
+            tp, None, 1, dp_enabled=False, pp_rank=0, pp_size=2, pp_group=pp0_group
+        )
+        req0 = _Request("r_pp0_exc")
+        req0.grammar.set_exception(RuntimeError("pp0 compiler boom"))
+        pp0.grammar_queue = [req0]
+
+        self.assertEqual(pp0.get_ready_grammar_requests(), [req0])
+        self.assertTrue(req0.finished())
+        self.assertNotIn(req0.grammar_key, pp0.grammar_backend.cache)
+        self.assertEqual(sent, [(set(), {0})])
+
+        pp1_group = SimpleNamespace(recv_object=lambda src, tag: sent[0])
+        pp1 = _manager(
+            tp, None, 1, dp_enabled=False, pp_rank=1, pp_size=2, pp_group=pp1_group
+        )
+        req1 = _Request("r_pp0_exc")
+        req1.grammar.set_result(BaseGrammarObject())
+        pp1.grammar_queue = [req1]
+
+        self.assertEqual(pp1.get_ready_grammar_requests(), [req1])
+        self.assertTrue(req1.finished())
+        self.assertNotIn(req1.grammar_key, pp1.grammar_backend.cache)
+
+    def test_pp1_single_rank_exception_caches_to_match_pp0_admission_path(self):
+        """If PP0 already cached a schema and PP1 raises, PP1 also caches so retries align."""
+        tp = SimpleNamespace(
+            cpu_group=object(), world_size=1, first_rank=0, is_first_rank=True
+        )
+        pp1_group = SimpleNamespace(recv_object=lambda src, tag: ({0}, set()))
+        pp1 = _manager(
+            tp, None, 1, dp_enabled=False, pp_rank=1, pp_size=2, pp_group=pp1_group
+        )
+        req = _Request("r_pp1_exc")
+        req.grammar.set_exception(RuntimeError("pp1 compiler boom"))
+        pp1.grammar_queue = [req]
+
+        self.assertEqual(pp1.get_ready_grammar_requests(), [req])
+        self.assertTrue(req.finished())
+        self.assertIsInstance(
+            pp1.grammar_backend.cache.get(req.grammar_key), InvalidGrammarObject
+        )
 
     def test_real_gloo_admission_timeout_and_dpa_isolation(self):
         with tempfile.TemporaryDirectory(prefix="grammar-cp-sync-") as folder:
