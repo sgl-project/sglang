@@ -1479,7 +1479,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
-        is_multimodal = mm_inputs is not None or bool(obj.need_wait_for_mm_inputs)
+        is_multimodal = mm_inputs is not None or (
+            isinstance(obj, GenerateReqInput) and bool(obj.need_wait_for_mm_inputs)
+        )
         self._validate_one_request(obj, input_ids, is_multimodal=is_multimodal)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
