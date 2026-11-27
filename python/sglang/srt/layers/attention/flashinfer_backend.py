@@ -2731,7 +2731,6 @@ class FlashInferMultiStepDraftBackend:
             )
 
         # Cached variables for generate_draft_decode_kv_indices
-        self.req_to_token_pool = model_runner.req_to_token_pool
         self.max_kv_len = self.attn_backends[0].max_kv_len
         self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
             model_runner
