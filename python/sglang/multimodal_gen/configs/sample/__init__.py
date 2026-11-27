@@ -8,6 +8,7 @@ from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParam
 from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     SenseNovaU1SamplingParams,
@@ -22,11 +23,3 @@ __all__ = [
     "LingBotVideoMoESamplingParams",
     "SenseNovaU1SamplingParams",
 ]
-
-
-def __getattr__(name):
-    if name == "Pi05SamplingParams":
-        from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
-
-        return Pi05SamplingParams
-    raise AttributeError(name)

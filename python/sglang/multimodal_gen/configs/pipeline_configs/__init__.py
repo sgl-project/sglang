@@ -63,6 +63,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
@@ -126,13 +127,3 @@ __all__ = [
     "FastH3PipelineConfig",
     "MiniMaxH3PipelineConfig",
 ]
-
-
-def __getattr__(name):
-    if name == "Pi05PipelineConfig":
-        from sglang.multimodal_gen.configs.pipeline_configs.pi05 import (
-            Pi05PipelineConfig,
-        )
-
-        return Pi05PipelineConfig
-    raise AttributeError(name)

@@ -41,6 +41,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation im
     DMDTimestepPreparationStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
+    VLAActionDenoisingStage,
+    VLAActionPostprocessStage,
+    VLAObservationPreprocessStage,
+    VLAPrefixEncodingStage,
+)
 
 __all__ = [
     "PipelineStage",
@@ -63,16 +69,3 @@ __all__ = [
     "VLAActionDenoisingStage",
     "VLAActionPostprocessStage",
 ]
-
-
-def __getattr__(name):
-    if name in {
-        "VLAObservationPreprocessStage",
-        "VLAPrefixEncodingStage",
-        "VLAActionDenoisingStage",
-        "VLAActionPostprocessStage",
-    }:
-        from sglang.multimodal_gen.runtime.pipelines_core.stages import vla
-
-        return getattr(vla, name)
-    raise AttributeError(name)
