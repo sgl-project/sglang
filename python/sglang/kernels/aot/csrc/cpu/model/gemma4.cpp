@@ -429,8 +429,7 @@ std::tuple<at::Tensor, at::Tensor> gemma_routing_post_topk_cpu(
 }
 
 // The kernel's bitwise ordering also ranks +0.0 before -0.0.
-// CUDA:
-// https://github.com/mingfeima/sglang/blob/38ec649048df9b7d4d2c3355a55d7eb724f572f3/python/sglang/kernels/ops/moe/gemma4_routing.py#L96
+// CUDA: python/sglang/kernels/ops/moe/gemma4_routing.py
 //
 // gating_output    : [num_tokens, num_experts];
 // per_expert_scale : [num_experts]
