@@ -42,6 +42,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
@@ -382,6 +383,10 @@ def mix_stats_from_state(
 
 
 def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
+    if _is_npu and not is_npu_arch35() and hc.cfg.pre_from_prev:
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import mix_stats_torch
+
+        return mix_stats_torch(hc, x)
     from sglang.kernels.ops.layernorm.mhc import (
         hc_mix_stats,
         hc_mix_stats_sinkhorn,
@@ -572,6 +577,12 @@ def _npu_combine_premix(
             x.new_empty((0, cfg.mult, cfg.mult), dtype=torch.float32),
         )
         return hc.norm(x[:, 0, :])
+    if not is_npu_arch35():
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import mix_stats_torch
+
+        state.stats = mix_stats_torch(hc, x)
+        mixed = x[:, 0, :] if apply_pre is None else combine_premix(x, apply_pre)
+        return hc.norm(mixed)
     if apply_pre is None:
         # The first sublayer has no previous pre-mix to fold; seed the identity
         # one-hot (stream 0 on its own).
@@ -656,6 +667,11 @@ def _combine(
 # ---------------------------------------------------------------------------
 
 
+def combine_premix(x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+    """Collapse ``[T, mult, H]`` with a pre-mix, accumulating in FP32."""
+    return (pre.unsqueeze(-1) * x.float()).sum(dim=1).to(x.dtype)
+
+
 def post(
     cfg: HcConfig,
     x: torch.Tensor,
@@ -669,6 +685,10 @@ def post(
 
     if _is_npu:
         if cfg.pre_from_prev:
+            if not is_npu_arch35():
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import post_torch
+
+                return post_torch(x, residual, post_mix, comb)
             # V4.1 (A5) CANN mhc_post(x, hRes, hOut, hPost): the residual is
             # the base stream, comb its res-mixing matrix, x the sublayer
             # output and post its post-mix.

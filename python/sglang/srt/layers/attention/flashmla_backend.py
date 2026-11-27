@@ -158,9 +158,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         # else the static bound (kernel reads are capped by seq_lens_k).
         seq_lens_cpu = forward_batch.seq_lens_cpu
         eager_max_k = (
-            seq_lens_cpu.max().item()
-            if seq_lens_cpu is not None
-            else self.max_context_len
+            seq_lens_cpu.max().item() if seq_lens_cpu is not None else self.max_kv_len
         )
         if forward_batch.forward_mode.is_decode_or_idle():
             max_seqlen_pad = triton.cdiv(eager_max_k, PAGE_SIZE)
@@ -276,7 +274,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     ):
         if block_kv_indices is None:
             self.cuda_graph_kv_indices = torch.full(
-                (max_bs, (self.max_context_len + PAGE_SIZE) // PAGE_SIZE),
+                (max_bs, (self.max_kv_len + PAGE_SIZE) // PAGE_SIZE),
                 1,
                 dtype=torch.int32,
                 device="cuda",
@@ -312,7 +310,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 is_draft_runner=self.is_draft_runner,
                 skip_prefill=self.skip_prefill,
                 max_bs=max_bs,
-                max_context_len=self.max_context_len,
+                max_kv_len=self.max_kv_len,
                 num_draft_tokens=self.num_draft_tokens,
                 device=self.device,
                 is_read=False,

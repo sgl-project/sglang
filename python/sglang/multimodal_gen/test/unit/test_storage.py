@@ -231,7 +231,12 @@ def test_env_configured_storage_uploads_and_cleans_up(tmp_path, monkeypatch):
     assert uploads == [
         (
             (file_path, "integration-test", "integration.png"),
-            {"ExtraArgs": {"ContentType": "image/png"}},
+            {
+                "ExtraArgs": {
+                    "ContentType": "image/png",
+                    "CacheControl": "private, no-store",
+                }
+            },
         )
     ]
 
