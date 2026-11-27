@@ -12,9 +12,15 @@ from sglang.srt.sampling.watermarking.config import (
 from sglang.srt.sampling.watermarking.gumbel.adapter import GumbelEngine, GumbelRows
 from sglang.srt.sampling.watermarking.gumbel.detector import hash_context
 from sglang.srt.sampling.watermarking.gumbel.state import WatermarkState
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(
+    est_time=20,
+    stage="base-a-jit-kernel-unit",
+    runner_config="amd",
+    disabled="dspark non-block accept regressed on ROCm after 11-04, under investigation",
+)
 
 _FEATURES = SimpleNamespace(
     watermark_key="0123456789abcdef",
