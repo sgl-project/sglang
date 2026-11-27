@@ -28,11 +28,10 @@ from sglang.srt.speculative.online_acceptance_estimator import (
     OnlineAcceptanceEstimator,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
-from sglang.srt.utils import is_npu, is_xpu
+from sglang.srt.utils import is_xpu
 
 logger = logging.getLogger(__name__)
 
-_is_npu = is_npu()
 _is_xpu = is_xpu()
 
 
@@ -163,8 +162,6 @@ class DsparkDraftSampler:
             capturing = (
                 torch.xpu.is_current_stream_capturing()
                 if _is_xpu
-                else torch.npu.is_current_stream_capturing()
-                if _is_npu
                 else torch.cuda.is_current_stream_capturing()
             )
             assert not capturing

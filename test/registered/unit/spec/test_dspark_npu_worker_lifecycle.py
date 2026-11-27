@@ -27,7 +27,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.models.dspark import DSparkConfidenceHead, VanillaMarkov
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.dspark_components import (
-    dspark_draft_sampler,
     dspark_verify,
     dspark_worker_v2,
 )
@@ -36,53 +35,6 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-
-
-@pytest.mark.parametrize("device_type", ["cuda", "xpu", "npu"])
-@pytest.mark.parametrize("capturing", [False, True])
-def test_draft_sampler_capture_query_is_device_specific(device_type, capturing):
-    sampler = dspark_draft_sampler.DsparkDraftSampler.__new__(
-        dspark_draft_sampler.DsparkDraftSampler
-    )
-    sampler.step_logits = None
-    sampler.max_bs, sampler.gamma = 2, 3
-    sampler.sharded_accept = False
-    sampler.markov_head = SimpleNamespace(
-        vocab_shard=None, step_logits_dtype=lambda dtype: dtype
-    )
-    sampler.model = SimpleNamespace(
-        lm_head=SimpleNamespace(org_vocab_size=4), markov_head=sampler.markov_head
-    )
-    base_logits = torch.zeros(2, 3, 4)
-    with (
-        patch.object(dspark_draft_sampler, "_is_npu", device_type == "npu"),
-        patch.object(dspark_draft_sampler, "_is_xpu", device_type == "xpu"),
-        patch.object(
-            torch.cuda, "is_current_stream_capturing", return_value=capturing
-        ) as cuda_query,
-        patch.object(
-            torch.xpu, "is_current_stream_capturing", return_value=capturing
-        ) as xpu_query,
-        patch.object(
-            torch,
-            "npu",
-            SimpleNamespace(is_current_stream_capturing=Mock(return_value=capturing)),
-            create=True,
-        ) as npu_module,
-    ):
-        if capturing:
-            with pytest.raises(AssertionError):
-                sampler._step_logits(base_logits)
-            assert sampler.step_logits is None
-        else:
-            output = sampler._step_logits(base_logits)
-            assert output.shape == (2, 3, 4)
-            assert sampler._step_logits(base_logits) is output
-        assert cuda_query.call_count == int(device_type == "cuda")
-        assert xpu_query.call_count == int(device_type == "xpu")
-        assert npu_module.is_current_stream_capturing.call_count == int(
-            device_type == "npu"
-        )
 
 
 def _cpu_scatter_into(
@@ -218,14 +170,7 @@ def test_dense_worker_constructor_to_draft_sampler_warmup(
         envs.SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT.override(quarot),
         envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.override(profile),
         envs.SGLANG_SIMULATE_ACC_LEN.override(1.0 if profile else 0.0),
-        patch.object(
-            torch,
-            "npu",
-            SimpleNamespace(is_current_stream_capturing=Mock(return_value=False)),
-            create=True,
-        ),
         patch.object(dspark_worker_v2, "_is_npu", True),
-        patch.object(dspark_draft_sampler, "_is_npu", True),
         patch.object(dspark_verify, "_is_npu", True),
         patch.object(torch, "get_device_module", return_value=torch.cpu),
         patch.object(
@@ -266,14 +211,10 @@ def test_dense_worker_constructor_to_draft_sampler_warmup(
         )
         if graph:
             assert worker._draft_sampler is not None
-            # Real folded proposal warmup, without CUDA aliases or a model
-            # backbone. This allocates the step logits before graph capture.
             hidden = torch.randn(6, 8)
             ids = torch.tensor([1, 31, 31, 2, 31, 31])
             with patch.object(
-                torch.cuda,
-                "is_current_stream_capturing",
-                side_effect=AssertionError("CUDA-only API"),
+                torch.cuda, "is_current_stream_capturing", return_value=False
             ):
                 worker._draft_sampler(hidden, ids)
             assert worker._draft_sampler.out[:6].shape == (6,)
