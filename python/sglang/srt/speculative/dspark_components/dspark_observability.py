@@ -816,6 +816,12 @@ class DsparkStepObservers:
 
     # --- per-step observation --------------------------------------------
 
+    def reads_folded_target_logits(self) -> bool:
+        """Whether a folded step's observers read the full-vocabulary target logits."""
+        return bool(
+            envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get() or self._sts_collect_path
+        )
+
     def observe_verify_step(
         self,
         *,

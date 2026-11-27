@@ -684,6 +684,11 @@ class DsparkVerifyEpilogue:
         self.folds_engram_commit = False
         # Per captured static batch size; the sampling-accept region's replays read them.
         self.static_io: dict[int, StaticVerifyIO] = {}
+        # Whether this step's target verify keeps its logits on vocab shards (set per
+        # step when wants_vocab_shards; the runner's logits-format predicate reads it).
+        self.shard_step = False
+        # Set when a static graph was captured with this accept on vocab shards.
+        self.shard_static_captured = False
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -696,6 +701,11 @@ class DsparkVerifyEpilogue:
             or out.next_token_logits is None
             or out.hidden_states is None
         ):
+            return
+        if out.next_token_logits_vocab_shard is not None and (
+            runner.ragged_verify_mode or not self.wants_vocab_shards()
+        ):
+            # Only a static step the epilogue serves on shards replays this graph.
             return
         if not runner.ragged_verify_mode:
             self._static_epilogue(out, forward_batch)
@@ -729,6 +739,28 @@ class DsparkVerifyEpilogue:
         self.inject_gate_buf.fill_(int(armed))
         self._static_step_state = state
 
+    def serves_sampled_fold(
+        self, *, sampling_info, draft_block, block_verification: bool
+    ) -> bool:
+        """Whether the static graph's accept also serves this all-sampled step; the
+        stock accept is greedy only."""
+        return False
+
+    def begin_fold(
+        self, bs: int, *, sampled: bool, draft_block, simulate_bonus_sampling_info
+    ) -> None:
+        """A folded step's inputs, before replay; the stock greedy accept reads none."""
+
+    def wants_vocab_shards(self) -> bool:
+        """Whether the static graph's accept reads the target logits on this rank's
+        vocab shard (asked before graph capture); the stock accept needs the full
+        vocabulary."""
+        return False
+
+    def serves_shards(self) -> bool:
+        """Whether a folded static step may verify on vocab shards now."""
+        return False
+
     def begin_sim_bonus(self, bs: int, temperatures: Optional[torch.Tensor]) -> None:
         """The step's bonus temperatures (None: greedy), before replay; the seed is
         TargetVerifyExecutor.begin_simulated_step's."""
@@ -754,8 +786,11 @@ class DsparkVerifyEpilogue:
         capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
-        if capturing:
+        if capturing and getattr(out, "next_token_logits_vocab_shard", None) is None:
+            # the sampling-accept region reads full-vocabulary logits
             self.static_io[bs] = io
+        elif capturing:
+            self.shard_static_captured = True
         committed_engram = self.run_static(
             io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
         )

@@ -546,6 +546,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.model_runner.capture_tail_hooks.append(
                 self._verify_epilogue.capture_hook
             )
+            if self._verify_epilogue.wants_vocab_shards():
+                self._enable_verify_vocab_shards(self._verify_epilogue)
             if (
                 envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
                 and static_epilogue_supported
@@ -719,6 +721,39 @@ class DSparkWorkerV2(BaseSpecWorker):
         ) is not None and hasattr(
             self.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
+        )
+
+    def _enable_verify_vocab_shards(self, epilogue) -> None:
+        """The target captures both logits formats; a step verifies on vocab shards
+        when the epilogue serves it (``shard_step``), on full logits otherwise."""
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+
+        processors = [
+            m
+            for m in self.model_runner.model.modules()
+            if isinstance(m, LogitsProcessor)
+        ]
+        if len(processors) != 1:
+            logger.warning(
+                "DSpark verify on vocab shards needs one target logits processor, "
+                "found %d; verifying on full logits.",
+                len(processors),
+            )
+            return
+        processor = processors[0]
+        processor.enable_sharded_verify(
+            temperature_keys=True, require_runtime_env=False
+        )
+        if not processor.sharded_verify:
+            logger.warning(
+                "DSpark verify on vocab shards: the LM head layout does not allow "
+                "shards; verifying on full logits."
+            )
+            return
+        processor.verify_shards_predicate = lambda forward_batch: epilogue.shard_step
+        logger.info(
+            "DSpark verify on vocab shards for served static steps (softcap %s)",
+            processor.final_logit_softcapping,
         )
 
     def init_cuda_graphs(self):
@@ -1192,13 +1227,30 @@ class DSparkWorkerV2(BaseSpecWorker):
             GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
         )
 
+        epilogue = self._verify_executor.verify_epilogue
+        # An epilogue whose static graph also runs the sampled accept (and its
+        # simulated bonus) serves this all-sampled step in the graph.
+        sampled_fold = (
+            epilogue is not None
+            and proposal.folded
+            and not run_compact
+            and self._verify_planner.mode_value == "static"
+            and sampling_info is not None
+            and not batch.has_grammar
+            and not batch.return_logprob
+            and epilogue.serves_sampled_fold(
+                sampling_info=sampling_info,
+                draft_block=draft_block,
+                block_verification=get_spec().speculative_use_block_verification,
+            )
+        )
         fold_eligible = (
-            self._verify_executor.verify_epilogue is not None
+            epilogue is not None
             and proposal.folded
             # The epilogue's in-graph accept is greedy (AcceptGreedy);
             # sampling batches must take the eager accept path even when the
             # draft proposal itself folded.
-            and (sampling_info is None or sampling_info.is_all_greedy)
+            and (sampling_info is None or sampling_info.is_all_greedy or sampled_fold)
             # A live grammar forces the eager path: the folded epilogue accepts inside
             # the cuda graph off its own buffers, where the mask below never lands.
             and verify_logits_adjustments_are_noop(
@@ -1208,9 +1260,26 @@ class DSparkWorkerV2(BaseSpecWorker):
             # only when the epilogue draws it there (SGLANG_DSPARK_SIMULATE_FOLD).
             and (
                 simulate_bonus_sampling_info is None
-                or self._verify_executor.verify_epilogue.simulate_fold
+                or epilogue.simulate_fold
+                or sampled_fold
             )
         )
+        if epilogue is not None:
+            # rank-uniform: sampling params, the plan and the epilogue's capture only
+            epilogue.shard_step = bool(
+                fold_eligible
+                and not run_compact
+                and epilogue.shard_static_captured
+                and not self._observers.reads_folded_target_logits()
+                and epilogue.serves_shards()
+            )
+        if fold_eligible:
+            epilogue.begin_fold(
+                bs,
+                sampled=sampled_fold,
+                draft_block=draft_block,
+                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
         if not self._sim_draw_ahead:
             self._verify_executor.begin_simulated_step()
             if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:

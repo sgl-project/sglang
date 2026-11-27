@@ -2289,6 +2289,10 @@ class Envs:
     SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # DSV4 HIP decode round: the replay metadata loads (req pool indices, seq lens,
+    # cache locations) and the spec-decode KV length loads run as one small_field_copy
+    # launch each instead of one copy per field.
+    SGLANG_OPT_DSV41_LEAN_ROUND_COPIES = EnvBool(False)
     # DSpark static verify: an all-sampled step (no top-k / top-p) replays its
     # sampling accept and commits as a CUDA graph right after the verify graph.
     SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(
