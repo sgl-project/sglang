@@ -7,10 +7,11 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_gfx95 = _is_hip and is_gfx95_supported()
 # (N, K) of the Kimi-K3.1 TP8 dense GEMMs hipBLASLt runs faster than AITER's tuned table at
 # 256-512 rows on MI350X (MoE front, KDA in_proj, latent up_proj, o_proj); level at 128.
