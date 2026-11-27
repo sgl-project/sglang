@@ -6218,9 +6218,9 @@ class Scheduler(
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache or self.enable_lmcache:
-            self.tree_cache.clear_storage_backend()
+            clear_result = self.tree_cache.clear_storage_backend()
             logger.info("Hierarchical cache or LMCache cleared successfully!")
-            if_success = True
+            if_success = clear_result is not False
         else:
             logging.warning("Hierarchical cache or LMCache is not enabled.")
             if_success = False

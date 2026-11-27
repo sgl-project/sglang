@@ -371,9 +371,8 @@ class TokenizerControlMixin:
         """Clear the hierarchical cache storage."""
         self.auto_create_handle_loop()
         # Delegate to the scheduler to handle HiCacheStorage clearing
-        return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[
-            0
-        ]
+        results = await self.clear_hicache_storage_communicator(ClearHiCacheReqInput())
+        return next((reply for reply in results if not reply.success), results[0])
 
     async def attach_hicache_storage(
         self: TokenizerManager,

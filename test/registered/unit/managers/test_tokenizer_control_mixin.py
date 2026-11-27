@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from sglang.srt.managers import tokenizer_control_mixin
 from sglang.srt.managers.io_struct import (
+    ClearHiCacheReqOutput,
     FlushCacheReqOutput,
     ProfileReq,
     ProfileReqOutput,
@@ -29,6 +30,30 @@ class TestFlushCache(CustomTestCase):
 
         self.assertIs(asyncio.run(TokenizerControlMixin.flush_cache(manager)), busy)
         manager.mm_processor.clear_preprocess_cache.assert_not_called()
+
+
+class TestClearHiCacheStorage(CustomTestCase):
+    def test_failed_dp_replica_prevents_success(self):
+        manager = MagicMock()
+        failure = ClearHiCacheReqOutput(success=False)
+        manager.clear_hicache_storage_communicator = AsyncMock(
+            return_value=[ClearHiCacheReqOutput(success=True), failure]
+        )
+
+        result = asyncio.run(TokenizerControlMixin.clear_hicache_storage(manager))
+
+        self.assertIs(result, failure)
+
+    def test_all_successful_dp_replicas_return_first_success(self):
+        manager = MagicMock()
+        first = ClearHiCacheReqOutput(success=True)
+        manager.clear_hicache_storage_communicator = AsyncMock(
+            return_value=[first, ClearHiCacheReqOutput(success=True)]
+        )
+
+        result = asyncio.run(TokenizerControlMixin.clear_hicache_storage(manager))
+
+        self.assertIs(result, first)
 
 
 class _QuietProfilePlatform(SRTPlatform):
