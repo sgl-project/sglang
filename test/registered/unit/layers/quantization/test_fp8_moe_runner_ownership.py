@@ -333,6 +333,33 @@ class TestFp8MoEAiterQuantInfo(CustomTestCase):
         self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "separated"})
         self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
 
+    def test_unclamped_block_fp8_does_not_import_gate_mode(self):
+        method = Fp8MoEMethod(
+            Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+        )
+        method.moe_runner_config = MoeRunnerConfig(swiglu_limit=0.0)
+        layer = SimpleNamespace(
+            w13_weight=torch.zeros((1, 4, 4), dtype=torch.float8_e4m3fn),
+            w2_weight=torch.zeros((1, 4, 2), dtype=torch.float8_e4m3fn),
+            w13_weight_scale_inv=torch.ones((1, 4, 1), dtype=torch.float32),
+            w2_weight_scale_inv=torch.ones((1, 4, 1), dtype=torch.float32),
+            hidden_pad=0,
+            intermediate_pad=0,
+            _aiter_gate_up_interleaved=False,
+            dispatcher=SimpleNamespace(expert_mask_gpu=torch.tensor([True, False])),
+        )
+
+        with (
+            patch.dict(sys.modules, {"aiter.ops.flydsl.moe_common": None}),
+            patch.object(fp8_module, "_use_aiter", True),
+        ):
+            quant_info = method.maybe_get_hip_aiter_quant_info(layer)
+
+        self.assertIsNotNone(quant_info)
+        self.assertEqual(quant_info.quant_type, AiterQuantType.PER_128X128)
+        self.assertEqual(quant_info.swiglu_limit, 0.0)
+        self.assertIsNone(quant_info.fused_moe_kwargs)
+
     def test_native_fp4_forwards_interleaved_layout_without_clamp(self):
         method = Fp8MoEMethod(
             Fp8Config(

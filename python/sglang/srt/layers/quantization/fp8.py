@@ -3777,9 +3777,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         fused_moe_kwargs = None
         gate_up_interleaved = getattr(layer, "_aiter_gate_up_interleaved", None)
         swiglu_limit = self.moe_runner_config.swiglu_limit or 0.0
-        if gate_up_interleaved is not None and (
-            self.is_fp4_expert or swiglu_limit > 0
-        ):
+        if gate_up_interleaved is not None and (self.is_fp4_expert or swiglu_limit > 0):
             from aiter.ops.flydsl.moe_common import GateMode
 
             fused_moe_kwargs = {
