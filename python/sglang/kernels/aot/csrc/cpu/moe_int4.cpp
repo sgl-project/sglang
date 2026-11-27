@@ -33,7 +33,6 @@ void fused_experts_int4_w4a8_kernel_impl(
     int64_t num_tokens_post_pad) {
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
-  int num_threads = at::get_num_threads();
 
   // stage 0: quantize input to uint8, [M, K]
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
@@ -50,14 +49,14 @@ void fused_experts_int4_w4a8_kernel_impl(
   int64_t Kc = K / _block_k;
   int64_t num_groups = K / group_size;
 
-  const int64_t stride_e = 2 * NB * Kc * (BLOCK_N * (_block_k / 2 + sizeof(int32_t)));
+  const int64_t block_stride = BLOCK_N * (_block_k / 2 + sizeof(int32_t));
+  const int64_t stride_e = 2 * NB * Kc * block_stride;
   const int64_t cache_size_per_thread = std::max(
       int64_t(get_cache_blocks<int8_t>(2 * BLOCK_N * K)) * 2 * BLOCK_N * K,
       int64_t(get_cache_blocks<int8_t>(BLOCK_N * N)) * BLOCK_N * N);
   // weight + compensation shape = [E, Nc, Kc, block_n * _block_k / 2 + block_n*sizeof(int32_t)]
   // scales/qzeros shape = [E, Nc, G, block_n]
 
-  // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb_end, int64_t nb0, int64_t nb_end) {
     // get local pointers
     int tid = get_thread_num();
@@ -69,27 +68,27 @@ void fused_experts_int4_w4a8_kernel_impl(
     bool is_brgemm_used = false;
     loop_2d<int8_t>(mb0, mb_end, nb0, nb_end, 2 * BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t nb1 = nb + NB;
-      int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
-      // B shape [K, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
       const uint8_t* __restrict__ B = packed_w1 + expert_id * stride_e;
       // Bz and Bs: [E, K/gs, 2N]
-      const int8_t* __restrict__ Bz = w1z + expert_id * (num_groups) * (2 * N);
-      const float* __restrict__ Bs = w1s + expert_id * (num_groups) * (2 * N);
+      const int8_t* __restrict__ Bz = w1z + expert_id * num_groups * (2 * N);
+      const float* __restrict__ Bs = w1s + expert_id * num_groups * (2 * N);
 
-      // 1.a load A
-      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       const bool use_brgemm = can_use_brgemm<int8_t>(m_size);
       is_brgemm_used = is_brgemm_used || use_brgemm;
       const bool do_dequant = mb == mb0 || expert_id != expert_ids[mb - 1];
       int8_t* dqB_tmp1 = thread_weight_cache + nb_offset * 2 * K * BLOCK_N;
       int8_t* dqB_tmp2 = dqB_tmp1 + K * BLOCK_N;
-      // copy to A [BLOCK_M, K]
-      for (int64_t m = 0; m < m_size; ++m) {
-        int32_t index = A_ids[m] / topk;
-        copy_stub(A + m * K, Aq_tmp + index * K, K);
-        As[m] = As_tmp[index];
+
+      if (nb_offset == 0) {
+        // 1.a load A [m_size, K]
+        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+        for (int64_t m = 0; m < m_size; ++m) {
+          int32_t index = A_ids[m] / topk;
+          copy_stub(A + m * K, Aq_tmp + index * K, K);
+          As[m] = As_tmp[index];
+        }
       }
       const int64_t offset = offsets[mb];
       fill_stub(C0, 0.f, m_size * BLOCK_N);
@@ -167,10 +166,9 @@ void fused_experts_int4_w4a8_kernel_impl(
   const int64_t IC = N;  // rename N as IC
   const int64_t MB2 = MB;
   const int64_t NB2 = div_up(OC, BLOCK_N);
-  const int64_t stride_oc = IC;
   num_groups = IC / group_size;
   Kc = IC / _block_k;
-  const int64_t stride_e2 = NB2 * Kc * (BLOCK_N * (_block_k / 2 + sizeof(int32_t)));
+  const int64_t stride_e2 = NB2 * Kc * block_stride;
   // parallel on [MB2, NB2]
   parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb_end, int64_t nb0, int64_t nb_end) {
     int tid = get_thread_num();

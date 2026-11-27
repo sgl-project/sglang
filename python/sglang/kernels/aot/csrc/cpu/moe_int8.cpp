@@ -304,7 +304,7 @@ void tinygemm_kernel(
           LAUNCH_TINYGEMM_KERNEL_VNNI(4, 32);
           break;
         default:
-          TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+          TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", nb_size);
       }
     }
   }
@@ -434,9 +434,9 @@ void tinygemm_kernel(
   // B compensation
   const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + block_size_n() * K);
 
-  // pattern: 1-4-16
+  // pattern: 1-2-8
   constexpr int64_t BLOCK_M = 4;
-  constexpr int64_t BLOCK_N = 64;
+  constexpr int64_t BLOCK_N = 32;
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
   for (int64_t mb = 0; mb < MB; ++mb) {
@@ -460,7 +460,7 @@ void tinygemm_kernel(
           LAUNCH_TINYGEMM_KERNEL_VNNI2(4, 32);
           break;
         default:
-          TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+          TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", nb_size);
       }
     }
   }

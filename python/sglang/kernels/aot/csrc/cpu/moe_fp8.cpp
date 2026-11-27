@@ -43,12 +43,13 @@ void fused_experts_fp_kernel_impl(
   int64_t scale_size_N = div_up(2 * N, block_size_N);
   int64_t scale_size_K = div_up(K, block_size_K);
   int64_t blocks_n_per_group = block_size_N / BLOCK_N;
-  std::function<int64_t(int64_t)> scale_offset_per_block;
-  if constexpr (is_mxfp4) {
-    scale_offset_per_block = [&](int64_t a) { return a * BLOCK_N; };
-  } else {
-    scale_offset_per_block = [&](int64_t a) { return a / blocks_n_per_group; };
-  }
+  auto scale_offset_per_block = [&](int64_t a) {
+    if constexpr (is_mxfp4) {
+      return a * BLOCK_N;
+    } else {
+      return a / blocks_n_per_group;
+    }
+  };
 
   const int64_t packed_K = get_row_size<packed_t>(K);
 
@@ -60,7 +61,6 @@ void fused_experts_fp_kernel_impl(
 
   int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
 
-  // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
     int tid = get_thread_num();
