@@ -715,9 +715,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_path()
         if self.served_model_name is None:
             self.served_model_name = self.model_id or self.model_path
-        if self.admin_api_key is None:
-            # --admin-api-key wins; without it the server takes SGLANG_ADMIN_API_KEY.
-            self.admin_api_key = srt_envs.SGLANG_ADMIN_API_KEY.get() or None
+        self._adjust_admin_api_key()
         self._adjust_quant_config()
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
@@ -1661,6 +1659,11 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"{name} port {port} is unavailable and --strict-ports is enabled. "
                 f"Either use a different port or disable --strict-ports."
             )
+
+    def _adjust_admin_api_key(self):
+        if self.admin_api_key is None:
+            # --admin-api-key wins; without it the server takes SGLANG_ADMIN_API_KEY.
+            self.admin_api_key = srt_envs.SGLANG_ADMIN_API_KEY.get() or None
 
     def _adjust_network_ports(self):
         # standalone roles only need an HTTP port when exposing metrics

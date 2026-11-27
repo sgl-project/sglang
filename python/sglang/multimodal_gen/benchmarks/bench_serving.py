@@ -42,7 +42,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.test.test_utils import print_divider, print_value_formatted
-from sglang.srt.utils.auth import admin_auth_headers
+from sglang.srt.utils.auth import admin_auth_headers, bearer_auth_headers
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -570,12 +570,16 @@ async def benchmark(args):
     if args.guidance_scale is not None:
         extra_body.setdefault("guidance_scale", args.guidance_scale)
 
+    auth_headers = bearer_auth_headers(args.api_key)
+
     # Wait for service
     wait_for_service(args.base_url)
 
     # Fetch model info
     try:
-        resp = requests.get(f"{args.base_url}/v1/model_info", timeout=5)
+        resp = requests.get(
+            f"{args.base_url}/v1/model_info", headers=auth_headers, timeout=5
+        )
         if resp.status_code == 200:
             info = resp.json()
             if "model_path" in info and info["model_path"]:
@@ -665,7 +669,7 @@ async def benchmark(args):
         else:
             return await request_func(req, session, pbar)
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers=auth_headers) as session:
         # Run warmup requests
         warmup_pairs: List[tuple] = []
         if args.warmup_requests and requests_list:
@@ -815,6 +819,12 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="localhost", help="Server host.")
     parser.add_argument("--port", type=int, default=30000, help="Server port.")
     parser.add_argument("--model", type=str, default="default", help="Model name.")
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=os.environ.get("OPENAI_API_KEY"),
+        help="The inference API key (default: OPENAI_API_KEY).",
+    )
     parser.add_argument(
         "--dataset",
         type=str,

@@ -755,13 +755,6 @@ def create_app(
         add_prometheus_middleware(app)
         add_http_request_metrics_middleware(app)
         init_http_request_metrics()
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
     app.add_middleware(_ServingHTTPMiddleware)
     gateway = server_args.media_gateway_key_file is not None
@@ -792,9 +785,21 @@ def create_app(
     app.include_router(image_api.router, dependencies=media_dependencies)
     app.include_router(video_api.router, dependencies=media_dependencies)
     app.include_router(mesh_api.router, dependencies=media_dependencies)
-    # Outermost: route levels come from sglang/srt/utils/auth_levels.json.
+    # Apply route authentication inside CORS so browsers can read auth errors.
     add_api_key_middleware(
-        app, get_keys=lambda: (server_args.api_key, server_args.admin_api_key)
+        app,
+        get_keys=lambda: (
+            getattr(server_args, "api_key", None),
+            getattr(server_args, "admin_api_key", None),
+        ),
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
     app.state.server_args = server_args
