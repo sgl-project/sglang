@@ -536,8 +536,6 @@ class TestTraceReplayBatch(CustomTestCase):
             apply_trace_decode_tokens(torch.tensor([30, 31]), right).tolist(), [13, 31]
         )
         snapshot = info.copy_for_forward().trace_replay
-        table = snapshot.pool.tokens
-        revision = snapshot.pool.revision
 
         info.advance_trace_decode_steps()
         info.trace_replay = TraceReplayBatch.merge(
@@ -547,6 +545,8 @@ class TestTraceReplayBatch(CustomTestCase):
             apply_trace_decode_tokens(torch.tensor([30, 31, 32]), info).tolist(),
             [8, 13, 32],
         )
+        table = info.trace_replay.pool.tokens
+        revision = info.trace_replay.pool.revision
         info.trace_replay = info.trace_replay.filter([0, 2], torch.tensor([0, 2]))
         self.assertEqual(
             apply_trace_decode_tokens(torch.tensor([30, 31]), info).tolist(), [8, 31]
@@ -600,7 +600,7 @@ class TestTraceReplayBatch(CustomTestCase):
             apply_trace_decode_tokens(torch.tensor([30]), turn1).tolist(), [7]
         )
 
-        turn2_req = self._make_req(trace=[21, 22])
+        turn2_req = self._make_req(trace=(21, 22))
         turn2_req.kv.req_pool_idx = slot
         turn2 = self._make_trace_info([turn2_req])
         self.assertEqual(
@@ -610,6 +610,13 @@ class TestTraceReplayBatch(CustomTestCase):
         self.assertEqual(
             apply_trace_decode_tokens(torch.tensor([30]), turn2).tolist(), [22]
         )
+        # Compact pool sizes to active traced requests (not full req_pool capacity)
+        # and keeps only 16-byte digests in residency metadata (no token_ids ref).
+        pool = turn2.trace_replay.pool
+        self.assertEqual(pool.tokens.shape[0], 2)
+        for key in pool._row_to_key.values():
+            self.assertIsInstance(key[2], bytes)
+            self.assertEqual(len(key[2]), 16)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ Common use cases include:
 
 ## Enabling Trace Replay
 
-Because trace replay lazily allocates a device trace table keyed by request-pool slots, it is **disabled by default**. Launch the server with `--enable-trace-replay`:
+Because trace replay lazily allocates a compact device trace table storing rows for active traced requests (`(max_concurrent_traced_reqs + 1) × max_trace_len × 4B`), it is **disabled by default**. Launch the server with `--enable-trace-replay`:
 
 ```bash
 python3 -m sglang.launch_server \
@@ -59,6 +59,7 @@ print("output_token_logprobs:", result["meta_info"]["output_token_logprobs"])
 
 Trace replay currently targets **normal (non-speculative) decoding** and rejects requests that combine `trace_decode_token_ids` with:
 - Speculative decoding (`--speculative-algorithm` enabled)
+- Diffusion LLMs (`--dllm-algorithm` enabled)
 - PD disaggregation (`--disaggregation-mode` != `null`) or HiSparse (`--enable-hisparse`)
 - `n != 1` or `beam_width > 1`
 - Structured outputs (`json_schema`, `regex`, `ebnf`, `structural_tag`)

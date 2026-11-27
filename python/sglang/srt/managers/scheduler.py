@@ -3646,6 +3646,10 @@ class Scheduler(
                 error_msg = (
                     "trace_decode_token_ids is not supported with --enable-hisparse."
                 )
+            elif get_exec().dllm.dllm_algorithm is not None:
+                error_msg = (
+                    "trace_decode_token_ids is not supported with --dllm-algorithm."
+                )
             elif req.return_sampling_mask:
                 error_msg = (
                     "trace_decode_token_ids is not supported with return_sampling_mask."

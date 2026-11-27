@@ -66,6 +66,8 @@ class DllmAlgorithm:
                 "(frequency_penalty, presence_penalty, repetition_penalty, "
                 "min_new_tokens)."
             )
+        if req.sampling_params.trace_decode_token_ids is not None:
+            return "Diffusion LLMs do not support trace_decode_token_ids."
         return None
 
     def prepare_inputs(

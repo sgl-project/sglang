@@ -58,7 +58,6 @@ class TestSRTEndpoint(CustomTestCase):
             env={**cls.env, **SERVER_ENV, "SGLANG_LOGPROB_CHUNK_SIZE": "64"},
             other_args=(
                 *cls.custom_logit_processor_args,
-                "--enable-trace-replay",
                 "--mem-fraction-static",
                 "0.7",
                 "--cuda-graph-max-bs-decode",
@@ -134,34 +133,20 @@ class TestSRTEndpoint(CustomTestCase):
             return_text=True,
         )
 
-    def test_trace_decode_token_ids_replay_end_to_end(self):
-        """The request path must preserve and replay every supplied token id."""
-        trace_token_ids = [1, 2, 3, 4]
+    def test_trace_decode_token_ids_rejected_when_disabled(self):
+        """Trace replay must be rejected with HTTP 400 unless --enable-trace-replay is set."""
         response = requests.post(
             self.base_url + "/generate",
             json={
                 "text": "Trace replay:",
                 "sampling_params": {
-                    "temperature": 0.8,
-                    "max_new_tokens": len(trace_token_ids),
-                    "trace_decode_token_ids": trace_token_ids,
+                    "temperature": 0.0,
+                    "trace_decode_token_ids": [1, 2, 3, 4],
                 },
-                "return_logprob": True,
-                "top_logprobs_num": 5,
             },
         )
-        self.assertEqual(response.status_code, 200, response.text)
-        result = response.json()
-        meta_info = result["meta_info"]
-
-        self.assertEqual(meta_info["completion_tokens"], len(trace_token_ids))
-        self.assertEqual(
-            [entry[1] for entry in meta_info["output_token_logprobs"]],
-            trace_token_ids,
-        )
-        self.assertTrue(
-            all(entry[0] is not None for entry in meta_info["output_token_logprobs"])
-        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("--enable-trace-replay", response.text)
 
     def test_logprob_start_len(self):
         logprob_start_len = 4
@@ -962,6 +947,85 @@ class TestRustServerEndpoint(TestSRTEndpoint):
                 self.assertAlmostEqual(pos_top[0][0], lp, places=4)
                 vals = [t[0] for t in pos_top]
                 self.assertEqual(vals, sorted(vals, reverse=True))
+
+
+class TestSRTEndpointTraceReplay(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=SERVER_ENV,
+            other_args=(
+                "--enable-trace-replay",
+                "--mem-fraction-static",
+                "0.7",
+                "--cuda-graph-max-bs-decode",
+                "8",
+            ),
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_trace_decode_token_ids_replay_end_to_end(self):
+        """The request path must preserve and replay every supplied token id."""
+        trace_token_ids = [1, 2, 3, 4]
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Trace replay:",
+                "sampling_params": {
+                    "temperature": 0.8,
+                    "trace_decode_token_ids": trace_token_ids,
+                },
+                "return_logprob": True,
+                "top_logprobs_num": 5,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        meta_info = response.json()["meta_info"]
+        self.assertEqual(meta_info["completion_tokens"], len(trace_token_ids))
+        self.assertEqual(
+            [entry[1] for entry in meta_info["output_token_logprobs"]],
+            trace_token_ids,
+        )
+        self.assertTrue(
+            all(entry[0] is not None for entry in meta_info["output_token_logprobs"])
+        )
+
+    def test_trace_decode_mixed_batch_end_to_end(self):
+        """Mixed trace and ordinary requests must coexist in the same batch."""
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": [
+                    "Short prompt:",
+                    "The capital of France is",
+                    "Longer replay prompt:",
+                ],
+                "sampling_params": [
+                    {"temperature": 0.0, "trace_decode_token_ids": [1, 2, 3]},
+                    {"temperature": 0.0, "max_new_tokens": 5},
+                    {"temperature": 0.0, "trace_decode_token_ids": [4, 5, 6, 7, 8]},
+                ],
+                "return_logprob": True,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        results = response.json()
+        self.assertEqual(
+            [e[1] for e in results[0]["meta_info"]["output_token_logprobs"]], [1, 2, 3]
+        )
+        self.assertGreater(results[1]["meta_info"]["completion_tokens"], 0)
+        self.assertEqual(
+            [e[1] for e in results[2]["meta_info"]["output_token_logprobs"]],
+            [4, 5, 6, 7, 8],
+        )
 
 
 if __name__ == "__main__":

@@ -527,6 +527,10 @@ def check_server_args(server_args: Any):
             raise ValueError(
                 "--enable-trace-replay is not supported with --enable-hisparse."
             )
+        if cfg.dllm_algorithm is not None:
+            raise ValueError(
+                "--enable-trace-replay is not supported with --dllm-algorithm."
+            )
 
     assert cfg.schedule_conservativeness >= 0, (
         "schedule_conservativeness must be non-negative"

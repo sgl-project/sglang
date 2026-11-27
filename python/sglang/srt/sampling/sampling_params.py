@@ -396,6 +396,13 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         )
 
         if self.trace_decode_token_ids is not None:
+            if (
+                isinstance(self.trace_decode_token_ids, (str, bytes))
+                or not isinstance(self.trace_decode_token_ids, (list, tuple))
+            ):
+                raise ValueError(
+                    "trace_decode_token_ids must be a list of non-negative integers."
+                )
             self.validate_trace_decode_compatibility(
                 self.trace_decode_token_ids,
                 custom_params=self.custom_params,
@@ -544,6 +551,14 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         """Apply request-local limits and stop behavior for trace replay."""
         if self.trace_decode_token_ids is None:
             return
+        if isinstance(self.trace_decode_token_ids, (str, bytes)) or not isinstance(
+            self.trace_decode_token_ids, (list, tuple)
+        ):
+            raise ValueError(
+                "trace_decode_token_ids must be a list of non-negative integers."
+            )
+        if not isinstance(self.trace_decode_token_ids, list):
+            self.trace_decode_token_ids = list(self.trace_decode_token_ids)
 
         invalid_token_ids = [
             token_id

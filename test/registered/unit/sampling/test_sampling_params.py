@@ -707,6 +707,18 @@ class TestSamplingParamsNormalize(CustomTestCase):
                 prompt_len=8, context_len=8, vocab_size=32000
             )
 
+    def test_trace_decode_token_ids_truncates_to_context_and_coerces_tuple(self):
+        sampling_params = SamplingParams(
+            trace_decode_token_ids=tuple(range(10)), max_new_tokens=64
+        )
+        sampling_params.normalize(tokenizer=None)
+        sampling_params.normalize_trace_decode_token_ids(
+            prompt_len=10, context_len=16, reserved_tokens=2, vocab_size=32000
+        )
+        self.assertEqual(sampling_params.trace_decode_token_ids, [0, 1, 2, 3])
+        self.assertIsInstance(sampling_params.trace_decode_token_ids, list)
+        self.assertEqual(sampling_params.max_new_tokens, 4)
+
 
 class TestSamplingParamsMsgspecStruct(CustomTestCase):
     def test_rust_sampling_schema_stays_in_lockstep(self):

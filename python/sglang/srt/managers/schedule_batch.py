@@ -3338,7 +3338,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Replay progress is request-local and must advance with the decode
         # batch, independently of model positions (which can be offset by
-        # prefixes, chunked prefill, or mixed batches).
+        # prefixes, chunked prefill, or mixed batches). This relies on
+        # sampling_info not being rebuilt for decode (PD disaggregation and
+        # HiSparse staging-to-decode are rejected for this reason).
+        if self.sampling_info.trace_replay is not None:
+            assert len(self.sampling_info.trace_replay.slots) == len(self.reqs), (
+                "TraceReplayBatch row count diverged from ScheduleBatch.reqs"
+            )
         self.sampling_info.advance_trace_decode_steps()
 
         if self.hisparse_coordinator is not None:

@@ -9,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=7, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # backend-specific: compile and exercise the irregular masked gather on Triton-Ascend.
-register_npu_ci(est_time=15, suite="base-b-test-1-npu-a3")
+register_npu_ci(est_time=15, suite="extra-b-test-1-npu-a3")
 
 
 class TestTraceReplay(CustomTestCase):

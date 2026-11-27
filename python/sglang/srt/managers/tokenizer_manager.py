@@ -1588,15 +1588,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             SamplingParams.validate_trace_decode_compatibility(
                 trace_decode_token_ids,
                 custom_logit_processor=obj.custom_logit_processor,
-                custom_params=request_sampling_params.get("custom_params"),
                 require_reasoning=obj.require_reasoning,
                 max_thinking_tokens=obj.max_thinking_tokens,
                 enable_strict_thinking=get_serving().enable_strict_thinking,
-                watermark=(
-                    obj.watermark
-                    if obj.watermark is not None
-                    else request_sampling_params.get("watermark")
-                ),
             )
         max_new_tokens = (
             None
@@ -1917,24 +1911,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             custom_params = dict(sampling_kwargs.get("custom_params") or {})
             custom_params["thinking_budget"] = obj.max_thinking_tokens
             sampling_kwargs["custom_params"] = custom_params
-        if (
-            sampling_kwargs.get("trace_decode_token_ids") is not None
-            and not get_exec().features.enable_trace_replay
-        ):
-            raise ValueError(
-                "The server is not configured to enable trace replay. "
-                "Please set `--enable-trace-replay` to enable this feature."
-            )
-        if isinstance(obj, GenerateReqInput):
-            SamplingParams.validate_trace_decode_compatibility(
-                sampling_kwargs.get("trace_decode_token_ids"),
-                custom_logit_processor=obj.custom_logit_processor,
-                custom_params=sampling_kwargs.get("custom_params"),
-                require_reasoning=obj.require_reasoning,
-                max_thinking_tokens=obj.max_thinking_tokens,
-                enable_strict_thinking=get_serving().enable_strict_thinking,
-                watermark=sampling_kwargs.get("watermark"),
-            )
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.normalize_trace_decode_token_ids(

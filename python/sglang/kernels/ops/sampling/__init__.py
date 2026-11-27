@@ -186,9 +186,25 @@ def argmax(logits: torch.Tensor) -> torch.Tensor:
 def trace_replay(table, slots, lengths, steps, sampled, *, inplace=False):
     """Replace sampled tokens with each request's next trace token.
 
-    Row zero is reserved. Steps have shape [batch].
+    Coverage:
+      - Devices: CUDA, HIP, and Ascend NPU use the fused Triton kernel when
+        ``table.stride(1) == 1`` and ``slots``/``lengths``/``steps``/``sampled``
+        are contiguous; CPU and non-contiguous layouts fall back to PyTorch.
+      - Dtypes: ``table`` is ``int32``; ``slots``, ``lengths``, and ``steps``
+        are ``int32`` or ``int64``; ``sampled`` is an integer tensor of any
+        shape with ``sampled.numel() == steps.numel()``, and the returned
+        tensor preserves ``sampled.shape`` and ``sampled.dtype``.
+      - Row 0 of ``table`` is reserved for non-trace entries; invalid slots or
+        out-of-range steps preserve ``sampled``.
+      - Inplace: when ``inplace=True``, ``sampled`` is updated in place and
+        returned; when ``inplace=False``, a new tensor is allocated and
+        ``sampled`` is not mutated.
     """
     import torch
+
+    assert sampled.numel() == steps.numel(), (
+        f"sampled.numel() ({sampled.numel()}) must match steps.numel() ({steps.numel()})."
+    )
 
     if (
         table.device.type in ("cuda", "npu")

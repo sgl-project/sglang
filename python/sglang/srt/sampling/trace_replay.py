@@ -1,6 +1,9 @@
-"""Request-slot storage and batch metadata for trace replay."""
+"""Compact device storage and batch metadata for trace replay."""
 
+from array import array
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
+import hashlib
 from typing import Optional
 
 import torch
@@ -13,31 +16,47 @@ from sglang.srt.utils.device import (
 )
 
 
+def _trace_fingerprint(token_ids: Sequence[int], length: int) -> bytes:
+    """Compute a 128-bit digest of the active trace prefix without retaining it."""
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(array("q", token_ids[:length]).tobytes())
+    return digest.digest()
+
+
 @dataclass(frozen=True)
 class TraceReplaySlot:
     index: int
     generation: int
+    fingerprint: bytes
     # The tokenizer publishes a request-local list. Scheduling may cap the
     # effective length, but never mutates the published token sequence.
     token_ids: list[int]
     length: int
 
+    @property
+    def key(self) -> tuple[int, int, bytes]:
+        return (self.index, self.generation, self.fingerprint)
+
 
 class TraceReplayPool:
-    """Device token table addressed by stable request-pool slots.
+    """Compact device token table storing rows only for active traced requests.
 
-    The first trace allocates the table. Rows are uploaded on the stream that
-    consumes them, avoiding writes from the schedule stream while an overlap
-    forward is reading a previous generation. A delayed sampler can restore
-    its own generation from its snapshot if a newer request used the slot.
+    Row 0 is reserved for non-trace entries. Active requests are mapped to
+    compact 1-based rows keyed by ``(req_pool_idx, generation, fingerprint)``,
+    so neither device memory nor host residency metadata scales with the full
+    request-pool capacity or retains finished token lists. Rows are uploaded on
+    the consuming stream, and a delayed sampler can restore its own trace from
+    its snapshot if a newer request reclaimed the row.
     """
 
     def __init__(self, req_pool):
         self.device = torch.device(req_pool.device)
-        self.capacity = req_pool.req_generation.numel()
+        self.max_rows = req_pool.req_generation.numel()
         self.max_width = req_pool.max_context_len
         self.tokens: Optional[torch.Tensor] = None
-        self._residents: dict[int, tuple[int, list[int], int]] = {}
+        self._key_to_row: dict[tuple[int, int, bytes], int] = {}
+        self._row_to_key: dict[int, tuple[int, int, bytes]] = {}
+        self._row_lengths: dict[int, int] = {}
         self._stream = None
         self.revision = 0
 
@@ -51,70 +70,122 @@ class TraceReplayPool:
                 self.tokens.record_stream(stream)
         self._stream = stream
 
-    def _ensure_width(self, width: int):
+    def _ensure_capacity(self, rows: int, width: int):
+        if rows > self.max_rows:
+            raise ValueError(
+                "Active trace count exceeds the request pool's slot capacity."
+            )
         if width > self.max_width:
             raise ValueError(
                 "Trace length exceeds the request pool's context capacity."
             )
         old = self.tokens
-        old_width = old.shape[1] if old is not None else 0
-        if width <= old_width:
+        old_rows, old_width = old.shape if old is not None else (0, 0)
+        if rows <= old_rows and width <= old_width:
             return
-        # Keep slot IDs stable while growing the token dimension occasionally.
-        new_width = min(self.max_width, max(width, 2 * old_width))
+        new_rows = (
+            old_rows
+            if rows <= old_rows
+            else (
+                rows if old_rows == 0 else min(self.max_rows, max(rows, 2 * old_rows))
+            )
+        )
+        new_width = (
+            old_width
+            if width <= old_width
+            else (
+                width
+                if old_width == 0
+                else min(self.max_width, max(width, 2 * old_width))
+            )
+        )
         self.tokens = torch.empty(
-            (self.capacity, new_width), dtype=torch.int32, device=self.device
+            (new_rows, new_width), dtype=torch.int32, device=self.device
         )
         if old is not None:
-            self.tokens[:, :old_width].copy_(old)
+            self.tokens[:old_rows, :old_width].copy_(old)
         else:
             self.tokens[0, 0] = 0
 
     def prepare(self, batch):
         self._use_current_stream()
-        if batch._prepared_revision == self.revision:
-            return self.tokens
+        if (
+            batch._prepared_revision == self.revision
+            and batch._prepared_rows is not None
+        ):
+            return self.tokens, batch._prepared_rows
 
-        pending = []
+        active_keys = {slot.key for slot in batch.slots if slot is not None}
+        reusable_rows = [
+            row for row, key in self._row_to_key.items() if key not in active_keys
+        ]
+        allocated_rows = self.tokens.shape[0] if self.tokens is not None else 1
+        free_rows = [
+            row for row in range(1, allocated_rows) if row not in self._row_to_key
+        ]
+        next_row = allocated_rows
+
+        pending: list[tuple[int, TraceReplaySlot]] = []
+        assigned: dict[tuple[int, int, bytes], int] = {}
         for slot in batch.slots:
             if slot is None:
                 continue
-            resident = self._residents.get(slot.index)
-            if (
-                resident is None
-                or resident[0] != slot.generation
-                or resident[1] is not slot.token_ids
-                or resident[2] < slot.length
-            ):
-                pending.append(slot)
+            key = slot.key
+            if key in assigned:
+                continue
+            row = self._key_to_row.get(key)
+            if row is not None:
+                assigned[key] = row
+                if self._row_lengths.get(row, 0) < slot.length:
+                    pending.append((row, slot))
+                continue
+            if free_rows:
+                row = free_rows.pop()
+            elif reusable_rows:
+                row = reusable_rows.pop()
+                old_key = self._row_to_key.pop(row)
+                self._key_to_row.pop(old_key, None)
+                self._row_lengths.pop(row, None)
+            else:
+                row = next_row
+                next_row += 1
+            self._key_to_row[key] = row
+            self._row_to_key[row] = key
+            assigned[key] = row
+            pending.append((row, slot))
 
         if pending:
-            self._ensure_width(max(slot.length for slot in pending))
+            needed_rows = max(next_row, max(row for row, _ in pending) + 1)
+            needed_width = max(slot.length for _, slot in pending)
+            self._ensure_capacity(needed_rows, needed_width)
             pin = is_pin_memory_available(self.device)
-            for slot in pending:
+            for row, slot in pending:
                 host = torch.tensor(
                     slot.token_ids[: slot.length], dtype=torch.int32, pin_memory=pin
                 )
-                self.tokens[slot.index, : slot.length].copy_(host, non_blocking=pin)
-                self._residents[slot.index] = (
-                    slot.generation,
-                    slot.token_ids,
-                    slot.length,
-                )
+                self.tokens[row, : slot.length].copy_(host, non_blocking=pin)
+                self._row_lengths[row] = slot.length
             self.revision += 1
+
+        row_indices = [
+            assigned[slot.key] if slot is not None else 0 for slot in batch.slots
+        ]
+        batch._prepared_rows = async_h2d(
+            row_indices, dtype=torch.int32, device=self.device
+        )
         batch._prepared_revision = self.revision
-        return self.tokens
+        return self.tokens, batch._prepared_rows
 
 
 @dataclass
 class TraceReplayBatch:
     pool: TraceReplayPool
     slots: tuple[Optional[TraceReplaySlot], ...]
-    indices: torch.Tensor
     lengths: torch.Tensor
     steps: torch.Tensor
-    # Only this host-side cache changes in place. In-flight forward snapshots
-    # retain their slot bindings and step tensors.
+    # Host/device residency cache updated by prepare() on the consumer stream.
+    # In-flight forward snapshots retain their slot bindings and step tensors.
+    _prepared_rows: Optional[torch.Tensor] = None
     _prepared_revision: int = -1
 
     @classmethod
@@ -122,16 +193,26 @@ class TraceReplayBatch:
         traces = [
             getattr(req.sampling_params, "trace_decode_token_ids", None) for req in reqs
         ]
-        if not any(isinstance(trace, list) and trace for trace in traces):
+        if not any(
+            isinstance(trace, Sequence)
+            and not isinstance(trace, (str, bytes))
+            and len(trace) > 0
+            for trace in traces
+        ):
             return None
 
         slots = []
         for req, trace in zip(reqs, traces, strict=True):
-            if not isinstance(trace, list) or not trace:
+            if (
+                not isinstance(trace, Sequence)
+                or isinstance(trace, (str, bytes))
+                or len(trace) == 0
+            ):
                 slots.append(None)
                 continue
+            token_list = trace if isinstance(trace, list) else list(trace)
             cap = req.sampling_params.max_new_tokens
-            length = len(trace) if cap is None else min(len(trace), cap)
+            length = len(token_list) if cap is None else min(len(token_list), cap)
             if length <= 0:
                 slots.append(None)
                 continue
@@ -139,7 +220,11 @@ class TraceReplayBatch:
             assert index is not None and index > 0
             slots.append(
                 TraceReplaySlot(
-                    index, int(req_pool.req_generation[index]), trace, length
+                    index,
+                    int(req_pool.req_generation[index]),
+                    _trace_fingerprint(token_list, length),
+                    token_list,
+                    length,
                 )
             )
 
@@ -150,7 +235,6 @@ class TraceReplayBatch:
             pool = req_pool.trace_replay_pool = TraceReplayPool(req_pool)
         meta = async_h2d(
             [
-                [slot.index if slot is not None else 0 for slot in slots],
                 [slot.length if slot is not None else 0 for slot in slots],
                 [
                     len(req.output_ids) if slot is not None else 0
@@ -160,19 +244,26 @@ class TraceReplayBatch:
             dtype=torch.int32,
             device=pool.device,
         )
-        return cls(pool, tuple(slots), meta[0], meta[1], meta[2])
+        return cls(pool, tuple(slots), meta[0], meta[1])
 
     def filter(self, keep_indices, keep_indices_device):
         slots = tuple(self.slots[i] for i in keep_indices)
         if not any(slot is not None for slot in slots):
             return None
+        prepared_rows = (
+            self._prepared_rows[keep_indices_device]
+            if self._prepared_rows is not None
+            else None
+        )
         return TraceReplayBatch(
             self.pool,
             slots,
-            self.indices[keep_indices_device],
             self.lengths[keep_indices_device],
             self.steps[keep_indices_device],
-            _prepared_revision=self._prepared_revision,
+            _prepared_rows=prepared_rows,
+            _prepared_revision=(
+                self._prepared_revision if prepared_rows is not None else -1
+            ),
         )
 
     @classmethod
@@ -187,7 +278,6 @@ class TraceReplayBatch:
             return cls(
                 trace.pool,
                 (None,) * before + trace.slots + (None,) * after,
-                torch.nn.functional.pad(trace.indices, pad),
                 torch.nn.functional.pad(trace.lengths, pad),
                 torch.nn.functional.pad(trace.steps, pad),
             )
@@ -195,7 +285,6 @@ class TraceReplayBatch:
         return cls(
             left.pool,
             left.slots + right.slots,
-            torch.cat((left.indices, right.indices)),
             torch.cat((left.lengths, right.lengths)),
             torch.cat((left.steps, right.steps)),
         )
@@ -204,9 +293,10 @@ class TraceReplayBatch:
         return replace(self, steps=self.steps + 1)
 
     def apply(self, sampled, *, inplace=False):
+        table, rows = self.pool.prepare(self)
         return trace_replay_op(
-            self.pool.prepare(self),
-            self.indices,
+            table,
+            rows,
             self.lengths,
             self.steps,
             sampled,
