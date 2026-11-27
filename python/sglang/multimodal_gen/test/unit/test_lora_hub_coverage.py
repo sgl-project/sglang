@@ -217,12 +217,20 @@ def _lora_layers(base_model: str, lora_repo: str, lora_file: str) -> set[str]:
             _header_state_dict(lora_repo, lora_file), adapter_config={}
         )
     )
+    target_names = {
+        f"{layer}.{suffix}"
+        for layer in _base_layers(base_model)
+        for suffix in ("lora_A", "lora_B", "alpha")
+    }
     adapter = map_lora_state_dict_to_dit(
         lora_state_dict,
-        get_param_names_mapping(arch.param_names_mapping),
+        get_param_names_mapping(
+            arch.param_names_mapping, valid_target_names=target_names
+        ),
         get_param_names_mapping(arch.lora_param_names_mapping),
         lora_alpha=None,
         device="meta",
+        lora_target_names=target_names,
     )
     return {
         name.removesuffix(".lora_A")

@@ -47,6 +47,24 @@ class QwenImageArchConfig(DiTArchConfig):
             ),
             # LoRA mappings
             r"^(transformer_blocks\.\d+\.attn\..*\.lora_[AB])\.default$": r"\1",
+            # Q/K/V LoRA weights for the fused `to_qkv` of ModelOpt FP8 builds.
+            # LoRA loading keeps the split name when the DiT has separate
+            # to_q/to_k/to_v layers.
+            r"^(transformer_blocks\.\d+\.attn)\.to_q\.(lora_A|lora_B|alpha)$": (
+                r"\1.to_qkv.\2",
+                0,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn)\.to_k\.(lora_A|lora_B|alpha)$": (
+                r"\1.to_qkv.\2",
+                1,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn)\.to_v\.(lora_A|lora_B|alpha)$": (
+                r"\1.to_qkv.\2",
+                2,
+                3,
+            ),
             # SVDquant mappings
             r"(.*)\.add_qkv_proj\.(.+)$": r"\1.to_added_qkv.\2",
             r"(transformer_blocks\.\d+\.(img_mlp|txt_mlp)\..*\.(smooth_factor_orig|wcscales))$": r"\1",
