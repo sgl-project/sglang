@@ -1278,11 +1278,20 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             use_triton_causal_conv or get_memory().enable_page_major_kv_layout
         )
         layer_cache = self.state_layer_cache(layer_id)
-        ssm_state_in_pool = _ssm_slots_contiguous(layer_cache.temporal)
-        track_states_in_pool = (
-            ssm_state_in_pool
-            and self.forward_metadata.track_ssm_final_dst_per_row is not None
-        )
+        # MambaMixer1 (Falcon-Mamba) also runs here; its 3-D state and forward()
+        # have no pool mode.
+        pool_kwargs = {}
+        track_states_in_pool = False
+        if isinstance(mixer, MambaMixer2):
+            ssm_state_in_pool = _ssm_slots_contiguous(layer_cache.temporal)
+            track_states_in_pool = (
+                ssm_state_in_pool
+                and self.forward_metadata.track_ssm_final_dst_per_row is not None
+            )
+            pool_kwargs = dict(
+                ssm_state_in_pool=ssm_state_in_pool,
+                track_states_in_pool=track_states_in_pool,
+            )
         mixer_out, intermediate_states, track_states = mixer.forward(
             hidden_states=hidden_states,
             output=output,
@@ -1290,8 +1299,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             metadata=self.forward_metadata,
             mup_vector=mup_vector,
             use_triton_causal_conv=use_triton_causal_conv,
-            ssm_state_in_pool=ssm_state_in_pool,
-            track_states_in_pool=track_states_in_pool,
+            **pool_kwargs,
         )
 
         if forward_batch.mamba_track_mask is not None:
