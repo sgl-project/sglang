@@ -70,6 +70,7 @@ class MockModelRunner:
             {
                 # A typical max_bs * max_context_len for cuda graph decode
                 "size": max_batch_size,
+                "row_width": max_context_len,
                 # Add req_to_token attribute
                 "req_to_token": torch.zeros(
                     max_batch_size,

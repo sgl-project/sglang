@@ -30,13 +30,11 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_npu = is_npu()
 _is_xpu = is_xpu()
-_is_mps = is_mps()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -156,7 +154,6 @@ class DSAIndexerPoolHost(HostKVCache):
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
         self.size_per_token = self.indexer_layout_dim // self.page_size
-        self.can_use_jit = False
         self.can_use_write_back_jit = False
         if self._is_dummy:
             self.index_k_with_scale_buffer = None
