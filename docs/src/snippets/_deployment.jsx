@@ -103,6 +103,11 @@
 //                      defaults to both, in that order
 //   showPlaygroundLink optional — false hides the "Open the Playground" footer
 //                      for cookbooks that only expose the deployment matrix
+//   ratings            optional — false hides the per-recipe 👍/👎 row (it is
+//                      also off for commandBuilder pages and redirect cells).
+//                      A recipe is keyed by page path + hw, match-dim and applied
+//                      overlay-dim ids (ratingKey), so renaming any of them
+//                      resets that recipe's ratings
 // Component props besides `config` / `benchmarks`:
 //   agenticLink        optional — heading id of the page's agentic long-context
 //                      section; adds a footer link to it under the Playground link
@@ -643,6 +648,25 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     return out;
   };
   // ==== end MIRROR ====
+  // Recipe-rating key for a selection: every dim that shapes the command, i.e.
+  // the match dims plus the overlay dims whose pick applies (an overlay such
+  // as speculative decoding changes the command, so its on and off states are
+  // rated apart). Same test as overlayPick: a visible row holding a disabled
+  // pick (every option disabled on this hardware) adds nothing to the command,
+  // so it stays out of the key. These ids are the ratings' storage keys:
+  // renaming hw, a dim, or an option id (or moving the page) starts its
+  // recipes from zero. docs/scripts/export_rating_ids.mjs lists every
+  // reachable key.
+  const ratingKey = (sel) => {
+    const applied = overlayDimSpecs.filter((spec) => {
+      if (!rowVisible(spec, sel)) return false;
+      const opt = (spec.options || []).find((o) => o.id === sel[spec.id]);
+      return !!opt && !optionDisabled(opt, sel);
+    });
+    return [...DIMENSIONS, ...applied.map((d) => d.id)]
+      .map((d) => `${d}=${sel[d]}`)
+      .join("&");
+  };
   // `soft` marks an option that is plausible but outside the verified matrix:
   // it stays selectable (the status badge reports verification separately),
   // where `disabled` is reserved for combinations that cannot work at all.
@@ -1545,6 +1569,78 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     : findCell(config.cells, sel);
   const builderMeta = (cell && cell.builder) || {};
   const verifyStatus = cellVerifyStatus(cell, sel);
+
+  // ==== Recipe ratings (👍/👎 per cell) ====
+  // Votes live in an external service (sgl-project/sglang-cookbook-ratings);
+  // the browser talks to it directly. It answers only https://docs.sglang.io
+  // (CORS and an Origin check), so local and preview builds show no row.
+  // Off when the endpoint is empty, for builder pages (no discrete cells to
+  // rate), or when a page sets `config.ratings: false`.
+  const RATINGS_ENDPOINT = "https://sglang-cookbook-ratings.vercel.app/";
+  const ratingsEnabled =
+    !!RATINGS_ENDPOINT && !commandBuilder && config.ratings !== false;
+  // Keyed by page path + ratingKey(sel) (see the engine). The path is read
+  // after mount because the static render has no window.
+  const [ratingPath, setRatingPath] = useState(null);
+  useEffect(() => {
+    setRatingPath(window.location.pathname.replace(/\/+$/, "").toLowerCase() || "/");
+  }, []);
+  const recipeId =
+    ratingsEnabled && ratingPath && cell && !cell.redirect
+      ? `${ratingPath}|${ratingKey(sel)}`
+      : null;
+  // Fingerprint of the command the reader saw, stored with each vote so votes
+  // cast before a recipe fix can be told apart from votes cast after it. It
+  // hashes the whole rendered command (env, model, image, flags, PD commands)
+  // in the first run mode, with placeholders unfilled and no calculator
+  // ratio, so it depends on the recipe alone, not on the reader's inputs.
+  const recipeFingerprint = (() => {
+    if (!recipeId) return "";
+    let h = 0x811c9dc5; // FNV-1a, 32-bit
+    const text = renderCommand(cell, sel, {}, runModes[0]);
+    for (let i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, "0");
+  })();
+  // {id, up, down, mine}: the service's answer, tagged with the recipe it is
+  // for. Only an answer for the current recipe is shown, and a vote reply that
+  // lands after the reader moved to another recipe neither shows nor replaces
+  // the new recipe's answer.
+  const [ratingState, setRatingState] = useState(null);
+  const rating = ratingState && ratingState.id === recipeId ? ratingState : null;
+  const [ratingBusy, setRatingBusy] = useState(false);
+  useEffect(() => {
+    if (!recipeId) return;
+    const ctrl = new AbortController();
+    fetch(`${RATINGS_ENDPOINT}?id=${encodeURIComponent(recipeId)}`, { signal: ctrl.signal })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (data) setRatingState({ ...data, id: recipeId }); })
+      .catch(() => {}); // A down rating service must never break the page.
+    return () => ctrl.abort();
+  }, [recipeId]);
+  const castVote = (vote) => {
+    if (!recipeId || !rating || ratingBusy) return;
+    // Clicking the active thumb again withdraws the vote.
+    const next = rating.mine === vote ? "none" : vote;
+    const votedId = recipeId;
+    setRatingBusy(true);
+    fetch(RATINGS_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: votedId, vote: next, fp: recipeFingerprint }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      // Keep an answer the page already holds for another recipe: the reader
+      // moved on while this vote was in flight.
+      .then((data) => {
+        if (data) setRatingState((prev) => (prev && prev.id !== votedId ? prev : { ...data, id: votedId }));
+      })
+      .catch(() => {})
+      .finally(() => setRatingBusy(false));
+  };
+
   // Pin the calculator-computed ratio into the rendered command (before the
   // host/port tail); cells themselves stay ratio-free. Cells sizing the pool
   // with --max-mamba-cache-size opt out.
@@ -2601,6 +2697,36 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               </div>
             )}
           </>)}
+        {recipeId && rating && (
+          <div
+            style={{
+              display: "flex", alignItems: "center", gap: "8px",
+              marginTop: "8px", fontSize: "12px",
+              color: isDark ? "#9ca3af" : "#6b7280",
+            }}
+          >
+            <span>Did this recipe work for you?</span>
+            {[["up", "👍"], ["down", "👎"]].map(([vote, icon]) => (
+              <button
+                key={vote}
+                type="button"
+                disabled={ratingBusy}
+                aria-pressed={rating.mine === vote}
+                aria-label={vote === "up" ? "This recipe worked" : "This recipe did not work"}
+                onClick={() => castVote(vote)}
+                style={{
+                  ...s.iconButton,
+                  ...(rating.mine === vote
+                    ? { borderColor: isDark ? "#FDBA74" : "#C2410C", fontWeight: 600 }
+                    : {}),
+                  opacity: ratingBusy ? 0.6 : 1,
+                }}
+              >
+                {icon} {rating[vote]}
+              </button>
+            ))}
+          </div>
+        )}
         </div>
       </div>
 
