@@ -13,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     register_memory_region,
+    register_memory_region_mori,
     register_memory_region_nixl,
 )
 from sglang.srt.runtime_context import (
@@ -36,6 +37,7 @@ class RemoteInstanceWeightTransporter:
     engine: Optional[Any] = None
     session_id: str = ""
     nixl_agent: Optional[Any] = None
+    mori_engine: Optional[Any] = None
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
     parallelism_config: Optional[RankParallelismConfig] = None
     _nixl_registration: Optional[Any] = None
@@ -50,6 +52,22 @@ class RemoteInstanceWeightTransporter:
             self._init_mooncake_engine()
         if get_model().remote_instance_weight_loader_start_seed_via_nixl:
             self._init_nixl_agent()
+        if get_model().remote_instance_weight_loader_start_seed_via_mori:
+            self._init_mori_engine()
+
+    def _init_mori_engine(self) -> None:
+        from mori.io import BackendType, IOEngine, IOEngineConfig, RdmaBackendConfig
+
+        engine = IOEngine(
+            f"sglang-weights-tp{self.tp_rank}-{uuid.uuid4()}",
+            IOEngineConfig(host=get_local_ip_auto(), port=0),
+        )
+        # notifications off: peers only write, and nothing pops the inbound status they leave
+        engine.create_backend(
+            BackendType.RDMA,
+            RdmaBackendConfig(enable_notification=False, enable_transfer_chunking=True),
+        )
+        self.mori_engine = engine
 
     def _init_nixl_agent(self) -> None:
         from nixl._api import nixl_agent, nixl_agent_config
@@ -99,13 +117,18 @@ class RemoteInstanceWeightTransporter:
             (
                 remote_instance_transfer_engine_enabled()
                 or get_model().remote_instance_weight_loader_start_seed_via_nixl
+                or get_model().remote_instance_weight_loader_start_seed_via_mori
             )
             # ModelExpress owns TransferEngine memory registration and metadata
             # publishing for backend=modelexpress. Re-registering here would
             # overlap the same weight buffers.
             and get_model().remote_instance_weight_loader_backend
             != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
-            and (self.engine is not None or self.nixl_agent is not None)
+            and (
+                self.engine is not None
+                or self.nixl_agent is not None
+                or self.mori_engine is not None
+            )
             and self.weight_info is None
         ):
             # Register memory and upstream the transfer engine info to the bootstrap server
@@ -123,6 +146,19 @@ class RemoteInstanceWeightTransporter:
 
     def _register_weights_for_peer_writes(self) -> dict:
         """Registers the weights with this runner's transport; returns what a peer needs to write them."""
+        if self.mori_engine is not None:
+            self.weight_info, blocks = register_memory_region_mori(
+                self.model, self.mori_engine, self.gpu_id
+            )
+            pack = lambda desc: base64.b64encode(desc.pack()).decode("ascii")  # noqa: E731
+            return {
+                "transport": "mori",
+                "engine_desc": pack(self.mori_engine.get_engine_desc()),
+                "memory_blocks": [
+                    [addr, size, pack(desc)] for addr, size, desc in blocks
+                ],
+                "weights_info_dict": self.weight_info,
+            }
         if self.nixl_agent is not None:
             self.weight_info, self._nixl_registration = register_memory_region_nixl(
                 self.model, self.nixl_agent, self.gpu_id
