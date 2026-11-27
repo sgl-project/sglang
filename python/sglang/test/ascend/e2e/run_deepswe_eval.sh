@@ -132,19 +132,32 @@ docker compose version || echo "WARNING: docker compose plugin is still unavaila
 # that has the key, so build a patched local image and retag it as
 # ubuntu:24.04; compose's `FROM ubuntu:24.04` then uses it instead of pulling.
 seed_ubuntu_base() {
-    local keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
-    if [ ! -f "${keyring}" ]; then
-        echo "WARNING: ${keyring} not found; skip patching ubuntu:24.04"
-        return 0
-    fi
     local work
     work="$(mktemp -d)"
-    cp "${keyring}" "${work}/ubuntu-archive-keyring.gpg"
+    local keys="${work}/ubuntu-archive-keyring.gpg"
+    : > "${keys}"
+    # Merge the keyrings this eval image actually uses for apt (Ubuntu 22.04,
+    # where apt verifies archive.ubuntu.com fine). The single
+    # /usr/share/keyrings file here is often a tiny placeholder, so include the
+    # trusted.gpg.d fragments too.
+    local f
+    for f in /usr/share/keyrings/ubuntu-archive-keyring.gpg /etc/apt/trusted.gpg.d/*.gpg; do
+        if [ -f "${f}" ]; then
+            cat "${f}" >> "${keys}"
+        fi
+    done
+    local size
+    size="$(wc -c < "${keys}" | tr -d ' ')"
+    if [ "${size:-0}" -lt 1024 ]; then
+        echo "WARNING: merged keyring is only ${size:-0} bytes; skip patching ubuntu:24.04"
+        rm -rf "${work}"
+        return 0
+    fi
     cat > "${work}/Dockerfile" <<'EOF'
 FROM ubuntu:24.04
 COPY ubuntu-archive-keyring.gpg /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
-    echo "Patching ubuntu:24.04 with the archive signing key ..."
+    echo "Patching ubuntu:24.04 with the archive signing key (${size} bytes) ..."
     if docker build -t ubuntu:24.04 "${work}"; then
         echo "Patched ubuntu:24.04 base ready."
     else
