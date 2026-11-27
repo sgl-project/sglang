@@ -88,6 +88,7 @@ These registered LeRobot checkpoints dispatch to the native `multimodal_gen` Pi0
 | `runtime.cuda_graph` | boolean or `"auto"`, optional | Enable the available prefix and action-denoise CUDA graph paths for this request. Defaults to `"auto"`. |
 | `runtime.output_format` | `"list"` or `"numpy"`, optional | Use `"list"` for JSON compatibility. Use `"numpy"` with msgpack or Python clients to avoid Python-list materialization. Defaults to `"list"`. |
 | `runtime.response_format` | `"envelope"` or `"raw"`, optional | HTTP-only response shape. `"envelope"` returns the generic action envelope. `"raw"` returns the policy payload directly. Defaults to `"envelope"`. |
+| `runtime.deadline_ms` | number, optional | Latency budget in milliseconds, measured from when the scheduler receives the request. Needs `enable_segmented_actions=true` in the pipeline config. Earlier deadlines run first and requests without one run after them. A request that expires before launch returns HTTP 504, or `error_type: "deadline_expired"` on the realtime WebSocket; a launched request is not cancelled. |
 
 ## 4. API Usage
 
