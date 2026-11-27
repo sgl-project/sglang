@@ -1237,11 +1237,14 @@ class Envs:
     # gfx1250 with SGLANG_USE_AITER=1: quantize the BF16 linears a Quark checkpoint excludes, when their module
     # path ends in one of SGLANG_QUARK_DENSE_FP8_LAYERS, to 128x128 block FP8 (power-of-two scales) after loading.
     SGLANG_QUARK_DENSE_FP8 = EnvBool(False)
-    # Comma-separated module-path suffixes. The default is o_proj only: the untuned decode-M block FP8 GEMMs lose
-    # to BF16 on the narrower linears, while o_proj gains the most at prefill for the least decode cost.
-    SGLANG_QUARK_DENSE_FP8_LAYERS = EnvStr("o_proj")
+    # Comma-separated module-path suffixes. The default is every SGLANG_QUARK_DENSE_FP8_ALL target except
+    # fused_qkv_a_proj_with_mqa: in FP8 it costs GSM8K accuracy on Kimi-K2-Thinking and slows decode.
+    SGLANG_QUARK_DENSE_FP8_LAYERS = EnvStr(
+        "q_b_proj,o_proj,shared_experts.gate_up_proj,shared_experts.down_proj,mlp.gate_up_proj,mlp.down_proj"
+    )
     # Implies SGLANG_QUARK_DENSE_FP8 and ignores SGLANG_QUARK_DENSE_FP8_LAYERS: every DeepSeek-V3 / Kimi-K2 attention
-    # projection except kv_b_proj (its absorbed w_kc / w_vc stay BF16), the shared expert and the dense-layer MLP.
+    # projection except kv_b_proj (its absorbed w_kc / w_vc stay BF16), the shared expert and the dense-layer MLP,
+    # including fused_qkv_a_proj_with_mqa.
     SGLANG_QUARK_DENSE_FP8_ALL = EnvBool(False)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra

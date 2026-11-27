@@ -46,7 +46,8 @@ def _dense_fp8_targets() -> list[str]:
 def online_block_fp8_applies(prefix: str) -> bool:
     """Whether the excluded linear at ``prefix`` is a dense FP8 target: every
     ALL_DENSE_FP8_LAYERS entry with SGLANG_QUARK_DENSE_FP8_ALL, else the ones
-    SGLANG_QUARK_DENSE_FP8_LAYERS names (o_proj by default)."""
+    SGLANG_QUARK_DENSE_FP8_LAYERS names (all but fused_qkv_a_proj_with_mqa by
+    default)."""
     if not (envs.SGLANG_QUARK_DENSE_FP8.get() or envs.SGLANG_QUARK_DENSE_FP8_ALL.get()):
         return False
     if not fp8_utils._use_aiter_mxfp8_gfx1250:

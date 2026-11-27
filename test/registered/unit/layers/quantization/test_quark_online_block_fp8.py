@@ -70,6 +70,7 @@ _ALL_TARGET_PREFIXES = (
     "model.layers.0.mlp.down_proj",
 )
 _O_PROJ = "model.layers.1.self_attn.o_proj"
+_QKV_A = "model.layers.1.self_attn.fused_qkv_a_proj_with_mqa"
 
 
 class TestOnlineBlockFp8Selection(CustomTestCase):
@@ -78,7 +79,7 @@ class TestOnlineBlockFp8Selection(CustomTestCase):
         prefix: str,
         enabled: bool = True,
         all_layers: bool = False,
-        layers: str = "o_proj",
+        layers: str = envs.SGLANG_QUARK_DENSE_FP8_LAYERS.default,
         aiter: bool = True,
     ) -> bool:
         with (
@@ -89,10 +90,15 @@ class TestOnlineBlockFp8Selection(CustomTestCase):
         ):
             return online_block_fp8_applies(prefix)
 
-    def test_default_is_o_proj_only(self):
-        self.assertEqual(envs.SGLANG_QUARK_DENSE_FP8_LAYERS.default, "o_proj")
+    def test_default_is_all_but_qkv_a(self):
         for prefix in _ALL_TARGET_PREFIXES:
-            self.assertEqual(self._applies(prefix), prefix == _O_PROJ, prefix)
+            self.assertEqual(self._applies(prefix), prefix != _QKV_A, prefix)
+
+    def test_o_proj_only(self):
+        for prefix in _ALL_TARGET_PREFIXES:
+            self.assertEqual(
+                self._applies(prefix, layers="o_proj"), prefix == _O_PROJ, prefix
+            )
 
     def test_all_flag_targets_every_dense_linear(self):
         for enabled in (False, True):
@@ -102,16 +108,13 @@ class TestOnlineBlockFp8Selection(CustomTestCase):
                 )
 
     def test_all_flag_ignores_layer_list(self):
+        self.assertTrue(self._applies(_QKV_A, all_layers=True))
         prefix = "model.layers.1.self_attn.q_b_proj"
         self.assertTrue(self._applies(prefix, all_layers=True, layers="o_proj"))
 
     def test_layer_list_override(self):
         layers = "fused_qkv_a_proj_with_mqa, o_proj"
-        self.assertTrue(
-            self._applies(
-                "model.layers.1.self_attn.fused_qkv_a_proj_with_mqa", layers=layers
-            )
-        )
+        self.assertTrue(self._applies(_QKV_A, layers=layers))
         self.assertFalse(
             self._applies("model.layers.1.self_attn.q_b_proj", layers=layers)
         )
