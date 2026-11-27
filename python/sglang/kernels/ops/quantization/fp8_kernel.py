@@ -51,13 +51,41 @@ if _is_cuda:
     )
 elif _is_xpu:
     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
-
-if _is_musa:
+elif _is_musa:
     from sgl_kernel import sgl_per_token_quant_fp8
 
     from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
+else:
+    # define default functions
+    def sgl_per_tensor_quant_fp8(
+        input: torch.Tensor,
+        output_q: torch.Tensor,
+        output_s: torch.Tensor,
+        is_static: bool = False,
+    ) -> None:
+        """Per-tensor FP8 quantization using native PyTorch operations."""
+        x = input.float()
+        if not is_static:
+            scale = x.abs().amax().clamp(min=1e-12) / fp8_max
+            output_s.copy_(scale.reshape_as(output_s))
+        quantized = (x / output_s.reshape(())).clamp(fp8_min, fp8_max).to(fp8_dtype)
+        output_q[: input.shape[0]].copy_(quantized)
+
+    def sgl_per_token_quant_fp8(
+        input: torch.Tensor,
+        output_q: torch.Tensor,
+        output_s: torch.Tensor,
+    ) -> None:
+        """Per-token FP8 quantization using native PyTorch operations."""
+        x = input.float()
+        num_tokens = input.shape[0]
+        scale = x.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / fp8_max
+        output_s[:num_tokens].view(num_tokens, 1).copy_(scale)
+        quantized = (x / scale).clamp(fp8_min, fp8_max).to(fp8_dtype)
+        output_q[:num_tokens].copy_(quantized)
+
 
 if _is_musa:
     # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
