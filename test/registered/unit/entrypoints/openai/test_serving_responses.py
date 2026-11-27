@@ -4,6 +4,7 @@ import functools
 import sys
 import unittest
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -17,6 +18,7 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai_harmony import Author, Conversation, Message, Role, ToolNamespaceConfig
+from transformers.utils.chat_template_utils import _compile_jinja_template
 from utils import (
     MockTemplateManager,
     MockTokenizerManager,
@@ -45,6 +47,10 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _build_output_text_logprobs,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.parser.jinja_template_utils import (
+    detect_jinja_template_content_format,
+    process_content_for_template_format,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
@@ -1291,6 +1297,63 @@ class InputItemNormalizationTestCase(CustomTestCase):
                 },
             ],
         )
+
+    def test_tool_output_image_keeps_its_slot_before_a_user_image(self):
+        template = (
+            Path(__file__).resolve().parents[5]
+            / "examples/chat_template/tool_chat_template_llama4_pythonic.jinja"
+        ).read_text()
+        screenshot, photo = "data:image/png;base64,AA", "data:image/png;base64,BB"
+        items = [
+            {"type": "message", "role": "user", "content": "Take a screenshot."},
+            {
+                "type": "function_call",
+                "call_id": "call_abc",
+                "name": "screenshot",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [
+                    {"type": "input_text", "text": "Screenshot captured."},
+                    {"type": "input_image", "image_url": screenshot},
+                ],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Compare it with my photo."},
+                    {"type": "input_image", "image_url": photo},
+                ],
+            },
+        ]
+        content_format = detect_jinja_template_content_format(template)
+        image_data = []
+        messages = [
+            process_content_for_template_format(
+                OpenAIServingResponses._normalize_response_message_for_chat(item),
+                content_format,
+                image_data,
+                [],
+                [],
+                [],
+            )
+            for item in items
+        ]
+        prompt = _compile_jinja_template(template).render(
+            messages=messages, bos_token="", add_generation_prompt=True
+        )
+
+        # The loader fills placeholders with image_data in order, so the n-th
+        # <|image|> must sit in the turn that carried the n-th image.
+        placeholder_turns = [
+            chunk.rsplit("<|header_start|>", 1)[1].split("<|header_end|>")[0]
+            for chunk in prompt.split("<|image|>")[:-1]
+        ]
+        self.assertEqual(placeholder_turns, ["ipython", "user"])
+        self.assertEqual([image.url for image in image_data], [screenshot, photo])
 
     def test_unknown_input_item_type_raises(self):
         with self.assertRaises(ValueError):

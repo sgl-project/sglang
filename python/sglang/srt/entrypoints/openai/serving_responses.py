@@ -1539,9 +1539,20 @@ class OpenAIServingResponses(OpenAIServingChat):
         if not isinstance(output, list):
             return output
         parts = [p for p in output if isinstance(p, dict)]
-        if any(p.get("type") in ("input_image", "image_url") for p in parts):
-            return [cls._normalize_response_content_part_for_chat(p) for p in parts]
-        return "".join(p.get("text", "") for p in parts)
+        image_types = ("input_image", "image_url")
+        if not any(p.get("type") in image_types for p in parts):
+            return "".join(p.get("text", "") for p in parts)
+        # Every non-image part becomes a typed text part, so the untyped
+        # {"text": ...} parts the string path accepts also pass chat validation.
+        return [
+            (
+                cls._normalize_response_content_part_for_chat(p)
+                if p.get("type") in image_types
+                else {"type": "text", "text": p["text"]}
+            )
+            for p in parts
+            if p.get("type") in image_types or "text" in p
+        ]
 
     @staticmethod
     def _chat_tool_call_message(message: dict, name: Any, arguments: str) -> dict:

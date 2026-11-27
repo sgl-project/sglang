@@ -11,7 +11,10 @@ from utils import (
     make_serving,
 )
 
-from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageGenericParam,
+    ResponsesRequest,
+)
 from sglang.srt.entrypoints.openai.responses_adapters import (
     decode_custom_tool_input,
     decode_custom_tool_input_prefix,
@@ -201,6 +204,30 @@ class CustomToolReplayTestCase(CustomTestCase):
             }
         )
         self.assertEqual(parts["content"], "/workspace")
+
+        with_image = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {"type": "output_text", "text": "/work"},
+                    {"text": "space"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AA"},
+                ],
+            }
+        )
+        ChatCompletionMessageGenericParam(**with_image)
+        self.assertEqual(
+            with_image["content"],
+            [
+                {"type": "text", "text": "/work"},
+                {"type": "text", "text": "space"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA", "detail": "auto"},
+                },
+            ],
+        )
 
 
 class CustomToolStreamTestCase(CustomTestCase):
