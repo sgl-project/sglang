@@ -4,7 +4,7 @@ import torch
 
 from sglang.srt.platforms import current_platform
 
-SUPPORTED_DEVICES = ["cuda", "xpu", "hpu", "cpu", "npu", "musa", "mps"]
+SUPPORTED_DEVICES = ["cuda", "xpu", "hpu", "cpu", "npu", "musa", "mps", "mlu"]
 
 
 class DeviceConfig:
