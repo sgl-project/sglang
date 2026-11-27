@@ -681,10 +681,10 @@ class Envs:
     # gather stays an NCCL allgather.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
-    # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
-    # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
-    # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
-    # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
+    # Attention (aiter, ROCm): route NEXTN/EAGLE draft_extend through aiter
+    # unified_attention instead of mha_batch_prefill. On by default for non-MLA
+    # topk<=1 even when prefill/target verify keep their default kernels; set 0
+    # for the CK fallback. Target verify still requires SGLANG_USE_AITER_UNIFIED_ATTN.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
     # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
     SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
@@ -1309,6 +1309,10 @@ class Envs:
     # Ascend NPU
     # ===================================================================
     SGLANG_NPU_ENABLE_STATIC_KERNEL = EnvBool(False)
+    # True means an unrotated dense DSpark draft needs correction for a GLM DSA
+    # ModelSlim QuaRot target: use checkpoint-local vocab and fold Q into the FC
+    # weights at load time. False preserves the existing loading behavior.
+    SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
     # time for arch35 (Ascend 950) Linear and MoE MXFP8 GEMMs. Disabled keeps
@@ -1540,6 +1544,8 @@ class Envs:
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvInt(32)
+    # Reshuffle experts in the elastic scale finalizer, not the next EPLB tick.
+    SGLANG_ENABLE_ELASTIC_SCALE_REBALANCE = EnvBool(True)
 
     # ===================================================================
     # DeepGEMM
@@ -1679,6 +1685,8 @@ class Envs:
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
+    # Unset, mooncake sends fp8, which cannot feed a deep_gemm runner on BF16 weights.
+    SGLANG_MOONCAKE_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)

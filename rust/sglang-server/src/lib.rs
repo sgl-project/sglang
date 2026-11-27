@@ -38,7 +38,7 @@ pub use message::config::{
 };
 pub use message::multimodal::{MediaHints, MmItem};
 pub use message::request::{
-    DispatchFinishTime, GenerateRequest, MediaAdmission, MmData, ProcessorFetch,
+    DispatchFinishTime, GenerateRequest, MediaAdmission, MmCancellation, MmData, ProcessorFetch,
 };
 pub use message::sampling::SamplingParams;
 pub use message::types::TokenIds;

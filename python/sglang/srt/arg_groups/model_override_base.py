@@ -262,6 +262,13 @@ def ep_scale_joiner_of(cfg: Any) -> bool:
     return cfg.ep_join_mode == "scale"
 
 
+def ep_offset_joiner_of(cfg: Any) -> bool:
+    """Joiner taking a specific global rank: scale, or recover into a retired slot."""
+    return cfg.ep_join_mode == "scale" or (
+        cfg.ep_join_mode == "recover" and cfg.ep_join_rank_offset > 0
+    )
+
+
 def startup_weight_load_overlap_of(cfg: Any) -> bool:
     """Whether weight loading overlaps startup."""
     return cfg.startup_weight_load_mode == "overlap"
@@ -318,6 +325,9 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
     cfg = resolving_view(server_args)
     # OOT platforms provide their own default attention backend.
     if current_platform.is_out_of_tree():
+        return current_platform.get_default_attention_backend()
+
+    if get_platform().is_mlu:
         return current_platform.get_default_attention_backend()
 
     # Whisper requires flashinfer for cross-attention CUDA graph support.

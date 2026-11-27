@@ -19,6 +19,10 @@ Families with a cookbook page: Cosmos, Ernie-Image, FLUX, Ideogram, JoyEcho,
 Krea, LTX, LingBot-Video, LingBot-World, LongLive, MOVA, MiniMax, Qwen-Image,
 SANA-Video, SANA-WM, Wan, Z-Image.
 
+For Cosmos3 Sim-Bimanual, warm up the served reference-image geometry and count
+denoise graph replays on both a prompt change and an action change. Report
+short-tail signature misses separately from hits on full chunks.
+
 `test/` configs are pinned CI setups for correctness and regression checks, not
 deployment advice. Use them when you need an exactly reproducible run, and note
 which cookbook flags you diverged from.
