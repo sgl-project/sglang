@@ -7,9 +7,8 @@
 # ``IS_KDA`` constexpr selects the gate path and the GDN path is bit-for-bit
 # the original (no regression to the validated GDN kernel).
 #
-# This is a STANDALONE increment: kernel + wrapper only. It is NOT yet wired
-# into the memory pool / radix cache / scheduler / backend dispatch. The caller
-# (currently the correctness test and the microbenchmark) owns the ring tensors.
+# Kernel + wrapper only: the caller (the GDN / KDA Triton decode backends)
+# owns the ring tensors.
 #
 # Idea (vs. ``fused_recurrent_gated_delta_rule_packed_decode`` / ``..._kda_...``):
 #   The plain packed decode reads the full recurrent state S [HV, V, K] from
@@ -487,8 +486,7 @@ def fused_recurrent_linear_replayssm_decode(
 
     Allocates nothing persistent: the caller owns the ring tensors and is
     responsible for advancing / resetting ``write_pos`` (e.g. ``(write_pos+1) %
-    L`` after each step).  This is a STANDALONE kernel; the memory-pool / cache
-    integration is a later phase.
+    L`` after each step).
     """
     if mixed_qkv.ndim != 2:
         raise ValueError(f"`mixed_qkv` must be 2D (got ndim={mixed_qkv.ndim}).")

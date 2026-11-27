@@ -64,16 +64,16 @@ GLM-5.1 also runs on **Atlas 800I A3** with the msModelSlim W4A8 checkpoint. One
 - **Front the PD roles with a router.** Once both roles are up, start the router and send requests to its port, `30000`. Only each role's head node serves HTTP, so run the router on a node that is not the prefill head — otherwise give it a free port instead, since the prefill role already listens on `30000` there:
 
   ```bash Command
-  python3 -m sglang_router.launch_router \
-      --pd-disaggregation \
+  sgl-router \
+      --model-id Eco-Tech/GLM-5.1-w4a8 \
+      --no-tokenizer \
       --policy round_robin \
-      --prefill http://<prefill-node0-ip>:30000 8998 \
-      --decode http://<decode-node0-ip>:30100 \
+      --worker-urls http://<prefill-node0-ip>:30000 http://<decode-node0-ip>:30100 \
       --host 0.0.0.0 \
       --port 30000
   ```
 
-- **Differences from the Ascend best practice.** The recipes follow the best-practice scripts, including the prefill role's context parallelism (`--enable-prefill-cp --cp-strategy interleave --attn-cp-size 32`), which spans all 32 prefill ranks and therefore runs without attention DP. Flags whose spelling the scripts predate are replaced by their current equivalents: `--attn-dp-size` for `--dp-size N --enable-dp-attention`, `--cuda-graph-backend-{decode,prefill} disabled` for `--disable-cuda-graph`, and `--moe-dense-tp-size` for `--moe-dense-tp`. Three things the scripts set are left out: `SGLANG_ENABLE_SPEC_V2` and `SGLANG_SPEC_ENABLE_OVERLAP_REFLOW`, which current SGLang no longer reads, and `--served-model-name glm-5`, so that requests use the checkpoint name the cURL example shows.
+- **Differences from the Ascend best practice.** The recipes follow the best-practice scripts, including the prefill role's context parallelism (`--enable-prefill-cp --cp-strategy interleave --attn-cp-size 32`), which spans all 32 prefill ranks and therefore runs without attention DP. Two flags are spelled differently: `--cuda-graph-backend-{decode,prefill} disabled` for `--disable-decode-cuda-graph --disable-prefill-cuda-graph`, and `--moe-dense-tp-size` for the abbreviated `--moe-dense-tp`. Three things the scripts set are left out: `SGLANG_ENABLE_SPEC_V2` and `SGLANG_SPEC_ENABLE_OVERLAP_REFLOW`, which current SGLang no longer reads, and `--served-model-name glm-5`, so that requests use the checkpoint name the cURL example shows.
 - **Verification status.** These recipes are transcribed from the best-practice entries linked above and have **not been run on A3 hardware for this page**, so both deployments are marked **In progress** and the benchmark card carries no numbers. For measured configurations, tuning and accuracy methods, see the [GLM-5.1 Ascend best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_1), [parameter tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning) and [accuracy evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation); for startup failures, the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/faq).
 
 ### 3.3 Configuration Tips

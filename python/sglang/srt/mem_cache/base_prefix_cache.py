@@ -38,6 +38,7 @@ from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
+    from sglang.srt.managers.kv_hints import KvHintsEnvelope
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -98,13 +99,6 @@ class InsertParams:
     # waits until the insert key is known, so a leaf that already has mamba
     # never pays the D2H.
     mamba_host_src: Optional[torch.Tensor] = None
-    # The request frees mamba_host_src right after the insert (finished), so
-    # the host waits for the copy; otherwise later forwards and loads wait on it.
-    mamba_host_src_freed: bool = False
-    # Finished request's tracking-slot index for mamba_host_src: the slot is parked
-    # (kept out of the free list) until its copy lands, instead of a host wait.
-    mamba_host_src_keep_idx: Optional[int] = None
-    mamba_host_parked: bool = False
     # Both mamba values stay empty and the leaf already holds the checkpoint.
     allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
@@ -940,6 +934,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Whether a request's prefix stays in the cache for other requests to
         share, including after the request finishes."""
         return True
+
+    def forwards_kv_hints(self) -> bool:
+        """Whether request ``kv_hints`` reach an attached storage backend."""
+        return False
+
+    def forwards_kv_hint_actions(self, kv_hints: Optional[KvHintsEnvelope]) -> bool:
+        """Whether this request's ``kv_hints`` would reach the storage backend."""
+        return (
+            kv_hints is not None and bool(kv_hints.actions) and self.forwards_kv_hints()
+        )
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()

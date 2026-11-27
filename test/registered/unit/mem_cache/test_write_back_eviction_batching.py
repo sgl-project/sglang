@@ -8,12 +8,10 @@ that wait, host room made per victim, and the load-back chain check.
 
 import unittest
 from array import array
-from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored, StorageMedium
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache import unified_radix_cache
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -51,9 +49,9 @@ class _FencedController(InstantWriteBackController):
     """Submits D->H copies through the controller's own start_writing, so a
     copy goes behind its write fence, onto streams and events that log what
     happens: ("fence",) when the D->H stream waits on the forward stream,
-    ("submit", n) for the n-th submission, ("sync", n) when its finish
-    event is waited on and ("wait", stream, n) when a stream waits on it.
-    ``submitted[n]`` maps each pool to the device pages submission n reads."""
+    ("submit", n) for the n-th submission and ("sync", n) when its finish
+    event is waited on. ``submitted[n]`` maps each pool to the device pages
+    submission n reads."""
 
     start_writing = HybridCacheController.start_writing
     _l2_transfers = HybridCacheController._l2_transfers
@@ -64,9 +62,10 @@ class _FencedController(InstantWriteBackController):
         self.log = []
         self.submitted = []
         self._pool_names = pool_names
-        forward = self._stream("forward")
-        self.write_fence_stream = self.load_fence_stream = forward
-        self.schedule_stream = self._stream("schedule")
+        forward = SimpleNamespace(
+            wait_event=lambda event: self.log.append(("wait", "forward", event.n))
+        )
+        self.write_fence_stream = forward
 
         def wait_stream(stream):
             assert stream is forward
@@ -75,14 +74,7 @@ class _FencedController(InstantWriteBackController):
         self.l2_transfer_engine = SimpleNamespace(
             batch_direct=False,
             device_to_host_stream=SimpleNamespace(wait_stream=wait_stream),
-            host_to_device_stream=self._stream("load"),
             submit_device_to_host=self._submit,
-        )
-
-    def _stream(self, name):
-        return SimpleNamespace(
-            name=name,
-            wait_event=lambda event: self.log.append(("wait", name, event.n)),
         )
 
     def _move_write_operation(self, op):
@@ -148,24 +140,6 @@ class _FencedController(InstantWriteBackController):
                 for n, read in enumerate(self.submitted):
                     if pages & read.get(pool, set()):
                         test.assertIn(n, synced, f"freed {pool} pages copy {n} reads")
-
-    def ordered_demotion(self, enabled=True):
-        """The ordered-demotion switch, with the cache's current stream logged."""
-        stack = ExitStack()
-        stack.enter_context(
-            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True)
-        )
-        stack.enter_context(
-            envs.SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE.override(enabled)
-        )
-        stack.enter_context(
-            mock.patch.object(
-                unified_radix_cache,
-                "device_module",
-                SimpleNamespace(current_stream=lambda: self.schedule_stream),
-            )
-        )
-        return stack
 
 
 class _WriteBackBatchingSuite:
@@ -266,33 +240,52 @@ class _WriteBackBatchingSuite:
         cc.assert_copies_behind_the_fence(self)
         cache.sanity_check()
 
-    def test_ordered_demotion_keeps_the_host_wait_for_storage_or_a_unified_pool(self):
-        """A storage backend reads host copies on the host, and a unified pool's
-        row moves are not ordered behind the copies: both take the blocking
-        path, as with the switch off."""
-        for case, attr, value in (
-            ("switch off", None, None),
-            ("storage backend", "enable_storage", True),
-            ("unified pool", "kv_storage", mock.Mock()),
-        ):
-            with self.subTest(case):
+    def test_stream_fenced_demotion_orders_the_forward_behind_the_copies(self):
+        """With the load stream fenced on the forward stream, the host never
+        waits on a copy: the forward stream (and, without overlap, the current
+        stream) waits on each copy's finish event before its victims' device
+        pages are freed."""
+        setup_allocator_context()
+        for forward_on_fence_stream in (True, False):
+            with self.subTest(forward_on_fence_stream=forward_on_fence_stream):
                 cache, allocator, host_pool = self._fill_host_with_one_batch()
                 for seq in batch_seqs(1):
                     insert_seq(cache, allocator, seq)
                 cc = _FencedController(cache.cache_controller, {id(host_pool): "kv"})
-                if attr is not None:
-                    setattr(cc, attr, value)
+                cc.load_fence_stream = cc.write_fence_stream
+                cc.forward_on_fence_stream = forward_on_fence_stream
                 cache.cache_controller = cc
+                current = SimpleNamespace(
+                    wait_event=lambda event: cc.log.append(("wait", "current", event.n))
+                )
 
                 with (
-                    cc.ordered_demotion(enabled=attr is not None),
                     cc.record_frees("kv", allocator),
+                    mock.patch.object(
+                        unified_radix_cache.device_module,
+                        "current_stream",
+                        return_value=current,
+                    ),
                 ):
-                    cache.evict(EvictParams(num_tokens=BATCH_TOKENS))
+                    result = cache.evict(EvictParams(num_tokens=BATCH_TOKENS))
 
-                self.assertIn(("sync", 0), cc.log)
-                self.assertFalse([event for event in cc.log if event[0] == "wait"])
-                cc.assert_copies_behind_the_fence(self)
+                self.assertEqual(result.num_tokens_evicted, BATCH_TOKENS)
+                self.assertEqual(len(cc.submitted), 1)
+                self.assertFalse(any(event[0] == "sync" for event in cc.log))
+                streams = {"forward"} | (
+                    set() if forward_on_fence_stream else {"current"}
+                )
+                waited = set()
+                freed = False
+                for event in cc.log:
+                    if event[0] == "wait":
+                        waited.add((event[1], event[2]))
+                    elif event[0] == "free" and event[2] & cc.submitted[0]["kv"]:
+                        freed = True
+                        self.assertTrue({(s, 0) for s in streams} <= waited)
+                self.assertTrue(freed)
+                self.assertEqual({e[1] for e in cc.log if e[0] == "wait"}, streams)
+                cache.sanity_check()
 
     def test_allocation_reclaim_on_a_token_chain_batches_its_copies(self):
         """Regression: on a token-only chain, an allocation reclaim's write-back

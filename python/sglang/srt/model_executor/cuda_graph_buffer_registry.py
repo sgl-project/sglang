@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import dp_capacity_for
 from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
@@ -43,7 +44,6 @@ if TYPE_CHECKING:
 
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
-_FIELD_COPY_PLAN = envs.SGLANG_OPT_CUDA_GRAPH_FIELD_COPY_PLAN.get()
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
@@ -60,13 +60,6 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
                 dst.copy_(src)
 
     if dsts and dsts[0].is_cuda:
-        if _FIELD_COPY_PLAN:
-            from sglang.kernels.ops.memory.small_field_copy import (
-                cached_small_field_copy,
-            )
-
-            if cached_small_field_copy(dsts, srcs):
-                return
         fast_path = envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.get()
         if fast_path and _has_foreach_copy and _one_dense_int_pair(dsts, srcs):
             # One foreach launch already writes what the small copy would; that kernel
@@ -765,10 +758,14 @@ def build_decode_registry(
         def _global_num_tokens_post_fill(buf, fb, ctx):
             # Only the gathered (DP) path writes a value; otherwise left as init.
             if require_gathered_buffer:
-                buf.fill_(ctx.padded_num_tokens)
+                # Retired slots (the contiguous tail) must contribute no tokens.
+                live = min(get_parallel().num_dp_ranks, buf.shape[0])
+                buf[:live].fill_(ctx.padded_num_tokens)
+                buf[live:].zero_()
 
+        _dp_capacity = dp_capacity_for(num_dp_ranks)
         _global_shape = (
-            (lambda _bs, _mt: (num_dp_ranks,))
+            (lambda _bs, _mt: (_dp_capacity,))
             if require_mlp_tp_gather
             else (lambda _bs, _mt: (1,))
         )

@@ -1,5 +1,6 @@
 """Unit tests for sglang.srt.environ: EnvField semantics and the deprecated-env registry."""
 
+import json
 import os
 import re
 import subprocess
@@ -9,23 +10,13 @@ import warnings
 from contextlib import ExitStack
 from unittest.mock import patch
 
-from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
+from sglang.srt.environ import EnvField, _DeprecatedEnv, envs, validate_env_values
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 
-# The first HARD_GATED children are EnvRuntimeBool: the master is a hard gate.
-HARD_GATED = 8
 NV_MEGA_RUNTIME_CHILDREN = (
-    "SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING",
-    "SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX",
-    "SGLANG_OPT_MAMBA_HOST_ONLY_CONCURRENT_FETCH",
-    "SGLANG_OPT_CUDA_GRAPH_FIELD_COPY_PLAN",
-    "SGLANG_OPT_POST_VERIFY_POOL_PRESIZE",
-    "SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC",
-    "SGLANG_OPT_MROPE_TEXT_DEVICE_POSITIONS",
-    "SGLANG_OPT_MAMBA_HOST_CHECKPOINT_NO_WAIT",
     "SGLANG_DSPARK_FUSED_ACCEPT_TAIL",
     "SGLANG_DSPARK_DEFER_CONTEXT_KV",
     "SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK",
@@ -56,28 +47,6 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP",
     "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND",
 )
-
-# Opt-in children (EnvRuntimeBool(False)): off unless set, and the master still gates them.
-NV_MEGA_RUNTIME_OPT_IN_CHILDREN = (
-    "SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST",
-    "SGLANG_OPT_PLE_PINNED_HUGEPAGE",
-    "SGLANG_OPT_GDN_REPLAYSSM_TILED_COMMIT",
-    "SGLANG_OPT_SPEC_COMMIT_MULTI_SCATTER",
-    "SGLANG_OPT_SPEC_FUSED_TOP_P_MASS",
-    "SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE",
-)
-
-RENAMED_NV_MEGA_RUNTIME_CHILDREN = {
-    "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED": "SGLANG_Q35MF_BK_VEC_COPY",
-    "SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS": "SGLANG_Q35MF_MKH_N3B",
-    "SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD": "SGLANG_Q35MF_MKH_N3C",
-    "SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY": "SGLANG_Q35MF_EDGE_CHAIN_TREE",
-    "SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING": "SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING",
-    "SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST": "SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST",
-    "SGLANG_OPT_SCHEDULER_SHM_SYNC": "SGLANG_Q35MF_EDGE_SHM_SYNC",
-    "SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST": "SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST",
-    "SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP": "SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
-}
 
 
 class TestEnvField(unittest.TestCase):
@@ -162,12 +131,34 @@ class TestEnvField(unittest.TestCase):
             if envs.SGLANG_TEST_RETRACT or (1 == 1):
                 pass
 
-    def test_invalid_value_warns_and_returns_default(self):
-        os.environ["SGLANG_TEST_RETRACT"] = "not-a-bool"
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            self.assertIs(envs.SGLANG_TEST_RETRACT.get(), False)
-        self.assertIn("Invalid value", str(caught[0].message))
+    def test_invalid_value_raises_naming_variable_and_type(self):
+        for field, value, kind in (
+            (envs.SGLANG_TEST_RETRACT, "not-a-bool", "boolean"),
+            (envs.SGLANG_PORT, "not-a-port", "integer"),
+            (envs.SGLANG_WARMUP_TIMEOUT, "not-a-float", "float"),
+            (envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG, "{invalid-json", "JSON"),
+        ):
+            with self.subTest(name=field.name), field.override(value):
+                with self.assertRaisesRegex(
+                    ValueError, f"Invalid value for {field.name}: .*{kind}"
+                ):
+                    field.get()
+
+    def test_empty_value_reads_as_unset_except_for_strings(self):
+        for field in (
+            envs.SGLANG_TEST_RETRACT,
+            envs.SGLANG_PORT,
+            envs.SGLANG_WARMUP_TIMEOUT,
+            envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG,
+        ):
+            with self.subTest(name=field.name), field.override(""):
+                self.assertFalse(field.is_set())
+                self.assertEqual(field.get(), field.default)
+                validate_env_values()
+
+        for field in (envs.SGLANG_ROLE_NAMESPACES, envs.SGLANG_DISABLED_MODEL_ARCHS):
+            with self.subTest(name=field.name), field.override(""):
+                self.assertTrue(field.is_set())
 
     def test_mega_runtime_defaults_and_registry_scope(self):
         with ExitStack() as stack:
@@ -194,7 +185,7 @@ class TestEnvField(unittest.TestCase):
         master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
         for master_value, child_value in ((True, "0"), (True, "false"), (False, "1")):
             with master.override(master_value):
-                for name in NV_MEGA_RUNTIME_CHILDREN[HARD_GATED:]:
+                for name in NV_MEGA_RUNTIME_CHILDREN:
                     child = self.env_fields[name]
                     with self.subTest(
                         master=master_value, child=name, value=child_value
@@ -205,46 +196,6 @@ class TestEnvField(unittest.TestCase):
                             child.clear()
                             self.assertIs(child.get(), master_value)
 
-    def test_mega_runtime_master_is_a_hard_gate(self):
-        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
-        for master_value in (False, True):
-            for child_value in ("0", "false", "1", "true", None):
-                with master.override(master_value):
-                    for name in NV_MEGA_RUNTIME_CHILDREN[:HARD_GATED]:
-                        child = self.env_fields[name]
-                        with self.subTest(
-                            master=master_value, child=name, value=child_value
-                        ):
-                            with child.override(child_value):
-                                expected = (
-                                    (
-                                        None
-                                        if child_value is None
-                                        else child_value in ("1", "true")
-                                    )
-                                    if master_value
-                                    else False
-                                )
-                                self.assertIs(child.get(), expected)
-                                self.assertTrue(child.is_set())
-                                child.clear()
-                                self.assertIs(child.get(), master_value)
-
-    def test_mega_runtime_opt_in_children_need_the_master_and_a_value(self):
-        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
-        for master_value in (False, True):
-            with master.override(master_value):
-                for name in NV_MEGA_RUNTIME_OPT_IN_CHILDREN:
-                    child = self.env_fields[name]
-                    with self.subTest(master=master_value, child=name):
-                        self.assertNotIn(name, NV_MEGA_RUNTIME_CHILDREN)
-                        child.clear()
-                        self.assertIs(child.get(), False)
-                        with child.override("1"):
-                            self.assertIs(child.get(), master_value)
-                        with child.override("0"):
-                            self.assertIs(child.get(), False)
-
     def test_mega_runtime_does_not_override_explicit_none(self):
         with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
             for name in NV_MEGA_RUNTIME_CHILDREN:
@@ -252,40 +203,6 @@ class TestEnvField(unittest.TestCase):
                     child = self.env_fields[name]
                     with child.override(None):
                         self.assertIsNone(child.get())
-
-
-class TestRenamedEnvAliases(unittest.TestCase):
-    def _read(self, new, env):
-        field = vars(type(envs))[new]
-        with (
-            patch.dict(os.environ, env),
-            warnings.catch_warnings(record=True) as caught,
-        ):
-            warnings.simplefilter("always")
-            if new not in env:
-                os.environ.pop(new, None)
-            with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
-                value = field.get()
-        deprecations = [w for w in caught if issubclass(w.category, FutureWarning)]
-        return field, value, deprecations
-
-    def test_former_name_applies_with_a_visible_warning(self):
-        """The warning must reach users: a DeprecationWarning raised from library
-        code is filtered out by Python's default warning filters."""
-        for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
-            with self.subTest(new=new):
-                field, value, deprecations = self._read(new, {old: "1"})
-                self.assertEqual(field.deprecated_name, old)
-                self.assertIs(value, True)
-                self.assertEqual(len(deprecations), 1)
-                self.assertIn(new, str(deprecations[0].message))
-
-    def test_new_name_wins_over_former_name(self):
-        for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
-            with self.subTest(new=new):
-                _, value, deprecations = self._read(new, {old: "1", new: "0"})
-                self.assertIs(value, False)
-                self.assertEqual(deprecations, [])
 
 
 class TestDeprecatedEnvRegistry(unittest.TestCase):
@@ -348,9 +265,45 @@ class TestDocumentedBooleanKnobs(unittest.TestCase):
                     ("1", True),
                     ("false", False),
                     ("0", False),
+                    ("On", True),
+                    ("off", False),
                 ):
                     os.environ[name] = value
                     self.assertIs(field.get(), expected)
+
+
+class TestImportTimeBooleanKnobs(unittest.TestCase):
+    """Modules that freeze a boolean at import must read it through the
+    registry: a second parser at the read site accepted fewer spellings than
+    the declaration, so `yes` set the knob for some readers and not for others."""
+
+    def test_frozen_module_flags_follow_the_registry(self):
+        deepgemm = "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM"
+        script = (
+            "import json\n"
+            "from sglang.srt.batch_invariant_ops import batch_invariant_ops as ops\n"
+            "from sglang.srt.batch_overlap import two_batch_overlap as tbo\n"
+            "print(json.dumps([ops._ENABLE_MM_DEEPGEMM, "
+            "ops._ENABLE_MM_FALLBACK_VARIANT, ops._ENABLE_MM_COMPARISON_TEST, "
+            "tbo._tbo_debug]))\n"
+        )
+        overrides = {
+            # The kill switch registered tests launch servers with.
+            deepgemm: "0",
+            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "yes",
+            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST": "1",
+            "SGLANG_TBO_DEBUG": "yes",
+        }
+        # One interpreter: the flags are read once, when the modules load.
+        out = subprocess.check_output(
+            [sys.executable, "-c", script], env={**os.environ, **overrides}, text=True
+        )
+        self.assertEqual(
+            json.loads(out.strip().splitlines()[-1]), [False, True, True, True]
+        )
+        with patch.dict(os.environ):
+            os.environ.pop(deepgemm, None)
+            self.assertIs(vars(type(envs))[deepgemm].get(), True)
 
 
 if __name__ == "__main__":

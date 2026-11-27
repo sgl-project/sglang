@@ -43,7 +43,7 @@ mp.set_start_method("spawn", force=True)
 
 register_npu_ci(
     est_time=400,
-    suite="nightly-1-npu-a3",
+    suite="nightly-test-1-npu-a3",
     nightly=True,
     disabled="run failed",
 )
@@ -271,7 +271,7 @@ def init_process_dst(
         terminate_process(process)
 
 
-def test_load_weights_from_remote_instance(
+def _run_load_weights_from_remote_instance(
     tp_size,
     dp_size,
     model_name,
@@ -432,7 +432,7 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
             backends,
             remote_instance_loader_backend,
         ) in test_suits:
-            test_load_weights_from_remote_instance(
+            _run_load_weights_from_remote_instance(
                 tp_size,
                 dp_size,
                 model_name,
