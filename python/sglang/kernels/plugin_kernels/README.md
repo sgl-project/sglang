@@ -13,9 +13,10 @@ device.
 The code is split at the kernel/runtime boundary.
 
 ```
-kernels/plugin_kernels/      # what a plugin implements; imports nothing from srt
-  <hardware>/spec.py         #   registration, API version, requirements,
-                             #   capabilities and widths, build/forward contract
+kernels/plugin_kernels/      # provider contracts and registration
+  megakernel/spec.py         #   shared megakernel contract and target-aware registry
+  nvidia/spec.py             #   NVIDIA settings and compatibility imports
+  amd/spec.py                #   AMD monokernel contract and registry
   <hardware>/<model>/        #   thin wrappers around the library's kernels
 srt/kernel_plugins/          # SGLang's integration
   <hardware>/binding.py      #   startup checks, weight observation, TP agreement,
@@ -39,9 +40,11 @@ With its server flag set, `srt/kernel_plugins/<hardware>/binding.py`:
 - replaces that model's forward for the steps the spec covers; every other step
   runs the model's own forward.
 
-The kernels stay in their libraries, which import the contract from
-`sglang.kernels.plugin_kernels.<hardware>` and, in their tests, the integration
-from `sglang.srt.kernel_plugins.<hardware>`. Unit tests are in
+The kernels stay in their libraries. Megakernel providers import the shared
+contract from `sglang.kernels.plugin_kernels.megakernel.spec`. Existing NVIDIA
+providers can keep importing `sglang.kernels.plugin_kernels.nvidia.spec`. AMD
+monokernel providers import `sglang.kernels.plugin_kernels.amd.spec`. The
+runtime integrations live in `sglang.srt.kernel_plugins.<hardware>`. Unit tests are in
 `test/registered/unit/kernel_plugins/<hardware>/`.
 
 ## Operators

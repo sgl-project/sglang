@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import torch
 
-from sglang.kernels.plugin_kernels.nvidia.spec import Step
+from sglang.kernels.plugin_kernels.megakernel.spec import Step
 from sglang.srt.kernel_plugins.nvidia.kimi_k31_verify_binding import (
     K31VerifyHostBinding,
 )
