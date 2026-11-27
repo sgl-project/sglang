@@ -515,6 +515,8 @@ class MiniMaxM3MoE(nn.Module):
             and get_moe_runner_backend().is_flashinfer_trtllm_routed()
             and self.experts.supports_deferred_finalize
         )
+        # Set by bind_low_batch_ffns when SGLANG_MINIMAX_M3_LOW_BATCH_FFN is on.
+        self.low_batch_ffn = None
 
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -530,8 +532,12 @@ class MiniMaxM3MoE(nn.Module):
             return self.forward_mega_moe(hidden_states, forward_batch)
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops():
             return self.forward_deepep(hidden_states, forward_batch)
-        else:
-            return self.forward_normal(hidden_states)
+        if self.low_batch_ffn is not None and (
+            (out := self.low_batch_ffn.maybe_run(self, hidden_states, forward_batch))
+            is not None
+        ):
+            return out
+        return self.forward_normal(hidden_states)
 
     def forward_mega_moe(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
@@ -2140,6 +2146,15 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
             # Decode and verify batches up to 341 rows at hidden 6144.
             register_fused_all_reduce_comm(max_push_size=4 * 1024 * 1024)
+        if envs.SGLANG_MINIMAX_M3_LOW_BATCH_FFN.get():
+            from sglang.srt.models.minimax_common.nvidia.low_batch_ffn import (
+                bind_low_batch_ffns,
+            )
+
+            bind_low_batch_ffns(
+                self.model.layers[layer_id]
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+            )
 
     @torch.no_grad()
     def forward(

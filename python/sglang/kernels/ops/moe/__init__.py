@@ -433,4 +433,17 @@ for _fn in (
             capabilities=_SM12X,
         )
     )
+
+# MiniMax-M3.1-Flash low-batch FFN (1-32 decode rows, one TP4/TP8 rank).
+for _fn in ("low_batch_routed_ffn", "low_batch_shared_ffn"):
+    register_kernel(
+        KernelSpec(
+            op=f"moe.minimax_m3_{_fn}",
+            backend=KernelBackend.CUTE_DSL,
+            target=f"sglang.kernels.ops.moe.minimax_m3_low_batch.ffn:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 3))}
+            ),
+        )
+    )
 del _fn
