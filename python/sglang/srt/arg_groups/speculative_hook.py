@@ -618,39 +618,49 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(model_config_of(server_args).hf_config)
 
 
-def _modelscope_resolved_a_repo_id(server_args: ServerArgs) -> bool:
-    """handle_modelscope_paths keeps a local --model-path as it is, so its
-    declaration changes the path only for a repo ID. Later hooks, for example
-    expert_pack, can change the path again."""
+# The hooks that download a --model-path repo ID at --revision before the
+# spec handlers run, with the revision of their hub for an unset --revision.
+_TARGET_DOWNLOAD_DEFAULT_REVISIONS = {
+    "_resolve_hf_gguf_model_path": "main",
+    "_handle_modelscope_paths": "master",
+}
+
+
+def _target_download_default_revision(server_args: ServerArgs) -> Optional[str]:
+    """These hooks keep a local --model-path as it is, so their declaration
+    changes the path only for a repo ID. Later hooks, for example expert_pack,
+    can change the path again."""
     model_path = (getattr(server_args, "_raw_input", None) or {}).get(
         "model_path", server_args.model_path
     )
     for source, declared in getattr(server_args, "_resolved_overrides", None) or ():
         if "model_path" not in declared:
             continue
-        if source == "_handle_modelscope_paths":
-            return declared["model_path"] != model_path
+        if (
+            source in _TARGET_DOWNLOAD_DEFAULT_REVISIONS
+            and declared["model_path"] != model_path
+        ):
+            return _TARGET_DOWNLOAD_DEFAULT_REVISIONS[source]
         model_path = declared["model_path"]
-    return False
+    return None
 
 
 def _check_bundled_draft_revision(server_args: ServerArgs) -> None:
-    """With ModelScope, handle_modelscope_paths has resolved a --model-path
-    repo ID to one local snapshot, and a bundled draft loads from it. An
-    unset --revision is master, the default revision of modelscope-hub."""
+    """A hook has downloaded a --model-path repo ID at --revision, and a
+    bundled draft loads from that local path."""
+    default_revision = _target_download_default_revision(server_args)
+    if default_revision is None:
+        return
     cfg = resolving_view(server_args)
     revision = cfg.speculative_draft_model_revision
-    target_revision = cfg.revision or "master"
-    if _modelscope_resolved_a_repo_id(server_args) and revision not in (
-        None,
-        target_revision,
-    ):
+    target_revision = cfg.revision or default_revision
+    if revision not in (None, target_revision):
         raise ValueError(
             f"--speculative-draft-model-revision {revision!r} differs from the "
-            f"target revision {target_revision!r}. With ModelScope, a bundled draft "
-            "loads from the local snapshot of --model-path. Pass the same value to "
-            "--revision, or download the draft revision to a local directory and "
-            "pass it with --speculative-draft-model-path."
+            f"target revision {target_revision!r}. A bundled draft loads from the "
+            "local download of --model-path at the target revision. Pass the same "
+            "value to --revision, or download the draft revision to a local "
+            "directory and pass it with --speculative-draft-model-path."
         )
 
 

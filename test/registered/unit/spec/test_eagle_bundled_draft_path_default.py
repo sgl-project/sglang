@@ -52,7 +52,7 @@ class TestEagleBundledDraftPathDefaulting(CustomTestCase):
         )
         with (
             envs.SGLANG_USE_MODELSCOPE.override(True),
-            self.assertRaisesRegex(ValueError, "ModelScope"),
+            self.assertRaisesRegex(ValueError, "local download"),
         ):
             _handle_eagle_family(server_args)
 
@@ -64,6 +64,25 @@ class TestEagleBundledDraftPathDefaulting(CustomTestCase):
         declare_resolution(server_args, "handle_expert_pack", model_path="/meta")
         with envs.SGLANG_USE_MODELSCOPE.override(True):
             _handle_eagle_family(server_args)
+
+    def test_hub_gguf_rejects_another_revision_for_a_bundled_draft(self):
+        for draft_revision, raises in (("main", False), ("draft", True)):
+            with self.subTest(draft_revision=draft_revision):
+                server_args = _make_nextn_server_args(draft_revision=draft_revision)
+                server_args.revision = None
+                declare_resolution(
+                    server_args,
+                    "_resolve_hf_gguf_model_path",
+                    model_path="/hf/model.gguf",
+                )
+                declare_resolution(
+                    server_args, "handle_expert_pack", model_path="/meta"
+                )
+                if raises:
+                    with self.assertRaisesRegex(ValueError, "local download"):
+                        _handle_eagle_family(server_args)
+                else:
+                    _handle_eagle_family(server_args)
 
 
 if __name__ == "__main__":

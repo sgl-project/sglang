@@ -135,7 +135,7 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
                 )
                 with envs.SGLANG_USE_MODELSCOPE.override(True):
                     if raises:
-                        with self.assertRaisesRegex(ValueError, "ModelScope"):
+                        with self.assertRaisesRegex(ValueError, "local download"):
                             _handle_dspark(server_args)
                     else:
                         _handle_dspark(server_args)
@@ -154,7 +154,7 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             )
             with (
                 envs.SGLANG_USE_MODELSCOPE.override(True),
-                self.assertRaisesRegex(ValueError, "ModelScope"),
+                self.assertRaisesRegex(ValueError, "local download"),
             ):
                 _handle_dspark(server_args)
 
