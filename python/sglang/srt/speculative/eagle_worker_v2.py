@@ -642,6 +642,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 or isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
             )
 
+            # The vectorized_5d KV layout shuffles the cache as
+            # (block, page, head, dim). A captured draft-extend graph bakes in
+            # the capture-time gather length; on replay with a longer prompt the
+            # attention reads the live KV offsets, desyncing the page/token
+            # mapping and mixing token positions. Fall back to eager draft
+            # extend (which re-reads live offsets each call) for this opt-in
+            # layout; every other layout keeps the graph.
+            if supports_hip_draft_extend_graph and (
+                getattr(
+                    self.draft_extend_attn_backend, "kv_cache_is_vectorized_5d", False
+                )
+                or any(
+                    getattr(b, "kv_cache_is_vectorized_5d", False)
+                    for b in getattr(self.draft_attn_backend, "attn_backends", [])
+                )
+            ):
+                supports_hip_draft_extend_graph = False
+
         graph_supported_backend_types = [
             TritonAttnBackend,
             TRTLLMMLABackend,

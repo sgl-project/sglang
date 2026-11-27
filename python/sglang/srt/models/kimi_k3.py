@@ -3910,7 +3910,8 @@ class KimiK3LinearForCausalLM(nn.Module):
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
             if (
-                input_ids is None
+                self.pp_group.world_size == 1
+                and input_ids is None
                 and embeds is not None
                 and layernorm_sp.runs_sp(forward_batch.forward_mode, embeds.shape[0])
             ):
