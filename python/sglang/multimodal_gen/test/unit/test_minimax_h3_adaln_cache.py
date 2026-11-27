@@ -163,6 +163,10 @@ def test_sidecar_resolve_slots_and_block_all_match_per_step_paths(tmp_path):
     cache = MiniMaxH3AdalnCache(_ARCH, path=str(cache_path), model_variant="fl2va")
     cache.load(torch.device("cpu"))
 
+    # Capacity must report the file's shape, not the online defaults.
+    assert cache.max_plans == 2
+    assert cache.max_plan_width == 2
+
     slots = cache.resolve_slots([torch.tensor([0.5]), torch.tensor([1.0, 2.0])])
     assert slots.dtype == torch.int64
     assert slots.tolist() == [0, 1]
@@ -178,6 +182,28 @@ def test_sidecar_resolve_slots_and_block_all_match_per_step_paths(tmp_path):
 
     with pytest.raises(ValueError, match="does not cover"):
         cache.resolve_slots([torch.tensor([9.0])])
+
+
+def test_sidecar_capacity_reports_file_shape(tmp_path):
+    """A 3x1 sidecar must not look wide enough for the other image task."""
+    cache_path = tmp_path / "adaln.safetensors"
+    save_file(
+        {
+            "plan_timesteps": torch.tensor([[0.25], [0.5], [0.75]]),
+            "plan_lengths": torch.ones(3, dtype=torch.int64),
+            "block_params": torch.zeros(
+                3, 1, _ARCH.num_layers, _BLOCK_WIDTH, dtype=torch.bfloat16
+            ),
+            "final_params": torch.zeros(3, 1, _FINAL_WIDTH, dtype=torch.bfloat16),
+        },
+        cache_path,
+        metadata={"format_version": "2", "model_variant": "fl2va"},
+    )
+    cache = MiniMaxH3AdalnCache(_ARCH, path=str(cache_path), model_variant="fl2va")
+    cache.load(torch.device("cpu"))
+
+    assert cache.max_plans == 3
+    assert cache.max_plan_width == 1
 
 
 def test_slot_gathers_never_read_the_slot_on_host(tmp_path):
@@ -345,9 +371,7 @@ def test_precision_fp32_projects_in_fp32_then_stores_bf16(tmp_path):
 
 
 def test_lora_guard_rejects_adaln_keys_in_cache_mode():
-    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
-        MiniMaxH3DiTModel,
-    )
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
 
     model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
     torch.nn.Module.__init__(model)
@@ -472,9 +496,7 @@ def _sidecar_cache(tmp_path: Path) -> MiniMaxH3AdalnCache:
 
 
 def _cache_mode_model(cache: MiniMaxH3AdalnCache | None):
-    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
-        MiniMaxH3DiTModel,
-    )
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
 
     model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
     torch.nn.Module.__init__(model)
