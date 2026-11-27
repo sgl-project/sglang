@@ -97,6 +97,8 @@ from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYP
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
+from sglang.srt.environ import envs as srt_envs
+from sglang.srt.environ import validate_env_values
 from sglang.srt.utils.network import is_valid_ipv6_address
 
 logger = init_logger(__name__)
@@ -212,6 +214,8 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "fal/ideogram-v4-instant",
         "flux.1-dev",
         "glm-image",
+        "hy-nomas",
+        "tencent/hy-nomas",
         "ideogram-4",
         "ideogram-4-fp8",
         "ideogram-4-nf4",
@@ -271,6 +275,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "MiniMaxH3ImagePipelineConfig",
         "MingImagePipelineConfig",
         "MingImageLayerPipelineConfig",
+        "NomasPipelineConfig",
         "QwenImagePipelineConfig",
         "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
@@ -576,6 +581,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # entries; a request executing longer turns /health unhealthy. Unset: off.
     request_time_limit: list[str] | None = None
     enable_metrics: bool = False
+    # HTTP auth, as the LLM server's --api-key / --admin-api-key; kept out of logs.
+    api_key: str | None = field(default=None, repr=False)
+    admin_api_key: str | None = field(default=None, repr=False)
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -597,6 +605,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
+    media_gateway_key_file: str | None = None
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -644,7 +653,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Logging
     log_level: str = "info"
     log_requests: bool = False
-    log_requests_level: int = 2
+    log_requests_level: int = 0
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
@@ -706,6 +715,9 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_path()
         if self.served_model_name is None:
             self.served_model_name = self.model_id or self.model_path
+        if self.admin_api_key is None:
+            # --admin-api-key wins; without it the server takes SGLANG_ADMIN_API_KEY.
+            self.admin_api_key = srt_envs.SGLANG_ADMIN_API_KEY.get() or None
         self._adjust_quant_config()
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
@@ -721,6 +733,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        validate_env_values()
         self._validate_scheduler_rpc_timeout()
         timeout = self.http_graceful_shutdown_timeout
         if timeout is not None and (
@@ -3237,6 +3250,21 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Expose Prometheus metrics at /metrics.",
         )
         parser.add_argument(
+            "--api-key",
+            type=str,
+            default=ServerArgs.api_key,
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+        )
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=ServerArgs.admin_api_key,
+            help="Set admin API key for management endpoints. Sensitive ones (e.g. weight "
+            "updates, LoRA loading, memory release, profiling) are refused unless it is "
+            "set. When set, admin endpoints require this key and do NOT accept --api-key. "
+            "Defaults to SGLANG_ADMIN_API_KEY.",
+        )
+        parser.add_argument(
             "--strict-ports",
             action=StoreBoolean,
             default=ServerArgs.strict_ports,
@@ -3347,6 +3375,11 @@ class ServerArgs(DisaggServerArgsMixin):
             "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang-diffusion'.",
         )
         parser.add_argument(
+            "--media-gateway-key-file",
+            help="Require a trusted gateway for OpenAI image, video and mesh jobs. "
+            "Read its 64-digit hex key from this file; scope jobs by its verified X-SGLang-Tenant.",
+        )
+        parser.add_argument(
             "--log-requests",
             action="store_true",
             help="Log user-facing fields of all requests (default: False). "
@@ -3360,7 +3393,7 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Verbosity level for request logging. "
             "0: Log request metadata only (request_id). "
             "1: Log metadata + sampling config (seed, steps, guidance, resolution, frames, fps, ...). "
-            "2: Log metadata + sampling config + prompt/negative prompt (truncated to 2 KiB). "
+            "2: Also log prompt/negative prompt (first and last 1,024 characters of long text). "
             "3: Log metadata + sampling config + full prompt/negative prompt.",
         )
         parser.add_argument(
@@ -3780,6 +3813,7 @@ class ServerArgs(DisaggServerArgsMixin):
         default_args: dict[str, Any] | None = None,
         *,
         argv: list[str] | None = None,
+        forced_args: dict[str, Any] | None = None,
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
@@ -3818,6 +3852,9 @@ class ServerArgs(DisaggServerArgsMixin):
         if default_args:
             for key, value in default_args.items():
                 provided_args.setdefault(key, value)
+        if forced_args:
+            # unlike default_args, these win over the CLI and the config file
+            provided_args.update(forced_args)
 
         if dynamic_paths:
             existing = dict(provided_args.get("component_paths") or {})
