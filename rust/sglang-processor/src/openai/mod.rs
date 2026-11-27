@@ -22,6 +22,9 @@ pub use pieces::TokenPieces;
 pub use sglang_api_types::api::v1::GenerateRequest;
 pub use wire::Reply;
 
+/// Python's `OPENAI_MAX_N`: the request models refuse an `n` past it.
+pub const OPENAI_MAX_N: i64 = 128;
+
 /// Builds the OpenAI response of a lowered request from the engine's `/generate` output.
 pub enum Responder {
     Completion(Box<CompletionResponder>),

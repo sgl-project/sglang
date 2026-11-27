@@ -20,7 +20,7 @@ use super::wire::{
     Reply, StreamState, abort_event, finish_fields, logprob_slice, logprobs_length, now,
     unary_reply, without_nulls,
 };
-use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
+use super::{OPENAI_MAX_N, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 
 /// `CompletionRequest` with Pydantic's defaults. A body this rejects goes to
 /// the engine, which answers with its own validation error.
@@ -145,7 +145,10 @@ pub fn lower_completion(
     if settings.completion_template.is_some() {
         return Err(Unsupported("completion_template"));
     }
-    if request.max_tokens <= 0 || request.n < 1 || prompt_is_empty(&request.prompt) {
+    if request.max_tokens <= 0
+        || !(1..=OPENAI_MAX_N).contains(&request.n)
+        || prompt_is_empty(&request.prompt)
+    {
         return Err(Unsupported("invalid_request"));
     }
     if request.return_hidden_states != false
@@ -594,6 +597,32 @@ impl CompletionResponder {
                 bytes.into_iter().map(char::from).collect()
             }
             _ => fallback,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// An `n` outside Python's `[1, OPENAI_MAX_N]` goes to the engine, whose
+    /// request model refuses it.
+    #[test]
+    fn n_outside_python_bounds_goes_to_the_engine() {
+        let lower = |n: i64| {
+            let body = serde_json::to_vec(&json!({"model": "m", "prompt": "hi", "n": n})).unwrap();
+            let settings = OpenAiSettings::default();
+            lower_completion(&body, &OpenAiHeaders::default(), &settings, None).err()
+        };
+        assert!(lower(128).is_none());
+        for n in [0, 129, i64::MAX] {
+            assert_eq!(
+                lower(n).map(|reason| reason.0),
+                Some("invalid_request"),
+                "n={n}"
+            );
         }
     }
 }
