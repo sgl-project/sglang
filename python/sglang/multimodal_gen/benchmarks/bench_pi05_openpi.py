@@ -669,6 +669,29 @@ def create_sglang_python_pipeline(
         kwargs["pipeline_config_path"] = pipeline_config_path
     server_args = ServerArgs.from_kwargs(**kwargs)
     set_global_server_args(server_args)
+    # Pi0.5 reuses SRT SigLIP, whose layers read the published parallel bag and
+    # the TP group. The diffusion GPU worker sets both up before model
+    # construction; this in-process entry must do the same (single GPU).
+    import atexit
+    import tempfile
+
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        maybe_init_distributed_environment_and_model_parallel,
+    )
+    from sglang.srt.runtime_context import get_context, publish
+    from sglang.srt.server_args import ServerArgs as SrtServerArgs
+
+    rendezvous = tempfile.TemporaryDirectory(prefix="pi05-bench-rendezvous-")
+    atexit.register(rendezvous.cleanup)
+    maybe_init_distributed_environment_and_model_parallel(
+        tp_size=1,
+        sp_size=1,
+        distributed_init_method=f"file://{rendezvous.name}/store",
+    )
+    if get_context()._server_args is None:
+        publish(
+            SrtServerArgs(model_path="dummy", tp_size=1), role="diffusion_gpu_worker"
+        )
     pipeline = Pi05Pipeline(
         model_path,
         server_args,
