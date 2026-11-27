@@ -221,6 +221,7 @@ def _request_stage(
         cache_controller=None,
     )
     s.enable_session_radix_cache = False
+    s.enable_unified_cache_external_linker = False
     s.disaggregation_mode = DisaggregationMode.NULL
     s.model_config = NS(hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=128)
     s.metrics_reporter = NS(enable_metrics=False)

@@ -62,6 +62,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 from sglang.srt.runtime_context import get_context, get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -896,7 +897,11 @@ class _PipelineFakeLinker(_FakeLinker):
         return lookup
 
 
-def _pipeline_cache(**kwargs):
+def _pipeline_cache(reductions=None, **kwargs):
+    def all_reduce(tensor, op):
+        if reductions is not None:
+            reductions.append(tensor.clone())
+
     return _cache_for_wrapper(
         pp_size=2,
         pp_group="pp",
@@ -905,32 +910,129 @@ def _pipeline_cache(**kwargs):
         tp_group=None,
         page_size=2,
         tree_core=SimpleNamespace(enable_external_cache_linker=False, is_eagle=False),
-        _all_reduce_attn_groups=lambda tensor, op: None,
+        _all_reduce_attn_groups=all_reduce,
+        get_last_hash_value=lambda node: f"{node:064x}",
         **kwargs,
     )
 
 
-def _arrival_req(tokens):
+def _arrival_req(tokens, rid="rid", device_prefix=0, last_node=1):
     return SimpleNamespace(
-        rid="rid",
+        rid=rid,
         origin_input_ids=array("q", tokens),
         extra_key=None,
         cache_salt=None,
         positional_embed_overrides=None,
         _compute_max_prefix_len=lambda length: length,
+        prefix_len=device_prefix,
+        last_node=last_node,
+        pp_linker_restorable_pages=[],
+        pp_linker_probe_start_pages=0,
     )
+
+
+def _arrive(wrapper, *reqs):
+    relays = [SimpleNamespace() for _ in reqs]
+    for req, relay in zip(reqs, relays):
+        wrapper.queue_pp_arrival(req, relay)
+    arrivals = wrapper.lookup_pp_arrivals()
+    assert [arrival.relay for arrival in arrivals] == relays
+    return arrivals
 
 
 def test_pipeline_arrival_lookup_keeps_boundaries_inside_the_prompt():
     backend = _PipelineFakeLinker(restorable=[1, 3, 9])
     wrapper = UnifiedCacheLinkerWrapper(_pipeline_cache(), backend)
 
-    assert wrapper.lookup_pp_arrival(_arrival_req(range(1, 10))) == [1, 3]
+    (arrival,) = _arrive(wrapper, req := _arrival_req(range(1, 10)))
+    assert req.pp_linker_restorable_pages == [1, 3]
+    assert req.pp_linker_probe_start_pages == 0
     ((rid, hashes),) = backend.pp_lookup_calls
-    assert rid == "rid" and len(hashes) == 4
+    assert rid == "rid" and hashes == get_storage_hash_str(
+        arrival.key[:8], None, page_size=2
+    )
 
     backend.restorable = RuntimeError("store down")
-    assert wrapper.lookup_pp_arrival(_arrival_req(range(1, 10))) == []
+    _arrive(wrapper, req := _arrival_req(range(1, 10)))
+    assert req.pp_linker_restorable_pages == []
+
+
+def test_pipeline_arrival_lookup_probes_only_past_the_device_prefix():
+    backend = _PipelineFakeLinker(restorable=[1, 2])
+    wrapper = UnifiedCacheLinkerWrapper(_pipeline_cache(), backend)
+
+    (arrival,) = _arrive(
+        wrapper, req := _arrival_req(range(1, 13), device_prefix=4, last_node=7)
+    )
+
+    # Pages 2-5 of the prompt, anchored on the device prefix's last hash.
+    ((_, hashes),) = backend.pp_lookup_calls
+    assert hashes == get_storage_hash_str(arrival.key[4:12], f"{7:064x}", page_size=2)
+    # Tail-relative hits become prompt-relative boundaries.
+    assert req.pp_linker_probe_start_pages == 2
+    assert req.pp_linker_restorable_pages == [3, 4]
+
+
+def test_pipeline_arrival_lookup_reduces_the_round_once():
+    reductions = []
+    backend = _PipelineFakeLinker(restorable=[2])
+    wrapper = UnifiedCacheLinkerWrapper(_pipeline_cache(reductions), backend)
+
+    first = _arrival_req(range(1, 9), rid="a")
+    second = _arrival_req(range(1, 9), rid="b", device_prefix=2)
+    _arrive(wrapper, first, second)
+
+    assert [rid for rid, _ in backend.pp_lookup_calls] == ["a", "b"]
+    # One reduction for the round: four tail pages of "a", three of "b".
+    (mask,) = reductions
+    assert mask.tolist() == [0, 0, 1, 0, 0] + [0, 0, 1, 0]
+    assert first.pp_linker_restorable_pages == [2]
+    assert second.pp_linker_restorable_pages == [3]
+    assert wrapper.pp_arrivals == []
+
+
+def test_pipeline_arrival_lookup_defers_to_the_leader_on_other_ranks():
+    reductions = []
+    backend = _PipelineFakeLinker(restorable=[2])
+    wrapper = UnifiedCacheLinkerWrapper(_pipeline_cache(reductions), backend)
+    wrapper._is_attn_leader = lambda: False
+
+    _arrive(wrapper, req := _arrival_req(range(1, 9)))
+
+    assert backend.pp_lookup_calls == []
+    (mask,) = reductions
+    assert mask.tolist() == [0, 1, 1, 1, 1]
+    # Without a reduction partner every unprobed page reads as present; the
+    # real MIN takes the leader's answer.
+    assert req.pp_linker_restorable_pages == [1, 2, 3, 4]
+
+
+def test_pipeline_arrival_lookup_skips_the_reduction_without_tails():
+    reductions = []
+    backend = _PipelineFakeLinker(restorable=[1])
+    wrapper = UnifiedCacheLinkerWrapper(_pipeline_cache(reductions), backend)
+
+    _arrive(wrapper, full_hit := _arrival_req(range(1, 9), device_prefix=8))
+
+    assert backend.pp_lookup_calls == [] and reductions == []
+    assert full_hit.pp_linker_restorable_pages == []
+    assert full_hit.pp_linker_probe_start_pages == 4
+
+
+def test_pipeline_arrival_lookup_keeps_the_layout_without_an_anchor():
+    # Whether a rank finds the anchor hash must not change the reduction's
+    # layout, or the ranks would reduce tensors of different sizes.
+    reductions = []
+    backend = _PipelineFakeLinker(restorable=[1])
+    wrapper = UnifiedCacheLinkerWrapper(_pipeline_cache(reductions), backend)
+    wrapper.cache.get_last_hash_value = lambda node: None
+
+    _arrive(wrapper, no_anchor := _arrival_req(range(1, 9), device_prefix=2))
+
+    assert backend.pp_lookup_calls == []
+    (mask,) = reductions
+    assert mask.tolist() == [0, 0, 0, 0]
+    assert no_anchor.pp_linker_restorable_pages == []
 
 
 def test_pipeline_parallelism_rejects_only_prefetch_mode():
@@ -1220,19 +1322,25 @@ class TestUnifiedCacheLinkerPythonBackend(
         producer_linker.complete_next_offload(True)
         producer.check_hicache_events()
 
-        for boundaries, hit, queued in (
-            ([4], 8, True),
-            ([1, 2], 4, True),
-            ([], 0, True),
-            ([4], 8, False),
+        # A probe start above the device prefix (here empty) means the prefix
+        # PP0 matched on arrival has since been evicted: nothing is loaded.
+        for boundaries, probe_start, hit, queued in (
+            ([4], 0, 8, True),
+            ([1, 2], 0, 4, True),
+            ([], 0, 0, True),
+            ([4], 0, 8, False),
+            ([4], 1, 0, True),
         ):
-            with self.subTest(boundaries=boundaries, queued=queued):
+            with self.subTest(
+                boundaries=boundaries, probe_start=probe_start, queued=queued
+            ):
                 consumer, _, consumer_req_pool = build_fixture(cfg)
                 consumer_linker = _PipelineInMemoryLinker(stored_keys, queued)
                 consumer.pp_size = 2
                 consumer.init_cache_linker(consumer_linker)
                 req = self._make_req(consumer_req_pool)
                 req.pp_linker_restorable_pages = boundaries
+                req.pp_linker_probe_start_pages = probe_start
                 match = consumer.match_prefix(
                     MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
                 )

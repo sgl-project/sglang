@@ -44,6 +44,7 @@ class TestArrivalMatchEviction(UnifiedRadixCacheFixtures, CustomTestCase):
         )
         scheduler = SimpleNamespace(
             tree_cache=cache,
+            enable_unified_cache_external_linker=False,
             _prefetch_kvcache=lambda r: r.init_next_round_input(cache, cow_mamba=False),
         )
         # The request stays out of the enqueue path while its grammar is pending.

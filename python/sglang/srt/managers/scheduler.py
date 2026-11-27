@@ -2442,6 +2442,8 @@ class Scheduler(
                 else:
                     self.send_control_output(output, recv_req)
 
+        # Before the requests are relayed to the next stage or scheduled.
+        self._lookup_pp_linker_arrivals()
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
@@ -3795,15 +3797,40 @@ class Scheduler(
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
 
+    def _lookup_pp_linker_arrivals(self) -> None:
+        """PP0 probes the store for the input round's arrivals in one collective;
+        the boundaries ride the request relay to later stages."""
+        if (
+            get_parallel().pp_size == 1
+            or get_parallel().pp_rank != 0
+            or not self.enable_unified_cache_external_linker
+        ):
+            return
+        linker = self.tree_cache.linker
+        if linker is None or not linker.pp_arrivals:
+            return
+        for arrival in linker.lookup_pp_arrivals():
+            arrival.relay.pp_linker_restorable_pages = (
+                arrival.req.pp_linker_restorable_pages
+            )
+            arrival.relay.pp_linker_probe_start_pages = (
+                arrival.req.pp_linker_probe_start_pages
+            )
+
     def _bind_pp_arrival_prefetch(self, req: Req, recv_req) -> None:
         """PP0 decides the request's L3 ticket on arrival; every stage takes the
         prefix match behind that decision at the same step."""
         if get_parallel().pp_size > 1 and self.enable_unified_cache_external_linker:
+            # Every stage takes the arrival match, so the trees stay mirrored;
+            # PP0 probes past it at the end of the input round.
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
             if get_parallel().pp_rank == 0:
-                recv_req.pp_linker_restorable_pages = (
-                    self.tree_cache.linker.lookup_pp_arrival(req)
+                self.tree_cache.linker.queue_pp_arrival(req, recv_req)
+            else:
+                req.pp_linker_restorable_pages = (
+                    recv_req.pp_linker_restorable_pages or []
                 )
-            req.pp_linker_restorable_pages = recv_req.pp_linker_restorable_pages or []
+                req.pp_linker_probe_start_pages = recv_req.pp_linker_probe_start_pages
             return
         controller = self.tree_cache.cache_controller
         if controller is None or controller.pp_prefetch_command_group is None:

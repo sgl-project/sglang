@@ -1331,6 +1331,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     filler_seed: Optional[int] = None
     # Internal: set by PP0; see Req.pp_linker_restorable_pages.
     pp_linker_restorable_pages: Optional[List[int]] = None
+    pp_linker_probe_start_pages: int = 0
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

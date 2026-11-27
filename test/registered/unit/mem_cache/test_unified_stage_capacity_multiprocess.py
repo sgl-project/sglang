@@ -296,6 +296,7 @@ def _loop_worker(rank, path, level, drift_round):
         def __init__(self):
             self.token_to_kv_pool_allocator = allocator
             self.tree_cache = None
+            self.enable_unified_cache_external_linker = False
             self.recv_skipper = None
             self.uocr_runtime = None
             self.device = "cpu"

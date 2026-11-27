@@ -202,7 +202,6 @@ class TestExternalLinkerConfig(unittest.TestCase):
             {"enable_linker_mla_dedup": True},
             {"disable_radix_cache": True},
             {"radix_cache_backend": "custom"},
-            {"pp_size": 2},
         ):
             fields = dict(
                 model_path="dummy",

@@ -668,8 +668,10 @@ class Req(ReqDllmMixin):
         self.host_loaded_length = 0
         # Buffer-mode host memory is transport staging, not an L2 cache tier.
         self.host_hit_is_storage = False
-        # Linker prefix lengths in pages that PP0 found on every stage at arrival.
+        # Linker prefix lengths in pages that PP0 found on every stage at arrival,
+        # probed past its arrival device prefix of pp_linker_probe_start_pages.
         self.pp_linker_restorable_pages: list[int] = []
+        self.pp_linker_probe_start_pages = 0
         self.storage_prefetch_retry_attempts = 0
         self.staged_prefetch_plan: Optional[StagedPrefetchPlan] = None
         # The tree lock this request holds; None while it runs on a session

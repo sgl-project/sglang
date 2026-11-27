@@ -329,6 +329,21 @@ class _ExternalCachePrefetch:
     stop_reason: str = ""
 
 
+class _PPArrival(NamedTuple):
+    """A request PP0 matched on arrival, awaiting the round's store probe.
+
+    The anchor is captured at arrival: a cache flush later in the same input
+    round would invalidate ``req.last_node``.
+    """
+
+    req: Req
+    relay: object
+    key: RadixKey
+    start: int
+    last_hash: Optional[str]
+    num_pages: int
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
@@ -391,6 +406,8 @@ class UnifiedCacheLinkerWrapper:
         self.decided_offloads = 0
         self.undelivered_offloads: list[bool] = []
         self.offload_epoch = 0
+        # PP0's arrivals of the current input round, probed together.
+        self.pp_arrivals: list[_PPArrival] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
 
@@ -455,11 +472,14 @@ class UnifiedCacheLinkerWrapper:
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         if cache.pp_size > 1:
             device_pages = device_hit_len // page
+            # PP0 probed only past its arrival device prefix. If that prefix
+            # was evicted since, the pages in between were never probed.
             hit_pages = max(
                 (
                     pages - device_pages
                     for pages in req.pp_linker_restorable_pages
                     if device_pages < pages <= device_pages + len(tail_hashes)
+                    and device_pages >= req.pp_linker_probe_start_pages
                 ),
                 default=0,
             )
@@ -496,8 +516,12 @@ class UnifiedCacheLinkerWrapper:
             ),
         )
 
-    def lookup_pp_arrival(self, req: Req) -> list[int]:
-        """Collective over PP0's attention ranks; only the leader queries."""
+    def queue_pp_arrival(self, req: Req, relay: object) -> None:
+        """Record a request PP0 has just matched on arrival.
+
+        Only the pages past its device prefix are probed, in
+        ``lookup_pp_arrivals`` at the end of the input round.
+        """
         page = self.cache.page_size
         key = RadixKey(
             req.origin_input_ids,
@@ -506,26 +530,81 @@ class UnifiedCacheLinkerWrapper:
             is_bigram=self.cache.tree_core.is_eagle,
             limit=req._compute_max_prefix_len(len(req.origin_input_ids)),
         ).page_aligned(page)
-        if not len(key) or req.positional_embed_overrides is not None:
-            return []
-        hashes = get_storage_hash_str(key[:], None, page_size=page)
-        mask = torch.ones(len(hashes) + 1, dtype=torch.int)
-        if self._is_attn_leader():
-            mask.zero_()
-            try:
-                restorable = self.pp_lookup(req.rid, hashes)
-            except Exception:
-                logger.warning("PP linker lookup failed for %s", req.rid, exc_info=True)
-                if self.metrics is not None:
-                    self.metrics.increment_linker_failures("lookup")
-                restorable = []
-            valid = [pages for pages in restorable if 0 < pages <= len(hashes)]
-            if valid:
-                mask[torch.tensor(valid, dtype=torch.long)] = 1
-            self._record_lookup(len(hashes) * page, max(valid, default=0) * page)
-        mask[0] = 0
+        start = req.prefix_len
+        last_hash = None
+        # The reduction's layout follows from the key and the device prefix
+        # alone, which agree across the group's mirrored trees.
+        if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
+            num_pages = 0
+        else:
+            num_pages = max((len(key) - start) // page, 0)
+            if start:
+                last_hash = self.cache.get_last_hash_value(req.last_node)
+        self.pp_arrivals.append(
+            _PPArrival(req, relay, key, start, last_hash, num_pages)
+        )
+
+    def lookup_pp_arrivals(self) -> list[_PPArrival]:
+        """Probe the round's arrivals and set each request's store boundaries.
+
+        Collective over PP0's attention ranks, which receive the same requests
+        and match them against a mirrored tree: the leader queries, and one
+        reduction shares the result. Returns the arrivals for the caller to
+        relay the boundaries.
+        """
+        arrivals, self.pp_arrivals = self.pp_arrivals, []
+        if not any(arrival.num_pages for arrival in arrivals):
+            for arrival in arrivals:
+                self._set_pp_boundaries(arrival, [])
+            return arrivals
+        page = self.cache.page_size
+        # Per arrival: index 0 is its device prefix, index i its first i tail pages.
+        lengths = [arrival.num_pages + 1 for arrival in arrivals]
+        leader = self._is_attn_leader()
+        mask = (torch.zeros if leader else torch.ones)(sum(lengths), dtype=torch.int)
+        offset = 0
+        for arrival, length in zip(arrivals, lengths):
+            mask[offset] = 0
+            if leader and arrival.num_pages:
+                restorable = self._probe_pp_arrival(arrival)
+                valid = [pages for pages in restorable if 0 < pages < length]
+                if valid:
+                    mask[torch.tensor(valid, dtype=torch.long) + offset] = 1
+                self._record_lookup(
+                    arrival.num_pages * page, max(valid, default=0) * page
+                )
+            offset += length
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
-        return mask.nonzero().flatten().tolist()
+        offset = 0
+        for arrival, length in zip(arrivals, lengths):
+            common = mask[offset : offset + length].nonzero().flatten().tolist()
+            self._set_pp_boundaries(arrival, common)
+            offset += length
+        return arrivals
+
+    def _probe_pp_arrival(self, arrival: _PPArrival) -> list[int]:
+        if arrival.start and arrival.last_hash is None:
+            # Without the anchor the tail would hash as if it started at the
+            # sequence head, yielding keys that can never match.
+            return []
+        page = self.cache.page_size
+        tail = arrival.key[arrival.start : arrival.start + arrival.num_pages * page]
+        hashes = get_storage_hash_str(tail, arrival.last_hash, page_size=page)
+        try:
+            return self.pp_lookup(arrival.req.rid, hashes)
+        except Exception:
+            logger.warning(
+                "PP linker lookup failed for %s", arrival.req.rid, exc_info=True
+            )
+            if self.metrics is not None:
+                self.metrics.increment_linker_failures("lookup")
+            return []
+
+    def _set_pp_boundaries(self, arrival: _PPArrival, tail_pages: list[int]) -> None:
+        start_pages = arrival.start // self.cache.page_size
+        req = arrival.req
+        req.pp_linker_probe_start_pages = start_pages
+        req.pp_linker_restorable_pages = [start_pages + p for p in tail_pages]
 
     def _is_attn_leader(self) -> bool:
         cache = self.cache
