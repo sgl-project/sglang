@@ -98,6 +98,8 @@ class NGRAMWorker(BaseSpecWorker):
         self.server_args = server_args
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
+        # Resolved in init_attention_backends() once model_runner.attn_backend exists.
+        self.use_full_mask: bool = USE_FULL_MASK and not _is_cpu
         self.page_size = get_schedule().page_size
         self.draft_token_num: int = get_spec().speculative_num_draft_tokens
         self.max_trie_depth: int = get_spec().speculative_ngram_max_trie_depth
@@ -157,6 +159,12 @@ class NGRAMWorker(BaseSpecWorker):
 
     def init_attention_backends(self):
         super().init_attention_backends()
+        attn_backend = getattr(self.model_runner, "attn_backend", None)
+        self.use_full_mask = (
+            USE_FULL_MASK
+            and not _is_cpu
+            and not getattr(attn_backend, "supports_qlen_only_verify_mask", False)
+        )
         self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
             self.target_worker, supports_sharded_verify=False
         )
@@ -322,7 +330,7 @@ class NGRAMWorker(BaseSpecWorker):
         # Pre-sync: only needs seq_lens_cpu, so build before the blocking
         # accept sync inside _prepare_draft_tokens.
         ones_masks = None
-        if USE_FULL_MASK and not _is_cpu:
+        if self.use_full_mask:
             ones_masks = [
                 torch.ones(
                     (self.draft_token_num, batch.seq_lens_cpu[i]), device=self.device
@@ -351,7 +359,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK and not _is_cpu:
+        if self.use_full_mask:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
@@ -390,6 +398,7 @@ class NGRAMWorker(BaseSpecWorker):
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             draft_token_num=self.draft_token_num,
+            custom_mask_is_qlen_only=not self.use_full_mask,
         )
 
     def _insert_extend_prompt_tails(self, batch: ScheduleBatch) -> None:
@@ -471,8 +480,7 @@ class NGRAMWorker(BaseSpecWorker):
                 # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
                 grammar_barrier=None,
                 watermark_engine=self.model_runner.watermark,
-                # NGRAM watermark contexts use the full-mask layout.
-                watermark_full_mask=True,
+                watermark_full_mask=not verify_input.custom_mask_is_qlen_only,
             )
             accept = accept_draft_tree(
                 batch,

@@ -187,6 +187,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     needs_cpu_seq_lens: bool = False
     supports_ragged_verify_graph: bool = True
+    supports_qlen_only_verify_mask: bool = True
 
     # Set from the pool type in __init__; the class default keeps the extend
     # metadata guard readable on instances built with __new__ (test stubs).
@@ -1340,6 +1341,9 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata_expand.page_table,
                     metadata_expand.cache_seqlens_int32,
                     num_queries,
+                    qlen_only=getattr(
+                        forward_batch.spec_info, "custom_mask_is_qlen_only", False
+                    ),
                 )
                 metadata_expand.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
@@ -3654,6 +3658,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata_expand.page_table,
                     metadata_expand.cache_seqlens_int32,
                     spec_info.positions.numel(),
+                    qlen_only=getattr(spec_info, "custom_mask_is_qlen_only", False),
                 )
                 metadata_expand.cu_seqlens_k[1:].copy_(
                     torch.cumsum(

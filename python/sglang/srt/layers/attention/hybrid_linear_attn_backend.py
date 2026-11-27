@@ -1358,6 +1358,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
     @property
+    def supports_qlen_only_verify_mask(self) -> bool:
+        # Linear attention layers do not read verify custom_mask.
+        return self.full_attn_backend.supports_qlen_only_verify_mask
+
+    @property
     def use_mha(self) -> bool:
         return getattr(self.full_attn_backend, "use_mha", False)
 

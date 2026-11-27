@@ -114,6 +114,9 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # Whether TARGET_VERIFY accepts a compact (bs * draft_num * draft_num)
+    # QLEN_ONLY custom_mask without prefix ones.
+    supports_qlen_only_verify_mask: bool = False
     # Bind-time cap on the window sub-pools one runner's layers attend through.
     max_window_sub_pools: int = 1
 

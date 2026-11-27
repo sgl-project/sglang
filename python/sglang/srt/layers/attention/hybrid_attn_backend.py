@@ -62,6 +62,10 @@ class HybridAttnBackend(AttentionBackend):
         # Ragged verify is TARGET_VERIFY-only; delegate to its executor.
         return self.target_verify_backend().supports_ragged_verify_graph
 
+    @property
+    def supports_qlen_only_verify_mask(self) -> bool:
+        return self.target_verify_backend().supports_qlen_only_verify_mask
+
     def target_verify_backend(self) -> AttentionBackend:
         """The backend that runs target verify: the decode backend when
         speculative_attention_mode is "decode", else the prefill backend."""

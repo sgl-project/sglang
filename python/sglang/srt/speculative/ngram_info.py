@@ -24,10 +24,12 @@ class NgramVerifyInput(SpecInput):
         new_seq_lens: Optional[torch.Tensor] = None,
         accept_tokens: Optional[torch.Tensor] = None,
         accept_lens: Optional[torch.Tensor] = None,
+        custom_mask_is_qlen_only: bool = False,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
         self.custom_mask = custom_mask
+        self.custom_mask_is_qlen_only = custom_mask_is_qlen_only
         self.positions = positions
         self.retrieve_index = retrieve_index
         self.retrieve_next_token = retrieve_next_token
@@ -72,6 +74,9 @@ class NgramVerifyInput(SpecInput):
         """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
         is widened here; the `RunnerIds` packs the read ids straight into
         ``kv_indices``. Under a ``window`` read, the mask carries the window."""
+        assert not self.custom_mask_is_qlen_only, (
+            "generate_attn_arg_prefill requires a FULL_MASK custom_mask"
+        )
         bs = req_pool_indices.numel()
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
