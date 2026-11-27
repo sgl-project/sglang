@@ -345,17 +345,10 @@ def get_request_length_limits(
     dllm_block_size: int,
     num_reserved_tokens: int,
 ) -> tuple[int, int]:
-    """(max_req_len, max_req_input_len) for a model context and a KV pool.
+    """(max_req_len, max_req_input_len): prompt + output cap, and the longest prompt (inclusive).
 
-    max_req_len is the most tokens one request holds, prompt and output
-    together: a request gets at most max_req_len - input_len new tokens.
-
-    max_req_input_len is the longest prompt accepted, inclusive. It leaves:
-    - 1 for the first output token, so every accepted prompt can generate;
-    - 5, a fixed margin with no recorded purpose;
-    - dllm_block_size, since a dLLM forward runs a whole block past the prompt;
-    - num_reserved_tokens, the output slots eagle fills with draft tokens
-      (compute_num_reserved_tokens).
+    The prompt leaves room for 1 first output token, 5 (no recorded purpose),
+    a dLLM block, and the reserved tokens.
     """
     max_req_len = min(context_len, kv_capacity)
     max_req_input_len = max_req_len - 1 - 5 - dllm_block_size - num_reserved_tokens
@@ -363,19 +356,16 @@ def get_request_length_limits(
 
 
 def get_context_length_sentence(max_tokens: int) -> str:
-    """OpenAI's context-overflow sentence. OpenAI-compatible clients (e.g.
-    LiteLLM) recognize a context overflow by it; without it a rejection is a
-    generic 400 to them."""
+    """OpenAI's context-overflow sentence; clients match on it."""
     return f"This model's maximum context length is {max_tokens} tokens on this server."
 
 
 def get_input_length_error(
     input_len: int, max_req_input_len: int, *, is_multimodal: bool
 ) -> Optional[str]:
-    """The rejection of a prompt longer than max_req_input_len, or None if it fits.
+    """The rejection of a prompt over max_req_input_len, or None.
 
-    A multimodal prompt is rejected even under --allow-auto-truncate: a cut can
-    split an item's placeholder tokens, so its message does not offer the flag.
+    A multimodal prompt is never truncated (a cut can split placeholder tokens).
     """
     if input_len <= max_req_input_len:
         return None

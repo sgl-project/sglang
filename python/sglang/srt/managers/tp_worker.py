@@ -425,7 +425,6 @@ class TpModelWorker(BaseTpWorker):
 
         # Validation
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
-        # One request holds at least two tokens.
         assert (
             min(
                 self.model_config.context_len,

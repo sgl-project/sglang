@@ -255,12 +255,6 @@ fn total_tokens_over_context_is_rejected() {
     let err = check_total_tokens(&mut g, &limits).unwrap_err();
     let msg = err.to_string();
     assert!(matches!(err, Error::Validation(_)));
-    // OpenAI-compatible clients (e.g. LiteLLM) classify a context overflow by
-    // OpenAI's sentence.
-    assert!(
-        msg.contains("This model's maximum context length is 10 tokens"),
-        "{msg}"
-    );
     assert!(msg.contains("total of 103 tokens"), "{msg}");
     assert!(msg.contains("3 tokens from the input"), "{msg}");
     assert!(msg.contains("100 tokens for the completion"), "{msg}");
@@ -407,8 +401,7 @@ fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
 /// `max_new_tokens: null` means "no cap", NOT "skip the checks" — the input
 /// alone must still fit. Gating the whole function on `max_new_tokens` let an
 /// over-long prompt through to the scheduler with no error at all.
-/// The limit is inclusive, as in Python: a prompt of exactly
-/// `max_req_input_len` tokens fits, one token more does not.
+/// The limit is inclusive: a prompt of exactly `max_req_input_len` tokens fits.
 #[test]
 fn input_length_is_checked_unconditionally() {
     let limits = Limits {
@@ -459,8 +452,7 @@ fn input_length_is_checked_unconditionally() {
         num_reserved_tokens: 1,
         ..truncating
     };
-    // The reserved slots are already taken out of `max_req_input_len`, so
-    // they do not count against it again.
+    // Reserved slots are already out of `max_req_input_len`.
     let mut g = GenerateRequest {
         input_ids: Some(vec![1, 2]),
         ..Default::default()

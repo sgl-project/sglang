@@ -124,21 +124,13 @@ pub(super) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result
     Ok(())
 }
 
-/// OpenAI's context-overflow sentence, the text Python's
-/// `get_context_length_sentence` builds. OpenAI-compatible clients (e.g.
-/// LiteLLM) recognize a context overflow by it; without it a rejection is a
-/// generic 400 to them.
+/// OpenAI's context-overflow sentence; clients match on it.
 fn context_length_sentence(max_tokens: u64) -> String {
     format!("This model's maximum context length is {max_tokens} tokens on this server.")
 }
 
-/// The rejection of an input longer than `max_req_input_len`, or `None` if it
-/// fits: the text of Python's `get_input_length_error`. A multimodal prompt is
-/// rejected even under `allow_auto_truncate` -- a cut can split an item's
-/// placeholder tokens -- so its message does not offer the flag. The MM worker
-/// checks the expanded ids with it, so its
-/// [`processed`](crate::MmProcessor::processed) hook never sees a prompt the
-/// scheduler rejects.
+/// The rejection of an input over `max_req_input_len`, or `None`. A multimodal
+/// prompt is never truncated (a cut can split placeholder tokens).
 pub(crate) fn input_length_error(
     input_len: usize,
     limits: &Limits,
@@ -163,21 +155,19 @@ pub(crate) fn input_length_error(
     })
 }
 
-/// The context-window checks that need the tokenized length, the policy of
-/// Python `TokenizerManager._validate_one_request`: the input must fit
+/// The context-window checks that need the tokenized length, mirroring Python
+/// `TokenizerManager._validate_one_request`: the input must fit
 /// `max_req_input_len`, and then input + reserved slots + the client's own
 /// `max_new_tokens` must fit `max_req_len`. Without them the scheduler
 /// silently clamps and the client gets a 200 with a truncated completion
 /// instead of an actionable 400. A defaulted `max_new_tokens` (see
 /// [`GenerateRequest::max_new_tokens_defaulted`]) is left to that clamp.
 ///
-/// Under `allow_auto_truncate` both clamp instead of rejecting -- the launch
-/// flag opted into that.
+/// Under `allow_auto_truncate` both clamp instead of rejecting.
 pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
     // Input length first, and unconditionally: `max_new_tokens: null` means "no
-    // cap", which must not disable this. A multimodal prompt was already
-    // checked, untruncated, by the MM worker; with MM disabled its media is
-    // ignored, so the prompt is text here.
+    // cap", which must not disable this. The MM worker already checked a
+    // multimodal prompt.
     if let Some(input_ids) = g.input_ids.as_mut()
         && let Some(error) = input_length_error(input_ids.len(), limits, false)
     {

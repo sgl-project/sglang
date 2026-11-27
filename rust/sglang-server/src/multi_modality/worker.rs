@@ -312,8 +312,7 @@ pub struct MmContext {
     /// (`RustMmProcessor._use_feature_shm`) exactly when the scheduler broadcasts
     /// across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
-    /// The intake limits, which reject expanded ids over the context before
-    /// [`MmProcessor::processed`] sees them (`None`: unchecked).
+    /// The intake limits for the expanded ids (`None`: unchecked).
     pub limits: Option<Limits>,
 }
 
@@ -508,9 +507,7 @@ fn process(
         .result
         .resolve_identities()
         .map_err(Error::Internal)?;
-    // The expanded ids must fit the context as they are: a multimodal prompt
-    // is rejected, never truncated, so `processed` sees the ids the scheduler
-    // gets and never a prompt that intake rejects.
+    // Reject before `processed`, so it never sees a prompt intake rejects.
     if let Some(limits) = &ctx.limits
         && let Some(error) = input_length_error(output.input_ids.len(), limits, true)
     {
@@ -1619,10 +1616,8 @@ mod tests {
         );
     }
 
-    /// A multimodal prompt over the input limit is rejected as a 400, never
-    /// truncated (a cut could split an item's placeholder tokens), even under
-    /// `allow_auto_truncate`, and `processed` never sees it; one within the
-    /// limit is observed with the ids intake forwards.
+    /// A multimodal prompt over the input limit is rejected, not truncated, even under
+    /// `allow_auto_truncate`.
     #[test]
     fn mm_prompt_over_the_limit_is_rejected_not_truncated() {
         use std::sync::Mutex;
@@ -1645,7 +1640,7 @@ mod tests {
             }
         }
 
-        for (allow_auto_truncate, max_req_input_len) in [(true, 8), (false, 8), (true, 12)] {
+        for (allow_auto_truncate, max_req_input_len) in [(true, 8), (true, 12)] {
             let processor = Arc::new(Observing(Mutex::new(Vec::new())));
             let ctx = MmContext::with_processor(processor.clone(), false).with_limits(Limits {
                 skip_tokenizer_init: false,

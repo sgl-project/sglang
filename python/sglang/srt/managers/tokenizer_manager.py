@@ -776,7 +776,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.served_model_name = get_serving().served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
-        # Set from the scheduler's init info once the scheduler is ready.
         self.max_req_len = None
         self.max_req_input_len = None
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
@@ -1480,7 +1479,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
-        # An encoder-dispatched request gets its mm_inputs in the scheduler.
         is_multimodal = mm_inputs is not None or bool(obj.need_wait_for_mm_inputs)
         self._validate_one_request(obj, input_ids, is_multimodal=is_multimodal)
         return self._create_tokenized_object(
@@ -1525,7 +1523,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         *,
         is_multimodal: bool = False,
     ) -> None:
-        """Validates the input token count and the requested token count against the server's request length limits."""
+        """Validates the input and requested token counts against the request length limits."""
         if get_exec().features.enable_encoder_swa_bounded_replay:
             if obj.image_data is not None and not get_platform().is_cuda:
                 raise ValueError(
@@ -1547,7 +1545,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
         self._validate_joint_schema_request(obj, input_ids)
-        # Validate input length; a multimodal prompt is never truncated.
         input_len = len(input_ids) if input_ids is not None else 0
         error_msg = get_input_length_error(
             input_len, self.max_req_input_len, is_multimodal=is_multimodal
@@ -1566,8 +1563,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 preserve_last_token_id=self._embedding_preserve_last_token_id,
             )
 
-        # Validate total tokens (input + max_new_tokens). The reserved output
-        # slots count as input here.
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
         max_new_tokens = obj.sampling_params.get("max_new_tokens")

@@ -251,8 +251,7 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
-    /// The scheduler's request length limits (`get_request_length_limits`),
-    /// which intake checks a request against as Python's `TokenizerManager` does.
+    /// The scheduler's request length limits (`get_request_length_limits`).
     pub max_req_len: u64,
     pub max_req_input_len: u64,
     /// Resolved deployment metadata used by out-of-process orchestrators.
@@ -500,8 +499,7 @@ impl Default for ServerArgs {
     /// this — Python supplies every field.
     fn default() -> Self {
         let model_config = ModelConfig::default();
-        // What the scheduler's `get_request_length_limits` derives from that
-        // context with an unbounded KV pool, no dLLM block and nothing reserved.
+        // `get_request_length_limits` for an unbounded KV pool, no dLLM block, nothing reserved.
         let max_req_len = model_config.context_len;
         Self {
             model_path: String::new(),

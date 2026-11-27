@@ -121,7 +121,6 @@ class HeadManager:
         )
         self.is_generation = False
         self.allow_auto_truncate = False
-        # The scheduler's limit for context_len 4096.
         self.max_req_input_len = 4090
         self.mm_processor = PatchCounter()
         self.request_logger = SimpleNamespace(log_requests=False)
@@ -407,7 +406,6 @@ class TestJointSchemaAdmission(CustomTestCase):
         generation = GenerateReqInput(input_ids=[1, 2, 3], sampling_params={})
         refused = {
             "generation": (generation, "/v1/systemone"),
-            # 4095 tokens fit the 4096-token context, but the server takes 4090.
             "past one prefill": (embedding(4095), "at most 4090"),
         }
         for name, (obj, message) in refused.items():

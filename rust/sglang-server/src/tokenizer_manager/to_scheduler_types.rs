@@ -23,14 +23,11 @@ pub struct Limits {
     /// `model_config.vocab_size`; bounds client-supplied token ids. A required
     /// field of the `ServerArgs` schema, so intake can check unconditionally.
     pub vocab_size: u64,
-    /// The scheduler's `max_req_len`: the most tokens one request holds,
-    /// input, reserved slots and `max_new_tokens` together.
+    /// The scheduler's `max_req_len`: input, reserved slots and `max_new_tokens` together.
     pub max_req_len: u64,
-    /// The scheduler's `max_req_input_len`: the longest input accepted, with
-    /// room for the reserved slots already taken out.
+    /// The scheduler's `max_req_input_len`, inclusive; reserved slots are already out of it.
     pub max_req_input_len: u64,
-    /// Output slots reserved on top of the input (eagle draft tokens), counted
-    /// in the total against `max_req_len`.
+    /// Output slots reserved on top of the input (eagle draft tokens).
     pub num_reserved_tokens: u64,
     /// Truncate a text input and clamp `max_new_tokens` to what fits instead
     /// of rejecting the request.
