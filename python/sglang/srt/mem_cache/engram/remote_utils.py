@@ -11,6 +11,7 @@ def make_remote_config(options, heads):
 
     from sglang.srt.runtime_context import (
         get_device,
+        get_disagg,
         get_exec,
         get_model,
         get_parallel,
@@ -43,14 +44,25 @@ def make_remote_config(options, heads):
     )
     node_id = hashlib.sha256(node.encode()).hexdigest()
     graph = get_exec().graph.cuda_graph_config
-    decode = graph.decode.max_bs or 1
-    prefill_graph = graph.prefill.max_bs or 1
-    prefill = schedule.chunked_prefill_size
-    if prefill is None or prefill < 1:
+    mode = get_disagg().disaggregation_mode
+    # Disabled graph defaults can remain unscaled on P/D engines. Only active
+    # graphs can submit padded rows and therefore contribute to this bound.
+    decode = (graph.decode.max_bs or 1) if graph.decode.backend != "disabled" else 1
+    prefill_graph = (
+        (graph.prefill.max_bs or 1)
+        if mode != "decode" and graph.prefill.backend != "disabled"
+        else 0
+    )
+    prefill = 0 if mode == "decode" else schedule.chunked_prefill_size
+    if mode != "decode" and (prefill is None or prefill < 1):
         prefill = max(schedule.max_prefill_tokens, process_model_config().context_len)
     # KV sizing caps its default request estimate at 4096 before memory limits.
     draft = get_spec().speculative_num_draft_tokens or 1
-    decode_tokens = max(schedule.max_running_requests or 4096, decode) * draft
+    decode_tokens = (
+        max(schedule.max_running_requests or 4096, decode) * draft
+        if mode != "prefill"
+        else 0
+    )
     tokens = max(
         prefill,
         prefill_graph,

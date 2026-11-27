@@ -223,7 +223,8 @@ class TestEngramRemoteConfig(CustomTestCase):
             attn_dp_size=1,
         )
         graph = SimpleNamespace(
-            decode=SimpleNamespace(max_bs=16), prefill=SimpleNamespace(max_bs=2048)
+            decode=SimpleNamespace(backend="full", max_bs=16),
+            prefill=SimpleNamespace(backend="breakable", max_bs=2048),
         )
         patches = dict(
             get_parallel=parallel,
@@ -237,6 +238,7 @@ class TestEngramRemoteConfig(CustomTestCase):
                 model_path="checkpoint", revision="r1", context_length=4096
             ),
             get_device=SimpleNamespace(base_gpu_id=0, gpu_id_step=1),
+            get_disagg=SimpleNamespace(disaggregation_mode="null"),
             get_exec=SimpleNamespace(graph=SimpleNamespace(cuda_graph_config=graph)),
             get_spec=SimpleNamespace(speculative_num_draft_tokens=5),
             process_model_config=SimpleNamespace(context_len=131072),
