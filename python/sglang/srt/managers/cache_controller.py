@@ -42,7 +42,6 @@ from sglang.srt.arg_groups.hicache_hook import UNIFIED_KEY_SCHEME_STORAGE_BACKEN
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cpp_utils.native_hash import ensure_native_hash
 from sglang.srt.mem_cache.hicache_key_scheme import (
     UnifiedKVPlan,
@@ -1736,10 +1735,6 @@ class HiCacheController:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-
-                delay = envs.SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY.get()
-                if delay:
-                    time.sleep(delay)
 
                 if not self.backup_skip:
                     self._page_backup_or_log(operation)
