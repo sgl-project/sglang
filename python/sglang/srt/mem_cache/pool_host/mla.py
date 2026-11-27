@@ -1289,9 +1289,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
 
             pages = [index // self.page_size for index in indices[:: self.page_size]]
-            ptr_list.extend(
-                base + page * size for page in pages for base, size in segments
-            )
+            for page in pages:
+                for base, size in segments:
+                    ptr_list.append(base + page * size)
             element_size_list = [size for _, size in segments] * len(pages)
             return ptr_list, element_size_list
 
