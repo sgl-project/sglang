@@ -13,6 +13,7 @@ import torch
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mooncake.buffers import group_contiguous_units
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.transport.base import Copy, Result, Status
 from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
@@ -25,6 +26,42 @@ from sglang.test.test_utils import CustomTestCase
 FOREGROUND = TransferIntent.FOREGROUND
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+class TestMooncakeContiguousUnits(CustomTestCase):
+    def test_contiguous_and_fragmented_indices(self):
+        for batch in (1, 4, 16, 32, 64, 128, 256):
+            for dtype in (np.int32, np.int64):
+                with self.subTest(batch=batch, dtype=dtype):
+                    indices = np.arange(batch, dtype=dtype)
+                    src = indices + 100
+                    dst = indices + 200
+                    units = group_contiguous_units(src, dst)
+                    self.assertEqual(units.dtype, np.dtype(np.uint64))
+                    np.testing.assert_array_equal(units, [[100, 200, batch]])
+                    dst = 200 + 2 * indices
+                    units = group_contiguous_units(src, dst)
+                    np.testing.assert_array_equal(
+                        units, np.column_stack((src, dst, np.ones_like(src)))
+                    )
+
+    def test_breaks_on_either_side_and_preserves_order(self):
+        src = np.array([9, 10, 20, 21, 22, 7, 8], dtype=np.int32)
+        dst = np.array([3, 4, 5, 6, 8, 9, 10], dtype=np.int32)
+        np.testing.assert_array_equal(
+            group_contiguous_units(src, dst),
+            [[9, 3, 2], [20, 5, 2], [22, 8, 1], [7, 9, 2]],
+        )
+
+    def test_empty_and_mismatched_indices(self):
+        empty = np.array([], dtype=np.int32)
+        nonempty = np.array([4], dtype=np.int32)
+        for src, dst in ((empty, nonempty), (nonempty, empty)):
+            units = group_contiguous_units(src, dst)
+            self.assertEqual(units.shape, (0, 3))
+            self.assertEqual(units.dtype, np.dtype(np.uint64))
+        with self.assertRaisesRegex(ValueError, "equal-length"):
+            group_contiguous_units(nonempty, np.array([1, 2], dtype=np.int32))
 
 
 class TestMooncakeTransferBatching(unittest.TestCase):
