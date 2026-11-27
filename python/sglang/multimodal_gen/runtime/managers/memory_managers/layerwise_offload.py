@@ -3533,6 +3533,10 @@ def get_layerwise_offload_component_names_for_pipeline(
     select_dit_group = LAYERWISE_OFFLOAD_DIT_GROUP in selected_component_names
     selected_pipeline_component_names: list[str] = []
     for component_name, module in modules.items():
+        # A component can be absent (e.g. the refiner on the preview-only tier)
+        # while its slot stays in the module dict; there is nothing to stream.
+        if module is None:
+            continue
         if layerwise_component_matches_any_selection(
             component_name, explicit_component_names
         ):

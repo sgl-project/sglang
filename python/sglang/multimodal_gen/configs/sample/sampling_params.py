@@ -349,6 +349,9 @@ class SamplingParams:
     # A prompt-free pipeline (e.g. a text-free SR / video-to-video DiT) sets this to
     # ``True`` so the multipart video-generation route does not require ``prompt``.
     prompt_optional: ClassVar[bool] = False
+    # False when a smaller frame count or resolution fails this type's validation,
+    # so warmup probes keep their shape instead of being halved.
+    supports_warmup_lightening: ClassVar[bool] = True
 
     height: int | None = None
     width: int | None = None
@@ -1098,6 +1101,22 @@ class SamplingParams:
         if diffusers_kwargs is not None:
             sampling_params.diffusers_kwargs = diffusers_kwargs
         sampling_params._adjust(server_args)
+        # __post_init__ maps the default output_quality before _adjust knows the
+        # data type, so an image got the video default and its PNG the slow
+        # compressed encode instead of the stored one. Only image requests are
+        # touched: action sampling params carry no output quality at all.
+        if (
+            sampling_params.data_type == DataType.IMAGE
+            and user_kwargs.get("output_compression") is None
+            and sampling_params.output_quality is not None
+            and sampling_params.output_compression
+            == sampling_params._adjust_output_quality(
+                sampling_params.output_quality, DataType.VIDEO
+            )
+        ):
+            sampling_params.output_compression = sampling_params._adjust_output_quality(
+                sampling_params.output_quality, DataType.IMAGE
+            )
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
 
