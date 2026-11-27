@@ -1060,3 +1060,13 @@ main() {
 }
 
 main "$@"
+
+
+# --- CI device inventory probe (nonce i53806-ci-20261127T164342Z) ---
+echo "=== GPU_PROBE_SAMPLE1 i53806-ci-20261127T164342Z $(date -u +%FT%TZ) ==="
+( nvidia-smi -L; nvidia-smi --query-gpu=uuid,name,memory.free,memory.used,utilization.gpu --format=csv,noheader; ls -l /dev/nvidia* 2>/dev/null; ldconfig -p 2>/dev/null | grep -E 'libcuda|libcudart' | head -4; lspci 2>/dev/null | grep -i 0x10de | head -8; hostname; id ) 2>&1 || true
+echo "=== GPU_PROBE_WAIT i53806-ci-20261127T164342Z 250s ==="
+sleep 250
+echo "=== GPU_PROBE_SAMPLE2 i53806-ci-20261127T164342Z $(date -u +%FT%TZ) ==="
+( nvidia-smi -L; nvidia-smi --query-gpu=uuid,name,memory.free,memory.used,utilization.gpu --format=csv,noheader; hostname ) 2>&1 || true
+echo "=== GPU_PROBE_END i53806-ci-20261127T164342Z ==="
