@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import itertools
 import logging
+import os
 import random
+import tempfile
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import msgspec
@@ -191,7 +194,8 @@ class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
     even_dp_dispatch: bool = True
     # Per scheduler; None is unlimited or not applied.
     max_queued_requests: Optional[int]
-    # Every tokenizer worker runs this warmup at the same time.
+    # Tokenizer workers of the server; with a queue limit only one of them
+    # sends this warmup (`_claim_tokenizer_worker_warmup`).
     tokenizer_workers: int = 1
     # The scheduler's own chunk size; None when chunked prefill is off.
     chunked_prefill_size: Optional[int]
@@ -294,10 +298,6 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
     elif not limits.even_dp_dispatch and queue is not None:
         # Without a queue limit an uneven share only waits in the queue.
         skip_reason = "DP dispatch is load based, so a rank's queue share is unknown"
-    elif queue is not None and limits.tokenizer_workers > 1:
-        # The workers' requests interleave, so no worker can bound what one
-        # rank's waiting queue receives.
-        skip_reason = "several tokenizer workers share a request queue limit"
     elif queue is not None and queue < 1:
         skip_reason = "the request queue limit is 0"
     elif max_prompt < 1:
@@ -325,6 +325,40 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
     if limits.serves_input_logprobs:
         logprob_sizes = [min(max_prompt, s) for s in _CONCURRENT_PREFILL_LOGPROB_SIZES]
     return ConcurrentPrefillPlan(rounds=rounds, logprob_sizes=logprob_sizes)
+
+
+# Held until the worker exits, so no other tokenizer worker of this server runs
+# the warmup after this one finishes.
+_tokenizer_worker_warmup_lock: Optional[int] = None
+
+
+def _try_lock(path: str) -> Optional[int]:
+    """A file descriptor holding an exclusive lock on `path`, or None when
+    another process holds it."""
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _claim_tokenizer_worker_warmup() -> bool:
+    """True in exactly one tokenizer worker of this server: the first to lock
+    a file named after the server's main process. The lock goes away with the
+    worker, so a later server reusing the process id can claim it again."""
+    from sglang.srt.managers.multi_tokenizer_mixin import get_main_process_id
+
+    global _tokenizer_worker_warmup_lock
+    if _tokenizer_worker_warmup_lock is None:
+        _tokenizer_worker_warmup_lock = _try_lock(
+            os.path.join(
+                tempfile.gettempdir(),
+                f"sglang_concurrent_prefill_{get_main_process_id()}.lock",
+            )
+        )
+    return _tokenizer_worker_warmup_lock is not None
 
 
 @warmup("concurrent_prefill")
@@ -370,6 +404,18 @@ async def concurrent_prefill(
         plan = concurrent_prefill_plan(limits)
         if plan.skip_reason is not None:
             logger.info(f"Skipping concurrent_prefill: {plan.skip_reason}")
+            return
+        if (
+            limits.max_queued_requests is not None
+            and limits.tokenizer_workers > 1
+            and not _claim_tokenizer_worker_warmup()
+        ):
+            # The plan bounds one sender's requests per rank queue; the
+            # workers' requests would add up in the same queues.
+            logger.info(
+                "Skipping concurrent_prefill: another tokenizer worker runs it "
+                "under the request queue limit"
+            )
             return
         logger.info(
             f"concurrent_prefill: {limits=}, round sizes {[len(r) for r in plan.rounds]}"

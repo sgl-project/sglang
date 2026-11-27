@@ -3,9 +3,13 @@
 sending a request the server refuses or can never admit."""
 
 import asyncio
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.entrypoints import warmup as warmup_mod
 from sglang.srt.entrypoints.warmup import (
     ConcurrentPrefillLimits,
     concurrent_prefill,
@@ -146,17 +150,16 @@ class TestConcurrentPrefillPlan(CustomTestCase):
             concurrent_prefill_plan(_limits(max_queued_requests=0)).rounds, []
         )
 
-    def test_tokenizer_workers_with_a_queue_limit_send_nothing(self):
-        """Every tokenizer worker runs this warmup at the same time and their
-        requests interleave in DP dispatch, so no worker can bound what one
-        rank's waiting queue receives: with a queue limit, the warmup skips."""
-        plan = concurrent_prefill_plan(
-            _limits(max_queued_requests=64, tokenizer_workers=2)
-        )
-        self.assertEqual((plan.rounds, plan.logprob_sizes), ([], []))
-        # Without a queue limit the workers only wait in the queue.
-        plan = concurrent_prefill_plan(_limits(tokenizer_workers=2))
-        self.assertEqual([len(r) for r in plan.rounds], [1, 4, 32])
+    def test_tokenizer_workers_plan_as_one_sender(self):
+        """With a queue limit only one tokenizer worker sends the warmup, so
+        its plan is the single-worker plan."""
+        for queue in (None, 1, 64):
+            self.assertEqual(
+                concurrent_prefill_plan(
+                    _limits(max_queued_requests=queue, tokenizer_workers=2)
+                ),
+                concurrent_prefill_plan(_limits(max_queued_requests=queue)),
+            )
 
     def test_load_based_dp_dispatch_sends_nothing(self):
         """Rounds are sized per DP rank, but total_tokens dispatch balances
@@ -308,6 +311,57 @@ class TestConcurrentPrefillRequests(CustomTestCase):
         lens = [len(r.input_ids) for r in tm.requests]
         self.assertTrue(lens)
         self.assertLessEqual(max(lens), _RecordingTokenizerManager.max_req_input_len)
+
+    def test_one_tokenizer_worker_runs_serially_under_a_queue_limit_of_one(self):
+        """Two tokenizer workers and --max-queued-requests 1: one worker sends
+        the rounds and the logprob probes one request at a time, and the other
+        sends nothing, so the waiting queue never holds two warmup requests."""
+
+        class _Worker(_RecordingTokenizerManager):
+            def generate_request(self, req, request):
+                self.requests.append(req)
+                in_flight.append(req)
+                peak[0] = max(peak[0], len(in_flight))
+
+                async def finished():
+                    await asyncio.sleep(0)
+                    in_flight.remove(req)
+                    yield {}
+
+                return finished()
+
+        in_flight, peak = [], [0]
+        workers = [_Worker(max_queued_requests=1, tokenizer_worker_num=2) for _ in "ab"]
+        with tempfile.TemporaryDirectory() as tmp:
+            claims = []
+
+            def claim():
+                # One process per worker: each holds its own lock descriptor.
+                fd = warmup_mod._try_lock(os.path.join(tmp, "warmup.lock"))
+                claims.append(fd)
+                return fd is not None
+
+            with mock.patch.object(warmup_mod, "_claim_tokenizer_worker_warmup", claim):
+                for tm in workers:
+                    asyncio.run(concurrent_prefill("null", tm))
+            for fd in claims:
+                if fd is not None:
+                    os.close(fd)
+        sent = sorted(len(tm.requests) for tm in workers)
+        self.assertEqual(sent[0], 0)
+        self.assertGreater(sent[1], 2)  # a round plus the two logprob probes
+        self.assertEqual(peak[0], 1)
+
+    def test_worker_lock_is_exclusive_until_its_holder_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "warmup.lock")
+            first = warmup_mod._try_lock(path)
+            self.assertIsNotNone(first)
+            self.assertIsNone(warmup_mod._try_lock(path))
+            os.close(first)  # the holder exits
+            again = warmup_mod._try_lock(path)
+            self.assertIsNotNone(again)
+            os.close(again)
 
     def test_decode_server_sends_nothing(self):
         tm = _RecordingTokenizerManager()
