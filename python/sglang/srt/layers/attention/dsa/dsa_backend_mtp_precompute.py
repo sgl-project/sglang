@@ -121,6 +121,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
     ) -> PrecomputedMetadata:
         """Precompute metadata for normal decode mode."""
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
+        seq_lens = self._with_draft_chain(seq_lens)
 
         if (
             (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1

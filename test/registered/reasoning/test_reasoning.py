@@ -4,7 +4,11 @@ import unittest
 import requests
 
 from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    declare_models,
+    register_amd_ci,
+    register_cuda_ci,
+)
 from sglang.test.kits.reasoning_kit import (
     ReasoningTokenUsageMixin,
     SeparateReasoningMixin,
@@ -18,6 +22,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+declare_models(skip_models=[DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST])  # AMD only
 # Backend-specific: the thinking-token and separate-reasoning assertions read
 # decoded output from a 30B MoE, so a ROCm fused-MoE or sampling regression
 # shows up here as malformed reasoning_content that CUDA cannot catch.
