@@ -1592,7 +1592,6 @@
                   },
                   {
                     "group": "Black Forest Labs",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/FLUX/FLUX.3",
                       "cookbook/diffusion/FLUX/FLUX"
@@ -1638,7 +1637,6 @@
                   },
                   {
                     "group": "Kandinsky",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Kandinsky/Kandinsky6",
                       "cookbook/diffusion/Kandinsky/Kandinsky6-SR"
@@ -1672,6 +1670,7 @@
                   },
                   {
                     "group": "MiniMax",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3",
                       "cookbook/diffusion/MiniMax/MiniMax-H3-Image"
@@ -1731,7 +1730,6 @@
                   },
                   {
                     "group": "Wan",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
                       "cookbook/diffusion/Wan/Wan2.2",
