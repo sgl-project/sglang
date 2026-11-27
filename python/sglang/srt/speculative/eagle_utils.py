@@ -75,6 +75,7 @@ _PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
 # optional binding contract.
 LOCAL_KEYS_SUPPORTED = True
 LocalKeysFn = Callable[[Any], Optional[torch.Tensor]]
+GatheredTokensFn = Callable[[Any], Optional[torch.Tensor]]
 _provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
 _ShardedLogitsView = getattr(_provider_spec, "ShardedLogitsView", None)
 _VocabShardView = getattr(_provider_spec, "VocabShardView", None)
@@ -849,6 +850,79 @@ def _sharded_sampling_applies(
     )
 
 
+def _gathered_sampling_applies(
+    *,
+    greedy: bool,
+    sparse: bool,
+    vocab_shard: Optional[VocabShard],
+    verify_input: EagleVerifyInput,
+    batch: ScheduleBatch,
+    grammar_mask: Optional[GrammarMask],
+    watermark: bool,
+    has_custom_logit_processor: bool,
+) -> bool:
+    """Whether a provider may draw this verify's target tokens from gathered logits:
+    temperature-only rows of a top-1 chain under the exact accept rule. A request
+    seed stays on stock seeded sampling."""
+    info = batch.sampling_info
+    return (
+        not (greedy or sparse)
+        and vocab_shard is None
+        and _is_cuda
+        and verify_input.tree_topk == 1
+        and grammar_mask is None
+        and not watermark
+        and info.sampling_seed is None
+        and sampling_allows_vocab_shards(
+            info,
+            adjusts_logits=has_custom_logit_processor
+            or info.step_penalties is not None
+            or info.logit_bias is not None,
+            # logprobs read these logits after verify and the policy must not write
+            # them; admitting logprob rounds keeps eager and graphed on one sampler
+            return_logprob=False,
+            has_local_keys=True,
+        )
+        and spec_allows_vocab_shards(get_spec())
+    )
+
+
+def _gathered_tokens(
+    logits: torch.Tensor,
+    *,
+    temperatures: torch.Tensor,
+    gathered_tokens: GatheredTokensFn,
+) -> Optional[torch.Tensor]:
+    """A provider's target token per row of gathered logits, or None for the stock
+    sampler; the provider declines before consuming RNG."""
+    tokens = gathered_tokens(
+        _provider_spec.GatheredLogitsView(values=logits, temperatures=temperatures)
+    )
+    if tokens is None:
+        return None
+    if not isinstance(tokens, torch.Tensor):
+        raise TypeError("gathered tokens must be a torch.Tensor or None")
+    if (
+        tuple(tokens.shape) != (logits.shape[0],)
+        or tokens.dtype != torch.int64
+        or tokens.device != logits.device
+    ):
+        raise ValueError(
+            f"gathered tokens are {tokens.dtype} {tuple(tokens.shape)} on "
+            f"{tokens.device}, expected int64 ({logits.shape[0]},) on {logits.device}"
+        )
+    return tokens
+
+
+def _row_temperatures(
+    *, sampling_info: SamplingBatchInfo, draft_token_num: int
+) -> torch.Tensor:
+    """Each request's temperature repeated for its verify rows: float32 [rows]."""
+    return torch.repeat_interleave(
+        sampling_info.temperatures.view(-1), draft_token_num, dim=0
+    )
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -862,6 +936,7 @@ def eagle_sample(
     sparse_bonus_argmax: bool = False,
     local_keys: Optional[LocalKeysFn] = None,
     has_custom_logit_processor: bool = False,
+    gathered_tokens: Optional[GatheredTokensFn] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -870,7 +945,8 @@ def eagle_sample(
     graph can replay the injection. simulated_acc_len_rng: the generator to draw
     it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
     injected acceptance's bonus is the target argmax on the compact top-k branch
-    too, as on the dense one.
+    too, as on the dense one. gathered_tokens: a provider's target sampler for
+    temperature-only rows on gathered logits; None keeps the stock sampler.
     """
     from sglang.srt.runtime_context import get_parallel
     from sglang.srt.speculative.target_verify import adjust_verify_logits
@@ -943,6 +1019,9 @@ def eagle_sample(
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
         local_keys=local_keys,
+        grammar_mask=grammar_mask,
+        has_custom_logit_processor=has_custom_logit_processor,
+        gathered_tokens=gathered_tokens,
     )
 
 
@@ -961,6 +1040,9 @@ def _tree_accept(
     simulated_acc_len_rng: Optional[torch.Generator],
     sparse_bonus_argmax: bool,
     local_keys: Optional[LocalKeysFn],
+    grammar_mask: Optional[GrammarMask],
+    has_custom_logit_processor: bool,
+    gathered_tokens: Optional[GatheredTokensFn],
 ):
     """A gather it still needs is published to ``logits_output``."""
     from sglang.srt.layers.dp_attention import (
@@ -993,10 +1075,9 @@ def _tree_accept(
     if vocab_shard is not None:
         temperatures = None
         if not greedy:
-            temperatures = torch.repeat_interleave(
-                sampling_info.temperatures.view(-1),
-                verify_input.draft_token_num,
-                dim=0,
+            temperatures = _row_temperatures(
+                sampling_info=sampling_info,
+                draft_token_num=verify_input.draft_token_num,
             )
         sharded_predict = _sharded_tokens(
             next_token_logits,
@@ -1014,6 +1095,25 @@ def _tree_accept(
             )
             logits_output.next_token_logits = next_token_logits
             logits_output.next_token_logits_vocab_shard = vocab_shard = None
+    gathered_predict = None
+    if gathered_tokens is not None and _gathered_sampling_applies(
+        greedy=greedy,
+        sparse=sparse,
+        vocab_shard=vocab_shard,
+        verify_input=verify_input,
+        batch=batch,
+        grammar_mask=grammar_mask,
+        watermark=watermark,
+        has_custom_logit_processor=has_custom_logit_processor,
+    ):
+        gathered_predict = _gathered_tokens(
+            next_token_logits,
+            temperatures=_row_temperatures(
+                sampling_info=sampling_info,
+                draft_token_num=verify_input.draft_token_num,
+            ),
+            gathered_tokens=gathered_tokens,
+        )
     # The generic fused chain acceptance writes every verify output itself.
     chain = _chain_accept_applies(
         verify_input=verify_input,
@@ -1023,7 +1123,9 @@ def _tree_accept(
         simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
         watermark=watermark,
     )
-    fused_verify = chain and (greedy or sparse or vocab_shard is not None)
+    fused_verify = chain and (
+        greedy or sparse or vocab_shard is not None or gathered_predict is not None
+    )
     predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
         rows=math.prod(predict_shape),
         bs=bs,
@@ -1110,18 +1212,23 @@ def _tree_accept(
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
             )
-    elif sparse:
-        from sglang.srt.speculative.uno_utils import (
-            sample_uno_tree_target_tokens,
-        )
+    elif sparse or gathered_predict is not None:
+        if gathered_predict is not None:
+            # a provider target sample per row; the greedy check against it is exact
+            # for a topk-1 chain, whose drafts are deterministic
+            target_predict = gathered_predict.reshape(bs, verify_input.draft_token_num)
+        else:
+            from sglang.srt.speculative.uno_utils import (
+                sample_uno_tree_target_tokens,
+            )
 
-        target_predict = sample_uno_tree_target_tokens(
-            next_token_logits=next_token_logits,
-            sampling_info=sampling_info,
-            batch_size=bs,
-            verify_width=verify_input.draft_token_num,
-            max_top_k=uno_target_max_top_k,
-        )
+            target_predict = sample_uno_tree_target_tokens(
+                next_token_logits=next_token_logits,
+                sampling_info=sampling_info,
+                batch_size=bs,
+                verify_width=verify_input.draft_token_num,
+                max_top_k=uno_target_max_top_k,
+            )
         if fused_verify:
             _chain_accept(
                 predict=predict,
@@ -1271,7 +1378,12 @@ def _tree_accept(
                 )
 
             # Use target argmax as the synthetic bonus for non-greedy requests.
-            if target_predict is None or sparse_bonus_argmax or vocab_shard is not None:
+            if (
+                target_predict is None
+                or sparse_bonus_argmax
+                or vocab_shard is not None
+                or gathered_predict is not None
+            ):
                 bonus_predict = None
                 if vocab_shard is not None:
                     bonus_predict = _sharded_tokens(

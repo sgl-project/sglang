@@ -103,6 +103,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     bind_eagle_runtime_hooks,
     build_eagle_verify_input,
     check_draft_branch_tail_copy,
+    offer_draft_attention,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -1674,6 +1675,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
             self.target_worker, supports_sharded_verify=self.topk == 1
         )
+        if self._draft_worker is not None:
+            offer_draft_attention(
+                self._speculative_runtime_hooks, draft_worker=self._draft_worker
+            )
         # not in __init__, which the standalone and frozen-KV workers do not run
         if (
             self._draft_worker is not None
@@ -2116,6 +2121,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 speculative_moe_a2a_backend_context(),
             ):
                 self._draft_worker.init_attention_backend()
+                # the rebuilt draft backends take the provider's draft attention
+                # before this state's draft graphs are captured, as at init
+                offer_draft_attention(
+                    self._speculative_runtime_hooks,
+                    draft_worker=self._draft_worker,
+                    log_decision=False,
+                )
                 self._draft_worker._capture_cuda_graphs()
 
             # Build target attention backend and CUDA graph runner

@@ -1161,7 +1161,8 @@ def bind_speculative_runtime_hooks(
     The caller's stock strategies are returned by identity when the runtime master
     switch is off or the built provider has no factory. Provider presence must agree
     across ranks before any rank can call it. The provider may change the local key
-    builder, but the runtime-owned verification runner cannot be replaced.
+    builder and add a gathered-logits sampler, a verify-shard head and a draft
+    attention, but the runtime-owned verification runner cannot be replaced.
     """
     if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
         return defaults
@@ -1186,6 +1187,21 @@ def bind_speculative_runtime_hooks(
         raise ValueError("a provider cannot replace the runtime post-verify runner")
     if not callable(hooks.post_verify.local_keys):
         raise TypeError("post_verify.local_keys must be callable")
+    gathered = hooks.post_verify.gathered_tokens
+    if gathered is not None and not callable(gathered):
+        raise TypeError("post_verify.gathered_tokens must be callable or None")
+    if hooks.verify_shard_head is not None and not callable(hooks.verify_shard_head):
+        raise TypeError("verify_shard_head must be callable or None")
+    if hooks.draft_attention is not None and not callable(hooks.draft_attention):
+        raise TypeError("draft_attention must be callable or None")
+    logger.info(
+        "NVIDIA megakernel: speculative runtime hooks: provider local keys %s, "
+        "gathered sampler %s, verify-shard head %s, draft attention %s",
+        hooks.post_verify.local_keys is not defaults.post_verify.local_keys,
+        gathered is not None,
+        hooks.verify_shard_head is not None,
+        hooks.draft_attention is not None,
+    )
     return hooks
 
 

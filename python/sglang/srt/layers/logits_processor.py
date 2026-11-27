@@ -38,6 +38,10 @@ from sglang.kernels.ops.sampling.softcap_row_argmax import (
     merge_row_argmax_shards,
     softcap_row_argmax,
 )
+from sglang.kernels.plugin_kernels.nvidia.spec import (
+    VerifyShardHeadFn,
+    VerifyShardHeadView,
+)
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
@@ -566,6 +570,7 @@ class LogitsProcessor(nn.Module):
         # full-vocabulary gather even when the runtime master switch is on.
         self.sharded_verify = False
         self._sharded_verify_temperature_keys = False
+        self._verify_shard_head: Optional[VerifyShardHeadFn] = None
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -612,14 +617,23 @@ class LogitsProcessor(nn.Module):
             self.vocab_size, chunking_group=chunking_group
         )
 
-    def enable_sharded_verify(self, *, temperature_keys: bool = False) -> None:
+    def enable_sharded_verify(
+        self,
+        *,
+        temperature_keys: bool = False,
+        shard_head: Optional[VerifyShardHeadFn] = None,
+    ) -> None:
         """Opt in a verify consumer that understands vocab-shard outputs.
 
         temperature_keys: the bound local key policy may serve temperature rows;
         the stock policy serves greedy rows only.
+        shard_head: a provider head offered the shard logits' plain GEMM first;
+        a subclass with its own _compute_lm_head is never offered one.
         """
         self.sharded_verify = self._sharded_verify_eligible
         self._sharded_verify_temperature_keys = temperature_keys
+        own_head = type(self)._compute_lm_head is not LogitsProcessor._compute_lm_head
+        self._verify_shard_head = None if own_head else shard_head
 
     def verify_uses_vocab_shards(self, forward_batch: ForwardBatch) -> bool:
         """Whether this target verify keeps its logits as vocabulary shards.
@@ -868,7 +882,13 @@ class LogitsProcessor(nn.Module):
         out = self._borrow_shard_logits_buffer(
             hidden_states, lm_head, logits_metadata.next_token_logits_buffer
         )
-        logits = self._compute_lm_head(hidden_states, lm_head, out=out)
+        # a provider head returns unscaled logits, so a scaled head keeps the GEMM
+        if self._verify_shard_head is not None and self.logit_scale is None:
+            logits = self._compute_lm_head(
+                hidden_states, lm_head, out=out, shard_head=self._verify_shard_head
+            )
+        else:
+            logits = self._compute_lm_head(hidden_states, lm_head, out=out)
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
         return logits
@@ -1420,6 +1440,7 @@ class LogitsProcessor(nn.Module):
         embedding_bias: Optional[torch.Tensor] = None,
         *,
         out: Optional[torch.Tensor] = None,
+        shard_head: Optional[VerifyShardHeadFn] = None,
     ) -> torch.Tensor:
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
@@ -1489,10 +1510,15 @@ class LogitsProcessor(nn.Module):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
                 lhs = hidden_states.to(lm_head.weight.dtype)
-                if out is not None and out.dtype == lm_head.weight.dtype:
+                if out is not None and out.dtype != lm_head.weight.dtype:
+                    out = None
+                logits = None
+                if shard_head is not None:
+                    logits = _provider_shard_logits(
+                        shard_head, hidden_states=lhs, weight=lm_head.weight, out=out
+                    )
+                if logits is None:
                     logits = torch.matmul(lhs, lm_head.weight.T, out=out)
-                else:
-                    logits = torch.matmul(lhs, lm_head.weight.T)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
@@ -1883,6 +1909,34 @@ def _reassemble_tp_lm_head_all_to_all_output(
         .permute(1, 0, 2)
         .reshape(local_rows, tp_size * vocab_shard)
     )
+
+
+def _provider_shard_logits(
+    shard_head: VerifyShardHeadFn,
+    *,
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    out: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """A provider head's vocabulary-shard logits, or None for the GEMM."""
+    logits = shard_head(
+        VerifyShardHeadView(hidden_states=hidden_states, weight=weight, out=out)
+    )
+    if logits is None:
+        return None
+    expected = (hidden_states.shape[0], weight.shape[0])
+    if (
+        not isinstance(logits, torch.Tensor)
+        or tuple(logits.shape) != expected
+        or logits.dtype != weight.dtype
+        or logits.device != weight.device
+        or (out is not None and logits.data_ptr() != out.data_ptr())
+    ):
+        raise ValueError(
+            f"a verify-shard head must return {weight.dtype} {expected} logits "
+            f"on {weight.device}, written into out when one is given"
+        )
+    return logits
 
 
 def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
