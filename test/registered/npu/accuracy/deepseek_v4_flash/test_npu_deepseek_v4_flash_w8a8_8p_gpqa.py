@@ -21,6 +21,10 @@ register_npu_ci(
     nightly=True,
 )
 
+# TEMP (validation only): dedicated suite so the nightly workflow can run this
+# single case on the B050 image without pulling in the whole full-acc suite.
+register_npu_ci(est_time=3600, suite="temp-pr1-acc-16-npu-a3")
+
 # The PR pipeline (pr-test-npu.yml) runs on both `pull_request` and a daily
 # `schedule`, so match the workflow file instead of the event name. Every other
 # caller (nightly, full test) still gets the full run.
@@ -95,6 +99,13 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     "bfloat16",
     "--load-balance-method",
     "round_robin",
+    "--cuda-graph-backend-prefill",
+    "breakable",
+    "--cuda-graph-bs-prefill",
+    128,
+    512,
+    1024,
+    2048,
     "--speculative-algorithm",
     "DSPARK",
     "--speculative-draft-model-path",
