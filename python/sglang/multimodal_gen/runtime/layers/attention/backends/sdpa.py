@@ -2,6 +2,8 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
+import math
 from contextlib import nullcontext
 
 import torch
@@ -12,7 +14,10 @@ try:
 except ImportError:
     torch_varlen_attn = None
 
-from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    QUALITY_LEVELS,
+    quality_allows,
+)
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
 )
@@ -43,6 +48,70 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 
 _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
 
+# Mirrors ATen's flash_api.cpp (num_splits_heuristic, set_params_splitkv); checked
+# against torch 2.14.1. The query block and SM factor are those of its split kernel.
+_FLASH_QUERY_BLOCK = 64
+_FLASH_SM_FACTOR = 2
+_FLASH_UNSPLIT_OCCUPANCY = 0.8
+_FLASH_SPLIT_EFFICIENCY_RATIO = 0.85
+_FLASH_MAX_SPLITS = 128
+# Arbitrary bound; one entry per distinct attention shape an impl has seen. The
+# shared split-count cache uses it too, since a plan needs at most two counts.
+_MAX_SPLIT_PADDING_PLANS = 256
+# Tiers that rule out "lossless" fast paths, i.e. the requests that pad.
+_EXACT_QUALITY_LEVELS = frozenset(
+    level for level in QUALITY_LEVELS if not quality_allows(level, "lossless")
+)
+
+
+@functools.cache
+def _multi_processor_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+# Every layer plans the same shapes, so only the first layer runs the search.
+@functools.lru_cache(maxsize=2 * _MAX_SPLIT_PADDING_PLANS)
+def _flash_num_splits(
+    query_blocks: int, key_len: int, head_dim: int, num_sms: int
+) -> int:
+    """Key splits flash picks; ``query_blocks`` is batch * heads * query blocks."""
+    capacity = num_sms * _FLASH_SM_FACTOR
+    if query_blocks >= _FLASH_UNSPLIT_OCCUPANCY * capacity:
+        return 1
+    key_block = 256 if head_dim <= 64 else 128 if head_dim <= 128 else 64
+    key_blocks = math.ceil(key_len / key_block)
+    efficiency = {}
+    for splits in range(1, min(_FLASH_MAX_SPLITS, capacity, key_blocks) + 1):
+        # A count that leaves the blocks per split unchanged is not a new split.
+        if splits > 1 and math.ceil(key_blocks / splits) == math.ceil(
+            key_blocks / (splits - 1)
+        ):
+            continue
+        waves = query_blocks * splits / capacity
+        efficiency[splits] = waves / math.ceil(waves)
+    best = max(efficiency.values())
+    return next(
+        splits
+        for splits, value in efficiency.items()
+        if value >= _FLASH_SPLIT_EFFICIENCY_RATIO * best
+    )
+
+
+def _request_quality_is_exact() -> bool:
+    # Split versus unsplit flash only moves rounding, which "lossless" allows;
+    # the slower unsplit kernel is reserved for "exact" requests.
+    context = get_forward_context_or_none()
+    if context is None:
+        return False
+    # Many stages pass forward_batch without quality=; the request's own tier wins.
+    batch = context.forward_batch
+    quality = (
+        batch.sampling_params.quality
+        if batch is not None and batch.sampling_params is not None
+        else context.quality
+    )
+    return quality in _EXACT_QUALITY_LEVELS
+
 
 def torch_default_sdpa_backends():
     """Reference SDPA with a stable cuDNN-first preference and fallback set.
@@ -70,6 +139,9 @@ class SDPABackend(AttentionBackend):
 
 
 class SDPAImpl(AttentionImpl):
+    # cuDNN SDPA does not depend on the head count; only flash needs padding.
+    _pad_flash_split_queries = True
+
     def __init__(
         self,
         num_heads: int,
@@ -84,6 +156,80 @@ class SDPAImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
+        # Heads of the unsharded layer; set when TP or Ulysses shards them.
+        self.global_num_heads = extra_impl_args.get("global_num_heads")
+        # The per-impl half of _unsplit_query_len's eligibility, resolved once.
+        # ROCm SDPA does not use the CUDA flash split heuristic modeled here.
+        self._may_pad_split_queries = (
+            self._pad_flash_split_queries
+            and not self.allow_cudnn_sdp
+            and self.global_num_heads is not None
+            and not self.dropout
+            and torch.version.hip is None
+        )
+        # (query shape, key length, dtype, device) -> _split_padding_len.
+        self._split_padding_plans: dict[tuple, int] = {}
+
+    def _unsplit_query_len(self, query: torch.Tensor, key_len: int) -> int:
+        """Query length that keeps sharded heads on the full layer's kernel.
+
+        Fewer local heads can push a short sequence onto PyTorch's split-KV
+        flash kernel while the unsharded layer is not split, which reorders
+        the softmax sums. Query rows attend independently, so padding them
+        past the split threshold restores the unsharded kernel exactly.
+        Applies to "exact" quality requests only.
+        ``query`` is [B, H, S, D]; ``key_len`` is the key sequence length.
+        """
+        query_shape = query.shape
+        if not self._may_pad_split_queries:
+            return query_shape[2]
+        return self._padded_query_len(query, query_shape, key_len) or query_shape[2]
+
+    def _padded_query_len(
+        self, query: torch.Tensor, query_shape: torch.Size, key_len: int
+    ) -> int:
+        """Padded length for this call, or 0 when it runs unpadded."""
+        # All heads present: this call already runs the full layer's kernel.
+        if query_shape[1] >= self.global_num_heads:
+            return 0
+        if torch.compiler.is_compiling():
+            padded_len = self._split_padding_len(query, query_shape, key_len)
+        else:
+            plan_key = (query_shape, key_len, query.dtype, query.device)
+            padded_len = self._split_padding_plans.get(plan_key)
+            if padded_len is None:
+                padded_len = self._split_padding_len(query, query_shape, key_len)
+                if len(self._split_padding_plans) >= _MAX_SPLIT_PADDING_PLANS:
+                    self._split_padding_plans.clear()
+                self._split_padding_plans[plan_key] = padded_len
+        # The request lookup comes last: only calls that would pad pay for it.
+        if padded_len and _request_quality_is_exact():
+            return padded_len
+        return 0
+
+    def _split_padding_len(
+        self, query: torch.Tensor, query_shape: torch.Size, key_len: int
+    ) -> int:
+        """Length that moves the shard off the split kernel, or 0 if it need not move."""
+        batch, heads, query_len, head_dim = query_shape
+        if (
+            not query.is_cuda
+            or query.dtype not in (torch.float16, torch.bfloat16)
+            or head_dim > 256
+        ):
+            return 0
+        num_sms = _multi_processor_count(query.device.index)
+        blocks = math.ceil(query_len / _FLASH_QUERY_BLOCK)
+
+        def num_splits(num_heads: int) -> int:
+            return _flash_num_splits(
+                batch * num_heads * blocks, key_len, head_dim, num_sms
+            )
+
+        if num_splits(heads) == 1 or num_splits(self.global_num_heads) > 1:
+            return 0
+        unsplit_blocks = _FLASH_UNSPLIT_OCCUPANCY * _FLASH_SM_FACTOR * num_sms
+        return math.ceil(unsplit_blocks / (batch * heads)) * _FLASH_QUERY_BLOCK
 
     def _sdpa_context(self, query: torch.Tensor):
         if self.allow_cudnn_sdp and query.device.type == "cuda":
@@ -101,13 +247,14 @@ class SDPAImpl(AttentionImpl):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
+        query_shape, key_shape = query.shape, key.shape
         attn_mask = None
         is_causal = self.causal
-        if self.causal and query.shape[-2] != key.shape[-2]:
+        if self.causal and query_shape[-2] != key_shape[-2]:
             is_causal = False
-            if query.shape[-2] > 1:
-                query_length = query.shape[-2]
-                key_length = key.shape[-2]
+            if query_shape[-2] > 1:
+                query_length = query_shape[-2]
+                key_length = key_shape[-2]
                 attn_mask = torch.ones(
                     query_length,
                     key_length,
@@ -121,14 +268,24 @@ class SDPAImpl(AttentionImpl):
             "is_causal": is_causal,
             "scale": self.softmax_scale,
         }
-        if query.shape[1] != key.shape[1]:
+        if query_shape[1] != key_shape[1]:
             attn_kwargs["enable_gqa"] = True
+        padded_len = 0
+        if self._may_pad_split_queries and attn_mask is None and not is_causal:
+            padded_len = self._padded_query_len(query, query_shape, key_shape[2])
+        if padded_len:
+            # Pad in the caller's [B, S, H, D] layout: flash allocates its output
+            # with the query's strides, and callers view the result as [B, S, H * D].
+            batch, heads, query_len, head_dim = query_shape
+            padding = query.new_zeros(batch, padded_len - query_len, heads, head_dim)
+            query = torch.cat([query.transpose(1, 2), padding], dim=1).transpose(1, 2)
         with self._sdpa_context(query):
             output = torch.nn.functional.scaled_dot_product_attention(
                 query, key, value, **attn_kwargs
             )
-        output = output.transpose(1, 2)
-        return output
+        if padded_len:
+            return output[:, :, :query_len].transpose(1, 2).contiguous()
+        return output.transpose(1, 2)
 
     def forward_varlen(
         self,
@@ -255,6 +412,8 @@ class CudnnSDPABackend(SDPABackend):
 
 
 class CudnnSDPAImpl(SDPAImpl):
+    _pad_flash_split_queries = False
+
     def _sdpa_context(self, query: torch.Tensor):
         if query.device.type == "cuda":
             return sdpa_kernel(SDPBackend.CUDNN_ATTENTION)

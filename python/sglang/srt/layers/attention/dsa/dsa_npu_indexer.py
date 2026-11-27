@@ -281,12 +281,12 @@ class DSANPUIndexerMixin:
         # indexer (before the attention backend's forward_extend), so prepare it
         # here rather than in the shared eager runner.
         attn_backend = get_attn_backend()
-        if hasattr(attn_backend, "prepare_dsa_cp_metadata"):
-            attn_backend.prepare_dsa_cp_metadata(forward_batch)
         # Hybrid models (Kimi K2/K3) wrap a full-attn and a linear backend;
-        # the forward metadata consumed here lives on the full-attn side.
+        # unwrap before preparing CP metadata as well as reading it.
         if hasattr(attn_backend, "full_attn_backend"):
             attn_backend = attn_backend.full_attn_backend
+        if hasattr(attn_backend, "prepare_dsa_cp_metadata"):
+            attn_backend.prepare_dsa_cp_metadata(forward_batch)
         if attn_backend.forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = attn_backend.forward_metadata.seq_lens
         else:
