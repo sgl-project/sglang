@@ -95,7 +95,6 @@ DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
     128,
     512,
     1024,
-    2048,
     "--reasoning-parser",
     "deepseek-v4",
     "--speculative-algorithm",

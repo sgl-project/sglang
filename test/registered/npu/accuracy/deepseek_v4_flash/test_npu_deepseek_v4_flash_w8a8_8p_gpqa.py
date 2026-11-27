@@ -101,7 +101,6 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     128,
     512,
     1024,
-    2048,
     "--speculative-algorithm",
     "DSPARK",
     "--speculative-draft-model-path",
