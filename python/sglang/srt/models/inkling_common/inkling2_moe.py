@@ -39,6 +39,7 @@ from sglang.kernels.ops.gemm.inkling2_nvfp4 import (
 )
 from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 from sglang.kernels.ops.moe import inkling2_experts_sm120 as experts_sm120
+from sglang.kernels.ops.moe import inkling2_moe_lowm_sm120 as moe_lowm_sm120
 from sglang.kernels.ops.moe.inkling2_moe import (
     routed_partial,
     routed_rows,
@@ -93,6 +94,10 @@ def _capped_swiglu(gate_up, gammas, gate_cap, up_cap, offsets=None):
     return out.to(gate_up.dtype)
 
 
+def _has_forward_hooks(*modules):
+    return any(m._forward_hooks or m._forward_pre_hooks for m in modules)
+
+
 class RoutedOutput(NamedTuple):
     """Expert rows in routing order, all-reduced; combined by the consumer.
     top_k 0: rows are already combined per token (src2dst None)."""
@@ -123,11 +128,14 @@ class Inkling2Gate(nn.Module):
             "_one", torch.ones((), dtype=torch.float32), persistent=False
         )
 
-    def forward(self, x):
+    def partials(self, x):
+        """FP32 router split-K partials, [groups, tokens, experts]."""
         if uses_k_groups(x, self.weight):
-            partials = linear_k_group_partials(x.contiguous(), self.weight)
-        else:
-            partials = linear(x, self.weight, out_dtype=torch.float32)[None]
+            return linear_k_group_partials(x.contiguous(), self.weight)
+        return linear(x, self.weight, out_dtype=torch.float32)[None]
+
+    def forward(self, x):
+        partials = self.partials(x)
         if self.topk == 8:
             _, ids, weights = route_topk(
                 partials, self.bias, self.topk, self.route_scale, self._one
@@ -849,12 +857,9 @@ class Inkling2Experts(nn.Module):
             tokens,
         )
 
-    def _forward_sm120(self, x, weights, ids, combine):
-        """SM120 NVFP4 or MXFP8 experts on rows in expert order (single EP rank):
-        routed quantization into the SM120 grouped GEMMs, then the per-token sum of
-        the (scaled) rows."""
-        tokens, top_k = ids.shape
-        src2dst, dst2src, gammas, offsets = self._sm120_route(ids, weights)
+    def _forward_sm120_routed(
+        self, x, src2dst, dst2src, gammas, offsets, top_k, tokens, combine
+    ):
         if self._routed_kernels == torch.uint8:
             down, scales = self._sm120_nvfp4(
                 x=x.contiguous(),
@@ -877,6 +882,28 @@ class Inkling2Experts(nn.Module):
             x.dtype
         )
         return out if combine else RoutedOutput(out, None, 0)
+
+    def _forward_sm120(self, x, weights, ids, combine):
+        """SM120 NVFP4 or MXFP8 experts on rows in expert order (single EP rank):
+        routed quantization into the SM120 grouped GEMMs, then the per-token sum of
+        the (scaled) rows."""
+        tokens, top_k = ids.shape
+        if moe_lowm_sm120.can_use_lowm_moe(
+            tokens,
+            self.num_global_experts,
+            top_k,
+            x.shape[1],
+            self.output_sizes["w13"] // 2,
+            x.device,
+        ):
+            src2dst, dst2src, gammas, offsets = moe_lowm_sm120.route_metadata_lowm(
+                ids, weights, self.num_global_experts
+            )
+        else:
+            src2dst, dst2src, gammas, offsets = self._sm120_route(ids, weights)
+        return self._forward_sm120_routed(
+            x, src2dst, dst2src, gammas, offsets, top_k, tokens, combine
+        )
 
     def _sm120_route(self, ids, weights):
         """(src2dst, dst2src, FP32 gammas in sorted order, expert offsets) of the
@@ -1231,6 +1258,40 @@ class Inkling2MoE(nn.Module):
         With total_tokens, x holds only local_input_rows(total_tokens, combine)."""
         if x.shape[0] == 0:
             return x
+        if (
+            self.experts.native_sm120
+            and total_tokens is None
+            and get_parallel().moe_tp_size == 1
+            and x.shape[0] <= moe_lowm_sm120.LOWM_FUSED_ROUTE_MAX_TOKENS
+            and moe_lowm_sm120.can_use_lowm_moe(
+                x.shape[0],
+                self.experts.num_global_experts,
+                self.gate.topk,
+                x.shape[1],
+                self.experts.output_sizes["w13"] // 2,
+                x.device,
+            )
+            # The fused route calls neither module: keep their --forward-hooks.
+            and not _has_forward_hooks(self.gate, self.experts)
+        ):
+            _, _, src2dst, dst2src, gammas, offsets = (
+                moe_lowm_sm120.route_topk_meta_lowm(
+                    self.gate.partials(x),
+                    self.gate.bias,
+                    self.gate.route_scale,
+                    self.gate._one,
+                )
+            )
+            return self.experts._forward_sm120_routed(
+                x,
+                src2dst,
+                dst2src,
+                gammas,
+                offsets,
+                self.gate.topk,
+                x.shape[0],
+                combine=combine,
+            )
         weights, ids = self.gate(x)
         if total_tokens is not None:
             return self.experts._forward_mega(
