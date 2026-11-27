@@ -182,9 +182,11 @@ def _diffusers_h3_checkpoint(
     """Map Diffusers H3 names/layout to the fused native checkpoint layout."""
     mapping = get_param_names_mapping(_ARCH_DEFAULTS.param_names_mapping)
     pending: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
+    has_rope_inv_freq = False
 
     for source_name, tensor in iterator:
         target_name, merge_index, merge_count = mapping(source_name)
+        has_rope_inv_freq |= target_name == "rope.inv_freq"
 
         # Diffusers SwiGLU stores [value, gate]; the native fused MLP consumes
         # [gate, value]. Packed GPTQ tensors carry output channels on dim 1.
@@ -217,6 +219,26 @@ def _diffusers_h3_checkpoint(
     if pending:
         incomplete = ", ".join(sorted(pending))
         raise ValueError(f"Incomplete Diffusers H3 fused parameters: {incomplete}")
+    if not has_rope_inv_freq:
+        # Diffusers computes the rope frequencies from rope_theta instead of
+        # storing them: base^-(arange(0, 2n, 2) / 2n) with base 10000.
+        inv_freq_len = _ARCH_DEFAULTS.rope_inv_freq_len
+        exponents = torch.arange(0, 2 * inv_freq_len, 2, dtype=torch.float64)
+        yield (
+            "rope.inv_freq",
+            (10000.0 ** (-exponents / (2 * inv_freq_len))).to(_FP32_DTYPE),
+        )
+
+
+def _dwd_varlen_attention_available() -> bool:
+    """The DWD pixel head runs torch's varlen flash attention (CUDA, not ROCm)."""
+    if not current_platform.is_cuda() or torch.version.hip is not None:
+        return False
+    try:
+        from torch.nn.attention.varlen import varlen_attn  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 _BF16_DTYPE = torch.bfloat16
@@ -289,6 +311,8 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "local_embedding_layout",
         "packed_seq_params",
         "refiner_packed_seq_params",
+        # pi-H3 DWD: also return the generated video rows' pixel-head features
+        "return_dwd_features",
     }
 )
 
@@ -1930,7 +1954,8 @@ class MiniMaxH3AdalnProj(nn.Module):
             bias=True,
             gather_output=False,
             params_dtype=params_dtype,
-            quant_config=quant_config,
+            # an online quantization config must not touch that FP32 island
+            quant_config=None if arch.adaln_curve_grid is not None else quant_config,
             prefix=f"{prefix}.linear",
         )
 
@@ -2987,6 +3012,10 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         pdd_heads = envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
         if pdd_heads:
             self.final_layer.load_pdd_fused_heads(pdd_heads)
+        self.dwd_norm_out = None
+        self.dwd_pixel_refiner = None
+        if arch.dwd_head_config is not None:
+            self._init_dwd_head(arch)
         self.adaln_cache = (
             MiniMaxH3AdalnCache(
                 arch,
@@ -3138,6 +3167,51 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             if isinstance(module, MiniMaxH3Attention):
                 module._set_attention_backend(backend)
         self._resolved_attention_backend = backend.get_enum()
+
+    def _init_dwd_head(self, arch: MiniMaxH3DiTArchConfig) -> None:
+        """The pi-H3 decoder-free pixel head (minimax_h3_dwd.py)."""
+        from sglang.multimodal_gen.runtime.models.dits.minimax_h3_dwd import (
+            MiniMaxH3DWDNormOut,
+            MiniMaxH3DWDPixelRefiner,
+        )
+
+        config = arch.dwd_head_config
+        refiner = config.get("pixel_refiner") or {}
+        if (
+            config.get("linear_head", True)
+            or refiner.get("type") != "SolH3DWDHead"
+            or arch.adaln_curve_grid is None
+        ):
+            raise ValueError(
+                "MiniMax H3 serves only the Sol pixel refiner DWD head without a "
+                "linear head on a pruned (AdaLN curve) DiT, got "
+                f"dwd_head_config={config!r}"
+            )
+        if not _dwd_varlen_attention_available():
+            raise ValueError(
+                "the MiniMax H3 DWD pixel head needs PyTorch's CUDA varlen "
+                "attention (torch.nn.attention.varlen), which this platform lacks; "
+                "serve a VAE-output variant (e.g. --model-variant 4step-vae) instead"
+            )
+        # Under TP and SP every rank holds the whole (0.6B) head and decodes
+        # the frames from the gathered features.
+        self.dwd_norm_out = MiniMaxH3DWDNormOut(
+            arch.hidden_size, arch.time_embed_dim, arch.final_norm_eps
+        )
+        self.dwd_pixel_refiner = MiniMaxH3DWDPixelRefiner(
+            arch.hidden_size,
+            src_patch_size=tuple(config["pixel_patch_size"]),
+            first_frame_period=int(config["first_frame_period"]),
+            num_layers=int(refiner.get("num_layers", 8)),
+        )
+
+    def decode_dwd_pixels(
+        self, features: torch.Tensor, token_grid: tuple[int, int, int]
+    ) -> torch.Tensor:
+        """ImageNet-normalized frames (1, 3, F, H, W) from the last step's features."""
+        if self.dwd_pixel_refiner is None:
+            raise ValueError("this MiniMax H3 checkpoint has no DWD pixel head")
+        return self.dwd_pixel_refiner(features.unsqueeze(0), token_grid)
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
@@ -3796,6 +3870,24 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             ),
         )
         self.release_mps_non_layer_weights("final_layer")
+        dwd_features = None
+        if kwargs.get("return_dwd_features"):
+            if self.dwd_norm_out is None:
+                raise ValueError("this MiniMax H3 checkpoint has no DWD pixel head")
+            # full-width rows under TP; sequence-parallel ranks gather their
+            # row shards like the logits below
+            dwd_features = self.dwd_norm_out(hidden, adaln_input, block_inverse)
+            if sp_ws > 1:
+                from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                    get_sp_group,
+                )
+
+                dwd_features = get_sp_group().all_gather(dwd_features, dim=0)
+            dwd_features = dwd_features.index_select(0, infer_out_pos.to(device))
+            if not skip_mask_out_condition:
+                # condition rows have no frames to predict
+                live = update_mask.view(-1).to(device).bool()
+                dwd_features = dwd_features[live]
         if sp_ws > 1:
             from sglang.multimodal_gen.runtime.distributed.parallel_state import (
                 get_sp_group,
@@ -3837,6 +3929,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             update_audio_mask = kwargs.get("update_audio_mask")
             if update_audio_mask is not None:
                 audio_logits = audio_logits * update_audio_mask.view(-1).unsqueeze(-1)
+        if dwd_features is not None:
+            return video_logits, audio_logits, dwd_features
         return video_logits, audio_logits
 
 
