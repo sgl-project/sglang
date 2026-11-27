@@ -1553,11 +1553,7 @@ def build_unified_host_stack(
 
     format_tag = storage.storage_format_tag()
     if format_tag is not None:
-        # Keep the pool's own page format (e.g. HND) in the key.
-        owner_tag = host_pools[owner].storage_format_tag
-        host_pools[owner].storage_format_tag = "-".join(
-            tag for tag in (format_tag, owner_tag) if tag
-        )
+        host_pools[owner].storage_format_tag = format_tag
 
     host_pool_group = HostPoolGroup(entries)
     cache_controller = _build_cache_controller(
