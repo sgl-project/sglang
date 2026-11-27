@@ -13,9 +13,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.gemma4_detector import (
@@ -1214,6 +1216,19 @@ class TestBaseFormatDetector(unittest.TestCase):
             params["city"], "杭州", "Should correctly parse Chinese city name"
         )
 
+    def test_chunk_stops_when_a_step_resends_its_buffer(self):
+        # Several detectors' error paths send their whole buffer as text and
+        # keep it, so stepping again would send it again.
+        def resend(new_text, tools):
+            self.detector._buffer += new_text
+            return StreamingParseResult(normal_text=self.detector._buffer)
+
+        with patch.object(self.detector, "parse_streaming_increment", resend):
+            results = self.detector.parse_streaming_segments("<tool_call>{", self.tools)
+            # The stream's last delta may be empty.
+            results += self.detector.parse_streaming_segments("", self.tools)
+        self.assertEqual([r.normal_text for r in results], ["<tool_call>{", ""])
+
 
 class TestLlama32Detector(unittest.TestCase):
     def setUp(self):
@@ -1564,6 +1579,46 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         params2 = json.loads(tool_calls_parameters[1])
         self.assertEqual(params1["city"], "Shanghai")
         self.assertEqual(params2["city"], "Beijing")
+
+    def _assert_two_buffered_calls_stream_in_order(self, detector, text):
+        # Each step emits one name or one argument diff; step until one emits nothing.
+        calls = list(detector.parse_streaming_increment(text, self.tools).calls)
+        for _ in range(4):
+            step = detector.parse_streaming_increment("", self.tools).calls
+            if not step:
+                break
+            calls += step
+        names = [c.name for c in calls if c.name]
+        args = [json.loads(c.parameters) for c in calls if c.parameters]
+        indices = [c.tool_index for c in calls]
+
+        self.assertEqual(names, ["get_weather", "get_tourist_attractions"])
+        self.assertEqual(args, [{"city": "Paris"}, {"city": "Tokyo"}])
+        self.assertEqual(indices, [0, 0, 1, 1])
+
+    def test_parse_streaming_two_complete_calls_in_one_increment(self):
+        """Two complete calls in one increment stream in order, the first one included."""
+        self._assert_two_buffered_calls_stream_in_order(
+            self.detector,
+            "<｜tool▁calls▁begin｜>"
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
+            '```json\n{"city": "Paris"}\n```<｜tool▁call▁end｜>'
+            "\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_tourist_attractions\n"
+            '```json\n{"city": "Tokyo"}\n```<｜tool▁call▁end｜>'
+            "<｜tool▁calls▁end｜>",
+        )
+
+    def test_v31_parse_streaming_two_complete_calls_in_one_increment(self):
+        """The same for the V3.1 format, whose call has no type or code fence."""
+        self._assert_two_buffered_calls_stream_in_order(
+            DeepSeekV31Detector(),
+            "<｜tool▁calls▁begin｜>"
+            '<｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city": "Paris"}'
+            "<｜tool▁call▁end｜>"
+            "<｜tool▁call▁begin｜>get_tourist_attractions<｜tool▁sep｜>"
+            '{"city": "Tokyo"}<｜tool▁call▁end｜>'
+            "<｜tool▁calls▁end｜>",
+        )
 
 
 class TestDeepSeekV32Detector(unittest.TestCase):
@@ -4323,15 +4378,18 @@ class TestJsonArrayParser(unittest.TestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, "")
 
-    def test_finish_streams_arguments_of_calls_completed_in_final_chunk(self):
-        """Calls that arrive whole in the last chunk still stream their
-        arguments at stream end, exactly once."""
+    def test_chunk_streams_the_arguments_of_whole_calls_once(self):
+        """Calls that arrive whole in one chunk stream their arguments in that
+        chunk, and stream end sends nothing more."""
         text = (
             '[{"name": "get_weather", "parameters": {"location": "Tokyo"}}, '
             '{"name": "search", "parameters": {"query": "restaurants"}}]'
         )
-        calls = self.detector.parse_streaming_increment(text, self.tools).calls
-        calls += self.detector.finish(self.tools).calls
+        calls = [
+            call
+            for result in self.detector.parse_streaming_segments(text, self.tools)
+            for call in result.calls
+        ]
 
         streamed = {}
         for call in calls:
@@ -4761,6 +4819,27 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "search")
 
+    def test_streaming_tool_index_is_call_ordinal(self):
+        """Streamed calls are numbered in emission order. Two calls to one
+        tool must not share an index (a client would merge them), in JSON
+        form and across separate blocks."""
+        self.detector = Lfm2Detector()
+
+        json_block = (
+            '<|tool_call_start|>[{"name": "calculator", "arguments": '
+            '{"expression": "1+1"}}, {"name": "calculator", "arguments": '
+            '{"expression": "2+2"}}]<|tool_call_end|>'
+        )
+        result1 = self.detector.parse_streaming_increment(json_block, self.tools)
+        pythonic_block = '<|tool_call_start|>[search(query="hotels")]<|tool_call_end|>'
+        result2 = self.detector.parse_streaming_increment(pythonic_block, self.tools)
+
+        calls = result1.calls + result2.calls
+        self.assertEqual(
+            [call.name for call in calls], ["calculator", "calculator", "search"]
+        )
+        self.assertEqual([call.tool_index for call in calls], [0, 1, 2])
+
     # ==================== recovery tests (dropped-call regressions) ====================
 
     def test_multiline_string_argument_recovered(self):
@@ -5014,6 +5093,42 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(info.begin, "<|tool_call_start|>[get_weather(")
         self.assertEqual(info.end, ")]<|tool_call_end|>")
         self.assertEqual(info.trigger, "<|tool_call_start|>")
+
+
+class TestCohereCommand4Detector(unittest.TestCase):
+    def test_streaming_tool_index_is_call_ordinal(self):
+        """Streamed calls are numbered in emission order. Two calls to one
+        tool must not share an index (a client would merge them), and the
+        numbering continues across action blocks."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name=name, parameters={"type": "object", "properties": {}}
+                ),
+            )
+            for name in ("get_weather", "search", "calculator")
+        ]
+        detector = CohereCommand4Detector()
+
+        result1 = detector.parse_streaming_increment(
+            '<|START_ACTION|>[{"tool_call_id": "0", "tool_name": "calculator", '
+            '"parameters": {"expression": "1+1"}}, {"tool_call_id": "1", '
+            '"tool_name": "calculator", "parameters": {"expression": "2+2"}}]'
+            "<|END_ACTION|>",
+            tools,
+        )
+        result2 = detector.parse_streaming_increment(
+            '<|START_ACTION|>[{"tool_call_id": "2", "tool_name": "search", '
+            '"parameters": {"query": "hotels"}}]<|END_ACTION|>',
+            tools,
+        )
+
+        calls = result1.calls + result2.calls
+        self.assertEqual(
+            [call.name for call in calls], ["calculator", "calculator", "search"]
+        )
+        self.assertEqual([call.tool_index for call in calls], [0, 1, 2])
 
 
 class TestGigaChat3Detector(unittest.TestCase):
@@ -5810,6 +5925,13 @@ class TestQwen25Detector(unittest.TestCase):
         cities = [json.loads(result[i]["parameters"])["city"] for i in sorted(result)]
         self.assertEqual(cities, ["NYC", "LA"])
 
+    def test_finish_releases_held_back_end_token_prefix(self):
+        """Text held back as a possible end-token prefix is released at stream end."""
+        text = "Close the tag with </"
+        streamed = self.detector.parse_streaming_increment(text, self.tools).normal_text
+        streamed += self.detector.finish(self.tools).normal_text
+        self.assertEqual(streamed, text)
+
 
 class TestGemma4Detector(CustomTestCase):
     def setUp(self):
@@ -6512,6 +6634,52 @@ class TestMuseSparkFunctionCallParser(CustomTestCase):
                     ),
                     expected,
                 )
+
+
+class TestStreamChunkOrder(unittest.TestCase):
+    """Text and calls streamed in one chunk keep their generation order."""
+
+    def setUp(self):
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="get_weather",
+                parameters={
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            ),
+        )
+        self.parser = FunctionCallParser(tools=[tool], tool_call_parser="glm47")
+
+    @staticmethod
+    def _call(city):
+        return (
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+            f"<arg_value>{city}</arg_value></tool_call>"
+        )
+
+    def _segments(self, chunk):
+        """Each segment as (text, names, arguments)."""
+        return [
+            (
+                text,
+                [c.name for c in calls if c.name],
+                json.loads("".join(c.parameters for c in calls)) if calls else None,
+            )
+            for text, calls in self.parser.parse_stream_segments(chunk)
+        ]
+
+    def test_calls_split_by_text_all_come_in_their_chunk(self):
+        chunk = "Sure." + self._call("Paris") + " Mid " + self._call("Rome") + " End"
+        self.assertEqual(
+            self._segments(chunk),
+            [
+                ("Sure.", ["get_weather"], {"city": "Paris"}),
+                (" Mid ", ["get_weather"], {"city": "Rome"}),
+                (" End", [], None),
+            ],
+        )
 
 
 class TestToolCallParserNames(unittest.TestCase):

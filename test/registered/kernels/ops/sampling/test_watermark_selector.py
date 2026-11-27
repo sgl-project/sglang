@@ -15,9 +15,10 @@ from sglang.srt.sampling.watermarking.gumbel.algorithm import (
     select_watermark_tokens_torch,
 )
 from sglang.srt.sampling.watermarking.gumbel.state import WatermarkState
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=25, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 def test_hash_near_uint32_max_does_not_override_probability():

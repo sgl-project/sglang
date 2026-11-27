@@ -6,7 +6,6 @@ on:
       - "scripts/ci/**"
       - ".github/workflows/pr-test.yml"
       - ".github/workflows/pr-gate.yml"
-      - ".github/workflows/pr-gate-approve.yml"
       - ".github/workflows/ci-scripts-test.yml"
 
 permissions:
@@ -30,5 +29,4 @@ jobs:
 
       - name: Run tests
         run: |
-          python -m unittest discover -s scripts/ci/utils -p 'test_run_ci_approval.py' -v
           python -m unittest discover -s scripts/ci -p 'test_diffusion_rust_gate.py' -v

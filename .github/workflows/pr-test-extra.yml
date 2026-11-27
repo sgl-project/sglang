@@ -1,6 +1,6 @@
 name: PR Test Extra
-# Extra CI, opted into per PR: needs a run-ci approval of the head commit
-# (pr-gate-approve.yml) and the run-ci-nv-extra label. pr-gate.yml reads both from the API,
+# Extra CI, opted into per PR: needs run-ci, a run-ci approval of the head commit (unless
+# its author may approve), and the run-ci-nv-extra label. pr-gate.yml reads them from the API,
 # because an event payload does not refresh on rerun.
 #
 # Stages: extra-a (1-/2-gpu) and extra-b (4-/8-gpu) caller stubs reuse
@@ -11,8 +11,7 @@ on:
   # cancel the run in progress. Adding `run-ci-nv-extra` after a push takes a
   # rerun (/run-extra-ci nv, or a manual rerun), which the live label
   # gate in pr-gate.yml then passes.
-  # Workflow file from the base branch, never the PR. pr-gate-approve.yml also reruns this
-  # workflow's gated run when run-ci-nv-extra is on the PR.
+  # Workflow file from the base branch, never the PR.
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, 'release/**']
@@ -230,9 +229,7 @@ jobs:
     secrets: inherit
 
   # =============================================== aggregator ====================================================
-  # Mirrors pr-test.yml's `pr-test-finish` so notify-pr-states below only
-  # depends on one job rather than re-listing every stage. Fails if any
-  # dependent failed/cancelled.
+  # Mirrors pr-test.yml's `pr-test-finish`: fails if any dependent failed/cancelled.
   pr-test-extra-finish:
     needs:
       [
@@ -258,29 +255,3 @@ jobs:
             echo "::error::A dependent job failed or was cancelled."
             exit 1
           fi
-
-  # =============================================== notify pr-states ====================================================
-  # Dispatches pr-states.yml after every attempt (initial + every rerun).
-  # workflow_run.completed only fires on the initial completion (one
-  # workflow_run record across attempts), so we explicitly dispatch —
-  # workflow_dispatch is the only event GITHUB_TOKEN can cascade-create.
-  #
-  # Fork PRs included: a pull_request_target token is not forced read-only.
-  notify-pr-states:
-    needs: [pr-test-extra-finish]
-    if: |
-      always() &&
-      github.event_name == 'pull_request_target'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write # gh workflow run
-    steps:
-      - name: Dispatch pr-states refresh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          gh workflow run pr-states.yml \
-            --repo ${{ github.repository }} \
-            --ref main \
-            -f pr_number="$PR_NUMBER"

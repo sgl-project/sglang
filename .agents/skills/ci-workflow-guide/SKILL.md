@@ -23,8 +23,8 @@ The workflow files settle any disagreement with this guide. Counts that change w
 
 | Tier (stages) | Workflow | When it runs |
 |---------------|----------|--------------|
-| base (`base-a`, `base-b`, `base-c`) | `pr-test.yml` | Every PR with `run-ci` whose head commit carries a run-ci approval; on main twice daily (cron) |
-| extra (`extra-a`, `extra-b`) | `pr-test-extra.yml` | PRs with `run-ci`, a run-ci approval of the head commit, and `run-ci-nv-extra`; on main from `pr-test.yml`'s scheduled run (`call-pr-test-extra`) |
+| base (`base-a`, `base-b`, `base-c`) | `pr-test.yml` | Every PR with `run-ci` whose head commit carries a run-ci approval (not needed if its author can approve); on main twice daily (cron) |
+| extra (`extra-a`, `extra-b`) | `pr-test-extra.yml` | PRs with `run-ci`, a run-ci approval of the head commit (as in base), and `run-ci-nv-extra`; on main from `pr-test.yml`'s scheduled run (`call-pr-test-extra`) |
 | nightly (`nightly`) | `nightly-test-nvidia.yml` | Every two days, 14:00 UTC |
 | weekly (`weekly`) | `weekly-test-nvidia.yml` | Sunday 00:00 UTC |
 
@@ -48,7 +48,6 @@ The workflow files settle any disagreement with this guide. Counts that change w
 | `python/sglang/test/ci/ci_register.py` | Test registration (AST-parsed markers), LPT auto-partition |
 | `python/sglang/test/ci/ci_utils.py` | `run_unittest_files()`: execution, retry, continue-on-error |
 | `.github/workflows/pr-gate.yml` | PR gating: draft check, `run-ci` label (with `approval-mode: commit`, also a run-ci approval of the head commit), per-user rate limiting |
-| `.github/workflows/pr-gate-approve.yml` | Adding `run-ci` approves the head commit for `pr-test.yml` and `pr-test-extra.yml` and reruns their gated runs (`scripts/ci/utils/run_ci_approval.py`) |
 | `.github/actions/check-pr-test-health/action.yml` | Cross-job fail-fast: queries API for any failed job |
 | `.github/actions/wait-for-jobs/action.yml` | Stage gating: polls API until stage jobs complete |
 | `.github/scripts/ci-labels.cjs` | Resolves the CI control labels into dispatch axes |
@@ -237,10 +236,10 @@ Base CI covers only the core default paths; tests in the extra, nightly, and wee
 
 ### Opt-in CI tiers
 
-An opt-in tier is a set of workflows a PR enters by carrying `run-ci-<tier>` on top of `run-ci`. NVIDIA and AMD have a Base selection (`nv`, `amd`, no label) and an Extra tier (`nv-extra` selects `pr-test-extra.yml`, `amd-extra` selects `pr-test-amd-extra.yml`). Every other hardware has only an Extra tier, `<hw>-extra` selecting `pr-test-<hw>.yml` (`xeon`, `npu`, `xpu`, `musa`, `arm64`, `mlx`, `mlu`, `ppu`). Each tier is one entry in `scripts/ci/opt_in_ci_tiers.json`; the slash handler reads it for the hardware arguments of `/run-ci`, `/run-extra-ci`, `/run-full-ci`, `/tag-run-ci-label` and `/tag-and-rerun-ci`, so adding a tier needs no handler change. A tier's workflows follow one convention, enforced by `scripts/lint/check_opt_in_ci_tiers.py` (pre-commit):
+An opt-in tier is a set of workflows a PR enters by carrying `run-ci-<tier>` on top of `run-ci`. NVIDIA and AMD have a Base selection (`nv`, `amd`, no label) and an Extra tier (`nv-extra` selects `pr-test-extra.yml`, `amd-extra` selects `pr-test-amd-extra.yml`). Every other hardware has only an Extra tier, `<hw>-extra` selecting `pr-test-<hw>.yml` (`xeon`, `npu`, `xpu`, `musa`, `arm64`, `mlx`, `mlu`, `ppu`). Each tier is one entry in `scripts/ci/opt_in_ci_tiers.json`; the slash handler reads it for the hardware arguments of `/run-ci`, `/run-extra-ci`, `/run-full-ci` and `/tag-and-rerun-ci`, so adding a tier needs no handler change. A tier's workflows follow one convention, enforced by `scripts/lint/check_opt_in_ci_tiers.py` (pre-commit):
 
 1. **Gate through `pr-gate.yml` with `require-label: run-ci-<tier>`, and skip every job that needs the gate when `needs.<gate>.outputs.opted-in == 'false'`.** The gate live-fetches labels; a missing opt-in passes the gate with `opted-in=false`, so the run is green with its tests skipped, and a full rerun after labeling runs them (`/run-extra-ci <hw>` reruns green runs). Keep this decision out of event-payload expressions, which do not refresh on rerun. A draft PR, a missing `run-ci`, or (`pr-test.yml`, `pr-test-extra.yml`) a head commit with no approval skips the same way in every workflow that uses the gate, so every job that needs the gate checks `opted-in`, finish jobs included, and a skipped run shows no passing check; only `pr-test-finish`, the required check, runs and fails then. The lint below enforces it.
-2. **No `labeled` trigger.** GitHub's rerun API reuses the original event payload, so a run started by an unrelated label event and skipped by an `if` on that payload stays skipped on rerun, and a label event joins the run's concurrency group and cancels the run in progress. Adding a label after a push takes a rerun instead (`/run-extra-ci <hw>`); for `run-ci` on `pr-test.yml` and `pr-test-extra.yml`, `pr-gate-approve.yml` does that rerun.
+2. **No `labeled` trigger.** GitHub's rerun API reuses the original event payload, so a run started by an unrelated label event and skipped by an `if` on that payload stays skipped on rerun, and a label event joins the run's concurrency group and cancels the run in progress. Adding a label after a push takes a rerun instead (`/run-extra-ci <hw>`); for `run-ci` on `pr-test.yml` and `pr-test-extra.yml`, the approving slash command does that rerun.
 3. **Every directly selectable workflow that accepts the label is listed in the tier**, so `/run-extra-ci <hw>` re-runs all of them. Reusable jobs chained from a listed workflow stay part of that run.
 
 The tier name `extra` is reserved: a tier name is also a slash-command hardware argument, and the bare `extra` argument is rejected as the retired shared tier.

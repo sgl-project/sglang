@@ -95,6 +95,9 @@ class TestDFlashPrefillBarrier(unittest.TestCase):
             raise _Stop
 
         worker = SimpleNamespace(
+            _hosts_draft=True,
+            _join_aux=lambda: None,
+            _note_non_decode_step=lambda: None,
             _validate_phase1_sampling_support=lambda batch: None,
             _wait_for_fused_hicache_load=lambda batch: None,
             target_worker=SimpleNamespace(forward_batch_generation=target_forward),

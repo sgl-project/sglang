@@ -20,6 +20,44 @@ Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installa
 
 <Deployment config={config} />
 
+### Optional: Prompt rewriter
+
+Rather than writing the JSON by hand, use the rewriter the model was released with. It runs in two turns: expand the free-text prompt into a detailed caption on the base VLM, then map that caption to JSON with the rewriter LoRA enabled. The weights are `Qwen/Qwen3.6-27B` plus `robbyant/lingbot-video-rewriter-lora`, a second model rather than part of the checkpoint.
+
+The rewriter has no CLI flags, so configure it in a config file:
+
+```bash Command
+cat > /tmp/lingbot_rewriter.json <<'EOF'
+{
+  "model_path": "robbyant/lingbot-video-moe-30b-a3b",
+  "prompt": "A red fox trots across fresh snow in a pine forest.",
+  "num_frames": 81,
+  "rewriter_model_path": "Qwen/Qwen3.6-27B",
+  "rewriter_adapter_path": "<path to lingbot-video-rewriter-lora>"
+}
+EOF
+
+sglang generate --config /tmp/lingbot_rewriter.json --save-output
+```
+
+This loads the VLM in the diffusion process and switches the adapter between turns, which is what the reference implementation does. It holds roughly 54 GB in bf16 on top of the DiT and has no offload path. `rewriter_device_map` defaults to `"auto"`, which spreads it over every visible GPU; to keep it off the DiT GPUs, point it at GPUs of its own or use the served option below. An under-provisioned VLM degrades quietly rather than failing.
+
+To serve the rewriter separately instead, launch it on its own port, for example `--port 30001`, set `rewriter_url` to it, and name a model per turn:
+
+```json Example
+{
+  "rewriter_url": "http://127.0.0.1:30001",
+  "rewriter_expand_model": "Qwen/Qwen3.6-27B",
+  "rewriter_map_model": "lingbot-rewriter"
+}
+```
+
+The mapping turn needs the adapter applied. `--lora-paths` does not accept this adapter: `Qwen/Qwen3.6-27B` is a `qwen3_5`-architecture checkpoint whose attention projections SGLang loads fused, while the adapter targets them unfused through a regex. So serve a checkpoint with the adapter already merged in, as its own endpoint via `rewriter_map_url` when one server cannot hold both.
+
+Prompts that already start with `{` are passed through untouched. If the mapping turn returns nothing parseable the request fails rather than falling back to the free-text prompt, which the DiT would render as a broken video. Setting `rewriter_model_path` without `rewriter_adapter_path` is rejected at startup, since the mapping turn would otherwise silently run base weights. Leaving both `rewriter_url` and `rewriter_model_path` unset, the default, skips the stage.
+
+Set `"rewriter_auto_negative": true` to also prune the negative prompt per request, which requires one of the two backends above. The shipped negative is deliberately over-complete and self-contradictory, so terms this caption legitimately wants push the sample away from the request. The rewriter deletes those terms and keeps the rest verbatim; a few, such as `underexposed` for a night scene and `motion blur` for a long exposure, are also deleted by rule afterwards because the model tends to leave them in. Because a merged request carries one negative prompt for several captions, enabling this turns dynamic batching off for the server.
+
 <a id="1-model-introduction" />
 
 ## 2. Model capabilities
