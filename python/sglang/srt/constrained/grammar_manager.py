@@ -60,6 +60,13 @@ class GrammarManager:
         self.grammar_sync_size = scheduler.dp_tp_group.world_size
         self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
         self.is_grammar_sync_entry = scheduler.dp_tp_group.is_first_rank
+        # With attention DP, dp_tp_group excludes CP peers of the same batch.
+        # Reuse their existing CPU group to keep grammar admission in lockstep.
+        self.grammar_sync_cp_group = (
+            scheduler.attn_cp_group
+            if get_parallel().attn_dp_enabled and get_parallel().attn_cp_size > 1
+            else None
+        )
         self.pp_rank = get_parallel().pp_rank
         self.pp_size = get_parallel().pp_size
         self.pp_group = scheduler.pp_group
@@ -277,21 +284,31 @@ class GrammarManager:
                         # The actual waiting time is SGLANG_GRAMMAR_MAX_POLL_ITERATIONS * max(SGLANG_GRAMMAR_POLL_INTERVAL, GPU_forward_batch_latency)
                         failed_req_idxs.add(i)
 
-            # Sync ready and failed requests across all TP ranks in PP0.
-            if self.grammar_sync_size == 1:
-                synced_ready_req_idxs = ready_req_idxs
-                synced_failed_req_idxs = failed_req_idxs
-            else:
-                all_gather_output = [None] * self.grammar_sync_size
+            # Sync along TP, then CP: their Cartesian product is one DP batch.
+            sync_groups = [(self.grammar_sync_group, self.grammar_sync_size)]
+            if self.grammar_sync_cp_group is not None:
+                sync_groups.append(
+                    (
+                        self.grammar_sync_cp_group.cpu_group,
+                        self.grammar_sync_cp_group.world_size,
+                    )
+                )
+            synced_ready_req_idxs = ready_req_idxs
+            synced_failed_req_idxs = failed_req_idxs
+            for sync_group, sync_size in sync_groups:
+                if sync_size == 1:
+                    continue
+                all_gather_output = [None] * sync_size
                 torch.distributed.all_gather_object(
                     all_gather_output,
-                    (ready_req_idxs, failed_req_idxs),
-                    group=self.grammar_sync_group,
+                    (synced_ready_req_idxs, synced_failed_req_idxs),
+                    group=sync_group,
                 )
                 synced_ready_req_idxs = set.intersection(
                     *[x[0] for x in all_gather_output]
                 )
                 synced_failed_req_idxs = set.union(*[x[1] for x in all_gather_output])
+                synced_ready_req_idxs -= synced_failed_req_idxs
         else:
             synced_ready_req_idxs = ready_req_idxs
             synced_failed_req_idxs = failed_req_idxs
@@ -307,7 +324,7 @@ class GrammarManager:
 
         # Return ready requests
         return_reqs: List[Req] = []
-        for i in synced_ready_req_idxs:
+        for i in sorted(synced_ready_req_idxs):
             req = grammar_queue[i]
             return_reqs.append(req)
             if req.finished() or req.grammar is None:  # It is aborted by AbortReq
@@ -329,7 +346,7 @@ class GrammarManager:
                 req.set_finish_with_abort(error_msg)
 
         # Return failed requests
-        for i in synced_failed_req_idxs:
+        for i in sorted(synced_failed_req_idxs):
             req = grammar_queue[i]
             return_reqs.append(req)
 
