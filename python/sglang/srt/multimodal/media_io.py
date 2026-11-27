@@ -24,6 +24,7 @@ import stat
 import threading
 import time
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from functools import lru_cache
 from io import BytesIO
 from typing import BinaryIO, Dict, Optional, Sequence, Union
@@ -53,6 +54,7 @@ _mm_http_session = threading.local()
 
 
 _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB = 64
+_MAX_MEDIA_URL_GLOB_STARS = 3
 
 
 _MAX_MEDIA_URL_REDIRECTS = 5
@@ -80,7 +82,7 @@ def _normalize_media_domain(domain: str) -> str:
     domain = domain.strip().rstrip(".")
     if not domain:
         raise ValueError("allowed media domains cannot be empty")
-    if "://" in domain or any(char in domain for char in "/?#@"):
+    if "://" in domain or any(char in domain for char in "/#@"):
         raise ValueError(
             f"Invalid allowed media domain {domain!r}: provide a hostname only"
         )
@@ -126,6 +128,12 @@ def configure_media_url_security(
     normalized_domains = sorted(
         {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
     )
+    for domain in normalized_domains:
+        if domain.count("*") > _MAX_MEDIA_URL_GLOB_STARS:
+            raise ValueError(
+                f"Invalid allowed media domain {domain!r}: at most "
+                f"{_MAX_MEDIA_URL_GLOB_STARS} '*' per entry"
+            )
     global _allowed_media_domains, _media_url_max_file_size_bytes
     global _media_url_timeout, _allow_local_media_files
     _allowed_media_domains = frozenset(normalized_domains)
@@ -151,7 +159,10 @@ def _assert_media_url_allowed(url: str) -> None:
         raise ValueError(f"Invalid media URL: {url!r}")
 
     hostname = _normalize_media_domain(parsed.hostname)
-    if _allowed_media_domains and hostname not in _allowed_media_domains:
+    if _allowed_media_domains and not (
+        hostname in _allowed_media_domains
+        or any(fnmatchcase(hostname, g) for g in _allowed_media_domains)
+    ):
         raise ValueError(
             "Media URL domain is not allowed. "
             f"Allowed domains: {sorted(_allowed_media_domains)}; "

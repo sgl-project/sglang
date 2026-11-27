@@ -101,8 +101,9 @@ class Mm(msgspec.Struct):
     allowed_media_domains: A[
         List[str],
         "Restrict client-supplied HTTP(S) image, video, and audio URLs to these "
-        "exact hostnames. Redirect destinations are checked against the same "
-        "allowlist. When unset, remote media from any domain is allowed.",
+        "hostnames. Entries support glob matching (fnmatch), with at most "
+        "three '*' per entry. Redirect destinations are checked against the "
+        "same allowlist. When unset, remote media from any domain is allowed.",
     ] = msgspec.field(default_factory=list)
     media_url_max_file_size_mb: A[
         int,
