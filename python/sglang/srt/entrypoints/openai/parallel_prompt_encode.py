@@ -103,6 +103,10 @@ _INTRA_CUT = re.compile(r"(?<=[A-Za-z])(?= [A-Za-z])|(?<=\n)(?=[A-Za-z])")
 
 _plans = weakref.WeakKeyDictionary()
 _segment_encoders = weakref.WeakKeyDictionary()
+# One build per tokenizer: the first long prompts of a burst arrive together,
+# and the build (parsing the backend, copying it) takes up to about a second.
+_build_lock = threading.RLock()
+_MISSING = object()
 # None: not yet checked; False: encode_batch consumed only one CPU (rayon
 # disabled, e.g. after a fork). The PID prevents inheriting the parent's result.
 _parallel_pid = os.getpid()
@@ -236,8 +240,10 @@ def _plan_for(tokenizer):
         pass
     except TypeError:
         return _build_plan(tokenizer)
-    plan = _build_plan(tokenizer)
-    _plans[tokenizer] = plan
+    with _build_lock:
+        plan = _plans.get(tokenizer, _MISSING)
+        if plan is _MISSING:
+            plan = _plans[tokenizer] = _build_plan(tokenizer)
     return plan
 
 
@@ -501,9 +507,13 @@ def _segment_encoder_for(tokenizer):
         pass
     except TypeError:
         return None
-    plan = _plan_for(tokenizer)
-    encoder = None if plan is None else _SegmentEncoder(plan)
-    _segment_encoders[tokenizer] = encoder
+    # One encoder per tokenizer, or requests would split its cache.
+    with _build_lock:
+        encoder = _segment_encoders.get(tokenizer, _MISSING)
+        if encoder is _MISSING:
+            plan = _plan_for(tokenizer)
+            encoder = None if plan is None else _SegmentEncoder(plan)
+            _segment_encoders[tokenizer] = encoder
     return encoder
 
 

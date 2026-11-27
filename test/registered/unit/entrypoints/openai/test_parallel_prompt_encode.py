@@ -757,6 +757,44 @@ class TestPromptSegments(_EncodeCase):
         thread.start()
         return thread
 
+    def test_concurrent_first_prompts_build_one_plan_and_encoder(self):
+        """The first long prompts of a burst arrive together: one of them
+        builds the plan (it copies the backend) while the others wait for it,
+        and all of them share one encoder and so one cache."""
+        tokenizer = _tokenizer()
+        build = ppe._build_plan
+        entered, proceed = threading.Event(), threading.Event()
+        self.addCleanup(proceed.set)
+        calls = []
+
+        def held_build(tok):
+            calls.append(tok)
+            if len(calls) == 1:
+                entered.set()
+                self.assertTrue(proceed.wait(10))
+            return build(tok)
+
+        encoders = []
+
+        def run():
+            encoders.append(ppe._segment_encoder_for(tokenizer))
+
+        with unittest.mock.patch.object(ppe, "_build_plan", side_effect=held_build):
+            first = threading.Thread(target=run)
+            first.start()
+            self.assertTrue(entered.wait(10))
+            second = threading.Thread(target=run)
+            second.start()
+            # Without the lock the second request builds its own plan now.
+            second.join(1)
+            proceed.set()
+            first.join(10)
+            second.join(10)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(encoders), 2)
+        self.assertIsNotNone(encoders[0])
+        self.assertIs(encoders[0], encoders[1])
+
     def test_distinct_long_texts_encode_concurrently(self):
         """A long text being encoded must not hold off the encode of a different
         long text: cold prompts of distinct conversations encode in parallel."""
