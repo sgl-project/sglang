@@ -107,6 +107,10 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     # Set when this rank scores only its share of the dense rows; backends
     # without a sharded path ignore it and score every row.
     row_shard: Optional[RowShard] = None
+    # Dense, request-grouped query rows ending at each request's sequence length:
+    # (request pool slot, query row count, sequence length). Absent for CP or
+    # other row layouts whose newest local position differs from the full length.
+    request_layout_cpu: Optional[List[tuple[int, int, int]]] = None
 
     def reset_outputs(self) -> None:
         self.out_raw_indices.fill_(-1)

@@ -55,6 +55,12 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
+    def test_pp_consumer_collects_remote_source(self):
+        sources = deepseek_v4_memory_pool.collect_sources_by_ratio(
+            [0, 0] + [2] * 18 + [1] * 20, [2, 8, 14, 20], range(9, 27)
+        )
+        self.assertEqual(sources, {1: [20], 2: [8, 14]})
+
     def test_checkpoint_pages_alias_complete_rings_and_exclude_trailing_rows(self):
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
             with self.subTest(dtype=dtype):
@@ -443,6 +449,33 @@ class TestV41KVPoolLayouts(CustomTestCase):
             )
             self.assertEqual(view.stride(1), bpt)
             self.assertEqual(view.stride(0), pool.bytes_per_page_padded)
+
+    def test_pp_source_pages_remap_kv_and_indexer(self):
+        producer = self.make_pool([0, 2, 2, 2], [1], KVLayout.V41, end_layer=2)
+        consumer = self.make_pool([0, 2, 2, 2], [1], KVLayout.V41, start_layer=2)
+        buffers = [producer.kv_pools[2].kv_buffer[0]]
+        buffers += producer.index_pools[2].contiguous_page_row_buffers()
+        for buffer in buffers:
+            buffer.fill_(7)
+        payload = producer.export_source_pages(1, torch.tensor([1]))
+        consumer.install_source_pages(1, torch.tensor([2]), payload)
+        copied = consumer.export_source_pages(1, torch.tensor([2]))
+        self.assertEqual(payload.keys(), copied.keys())
+        for name in payload:
+            torch.testing.assert_close(payload[name], copied[name], rtol=0, atol=0)
+
+    def test_pp_transfer_manifests_exclude_source_replicas(self):
+        for start, end, kv_ids, request_ids in (
+            (0, 2, [1, 1], [1]),
+            (2, 4, [], []),
+        ):
+            pool = self.make_pool(
+                [0, 2, 2, 2], [1], KVLayout.V41, start_layer=start, end_layer=end
+            )
+            self.assertEqual(pool.get_kv_layer_ids(), kv_ids)
+            self.assertEqual(len(pool.get_contiguous_buf_infos()[0]), len(kv_ids))
+            self.assertEqual(pool.get_state_layer_ids(), list(range(start, end)))
+            self.assertEqual(pool.get_request_state_layer_ids(), request_ids)
 
     def test_root_inventory_keeps_pp_owners_and_excludes_empty_groups(self):
         pool = self.make_pool(

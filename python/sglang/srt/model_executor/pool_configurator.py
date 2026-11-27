@@ -1191,6 +1191,12 @@ def compute_swa_request_cap(
         )
     else:
         chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
+        if get_parallel().pp_size > 1:
+            # PP retains every microbatch's SWA chunk until its output returns
+            # from the final stage, even with overlap scheduling disabled.
+            chunks_in_flight = (
+                get_parallel().pp_size + get_parallel().pp_async_batch_depth
+            )
         return (
             per_request * num_reqs
             + chunks_in_flight * get_schedule().chunked_prefill_size

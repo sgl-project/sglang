@@ -87,6 +87,11 @@ def should_run_flashinfer_autotune(
         # Sharded P pools only implement logical-page extend; warm them through
         # real extend batches until the dummy owns a rotation-aware allocation.
         return False
+    if (
+        get_parallel().pp_size > 1
+        and getattr(mr.model_config.hf_config, "model_type", None) == "deepseek_v41"
+    ):
+        return False
     if get_exec().kernel.disable_flashinfer_autotune:
         return False
     if get_exec().deterministic.enable_deterministic_inference:
