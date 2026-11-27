@@ -423,6 +423,7 @@ jobs:
       && needs.call-gate.outputs.opted-in != 'false'
     uses: ./.github/workflows/pr-test-multimodal-gen.yml
     with:
+      model_scoped_pr: ${{ github.event_name == 'pull_request_target' && github.base_ref == 'main' && !inputs.git_ref && !inputs.run_all_tests }}
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
       multimodal_gen_server: ${{ needs.check-changes.outputs.multimodal_gen_server }}

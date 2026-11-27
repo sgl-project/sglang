@@ -303,7 +303,7 @@ class DiffusionSamplingParams:
 
     # inputs and conditioning
     prompt: str | None = None  # text prompt for generation
-    image_path: Path | str | None = None  # input image/video for editing (Path or URL)
+    image_path: Path | str | list[Path | str] | None = None  # local paths or URLs
 
     # duration
     seconds: int = 1  # for video: duration in seconds
@@ -331,6 +331,7 @@ class DiffusionSamplingParams:
     # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
     # merged directly into the OpenAI extra_body dict.
     extras: dict = field(default_factory=dict)
+    expect_rgba_layers: bool = False
 
 
 @dataclass(frozen=True)
@@ -856,6 +857,7 @@ MULTI_FRAME_I2I_sampling_params = DiffusionSamplingParams(
     num_frames=4,
     direct_url_test=True,
     output_format="png",
+    expect_rgba_layers=True,
 )
 
 T2V_PROMPT = "A curious raccoon"
