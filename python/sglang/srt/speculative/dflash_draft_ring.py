@@ -78,7 +78,10 @@ def draft_kv_ring_unsupported_reason(
 ) -> Optional[str]:
     """Why a ring cannot serve this draft, or None. Loads the draft config only
     once the launch flags allow a ring."""
-    if disaggregation_mode != "null" and disaggregation_transfer_backend != "mooncake":
+    if disaggregation_mode != "null" and disaggregation_transfer_backend not in (
+        "mooncake",
+        "nixl",
+    ):
         return (
             f"the {disaggregation_transfer_backend} PD transfer backend does not "
             "send the ring"

@@ -86,17 +86,29 @@ class TestResolveDraftKVRing(CustomTestCase):
                 args = _args(speculative_draft_attention_backend=backend)
                 self.assertTrue(self._resolve(args))
 
-    def test_on_under_pd_over_mooncake(self):
+    def test_on_under_pd(self):
+        for backend in ("mooncake", "nixl"):
+            with self.subTest(backend=backend), _switch():
+                args = _args(
+                    disaggregation_mode="decode",
+                    disaggregation_transfer_backend=backend,
+                )
+                self.assertTrue(self._resolve(args))
+
+    def test_nixl_checksum_is_rejected_without_loading_the_draft(self):
+        """The target checksum cannot attest to the separately addressed ring."""
         with _switch():
             args = _args(
-                disaggregation_mode="decode", disaggregation_transfer_backend="mooncake"
+                disaggregation_mode="decode",
+                disaggregation_transfer_backend="nixl",
+                disaggregation_enable_kv_checksum=True,
             )
-            self.assertTrue(self._resolve(args))
+            self._assert_rejected(args, draft_cfg=None)
 
     def test_rejected_by_launch_flags_without_loading_the_draft(self):
         cases = {
-            "prefill over nixl": _args(
-                disaggregation_mode="prefill", disaggregation_transfer_backend="nixl"
+            "prefill over mori": _args(
+                disaggregation_mode="prefill", disaggregation_transfer_backend="mori"
             ),
             "decode host receive": _args(
                 disaggregation_mode="decode",
@@ -159,6 +171,16 @@ class TestResolveMHADraftKVRing(CustomTestCase):
             "trtllm_mha": _mha_args(),
             "fa3": _mha_args(speculative_draft_attention_backend="fa3"),
             "fa4": _mha_args(speculative_draft_attention_backend="fa4"),
+            "fa3 prefill over nixl": _mha_args(
+                speculative_draft_attention_backend="fa3",
+                disaggregation_mode="prefill",
+                disaggregation_transfer_backend="nixl",
+            ),
+            "fa3 decode over nixl": _mha_args(
+                speculative_draft_attention_backend="fa3",
+                disaggregation_mode="decode",
+                disaggregation_transfer_backend="nixl",
+            ),
             "pd prefill over mooncake": _mha_args(
                 disaggregation_mode="prefill",
                 disaggregation_transfer_backend="mooncake",
