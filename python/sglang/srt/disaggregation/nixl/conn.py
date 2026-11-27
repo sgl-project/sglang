@@ -1543,8 +1543,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             # Disagreeing cell sizes mean the peers did not build the same KV geometry;
             # writing anyway would silently corrupt the peer's pool.
             raise RuntimeError(
-                "PP-heterogeneous MLA transfer: decode KV cell geometry differs from "
-                f"prefill over layers [{start}, {end}): prefill item_lens="
+                "MLA layer-offset transfer (PP or DSA cache layer split): decode KV "
+                f"cell geometry differs from prefill over layers [{start}, {end}): "
+                f"prefill item_lens="
                 f"{src_item_lens}, decode item_lens={dst_item_lens}"
             )
         return indices
