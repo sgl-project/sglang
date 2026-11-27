@@ -3,9 +3,10 @@
 import unittest
 
 import numpy as np
-
 from sglang.test.ascend import test_npu_rl_weights as weights
-from sglang.test.ascend.npu_rl_routed_experts import (
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
+from test_npu_return_routed_experts import (
     ATTN_DP_SIZE,
     CASE,
     LONG_PROMPT,
@@ -13,8 +14,6 @@ from sglang.test.ascend.npu_rl_routed_experts import (
     generate,
     seqlen,
 )
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=600, suite="extra-b-test-4-npu-a3")
 register_npu_ci(est_time=600, suite="nightly-test-4-npu-a3", nightly=True)
