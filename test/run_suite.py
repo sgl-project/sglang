@@ -1,10 +1,8 @@
 import argparse
-import glob
-import json
 import math
 import os
 import sys
-from typing import Dict, List, Optional
+from typing import List
 
 import tabulate
 
@@ -13,6 +11,9 @@ from sglang.test.ci.ci_register import (
     HWBackend,
     auto_partition,
     collect_tests,
+    filter_tests,
+    load_live_est,
+    registered_test_files,
 )
 from sglang.test.ci.ci_utils import run_unittest_files
 
@@ -29,33 +30,29 @@ HW_MAPPING = {
     "mlu": HWBackend.MLU,
 }
 
-# Per-commit test suites (run on every PR).
-# Includes both base-a/b/c (always-on; pr-test.yml) and extra-a/b
-# (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
-# pr-test-extra.yml's `run-ci-nv-extra` PR label decides whether extra-* dispatches.
+# Per-commit test suites. On a PR, NVIDIA and AMD base suites run with `run-ci`;
+# their extra-* suites and every other hardware's suites also need that
+# hardware's `run-ci-<hw>-extra` label (scripts/ci/opt_in_ci_tiers.json).
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
-        "stage-a-test-cpu-intel",
-        "stage-a-tp-test-cpu-intel",
-        "stage-b-test-cpu-intel",
         "extra-test-cpu-intel",
-        "base-b-test-cpu-arm64",
+        "extra-tp-test-cpu-intel",
+        "extra-test-cpu-arm64",
     ],
     HWBackend.AMD: [
-        "stage-a-test-1-gpu-small-amd",
-        "stage-b-test-1-gpu-small-amd",
-        "stage-b-test-1-gpu-small-amd-nondeterministic",
-        "stage-b-test-1-gpu-small-amd-mi35x",
-        "stage-b-test-large-8-gpu-mi35x-disaggregation-amd",
-        "stage-b-test-1-gpu-large-amd",
-        "stage-b-test-2-gpu-large-amd",
-        "jit-kernel-unit-test-amd",
-        "jit-kernel-benchmark-test-amd",
-        "sgl-kernel-unit-test-2-gpu-amd",
-        "stage-c-test-4-gpu-amd",
-        "stage-c-test-large-8-gpu-amd",
-        "stage-c-test-large-8-gpu-amd-mi35x",
+        "base-a-test-1-gpu-small-amd",
+        "base-b-test-1-gpu-small-amd",
+        "base-b-test-1-gpu-small-amd-mi35x",
+        "base-b-disaggregation-test-large-8-gpu-amd-mi35x",
+        "base-b-test-1-gpu-large-amd",
+        "base-b-test-2-gpu-large-amd",
+        "base-a-jit-kernel-unit-test-amd",
+        "base-a-jit-kernel-benchmark-test-amd",
+        "base-a-sgl-kernel-unit-test-2-gpu-amd",
+        "base-c-test-4-gpu-amd",
+        "base-c-test-large-8-gpu-amd",
+        "base-c-test-large-8-gpu-amd-mi35x",
         # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
         # (mirror of CUDA extra-a; tests stay tagged per-commit but only
         # dispatch when the PR carries the `run-ci-amd-extra` label). 1-gpu-small
@@ -69,7 +66,7 @@ PER_COMMIT_SUITES = {
         # below the gsm8k floor on the topk=3 leg) and stay CUDA-only for now.
         # Tests that pass on ROCm but sit in CUDA's extra tier (basic_perf,
         # torch.compile, LoRA/RL weight updates, ...) are registered here too
-        # rather than in the always-on stage-b/c suites.
+        # rather than in the always-on base-b/c suites.
         "extra-a-test-1-gpu-small-amd",
         "extra-a-test-1-gpu-large-amd",
         "extra-a-test-2-gpu-large-amd",
@@ -88,15 +85,15 @@ PER_COMMIT_SUITES = {
         "base-b-kernel-unit-test-4-gpu-b200",
         "base-b-kernel-benchmark-test-1-gpu-small",
         "base-b-kernel-benchmark-test-1-gpu-large",
+        "base-b-kernel-benchmark-test-1-gpu-b200",
         # Diffusion keeps case-level pytest partitioning behind registered
         # bridge files while sharing this discovery and dispatch entry point.
-        "base-b-test-diffusion-1-gpu-h100",
-        "base-b-test-diffusion-1-gpu-5090",
-        "base-b-test-diffusion-1-gpu-b200",
-        "base-b-test-diffusion-2-gpu-h100",
-        "base-b-test-diffusion-bcg-1-gpu-h100",
-        "base-b-test-diffusion-component-2-gpu-h100",
-        "base-b-test-diffusion-unit-1-gpu-h100",
+        "base-b-diffusion-test-1-gpu-large",
+        "base-b-diffusion-test-1-gpu-small",
+        "base-b-diffusion-test-4-gpu-b200",
+        "base-b-diffusion-test-2-gpu-large",
+        "base-b-diffusion-unit-test-1-gpu-large",
+        "base-b-diffusion-unit-test-1-gpu-b300",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
         "base-c-test-2-gpu-gb300",
@@ -116,36 +113,35 @@ PER_COMMIT_SUITES = {
         "extra-b-test-4-gpu-gb300",
     ],
     HWBackend.NPU: [
-        "base-a-test-npu",
-        "base-b-test-1-npu-a3",
-        "base-b-test-2-npu-a3",
-        "base-b-test-4-npu-a3",
-        "base-b-test-8-npu-a3",
-        "base-b-test-16-npu-a3",
-        "base-c-test-acc-2-npu-a3",
-        "base-c-test-acc-16-npu-a3",
-        "base-c-test-perf-2-npu-a3",
-        "base-c-test-perf-16-npu-a3",
+        "extra-a-test-npu",
+        "extra-b-test-1-npu-a3",
+        "extra-b-test-2-npu-a3",
+        "extra-b-test-4-npu-a3",
+        "extra-b-test-8-npu-a3",
+        "extra-b-test-16-npu-a3",
+        "extra-c-acc-test-2-npu-a3",
+        "extra-c-acc-test-16-npu-a3",
+        "extra-c-perf-test-2-npu-a3",
+        "extra-c-perf-test-16-npu-a3",
     ],
     HWBackend.XPU: [
-        "stage-a-test-1-gpu-xpu",
-        "stage-b-test-1-gpu-xpu",
+        "extra-test-1-gpu-xpu",
     ],
     HWBackend.MLX: [
-        "stage-a-unit-test-mlx",
-        "stage-b-e2e-mlx",
+        "extra-unit-test-mlx",
+        "extra-e2e-test-mlx",
     ],
     HWBackend.MPS: [
-        "stage-a-unit-test-mps",
-        # stage-b needs a self-hosted Apple Silicon runner; dispatched manually.
-        "stage-b-e2e-mps",
+        "extra-unit-test-mps",
+        # extra-e2e needs a self-hosted Apple Silicon runner; dispatched manually.
+        "extra-e2e-test-mps",
     ],
     HWBackend.PPU: [
-        "stage-a-test-1-gpu-ppu",
+        "extra-test-1-gpu-ppu",
     ],
     HWBackend.MLU: [
-        "pr-test-1-mlu",
-        "pr-test-2-mlu",
+        "extra-test-1-mlu",
+        "extra-test-2-mlu",
     ],
 }
 
@@ -166,66 +162,65 @@ NIGHTLY_SUITES = {
         "nightly-test-8-gpu-b300",
     ],
     HWBackend.AMD: [
-        "nightly-amd",
-        "nightly-amd-1-gpu",
-        "nightly-amd-kernel-1-gpu",
-        "nightly-amd-1-gpu-mi35x",
-        "nightly-amd-1-gpu-zimage-turbo",
-        "nightly-amd-2-gpu",
-        "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
-        "nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
-        "nightly-amd-accuracy-8-gpu-mi35x-kimi-k3",
-        "nightly-amd-accuracy-8-gpu-mi35x-kimi-k31-pro",
-        "nightly-amd-8-gpu-mi35x-qwen38-mxfp4",
-        "nightly-amd-8-gpu-mi35x-glm52-fp8",
-        "nightly-amd-8-gpu-mi35x-glm53-flash",
-        "nightly-amd-accuracy-8-gpu-glm53",
-        "nightly-amd-8-gpu-mi35x-glm53",
-        "nightly-amd-4-gpu",
-        "nightly-amd-8-gpu",
-        "nightly-amd-accuracy-8-gpu-deepseek-v4-flash",
-        "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
-        "nightly-amd-4-gpu-mi35x-deepseek-v41-flash",
+        "nightly-test-amd",
+        "nightly-test-1-gpu-amd",
+        "nightly-kernel-test-1-gpu-amd",
+        "nightly-test-1-gpu-amd-mi35x",
+        "nightly-test-1-gpu-amd-zimage-turbo",
+        "nightly-test-2-gpu-amd",
+        "nightly-test-2-gpu-amd-mi35x-deepseek-r1-mxfp4-tp2",
+        "nightly-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-tp4",
+        "nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k31-pro",
+        "nightly-accuracy-test-8-gpu-amd-mi35x-muse-spark",
+        "nightly-accuracy-test-8-gpu-amd-mi35x-muse-spark-mmmu",
+        "nightly-test-8-gpu-amd-mi35x-qwen38-mxfp4",
+        "nightly-test-8-gpu-amd-mi35x-glm53-flash",
+        "nightly-accuracy-test-8-gpu-amd-glm53",
+        "nightly-test-8-gpu-amd-mi35x-glm53",
+        "nightly-test-4-gpu-amd",
+        "nightly-test-8-gpu-amd",
+        "nightly-accuracy-test-8-gpu-amd-deepseek-v4-flash",
+        "nightly-test-8-gpu-amd-mi35x-deepseek-v4-flash",
+        "nightly-test-4-gpu-amd-mi35x-deepseek-v41-flash",
         # MI35x 8-GPU suite (different model configs)
-        "nightly-amd-8-gpu-mi35x",
+        "nightly-test-8-gpu-amd-mi35x",
     ],
     HWBackend.MUSA: [
-        "nightly-musa-1-gpu",
+        "nightly-test-1-gpu-musa",
     ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
-        "nightly-1-npu-a3",
-        "nightly-2-npu-a3",
-        "nightly-4-npu-a3",
-        "nightly-8-npu-a3",
-        "nightly-16-npu-a3",
-        "nightly-acc-2-npu-a3",
-        "nightly-acc-8-npu-a3",
-        "nightly-acc-16-npu-a3",
-        "nightly-acc-4-npu-a5",
-        "nightly-perf-2-npu-a3",
-        "nightly-perf-4-npu-a3",
-        "nightly-perf-16-npu-a3",
-        "nightly-perf-16-npu-a3-cann910",
-        "full-4-npu-a2",
-        "full-1-npu-a3",
-        "full-2-npu-a3",
-        "full-4-npu-a3",
-        "full-8-npu-a3",
-        "full-16-npu-a3",
-        "full-acc-2-npu-a3",
-        "full-acc-4-npu-a3",
-        "full-acc-16-npu-a3",
-        "full-perf-2-npu-a3",
-        "full-perf-4-npu-a3",
-        "full-perf-8-npu-a3",
-        "full-perf-16-npu-a3",
+        "nightly-test-1-npu-a3",
+        "nightly-test-2-npu-a3",
+        "nightly-test-4-npu-a3",
+        "nightly-test-8-npu-a3",
+        "nightly-test-16-npu-a3",
+        "nightly-acc-test-2-npu-a3",
+        "nightly-acc-test-8-npu-a3",
+        "nightly-acc-test-16-npu-a3",
+        "nightly-acc-test-4-npu-a5",
+        "nightly-perf-test-2-npu-a3",
+        "nightly-perf-test-4-npu-a3",
+        "nightly-perf-test-16-npu-a3",
+        "full-test-1-npu-a3",
+        "full-test-2-npu-a3",
+        "full-test-4-npu-a3",
+        "full-test-8-npu-a3",
+        "full-test-16-npu-a3",
+        "full-acc-test-2-npu-a3",
+        "full-acc-test-4-npu-a3",
+        "full-acc-test-8-npu-a3",
+        "full-acc-test-16-npu-a3",
+        "full-perf-test-2-npu-a3",
+        "full-perf-test-4-npu-a3",
+        "full-perf-test-8-npu-a3",
+        "full-perf-test-16-npu-a3",
     ],
     HWBackend.XPU: [
-        "nightly-xpu-kernel-main-1-gpu",
-        "nightly-xpu-kernel-main-2-gpu",
-        "nightly-xpu-kernel-main-4-gpu",
-        "nightly-xpu-kernel-wheel-1-gpu",
+        "nightly-kernel-main-test-1-gpu-xpu",
+        "nightly-kernel-main-test-2-gpu-xpu",
+        "nightly-kernel-main-test-4-gpu-xpu",
+        "nightly-kernel-wheel-test-1-gpu-xpu",
     ],
 }
 
@@ -247,6 +242,7 @@ OTHER_SUITES = {
         "weekly-test-4-gpu-b200",
         "weekly-test-8-gpu-h200",
         "weekly-test-8-gpu-b200",
+        "weekly-test-8-gpu-b300",
     ],
 }
 
@@ -290,33 +286,13 @@ def validate_all_suites(all_tests: List[CIRegistry]):
         raise ValueError("Tests registered to invalid suites:\n" + "\n".join(errors))
 
 
-def filter_tests(
-    ci_tests: List[CIRegistry],
-    hw: HWBackend,
-    suites: List[str],
-    nightly: bool = False,
-) -> tuple[List[CIRegistry], List[CIRegistry]]:
-    # `suites` may hold more than one suite (comma-separated --suite): the
-    # matched tests are unioned so a single runner can partition several
-    # suites as one balanced pool (e.g. base-b + base-c on a Xeon SPR box).
-    suite_set = set(suites)
-    ci_tests = [
-        t
-        for t in ci_tests
-        if t.backend == hw and t.effective_suite in suite_set and t.nightly == nightly
-    ]
-
+def warn_unknown_suites(hw: HWBackend, suites: List[str]):
     # Union of all three dicts, not just the per-commit or nightly half:
     # CUDA nightly suites are selected by name alone, without --nightly.
     valid = _valid_suites_by_backend().get(hw, set())
     for suite in suites:
         if suite not in valid:
             print(f"Warning: Unknown suite {suite} for backend {hw.name}")
-
-    enabled_tests = [t for t in ci_tests if t.disabled is None]
-    skipped_tests = [t for t in ci_tests if t.disabled is not None]
-
-    return enabled_tests, skipped_tests
 
 
 def pretty_print_tests(
@@ -358,34 +334,6 @@ def pretty_print_tests(
     print(msg, flush=True)
 
 
-def load_live_est(
-    partition_model_file: Optional[str], suites: List[str], repo_root: str
-) -> Optional[Dict[str, float]]:
-    """`CIRegistry.filename -> est seconds` from `model.json est[suite]`,
-    merged across all requested `suites`; None if no suite yielded any entry
-    (caller then falls back to in-source `est_time`)."""
-    if not partition_model_file or not os.path.exists(partition_model_file):
-        return None
-    try:
-        with open(partition_model_file) as f:
-            partition_model = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(partition_model, dict):
-        return None
-    est_by_suite = partition_model.get("est", {})
-    if not isinstance(est_by_suite, dict):
-        return None
-    merged: Dict[str, float] = {}
-    for suite in suites:
-        suite_est = est_by_suite.get(suite)
-        if not isinstance(suite_est, dict):
-            continue
-        for relpath, elapsed in suite_est.items():
-            merged[os.path.join(repo_root, relpath)] = float(elapsed)
-    return merged or None
-
-
 def load_only_file_list(list_path: str, repo_root: str) -> set:
     """Read repo-relative test paths (one per line, optional ::case suffix)
     and normalize them to the absolute-path form CIRegistry.filename uses."""
@@ -417,22 +365,14 @@ def run_a_suite(args):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(script_dir)
 
-    # Registered tests under test/registered/
-    files = [
-        f
-        for f in glob.glob(
-            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
-        )
-        # conftest.py / __init__.py are pytest+package structure, never
-        # registered tests, and must not be executed as one.
-        if os.path.basename(f) not in ("conftest.py", "__init__.py")
-    ]
-
     # Strict: all discovered files must have proper registration
     sanity_check = True
 
-    all_tests = collect_tests(files, sanity_check=sanity_check)
+    all_tests = collect_tests(
+        registered_test_files(repo_root), sanity_check=sanity_check
+    )
     validate_all_suites(all_tests)
+    warn_unknown_suites(hw, suites)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suites, nightly)
 
     # Precision-test mode: keep only the coverage-recommended files before
@@ -514,7 +454,7 @@ def main():
         required=True,
         help=(
             "Test suite to run. Accepts a comma-separated list of suites "
-            "(e.g. 'stage-a-test-cpu-intel,stage-b-test-cpu-intel'); their tests are unioned "
+            "(e.g. 'base-b-test-1-gpu-small,base-b-test-1-gpu-large'); their tests are unioned "
             "into one pool before partitioning."
         ),
     )

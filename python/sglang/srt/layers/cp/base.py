@@ -226,7 +226,7 @@ class ContextParallelStrategy(ABC):
         layer: Any = None,
         k: Any = None,
         v: Any = None,
-        swa_loc: Optional[Any] = None,
+        window_locs: Optional[Any] = None,
     ) -> Any:
         """Write full-layout K/V to the backend cache if needed."""
 

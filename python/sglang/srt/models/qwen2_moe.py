@@ -112,6 +112,7 @@ from sglang.srt.models.utils import (
     can_run_silu_fp4_quant_fusion,
     silu_and_mul_fp4_quant,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -170,10 +171,6 @@ def can_fuse_shared_expert(
         return False
 
     if quant_config is not None:
-        exclude_layers = getattr(quant_config, "exclude_layers", None)
-        if exclude_layers is None:
-            exclude_layers = getattr(quant_config, "ignored_layers", [])
-
         # Other backends than quark do not exclude the shared expert here, so they
         # intentionally fall through and remain fusable
         can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
@@ -403,6 +400,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     dict(parallel_group="replicated")
                     if (
                         get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_ascend_ops()
                         or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_deepep_v2()
                         or get_moe_a2a_backend().is_flashinfer()
@@ -570,7 +568,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     gate = self.shared_expert_gate(hidden_states)
                     shared_output = sigmoid_gate_mul_broadcast(shared_output, gate)
                 elif _is_npu:
-                    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+                    from sgl_kernel_npu.operators.activation import (
                         fused_sigmoid_mul_broadcast,
                     )
 
@@ -844,6 +842,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_ops()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
@@ -917,8 +916,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.reduce_results:
             final_hidden_states = reduce_moe_output(final_hidden_states)
 
-        # Debug removed - was causing issues during CUDA graph capture
-
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -934,7 +931,6 @@ class Qwen2MoeAttention(nn.Module):
         max_position_embeddings: int = 8192,
         qkv_bias: int = True,
         quant_config: Optional[QuantizationConfig] = None,
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -989,7 +985,6 @@ class Qwen2MoeAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -1032,9 +1027,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         qkv_bias = getattr(config, "qkv_bias", True)
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
-        )
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -1044,7 +1036,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            dual_chunk_attention_config=dual_chunk_attention_config,
             qkv_bias=qkv_bias,
             prefix=add_prefix("self_attn", prefix),
         )
@@ -1389,14 +1380,11 @@ class Qwen2MoeForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -1422,6 +1410,17 @@ class Qwen2MoeForCausalLM(nn.Module):
             )  # Specific layers for EAGLE3 support
         else:
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
 
 EntryClass = Qwen2MoeForCausalLM

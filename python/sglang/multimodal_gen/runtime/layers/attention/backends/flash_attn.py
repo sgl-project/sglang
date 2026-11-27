@@ -343,8 +343,6 @@ class FlashAttentionBackend(AttentionBackend):
     def supports_ring_rotation(cls) -> bool:
         return True
 
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128, 160, 192, 224, 256]
@@ -358,12 +356,12 @@ class FlashAttentionBackend(AttentionBackend):
         return FlashAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        raise NotImplementedError
-
-    @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         return FlashAttentionMetadataBuilder
+
+
+def _skip_softmax_off() -> tuple[bool, None]:
+    return False, None
 
 
 class FlashAttentionImpl(AttentionImpl):
@@ -387,10 +385,18 @@ class FlashAttentionImpl(AttentionImpl):
         self.packed_trailing_padding = extra_impl_args.get(
             "packed_trailing_padding", False
         )
+        if is_cross_attention:
+            # Cross-attention never takes Skip Softmax, so it never reads the request.
+            self._request_skip_softmax_threshold = _skip_softmax_off
+
+        # Per-head sink logits (an extra always-attended column in the softmax
+        # denominator) and a local attention window, both off by default.
+        self.sinks = extra_impl_args.get("sinks")
+        self.window_size = extra_impl_args.get("window_size", (-1, -1))
 
     def _request_skip_softmax_threshold(self) -> tuple[bool, float | None]:
         params = get_request_skip_softmax_params()
-        if params is None or self.is_cross_attention:
+        if params is None:
             return False, None
         current_step = get_forward_context().current_timestep
         if not isinstance(current_step, Integral):
@@ -413,6 +419,7 @@ class FlashAttentionImpl(AttentionImpl):
     ):
         use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
         if use_trtllm:
+            assert self.sinks is None, "run_skip_softmax does not support sinks"
             if return_softmax_lse:
                 raise NotImplementedError(
                     "Skip Softmax does not support the LSE output required by "
@@ -469,6 +476,8 @@ class FlashAttentionImpl(AttentionImpl):
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
+                window_size=tuple(self.window_size),
+                sinks=self.sinks,
                 return_softmax_lse=return_softmax_lse,
                 ver=fa_ver,
             )
@@ -486,6 +495,8 @@ class FlashAttentionImpl(AttentionImpl):
                     max_seqlen_k=max_seqlen_k,
                     softmax_scale=self.softmax_scale,
                     causal=self.causal,
+                    window_size=list(self.window_size),
+                    sinks=self.sinks,
                     return_softmax_lse=True,
                     ver=fa_ver,
                 )
@@ -500,6 +511,8 @@ class FlashAttentionImpl(AttentionImpl):
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
+                window_size=list(self.window_size),
+                sinks=self.sinks,
                 return_softmax_lse=False,
                 ver=fa_ver,
             )
@@ -525,6 +538,11 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_k = attn_metadata.max_seqlen_k or key.shape[1]
         else:
             max_seqlen_q, max_seqlen_k = query.shape[1], key.shape[1]
+        # self.sinks is impl-wide shape; Ulysses hands a head-shard here and
+        # there is no call-site slice, so pass-through would read wrong.
+        assert self.sinks is None, (
+            "forward_into does not support per-head sinks; pass sinks=None to this impl"
+        )
         flash_attn_varlen_func(
             q=query,
             k=key,
@@ -535,7 +553,7 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_k=max_seqlen_k,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
-            window_size=(-1, -1),
+            window_size=tuple(self.window_size),
             ver=fa_ver,
             out=out,
         )
@@ -553,6 +571,7 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         use_trtllm, skip_threshold = self._request_skip_softmax_threshold()
         if use_trtllm:
+            assert self.sinks is None, "run_skip_softmax does not support sinks"
             bounds = cu_seqlens_host
             used = (
                 trailing_padding_used_len(
@@ -607,6 +626,44 @@ class FlashAttentionImpl(AttentionImpl):
                 q_seq_lens_cpu=seq_lens_cpu,
                 kv_seq_lens_cpu=seq_lens_cpu,
             )
+        used = None
+        if fa_ver == 3 and cu_seqlens_host is not None:
+            if tuple(cu_seqlens_host) == (0, query.shape[0]):
+                used = query.shape[0]
+            elif self.packed_trailing_padding:
+                used = trailing_padding_used_len(
+                    total_tokens=query.shape[0],
+                    max_seqlen=max_seqlen,
+                    bounds=cu_seqlens_host,
+                )
+        if used is not None:
+            # One live sequence (plus trailing padding): FA3's batch kernel
+            # gives its rows the same bytes without the varlen indexing (4%
+            # faster at H3's H200 shapes). Padding rows are zeroed, as the
+            # skip-softmax path leaves them; no live row attends to them.
+            output = query.new_empty(query.shape[0], query.shape[1], value.shape[2])
+            output[used:].zero_()
+            live = flash_attn_varlen_func(
+                query[None, :used],
+                key[None, :used],
+                value[None, :used],
+                cu_seqlens_q=None,
+                cu_seqlens_k=None,
+                max_seqlen_q=used,
+                max_seqlen_k=used,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+                window_size=tuple(self.window_size),
+                sinks=self.sinks,
+                ver=fa_ver,
+                out=output[None, :used],
+            )
+            # The FA2 fallback (no sgl-kernel FA3, e.g. CUDA < 12.3) ignores
+            # `out` and returns a fresh tensor.
+            live = live[0] if isinstance(live, tuple) else live
+            if live.data_ptr() != output.data_ptr():
+                output[:used] = live[0]
+            return output
         output = flash_attn_varlen_func(
             query,
             key,
@@ -617,6 +674,8 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_k=max_seqlen,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            window_size=tuple(self.window_size),
+            sinks=self.sinks,
             ver=fa_ver,
         )
         return output[0] if isinstance(output, tuple) else output
@@ -628,6 +687,11 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one non-causal FlashAttention ring chunk with LSE output."""
+        # Ring applies each chunk's softmax independently; a sink or local window
+        # would fire once per chunk and be counted ring_ws times total.
+        assert self.sinks is None and tuple(self.window_size) == (-1, -1), (
+            "ring attention does not support sinks or a local window"
+        )
         result = flash_attn_varlen_func(
             query,
             key,

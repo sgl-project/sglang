@@ -26,6 +26,20 @@ _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
+for _name, _backend in (
+    ("linear_bf16_quack", KernelBackend.CUTE_DSL),
+    ("linear_bf16_cublaslt", KernelBackend.FLASHINFER),
+):
+    register_kernel(
+        KernelSpec(
+            op="gemm.linear_bf16",
+            backend=_backend,
+            target=f"sglang.kernels.ops.gemm.sm120_bf16:{_name}",
+            capabilities=_SM120,
+        )
+    )
+del _name, _backend
+
 
 for _name in ("npu_w8a8_block_fp8_linear", "npu_w8a8_block_fp8_grouped_matmul"):
     register_kernel(
@@ -273,7 +287,7 @@ def dual_gemm_swiglu_fp8(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
-    quant_mode: Optional["DualGemmQuantMode"] = None,
+    quant_mode: Optional[DualGemmQuantMode] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse FP8 gate/up projections, SwiGLU, and activation quantization."""
     if quant_mode is None:
@@ -409,6 +423,35 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.sm12x_bf16_gemv",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.gemm.sm12x_bf16_gemv:b12x_bf16_gemv",
+        capabilities=_SM12X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm12x_bf16_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.sm12x_bf16_gemv:sm12x_bf16_gemv",
+        capabilities=_SM12X,
+    )
+)
+for _name, _backend in (
+    ("nvfp4_expert_matmul", KernelBackend.FLASHINFER),
+    ("mxfp8_expert_matmul", KernelBackend.FLASHINFER),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.inkling2_{_name}_sm120",
+            backend=_backend,
+            target=f"sglang.kernels.ops.gemm.inkling2_grouped_sm120:{_name}",
+            capabilities=_SM12X,
+        )
+    )
+del _name, _backend
+register_kernel(
+    KernelSpec(
         op="gemm.fp8_blockwise_scaled_mm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.fp8_blockwise_gemm:fp8_blockwise_scaled_mm",
@@ -536,6 +579,13 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.int8_scaled_mm_via_int_mm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.int8_kernel:int8_scaled_mm_via_int_mm",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.muse_spark_router_gemv",
         backend=KernelBackend.CUTE_DSL,
         target="sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl:router_gemv_cute",
@@ -556,6 +606,70 @@ register_kernel(
         backend=KernelBackend.TORCH,
         target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",
         capabilities=CUDA_ONLY,
+    )
+)
+
+
+# Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
+# Triton attention backends dispatch to by shape; registered for inventory.
+_MUSE_SPARK_GFX950_KERNELS = [
+    (
+        "bf16_splitk_gemm",
+        "bf16_splitk_gemm_partials",
+        "BF16 small-M split-K GEMM partials in FP32",
+    ),
+    (
+        "bf16_tiled_small_m_gemm",
+        "tiled_gemm",
+        "BF16 17..64-row GEMM from a tile-contiguous weight copy",
+    ),
+    ("router_gemm_fp32", "router_gemv_fp32", "bf16 x fp32 router logits GEMV, M <= 64"),
+    (
+        "router_gemm_fp32",
+        "router_gemm_tuned",
+        "bf16 x fp32 router logits, tuned split-K at verify widths",
+    ),
+    (
+        "router_gemm_fp32",
+        "router_gemm_tlx",
+        "bf16 x fp32 router logits on the vendored tlx.ops.router_gemm, any M",
+    ),
+    (
+        "unpool_gemm_norm_residual",
+        "unpool_gemm_norm_residual",
+        "MoE unpooler GEMM + boundary norms + gated residual",
+    ),
+    (
+        "unpool_gemm_norm_residual",
+        "unpool_gemm_norm_residual_tlx",
+        "MoE unpooler GEMM + boundary norms + gated residual on the TLX mm and norm_residual_norm",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.gemm.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn, _desc
+# Vendored tlx.ops.mm (gfx950); needs triton.language.extra.tlx from fbtriton or the uTLX plugin.
+register_kernel(
+    KernelSpec(
+        op="gemm.tlx_linear",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.tlx:linear",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.project_active_codebook_logits",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.codebook_projection:project_active_codebook_logits",
+        capabilities=_SM90,
     )
 )
 register_kernel(

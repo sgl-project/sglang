@@ -394,7 +394,7 @@ async fn generate_batch_context_limit_pairs_each_prompt_with_its_output_budget()
 }
 
 #[tokio::test]
-async fn rejects_unsupported_length_unknown_model_and_overflow_before_policy() {
+async fn rejects_unsupported_length_and_overflow_before_policy() {
     let worker = MockWorker::start(vec![]).await;
     let policy = Arc::new(FirstPolicy::default());
     let mut bucket = Bucket::new("short", BucketGroups::Plain(group("w", policy.clone())));
@@ -404,12 +404,9 @@ async fn rejects_unsupported_length_unknown_model_and_overflow_before_policy() {
     long["max_tokens"] = 100.into();
     let mut overflow = body("hi");
     overflow["max_tokens"] = u64::MAX.into();
-    let mut unknown = body("hi");
-    unknown["model"] = "unknown".into();
     for (body, status) in [
         (long, StatusCode::BAD_REQUEST),
         (overflow, StatusCode::BAD_REQUEST),
-        (unknown, StatusCode::NOT_FOUND),
         (serde_json::json!({}), StatusCode::BAD_REQUEST),
     ] {
         let response = app.clone().oneshot(request(body)).await.unwrap();
@@ -444,7 +441,7 @@ async fn reorg_route_keeps_chat_body_limit() {
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
-        .body(Body::from(vec![b' '; MAX_CHAT_BODY_BYTES + 1]))
+        .body(Body::from(vec![b' '; max_chat_body_bytes() + 1]))
         .unwrap();
     assert_eq!(
         app.oneshot(request).await.unwrap().status(),
@@ -649,10 +646,13 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
     let value = body("hello world");
     let config = config_for("");
     let tokenizers = TokenizerRegistry::load_from_config(&config).unwrap();
-    let ids =
-        sgl_router::policies::request_tokens_for(&tokenizers, &ModelId("tiny".into()), &value)
-            .unwrap()
-            .ids;
+    let ids = sgl_router::tokenizer::prompt::request_tokens_for(
+        &tokenizers,
+        &ModelId("tiny".into()),
+        &value,
+    )
+    .unwrap()
+    .ids;
     let hashes = compute_block_hashes(&ids, 1);
     let tree = Arc::new(HashTree::new());
     for worker in [&rejected, &owner] {
@@ -784,7 +784,7 @@ async fn portless_prefill_is_not_dispatched_until_bootstrap_is_resolved() {
         if !reorg {
             ctx = Arc::new(AppContext::new(
                 ctx.config.clone(),
-                ctx.tokenizers.clone(),
+                ctx.preprocessor.tokenizers().clone(),
                 ctx.proxy.clone(),
                 ctx.registry.clone(),
                 Arc::new(build_policy_registry(&ctx.config).unwrap()),
@@ -836,8 +836,11 @@ async fn load_only_routing_forwards_messages_without_a_tokenizer() {
         let mutable = Arc::get_mut(&mut ctx).unwrap();
         mutable.config.model.policy = PolicyKind::PowerOfTwo;
         mutable.config.model.tokenizer_path = None;
-        mutable.tokenizers =
-            Arc::new(TokenizerRegistry::load_from_config(&mutable.config).unwrap());
+        mutable.preprocessor = sgl_router::server::routes::chat::Preprocessor::new(
+            &mutable.config.model,
+            Arc::new(TokenizerRegistry::load_from_config(&mutable.config).unwrap()),
+            Arc::clone(&mutable.metrics),
+        );
         if reorg {
             let state = sgl_router::state::kv_events::KvEventIndex::new();
             let (resolver, _) = sgl_router::policies_reorg::factory::build_resolver(
@@ -1062,8 +1065,16 @@ async fn embeddings_fallback_batches_use_per_prompt_context_limits() {
     )
     .unwrap();
     ctx.config.model.tokenizer_path = Some(path.to_str().unwrap().into());
-    ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
-    assert!(ctx.tokenizers.encode_prompt("tiny", "hello").is_none());
+    ctx.preprocessor = sgl_router::server::routes::chat::Preprocessor::new(
+        &ctx.config.model,
+        Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap()),
+        Arc::clone(&ctx.metrics),
+    );
+    assert!(ctx
+        .preprocessor
+        .tokenizers()
+        .encode_prompt("tiny", "hello")
+        .is_none());
     let app = build_router(Arc::new(ctx));
     for (input, expected) in [
         (serde_json::json!("hello"), StatusCode::OK),

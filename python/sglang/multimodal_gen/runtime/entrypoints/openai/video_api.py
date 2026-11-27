@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     flatten_extra_params,
     get_declared_request_extra_fields,
     merge_image_input_list,
+    parse_form_extra_value,
     process_generation_batch,
     request_extra_value,
     request_field_value,
@@ -106,15 +107,6 @@ async def shutdown_video_jobs() -> None:
             await task
 
 
-def _parse_form_extra_value(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except Exception:
-        return value
-
-
 _MULTIPART_EXTRA_FORM_FIELDS = (
     "attention_backend_override",
     "cache_dit_params",
@@ -156,7 +148,7 @@ def _merge_multipart_extra_form_fields(
 ) -> None:
     for key in _multipart_extra_form_keys(sampling_params_cls):
         if key in raw_form:
-            extra_from_form[key] = _parse_form_extra_value(raw_form[key])
+            extra_from_form[key] = parse_form_extra_value(raw_form[key])
 
 
 def _multipart_video_extras(
@@ -380,11 +372,9 @@ async def _dispatch_job_async(
                     os.remove(output_path)
                 except FileNotFoundError:
                     pass
-                except OSError:
+                except OSError as exc:
                     logger.warning(
-                        "Failed to remove rejected video output %s",
-                        output_path,
-                        exc_info=True,
+                        "Failed to remove rejected video output (errno=%s)", exc.errno
                     )
             raise
 
@@ -426,14 +416,14 @@ async def _dispatch_job_async(
     except Exception as e:
         if await VIDEO_STORE.get(job_id) is None:
             # DELETE removed the job and stopped its generation
-            logger.info("Video job %s was deleted: %s", job_id, e)
+            logger.info("Video job %s was deleted", job_id)
             return
-        logger.exception("Video job %s failed", job_id)
+        logger.error("Video job %s failed (%s)", job_id, type(e).__name__)
         await VIDEO_STORE.update_fields(
             job_id,
             {
                 "status": "failed",
-                "error": {"message": str(e)},
+                "error": {"message": "Video generation failed"},
                 "url": None,
                 "urls": None,
                 "file_path": None,
@@ -446,7 +436,6 @@ async def _dispatch_job_async(
         await resources.aclose()
 
 
-# TODO: support image to video generation
 @router.post("", response_model=VideoResponse)
 async def create_video(
     request: Request,
@@ -563,13 +552,13 @@ async def create_video(
 
                 def form_value(name: str, value: Any) -> Any:
                     selected = value if value is not None else extra_from_form.get(name)
-                    return _parse_form_extra_value(selected)
+                    return parse_form_extra_value(selected)
 
                 def form_text_value(name: str, value: Any) -> Any:
                     """Resolve a text field without JSON-decoding it.
 
                     Some models take a serialized JSON object as the prompt text, which
-                    ``_parse_form_extra_value`` would turn back into a dict and fail
+                    ``parse_form_extra_value`` would turn back into a dict and fail
                     request validation.
                     """
                     return value if value is not None else extra_from_form.get(name)
@@ -710,7 +699,6 @@ async def create_video(
             req.output_path = resources.enter_context(
                 temp_dir_if_disabled(effective_output_path)
             )
-            logger.debug(f"Server received from create_video endpoint: req={req}")
 
             image_path = _resolve_image_path(req, _resolve_video_path(req))
             req.prompt = await maybe_enhance_prompt(
@@ -858,6 +846,9 @@ async def download_video_content(
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
 
+    if job.get("status") != "completed":
+        raise HTTPException(status_code=404, detail="Video output is not available")
+
     cloud_url = select_output_variant(job, variant, "urls", "url")
     if cloud_url:
         raise HTTPException(
@@ -868,8 +859,6 @@ async def download_video_content(
     file_path = _select_lidar_artifact_path(job, variant) or select_output_variant(
         job, variant, "file_paths", "file_path"
     )
-    if job.get("status") not in {"completed", "failed"}:
-        raise HTTPException(status_code=404, detail="Generation is still in-progress")
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(
             status_code=404, detail=f"Video variant {variant} not found"

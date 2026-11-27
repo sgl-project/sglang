@@ -4,7 +4,7 @@
 import os
 from collections import defaultdict
 from collections.abc import Hashable
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -65,6 +65,10 @@ logger = init_logger(__name__)
 # (Wan Arcane-Jinx loses 14%, a Z-Image anime LoRA 31%) and would pay the
 # dynamic path's cost, up to +50% per step on small models, for little
 AUTO_MERGE_MAX_ROUNDING_LOSS = 0.5
+
+
+def _has_lora_pair(adapter: dict[str, torch.Tensor], name: str) -> bool:
+    return name + ".lora_A" in adapter and name + ".lora_B" in adapter
 
 
 def merge_rounding_loss(lora_layers: dict) -> float | None:
@@ -155,6 +159,72 @@ def _store_fused_lora_groups(
         adapter[b_key] = b.to(device)
         if fused_alpha is not None:
             adapter[f"{base}.alpha"] = torch.tensor(float(fused_alpha), device=device)
+
+
+def map_lora_state_dict_to_dit(
+    lora_state_dict: dict[str, torch.Tensor],
+    param_names_mapping_fn,
+    lora_param_names_mapping_fn,
+    lora_alpha: float | None,
+    device: torch.device | str,
+) -> dict[str, torch.Tensor]:
+    """Rename a normalized LoRA state dict to the DiT's LoRA layer names.
+
+    Returns ``{"<layer>.lora_A": A, "<layer>.lora_B": B, ...}``; a layer gets
+    the adapter only when both of its keys are present. Shared by
+    ``load_lora_adapter`` and the Hub LoRA coverage test.
+    """
+    new_adapter: dict[str, torch.Tensor] = {}
+    to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
+    for name, weight in lora_state_dict.items():
+        name = name.replace("diffusion_model.", "")
+        name = name.removesuffix(".weight")
+        # misc-format -> HF-format
+        name, _, _ = lora_param_names_mapping_fn(name)
+        # HF-format (LoRA) -> SGLang-dit-format
+        target_name, merge_index, num_params_to_merge = param_names_mapping_fn(name)
+        # for fuse B(out_dim, r) @ A(r, in_dim) -> (N, out_dim, r) @ (N, r, in_dim)
+        # see param mapping in HunyuanVideoArchConfig
+        if merge_index is not None:
+            to_merge_params[target_name][merge_index] = weight
+            # A/B/alpha of one fused layer are laid out together (GQA B cannot stack).
+            if target_name.endswith((".lora_A", ".lora_B", ".alpha")):
+                continue
+            if len(to_merge_params[target_name]) == num_params_to_merge:
+                sorted_tensors = [
+                    to_merge_params[target_name][i] for i in range(num_params_to_merge)
+                ]
+                # Use stack instead of cat because it needs to be compatible with TP.
+                weight = torch.stack(sorted_tensors, dim=0)
+                del to_merge_params[target_name]
+            else:
+                continue
+
+        weight = _swap_peft_swiglu_fc1_lora_b(name, target_name, weight)
+        if target_name in new_adapter:
+            raise ValueError(
+                f"Dit target weight name {target_name} already exists in the adapter"
+            )
+        new_adapter[target_name] = weight.to(device)
+
+    _store_fused_lora_groups(
+        new_adapter,
+        to_merge_params,
+        lora_alpha,
+        device,
+    )
+    return new_adapter
+
+
+def strip_diffusers_transformer_prefix(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Drop the ``transformer.`` that diffusers ``save_lora_weights`` puts on every
+    DiT key. Mixed-component files keep their keys."""
+    prefix = "transformer."
+    if state_dict and all(key.startswith(prefix) for key in state_dict):
+        return {key[len(prefix) :]: value for key, value in state_dict.items()}
+    return state_dict
 
 
 class LoRAPipeline(ComposedPipelineBase):
@@ -813,10 +883,7 @@ class LoRAPipeline(ComposedPipelineBase):
             ):
                 lora_A_name = name + ".lora_A"
                 lora_B_name = name + ".lora_B"
-                if (
-                    lora_A_name in self.lora_adapters[nickname]
-                    and lora_B_name in self.lora_adapters[nickname]
-                ):
+                if _has_lora_pair(self.lora_adapters[nickname], name):
                     inferred_rank = int(
                         self.lora_adapters[nickname][lora_A_name].shape[-2]
                     )
@@ -857,8 +924,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     # Only disable if no LoRA was applied at all
                     if idx == len(lora_nicknames) - 1:
                         has_any_lora = any(
-                            name + ".lora_A" in self.lora_adapters[n]
-                            and name + ".lora_B" in self.lora_adapters[n]
+                            _has_lora_pair(self.lora_adapters[n], name)
                             for n in lora_nicknames
                         )
                         if not has_any_lora:
@@ -935,8 +1001,7 @@ class LoRAPipeline(ComposedPipelineBase):
         for name, layer in lora_layers.items():
             if layer.merged:
                 return None
-            has_adapter = name + ".lora_A" in adapter and name + ".lora_B" in adapter
-            if not has_adapter:
+            if not _has_lora_pair(adapter, name):
                 continue
             if len(layer.lora_weights_list) != 1:
                 return None
@@ -953,8 +1018,7 @@ class LoRAPipeline(ComposedPipelineBase):
             return None
 
         for name, layer in lora_layers.items():
-            has_adapter = name + ".lora_A" in adapter and name + ".lora_B" in adapter
-            layer.disable_lora = not has_adapter
+            layer.disable_lora = not _has_lora_pair(adapter, name)
 
         return active_count
 
@@ -1021,17 +1085,16 @@ class LoRAPipeline(ComposedPipelineBase):
         adapter_fingerprint = (stat.st_size, stat.st_mtime_ns)
         raw_state_dict = load_file(lora_local_path)
         adapter_config = load_peft_config(lora_local_path)
-        lora_state_dict = normalize_lora_state_dict(
-            raw_state_dict,
-            logger=logger,
-            adapter_config=adapter_config,
+        lora_state_dict = strip_diffusers_transformer_prefix(
+            normalize_lora_state_dict(
+                raw_state_dict,
+                logger=logger,
+                adapter_config=adapter_config,
+            )
         )
         adapter_lora_alpha = lora_alpha
         if adapter_lora_alpha is None:
             adapter_lora_alpha = get_peft_lora_alpha(adapter_config)
-
-        # Swapped in at the end so a failed load keeps the previous adapter.
-        new_adapter: dict[str, torch.Tensor] = {}
 
         config = self.server_args.pipeline_config.dit_config.arch_config
 
@@ -1044,42 +1107,11 @@ class LoRAPipeline(ComposedPipelineBase):
             or self.modules["transformer"].lora_param_names_mapping
         )
 
-        to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
-        for name, weight in lora_state_dict.items():
-            name = name.replace("diffusion_model.", "")
-            name = name.removesuffix(".weight")
-            # misc-format -> HF-format
-            name, _, _ = lora_param_names_mapping_fn(name)
-            # HF-format (LoRA) -> SGLang-dit-format
-            target_name, merge_index, num_params_to_merge = param_names_mapping_fn(name)
-            # for fuse B(out_dim, r) @ A(r, in_dim) -> (N, out_dim, r) @ (N, r, in_dim)
-            # see param mapping in HunyuanVideoArchConfig
-            if merge_index is not None:
-                to_merge_params[target_name][merge_index] = weight
-                # A/B/alpha of one fused layer are laid out together (GQA B cannot stack).
-                if target_name.endswith((".lora_A", ".lora_B", ".alpha")):
-                    continue
-                if len(to_merge_params[target_name]) == num_params_to_merge:
-                    sorted_tensors = [
-                        to_merge_params[target_name][i]
-                        for i in range(num_params_to_merge)
-                    ]
-                    # Use stack instead of cat because it needs to be compatible with TP.
-                    weight = torch.stack(sorted_tensors, dim=0)
-                    del to_merge_params[target_name]
-                else:
-                    continue
-
-            weight = _swap_peft_swiglu_fc1_lora_b(name, target_name, weight)
-            if target_name in new_adapter:
-                raise ValueError(
-                    f"Dit target weight name {target_name} already exists in lora_adapters[{lora_nickname}]"
-                )
-            new_adapter[target_name] = weight.to(self.device)
-
-        _store_fused_lora_groups(
-            new_adapter,
-            to_merge_params,
+        # Swapped in at the end so a failed load keeps the previous adapter.
+        new_adapter = map_lora_state_dict_to_dit(
+            lora_state_dict,
+            param_names_mapping_fn,
+            lora_param_names_mapping_fn,
             adapter_lora_alpha,
             self.device,
         )
@@ -1093,7 +1125,49 @@ class LoRAPipeline(ComposedPipelineBase):
         self.loaded_adapter_configs[lora_nickname] = adapter_config
         self.loaded_adapter_fingerprints[lora_nickname] = adapter_fingerprint
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
-        logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
+        logger.debug("Rank %d: read LoRA adapter %s", rank, lora_path)
+
+    def _check_adapter_matches_lora_layers(
+        self,
+        nickname: str,
+        target: str,
+        target_modules: list[tuple[str, dict[str, BaseLayerWithLoRA]]],
+        *,
+        report_unused: bool,
+    ) -> None:
+        adapter = self.lora_adapters[nickname]
+        matched = any(
+            _has_lora_pair(adapter, name)
+            for _, layers in target_modules
+            for name in layers
+        )
+        if matched and not report_unused:
+            return
+        suffixes = (".lora_A", ".lora_B", ".lora_output_offset")
+        adapter_layers = {
+            key.rsplit(".", 1)[0] for key in adapter if key.endswith(suffixes)
+        }
+        if not matched:
+            raise ValueError(
+                f"LoRA adapter {nickname!r} ({self.loaded_adapter_paths[nickname]}) "
+                f"has no matching A/B pair on target {target!r}. "
+                f"Adapter layers: {', '.join(sorted(adapter_layers)[:8]) or '(none)'}"
+            )
+        unmatched = sorted(
+            name
+            for name in adapter_layers
+            if not _has_lora_pair(adapter, name)
+            or not any(name in layers for _, layers in target_modules)
+        )
+        if unmatched:
+            logger.info(
+                "LoRA adapter %s: ignoring %d/%d layers on target %s. Examples: %s",
+                nickname,
+                len(unmatched),
+                len(adapter_layers),
+                target,
+                ", ".join(unmatched[:8]),
+            )
 
     def _invalidate_lora_conditioning(self):
         # LoRA targets DiTs; unrelated text and VAE weights remain unchanged
@@ -1122,7 +1196,6 @@ class LoRAPipeline(ComposedPipelineBase):
         stop costing anonymous host memory; pass it only for the startup
         (static) adapter, where the merged combination is stable.
         """
-        self._invalidate_lora_conditioning()
         merge_mode = self._resolve_lora_merge_mode(merge_weights, merge_mode)
 
         # Normalize inputs to lists for multi-LoRA support
@@ -1148,52 +1221,61 @@ class LoRAPipeline(ComposedPipelineBase):
         if not self.lora_initialized:
             self.convert_to_lora_layers(snapshot_base=not self._has_layerwise_offload())
 
-        # Check adapter presence and load missing adapters
-        adapter_updated = False
-        rank = dist.get_rank()
-
-        # load required adapters
-        for nickname, path, alpha in zip(lora_nicknames, lora_paths, lora_alphas):
-            if nickname not in self.lora_adapters and path is None:
-                raise ValueError(
-                    f"Adapter {nickname} not found in the pipeline. Please provide lora_path to load it."
-                )
-            # Check if adapter needs to be loaded
-            should_load = False
-            if path is not None:
-                if nickname not in self.loaded_adapter_paths:
-                    should_load = True
-                elif self.loaded_adapter_paths[nickname] != path:
-                    should_load = True
-            if should_load:
-                adapter_updated = True
-                self.load_lora_adapter(path, nickname, rank, lora_alpha=alpha)
-            elif (
-                alpha is not None and self.loaded_adapter_alphas.get(nickname) != alpha
-            ):
-                # Reload: fused GQA groups bake the alpha into lora_B at load time.
-                adapter_updated = True
-                self.load_lora_adapter(
-                    self.loaded_adapter_paths[nickname],
-                    nickname,
-                    rank,
-                    lora_alpha=alpha,
-                )
-
-        # Group by target to apply separately
         target_to_indices = {}
+        modules_by_target = {}
         for idx, tgt in enumerate(targets):
-            if tgt not in target_to_indices:
-                target_to_indices[tgt] = []
-            target_to_indices[tgt].append(idx)
+            if tgt not in modules_by_target:
+                modules_by_target[tgt], error = self._get_target_lora_layers(tgt)
+                if error:
+                    raise ValueError(error)
+            target_to_indices.setdefault(tgt, []).append(idx)
 
+        rank = dist.get_rank()
+        updated = set()
+        # loaders replace cache entries; keep their old references (not tensor copies)
+        # until every adapter in the request has been validated for its selected target
+        with ExitStack() as rollback:
+            for nickname, path, alpha in zip(lora_nicknames, lora_paths, lora_alphas):
+                cached_path = self.loaded_adapter_paths.get(nickname)
+                if path is None and nickname not in self.lora_adapters:
+                    raise ValueError(
+                        f"Adapter {nickname} not found in the pipeline. Please provide lora_path to load it."
+                    )
+                if (path is not None and path != cached_path) or (
+                    alpha is not None
+                    and self.loaded_adapter_alphas.get(nickname) != alpha
+                ):
+                    for cache in (
+                        self.lora_adapters,
+                        self.loaded_adapter_paths,
+                        self.loaded_adapter_files,
+                        self.loaded_adapter_configs,
+                        self.loaded_adapter_fingerprints,
+                        self.loaded_adapter_alphas,
+                    ):
+                        if nickname in cache:
+                            rollback.callback(
+                                cache.__setitem__, nickname, cache[nickname]
+                            )
+                        else:
+                            rollback.callback(cache.pop, nickname, None)
+                    self.load_lora_adapter(
+                        path or cached_path, nickname, rank, lora_alpha=alpha
+                    )
+                    updated.add(nickname)
+            for nickname, tgt in zip(lora_nicknames, targets):
+                self._check_adapter_matches_lora_layers(
+                    nickname,
+                    tgt,
+                    modules_by_target[tgt],
+                    report_unused=rank == 0 and nickname in updated,
+                )
+            rollback.pop_all()
+
+        self._invalidate_lora_conditioning()
         adapted_count = 0
         for tgt, idx_list in target_to_indices.items():
-            target_modules, error = self._get_target_lora_layers(tgt)
-            if error:
-                logger.warning("set_lora: %s", error)
-            if not target_modules:
-                continue
+            target_modules = modules_by_target[tgt]
 
             tgt_nicknames = [lora_nicknames[i] for i in idx_list]
             tgt_paths = [
@@ -1211,11 +1293,6 @@ class LoRAPipeline(ComposedPipelineBase):
             first_effective_merge_weights = self._should_merge_lora_for_layers(
                 first_module_name, first_lora_layers_dict, merge_mode
             )
-            if not first_effective_merge_weights and len(tgt_nicknames) > 1:
-                raise ValueError(
-                    "Dynamic LoRA currently supports only one adapter per target. "
-                    "Use merge_mode='merge' for multiple adapters."
-                )
 
             merge_weights_by_module = {}
             for module_name, lora_layers_dict in target_modules:
@@ -1236,7 +1313,6 @@ class LoRAPipeline(ComposedPipelineBase):
                     # auto already kept this adapter unmerged; that state matches
                     and not (
                         merge_mode == "auto"
-                        and len(tgt_nicknames) == 1
                         and self._auto_merge_rounds_away(
                             module_name,
                             lora_layers_dict,
@@ -1247,7 +1323,7 @@ class LoRAPipeline(ComposedPipelineBase):
                             measure=False,
                         )
                     ),
-                    adapter_updated,
+                    bool(updated),
                 )
                 for module_name, lora_layers_dict in target_modules
             ):
@@ -1270,7 +1346,6 @@ class LoRAPipeline(ComposedPipelineBase):
                     if (
                         effective_merge_weights
                         and merge_mode == "auto"
-                        and len(tgt_nicknames) == 1
                         and self._auto_merge_rounds_away(
                             module_name,
                             lora_layers_dict,
@@ -1282,7 +1357,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     ):
                         effective_merge_weights = False
                     count = None
-                    if not effective_merge_weights and not adapter_updated:
+                    if not effective_merge_weights and not updated:
                         count = self._reactivate_cached_dynamic_lora_layers(
                             lora_layers_dict,
                             tgt_nicknames,
@@ -1532,7 +1607,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         if layer.merged:
                             layer.unmerge_lora_weights()
                         layer.disable_lora = False
-                        layer.strength = strength
+                        layer.set_dynamic_strength(strength)
                     self.is_lora_merged[module_name] = False
                     self._record_merge_strength(module_name, strength)
                     logger.info(

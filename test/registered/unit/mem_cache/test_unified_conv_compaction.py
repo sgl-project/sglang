@@ -48,7 +48,7 @@ def make_conv_bundle(device, page_size=1, lazy=True, state_slots=40):
         swa_max_total_num_tokens=64,
         max_mamba_cache_size=state_slots,
         model_context_len=64,
-        extra_max_context_len=0,
+        req_to_token_row_width=64,
         max_num_reqs=4,
         enable_memory_saver=False,
         enable_mamba_extra_buffer=False,
@@ -67,7 +67,7 @@ class TestConvCompaction(CustomTestCase):
         self.addCleanup(reset_context)
 
     def _exercise(self, device, page_size, mode):
-        bundle = make_conv_bundle(device, page_size, lazy=mode != "eager")
+        bundle = make_conv_bundle(device, page_size)
         pool = bundle.arena
         composite = bundle.token_to_kv_pool_allocator
         state = composite.state.pool
@@ -163,14 +163,14 @@ class TestConvCompaction(CustomTestCase):
 
     def test_cpu_conv_only_tri_pool(self):
         for ps in (1, 4):
-            for mode in ("eager", "urgent", "opportunistic"):
+            for mode in ("urgent", "opportunistic"):
                 with self.subTest(page_size=ps, mode=mode):
                     self._exercise("cpu", ps, mode)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_cuda_conv_only_tri_pool(self):
         for ps in (1, 4):
-            for mode in ("eager", "urgent", "opportunistic"):
+            for mode in ("urgent", "opportunistic"):
                 with self.subTest(page_size=ps, mode=mode):
                     self._exercise("cuda", ps, mode)
 

@@ -34,10 +34,11 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-        BaseCudaGraphBackend,
+    from sglang.srt.model_executor.runner_backend.base_graph_backend import (
+        BaseGraphBackend,
     )
 
 logger = logging.getLogger(__name__)
@@ -47,19 +48,29 @@ logger = logging.getLogger(__name__)
 def freeze_gc(enable_cudagraph_gc: bool):
     """Optimize garbage collection during CUDA graph capture.
 
-    Clean up first, then freeze remaining objects from being included in
-    future collections if GC is disabled during capture.
+    Clean up first. If GC is disabled during capture, freeze the remaining
+    objects and pause automatic collection until capture ends. A heap frozen
+    before the capture, as after warmup, is frozen again after it.
     """
     gc.collect()
     should_freeze = not enable_cudagraph_gc
+    gc_was_enabled = gc.isenabled()
+    heap_was_frozen = gc.get_freeze_count() > 0
     if should_freeze:
         gc.freeze()
+        # A collection can finalize a Triton kernel, and unloading its module
+        # on a capturing stream is not permitted and invalidates the capture.
+        gc.disable()
     try:
         yield
     finally:
         if should_freeze:
+            if gc_was_enabled:
+                gc.enable()
             gc.unfreeze()
             gc.collect()
+            if heap_was_frozen:
+                gc.freeze()
 
 
 def get_batch_sizes_to_capture(
@@ -126,7 +137,7 @@ class BaseCudaGraphRunner(BaseRunner):
     """Abstract base for phase-specific cuda-graph runners.
 
     A subclass (DecodeCudaGraphRunner / PrefillCudaGraphRunner) owns one
-    phase and plugs in a BaseCudaGraphBackend that handles the
+    phase and plugs in a BaseGraphBackend that handles the
     capture / replay mechanics. The runner orchestrates bucket
     selection, static buffer population, attention metadata init,
     replay dispatch, and output slicing.
@@ -151,7 +162,7 @@ class BaseCudaGraphRunner(BaseRunner):
 
     # Subclasses populate before calling capture().
     buffers: ForwardInputBuffers
-    backend: BaseCudaGraphBackend
+    backend: BaseGraphBackend
 
     def cuda_graph_output_rows(self, output: Any) -> Optional[int]:
         """Rows of graph output that must be preserved for post-replay work.
@@ -190,6 +201,13 @@ class BaseCudaGraphRunner(BaseRunner):
         )
         index = bisect.bisect_left(buckets, raw_size)
         return buckets[index]
+
+    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
+        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
+            raise RuntimeError(
+                "The runtime hidden-state mode exceeds the fixed CUDA graph "
+                f"capture mode ({self.capture_hidden_mode.name})."
+            )
 
     @abstractmethod
     def capture_prepare(self, size: int, *args, **kwargs) -> Any: ...

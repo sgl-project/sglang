@@ -24,10 +24,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import GptOssConfig, PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -52,7 +53,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
@@ -90,6 +91,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
 )
@@ -114,13 +116,6 @@ if _is_tinygemm_supported:
 else:
     tinygemm_bf16 = None
     _is_tinygemm_supported = False
-
-
-class GptOssConfig(PretrainedConfig):
-    model_type = "gpt_oss"
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
 
 
 logger = logging.getLogger(__name__)
@@ -183,8 +178,6 @@ def _resolve_moe_input_pad_multiple(
     GptOssDecoderLayer for the safety preconditions."""
     if quant_config is None:
         return 0
-    from sglang.srt.environ import envs
-
     if not envs.SGLANG_AITER_FUSE_RMSNORM_PAD.get():
         return 0
     if not (_is_hip and envs.SGLANG_USE_AITER.get()):
@@ -252,6 +245,18 @@ class GptOssSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             **extra_kwargs,
         )
+        scheme = getattr(self.experts, "scheme", None)
+        if (
+            envs.SGLANG_GFX1250_W4A8_BYPASS_TOPK.get()
+            and is_gfx1250_supported()
+            and getattr(scheme, "routes_from_router_logits", False)
+            and get_moe_a2a_backend().is_none()
+            and get_exec().moe.expert_distribution_recorder_mode is None
+            and not get_exec().features.enable_return_routed_experts
+        ):
+            # The experts route from the raw router logits themselves; a STANDARD
+            # TopK would compute top-k ids and weights that nothing reads.
+            self.topk.topk_config.output_format = TopKOutputFormat.BYPASSED
         self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.router = TinyGemmLinear(

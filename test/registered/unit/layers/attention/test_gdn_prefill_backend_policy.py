@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
+from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
 from sglang.srt.arg_groups.choices import LINEAR_ATTN_KERNEL_BACKEND_CHOICES
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
@@ -18,6 +19,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     validate_gdn_mis_backend,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    FlashInferGDNKernel,
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
@@ -26,13 +28,16 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
-    LinearAttnBackends,
     LinearAttnKernelBackend,
     resolve_linear_attn_backends,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    set_external_prefill_body,
+)
+from sglang.srt.runtime_context import get_context, override_platform
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -95,18 +100,23 @@ def make_runner(
 
 class TestGDNPrefillGraphExtend(CustomTestCase):
     @contextmanager
-    def _setup(self, *, cuda=True, enable_mis=False, draft=False):
+    def _setup(
+        self, *, cuda=True, enable_mis=False, draft=False, kernel=TritonGDNKernel
+    ):
         """A target's GDN backend on a setup the graph-safe chain supports, unless
-        cuda, enable_mis or draft say otherwise."""
+        the arguments say otherwise."""
         backend = GDNAttnBackend.__new__(GDNAttnBackend)
         backend.is_draft_worker = draft
         backend.enable_mis = enable_mis
         backend._mamba_chunk_size = 64
         backend.kernel_dispatcher = SimpleNamespace(
-            extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel)
+            extend_kernel=kernel.__new__(kernel)
         )
         cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
         backend.state_pool = SimpleNamespace(mamba_cache=cache)
+        backend.req_to_token_pool = SimpleNamespace(size=64)
+        backend.prefill_graph_max_seqs = 64
+        backend._model_runner = SimpleNamespace(model=torch.nn.Module())
         graph = SimpleNamespace(
             cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[512]))
         )
@@ -144,6 +154,20 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
                 self._setup(**setup) as backend,
             ):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
+
+    def test_another_extend_kernel_is_captured_only_where_an_external_body_asks(self):
+        for body_seqs, captured in (("no body", False), (None, False), (8, True)):
+            with (
+                self.subTest(body_seqs=body_seqs),
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+                self._setup(kernel=FlashInferGDNKernel) as backend,
+            ):
+                if body_seqs != "no body":
+                    body = MagicMock()
+                    body.linear_prefill_graph_seqs.return_value = body_seqs
+                    set_external_prefill_body(backend._model_runner.model, body)
+                self.assertEqual(backend.supports_prefill_graph_extend(), captured)
+                self.assertEqual(backend.prefill_graph_max_seqs, 8 if captured else 64)
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
@@ -348,9 +372,9 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 )
 
     def test_selects_flashinfer_for_a_page_major_pool(self):
-        """The unified pool runs page-major. Its strided state reaches every
-        prefill kernel as contiguous per-sequence copies, so FlashInfer prefill
-        qualifies there exactly as on the contiguous pool."""
+        """The unified pool runs page-major. FlashInfer prefill gathers and
+        scatters each request's state by pool index, whatever the pool's slot
+        pitch, so it qualifies there exactly as on the contiguous pool."""
         cases = (
             ("sm100", {}, {}),
             (
@@ -384,17 +408,21 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 self.assertIsNone(self.apply_policy(make_runner(self, **runner_args)))
 
     def test_builds_compact_checkpoint_plan_for_packed_sequences(self):
+        extend_seq_lens = [63, 64, 65, 127, 128, 129]
+        track_mask = [False, True, True, True, True, True]
+        # 65 on the 128-token sequence represents an interior S64
+        # boundary encoded as S64 + 1 by the scheduler.
+        track_seqlens = [63, 64, 65, 127, 65, 129]
+        prefix_lens = [0] * 6
         forward_batch = SimpleNamespace(
-            extend_seq_lens=torch.tensor([63, 64, 65, 127, 128, 129]),
-            mamba_track_mask=torch.tensor([False, True, True, True, True, True]),
-            # 65 on the 128-token sequence represents an interior S64
-            # boundary encoded as S64 + 1 by the scheduler.
-            mamba_track_seqlens=torch.tensor([63, 64, 65, 127, 65, 129]),
-            extend_prefix_lens=torch.zeros(6, dtype=torch.int64),
-        )
-        metadata = SimpleNamespace(
-            track_ssm_h_src=torch.empty(4),
-            track_ssm_h_dst=torch.empty(4),
+            extend_seq_lens=torch.tensor(extend_seq_lens),
+            mamba_track_mask=torch.tensor(track_mask),
+            mamba_track_seqlens=torch.tensor(track_seqlens),
+            extend_prefix_lens=torch.tensor(prefix_lens),
+            extend_seq_lens_cpu=extend_seq_lens,
+            mamba_prefill_track_mask_cpu=track_mask,
+            mamba_track_seqlens_cpu=track_seqlens,
+            extend_prefix_lens_cpu=prefix_lens,
         )
 
         # The chunk size is a derived config member; seed its private cache on a
@@ -402,15 +430,29 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         override = get_context().override_server_args(_mamba_cache_chunk_size=64)
         override.install()
         self.addCleanup(override.restore)
-        maybe_build_flashinfer_checkpoint_plan(forward_batch, metadata, "cpu")
+        # The scheduler's host copies and the device tensors must plan alike.
+        for use_host_metadata in (False, True):
+            with self.subTest(use_host_metadata=use_host_metadata):
+                metadata = SimpleNamespace(
+                    track_ssm_h_src=torch.empty(4),
+                    track_ssm_h_dst=torch.empty(4),
+                )
+                maybe_build_flashinfer_checkpoint_plan(
+                    forward_batch,
+                    metadata,
+                    "cpu",
+                    use_host_metadata=use_host_metadata,
+                )
 
-        torch.testing.assert_close(
-            metadata.state_checkpoint_cu_starts,
-            torch.tensor([0, 0, 1, 2, 3, 5, 7]),
-        )
-        torch.testing.assert_close(metadata.track_ssm_h_src, torch.tensor([1, 2, 3, 6]))
-        self.assertEqual(metadata.num_state_checkpoints, 7)
-        self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
+                torch.testing.assert_close(
+                    metadata.state_checkpoint_cu_starts,
+                    torch.tensor([0, 0, 1, 2, 3, 5, 7]),
+                )
+                torch.testing.assert_close(
+                    metadata.track_ssm_h_src, torch.tensor([1, 2, 3, 6])
+                )
+                self.assertEqual(metadata.num_state_checkpoints, 7)
+                self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
 
     def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
         backend = object.__new__(GDNAttnBackend)
@@ -420,7 +462,9 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         )
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False, is_extend=lambda: False
+            ),
             multi_item_delimiter_indices=None,
             mamba_track_mask=torch.tensor([True]),
             mamba_track_indices=torch.tensor([7]),
@@ -527,20 +571,28 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 self.assertIn(choice, LINEAR_ATTN_KERNEL_BACKEND_CHOICES)
                 LinearAttnKernelBackend(choice)
 
-    def test_flydsl_rejects_decode_and_verify(self):
-        triton = LinearAttnKernelBackend.TRITON
-        for flydsl in (
-            LinearAttnKernelBackend.FLYDSL,
-            LinearAttnKernelBackend.FLYDSL_FUSED,
-        ):
+    def test_flydsl_rejects_decode_and_verify_on_every_platform(self):
+        for flydsl in ("flydsl", "flydsl_fused"):
             cases = (
-                LinearAttnBackends(decode=flydsl, prefill=flydsl, verify=triton),
-                LinearAttnBackends(decode=triton, prefill=flydsl, verify=flydsl),
+                {"linear_attn_backend": flydsl},
+                {"linear_attn_decode_backend": flydsl},
+                {"linear_attn_verify_backend": flydsl},
             )
-            for backends in cases:
-                with self.subTest(backends=backends):
-                    with self.assertRaisesRegex(ValueError, "support prefill only"):
-                        GDNAttnBackend(SimpleNamespace(linear_attn_backends=backends))
+            for flags in cases:
+                for is_cuda in (True, False):
+                    with (
+                        self.subTest(flags=flags, is_cuda=is_cuda),
+                        override_platform(is_sm100=False),
+                        override_platform(is_cuda=is_cuda),
+                    ):
+                        args = ServerArgs(model_path="dummy", **flags)
+                        with self.assertRaisesRegex(ValueError, "prefill only"):
+                            handle_linear_attn_backend(args)
+
+            with override_platform(is_sm100=False), override_platform(is_cuda=False):
+                handle_linear_attn_backend(
+                    ServerArgs(model_path="dummy", linear_attn_prefill_backend=flydsl)
+                )
 
     def test_flydsl_prefill_dispatch_requires_gfx95_and_aiter(self):
         triton = LinearAttnKernelBackend.TRITON
@@ -582,6 +634,10 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         )
 
     def test_flydsl_schedule_flows_from_metadata_to_kernel(self):
+        self._run_flydsl_extend(eager_mixed_as_extend=False)
+        self._run_flydsl_extend(eager_mixed_as_extend=True)
+
+    def _run_flydsl_extend(self, *, eager_mixed_as_extend):
         extend_kernel = MagicMock(spec=FlyDSLGDNKernel)
         extend_kernel.extend.return_value = (sentinel.output, None, None)
         extend_kernel.build_prefill_metadata.return_value = sentinel.schedule
@@ -601,6 +657,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            eager_mixed_as_extend=eager_mixed_as_extend,
             extend_seq_lens_cpu=[2, 2],
             extend_prefix_lens=None,
             multi_item_delimiter_indices=None,
@@ -616,6 +673,8 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             head_q_dim=2,
             head_k_dim=2,
             head_v_dim=2,
+            A_log=torch.zeros(1),
+            dt_bias=torch.zeros(1),
         )
 
         def init_base(instance, _batch):
@@ -630,13 +689,15 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             backend.init_forward_metadata(batch)
             backend.forward_extend(layer, batch, torch.zeros(4, 6), None, None)
 
+        prefill_metadata = extend_kernel.extend.call_args.kwargs["prefill_metadata"]
+        if eager_mixed_as_extend:
+            extend_kernel.build_prefill_metadata.assert_not_called()
+            self.assertIsNone(prefill_metadata)
+            return
         extend_kernel.build_prefill_metadata.assert_called_once_with(
             [2, 2], cu_seqlens=metadata.query_start_loc
         )
-        self.assertIs(
-            extend_kernel.extend.call_args.kwargs["prefill_metadata"],
-            sentinel.schedule,
-        )
+        self.assertIs(prefill_metadata, sentinel.schedule)
 
     def test_flydsl_wrapper_returns_chunk_states(self):
         kernel = object.__new__(FlyDSLGDNKernel)
