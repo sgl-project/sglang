@@ -38,7 +38,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
-from sglang.srt.mem_cache.allocation_sizing import get_decode_reach
+from sglang.srt.mem_cache.allocation_sizing import get_spec_decode_reach
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -59,6 +59,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
@@ -133,6 +134,47 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * kvc.dflash_draft_loc_space_scale
+
+
+def _eagle_draft_kv_cache_dtype(kvc: KVCacheConfigurator) -> torch.dtype:
+    """KV dtype a private EAGLE/MTP draft pool resolves: the target's, unless
+    --speculative-draft-kv-cache-dtype gives the draft its own."""
+    from sglang.srt.mem_cache.kv_cache_configurator import _draft_quant_config
+    from sglang.srt.mem_cache.kv_cache_dtype import (
+        configure_kv_cache_dtype,
+        draft_reads_packed_dsa_kv,
+    )
+
+    draft_flag = get_spec().speculative_draft_kv_cache_dtype
+    # Inherited as it is, but for the INT8 record a draft may not read.
+    if draft_flag is None and kvc.kv_cache_dtype != torch.int8:
+        return kvc.kv_cache_dtype
+    draft_backend = get_spec().speculative_draft_attention_backend
+    aux_draft_model_config = kvc.spec_aux_config.draft_model_config
+    # An EAGLE/MTP draft without its own checkpoint config reuses the target's.
+    draft_model_config = aux_draft_model_config or kvc.model_config
+    if draft_flag is None:
+        if draft_reads_packed_dsa_kv(
+            draft_model_config=draft_model_config,
+            draft_attention_backend=draft_backend,
+        ):
+            return kvc.kv_cache_dtype
+        return kvc.model_dtype
+    _, draft_kv_cache_dtype = configure_kv_cache_dtype(
+        server_args_kv_cache_dtype=draft_flag,
+        quant_config=(
+            _draft_quant_config(aux_draft_model_config)
+            if draft_flag == "auto" and aux_draft_model_config is not None
+            else None
+        ),
+        model_dtype=kvc.model_dtype,
+        is_draft_worker=True,
+        is_dflash=False,
+        speculative_draft_attention_backend=draft_backend,
+        speculative_draft_kv_cache_dtype=draft_flag,
+        model_config=draft_model_config,
+    )
+    return draft_kv_cache_dtype
 
 
 def dflash_draft_kv_follows_target_swa(kvc: KVCacheConfigurator) -> bool:
@@ -349,16 +391,36 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    draft_kv_size = (
-                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
-                        * draft_loc_space_scale
-                    )
+                    draft_kv_cache_dtype = _eagle_draft_kv_cache_dtype(kvc)
+                    if draft_kv_cache_dtype == kvc.kv_cache_dtype:
+                        draft_kv_size = (
+                            int(
+                                target_kv_size * draft_num_layers / target_kv_num_layers
+                            )
+                            * draft_loc_space_scale
+                        )
+                    else:
+                        # A draft with its own KV dtype has its own row layout.
+                        from sglang.srt.mem_cache.kv_cache_configurator import (
+                            calculate_mla_kv_cache_dim,
+                        )
+
+                        draft_kv_size = (
+                            calculate_mla_kv_cache_dim(
+                                model_config=kvc.model_config,
+                                kv_cache_dtype=draft_kv_cache_dtype,
+                            )
+                            * torch._utils._element_size(draft_kv_cache_dtype)
+                            * draft_num_layers
+                            * draft_loc_space_scale
+                        )
                     # _compute_dsa_indexer_cell_size already applies the
                     # HiSparse logical-space ratio to the draft indexer.
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
+                        kv_cache_dtype=draft_kv_cache_dtype,
                     )
                     draft_kv_size *= dcp_size
                     draft_indexer_size *= dcp_size
@@ -625,6 +687,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size += (
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
+                if get_platform().is_sm120 and num_layers:
+                    # One BF16 row per token for FA4 (MHATokenToKVPoolMXFP8).
+                    cell_size += (
+                        n
+                        * (model_config.head_dim + model_config.v_head_dim)
+                        * torch._utils._element_size(torch.bfloat16)
+                    )
 
         cell_size += self._compute_qsa_cell_size(
             hf_config=model_config.hf_config,
@@ -666,7 +735,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         kvc: KVCacheConfigurator,
         num_layers: int,
         allocate_all_layers: bool = False,
+        kv_cache_dtype: Optional[torch.dtype] = None,
     ) -> int:
+        """``kv_cache_dtype`` is the main KV dtype the indexer sits next to,
+        the runner's by default; a draft with its own dtype passes that."""
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = ceil_div(
             DSATokenToKVPool.index_bytes_per_token_for(
@@ -680,12 +752,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
+            from sglang.srt.hardware_backend.npu.kv_capability import (
+                resolve_npu_kv_capability,
+            )
             from sglang.srt.mem_cache.kv_cache_dtype import (
                 QUANT_MODE_TOKEN_INT8,
                 resolve_indexer_quant_mode,
             )
 
-            dtype = kvc.kv_cache_dtype
+            dtype = kvc.kv_cache_dtype if kv_cache_dtype is None else kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
                 indexer_quant_mode = resolve_indexer_quant_mode(
@@ -704,7 +779,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     indexer_size_per_token = ceil_div(
                         index_head_dim, get_dsa_index_kpool(kvc.model_config.hf_config)
                     )
-                    element_size = torch._utils._element_size(dtype)
+                    # The unquantized indexer keeps its own dtype, which stays
+                    # BF16 under an INT8 main KV.
+                    element_size = torch._utils._element_size(
+                        resolve_npu_kv_capability(dtype).indexer_kv_dtype
+                    )
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
@@ -853,6 +932,20 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 model_config.get_swa_num_kv_heads(tp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
+        self._full_dequant_per_token = self._swa_dequant_per_token = 0
+        if self.kv_cache_dtype_str == "mxfp8" and get_platform().is_sm120:
+            bf16_size = torch._utils._element_size(torch.bfloat16)
+            if self._full_layers_num:
+                self._full_dequant_per_token = (
+                    model_config.get_num_kv_heads(tp_size)
+                    * (model_config.head_dim + model_config.v_head_dim)
+                    * bf16_size
+                )
+            self._swa_dequant_per_token = (
+                model_config.get_swa_num_kv_heads(tp_size)
+                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+                * bf16_size
+            )
 
         # Draft KV tensors use full, SWA, or full-capacity SWA geometry.
         self._draft_full_layers_num = 0
@@ -914,8 +1007,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         there, else the target's rows plus the private draft's full rows."""
         if self._fused_full_entry is not None:
             return self._fused_full_entry
-        return self._full_per_token * (
-            self._full_layers_num + self._draft_full_layers_num
+        return (
+            self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
+            + self._full_dequant_per_token
         )
 
     def _swa_cell_bytes(self) -> int:
@@ -923,6 +1017,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             return self._fused_swa_entry
         return (
             self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
+            + self._swa_dequant_per_token
             + self._draft_swa_cell_size
         )
 
@@ -932,6 +1027,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if self._full_layers_num == 0:
             self._cell_size = (
                 self._swa_per_token * self._swa_layers_num
+                + self._swa_dequant_per_token
                 + self._full_per_token * self._draft_full_layers_num
                 + self._swa_per_token * self._draft_swa_layers_num
                 + self._swa_per_token * self._draft_swa_full_layers_num
@@ -1082,7 +1178,7 @@ def compute_swa_request_cap(
     if get_spec().speculative_algorithm is None:
         decode_alloc = page_size
     else:
-        decode_alloc = get_decode_reach(page_size)
+        decode_alloc = get_spec_decode_reach(page_size)
     per_request = trailing_tokens + decode_alloc
 
     if max_running_requests is None:

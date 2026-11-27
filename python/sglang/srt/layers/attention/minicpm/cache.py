@@ -28,10 +28,8 @@ class MiniCPMCompressedCache:
         self.kernel_stride = kernel_stride
         saver = TorchMemorySaverAdapter.create(enable=enable_memory_saver)
         with saver.region(GPU_MEMORY_TYPE_KV_CACHE):
-            k1_size = (pool.max_context_len - kernel_size) // kernel_stride + 1
-            k2_size = (pool.max_context_len - kernel_size * 4) // (
-                kernel_stride * 4
-            ) + 1
+            k1_size = (pool.row_width - kernel_size) // kernel_stride + 1
+            k2_size = (pool.row_width - kernel_size * 4) // (kernel_stride * 4) + 1
             pool.req_to_sparse_k1_token = torch.zeros(
                 (pool._alloc_size, k1_size), dtype=torch.int32, device=pool.device
             )

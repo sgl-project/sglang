@@ -93,11 +93,7 @@ class NgramEmbeddingManager:
             # Sized to mirror req_to_token (indexed by req_pool_idx).
             token_table = torch.empty(
                 req_to_token_pool.req_to_token.shape[0],
-                (
-                    req_to_token_pool.req_to_token.shape[1]
-                    if _is_npu
-                    else model_config.context_len
-                ),
+                req_to_token_pool.row_width,
                 dtype=torch.int32,
                 device=device,
             )
