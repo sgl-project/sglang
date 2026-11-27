@@ -336,19 +336,6 @@ class TritonContract(RunnerContract):
         # Per layer: whether a compacted call computes exactly what the full call does.
         self._exact = weakref.WeakKeyDictionary()
 
-    def validate(self, config) -> None:
-        """On XPU, the unquantized method runs the triton runner only when it is selected by
-        name: otherwise it calls sgl-kernel's fused MoE, which sums the top-k outputs."""
-        from sglang.srt.layers.moe.paged_experts.store import accelerator_type
-        from sglang.srt.layers.moe.utils import get_moe_runner_backend
-
-        if accelerator_type() == "xpu" and not get_moe_runner_backend().is_triton():
-            raise RuntimeError(
-                "Paged experts: on XPU, select the triton MoE runner with "
-                "--moe-runner-backend triton (the default runs a fused MoE that sums the "
-                "top-k outputs, which paged experts cannot split into waves yet)"
-            )
-
     def compacts(self, base_method, layer, dispatch_output) -> bool:
         if not _unquantized_inputs(dispatch_output):
             return False
@@ -462,6 +449,37 @@ def runner_of(base_method, layer):
         if runner is not None:
             return runner
     return None
+
+
+def check_runs_its_runner(base_method) -> None:
+    """Raise if the base method's ``apply`` would not run its runner: on XPU some methods call
+    sgl-kernel's fused MoE instead, which sums the top-k outputs over all experts (paged
+    experts cannot split it into waves yet). The other methods always run their runner."""
+    from sglang.srt.layers.moe.paged_experts.store import accelerator_type
+
+    if accelerator_type() != "xpu":
+        return
+    from sglang.srt.layers.moe.utils import get_moe_runner_backend
+    from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+    fused = (
+        "sgl-kernel's fused MoE, which sums the top-k outputs (paged experts cannot split "
+        "it into waves yet)"
+    )
+    if isinstance(base_method, Mxfp4MoEMethod):
+        raise RuntimeError(
+            f"Paged experts: on XPU, the MXFP4 MoE method always runs {fused}"
+        )
+    if (
+        isinstance(base_method, (UnquantizedFusedMoEMethod, Fp8MoEMethod))
+        and not get_moe_runner_backend().is_triton()
+    ):
+        raise RuntimeError(
+            f"Paged experts: on XPU, {type(base_method).__name__} runs {fused} unless the "
+            "triton MoE runner is selected: pass --moe-runner-backend triton"
+        )
 
 
 def contract_for(runner) -> RunnerContract:

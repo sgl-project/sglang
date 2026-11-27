@@ -54,6 +54,7 @@ from sglang.srt.layers.moe.paged_experts.runners import (
     MarlinContract,
     RunnerContract,
     TritonContract,
+    check_runs_its_runner,
     contract_for,
 )
 from sglang.srt.layers.moe.paged_experts.store import (
@@ -651,16 +652,28 @@ class TestContractHooks(CustomTestCase):
         FLASHINFER_CUTLASS.validate(_exec())
         TRITON.validate(_exec(deterministic=True))
 
-    def test_triton_on_xpu_must_be_selected_by_name(self):
-        """On XPU the unquantized method runs sgl-kernel's fused MoE, which sums the top-k
-        outputs, unless the triton runner is selected by name: paging refuses the default.
-        Controls: triton selected on XPU, and the default on CUDA."""
-        for device, triton, refused in (
-            ("xpu", False, True),
-            ("xpu", True, False),
-            ("cuda", False, False),
+    def test_xpu_refuses_methods_that_skip_their_runner(self):
+        """On XPU the unquantized and FP8 methods run sgl-kernel's fused MoE (it sums the
+        top-k outputs) unless the triton runner is selected by name, and the MXFP4 method
+        always does: paging refuses those. Controls: triton selected on XPU, the default on
+        CUDA, and a method that always runs its triton runner (block INT8) on XPU."""
+        from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8MoEMethod
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+        for cls, device, triton, refused in (
+            (UnquantizedFusedMoEMethod, "xpu", False, True),
+            (UnquantizedFusedMoEMethod, "xpu", True, False),
+            (UnquantizedFusedMoEMethod, "cuda", False, False),
+            (Fp8MoEMethod, "xpu", False, True),
+            (Fp8MoEMethod, "xpu", True, False),
+            (Mxfp4MoEMethod, "xpu", True, True),
+            (Mxfp4MoEMethod, "cuda", False, False),
+            (BlockInt8MoEMethod, "xpu", False, False),
         ):
-            with self.subTest(device=device, triton=triton):
+            with self.subTest(method=cls.__name__, device=device, triton=triton):
+                method = object.__new__(cls)
                 backend = SimpleNamespace(is_triton=lambda triton=triton: triton)
                 with (
                     patch.object(store_module, "accelerator_type", return_value=device),
@@ -671,9 +684,9 @@ class TestContractHooks(CustomTestCase):
                 ):
                     if refused:
                         with self.assertRaisesRegex(RuntimeError, "on XPU"):
-                            TRITON.validate(_exec())
+                            check_runs_its_runner(method)
                     else:
-                        TRITON.validate(_exec())
+                        check_runs_its_runner(method)
 
     def test_sizing_resizes_the_runners_per_expert_state_before_rebuilding_it(self):
         """``materialize`` (the final K of an auto-sized layer) has the contract resize what

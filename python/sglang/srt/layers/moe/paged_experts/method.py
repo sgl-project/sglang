@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.paged_experts.formats import (
 )
 from sglang.srt.layers.moe.paged_experts.residency import DeviceResidency, LRUPolicy
 from sglang.srt.layers.moe.paged_experts.runners import (
+    check_runs_its_runner,
     contract_for,
     runner_config,
     runner_of,
@@ -194,6 +195,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         self._create_runner(layer)
         self.contract = contract_for(self.runner)
         self.contract.check_layer(layer, self.format)
+        check_runs_its_runner(self.base_method)
         self.contract.validate(get_exec())
         if (
             self.contract.runner_config(moe_runner_config, self.num_resident)
