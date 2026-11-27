@@ -2694,6 +2694,7 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 return attn_output
 
+            encoder_only = layer.attn_type == AttentionType.ENCODER_ONLY
             if self.use_fia:
                 if self._can_use_tnd(layer):
                     """FIA supports multi-bs in the current version of CANN"""
@@ -2717,14 +2718,14 @@ class AscendAttnBackend(AttentionBackend):
                         ),
                         block_table=self.forward_metadata.block_tables,
                         block_size=self.page_size,
-                        atten_mask=self.fia_mask,
+                        atten_mask=None if encoder_only else self.fia_mask,
                         input_layout="TND",
                         actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
                         actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
                         num_key_value_heads=layer.tp_k_head_num,
                         num_heads=layer.tp_q_head_num,
                         scale=layer.scaling,
-                        sparse_mode=3,
+                        sparse_mode=0 if encoder_only else 3,
                     )
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
@@ -2780,8 +2781,10 @@ class AscendAttnBackend(AttentionBackend):
                             block_size=self.page_size,
                             actual_seq_qlen=[q_len],
                             actual_seq_kvlen=[total_kv_len],
-                            atten_mask=self.fia_mask.unsqueeze(0),
-                            sparse_mode=3,
+                            atten_mask=None
+                            if encoder_only
+                            else self.fia_mask.unsqueeze(0),
+                            sparse_mode=0 if encoder_only else 3,
                             softmax_scale=layer.scaling,
                         )
                         attn_output[q_len_offset : q_len_offset + q_len] = result[0]
@@ -2817,7 +2820,7 @@ class AscendAttnBackend(AttentionBackend):
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
                     softmax_scale=layer.scaling,
-                    causal=True,
+                    causal=not encoder_only,
                     window_size=[-1, -1],
                     softcap=0.0,
                     rotary_interleaved=False,
@@ -2829,12 +2832,7 @@ class AscendAttnBackend(AttentionBackend):
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
             else:
-                causal = True
-                if (
-                    layer.is_cross_attention
-                    or layer.attn_type == AttentionType.ENCODER_ONLY
-                ):
-                    causal = False
+                causal = not (layer.is_cross_attention or encoder_only)
                 # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
                 # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
                 # Model skywork-reward-gemma2-2-27B also suffers from precision anomalies, thus the torch native backend becomes beneficial approach.

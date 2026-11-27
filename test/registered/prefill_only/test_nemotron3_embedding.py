@@ -8,6 +8,7 @@ nvidia/Nemotron-3-Embed-1B (bare ``Ministral3Model``, ``is_causal=false``,
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -18,10 +19,12 @@ from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import Ministral3Config, Ministral3Model, PreTrainedTokenizerFast
 
 from sglang import Engine
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_npu
+from sglang.test.ci.ci_register import register_cuda_ci, register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-small")
+register_npu_ci(est_time=120, suite="extra-b-test-1-npu-a3")
 
 PROMPTS = ["t3 t4", "t5 t6 t7 t8 t9", " ".join(["t10", "t11"] * 24)]
 
@@ -62,12 +65,12 @@ class TestNemotron3Embedding(CustomTestCase):
             eos_token="t2",
         )
 
-        cls.references = []
         with torch.no_grad():
-            for prompt in PROMPTS:
-                tokens = tokenizer(prompt, return_tensors="pt")
-                hidden = hf_model(**tokens).last_hidden_state
-                cls.references.append(F.normalize(hidden.mean(dim=1), dim=-1)[0])
+            tokens = tokenizer(PROMPTS, padding=True, return_tensors="pt")
+            mask = tokens.attention_mask.unsqueeze(-1)
+            hidden = hf_model(**tokens).last_hidden_state
+            pooled = (hidden.float() * mask).sum(dim=1) / mask.sum(dim=1)
+            cls.references = F.normalize(pooled, dim=-1)
 
         cls.model_dir = tempfile.TemporaryDirectory()
         hf_model.save_pretrained(cls.model_dir.name)
@@ -103,6 +106,7 @@ class TestNemotron3Embedding(CustomTestCase):
         finally:
             engine.shutdown()
 
+    @unittest.skipIf(is_npu(), "the Ascend runtime uses BF16 attention")
     def test_fp32_torch_native_matches_hf(self):
         def assert_close(actual, expected):
             torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-4)
@@ -114,16 +118,46 @@ class TestNemotron3Embedding(CustomTestCase):
                 assert_close=assert_close,
             )
 
+    def _assert_bf16_close(self, actual, expected):
+        self.assertAlmostEqual(actual.norm().item(), 1.0, places=5)
+        cosine = F.cosine_similarity(actual, expected, dim=0).item()
+        self.assertGreaterEqual(cosine, 0.999)
+
     @unittest.skipUnless(
-        torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-        "requires a GPU with bf16 support",
+        is_npu() or (torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
+        "requires a BF16 GPU or an Ascend NPU",
     )
     def test_bf16_default_backend_matches_hf(self):
-        def assert_close(actual, expected):
-            cosine = F.cosine_similarity(actual, expected, dim=0).item()
-            self.assertGreaterEqual(cosine, 0.999)
+        self._check(
+            dtype="bfloat16",
+            engine_kwargs={"max_total_tokens": 2048},
+            assert_close=self._assert_bf16_close,
+        )
 
-        self._check(dtype="bfloat16", engine_kwargs={}, assert_close=assert_close)
+    @unittest.skipUnless(is_npu(), "requires an Ascend NPU")
+    def test_bf16_fia_backend_matches_hf(self):
+        with patch.dict(os.environ, {"ASCEND_USE_FIA": "1"}):
+            self._check(
+                dtype="bfloat16",
+                engine_kwargs={"max_total_tokens": 2048},
+                assert_close=self._assert_bf16_close,
+            )
+
+    @unittest.skipUnless(is_npu(), "requires an Ascend NPU")
+    def test_fp32_mean_pooling_on_npu(self):
+        from sglang.srt.layers.pooler import PoolingType
+        from sglang.srt.models.nemotron3_embedding import _FP32Pooler
+
+        # The last two tokens follow a long packed sequence.
+        hidden = torch.arange(514 * 4).reshape(514, 4).remainder(17).bfloat16()
+        lengths = [512, 2]
+        batch = SimpleNamespace(
+            extend_seq_lens=torch.tensor(lengths, device="npu"), dimensions=None
+        )
+        pooler = _FP32Pooler(pooling_type=PoolingType.MEAN, normalize=True)
+        actual = pooler(hidden.to("npu"), batch).embeddings.cpu()
+        expected = torch.stack([seq.float().mean(0) for seq in hidden.split(lengths)])
+        torch.testing.assert_close(actual, F.normalize(expected, dim=-1))
 
 
 if __name__ == "__main__":
