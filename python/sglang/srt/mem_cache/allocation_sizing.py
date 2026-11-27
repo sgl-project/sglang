@@ -123,7 +123,7 @@ def add_spec_decode_headroom_pages(
     pages = _spec_decode_headroom_pages(batch.hisparse_coordinator is not None)
     if pages == 0:
         return nxt_kv_lens, num_needed_tokens
-    row_cap = batch.req_to_token_pool.req_to_token.shape[1] // page_size * page_size
+    row_cap = batch.req_to_token_pool.row_width // page_size * page_size
     reserve = get_spec_decode_reserve()
     lens = list(nxt_kv_lens)
     extra = 0

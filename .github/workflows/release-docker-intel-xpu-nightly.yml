@@ -106,7 +106,7 @@ jobs:
             --build-arg SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git \
             --build-arg SG_LANG_KERNEL_BRANCH="${KERNEL_REF}" \
             --build-arg SG_LANG_KERNEL_SOURCE="${KERNEL_SOURCE}" \
-            --no-cache --progress=plain \
+            --pull --no-cache --progress=plain \
             -t "intel/sglang-dev:${IMAGE_TAG}" \
             "${latest_tag[@]}"
 
