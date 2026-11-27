@@ -260,3 +260,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="sampling.selected_token_logprobs",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.selected_token_logprobs:selected_token_logprobs",
+        capabilities=CUDA_ONLY,
+    )
+)

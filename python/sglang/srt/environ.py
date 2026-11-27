@@ -1770,6 +1770,9 @@ class Envs:
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
+    # Fuse selected-token logprobs for eligible DSpark verification batches.
+    # Disable to use the original log-softmax path for comparison or rollback.
+    SGLANG_ENABLE_FAST_SPEC_LOGPROBS = EnvBool(True)
 
     # ===================================================================
     # Deterministic inference and all-reduce

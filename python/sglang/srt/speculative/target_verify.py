@@ -10,6 +10,9 @@ from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.sampling.custom_logit_processor import apply_custom_logit_processor
 from sglang.srt.sampling.logit_bias import apply_logit_bias
 from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
+from sglang.srt.speculative.dspark_components.dspark_logprobs import (
+    dspark_selected_logprobs,
+)
 from sglang.srt.speculative.spec_utils import GrammarTree, build_grammar_vocab_mask
 
 if TYPE_CHECKING:
@@ -112,6 +115,12 @@ class TargetVerify(msgspec.Struct, frozen=True):
                 batch, logits_output, accept.tokens, accept_index=accept.accept_index
             )
         else:
+            fast_logprobs = dspark_selected_logprobs(
+                batch, logits_output.next_token_logits, accept.tokens
+            )
+            if fast_logprobs is not None:
+                logits_output.next_token_logprobs = fast_logprobs
+                return
             compute_spec_logprobs(
                 batch,
                 logits_output,
