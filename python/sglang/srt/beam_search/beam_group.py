@@ -24,6 +24,7 @@ split documented in coordinator.py.
 from __future__ import annotations
 
 import enum
+from collections import deque
 from typing import List, Optional, Sequence
 
 import msgspec
@@ -97,7 +98,7 @@ class BeamGroup:
         self._device_final_cum_logprobs: Optional[torch.Tensor] = None
         # Selection results staged by the launch half as (forward tick, sel),
         # consumed in tick order by commit.
-        self._pending_steps: List[tuple] = []
+        self._pending_steps: deque[tuple] = deque()
         # Set once by the coordinator when the group leaves the live set
         # (finish / abort / dead-leader); guards double bookkeeping.
         self.retired = False
@@ -187,7 +188,7 @@ class BeamGroup:
             # forward, so a later-staged step may not be readable yet.
             if up_to_tick is not None and tick > up_to_tick:
                 break
-            self._pending_steps.pop(0)
+            self._pending_steps.popleft()
             finished = (
                 self._commit_final(sel)
                 if isinstance(sel, FinalSelect)
@@ -318,10 +319,16 @@ class BeamGroup:
             BeamResult(
                 tokens=materialize_tokens(beam.leaf),
                 cum_logprob=beam.cum_logprob,
-                beam_score=self.beam_score(beam.cum_logprob, beam.num_tokens),
+                beam_score=score,
                 matched_token=beam.matched_token,
             )
-            for beam in self.completed
+            for score, beam in sorted(
+                (
+                    (self.beam_score(beam.cum_logprob, beam.num_tokens), beam)
+                    for beam in self.completed
+                ),
+                key=lambda item: item[0],
+                reverse=True,
+            )[: self.beam_width]
         ]
-        results.sort(key=lambda r: r.beam_score, reverse=True)
-        return results[: self.beam_width]
+        return results
