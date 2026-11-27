@@ -122,6 +122,14 @@ def _split_payload(payload: str, tools: Sequence[Tool]) -> tuple[str, str, str]:
             if rest.startswith("{"):
                 return tool_name, "", rest
 
+    # Name + JSON for tools not declared in `tools` (forwarded as-is).
+    brace_pos = payload.find("{")
+    if brace_pos > 0:
+        candidate_name = payload[:brace_pos].strip()
+        candidate_json = payload[brace_pos:]
+        if candidate_name and isinstance(_deserialize(candidate_json), Mapping):
+            return candidate_name, "", candidate_json
+
     return payload, "", ""
 
 
@@ -133,7 +141,8 @@ def _parse_payload(payload: str, tools: Sequence[Tool]) -> tuple[str, Dict[str, 
     if not tool_name and json_text:
         parsed = _deserialize(json_text)
         if isinstance(parsed, Mapping):
-            tool_name = parsed.get("name", "") or ""
+            raw_name = parsed.get("name")
+            tool_name = raw_name.strip() if isinstance(raw_name, str) else ""
 
     for key, value in PARAM_REGEX.findall(params_text):
         arg_key = key.strip()
@@ -213,7 +222,6 @@ class Xing4_0Detector(BaseFormatDetector):
         self._buffer += new_text
         content = ""
         calls: List[ToolCallItem] = []
-        tool_indices = self._get_tool_indices(tools)
 
         while True:
             start_idx = self._buffer.find(self.bot_token)

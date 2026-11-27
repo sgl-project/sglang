@@ -29,6 +29,10 @@ def _json_call(name: str, arguments: dict) -> str:
     return f"{TOOL_START}{payload}{TOOL_END}"
 
 
+def _raw_call(payload: str) -> str:
+    return f"{TOOL_START}{payload}{TOOL_END}"
+
+
 def _tools() -> list[Tool]:
     return [
         Tool(
@@ -143,6 +147,68 @@ class TestXing4_0DetectorNonStream(CustomTestCase):
 
         self.assertEqual(result.calls, [])
 
+    def test_declared_name_json_format_is_supported(self):
+        text = _raw_call('get_weather{"city": "Paris", "count": 2}')
+
+        result = Xing4_0Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"city": "Paris", "count": 2}
+        )
+
+    def test_undeclared_name_json_format_dropped_by_default(self):
+        text = _raw_call('get_time{"timezone": "UTC"}')
+
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(False):
+            result = Xing4_0Detector().detect_and_parse(text, _tools_without_time())
+
+        self.assertEqual(result.calls, [])
+        self.assertNotIn(TOOL_START, result.normal_text)
+
+    def test_undeclared_name_json_format_forwarded_when_enabled(self):
+        text = _raw_call('get_time{"timezone": "UTC"}')
+
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            result = Xing4_0Detector().detect_and_parse(text, _tools_without_time())
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_time")
+        self.assertEqual(result.calls[0].tool_index, 0)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"timezone": "UTC"})
+
+    def test_bare_name_json_format_still_parses_without_arguments(self):
+        text = _raw_call("get_time")
+
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            result = Xing4_0Detector().detect_and_parse(text, _tools_without_time())
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_time")
+        self.assertEqual(json.loads(result.calls[0].parameters), {})
+
+    def test_invalid_name_is_skipped_and_keeps_other_calls(self):
+        payloads = [
+            '{"name": 123, "arguments": {}}',
+            '{"name": ["x"], "arguments": {}}',
+            '{"name": "   ", "arguments": {}}',
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                text = _tag_call("get_weather", [("city", "Paris")]) + _raw_call(
+                    payload
+                )
+
+                with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+                    result = Xing4_0Detector().detect_and_parse(
+                        text, _tools_without_time()
+                    )
+
+                self.assertEqual([call.name for call in result.calls], ["get_weather"])
+                self.assertEqual(
+                    json.loads(result.calls[0].parameters), {"city": "Paris"}
+                )
+
     def test_repeated_call_gets_sequential_indices(self):
         text = _tag_call("get_weather", [("city", "Paris")]) + _tag_call(
             "get_weather", [("city", "London")]
@@ -212,6 +278,18 @@ class TestXing4_0DetectorStreaming(CustomTestCase):
 
     def test_forwarded_unknown_call_streams_with_arguments(self):
         text = "before" + _json_call("get_time", {"timezone": "UTC"}) + "after"
+
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            content, calls = _stream(text, _tools_without_time())
+
+        self.assertEqual(content, "beforeafter")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "get_time")
+        self.assertEqual(calls[0].tool_index, 0)
+        self.assertEqual(json.loads(calls[0].parameters), {"timezone": "UTC"})
+
+    def test_forwarded_unknown_name_json_call_streams_with_arguments(self):
+        text = "before" + _raw_call('get_time{"timezone": "UTC"}') + "after"
 
         with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
             content, calls = _stream(text, _tools_without_time())
