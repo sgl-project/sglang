@@ -109,7 +109,9 @@ class MiniMaxH3ImageVAE(MiniMaxH3VideoVAE):
 
     def tiled_encode(self, x):
         encode = super().tiled_encode
-        if self.parallel_tiling or x.ndim != 5 or x.shape[2] != 1:
+        if x.ndim != 5 or x.shape[2] != 1:
+            return encode(x)
+        if self.parallel_tiling and get_tile_parallel_state()[1] > 1:
             return encode(x)
         # The request generator samples this posterior after tile assembly.
         # On a miss, unchanged tiles can still hit their own cache entries.
