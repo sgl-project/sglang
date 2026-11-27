@@ -21,7 +21,6 @@ class LinearAttnKernelBackend(Enum):
     FLASHINFER = "flashinfer"
     FLASHKDA = "flashkda"
     FLYDSL = "flydsl"
-    FLYDSL_FUSED = "flydsl_fused"
     NVIDIA_KDA = "nvidia_kda"
     PTX_KDA = "ptx_kda"
     HELION = "helion"
@@ -50,9 +49,6 @@ class LinearAttnKernelBackend(Enum):
 
     def is_flydsl(self):
         return self == LinearAttnKernelBackend.FLYDSL
-
-    def is_flydsl_fused(self):
-        return self == LinearAttnKernelBackend.FLYDSL_FUSED
 
     def is_nvidia_kda(self):
         return self == LinearAttnKernelBackend.NVIDIA_KDA

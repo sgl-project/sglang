@@ -35,8 +35,8 @@ from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     build_track_rows,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
-    FlyDSLFusedGDNKernel,
     FlyDSLGDNKernel,
+    create_flydsl_gdn_kernel,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
@@ -340,10 +340,6 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     return "flashinfer"
 
 
-def _is_flydsl_gdn(backend: LinearAttnKernelBackend) -> bool:
-    return backend.is_flydsl() or backend.is_flydsl_fused()
-
-
 def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
     if (
         get_exec().deterministic.enable_deterministic_inference
@@ -354,8 +350,9 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
         )
-    if get_exec().deterministic.enable_deterministic_inference and _is_flydsl_gdn(
-        backends.prefill
+    if (
+        get_exec().deterministic.enable_deterministic_inference
+        and backends.prefill.is_flydsl()
     ):
         raise ValueError(
             "FlyDSL GDN prefill is not supported with "
@@ -380,18 +377,6 @@ def _validate_gdn_target_verify_layout(model_runner: ModelRunner) -> None:
         )
 
 
-def _validate_fused_flydsl_state_dtype(
-    prefill_backend: LinearAttnKernelBackend, ssm_dtype: torch.dtype
-) -> None:
-    # The fused kernel only takes a bf16 state pool; any other dtype would
-    # silently run the staged path on every batch.
-    if prefill_backend.is_flydsl_fused() and ssm_dtype != torch.bfloat16:
-        raise ValueError(
-            "--linear-attn-prefill-backend flydsl_fused requires "
-            f"--mamba-ssm-dtype bfloat16, got {ssm_dtype}."
-        )
-
-
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -402,6 +387,7 @@ class GDNKernelDispatcher:
         verify_backend: Optional[LinearAttnKernelBackend] = None,
         *,
         round_beta_to_input_dtype: bool = False,
+        ssm_state_dtype: Optional[torch.dtype] = None,
     ):
         triton_kernel = TritonGDNKernel(
             round_beta_to_input_dtype=round_beta_to_input_dtype
@@ -486,17 +472,13 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
-        elif _is_flydsl_gdn(prefill_backend):
+        elif prefill_backend.is_flydsl():
             if not _use_aiter or not is_gfx95_supported():
                 raise ValueError(
                     "The FlyDSL GDN prefill backend requires AMD gfx95 and "
                     "SGLANG_USE_AITER=1"
                 )
-            self.extend_kernel = (
-                FlyDSLFusedGDNKernel()
-                if prefill_backend.is_flydsl_fused()
-                else FlyDSLGDNKernel()
-            )
+            self.extend_kernel = create_flydsl_gdn_kernel(ssm_state_dtype)
         elif prefill_backend.is_helion():
             raise ValueError(
                 "The Helion linear-attention backend supports KDA only, not GDN."
@@ -728,6 +710,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             backends.prefill,
             backends.verify,
             round_beta_to_input_dtype=self._round_beta_to_input_dtype,
+            ssm_state_dtype=self.state_pool.mamba_cache.temporal.dtype,
         )
 
     def __init__(self, model_runner: ModelRunner):
@@ -749,9 +732,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
-        _validate_fused_flydsl_state_dtype(
-            backends.prefill, self.state_pool.mamba_cache.temporal.dtype
-        )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(

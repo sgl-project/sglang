@@ -13,11 +13,11 @@ from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
-    _validate_fused_flydsl_state_dtype,
     _validate_gdn_linear_attn_backends,
     flashinfer_gdn_prefill_default,
     validate_gdn_mis_backend,
 )
+from sglang.srt.layers.attention.linear.kernels import gdn_flydsl
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
     maybe_build_flashinfer_checkpoint_plan,
@@ -25,6 +25,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
 from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
     FlyDSLFusedGDNKernel,
     FlyDSLGDNKernel,
+    create_flydsl_gdn_kernel,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -566,72 +567,81 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                     GDNKernelDispatcher(decode_backend, prefill_backend)
 
     def test_flydsl_is_a_cli_choice(self):
-        for choice in ("flydsl", "flydsl_fused"):
-            with self.subTest(choice=choice):
-                self.assertIn(choice, LINEAR_ATTN_KERNEL_BACKEND_CHOICES)
-                LinearAttnKernelBackend(choice)
+        self.assertIn("flydsl", LINEAR_ATTN_KERNEL_BACKEND_CHOICES)
 
     def test_flydsl_rejects_decode_and_verify_on_every_platform(self):
-        for flydsl in ("flydsl", "flydsl_fused"):
-            cases = (
-                {"linear_attn_backend": flydsl},
-                {"linear_attn_decode_backend": flydsl},
-                {"linear_attn_verify_backend": flydsl},
-            )
-            for flags in cases:
-                for is_cuda in (True, False):
-                    with (
-                        self.subTest(flags=flags, is_cuda=is_cuda),
-                        override_platform(is_sm100=False),
-                        override_platform(is_cuda=is_cuda),
-                    ):
-                        args = ServerArgs(model_path="dummy", **flags)
-                        with self.assertRaisesRegex(ValueError, "prefill only"):
-                            handle_linear_attn_backend(args)
+        cases = (
+            {"linear_attn_backend": "flydsl"},
+            {"linear_attn_decode_backend": "flydsl"},
+            {"linear_attn_verify_backend": "flydsl"},
+        )
+        for flags in cases:
+            for is_cuda in (True, False):
+                with (
+                    self.subTest(flags=flags, is_cuda=is_cuda),
+                    override_platform(is_sm100=False),
+                    override_platform(is_cuda=is_cuda),
+                ):
+                    args = ServerArgs(model_path="dummy", **flags)
+                    with self.assertRaisesRegex(ValueError, "prefill only"):
+                        handle_linear_attn_backend(args)
 
-            with override_platform(is_sm100=False), override_platform(is_cuda=False):
-                handle_linear_attn_backend(
-                    ServerArgs(model_path="dummy", linear_attn_prefill_backend=flydsl)
-                )
+        with override_platform(is_sm100=False), override_platform(is_cuda=False):
+            handle_linear_attn_backend(
+                ServerArgs(model_path="dummy", linear_attn_prefill_backend="flydsl")
+            )
 
     def test_flydsl_prefill_dispatch_requires_gfx95_and_aiter(self):
-        triton = LinearAttnKernelBackend.TRITON
-        kernel_classes = {
-            LinearAttnKernelBackend.FLYDSL: "FlyDSLGDNKernel",
-            LinearAttnKernelBackend.FLYDSL_FUSED: "FlyDSLFusedGDNKernel",
-        }
-        for prefill, kernel_class in kernel_classes.items():
-            for use_aiter, gfx95 in ((False, True), (True, False)):
-                with (
-                    self.subTest(prefill=prefill, use_aiter=use_aiter, gfx95=gfx95),
-                    patch.object(gdn_backend, "_use_aiter", use_aiter),
-                    patch.object(gdn_backend, "is_gfx95_supported", return_value=gfx95),
-                ):
-                    with self.assertRaisesRegex(ValueError, "SGLANG_USE_AITER=1"):
-                        GDNKernelDispatcher(triton, prefill)
-
+        backends = (LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.FLYDSL)
+        for use_aiter, gfx95 in ((False, True), (True, False)):
             with (
-                self.subTest(prefill=prefill),
-                patch.object(gdn_backend, "_use_aiter", True),
-                patch.object(gdn_backend, "is_gfx95_supported", return_value=True),
-                patch.object(gdn_backend, "FlyDSLGDNKernel") as flydsl,
-                patch.object(gdn_backend, "FlyDSLFusedGDNKernel") as fused,
+                self.subTest(use_aiter=use_aiter, gfx95=gfx95),
+                patch.object(gdn_backend, "_use_aiter", use_aiter),
+                patch.object(gdn_backend, "is_gfx95_supported", return_value=gfx95),
             ):
-                chosen = {"FlyDSLGDNKernel": flydsl, "FlyDSLFusedGDNKernel": fused}
-                self.assertIs(
-                    GDNKernelDispatcher(triton, prefill).extend_kernel,
-                    chosen[kernel_class].return_value,
-                )
+                with self.assertRaisesRegex(ValueError, "SGLANG_USE_AITER=1"):
+                    GDNKernelDispatcher(*backends)
 
-    def test_flydsl_fused_requires_a_bf16_state_pool(self):
-        fused = LinearAttnKernelBackend.FLYDSL_FUSED
-        with self.assertRaisesRegex(ValueError, "--mamba-ssm-dtype bfloat16"):
-            _validate_fused_flydsl_state_dtype(fused, torch.float32)
-        _validate_fused_flydsl_state_dtype(fused, torch.bfloat16)
-        # The staged FlyDSL path also takes an fp32 pool.
-        _validate_fused_flydsl_state_dtype(
-            LinearAttnKernelBackend.FLYDSL, torch.float32
+        flydsl_kernel = MagicMock(spec=FlyDSLGDNKernel)
+        with (
+            patch.object(gdn_backend, "_use_aiter", True),
+            patch.object(gdn_backend, "is_gfx95_supported", return_value=True),
+            patch.object(
+                gdn_backend, "create_flydsl_gdn_kernel", return_value=flydsl_kernel
+            ) as create,
+        ):
+            dispatcher = GDNKernelDispatcher(*backends, ssm_state_dtype=torch.bfloat16)
+            self.assertIs(dispatcher.extend_kernel, flydsl_kernel)
+            create.assert_called_once_with(torch.bfloat16)
+
+    def test_flydsl_uses_the_fused_kernel_for_a_bf16_pool_on_a_capable_aiter(self):
+        fused_ops = (sentinel.fused_fn, sentinel.fused_supported)
+        cases = (
+            # (state dtype, fused kernel in AITER, expected kernel)
+            (torch.bfloat16, True, FlyDSLFusedGDNKernel),
+            (torch.float32, True, FlyDSLGDNKernel),
+            (torch.bfloat16, False, FlyDSLGDNKernel),
+            (None, True, FlyDSLGDNKernel),
         )
+        for dtype, has_fused, expected in cases:
+            with (
+                self.subTest(dtype=dtype, has_fused=has_fused),
+                patch.object(
+                    gdn_flydsl,
+                    "_load_aiter_flydsl_gdn",
+                    return_value=(sentinel.prefill, sentinel.prepare, sentinel.meta),
+                ),
+                patch.object(
+                    gdn_flydsl,
+                    "_load_aiter_fused_gdn",
+                    return_value=fused_ops if has_fused else None,
+                ),
+            ):
+                kernel = create_flydsl_gdn_kernel(dtype)
+                self.assertIs(type(kernel), expected)
+                if expected is FlyDSLFusedGDNKernel:
+                    self.assertIs(kernel._fused_fn, sentinel.fused_fn)
+                    self.assertIs(kernel._fused_supported, sentinel.fused_supported)
 
     def test_flydsl_schedule_flows_from_metadata_to_kernel(self):
         self._run_flydsl_extend(eager_mixed_as_extend=False)
@@ -733,8 +743,6 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         self.assertIsNone(final_state)
         self.assertIs(chunk_states, sentinel.h)
         self.assertIs(call["ssm_states"], state)
-        # A padded row (-1) must land on the padding sink, row 0; the pool's
-        # last row is a live slot whose state the in-place write would clobber.
         torch.testing.assert_close(
             call["cache_indices"], torch.tensor([0], dtype=torch.int32)
         )
@@ -775,6 +783,21 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         self.assertIs(result, sentinel.triton_result)
         triton_extend.assert_called_once()
         kernel._prefill_fn.assert_not_called()
+
+    def test_gdn_backend_hands_the_pool_dtype_to_the_dispatcher(self):
+        backend = object.__new__(GDNAttnBackend)
+        backend._model_runner = SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=SimpleNamespace())
+        )
+        backend.state_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(temporal=torch.empty(1, dtype=torch.bfloat16))
+        )
+        flydsl = LinearAttnKernelBackend.FLYDSL
+        triton = LinearAttnKernelBackend.TRITON
+        backends = SimpleNamespace(decode=triton, prefill=flydsl, verify=None)
+        with patch.object(gdn_backend, "GDNKernelDispatcher") as dispatcher:
+            backend._create_kernel_dispatcher(backends)
+        self.assertIs(dispatcher.call_args.kwargs["ssm_state_dtype"], torch.bfloat16)
 
     def test_flydsl_fused_writes_the_track_snapshot_in_kernel(self):
         """The backend reads the radix track snapshot only from track_state for

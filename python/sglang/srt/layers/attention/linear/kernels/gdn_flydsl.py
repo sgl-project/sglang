@@ -191,16 +191,15 @@ class FlyDSLGDNKernel(TritonGDNKernel):
 
 
 def _load_aiter_fused_gdn():
+    """The fused kernel and its support check, or None on an AITER without it
+    (it landed in ROCm/aiter#6496)."""
     try:
         from aiter.ops.flydsl.gdn_fused_prefill import (
             gdn_fused_prefill_fwd,
             gdn_fused_prefill_supported,
         )
-    except ImportError as exc:
-        raise ImportError(
-            "The fused FlyDSL GDN prefill backend requires an AITER build with "
-            "aiter.ops.flydsl.gdn_fused_prefill (ROCm/aiter#6496)."
-        ) from exc
+    except ImportError:
+        return None
     return gdn_fused_prefill_fwd, gdn_fused_prefill_supported
 
 
@@ -233,9 +232,10 @@ class FlyDSLFusedGDNKernel(FlyDSLGDNKernel):
     _logged_staged_fallback = False
     _max_seqlen_batch = None
 
-    def __init__(self):
+    def __init__(self, fused_fn, fused_supported):
         super().__init__()
-        self._fused_fn, self._fused_supported = _load_aiter_fused_gdn()
+        self._fused_fn = fused_fn
+        self._fused_supported = fused_supported
 
     def _batch_max_seqlen(self, prefill_metadata) -> int | None:
         # AITER's speed heuristic: it declines long sequences with few heads,
@@ -304,3 +304,19 @@ class FlyDSLFusedGDNKernel(FlyDSLGDNKernel):
         if track_state is not None:
             _fill_track_state_from_h(h, track_state, track_chunk_idx, query_start_loc)
         return output, final_state, h
+
+
+def create_flydsl_gdn_kernel(ssm_state_dtype: torch.dtype | None) -> FlyDSLGDNKernel:
+    """The fused kernel when the state pool is bf16 and AITER ships it, else the
+    staged kernels."""
+    if ssm_state_dtype != torch.bfloat16:
+        reason = f"it needs a bfloat16 SSM state, got {ssm_state_dtype}"
+    elif (fused := _load_aiter_fused_gdn()) is None:
+        reason = "the installed AITER lacks aiter.ops.flydsl.gdn_fused_prefill"
+    else:
+        rank0_log("FlyDSL GDN prefill: using the fused kernel.")
+        return FlyDSLFusedGDNKernel(*fused)
+    rank0_log(
+        f"FlyDSL GDN prefill: using the staged kernels; the fused one is off ({reason})."
+    )
+    return FlyDSLGDNKernel()
