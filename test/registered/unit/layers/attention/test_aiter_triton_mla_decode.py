@@ -360,7 +360,8 @@ def _metadata_backend(triton):
     backend.dcp_world_size = 1
     backend.use_mla_dcp_asm = False
     backend.page_size = _PAGE_SIZE
-    backend.max_context_len = max_context_len
+    backend.max_kv_len = max_context_len
+    backend.max_num_pages = len(_SPLIT_PAGES[0])
     backend.max_split_per_batch = 16
     backend.max_num_partitions = 1
     backend._decode_partition_buckets = []

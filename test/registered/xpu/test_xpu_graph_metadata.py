@@ -36,7 +36,8 @@ class TestXPUGraphMetadata(CustomTestCase):
         backend.attention_chunk_size = None
         backend.use_sliding_window_kv_pool = True
         backend.page_size = page_size
-        backend.max_context_len = max_context_len
+        backend.max_kv_len = max_context_len
+        backend.max_num_pages = -(-max_context_len // page_size)
 
         # Pool setup: 2 requests, stride indices at 0, 16, 32, 48.
         # Req 0 has length 32 (needs 2 pages: pos 0 and 16).
@@ -222,6 +223,7 @@ class TestXPUGraphMetadata(CustomTestCase):
                     req_to_token_pool = SimpleNamespace(
                         size=16,
                         req_to_token=torch.zeros((16, 64), dtype=torch.int32),
+                        row_width=64,
                     )
                     model_config = SimpleNamespace(
                         is_multimodal=False,
