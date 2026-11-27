@@ -5118,7 +5118,11 @@ class DeepseekSparseAttnBackend(
             # Check if sequence meets criteria for MHA_ONE_SHOT
             assert forward_batch.seq_lens_cpu is not None
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
-            sum_seq_lens = sum(forward_batch.seq_lens_cpu)
+            sum_seq_lens = (
+                int(forward_batch.seq_lens_sum)
+                if getattr(forward_batch, "seq_lens_sum", None) is not None
+                else int(forward_batch.seq_lens_cpu.sum())
+            )
             device_sm = get_device_sm()
 
             # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
