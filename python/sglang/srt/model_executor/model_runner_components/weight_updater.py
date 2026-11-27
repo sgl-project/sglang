@@ -28,6 +28,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils.xpu_tensor_shm import release_unread
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -529,6 +530,14 @@ def unwrap_local_serialized_tensors(named_tensors, device: str):
         (name, _unwrap_tensor(tensor, tp_rank=tp_rank, device=current_device))
         for name, tensor in named_tensors
     ]
+
+
+def release_local_serialized_tensors(named_tensors) -> None:
+    """Count this rank out of the per-rank payloads it will not unwrap."""
+    tp_rank = get_parallel().tp_rank
+    for _, tensor in named_tensors:
+        if isinstance(tensor, LocalSerializedTensor):
+            release_unread(tensor.values[tp_rank])
 
 
 @dataclass
