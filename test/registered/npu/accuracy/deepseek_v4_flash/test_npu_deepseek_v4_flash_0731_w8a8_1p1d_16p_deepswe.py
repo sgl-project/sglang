@@ -1,4 +1,3 @@
-import importlib.util
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
@@ -6,10 +5,6 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-)
-from sglang.test.ascend.test_ascend_utils import (
-    append_ld_library_path,
-    write_memfabric_tent_conf,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -19,16 +14,11 @@ register_npu_ci(
     nightly=True,
 )
 
-MOONCAKE_INSTALLED = importlib.util.find_spec("mooncake") is not None
-DISAGGREGATION_TRANSFER_BACKEND = "mooncake" if MOONCAKE_INSTALLED else "ascend"
-
-# Mooncake + TENT + MemFabric, only used when the Mooncake package is present.
-MOONCAKE_ENVS = {
-    "MC_USE_TENT": "1",
-    "MF_PROTOCOL": "device_sdma",
-    "MF_TRANSFER_TIMEOUT": "10000",
-    "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
-}
+# Transfer through Ascend's native backend even when mooncake is installed.
+# With mooncake, its PD registration rejects this DSPARK + prefill(pp=2)
+# deployment ("PD KV layout mismatch ... prefill=4096 decode=32768"), so every
+# chat request fails with 500 before any KV moves.
+DISAGGREGATION_TRANSFER_BACKEND = "ascend"
 
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -214,9 +204,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
-# Model config for DSV4-Flash-0731 W8A8 1P+1D PD-Sep deployment. The env
-# overrides are applied per class in setUpClass so the Mooncake envs only land
-# on nodes where the Mooncake package is installed.
+# Model config for DSV4-Flash-0731 W8A8 1P+1D PD-Sep deployment.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG = {
     "model_path": DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     "prefill_args": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS,
@@ -274,12 +262,6 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPDeepSWE(
     @classmethod
     def setUpClass(cls):
         common_envs = dict(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS)
-        if MOONCAKE_INSTALLED:
-            common_envs.update(MOONCAKE_ENVS)
-            common_envs["MC_TENT_CONF"] = write_memfabric_tent_conf()
-            common_envs["LD_LIBRARY_PATH"] = append_ld_library_path(
-                ("memfabric_hybrid", "lib"), ("mooncake", None)
-            )
         cls.model_config = {
             **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG,
             "prefill_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS),
