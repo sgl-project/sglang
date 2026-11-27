@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
+from math import lcm
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -39,7 +40,6 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
-from sglang.srt.mem_cache.deepseek_v4_compress_state import offline_compress_state_rows
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -1541,9 +1541,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if not self.num_layers(4):
             return kv_bytes
         ring = self.ring_sizes[4]
-        state_rows = offline_compress_state_rows(
-            swa_tokens // self.page_size * ring, ring, 4, ring
-        )
+        state_size = swa_tokens // self.page_size * ring
+        state_rows = ceil_align(state_size + ring + 1, lcm(4, ring))
         state_row_bytes = 4 * (self.attn_head_dim + self.indexer_head_dim)
         return (
             kv_bytes
@@ -1818,9 +1817,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             state_last_dim = 3 * self.attn_head_dim
         else:
             state_pool_size = num_req_slots * ring_size
-            state_rows = offline_compress_state_rows(
-                state_pool_size, ring_size, 128, ring_size if _is_npu else 1
-            )
+            # NPU exposes state in ring-sized banks; GPU uses flat storage.
+            pad_to = lcm(128, ring_size) if _is_npu else 128
+            state_rows = ceil_align(state_pool_size + ring_size + 1, pad_to)
             state_last_dim = 2 * self.attn_head_dim
 
         return state_rows * state_last_dim * c128_state_dtype_size * num_layers
@@ -1834,9 +1833,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_size = self.ring_sizes[2]
-        state_rows = offline_compress_state_rows(
-            num_req_slots * ring_size, ring_size, 2, ring_size if _is_npu else 1
-        )
+        pad_to = lcm(2, ring_size) if _is_npu else 2
+        state_rows = ceil_align(num_req_slots * ring_size + ring_size + 1, pad_to)
         state_last_dim = 2 * self.attn_head_dim
         return state_rows * state_last_dim * torch.float32.itemsize * num_layers
 
