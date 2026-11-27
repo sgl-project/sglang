@@ -644,20 +644,13 @@ def test_sensenova_u1_batch_cost_tracks_resolution_steps_and_cfg():
 
 def test_sensenova_u1_multi_output_request_is_not_dynamically_batched():
     scheduler = object.__new__(Scheduler)
-    scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(), batching_mode="dynamic"
+    )
     sampling = SenseNovaU1SamplingParams(
         prompt="a mountain lake", num_outputs_per_prompt=2
     )
-    request = SimpleNamespace(
-        is_warmup=False,
-        realtime_session_id=None,
-        session=None,
-        prompt=sampling.prompt,
-        image_path=None,
-        return_file_paths_only=False,
-        num_outputs_per_prompt=2,
-        sampling_params=sampling,
-    )
+    request = Req(sampling_params=sampling)
 
     assert not scheduler._can_dynamic_batch(request, request)
     assert (
@@ -668,11 +661,13 @@ def test_sensenova_u1_multi_output_request_is_not_dynamically_batched():
 
 def test_sensenova_u1_think_mode_request_is_dispatched_without_batching():
     scheduler = object.__new__(Scheduler)
-    scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(), batching_mode="opt-in"
+    )
     scheduler._batch_admission = SimpleNamespace(enabled=True)
     scheduler._batch_metrics_enabled = False
     request = _make_sensenova_u1_scheduler_request(
-        "request-0", "a mountain lake", 7, think_mode=True
+        "request-0", "a mountain lake", 7, think_mode=True, allow_dynamic_batching=True
     )
     scheduler.waiting_queue = deque([(b"identity", request, time.monotonic())])
 
@@ -702,7 +697,9 @@ def test_sensenova_u1_scheduler_rejects_heterogeneous_generation_options(
     sampling_overrides,
 ):
     scheduler = object.__new__(Scheduler)
-    scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(), batching_mode="dynamic"
+    )
     base = _make_sensenova_u1_scheduler_request("request-0", "first", 7)
     candidate = _make_sensenova_u1_scheduler_request(
         "request-1", "second", 19, **sampling_overrides
@@ -713,7 +710,9 @@ def test_sensenova_u1_scheduler_rejects_heterogeneous_generation_options(
 
 def test_sensenova_u1_scheduler_normalizes_single_output_seed_lists():
     scheduler = object.__new__(Scheduler)
-    scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(), batching_mode="dynamic"
+    )
     requests = [
         _make_sensenova_u1_scheduler_request("request-0", "first", [7]),
         _make_sensenova_u1_scheduler_request("request-1", "second", 19),
@@ -726,7 +725,9 @@ def test_sensenova_u1_scheduler_normalizes_single_output_seed_lists():
 
 def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
     scheduler = object.__new__(Scheduler)
-    scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(), batching_mode="dynamic"
+    )
     requests = [
         _make_sensenova_u1_scheduler_request(
             "request-0",

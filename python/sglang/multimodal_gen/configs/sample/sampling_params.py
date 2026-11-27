@@ -330,8 +330,8 @@ class SamplingParams:
     # Batch info
     num_outputs_per_prompt: int = 1
     # Admission only: this request may share a scheduler batch with other requests.
-    allow_dynamic_batching: bool = field(
-        default=True, metadata={"batch_sig_exclude": True}
+    allow_dynamic_batching: bool | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
     )
     seed: int | list[int] = field(default=42, metadata={"batch_sig_exclude": True})
     generator_device: str | None = None  # None means use the pipeline/model default
@@ -655,7 +655,9 @@ class SamplingParams:
 
         self.quality = normalize_quality(self.quality)
 
-        if not isinstance(self.allow_dynamic_batching, bool):
+        if self.allow_dynamic_batching is not None and not isinstance(
+            self.allow_dynamic_batching, bool
+        ):
             raise ValueError("allow_dynamic_batching must be a boolean")
 
         resolve_skip_softmax_params(self.skip_softmax_params)

@@ -16,14 +16,22 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 
 @pytest.mark.parametrize("disaggregated_ar", [False, True])
-@pytest.mark.parametrize("cap,first_dispatch", [(1, ["a"]), (2, ["a", "c"])])
+@pytest.mark.parametrize(
+    "mode,cap,dispatches",
+    [
+        ("dynamic", 1, [["a"], ["b"], ["c"], ["d"]]),
+        ("opt-in", 1, [["a"], ["b"], ["c"], ["d"]]),
+        ("dynamic", 2, [["a", "b"], ["c"], []]),  # d still waits for a partner
+        ("opt-in", 2, [["a", "d"], ["b"], ["c"]]),
+    ],
+)
 def test_mixed_queue_respects_request_and_server_policy(
-    disaggregated_ar, cap, first_dispatch
+    disaggregated_ar, mode, cap, dispatches
 ):
     args = SimpleNamespace(
         pipeline_config=FluxPipelineConfig(),
         model_path="flux",
-        batching_mode="dynamic",
+        batching_mode=mode,
         batching_max_size=cap,
         batching_config=None,
         batching_delay_ms=60000,
@@ -32,9 +40,10 @@ def test_mixed_queue_respects_request_and_server_policy(
     requests = [
         Req(request_id=key, sampling_params=SamplingParams(prompt=key, **options))
         for key, options in [
-            ("a", {}),
-            ("b", {"allow_dynamic_batching": False}),
-            ("c", {"allow_dynamic_batching": True}),
+            ("a", {"allow_dynamic_batching": True}),
+            ("b", {}),
+            ("c", {"allow_dynamic_batching": False}),
+            ("d", {"allow_dynamic_batching": True}),
         ]
     ]
     now = time.monotonic()
@@ -57,6 +66,8 @@ def test_mixed_queue_respects_request_and_server_policy(
         def dispatch():
             state.active_ar_batch = None
             server._dispatch_glm_ar_batch_if_ready()
+            if state.active_ar_batch is None:
+                return []
             return [item.req.request_id for item in state.active_ar_batch[1]]
 
     else:
@@ -69,7 +80,9 @@ def test_mixed_queue_respects_request_and_server_policy(
         scheduler.waiting_queue = deque((None, req, now) for req in requests)
 
         def dispatch():
-            return [req.request_id for _, req in scheduler.get_next_batch_to_run()]
+            return [
+                req.request_id for _, req in scheduler.get_next_batch_to_run() or []
+            ]
 
-    assert dispatch() == first_dispatch
-    assert dispatch() == ["b"]
+    for expected in dispatches:
+        assert dispatch() == expected

@@ -45,23 +45,29 @@ Use `--batching-config /path/to/batching_config.json` to load JSON rules when a 
 
 ## Per-request control
 
-On a batching-enabled server, send `allow_dynamic_batching: false` to run an
-image or video request without merging it with other requests. Once it reaches
-the head of the queue, the scheduler does not wait for a batch partner. This is
-not a priority setting and does not change the number of outputs (`n`).
+To serve interactive and offline traffic on the same endpoint, start the server
+with `--batching-mode opt-in --batching-max-size 4`. Interactive clients need
+no changes. Offline clients can opt in on each request:
 
 ```python
 client.images.generate(
     model="black-forest-labs/FLUX.1-dev",
     prompt="A studio portrait",
-    extra_body={"allow_dynamic_batching": False},
+    extra_body={"allow_dynamic_batching": True},
 )
 ```
 
-Omitting the field (or sending `true`) follows the deployment policy. A
-request cannot enable batching on a singleton server, raise the batch cap, or
-force incompatible requests to run together.
-For the action API, put the boolean in `runtime.allow_dynamic_batching`.
+| Image/video request | `dynamic` (default) | `opt-in` |
+| --- | --- | --- |
+| Field omitted | Eligible to batch | Run alone |
+| `allow_dynamic_batching: true` | Eligible to batch | Eligible to batch |
+| `allow_dynamic_batching: false` | Run alone | Run alone |
+
+Only compatible, eligible requests can merge. Neither mode overrides
+`--batching-max-size 1` or adds batching support to a pipeline. A request that
+runs alone does not wait for a batch partner once it reaches the head of the
+queue; it does not get higher priority or change its number of outputs (`n`).
+For the action API, set `runtime.allow_dynamic_batching`.
 
 HunyuanImage-3 also accepts two independent image request fields:
 
