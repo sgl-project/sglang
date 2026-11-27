@@ -16,9 +16,10 @@ from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResu
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     accept_draft_tokens,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=65, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 DEVICE = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
 
@@ -473,6 +474,7 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
                 is_any_greedy=any_greedy,
                 need_top_k_sampling=False,
                 need_top_p_sampling=False,
+                need_min_p_sampling=False,
                 temperatures=torch.ones(batch, 1, device=DEVICE),
             ),
             draft_input=SimpleNamespace(max_top_k=1, uniform_top_k_value=None),
@@ -529,6 +531,7 @@ def test_ragged_cutoff_preserves_distribution(block):
             is_any_greedy=False,
             need_top_k_sampling=False,
             need_top_p_sampling=False,
+            need_min_p_sampling=False,
             temperatures=torch.ones(batch, 1, device=DEVICE),
         ),
         draft_input=SimpleNamespace(max_top_k=1, uniform_top_k_value=None),
