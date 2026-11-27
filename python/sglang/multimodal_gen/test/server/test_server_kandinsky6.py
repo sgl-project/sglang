@@ -22,6 +22,7 @@ from sglang.multimodal_gen.test.test_utils import (
     extract_audio_pcm_from_video_bytes,
     get_dynamic_server_port,
 )
+from sglang.test.test_utils import admin_post
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("SGLANG_KANDINSKY6_TEST_MODEL"),
@@ -198,7 +199,7 @@ def test_lora_scaling_repeatability_and_restore(server, lora_adapter, merge_mode
     baseline = _generate_video(server, enable_cache_dit=False)
 
     def set_strength(strength):
-        response = requests.post(
+        response = admin_post(
             f"{base_url}/set_lora",
             json={
                 "lora_nickname": "kandinsky6_synthetic",
@@ -235,7 +236,7 @@ def test_lora_scaling_repeatability_and_restore(server, lora_adapter, merge_mode
         for actual, expected in zip(restored_adapter, adapted, strict=True):
             np.testing.assert_array_equal(actual, expected)
     finally:
-        response = requests.post(
+        response = admin_post(
             f"{base_url}/unmerge_lora_weights",
             json={"target": "transformer"},
             timeout=180,

@@ -549,7 +549,6 @@ class MMEncoder:
         argument."""
         assert_published(server_args, role="encoder")
         logger.info(f"init MMEncoder {rank}/{get_parallel().tp_size}")
-        self.server_args = server_args
         configure_media_url_security(
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
@@ -559,9 +558,6 @@ class MMEncoder:
         self.transfer_backend = get_disagg().encoder_transfer_backend
         self.use_mooncake = self.transfer_backend == "mooncake"
         self.rank = rank
-        # DP rank for metric labels; overridden by runtime.run_dp_worker.
-        # 0 in the single-instance (non-DP) path.
-        self.dp_rank = 0
         self.profiler = EncoderProfiler(rank)
 
         self.model_config = ModelConfig.from_server_args(
@@ -1925,11 +1921,9 @@ class MMEncoder:
         self,
         embedding: torch.Tensor,
         mm_data: EmbeddingData,
+        url: str,
         session_id=None,
         buffer_address=None,
-        prefill_host=None,
-        embedding_port=None,
-        url=None,
     ):
         if get_disagg().encoder_transfer_backend == "mooncake":
             # Encode is synchronous, so mm_data was staged before /encode returned.
@@ -1995,10 +1989,7 @@ class MMEncoder:
             # Sibling ranks re-read mm_data here; meta_registry owns the release.
 
         # Send ack/data
-        if url is not None:
-            endpoint = NetworkAddress.parse(url).to_tcp()
-        else:
-            endpoint = NetworkAddress(prefill_host, embedding_port).to_tcp()
+        endpoint = NetworkAddress.parse(url).to_tcp()
         logger.info(f"{endpoint = }")
 
         # Serialize data
@@ -2268,9 +2259,8 @@ class MMEncoder:
             )
             mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
 
-            if self.profiler is not None:
-                for _ in requests:
-                    self.profiler.step()
+            for _ in requests:
+                self.profiler.step()
 
             return self._stage_embeddings(
                 ctx, requests, mm_embedding, keep_on_gpu=keep_on_gpu
@@ -2506,8 +2496,6 @@ async def run_encoder(
 async def _handle_encoder_worker_request(encoder: MMEncoder, request):
     if isinstance(request, ProfileReq):
         if request.req_type == ProfileReqType.START_PROFILE:
-            if encoder.profiler is None:
-                encoder.profiler = EncoderProfiler(encoder.rank)
             encoder.profiler.start(request)
         else:
             encoder.profiler.stop()

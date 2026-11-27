@@ -54,7 +54,7 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
         })
         .collect();
     let mut body = ctx.metrics.render_with_workers(&workers);
-    body.push_str(&ctx.tokenizers.stats().render());
+    body.push_str(&ctx.preprocessor.tokenizers().stats().render());
     // Pull-on-scrape, like the worker gauges above: the tree and the tally
     // own the numbers, so a worker that goes away stops emitting series
     // without anything having to reset a pushed counter.
@@ -340,7 +340,7 @@ fn render_kv_tiers(kv: &KvIndexMetrics, block_size: u32) -> String {
         kv.tree.media().hits(),
     ));
     out.push_str(
-        "# HELP sgl_router_cache_media_affinity_tiebreaks_total Lookups of a chat with images, with no remembered placement, where workers or DP ranks tied on the confirmed prefix and the conversation's rendezvous hash chose one.\n",
+        "# HELP sgl_router_cache_media_affinity_tiebreaks_total Lookups of a chat with images, with no remembered placement, where workers tied on the confirmed prefix and the conversation's rendezvous hash ordered them.\n",
     );
     out.push_str("# TYPE sgl_router_cache_media_affinity_tiebreaks_total counter\n");
     out.push_str(&format!(

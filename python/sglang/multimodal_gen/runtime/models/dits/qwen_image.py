@@ -946,6 +946,7 @@ class QwenImageCrossAttention(nn.Module):
         # self-attention: Q/K/V are concatenated before the kernel call.
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=self.num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -2203,7 +2204,6 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     """
 
-    _supports_gradient_checkpointing = True
     _no_split_modules = ["QwenImageTransformerBlock"]
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _repeated_blocks = ["QwenImageTransformerBlock"]

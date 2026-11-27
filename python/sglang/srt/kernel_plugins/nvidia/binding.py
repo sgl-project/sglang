@@ -4,11 +4,12 @@
 It checks a plugin's spec against the resolved configuration at startup, builds it
 once the model is prepared, and installs the whole-step dispatch on the model. It is
 also the one place a megakernel reads SGLang's runtime state: the KV pool, the
-attention metadata of the running forward and the Engram tables. A spec's build gets
-a ``MegakernelBinding`` as ``BuildContext.binding``; a covered forward gets the
-running forward's ``ForwardView`` as ``Step.view`` (a draft entry asks
-``binding.forward_view()``). Everything else a megakernel touches is the model it
-replaces, SGLang's kernel ops, and the reads listed below.
+attention metadata of the running forward, the DSA (sparse MLA) backend's layout and
+buffers and the Engram tables. A spec's build gets a ``MegakernelBinding`` as
+``BuildContext.binding``; a covered forward gets the running forward's
+``ForwardView`` as ``Step.view`` (a draft entry asks ``binding.forward_view()``).
+Everything else a megakernel touches is the model it replaces, SGLang's kernel ops,
+and the reads listed below.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     ENTRIES,
     ENTRY_POINT,
     FLAG,
+    FLAG_SETS_ENV,
     GRAPH_VARIANT_RUNNERS,
     BuildContext,
     BuiltMegakernel,
@@ -39,14 +41,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     SpeculativeRuntimeHooks,
     Step,
     SupportsDecodeTensorEntry,
-    SupportsDraftAccept,
-    SupportsDraftAux,
-    SupportsDraftEmbed,
-    SupportsDraftSelectorHead,
-    SupportsKdaCommit,
     SupportsPrefillBody,
-    SupportsRank0Broadcast,
-    SupportsSampledAccept,
     SupportsStateSlotReset,
     find_spec,
     registered_architectures,
@@ -56,6 +51,9 @@ from sglang.srt.arg_groups.model_override_base import model_config_of, resolving
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.amd.binding import msa_serves
 from sglang.srt.kernel_plugins.nvidia.eagle_binding import EagleBinding
+from sglang.srt.layers.attention.linear.utils import (
+    select_verify_intermediate_state_indices,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
@@ -74,6 +72,7 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -122,6 +121,18 @@ TOLERATED_READS = (
     "capture-mode queries (get_is_capture_mode, is_in_breakable_cuda_graph)",
     "MegakernelBinding.engram_host_table",  # the per-layer host table object
 )
+# Called by a megakernel on a DSA (sparse MLA) backend, tolerated until offered as
+# data.
+TOLERATED_DSA_CALLABLES = (
+    "KvPoolView.set_mla_kv_buffer",  # the MLA key write
+    "DsaView.indexer_metadata",  # the indexer's metadata of the running forward
+)
+# Written into the DSA pool by a megakernel (the step's rows, at its out_cache_loc),
+# tolerated until SGLang owns the writes.
+TOLERATED_DSA_WRITES = (
+    "KvPoolView.get_key_buffer",  # the MLA key rows
+    "KvPoolView.get_index_k_with_scale_buffer",  # the index-K rows and their scales
+)
 
 
 _VIEW_DTYPES = {
@@ -159,6 +170,10 @@ class MlaPoolView:
 class KdaStateView:
     conv: tuple[torch.Tensor, ...]
     temporal: torch.Tensor
+    # The target-verify scratch (one convolution window and the per-draft-token SSM
+    # states), indexed by KdaStepView.verify_scratch_indices; empty without it.
+    intermediate_conv_window: tuple[torch.Tensor, ...] = ()
+    intermediate_ssm: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -194,11 +209,16 @@ class MlaStepView:
     block_table: torch.Tensor
     sequence_lengths: torch.Tensor
     write_slots: torch.Tensor
+    # Token rows per request: 1 for a decode step, the draft tokens for a target verify.
+    tokens_per_request: int = 1
 
 
 @dataclass(frozen=True)
 class KdaStepView:
     state_indices: torch.Tensor
+    # [requests] int32: each request's row in the verify scratch; None outside a
+    # target verify.
+    verify_scratch_indices: Optional[torch.Tensor] = None
 
     def track_decode_state(self, layer_id: int) -> None:
         # SGLang snapshots the completed states once after the fused forward.
@@ -209,6 +229,9 @@ class KdaStepView:
 class HybridStepView:
     mla: MlaStepView
     kda: KdaStepView
+    # [tokens, width] the DFlash-family draft's input taps a target verify writes;
+    # None outside a target verify.
+    aux_hidden_states: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -260,6 +283,97 @@ class KvPoolView:
     def set_swa_key_buffer_radix_fused_norm_rope(self) -> Callable[..., None]:
         return self.pool.set_swa_key_buffer_radix_fused_norm_rope
 
+    # MLA / DSA pools
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.pool.get_index_k_with_scale_buffer(layer_id)
+
+    @property
+    def index_page_size(self) -> Optional[int]:
+        """Tokens per page of the index-K buffer; None for a pool without one."""
+        return getattr(self.pool, "index_page_size", None)
+
+    def set_mla_kv_buffer(self, *args: Any, **kwargs: Any) -> None:
+        # Forwards the loc argument untouched, as a pool write door must.
+        return self.pool.set_mla_kv_buffer(*args, **kwargs)
+
+
+class DsaView:
+    """The running DSA (sparse MLA) backend's layout and the buffers its decode
+    uses, under names a megakernel can rely on."""
+
+    def __init__(self, backend: Any):
+        self._backend = backend
+
+    @property
+    def kv_lora_rank(self) -> int:
+        return self._backend.kv_lora_rank
+
+    @property
+    def qk_nope_head_dim(self) -> int:
+        return self._backend.qk_nope_head_dim
+
+    @property
+    def qk_rope_head_dim(self) -> int:
+        return self._backend.qk_rope_head_dim
+
+    @property
+    def kv_cache_dim(self) -> int:
+        return self._backend.kv_cache_dim
+
+    @property
+    def physical_page_size(self) -> int:
+        return self._backend.physical_page_size
+
+    @property
+    def decode_impl(self) -> str:
+        return self._backend.dsa_decode_impl
+
+    @property
+    def use_mha(self) -> bool:
+        """Whether the running forward takes the MHA path instead of MLA."""
+        return self._backend.use_mha
+
+    @property
+    def kv_cache_dtype(self) -> torch.dtype:
+        return self._backend.kv_cache_dtype
+
+    @property
+    def use_fused_topk(self) -> bool:
+        return self._backend.use_fused_topk
+
+    @property
+    def topk_backend(self) -> Any:
+        return self._backend.dsa_topk_backend
+
+    @property
+    def dcp_size(self) -> int:
+        return self._backend.attn_dcp_size
+
+    @property
+    def index_kpool(self) -> int:
+        return self._backend.dsa_index_kpool
+
+    @property
+    def hisparse(self) -> bool:
+        return self._backend.hisparse_coordinator is not None
+
+    @property
+    def workspace_buffer(self) -> Optional[torch.Tensor]:
+        """The decode kernels' workspace, or None when the backend has none."""
+        return self._backend.workspace_buffer
+
+    @property
+    def multi_ctas_kv_counter_buffer(self) -> Optional[torch.Tensor]:
+        """The TRT-LLM decode's multi-CTA KV counter, sized before the decode graphs
+        are captured; None when the backend has none."""
+        return self._backend._multi_ctas_kv_counter_buffer
+
+    @property
+    def indexer_metadata(self) -> Callable[[int, Any], Any]:
+        """The backend's indexer metadata of the running forward, by
+        (layer_id, forward_batch)."""
+        return self._backend.get_indexer_metadata
+
 
 class ForwardView:
     """The running forward's attention data, read from its attention backend; built
@@ -302,6 +416,11 @@ class ForwardView:
     def core_compressor(self) -> Callable[..., Any]:
         return self._backend.forward_core_compressor
 
+    @property
+    def dsa(self) -> Optional[DsaView]:
+        """The DSA backend's view, or None when the running backend is not DSA."""
+        return _dsa_view(self._backend)
+
 
 class MegakernelBinding:
     """Built at install, before the KV pools exist; read at build or forward. Each
@@ -315,6 +434,12 @@ class MegakernelBinding:
         # (pool, req_pool) and their tensor identities
         self._hybrid_sources: Optional[tuple] = None
         self._hybrid_identity: Optional[tuple] = None
+        # a sealed source assert_live does not re-read itself -> its re-read
+        self._sources: dict[str, Callable[[], Any]] = {}
+        self._dsa_backends: list[AttentionBackend] = []
+        # The target verify's auxiliary hidden-state width and dtype (0: none)
+        self._aux_width = 0
+        self._aux_dtype: Optional[torch.dtype] = None
 
     def forward_view(
         self, forward_batch: Any = None
@@ -338,29 +463,80 @@ class MegakernelBinding:
             else:
                 block_table = full.block_kv_indices
                 lengths = full.seq_lens_k
+            verify = (
+                self._verify_step(backend, forward_batch)
+                if forward_batch.forward_mode.is_target_verify()
+                else {}
+            )
             return HybridForwardView(
                 hybrid=HybridStepView(
                     mla=MlaStepView(
                         block_table=block_table,
                         sequence_lengths=lengths,
                         write_slots=forward_batch.out_cache_loc,
+                        tokens_per_request=verify.get("tokens_per_request", 1),
                     ),
-                    kda=KdaStepView(state_indices=linear.mamba_cache_indices),
+                    kda=KdaStepView(
+                        state_indices=linear.mamba_cache_indices,
+                        verify_scratch_indices=verify.get("verify_scratch_indices"),
+                    ),
+                    aux_hidden_states=verify.get("aux_hidden_states"),
                 )
             )
-        return ForwardView(backend, self._seal_cache)
+        view = ForwardView(backend, self._seal_cache)
+        dsa = view.dsa
+        if dsa is not None:
+            self._seal_dsa_buffers(backend, dsa)
+        return view
 
     def prefill_view(self) -> ForwardView:
         """The view for an eager prefill step, without graph-static decode metadata."""
         return self.forward_view(forward_batch=None)
 
+    def _verify_step(self, backend: Any, forward_batch: Any) -> dict:
+        """A hybrid target verify's rows per request, each request's verify scratch
+        row and the auxiliary hidden-state rows the draft reads."""
+        linear = backend.linear_attn_backend
+        num_requests = int(forward_batch.batch_size)
+        tokens_per_request = int(forward_batch.spec_info.draft_token_num)
+        scratch = None
+        if linear.verify_intermediate_state_indices is not None:
+            cache_indices = linear.forward_metadata.mamba_cache_indices
+            scratch = select_verify_intermediate_state_indices(
+                linear.verify_intermediate_state_indices,
+                forward_batch.req_pool_indices,
+                lambda: cache_indices[:num_requests] >= 0,
+                linear.req_to_token_pool.size,
+            )[:num_requests]
+        aux = forward_batch.aux_hidden_states_buffer
+        if aux is None and self._aux_width > 0:
+            # A captured verify reads the graph runner's buffer; an eager one gets its own.
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "megakernel binding: a captured target verify needs the graph "
+                    "runner's auxiliary hidden-state buffer"
+                )
+            aux = torch.empty(
+                (num_requests * tokens_per_request, self._aux_width),
+                dtype=self._aux_dtype,
+                device=forward_batch.input_ids.device,
+            )
+            forward_batch.aux_hidden_states_buffer = aux
+        return {
+            "tokens_per_request": tokens_per_request,
+            "verify_scratch_indices": scratch,
+            "aux_hidden_states": aux,
+        }
+
     def preparation_view(self, model_runner: ModelRunner) -> PreparationView:
+        self._aux_width = model_runner.get_aux_hidden_states_width()
+        self._aux_dtype = model_runner.dtype
         return self.pool_view(
             model_runner.token_to_kv_pool, model_runner.req_to_token_pool
         )
 
     def pool_view(self, pool: Any, req_pool: Any) -> PreparationView:
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MambaPool
 
         if not (isinstance(pool, HybridLinearKVPool) and pool.use_mla):
             return PreparationView()
@@ -374,8 +550,17 @@ class MegakernelBinding:
         states = {}
         for layer in mamba_mapping:
             state = req_pool.mamba_pool.mamba2_layer_cache(req_pool.mamba_map[layer])
+            verifies = (
+                isinstance(state, MambaPool.SpeculativeState)
+                and state.intermediate_ssm is not None
+            )
             states[layer] = KdaStateView(
-                conv=tuple(state.conv), temporal=state.temporal
+                conv=tuple(state.conv),
+                temporal=state.temporal,
+                intermediate_conv_window=(
+                    tuple(state.intermediate_conv_window) if verifies else ()
+                ),
+                intermediate_ssm=state.intermediate_ssm if verifies else None,
             )
         indexer = None
         if pool.use_dsa:
@@ -416,6 +601,8 @@ class MegakernelBinding:
 
     @staticmethod
     def _pool_identity(pool: Any, req_pool: Any) -> tuple:
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+
         full = pool.full_kv_pool
         tensors = list(full.kv_buffer)
         if pool.use_dsa:
@@ -423,6 +610,13 @@ class MegakernelBinding:
         for layer in req_pool.mamba_map:
             state = req_pool.mamba_pool.mamba2_layer_cache(req_pool.mamba_map[layer])
             tensors.extend((*state.conv, state.temporal))
+            if (
+                isinstance(state, MambaPool.SpeculativeState)
+                and state.intermediate_ssm is not None
+            ):
+                tensors.extend(
+                    (*state.intermediate_conv_window, state.intermediate_ssm)
+                )
         return tuple(_identity(tensor) for tensor in tensors)
 
     def finish_step(self, forward_batch: Any) -> None:
@@ -464,7 +658,11 @@ class MegakernelBinding:
             and self._pool_identity(*self._hybrid_sources) != self._hybrid_identity
         ):
             raise RuntimeError("megakernel hybrid buffers changed after preparation")
-        current = {"kv_pool": self._current_pool, "engram_history": self._history}
+        current = {
+            "kv_pool": self._current_pool,
+            "engram_history": self._history,
+            **self._sources,
+        }
         for name, sealed in self._sealed.items():
             if _identity(current[name]()) != sealed:
                 raise RuntimeError(
@@ -487,16 +685,52 @@ class MegakernelBinding:
                 "after its first read"
             )
 
-    def _seal(self, name: str, value: Any) -> None:
+    def _seal(
+        self, name: str, value: Any, current: Optional[Callable[[], Any]] = None
+    ) -> None:
         self._sealed.setdefault(name, _identity(value))
+        if current is not None:
+            self._sources.setdefault(name, current)
 
     def _current_pool(self) -> Any:
         return get_attn_backend().token_to_kv_pool
+
+    def _seal_dsa_buffers(self, backend: AttentionBackend, dsa: DsaView) -> None:
+        # An EAGLE draft runs one DSA backend per step and one for draft extend,
+        # each owning its KV counter; each backend's buffers are sealed by its index.
+        index = next(
+            (i for i, known in enumerate(self._dsa_backends) if known is backend), None
+        )
+        if index is None:
+            index = len(self._dsa_backends)
+            self._dsa_backends.append(backend)
+        for name, buffer in _dsa_buffers(dsa).items():
+            if buffer is not None:
+                self._seal(
+                    f"{name}[{index}]",
+                    buffer,
+                    lambda name=name: _dsa_buffers(dsa)[name],
+                )
 
     def _history(self) -> Optional[torch.Tensor]:
         # only models with Engram layers have a hasher
         hasher = getattr(self.model, "engram_hasher", None)
         return None if hasher is None else hasher.history
+
+
+def _dsa_view(backend: Any) -> Optional[DsaView]:
+    # only the DSA backend resolves a DSA decode implementation
+    if getattr(backend, "dsa_decode_impl", None) is None:
+        return None
+    return DsaView(backend)
+
+
+def _dsa_buffers(dsa: DsaView) -> dict[str, Optional[torch.Tensor]]:
+    """The DSA backend's buffers a captured step reads by address, sealed per backend."""
+    return {
+        "dsa_workspace": dsa.workspace_buffer,
+        "dsa_kv_counter": dsa.multi_ctas_kv_counter_buffer,
+    }
 
 
 def _identity(value: Any) -> tuple:
@@ -650,31 +884,59 @@ def _dtype_reasons(spec: Optional[MegakernelSpec], model_config: Any) -> list[st
     return [f"dtype {dtype!r} is not one of {sorted(spec.requires.dtypes)}"]
 
 
+def set_flag_env(spec: Optional[MegakernelSpec]) -> list[str]:
+    """Set each variable of FLAG_SETS_ENV that the spec requires and the user left
+    unset to the spec's value; return their names."""
+    if spec is None:
+        return []
+    names = [
+        name
+        for name in spec.requires.env
+        if name in FLAG_SETS_ENV and not getattr(envs, name).is_set()
+    ]
+    for name in names:
+        getattr(envs, name).set(spec.requires.env[name])
+    return names
+
+
 def handle_nvidia_megakernel(server_args: Any) -> None:
     """Resolution step: fail before the weights load when the flag cannot be served,
-    listing every reason."""
+    listing every reason. The model processes, started after it, inherit what it sets
+    for the spec (FLAG_SETS_ENV)."""
     cfg = resolving_view(server_args)
     if not cfg.enable_nvidia_megakernel:
         return
     archs = model_config_of(server_args).hf_config.architectures
     if msa_serves(archs) and not cfg.enable_amd_monokernel:
         return  # handle_monokernel checks the MSA plugin's spec
+    env_set = []
     reasons = plugin_reasons()
     if not reasons:
         model_config = model_config_of(server_args)
+        hf_config, isa = model_config.hf_config, device_isa()
+        env_set = set_flag_env(
+            find_spec(architectures=hf_config.architectures, isa=isa)[0]
+        )
         spec, reasons = megakernel_disable_reasons(
-            cfg=cfg, hf_config=model_config.hf_config, isa=device_isa()
+            cfg=cfg, hf_config=hf_config, isa=isa
         )
         reasons += _dtype_reasons(spec, model_config)
     if cfg.enable_amd_monokernel:
         # both replace the model's forward, which would fail only after weights load
         reasons.append("--enable-amd-monokernel is also set; use one of the two")
     if reasons:
+        # a refused setup leaves the environment as it was
+        for name in env_set:
+            getattr(envs, name).clear()
         raise ValueError(
             f"{FLAG} cannot run this setup:\n  - " + "\n  - ".join(reasons)
         )
     logger.warning("%s is experimental. Its kernels and coverage may change.", FLAG)
     logger.info("%s: %s on %s", FLAG, spec.name, device_isa())
+    for name in env_set:
+        logger.info(
+            "%s: set %s=%s for %s", FLAG, name, getattr(envs, name).get(), spec.name
+        )
 
 
 class _InstalledMegakernel(msgspec.Struct, frozen=True):
@@ -753,6 +1015,19 @@ def install_megakernel(
     tokens = _tokens_per_request()
     tensor_verify = tokens > 1 and spec.tensor_verify_build is not None
     reasons = _requirement_reasons(spec=spec, hf_config=hf_config)
+    # The draft's own forward serves a draft spec this server or GPU does not meet; all
+    # ranks decline together, skipping the collectives below.
+    if is_draft and (
+        unmet := sorted(set().union(*_gather_tp(reasons + _residency_reasons(spec))))
+    ):
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "NVIDIA megakernel: %s does not serve this setup (%s); the draft "
+                "keeps its own forward",
+                spec.name,
+                "; ".join(unmet),
+            )
+        return
     reasons += _layout_reasons()
     if not tensor_verify:
         reasons += _model_disable_reasons(spec=spec, model=model, hf_config=hf_config)
@@ -929,86 +1204,6 @@ def megakernel_draft_sampler(draft_model: torch.nn.Module) -> Optional[Callable]
     """The built draft spec's draft_sampler factory, or None for SGLang's proposal."""
     built = built_megakernel(draft_model)
     return None if built is None else built.draft_sampler
-
-
-def _offered(model: torch.nn.Module, protocol: type) -> Any:
-    if not megakernel_enabled():
-        return None
-    built = built_megakernel(model)
-    return built if isinstance(built, protocol) else None
-
-
-def _offered_draft(
-    draft_model: torch.nn.Module, protocol: type, sizes: str, *, what: str
-) -> Any:
-    if not megakernel_enabled():
-        return None
-    built = built_megakernel(draft_model)
-    offered = built if isinstance(built, protocol) and getattr(built, sizes) else None
-    megakernel_agree(() if offered is None else getattr(offered, sizes), what=what)
-    return offered
-
-
-def megakernel_draft_aux(draft_model: torch.nn.Module) -> Optional[SupportsDraftAux]:
-    """Draft spec that writes the DFlash context KV, else None; call on all TP ranks."""
-    return _offered_draft(
-        draft_model, SupportsDraftAux, "draft_aux_rows", what="draft aux rows"
-    )
-
-
-def megakernel_draft_selector_head(
-    draft_model: torch.nn.Module,
-) -> Optional[SupportsDraftSelectorHead]:
-    """Draft spec whose forward proposes the block, else None; call on all TP ranks."""
-    return _offered_draft(
-        draft_model,
-        SupportsDraftSelectorHead,
-        "draft_head_requests",
-        what="draft head requests",
-    )
-
-
-def megakernel_draft_accept(
-    draft_model: torch.nn.Module,
-) -> Optional[SupportsDraftAccept]:
-    """Draft spec running the greedy verify accept, else None; call on all TP ranks."""
-    return _offered_draft(
-        draft_model,
-        SupportsDraftAccept,
-        "draft_accept_requests",
-        what="draft accept requests",
-    )
-
-
-def megakernel_draft_embed(
-    draft_model: torch.nn.Module,
-) -> Optional[SupportsDraftEmbed]:
-    """Draft spec that embeds the draft block, else None; call on all TP ranks."""
-    return _offered_draft(
-        draft_model,
-        SupportsDraftEmbed,
-        "draft_embed_requests",
-        what="draft embed requests",
-    )
-
-
-def megakernel_kda_commit(target_model: torch.nn.Module) -> Optional[SupportsKdaCommit]:
-    """Target spec that commits the KDA state after a verify (rank-local), else None."""
-    return _offered(target_model, SupportsKdaCommit)
-
-
-def megakernel_rank0_broadcast(
-    target_model: torch.nn.Module,
-) -> Optional[SupportsRank0Broadcast]:
-    """Target spec broadcasting rank 0's sampled-accept decision on device, else None."""
-    return _offered(target_model, SupportsRank0Broadcast)
-
-
-def megakernel_sampled_accept(
-    target_model: torch.nn.Module,
-) -> Optional[SupportsSampledAccept]:
-    """Target spec that runs the DFLASH sampled accept on vocab shards, else None."""
-    return _offered(target_model, SupportsSampledAccept)
 
 
 def megakernel_entry(model: torch.nn.Module, name: str) -> Optional[Callable]:
@@ -1209,15 +1404,20 @@ def _model_disable_reasons(
         reasons += spec.model_disable_reasons(model, hf_config)
     if "forward" in model.__dict__:
         reasons.append("the model's forward is already replaced on this instance")
+    return reasons + _residency_reasons(spec)
+
+
+def _residency_reasons(spec: MegakernelSpec) -> list[str]:
+    """This rank's GPU cannot keep the spec's persistent grids resident."""
     sms = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
     if sms < spec.requires.resident_blocks:
-        reasons.append(
+        return [
             f"{Feature.PARTITIONED_GPU.value}: {sms} SMs, the persistent grids need "
             f"{spec.requires.resident_blocks}"
-        )
-    return reasons
+        ]
+    return []
 
 
 class _Dispatch:
