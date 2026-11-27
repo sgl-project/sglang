@@ -110,7 +110,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.pause_state = PauseState()
         s.mbs = [None]
         enter_scope(self, published_topology(pp_size=2))
-        s.pp_group = SimpleNamespace(is_last_rank=True)
+        s.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=True)
         s.running_mbs = [self.running_batch]
         s.last_mbs = [None]
         s.ingest_requests = Mock(return_value=[])
