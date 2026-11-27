@@ -24,6 +24,10 @@ runs:
       with:
         python-version: '3.12'
         update-environment: false
+        # update-environment: false also leaves LD_LIBRARY_PATH unset, and
+        # setup-python's Linux builds link libpython3.12.so from their own
+        # lib/. Each step below adds that directory itself, so the
+        # interpreter starts without changing the environment of later steps.
 
     # No token here. -I and --isolated: no PR checkout on sys.path, and no
     # user site, PYTHON*, pip config, or PIP_* left on the persistent runner.
@@ -34,6 +38,7 @@ runs:
       env:
         PREFETCH_PYTHON: ${{ steps.prefetch-python.outputs.python-path }}
       run: |
+        export LD_LIBRARY_PATH="${PREFETCH_PYTHON%/bin/*}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         "$PREFETCH_PYTHON" -I -m pip install --isolated --disable-pip-version-check --quiet \
           --no-cache-dir --no-deps --only-binary=:all: --index-url https://pypi.org/simple \
           --target "$RUNNER_TEMP/hf-prefetch" \
@@ -49,5 +54,6 @@ runs:
         HF_TOKEN: ${{ inputs.hf-token }}
         REPO_IDS: ${{ inputs.repo-ids }}
       run: |
+        export LD_LIBRARY_PATH="${PREFETCH_PYTHON%/bin/*}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         PYTHONPATH="$RUNNER_TEMP/hf-prefetch" "$PREFETCH_PYTHON" -S \
           "$GITHUB_ACTION_PATH/../../../scripts/ci/utils/prefetch_hf_models.py"
