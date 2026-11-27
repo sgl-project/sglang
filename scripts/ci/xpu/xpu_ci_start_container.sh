@@ -55,6 +55,12 @@ retry_with_backoff() {
 # Authenticate to Docker Hub when credentials are present (avoids anonymous pull
 # rate limits). Both vars are optional; falls back to unauthenticated pulls.
 if [[ -n "${DOCKERHUB_INTEL_USERNAME:-}" && -n "${DOCKERHUB_INTEL_TOKEN:-}" ]]; then
+  # The runners are long-lived and also run approved PR code: log in to a throwaway
+  # config so the token never lands in the runner user's ~/.docker/config.json.
+  # RUNNER_TEMP is emptied after every job, should the trap not run.
+  DOCKER_CONFIG="$(mktemp -d "${RUNNER_TEMP:-/tmp}/docker-config.XXXXXX")"
+  export DOCKER_CONFIG
+  trap 'rm -rf "${DOCKER_CONFIG}"' EXIT
   echo "Logging in to Docker Hub..."
   if retry_with_backoff 6 sh -c 'echo "${DOCKERHUB_INTEL_TOKEN}" | docker login -u "${DOCKERHUB_INTEL_USERNAME}" --password-stdin >/dev/null 2>&1'; then
     echo "Docker Hub login successful"
@@ -102,9 +108,24 @@ else
   echo "         Set ZE_AFFINITY_MASK per runner to spread jobs across GPUs." >&2
 fi
 
+# PR jobs run the PR's code inside this container. Treat them as untrusted:
+# no Hugging Face token and no writable host workspace. XPU_CI_UNTRUSTED=1|0 overrides.
+case "${XPU_CI_UNTRUSTED:-}" in
+  1|0) UNTRUSTED="${XPU_CI_UNTRUSTED}" ;;
+  *)
+    case "${GITHUB_EVENT_NAME:-}" in
+      pull_request|pull_request_target) UNTRUSTED=1 ;;
+      *) UNTRUSTED=0 ;;
+    esac
+    ;;
+esac
+
 HF_TOKEN_FILE="${HOME}/huggingface_token.txt"
 HF_TOKEN_VALUE=""
-if [[ -n "${HF_TOKEN:-}" ]]; then
+if [[ "${UNTRUSTED}" == "1" ]]; then
+  echo "Untrusted (PR) job: starting the container without a Hugging Face token."
+  unset HF_TOKEN
+elif [[ -n "${HF_TOKEN:-}" ]]; then
   HF_TOKEN_VALUE="${HF_TOKEN}"
 elif [[ -r "${HF_TOKEN_FILE}" ]]; then
   HF_TOKEN_VALUE=$(cat "${HF_TOKEN_FILE}")
@@ -152,6 +173,13 @@ if [[ -n "${cache_mb}" && "${cache_mb}" -gt "${XPU_KERNEL_CACHE_MAX_MB}" ]]; the
   mkdir -p "${XPU_KERNEL_CACHE_HOST}"/{triton,inductor,neo,sycl}
 fi
 
+# Untrusted jobs get a copy of the checkout instead of a bind mount, so root in the
+# container can't plant files (e.g. .git/hooks) that later run on the host.
+WORKSPACE_MOUNT=(-v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout")
+if [[ "${UNTRUSTED}" == "1" ]]; then
+  WORKSPACE_MOUNT=()
+fi
+
 echo "Launching container: ${CONTAINER_NAME} from ${IMAGE}"
 # SGLANG_SERVER_LAUNCH_TIMEOUT=36000 matches /data/pgirijal/scripts/setup_upstream_env.sh:
 # 4-GPU MoE loads (Qwen3.5-35B-A3B, gemma-4-26B-A4B, ...) on Arc Pro B60 can
@@ -174,7 +202,7 @@ docker run -dt \
   --device /dev/dri \
   -v /dev/dri/by-path:/dev/dri/by-path \
   -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
-  -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
+  "${WORKSPACE_MOUNT[@]}" \
   -v "${XPU_KERNEL_CACHE_HOST}:/root/.cache/sglang-xpu" \
   -e HF_TOKEN="${HF_TOKEN_VALUE}" \
   -e SGLANG_SERVER_LAUNCH_TIMEOUT=36000 \
@@ -188,6 +216,11 @@ docker run -dt \
   "${GPU_AFFINITY_ARGS[@]}" \
   --name "${CONTAINER_NAME}" \
   "${IMAGE}"
+
+if [[ "${UNTRUSTED}" == "1" ]]; then
+  # docker cp copies symlinks as links and does not follow them out of the checkout.
+  docker cp "${GITHUB_WORKSPACE:-$PWD}/." "${CONTAINER_NAME}:/sglang-checkout"
+fi
 
 # Mark the workspace mount as a safe directory so git operations as root
 # inside the container don't trip the cross-user repo guard.

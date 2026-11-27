@@ -20,8 +20,10 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
     AnthropicCountTokensResponse,
+    AnthropicCustomTool,
     AnthropicError,
     AnthropicErrorResponse,
+    AnthropicMessage,
     AnthropicMessageEndDelta,
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
@@ -32,6 +34,8 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     ContentBlockStopEvent,
     ErrorEvent,
     InputJsonDelta,
+    McpToolReference,
+    McpToolsetReference,
     MessageDeltaEvent,
     MessageStartEvent,
     MessageStopEvent,
@@ -40,6 +44,8 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     TextDelta,
     ThinkingBlock,
     ThinkingDelta,
+    ToolDefinition,
+    ToolReferenceBlock,
     ToolUseBlock,
     is_server_tool,
 )
@@ -153,6 +159,239 @@ def _extract_system_text(
     return "\n".join(texts) if texts else None
 
 
+def _block_types(request: AnthropicMessagesRequest) -> set[str]:
+    """The block types of the request's system and messages, tool result contents
+    included."""
+    types = set()
+    for content in [request.system, *(message.content for message in request.messages)]:
+        for block in content if isinstance(content, list) else []:
+            types.add(block.type)
+            if block.type == "tool_result" and isinstance(block.content, list):
+                types.update(item.type for item in block.content)
+    return types
+
+
+def _without_cleared_messages(
+    request: AnthropicMessagesRequest,
+) -> AnthropicMessagesRequest:
+    """`request` without the turn-scoped system messages (`clear_at:
+    "next_user_message"`) that a later user message has cleared."""
+    last_user = max(
+        (
+            index
+            for index, message in enumerate(request.messages)
+            if message.role == "user"
+        ),
+        default=-1,
+    )
+    rendered = []
+    for index, message in enumerate(request.messages):
+        if message.clear_at is not None and message.role != "system":
+            raise ValueError(
+                f"messages.{index}.clear_at: clear_at is only permitted on role "
+                "'system' messages"
+            )
+        if message.clear_at == "next_user_message":
+            _check_turn_scoped(index=index, messages=request.messages)
+            if index < last_user:
+                continue
+        rendered.append(message)
+    return request.model_copy(update={"messages": rendered})
+
+
+def _check_turn_scoped(index: int, messages: list[AnthropicMessage]) -> None:
+    scope = "a turn-scoped system message (clear_at: 'next_user_message')"
+    message = messages[index]
+    if message.output_config is not None:
+        raise ValueError(f"messages.{index}: output_config is not permitted on {scope}")
+    for position, block in enumerate(
+        message.content if isinstance(message.content, list) else []
+    ):
+        if block.type != "text":
+            raise ValueError(f"messages.{index}: {scope} supports text blocks only")
+        if block.cache_control is not None:
+            raise ValueError(
+                f"messages.{index}.content.{position}: cache_control is not "
+                f"permitted on {scope}"
+            )
+    # Consecutive system messages are placed as one group.
+    before = next(
+        (m.role for m in reversed(messages[:index]) if m.role != "system"), None
+    )
+    after = next((m.role for m in messages[index + 1 :] if m.role != "system"), None)
+    if before != "user" or after == "user":
+        raise ValueError(
+            f"messages.{index}: {scope} must follow a user message and either end "
+            "messages or precede an assistant message"
+        )
+
+
+def _declare_inline_tools(
+    request: AnthropicMessagesRequest,
+) -> AnthropicMessagesRequest:
+    """`request` with each custom tool a `tool_addition` block defines by value
+    declared in `tools` as deferred, and the block naming it by reference. A
+    definition of a tool already offered unchanged is dropped."""
+    tools = list(request.tools or [])
+    declared = {tool.name: tool for tool in tools}
+    offered = {tool.name for tool in tools if not tool.defer_loading}
+    unresolved: dict[str, str] = {}
+    messages = []
+    for index, message in enumerate(request.messages):
+        if isinstance(message.content, str):
+            messages.append(message)
+            continue
+        blocks = []
+        for position, block in enumerate(message.content):
+            where = f"messages.{index}.content.{position}"
+            for name in _referenced_tool_names(block):
+                if name in declared:
+                    offered.add(name)
+                else:
+                    unresolved.setdefault(name, where)
+            if block.type == "tool_addition" and block.tool.type != "tool_reference":
+                if message.role != "system":
+                    raise ValueError(
+                        f"{where}: tool_addition blocks can only be in system messages"
+                    )
+                tool = _inline_custom_tool(where=where, target=block.tool)
+                # Declaring the tool makes it resolvable from the first message on.
+                if tool.name in unresolved:
+                    raise ValueError(
+                        f"{unresolved[tool.name]}: tool reference {tool.name!r} "
+                        f"precedes the tool_definition that defines it at {where}"
+                    )
+                earlier = declared.setdefault(tool.name, tool)
+                if earlier is tool:
+                    tools.append(tool)
+                elif is_server_tool(earlier) or _definition(earlier) != _definition(
+                    tool
+                ):
+                    raise ValueError(
+                        f"{where}: tool_definition "
+                        f"reuses the name {tool.name!r} with a different "
+                        "definition; replacing a tool mid-conversation is not "
+                        "supported"
+                    )
+                if tool.name in offered:
+                    continue
+                offered.add(tool.name)
+                block = block.model_copy(
+                    update={"tool": ToolReferenceBlock(name=tool.name)}
+                )
+            blocks.append(block)
+        # recipe renders a system message left without blocks as an empty turn.
+        if blocks or not message.content:
+            messages.append(message.model_copy(update={"content": blocks}))
+    return request.model_copy(update={"tools": tools, "messages": messages})
+
+
+def _referenced_tool_names(block: AnthropicContentBlock) -> list[Optional[str]]:
+    if block.type == "tool_addition" and block.tool.type == "tool_reference":
+        return [block.tool.name or block.tool.tool_name]
+    if block.type == "tool_reference":
+        return [block.tool_name or block.name]
+    if block.type == "tool_result" and isinstance(block.content, list):
+        return [name for item in block.content for name in _referenced_tool_names(item)]
+    return []
+
+
+def _inline_custom_tool(
+    where: str, target: Union[McpToolReference, McpToolsetReference, ToolDefinition]
+) -> AnthropicCustomTool:
+    if target.type != "tool_definition":
+        raise ValueError(
+            f"{where}: tool_addition with a {target.type} is not supported; this "
+            "server runs no MCP connector"
+        )
+    kind = target.definition.get("type")
+    if kind not in (None, "custom"):
+        raise ValueError(
+            f"{where}: tool_definition supports custom tools only, got a "
+            f"definition of type {kind!r}"
+        )
+    tool = AnthropicCustomTool.model_validate(target.definition)
+    if tool.defer_loading:
+        raise ValueError(
+            f"{where}: a tool_definition with defer_loading is not supported; "
+            "declare the tool in tools and add it by reference"
+        )
+    return tool.model_copy(update={"defer_loading": True})
+
+
+def _definition(tool: AnthropicCustomTool) -> dict[str, Any]:
+    return tool.model_dump(exclude={"type", "defer_loading"})
+
+
+def _text_from_search_result(item: dict[str, Any]) -> str:
+    search_parts = []
+    title = item.get("title")
+    if title:
+        search_parts.append(f"Title: {title}")
+
+    source = item.get("source")
+    if isinstance(source, dict):
+        source_text = source.get("url") or source.get("text")
+        if source_text:
+            search_parts.append(f"Source: {source_text}")
+    elif source:
+        search_parts.append(f"Source: {source}")
+
+    content = item.get("content")
+    content_parts = []
+    if isinstance(content, str):
+        content_parts.append(content)
+    elif isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and part.get("text"):
+                content_parts.append(part["text"])
+    if content_parts:
+        search_parts.append("Content: " + "\n".join(content_parts))
+
+    return "\n".join(search_parts)
+
+
+def _native_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [native for native in map(_native_block, blocks) if native is not None]
+
+
+def _native_block(block: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """`block` with SGLang's accepted aliases spelled as deepseek-recipe reads them;
+    None for a search result without text."""
+    kind = block["type"]
+    if kind == "search_result":
+        # deepseek-recipe has no search result block; it reads as on the Chat path.
+        text = _text_from_search_result(block)
+        return {"type": "text", "text": text} if text else None
+    if kind == "tool_result":
+        content = block.get("content")
+        fields = {
+            "type": kind,
+            "tool_use_id": block.get("tool_use_id") or block.get("id"),
+            "content": (
+                _native_blocks(content) if isinstance(content, list) else content
+            ),
+            "is_error": block.get("is_error"),
+        }
+        return {key: value for key, value in fields.items() if value is not None}
+    if kind == "tool_reference":
+        return {"type": kind, "tool_name": block.get("tool_name") or block.get("name")}
+    if kind == "tool_addition":
+        tool = block["tool"]
+        name = tool.get("name") or tool.get("tool_name")
+        return {"type": kind, "tool": {"type": "tool_reference", "name": name}}
+    return block
+
+
+def _native_message(message: AnthropicMessage) -> dict[str, Any]:
+    data = message.model_dump(exclude_none=True)
+    if isinstance(data["content"], list):
+        data["content"] = _native_blocks(data["content"])
+    return data
+
+
 def _wrap_sse_event(data: str, event_type: str) -> str:
     """Format an Anthropic SSE event with event type and data lines."""
     return f"event: {event_type}\ndata: {data}\n\n"
@@ -219,6 +458,24 @@ class AnthropicServing:
         self, anthropic_request: AnthropicMessagesRequest
     ) -> ChatCompletionRequest:
         """Convert an Anthropic Messages request to an OpenAI ChatCompletion request."""
+        anthropic_request = _declare_inline_tools(
+            _without_cleared_messages(anthropic_request)
+        )
+        block_types = _block_types(anthropic_request)
+        if "tool_removal" in block_types:
+            raise ValueError(
+                "tool_removal blocks are not supported; a tool cannot be withdrawn "
+                "mid-conversation"
+            )
+        native = self.openai_serving_chat.native_tool_loading and (
+            bool(block_types & {"tool_reference", "tool_addition"})
+            or any(
+                not is_server_tool(tool) and tool.defer_loading
+                for tool in anthropic_request.tools or []
+            )
+        )
+        if not native and "tool_addition" in block_types:
+            raise ValueError("tool_addition blocks are not supported by this model")
         openai_messages = []
 
         def _convert_anthropic_image_source_to_openai_part(
@@ -254,35 +511,6 @@ class AnthropicServing:
                 }
 
             return None
-
-        def _text_from_search_result(item: dict[str, Any]) -> str:
-            search_parts = []
-            title = item.get("title")
-            if title:
-                search_parts.append(f"Title: {title}")
-
-            source = item.get("source")
-            if isinstance(source, dict):
-                source_text = source.get("url") or source.get("text")
-                if source_text:
-                    search_parts.append(f"Source: {source_text}")
-            elif source:
-                search_parts.append(f"Source: {source}")
-
-            content = item.get("content")
-            content_parts = []
-            if isinstance(content, str):
-                content_parts.append(content)
-            elif isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    if part.get("type") == "text" and part.get("text"):
-                        content_parts.append(part["text"])
-            if content_parts:
-                search_parts.append("Content: " + "\n".join(content_parts))
-
-            return "\n".join(search_parts)
 
         def _convert_tool_result_content(
             content: Any,
@@ -723,7 +951,50 @@ class AnthropicServing:
         elif chat_request.tools:
             chat_request.tool_choice = "auto"
 
+        if native:
+            self._prepare_native_prompt(anthropic_request, chat_request)
         return chat_request
+
+    def _prepare_native_prompt(
+        self,
+        anthropic_request: AnthropicMessagesRequest,
+        chat_request: ChatCompletionRequest,
+    ) -> None:
+        """Render the request's own wire form into `chat_request`, whose tools
+        become the ones the history has loaded."""
+        body = {
+            "messages": [
+                _native_message(message) for message in anthropic_request.messages
+            ],
+            # recipe reads a tool with a `type` as a server tool.
+            "tools": [
+                tool.model_dump(exclude_none=True, exclude={"type"})
+                for tool in anthropic_request.tools or []
+                if not is_server_tool(tool)
+            ],
+        }
+        system = anthropic_request.system
+        if system:
+            body["system"] = (
+                system
+                if isinstance(system, str)
+                else [block.model_dump(exclude_none=True) for block in system]
+            )
+        choice = anthropic_request.tool_choice
+        if choice is not None and choice.type == "none":
+            body["tool_choice"] = {"type": "none"}
+        tools = self.openai_serving_chat.prepare_native_prompt(
+            chat_request, protocol="messages", body=body
+        ).tools
+        if (
+            choice is not None
+            and choice.type == "tool"
+            and not any(tool.function.name == choice.name for tool in tools)
+        ):
+            raise ValueError(
+                f"tool_choice names {choice.name!r}, a deferred tool no "
+                "tool_reference or tool_addition block has loaded"
+            )
 
     async def _handle_non_streaming(
         self,

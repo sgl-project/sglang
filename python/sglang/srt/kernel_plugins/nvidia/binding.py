@@ -51,6 +51,9 @@ from sglang.srt.arg_groups.model_override_base import model_config_of, resolving
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.amd.binding import msa_serves
 from sglang.srt.kernel_plugins.nvidia.eagle_binding import EagleBinding
+from sglang.srt.layers.attention.linear.utils import (
+    select_verify_intermediate_state_indices,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
@@ -167,6 +170,10 @@ class MlaPoolView:
 class KdaStateView:
     conv: tuple[torch.Tensor, ...]
     temporal: torch.Tensor
+    # The target-verify scratch (one convolution window and the per-draft-token SSM
+    # states), indexed by KdaStepView.verify_scratch_indices; empty without it.
+    intermediate_conv_window: tuple[torch.Tensor, ...] = ()
+    intermediate_ssm: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -202,11 +209,16 @@ class MlaStepView:
     block_table: torch.Tensor
     sequence_lengths: torch.Tensor
     write_slots: torch.Tensor
+    # Token rows per request: 1 for a decode step, the draft tokens for a target verify.
+    tokens_per_request: int = 1
 
 
 @dataclass(frozen=True)
 class KdaStepView:
     state_indices: torch.Tensor
+    # [requests] int32: each request's row in the verify scratch; None outside a
+    # target verify.
+    verify_scratch_indices: Optional[torch.Tensor] = None
 
     def track_decode_state(self, layer_id: int) -> None:
         # SGLang snapshots the completed states once after the fused forward.
@@ -217,6 +229,9 @@ class KdaStepView:
 class HybridStepView:
     mla: MlaStepView
     kda: KdaStepView
+    # [tokens, width] the DFlash-family draft's input taps a target verify writes;
+    # None outside a target verify.
+    aux_hidden_states: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -422,6 +437,9 @@ class MegakernelBinding:
         # a sealed source assert_live does not re-read itself -> its re-read
         self._sources: dict[str, Callable[[], Any]] = {}
         self._dsa_backends: list[AttentionBackend] = []
+        # The target verify's auxiliary hidden-state width and dtype (0: none)
+        self._aux_width = 0
+        self._aux_dtype: Optional[torch.dtype] = None
 
     def forward_view(
         self, forward_batch: Any = None
@@ -445,14 +463,24 @@ class MegakernelBinding:
             else:
                 block_table = full.block_kv_indices
                 lengths = full.seq_lens_k
+            verify = (
+                self._verify_step(backend, forward_batch)
+                if forward_batch.forward_mode.is_target_verify()
+                else {}
+            )
             return HybridForwardView(
                 hybrid=HybridStepView(
                     mla=MlaStepView(
                         block_table=block_table,
                         sequence_lengths=lengths,
                         write_slots=forward_batch.out_cache_loc,
+                        tokens_per_request=verify.get("tokens_per_request", 1),
                     ),
-                    kda=KdaStepView(state_indices=linear.mamba_cache_indices),
+                    kda=KdaStepView(
+                        state_indices=linear.mamba_cache_indices,
+                        verify_scratch_indices=verify.get("verify_scratch_indices"),
+                    ),
+                    aux_hidden_states=verify.get("aux_hidden_states"),
                 )
             )
         view = ForwardView(backend, self._seal_cache)
@@ -465,13 +493,50 @@ class MegakernelBinding:
         """The view for an eager prefill step, without graph-static decode metadata."""
         return self.forward_view(forward_batch=None)
 
+    def _verify_step(self, backend: Any, forward_batch: Any) -> dict:
+        """A hybrid target verify's rows per request, each request's verify scratch
+        row and the auxiliary hidden-state rows the draft reads."""
+        linear = backend.linear_attn_backend
+        num_requests = int(forward_batch.batch_size)
+        tokens_per_request = int(forward_batch.spec_info.draft_token_num)
+        scratch = None
+        if linear.verify_intermediate_state_indices is not None:
+            cache_indices = linear.forward_metadata.mamba_cache_indices
+            scratch = select_verify_intermediate_state_indices(
+                linear.verify_intermediate_state_indices,
+                forward_batch.req_pool_indices,
+                lambda: cache_indices[:num_requests] >= 0,
+                linear.req_to_token_pool.size,
+            )[:num_requests]
+        aux = forward_batch.aux_hidden_states_buffer
+        if aux is None and self._aux_width > 0:
+            # A captured verify reads the graph runner's buffer; an eager one gets its own.
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "megakernel binding: a captured target verify needs the graph "
+                    "runner's auxiliary hidden-state buffer"
+                )
+            aux = torch.empty(
+                (num_requests * tokens_per_request, self._aux_width),
+                dtype=self._aux_dtype,
+                device=forward_batch.input_ids.device,
+            )
+            forward_batch.aux_hidden_states_buffer = aux
+        return {
+            "tokens_per_request": tokens_per_request,
+            "verify_scratch_indices": scratch,
+            "aux_hidden_states": aux,
+        }
+
     def preparation_view(self, model_runner: ModelRunner) -> PreparationView:
+        self._aux_width = model_runner.get_aux_hidden_states_width()
+        self._aux_dtype = model_runner.dtype
         return self.pool_view(
             model_runner.token_to_kv_pool, model_runner.req_to_token_pool
         )
 
     def pool_view(self, pool: Any, req_pool: Any) -> PreparationView:
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MambaPool
 
         if not (isinstance(pool, HybridLinearKVPool) and pool.use_mla):
             return PreparationView()
@@ -485,8 +550,17 @@ class MegakernelBinding:
         states = {}
         for layer in mamba_mapping:
             state = req_pool.mamba_pool.mamba2_layer_cache(req_pool.mamba_map[layer])
+            verifies = (
+                isinstance(state, MambaPool.SpeculativeState)
+                and state.intermediate_ssm is not None
+            )
             states[layer] = KdaStateView(
-                conv=tuple(state.conv), temporal=state.temporal
+                conv=tuple(state.conv),
+                temporal=state.temporal,
+                intermediate_conv_window=(
+                    tuple(state.intermediate_conv_window) if verifies else ()
+                ),
+                intermediate_ssm=state.intermediate_ssm if verifies else None,
             )
         indexer = None
         if pool.use_dsa:
@@ -527,6 +601,8 @@ class MegakernelBinding:
 
     @staticmethod
     def _pool_identity(pool: Any, req_pool: Any) -> tuple:
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+
         full = pool.full_kv_pool
         tensors = list(full.kv_buffer)
         if pool.use_dsa:
@@ -534,6 +610,13 @@ class MegakernelBinding:
         for layer in req_pool.mamba_map:
             state = req_pool.mamba_pool.mamba2_layer_cache(req_pool.mamba_map[layer])
             tensors.extend((*state.conv, state.temporal))
+            if (
+                isinstance(state, MambaPool.SpeculativeState)
+                and state.intermediate_ssm is not None
+            ):
+                tensors.extend(
+                    (*state.intermediate_conv_window, state.intermediate_ssm)
+                )
         return tuple(_identity(tensor) for tensor in tensors)
 
     def finish_step(self, forward_batch: Any) -> None:
