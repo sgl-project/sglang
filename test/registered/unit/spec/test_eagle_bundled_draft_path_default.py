@@ -56,6 +56,15 @@ class TestEagleBundledDraftPathDefaulting(CustomTestCase):
         ):
             _handle_eagle_family(server_args)
 
+    def test_modelscope_check_ignores_a_later_model_path_change(self):
+        server_args = _make_nextn_server_args(draft_revision="draft")
+        declare_resolution(
+            server_args, "_handle_modelscope_paths", model_path=_MODEL_PATH
+        )
+        declare_resolution(server_args, "handle_expert_pack", model_path="/meta")
+        with envs.SGLANG_USE_MODELSCOPE.override(True):
+            _handle_eagle_family(server_args)
+
 
 if __name__ == "__main__":
     unittest.main()
