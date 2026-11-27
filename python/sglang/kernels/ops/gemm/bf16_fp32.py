@@ -148,6 +148,15 @@ def linear_bf16_fp32(
         if output is not None:
             return output
         return _linear_bf16_fp32_cublas(x, y)
+    elif (
+        _linear_bf16_fp32_algo == "triton"
+        and x.is_cuda
+        and x.dtype == y.dtype == torch.bfloat16
+    ):
+        # Bits independent of operand addresses; see bf16_fp32_triton.py.
+        from sglang.kernels.ops.gemm.bf16_fp32_triton import linear_bf16_fp32_triton
+
+        return linear_bf16_fp32_triton(x, y)
     elif _linear_bf16_fp32_algo == "deep_gemm" and y.dtype == torch.bfloat16:
         from sglang.srt.layers import deep_gemm_wrapper
 

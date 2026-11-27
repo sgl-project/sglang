@@ -2337,6 +2337,10 @@ class Envs:
     SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG = EnvBool(False)
     # Debug: run both the fused and the unfused wo_b and log their relative L2.
     SGLANG_DEBUG_FUSED_WO_B_AR = EnvBool(False)
+    # BF16 x BF16 -> FP32 GEMMs (routers, DSv4 compressor, FP32 LM head):
+    # "cublas" (default), "hpc" (HPC-Ops, sm90a), "deep_gemm", or "triton"
+    # (split-K Triton kernel whose bits do not depend on operand addresses;
+    # for SM80, where hpc and deep_gemm are unavailable).
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     # DSpark decode: build the verify window and the draft anchor column in one

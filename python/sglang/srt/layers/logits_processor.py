@@ -1451,6 +1451,16 @@ class LogitsProcessor(nn.Module):
 
                 if sm12x_fp32_lm_head_applies(hidden_states, lm_head.weight, out):
                     logits = sm12x_fp32_lm_head(hidden_states, lm_head.weight, out)
+                elif (
+                    envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get() == "triton"
+                    and hidden_states.dtype == torch.bfloat16
+                ):
+                    # Same backend choice as linear_bf16_fp32 (see bf16_fp32_triton.py).
+                    from sglang.kernels.ops.gemm.bf16_fp32_triton import (
+                        linear_bf16_fp32_triton,
+                    )
+
+                    logits = linear_bf16_fp32_triton(hidden_states, lm_head.weight, out)
                 elif out is None and _gfx1250_lmhead_applies(
                     hidden_states, lm_head.weight
                 ):
