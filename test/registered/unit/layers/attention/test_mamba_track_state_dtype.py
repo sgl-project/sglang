@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -177,6 +178,31 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     kwargs["has_initial_state"], torch.tensor([False, True])
                 )
 
+    def test_fp32_snapshot_opt_in_routes_prefill_graph(self) -> None:
+        backend = object.__new__(GDNAttnBackend)
+        backend._prefill_graph_cache_indices = Mock(return_value=torch.tensor([0]))
+        backend._fill_prefill_graph_metadata = Mock()
+        backend.prefill_graph_max_seqs = 1
+        backend.device = "cpu"
+        backend.state_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(temporal=torch.empty(1, dtype=torch.float32))
+        )
+        backend._model_runner = SimpleNamespace(dtype=torch.bfloat16)
+        batch = SimpleNamespace(positions=torch.arange(64))
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                get_context().override_server_args(
+                    enable_gdn_fp32_snapshots=enabled,
+                    mamba_radix_cache_strategy="extra_buffer",
+                ),
+                patch.object(
+                    gdn_backend.GDNPrefillGraphMetadata, "allocate"
+                ) as allocate,
+            ):
+                backend.init_prefill_graph_metadata(batch)
+                self.assertEqual(allocate.call_args.kwargs["fp32_snapshots"], enabled)
+
     def test_gdn_prefill_hooks_and_checkpoint_routing(self):
         layer = SimpleNamespace(
             layer_id=3,
@@ -211,14 +237,23 @@ class TestTrackMambaStateDtype(CustomTestCase):
             track_ssm_final_src=torch.tensor([6]),
             track_ssm_final_dst=torch.tensor([5]),
         )
-        for snapshot in (False, True):
+        for enabled, activation_dtype, snapshot in (
+            (False, torch.bfloat16, False),
+            (True, torch.bfloat16, True),
+            (True, torch.float32, False),
+        ):
             for contiguous in (True, False):
-                with self.subTest(snapshot=snapshot, contiguous=contiguous):
+                with self.subTest(
+                    enabled=enabled,
+                    activation_dtype=activation_dtype,
+                    contiguous=contiguous,
+                ):
                     backend = object.__new__(GDNAttnBackend)
                     backend.forward_metadata = metadata
                     backend.mis_metadata = None
                     backend.requires_contiguous_prefill_state = contiguous
-                    conv_states = torch.zeros(16, 6, 2)[::2]
+                    qkv = qkv.to(activation_dtype)
+                    conv_states = torch.zeros(16, 6, 2, dtype=qkv.dtype)[::2]
                     ssm_states = torch.zeros(16, 1, 2, 2)[::2]
                     cache = SimpleNamespace(conv=[conv_states], temporal=ssm_states)
                     backend.state_layer_cache = lambda _: cache
@@ -268,12 +303,15 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     backend._prefill_gates = Mock(return_value=(None, None))
                     backend.kernel_dispatcher = object.__new__(GDNKernelDispatcher)
                     backend.kernel_dispatcher.extend_kernel = SimpleNamespace(
-                        supports_track_state_snapshot=snapshot,
+                        supports_track_state_snapshot=True,
                         defers_prefill_gates=False,
                         extend=extend,
                     )
                     # Exercise the GPU gather policy with CPU tensors and fake kernels.
                     with (
+                        get_context().override_server_args(
+                            enable_gdn_fp32_snapshots=enabled
+                        ),
                         patch.object(gdn_backend, "is_cpu", return_value=False),
                         patch.object(gdn_backend, "is_cuda", return_value=False),
                         patch.object(gdn_backend, "is_hip", return_value=False),
