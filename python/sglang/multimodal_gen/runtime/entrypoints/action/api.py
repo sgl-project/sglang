@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any
 
@@ -197,12 +196,6 @@ async def _multipart_action_payload(request: Request, uploads_dir: str) -> dict:
 
 @router.post("/generations")
 async def create_action_generation(request: Request):
-    return await handle_action_generation(request)
-
-
-async def handle_action_generation(
-    request: Request, prepare_payload: Callable[[dict], None] | None = None
-):
     server_args: ServerArgs = request.app.state.server_args
     content_type = request.headers.get("content-type", "").lower()
     is_multipart = "multipart/form-data" in content_type
@@ -222,8 +215,6 @@ async def handle_action_generation(
             wants_msgpack = _wants_msgpack(request)
             if wants_msgpack:
                 _prefer_numpy_output(payload)
-            if prepare_payload is not None:
-                prepare_payload(payload)
             output = await infer_action(payload, server_args)
             if _response_format(payload) == "raw":
                 response = action_raw_response(output, preserve_numpy=wants_msgpack)

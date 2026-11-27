@@ -146,6 +146,7 @@ class NativeOutputValidityTest(unittest.TestCase):
         override = {**flat, "parameters": {"return_native_outputs": False}}
         for name, payload, native, cache in (
             ("nested", nested, True, True),
+            ("auto", {**nested, "runtime": {"cuda_graph": "auto"}}, True, True),
             ("flat", flat, True, False),
             ("override", override, False, False),
         ):

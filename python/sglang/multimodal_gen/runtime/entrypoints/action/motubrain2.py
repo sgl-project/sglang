@@ -1,25 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """Serve Motubrain actions with a private continuation for each robot connection."""
 
+from contextlib import ExitStack
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Request, WebSocket
+from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
 
 from sglang.multimodal_gen.configs.sample.motubrain2 import _ConnectionState
-from sglang.multimodal_gen.runtime.entrypoints.action.api import (
-    action_metadata_endpoint,
-    handle_action_generation,
-)
+from sglang.multimodal_gen.runtime.entrypoints.action import api as action_api
 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
+    _runtime_bool,
     action_generation_response,
+    action_raw_response,
+    infer_action,
+    pack_msgpack,
+    unpack_msgpack,
 )
 from sglang.multimodal_gen.runtime.entrypoints.action.ws_utils import (
     run_action_msgpack_ws,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import temp_dir_if_disabled
+from sglang.srt.utils.json_response import orjson_response
 
 router = APIRouter(tags=["actions"])
-router.add_api_route("/v1/actions/metadata", action_metadata_endpoint, methods=["GET"])
+router.add_api_route(
+    "/v1/actions/metadata", action_api.action_metadata_endpoint, methods=["GET"]
+)
 
 
 def _client_fields(fields: dict | None) -> dict:
@@ -53,7 +60,7 @@ def prepare_motubrain2_payload(
         value = runtime.get(name)
         if value is None:
             value = observation.get(f"enable_{name}")
-        runtime[name] = default if value is None else value
+        runtime[name] = _runtime_bool(value, default)
 
     native = parameters.get(
         "return_native_outputs", observation.get("return_native_outputs")
@@ -69,7 +76,39 @@ def prepare_motubrain2_payload(
 
 @router.post("/v1/actions/generations")
 async def create_action_generation(request: Request):
-    return await handle_action_generation(request, prepare_motubrain2_payload)
+    server_args = request.app.state.server_args
+    content_type = request.headers.get("content-type", "").lower()
+    wants_msgpack = action_api._wants_msgpack(request)
+    try:
+        with ExitStack() as files:
+            if "multipart/form-data" in content_type:
+                uploads_dir = files.enter_context(
+                    temp_dir_if_disabled(getattr(server_args, "input_save_path", None))
+                )
+                payload = await action_api._multipart_action_payload(
+                    request, uploads_dir
+                )
+            elif "msgpack" in content_type:
+                payload = unpack_msgpack(await request.body())
+            else:
+                payload = await request.json()
+            if wants_msgpack:
+                action_api._prefer_numpy_output(payload)
+            prepare_motubrain2_payload(payload)
+            output = await infer_action(payload, server_args)
+            if action_api._response_format(payload) == "raw":
+                response = action_raw_response(output, preserve_numpy=wants_msgpack)
+            else:
+                response = action_generation_response(
+                    output, server_args, preserve_numpy=wants_msgpack
+                )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if wants_msgpack:
+        return Response(
+            content=pack_msgpack(response), media_type="application/msgpack"
+        )
+    return orjson_response(response)
 
 
 @router.websocket("/v1/actions/realtime")
