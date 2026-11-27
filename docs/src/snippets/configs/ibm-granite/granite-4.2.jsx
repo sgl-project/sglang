@@ -201,7 +201,7 @@ export const config = {
       verified: true,
       env: [],
       flags: [
-        "--model {{MODEL_NAME}}",
+        "--model-path {{MODEL_NAME}}",
         "--device cpu",
         "--disable-overlap-schedule",
         "--mem-fraction-static 0.8",
@@ -217,7 +217,7 @@ export const config = {
       verified: true,
       env: [],
       flags: [
-        "--model {{MODEL_NAME}}",
+        "--model-path {{MODEL_NAME}}",
         "--device cpu",
         "--disable-overlap-schedule",
         "--mem-fraction-static 0.8",
@@ -233,7 +233,7 @@ export const config = {
       verified: true,
       env: [],
       flags: [
-        "--model {{MODEL_NAME}}",
+        "--model-path {{MODEL_NAME}}",
         "--device cpu",
         "--disable-overlap-schedule",
         "--mem-fraction-static 0.8",

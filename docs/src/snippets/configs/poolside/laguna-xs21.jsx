@@ -608,7 +608,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [],
       flags: [
-        "--model {{MODEL_NAME}}",
+        "--model-path {{MODEL_NAME}}",
         "--device cpu",
         "--trust-remote-code",
         "--disable-overlap-schedule",

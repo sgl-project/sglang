@@ -247,7 +247,7 @@ export const config = {
       verified: true,
       env: [],
       flags: [
-        "--model ornith-ai/Ornith-1.5-9B",
+        "--model-path ornith-ai/Ornith-1.5-9B",
         "--device cpu",
         "--disable-overlap-schedule",
         "--mem-fraction-static 0.85",
@@ -263,7 +263,7 @@ export const config = {
       verified: true,
       env: [],
       flags: [
-        "--model ornith-ai/Ornith-1.5-35B-A3B",
+        "--model-path ornith-ai/Ornith-1.5-35B-A3B",
         "--device cpu",
         "--disable-overlap-schedule",
         "--mem-fraction-static 0.85",
