@@ -9,7 +9,7 @@ use crate::message::io_struct::{ControlRequest, GetHiCacheL3LayoutReq, GetIntern
 
 use std::sync::Arc;
 
-use super::frontend_state::ModelFacts;
+use super::frontend_state::{ModelFacts, ModelFactsRead};
 use super::handle::CoreHandle;
 use crate::api_server::core::CoreError;
 
@@ -20,14 +20,15 @@ impl CoreHandle {
     /// because a scheduler is busy.
     pub(crate) async fn model_facts(&self) -> Arc<ModelFacts> {
         let frontend = &self.inner.frontend;
-        if !frontend.is_stale() {
-            return frontend.cached().await;
-        }
+        let revision = match frontend.read_facts() {
+            ModelFactsRead::Cached(facts) => return facts,
+            ModelFactsRead::Refresh(revision) => revision,
+        };
         match self.local_model_facts().await {
-            Ok(facts) => frontend.store(facts, true).await,
+            Ok(facts) => frontend.store(revision, facts),
             Err(error) => {
                 tracing::warn!(%error, "model facts refresh failed; serving the last known");
-                frontend.cached().await
+                frontend.cached()
             }
         }
     }
@@ -177,6 +178,7 @@ mod tests {
     use super::*;
     use crate::api_server::handlers::test_utils::*;
     use crate::api_server::handlers::{CoreConfig, CoreMetadata};
+    use crate::message::response::ResponseItem;
     use crate::tokenizer_manager::wiring::TmEvent;
 
     #[tokio::test]
@@ -217,6 +219,108 @@ mod tests {
         );
         assert!(intake_rx.try_recv().is_err());
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    fn model_facts_reply(weight_version: &str) -> bytes::Bytes {
+        bytes::Bytes::from(
+            rmp_serde::to_vec_named(&serde_json::json!({
+                "internal_state": {
+                    "model_path": "/model",
+                    "served_model_name": "served",
+                    "weight_version": weight_version,
+                },
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn model_facts_refresh_clears_current_revision() {
+        let Harness {
+            handle, intake_rx, ..
+        } = Harness::unbounded(8);
+        let frontend = &handle.inner.frontend;
+        frontend.invalidate();
+
+        let (facts, ()) = tokio::join!(
+            handle.model_facts(),
+            answer_local_control(&intake_rx, model_facts_reply("v1")),
+        );
+        assert_eq!(facts.weight_version.as_deref(), Some("v1"));
+        assert!(!frontend.is_stale());
+        assert!(Arc::ptr_eq(&facts, &handle.model_facts().await));
+    }
+
+    #[tokio::test]
+    async fn model_facts_refresh_does_not_clear_new_invalidation() {
+        let Harness {
+            handle, intake_rx, ..
+        } = Harness::unbounded(8);
+        let frontend = &handle.inner.frontend;
+        frontend.invalidate();
+
+        let (facts, ()) = tokio::join!(handle.model_facts(), async {
+            let request = accept_intake(intake_rx.recv_async().await.unwrap());
+            frontend.invalidate();
+            request
+                .sink
+                .try_send(ResponseItem::Control(model_facts_reply("v1")))
+                .unwrap();
+        });
+        assert!(frontend.is_stale(), "the later invalidation must survive");
+        assert_eq!(facts.weight_version, None);
+
+        let (facts, ()) = tokio::join!(
+            handle.model_facts(),
+            answer_local_control(&intake_rx, model_facts_reply("v2")),
+        );
+        assert_eq!(facts.weight_version.as_deref(), Some("v2"));
+        assert!(!frontend.is_stale());
+    }
+
+    #[tokio::test]
+    async fn overlapping_model_facts_refreshes_keep_newer_snapshot() {
+        assert_first_published_model_facts_are_retained(true).await;
+    }
+
+    #[tokio::test]
+    async fn model_facts_refresh_for_same_revision_keeps_published_snapshot() {
+        assert_first_published_model_facts_are_retained(false).await;
+    }
+
+    async fn assert_first_published_model_facts_are_retained(invalidate_between_reads: bool) {
+        let Harness {
+            handle, intake_rx, ..
+        } = Harness::unbounded(8);
+        let frontend = &handle.inner.frontend;
+        frontend.invalidate();
+
+        let older = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.model_facts().await }
+        });
+        let older_request = accept_intake(intake_rx.recv_async().await.unwrap());
+        if invalidate_between_reads {
+            frontend.invalidate();
+        }
+
+        let (newer, ()) = tokio::join!(
+            handle.model_facts(),
+            answer_local_control(&intake_rx, model_facts_reply("v2")),
+        );
+        older_request
+            .sink
+            .try_send(ResponseItem::Control(model_facts_reply("v1")))
+            .unwrap();
+        let older = older.await.unwrap();
+
+        assert_eq!(newer.weight_version.as_deref(), Some("v2"));
+        assert!(!frontend.is_stale());
+        assert_eq!(
+            handle.model_facts().await.weight_version.as_deref(),
+            Some("v2")
+        );
+        assert!(Arc::ptr_eq(&older, &newer));
     }
 
     /// `/server_info` lists one internal state per DP rank, in rank order:
