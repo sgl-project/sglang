@@ -1,7 +1,6 @@
 import json
-import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -18,12 +17,6 @@ ARG_KEY_BEGIN = "<arg_key>"
 ARG_KEY_END = "</arg_key>"
 ARG_VALUE_BEGIN = "<arg_value>"
 ARG_VALUE_END = "</arg_value>"
-
-ARG_PAIR_PATTERN = re.compile(
-    rf"{re.escape(ARG_KEY_BEGIN)}(.*?){re.escape(ARG_KEY_END)}"
-    rf"{re.escape(ARG_VALUE_BEGIN)}(.*?){re.escape(ARG_VALUE_END)}",
-    re.DOTALL,
-)
 
 
 @dataclass(frozen=True)
@@ -81,6 +74,28 @@ def _convert_value(value: str, param_type: str) -> Any:
             return value
 
 
+def _iter_arg_pairs(body: str) -> Iterator[tuple[str, str]]:
+    """Yield (key, value) for each <arg_key>k</arg_key><arg_value>v</arg_value>.
+
+    Uses str.find instead of a regex: a regex with two lazy groups rescanned
+    the body from every unclosed <arg_key> (#52090). Once a key or value has
+    no closing tag, no later pair can close either, so the scan stops there.
+    """
+    key_end_marker = ARG_KEY_END + ARG_VALUE_BEGIN
+    pos = 0
+    while (start := body.find(ARG_KEY_BEGIN, pos)) != -1:
+        key_start = start + len(ARG_KEY_BEGIN)
+        key_end = body.find(key_end_marker, key_start)
+        if key_end == -1:
+            return
+        value_start = key_end + len(key_end_marker)
+        value_end = body.find(ARG_VALUE_END, value_start)
+        if value_end == -1:
+            return
+        yield body[key_start:key_end], body[value_start:value_end]
+        pos = value_end + len(ARG_VALUE_END)
+
+
 def _parse_tool_call_xml(tool_xml: str, tools: list[Tool]) -> _Spark2_5ToolCall | None:
     if not tool_xml.startswith(TOOL_CALL_BEGIN) or not tool_xml.endswith(TOOL_CALL_END):
         return None
@@ -92,8 +107,7 @@ def _parse_tool_call_xml(tool_xml: str, tools: list[Tool]) -> _Spark2_5ToolCall 
         return None
 
     arguments: dict[str, Any] = {}
-    for match in ARG_PAIR_PATTERN.finditer(body):
-        key, raw_value = match.group(1), match.group(2)
+    for key, raw_value in _iter_arg_pairs(body):
         if not key:
             continue
         arguments[key] = _convert_value(
