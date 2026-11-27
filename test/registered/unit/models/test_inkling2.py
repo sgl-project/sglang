@@ -35,6 +35,7 @@ from sglang.srt.multimodal.inkling2 import Inkling2ImageProcessor
 from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.parser.inkling_renderer import render_inkling_messages
 from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID
+from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.inkling2_test_utils import precision_group
 
@@ -761,6 +762,26 @@ def test_multimodal_requires_explicit_enable(tmp_path):
     assert enabled.is_multimodal
     assert not enabled.is_audio_model
     assert enabled.hf_config.vision_config == _RELEASE_CONFIG["vision_config"]
+
+
+def test_mxfp8_cache_needs_the_fused_decode_prologue(monkeypatch):
+    """SM90 and SM120 decode an MXFP8 cache only through the relative-bias decode
+    kernel, so attention without the fused decode prologue fails at construction
+    instead of at its first decode; other caches and FA4's MXFP8 path build as before."""
+    from sglang.srt.models.inkling_common import inkling2_attn
+
+    def build(sm, kv_cache_dtype, fused):
+        model = SimpleNamespace(kv_cache_dtype=kv_cache_dtype)
+        monkeypatch.setattr(inkling2_attn, "get_model", lambda: model)
+        with override_platform(is_sm90=sm == 90, is_sm120=sm == 120, device_sm=sm):
+            inkling2_attn._check_mxfp8_decode_prologue(fused)
+
+    for sm in (90, 120):
+        with pytest.raises(ValueError, match=f"mxfp8 on SM{sm} needs"):
+            build(sm, "mxfp8", fused=False)
+        build(sm, "mxfp8", fused=True)
+        build(sm, "auto", fused=False)
+    build(100, "mxfp8", fused=False)
 
 
 if __name__ == "__main__":
