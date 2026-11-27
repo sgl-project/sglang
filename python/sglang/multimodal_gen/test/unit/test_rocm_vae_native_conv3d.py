@@ -7,9 +7,6 @@ import torch
 
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanCausalConv3d
 from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestRocmVaeNativeConv3d(unittest.TestCase):
