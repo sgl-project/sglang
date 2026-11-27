@@ -159,6 +159,37 @@ class Model(msgspec.Struct):
         str,
         "A dictionary in JSON string format used to override default model configurations.",
     ] = "{}"
+    inkling2_loop_num_passes: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Number of loop passes for an inkling2_loop checkpoint with "
+                "loop_config.is_varloop=true. Default: the checkpoint's num_passes."
+            ),
+        ),
+    ] = None
+    inkling2_loop_share_cache: A[
+        bool,
+        "Share one K/V cache per loop core layer across passes for an inkling2_loop "
+        "checkpoint with loop_config.is_varloop=true. Every pass writes the shared "
+        "cache, so later tokens read the last pass's K/V. By default each pass "
+        "keeps its own cache.",
+    ] = False
+    inkling2_tool_call_author_name_mode: A[
+        Optional[Literal["tool_name", "independent", "drop_name"]],
+        Arg(
+            help=(
+                "The tool-call header an inkling2 checkpoint writes, which chat "
+                "prompts render past tool calls with, between <|message_model|> and "
+                "<|content_invoke_tool_json|>. 'tool_name': the tool's name "
+                "(Inkling-2-Mini, Inkling-2-Small). 'independent': the assistant "
+                "message's own name, empty when it has none. 'drop_name': assistant "
+                "message names are dropped, so the header is always empty. Default: the "
+                "checkpoint's config.json text_config.tool_call_author_name_mode, else "
+                "'tool_name', as Inkling-2-Mini and Inkling-2-Small. Other models ignore it."
+            ),
+        ),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Quantization and data type
@@ -210,7 +241,9 @@ class Model(msgspec.Struct):
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. Out-of-tree "
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "
+                '"int8" stores the DSA MLA KV as a packed INT8 record and is '
+                "supported for DSA models on Ascend A2 NPUs only. Out-of-tree "
                 "platform plugins can register further values for KV cache formats "
                 "that only their KV pool implements; in-tree platforms reject them."
             ),

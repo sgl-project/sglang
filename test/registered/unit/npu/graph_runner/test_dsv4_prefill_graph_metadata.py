@@ -44,12 +44,11 @@ def _backend():
     return SimpleNamespace(
         device="cpu",
         page_size=128,
-        max_context_len=4096,
         _dsv4_has_c4=True,
         _dsv4_has_c128=True,
         _dsv4_unique_compress_ratios=[4, 128],
         _dsv4_state_pools_by_ratio={4: pool, 128: pool},
-        req_to_token_pool=SimpleNamespace(c128_page_size=32),
+        req_to_token_pool=SimpleNamespace(c128_page_size=32, row_width=4096),
         _kernel_metadata_from_parts=_kernel_metadata,
         _build_dsv4_prefill_graph_state_table=_state_table,
     )
