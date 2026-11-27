@@ -26,6 +26,7 @@ export const benchmarks = [
   { match: { hw: "mi355x", pdMode: "unified", strategy: "high-throughput" } },
   { match: { hw: "mi355x", pdMode: "prefill", strategy: "high-throughput" } },
   { match: { hw: "mi355x", pdMode: "decode", strategy: "high-throughput" } },
+  { match: { hw: "a3", pdMode: "unified", strategy: "balanced-tp16-pp4-ep16" } },
   { match: { hw: "m890", pdMode: "prefill", strategy: "balanced-ep16" } },
   { match: { hw: "m890", pdMode: "decode", strategy: "balanced-ep32-dp4" } },
   { match: { hw: "810e", pdMode: "prefill", strategy: "balanced-pp4" } },
