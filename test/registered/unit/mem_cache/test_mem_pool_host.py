@@ -1481,7 +1481,9 @@ class TestMLAKvSplitMappingLengths(CustomTestCase):
     """page_first_kv_split books K, V and the indexer mirrors as own mappings."""
 
     @staticmethod
-    def _pool(packed_fp8=False, indexer=True, index_page_size=16):
+    def _pool(
+        packed_fp8=False, indexer=True, index_page_size=16, layout="page_first_kv_split"
+    ):
         layer_num = 3
         info = MLABufferInfo(
             buffers=MLASplitBuffers(
@@ -1514,7 +1516,7 @@ class TestMLAKvSplitMappingLengths(CustomTestCase):
             host_to_device_ratio=0,
             host_size=0,
             page_size=16,
-            layout="page_first_kv_split",
+            layout=layout,
             pin_memory=False,
             device_capacity_tokens=80,
             start_layer=0,
@@ -1597,6 +1599,64 @@ class TestMLAKvSplitMappingLengths(CustomTestCase):
                     if indexer:
                         self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float32)
                         self.assertEqual(sizes[len(buffers) - 1], 2 * 16 * 4)
+
+    def test_layer_first_storage_page_matches_page_first_bytes(self):
+        pages = [4, 1]
+        for packed_fp8 in (False, True):
+            for indexer in (False, True):
+                with self.subTest(packed_fp8=packed_fp8, indexer=indexer):
+                    page_pool, layer_pool = [
+                        self._pool(
+                            packed_fp8, indexer, index_page_size=4, layout=layout
+                        )
+                        for layout in ("page_first_kv_split", "layer_first_kv_split")
+                    ]
+                    self.addCleanup(page_pool.destroy)
+                    self.addCleanup(layer_pool.destroy)
+                    source = page_pool.get_hybrid_pool_buffer()
+                    target = layer_pool.get_hybrid_pool_buffer()
+                    self.assertEqual(
+                        layer_pool.get_mapping_lengths(), page_pool.get_mapping_lengths()
+                    )
+                    for src, dst in zip(source, target, strict=True):
+                        values = (torch.arange(src.numel()) % 251 + 1).reshape(src.shape)
+                        src.copy_(values)
+                        dst.zero_()
+
+                    indices = torch.cat(
+                        [torch.arange(p * 16, (p + 1) * 16) for p in pages]
+                    )
+                    source_pages = [[b[p] for b in source] for p in pages]
+                    target_pages = [
+                        [layer[p] for b in target for layer in b] for p in pages
+                    ]
+                    for pool, segments in (
+                        (page_pool, source_pages),
+                        (layer_pool, target_pages),
+                    ):
+                        pointers, sizes = pool.get_page_buffer_meta(indices)
+                        self.assertEqual(
+                            list(zip(pointers, sizes, strict=True)),
+                            [
+                                (s.data_ptr(), s.nbytes)
+                                for page in segments
+                                for s in page
+                            ],
+                        )
+
+                    for src_page, dst_page in zip(source_pages, target_pages):
+                        payload = torch.cat(
+                            [s.view(torch.uint8).flatten() for s in src_page]
+                        )
+                        for dst, chunk in zip(
+                            dst_page, payload.split([s.nbytes for s in dst_page])
+                        ):
+                            dst.view(torch.uint8).flatten().copy_(chunk)
+                    for src, dst in zip(source, target, strict=True):
+                        self.assertTrue(
+                            torch.equal(dst[:, pages], src[pages].transpose(0, 1))
+                        )
+                        self.assertEqual(dst[:, 0].count_nonzero().item(), 0)
 
     def test_storage_buffer_enumeration_filters_optional_buffers(self):
         pool = self._pool()
