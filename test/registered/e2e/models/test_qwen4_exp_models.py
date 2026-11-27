@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=706, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1060, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 
@@ -39,7 +39,7 @@ BASE_ARGS = [
 
 
 class _Qwen4ExpServer:
-    speculative_args: list[str] = []
+    server_args: list[str] = []
     model = try_cached_model(MODEL)
     base_url = DEFAULT_URL_FOR_TEST
     gsm8k_backend = "sgl_eval"
@@ -55,7 +55,7 @@ class _Qwen4ExpServer:
             cls.model,
             cls.base_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=BASE_ARGS + cls.speculative_args,
+            other_args=BASE_ARGS + cls.server_args,
         )
 
     @classmethod
@@ -68,13 +68,26 @@ class TestQwen4ExpBase(_Qwen4ExpServer, GSM8KMixin, CustomTestCase):
     """Normal autoregressive serving."""
 
 
+class TestQwen4ExpPLENVLink(_Qwen4ExpServer, GSM8KMixin, CustomTestCase):
+    """Serve PLE shards over NVLink in two attention-TP groups of two GPUs."""
+
+    server_args = [
+        "--enable-ple-nvlink",
+        "--attn-dp-size",
+        "2",
+        "--ep-size",
+        "4",
+        "--no-ple-offload-embedding",
+    ]
+
+
 class TestQwen4ExpMTP(_Qwen4ExpServer, GSM8KMixin, CustomTestCase):
     """NEXTN MTP serving (3 steps, topk 1, 4 draft tokens)."""
 
     # GSM8K accept length measured at 3.02-3.03 (max 4.0 with 3 steps);
     # 2.9 leaves noise margin while still failing on a real drop.
     gsm8k_accept_length_thres = 2.9
-    speculative_args = [
+    server_args = [
         "--speculative-algorithm",
         "NEXTN",
         "--speculative-num-steps",

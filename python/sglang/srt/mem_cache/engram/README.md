@@ -1,4 +1,4 @@
-# HiCache Engram storage
+# Engram table storage
 
 HiCache provides a unified storage interface for immutable Engram tables.
 Models supply integer row IDs and interpret the returned bytes; storage backends
@@ -10,9 +10,8 @@ host KV pool.
 The current backend, `MooncakeEngramStorage`, uses Mooncake EngramStore to own
 local host snapshots and read rows on the caller's CUDA stream. Enable it with
 `--enable-hi-engram`. This boolean flag defaults to disabled. Select the backend
-through `--hi-engram-config`; `backend` defaults to `local`. Omitting the flag
-preserves each model's native implementation. `backend: "remote"` is reserved
-and fails when the Engram component is constructed:
+through `--hi-engram-config`; `backend` defaults to `local`.
+`backend: "remote"` is reserved and fails when the Engram component is constructed:
 Mooncake's remote table API does not yet support CUDA stream/graph lookup.
 
 ## Model integration
@@ -29,9 +28,19 @@ embedding dtypes or distributed model state. Qwen4-Exp selects the embedding
 class directly from `enable_hi_engram`; hashing, scales, projections, request
 history, collectives and prefetch scheduling remain in the model.
 
+### Native NVLink lookup
+
+[`PeerVocabParallelEmbedding`](peer_embedding.py) accepts global row IDs and
+reads BF16 or FP8 E4M3 rows from contiguous row shards on peer GPUs. It returns
+BF16 vectors. The model applies its embedding scale. After loading weights,
+call `finish_loading()` on every rank in the TP group before the first lookup.
+With `--enable-ple-nvlink`, Qwen4-Exp shards each PLE table across the TP group
+in pure TP mode. With DP attention, each replica shards its own table across
+its attention-TP ranks.
+
 ## Usage
 
-Install the CUDA-enabled wheel from
+For the HiCache backend, install the CUDA-enabled wheel from
 [Mooncake #4701](https://github.com/kvcache-ai/Mooncake/pull/4701), which supplies
 `mooncake.engram.EngramStore` and `mooncake._engram_cuda`. The ordinary Mooncake KV
 backend does not provide this table API. Native execution does not import it.
@@ -59,7 +68,7 @@ is constructed, before allocating or loading its embedding weights.
 
 ## Ownership and ordering
 
-The first eager lookup publishes an immutable copy of the loaded CPU weights.
+The first eager HiCache lookup publishes an immutable copy of the CPU weights.
 Each table and TP rank owns an anonymous snapshot (`persistent=False`), so
 worker exit leaves no named table files and instances cannot reuse stale weights.
 After successful publication, the adapter releases the checkpoint parameter's

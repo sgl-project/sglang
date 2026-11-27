@@ -2603,6 +2603,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-ple-nvlink`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Read PLE embedding rows directly from peer GPUs over NVLink. Currently supported by Qwen4-Exp on CUDA with attention TP greater than one and attention CP of one. With pure TP, all TP ranks share each table. With DP attention, each replica shares its own table across its attention-TP ranks. Mutually exclusive with `--enable-hi-engram`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Flag</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ple-offload-embedding`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep the Qwen4-Exp PLE n-gram embedding table in host memory instead of device memory; the gather kernel reads it from a host pointer. Enabled by default for BF16 Qwen4-Exp on CUDA; `--no-ple-offload-embedding` disables it.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
