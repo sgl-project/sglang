@@ -21,7 +21,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
 
 
 class Request:
-    def __init__(self, name, steps=5, signature="a"):
+    def __init__(self, name, steps=5, signature="a", deadline_ms=None):
+        self.sampling_params = SimpleNamespace(deadline_ms=deadline_ms)
         self.request_id = name
         self.num_inference_steps = steps
         self.extra = {"vla": {}}
@@ -54,8 +55,12 @@ class Scheduler(Pi05SegmentSchedulerMixin):
         self.metrics = None
         self._batch_metrics_enabled = True
         self._batch_metrics_window = BatchMetricsWindow()
+        self.returned = []
 
     _record_batch_dispatch_metrics = ProductionScheduler._record_batch_dispatch_metrics
+
+    def _return_item_result(self, item, output):
+        self.returned.append((item[1].request_id, output))
 
     def _dynamic_batching_enabled(self):
         return True
@@ -128,6 +133,76 @@ def test_tp_uses_rank_zero_packet_and_rejects_queue_mismatch(monkeypatch):
     bad.server_args.tp_size = 2
     with pytest.raises(RuntimeError, match="differs"):
         bad._get_next_pi05_segment_batch()
+
+
+def test_earliest_deadline_runs_first_and_undated_requests_follow():
+    undated = Request("undated", signature="b")
+    late = Request("late", signature="c", deadline_ms=60_000)
+    soon = Request("soon", deadline_ms=20_000)
+    scheduler = Scheduler([(undated, 1.0), (late, 2.0), (soon, 3.0)])
+    order = [scheduler._get_next_pi05_segment_batch()[0][1] for _ in range(3)]
+    assert [r.request_id for r in order] == ["soon", "late", "undated"]
+
+
+def test_expired_requests_are_returned_without_launching():
+    """A fresh or half-denoised request past its deadline frees its state."""
+    fresh = Request("fresh", deadline_ms=500)
+    continuation = Request("continuation", deadline_ms=500)
+    continuation.extra["vla"]["pi05_flow"] = SimpleNamespace(remaining=2)
+    alive = Request("alive", deadline_ms=60_000)
+    scheduler = Scheduler([(alive, 3.0), (continuation, 9.0), (fresh, 8.0)])
+    scheduler._pi05_arrivals[id(continuation)] = (1.0, 0)
+    scheduler._pi05_sequence = 1
+    items = scheduler._get_next_pi05_segment_batch()
+    assert [r.request_id for _, r in items] == ["alive"]
+    assert sorted(name for name, _ in scheduler.returned) == ["continuation", "fresh"]
+    assert all(o.deadline_expired and o.error for _, o in scheduler.returned)
+    assert not scheduler.waiting_queue
+    assert "pi05_flow" not in continuation.extra["vla"]
+    assert list(scheduler._pi05_arrivals) == [id(alive)]
+
+
+def test_deadline_does_not_jump_a_control_barrier():
+    old = Request("old")
+    control = SimpleNamespace(request_id="update_weights")
+    urgent = Request("urgent", deadline_ms=20_000)
+    scheduler = Scheduler([(old, 1.0), (control, 2.0), (urgent, 3.0)])
+    order = [scheduler._get_next_pi05_segment_batch()[0][1] for _ in range(3)]
+    assert order == [old, control, urgent]
+
+
+@pytest.mark.parametrize("deadline_ms,held", [(30, False), (5_000, True)])
+def test_batch_delay_never_holds_past_a_deadline(deadline_ms, held):
+    req = Request("a", deadline_ms=deadline_ms)
+    scheduler = Scheduler([(req, 9.99)])
+    assert (scheduler._get_next_pi05_segment_batch() is None) is held
+    assert not scheduler.returned
+
+
+def test_tp_followers_drop_what_rank_zero_expired(monkeypatch):
+    """Followers use rank zero's verdict even if their own clock disagrees."""
+    packet = []
+
+    def broadcast(value, rank, group, src):
+        if rank == 0:
+            packet[:] = [value]
+        return packet[0]
+
+    monkeypatch.setattr(module, "broadcast_pyobj", broadcast)
+
+    def rows(arrival):
+        return [
+            (Request("dead", deadline_ms=500), arrival),
+            (Request("alive"), arrival + 1),
+        ]
+
+    leader, follower = Scheduler(rows(1.0)), Scheduler(rows(9.9), rank=1)
+    leader.server_args.tp_size = follower.server_args.tp_size = 2
+    for scheduler in (leader, follower):
+        items = scheduler._get_next_pi05_segment_batch()
+        assert [r.request_id for _, r in items] == ["alive"]
+        assert [name for name, _ in scheduler.returned] == ["dead"]
+        assert not scheduler.waiting_queue
 
 
 def test_retire_refill_and_only_return_completed_actions():

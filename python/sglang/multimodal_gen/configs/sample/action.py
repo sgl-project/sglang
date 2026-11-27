@@ -2,6 +2,7 @@
 
 import argparse
 import dataclasses
+import math
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -33,6 +34,10 @@ class ActionSamplingParams:
     seed: int | list[int] = field(default=42, metadata={"batch_sig_exclude": True})
     generator_device: str | None = None
     num_inference_steps: int = 10
+    # Latency budget from scheduler arrival; used by segmented action scheduling.
+    deadline_ms: float | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )
 
     output_path: str | None = field(default=None, metadata={"batch_sig_exclude": True})
     output_file_name: str | None = field(
@@ -106,6 +111,16 @@ class ActionSamplingParams:
             raise ValueError(
                 "num_inference_steps must be a positive int, "
                 f"got {self.num_inference_steps!r}"
+            )
+
+        if self.deadline_ms is not None and (
+            isinstance(self.deadline_ms, bool)
+            or not isinstance(self.deadline_ms, (int, float))
+            or not math.isfinite(self.deadline_ms)
+            or self.deadline_ms <= 0
+        ):
+            raise ValueError(
+                f"deadline_ms must be a positive number, got {self.deadline_ms!r}"
             )
 
         if self.generator_device not in (None, "cuda", "musa", "cpu"):

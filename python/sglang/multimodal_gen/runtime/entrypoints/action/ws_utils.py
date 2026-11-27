@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import WebSocket, WebSocketDisconnect
 
 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
+    ActionDeadlineExpiredError,
     action_metadata,
     infer_action,
     pack_msgpack,
@@ -46,6 +47,11 @@ async def run_action_msgpack_ws(
             prev_total_time = time.monotonic() - start_time
         except WebSocketDisconnect:
             break
+        except ActionDeadlineExpiredError as exc:
+            # A missed deadline is per request; the robot keeps its connection.
+            await websocket.send_bytes(
+                pack_msgpack({"error": str(exc), "error_type": "deadline_expired"})
+            )
         except Exception:
             try:
                 await websocket.send_bytes(

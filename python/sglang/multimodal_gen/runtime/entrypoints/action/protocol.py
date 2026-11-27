@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
@@ -25,6 +26,10 @@ from sglang.multimodal_gen.runtime.entrypoints.action.cosmos3 import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+class ActionDeadlineExpiredError(RuntimeError):
+    """The scheduler dropped the request because its deadline passed."""
 
 
 def pack_numpy_payload(obj):
@@ -431,6 +436,7 @@ def _build_action_model_sampling_params(
         "return_timing": _runtime_bool(runtime.get("return_timing"), True),
         "enable_prefix_cache": _runtime_bool(prefix_cache, True),
         "enable_cuda_graph": _runtime_bool(cuda_graph, True),
+        "deadline_ms": runtime.get("deadline_ms"),
     }
     # Optional per-request overrides; absent keys keep the model defaults.
     for name in ("seed", "guidance_scale", "guidance_scale_action"):
@@ -449,11 +455,22 @@ def _build_action_model_sampling_params(
     return sp
 
 
+def _check_deadline_supported(payload: dict[str, Any], server_args: ServerArgs) -> None:
+    if (payload.get("runtime") or {}).get("deadline_ms") is None:
+        return
+    config = server_args.pipeline_config
+    if not (isinstance(config, Pi05PipelineConfig) and config.enable_segmented_actions):
+        raise ValueError(
+            "runtime.deadline_ms requires a Pi0.5 server with segmented actions enabled"
+        )
+
+
 def build_action_sampling_params(
     payload: dict[str, Any],
     server_args: ServerArgs,
 ) -> SamplingParams | ActionSamplingParams:
     sampling_params_cls = _resolve_action_sampling_params_cls(server_args)
+    _check_deadline_supported(payload, server_args)
     if issubclass(sampling_params_cls, ActionSamplingParams):
         return _build_action_model_sampling_params(
             payload,
@@ -479,6 +496,8 @@ async def infer_action(
     sp = build_action_sampling_params(payload, server_args)
     req = prepare_request(server_args, sp)
     response = await async_scheduler_client.forward(req)
+    if response.deadline_expired:
+        raise ActionDeadlineExpiredError(response.error)
     if getattr(response, "error", None):
         raise RuntimeError(response.error)
     if response.output is None:

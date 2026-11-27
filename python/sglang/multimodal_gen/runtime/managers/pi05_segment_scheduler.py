@@ -3,15 +3,22 @@
 
 from __future__ import annotations
 
+import math
 import time
+from itertools import takewhile
 from typing import TYPE_CHECKING, Any
+
+import zmq
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.vla.pi05_segment import Pi05FlowState
+
+logger = init_logger(__name__)
 
 
 def _flow(req: Req) -> Pi05FlowState | None:
@@ -51,10 +58,17 @@ class Pi05SegmentSchedulerMixin:
             for _, req, _ in self.waiting_queue
         ]
 
+    def _pi05_deadline(self, req: Req) -> float:
+        """Absolute time on this rank's monotonic clock; inf without a deadline."""
+        budget_ms = req.sampling_params.deadline_ms
+        if budget_ms is None:
+            return math.inf
+        return self._pi05_arrivals[id(req)][0] + budget_ms / 1000.0
+
     def _select_pi05_segment(self) -> dict[str, Any]:
         q = self.waiting_queue
         if not q:
-            return {"indices": []}
+            return {"indices": [], "arrivals": [], "expired": []}
         # Queue position is a stable tie-breaker for fresh requests received in
         # one poll. Continuations retain their original sequence and timestamp.
         for _, req, arrived in q:
@@ -63,21 +77,39 @@ class Pi05SegmentSchedulerMixin:
                     raise RuntimeError("Continuation lost its original arrival")
                 self._pi05_arrivals[id(req)] = (arrived, self._pi05_sequence)
                 self._pi05_sequence += 1
+        now = time.monotonic()
+        expired = [
+            i
+            for i, (_, req, _) in enumerate(q)
+            if self._is_pi05_segment_request(req) and self._pi05_deadline(req) <= now
+        ]
         # Keep control requests in arrival order relative to continuations.
         ordered = sorted(
-            range(len(q)),
+            set(range(len(q))).difference(expired),
             key=lambda i: self._pi05_arrivals[id(q[i][1])],
         )
-        head = q[ordered[0]][1]
-        if not self._is_pi05_segment_request(head):
+        if not ordered:
+            return {"indices": [], "arrivals": [], "expired": expired}
+        # Earliest deadline first, but only among requests ahead of the next
+        # control/warmup request; without deadlines this is arrival order.
+        window = sorted(
+            takewhile(lambda i: self._is_pi05_segment_request(q[i][1]), ordered),
+            key=lambda i: (
+                self._pi05_deadline(q[i][1]),
+                self._pi05_arrivals[id(q[i][1])],
+            ),
+        )
+        if not window:
             return {
                 "indices": ordered[:1],
-                "arrivals": [self._pi05_arrivals[id(head)]],
+                "arrivals": [self._pi05_arrivals[id(q[ordered[0]][1])]],
+                "expired": expired,
             }
-        selected = [ordered[0]]
-        reqs = [head]
+        selected = window[:1]
+        reqs = [q[window[0]][1]]
+        head = reqs[0]
         if self._dynamic_batching_enabled() and self._can_dynamic_batch(head, head):
-            for i in ordered[1:]:
+            for i in window[1:]:
                 req = q[i][1]
                 if len(
                     reqs
@@ -85,8 +117,6 @@ class Pi05SegmentSchedulerMixin:
                     reqs
                 ):
                     break
-                if not self._is_pi05_segment_request(req):
-                    break  # Do not start requests across a control/warmup boundary.
                 if not self._can_dynamic_batch(head, req):
                     continue
                 if self._batch_admission.reject_reason_for_candidate(reqs, req) is None:
@@ -96,18 +126,54 @@ class Pi05SegmentSchedulerMixin:
                 self._is_pi05_segment_request(r) and _flow(r) is not None
                 for _, r, _ in q
             )
+            hold_until = (
+                min(self._pi05_arrivals[id(r)][0] for r in reqs)
+                + self._batching_delay_s
+            )
             if (
                 not continuing
                 and len(reqs) < self._batching_max_size
                 and not self._batch_admission.batch_is_full(reqs)
-                and time.monotonic() - self._pi05_arrivals[id(head)][0]
-                < self._batching_delay_s
+                and now < hold_until
+                # Never hold a request until after its own deadline.
+                and all(self._pi05_deadline(r) > hold_until for r in reqs)
             ):
-                return {"indices": []}
+                return {"indices": [], "arrivals": [], "expired": expired}
         return {
             "indices": selected,
             "arrivals": [self._pi05_arrivals[id(r)] for r in reqs],
+            "expired": expired,
         }
+
+    def _release_pi05_state(self, req: Req) -> None:
+        self._pi05_arrivals.pop(id(req), None)
+        for key in (
+            "pi05_flow",
+            "pi05_segment_length",
+            "actions",
+            "prefix_context",
+            "prefix_context_group",
+            "observation_group",
+            "observation_batch",
+        ):
+            req.extra["vla"].pop(key, None)
+
+    def _drop_expired_pi05_requests(
+        self, entries: list[tuple[bytes | None, Req, float]]
+    ) -> None:
+        for identity, req, _ in entries:
+            self._release_pi05_state(req)
+            output = OutputBatch(
+                error=(
+                    f"Action deadline of {req.sampling_params.deadline_ms:g} ms "
+                    "expired before launch"
+                ),
+                deadline_expired=True,
+            )
+            try:
+                self._return_item_result((identity, req), output)
+            except zmq.ZMQError as exc:
+                logger.error("ZMQ error returning expired pi05 request: %s", exc)
 
     def _get_next_pi05_segment_batch(self) -> list[tuple[bytes | None, Any]] | None:
         rank = self.worker.tp_group.rank
@@ -129,8 +195,7 @@ class Pi05SegmentSchedulerMixin:
             raise RuntimeError(packet["error"])
         if packet["signature"] != self._pi05_queue_signature():
             raise RuntimeError("Pi05 continuation queue differs between TP ranks")
-        if not packet["indices"]:
-            return None
+        expired = [self.waiting_queue[i] for i in packet["expired"]]
         selected = []
         enqueue_times = []
         for i, arrival in zip(packet["indices"], packet["arrivals"], strict=True):
@@ -141,8 +206,11 @@ class Pi05SegmentSchedulerMixin:
                 self._pi05_arrivals.pop(id(req), None)
             selected.append((identity, req))
             enqueue_times.append(enqueued)
-        for i in sorted(packet["indices"], reverse=True):
+        for i in sorted(packet["indices"] + packet["expired"], reverse=True):
             del self.waiting_queue[i]
+        self._drop_expired_pi05_requests(expired)
+        if not selected:
+            return None
         if isinstance(selected[0][1], Req):
             reqs = [req for _, req in selected]
             output_count = sum(
@@ -189,7 +257,6 @@ class Pi05SegmentSchedulerMixin:
             items, outputs, budgets, before, strict=True
         ):
             _, req = item
-            state = req.extra["vla"]
             flow = _flow(req)
             if not output.error and (
                 flow is None
@@ -204,16 +271,6 @@ class Pi05SegmentSchedulerMixin:
                 # the wait since this continuation became ready again.
                 self.waiting_queue.append((item[0], req, time.monotonic()))
             else:
-                self._pi05_arrivals.pop(id(req), None)
-                for key in (
-                    "pi05_flow",
-                    "pi05_segment_length",
-                    "actions",
-                    "prefix_context",
-                    "prefix_context_group",
-                    "observation_group",
-                    "observation_batch",
-                ):
-                    state.pop(key, None)
+                self._release_pi05_state(req)
                 completed.append((item, output))
         return completed
