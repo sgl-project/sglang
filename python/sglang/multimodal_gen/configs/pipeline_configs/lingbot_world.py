@@ -18,6 +18,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_I2V_A14B_Config
+from sglang.multimodal_gen.configs.post_training.denoising_env import (
+    register_denoising_env_args,
+)
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
 )
@@ -277,6 +280,8 @@ def _prepare_lingbot_world_condition(
     return c2ws_plucker_emb
 
 
+# A different DiT from the Wan base, so the base env args do not apply.
+@register_denoising_env_args(None)
 @dataclass
 class LingBotWorldI2VConfig(Wan2_2_I2V_A14B_Config):
     dit_config: DiTConfig = field(default_factory=LingBotWorldVideoConfig)

@@ -1658,7 +1658,6 @@ class Cosmos3DenoisingStage(PipelineStage):
         timesteps = batch.timesteps
         init_rollout_env_if_enabled(
             batch=batch,
-            image_kwargs={},
             pos_cond_kwargs={
                 "text_ids": cond_text_ids,
                 "text_mask": cond_text_mask,
@@ -1669,7 +1668,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 "text_mask": uncond_text_mask,
                 "fps": fps,
             },
-            guidance=None,
+            pipeline_config=server_args.pipeline_config,
         )
 
         do_cfg = guidance_scale > 1.0

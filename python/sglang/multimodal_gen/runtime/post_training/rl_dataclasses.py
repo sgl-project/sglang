@@ -19,10 +19,10 @@ class RolloutDebugTensors:
 
 @dataclass
 class RolloutDenoisingEnv:
-    image_kwargs: dict[str, Any] | None = None
+    """The conditional and the unconditional CFG branch's loop-invariant DiT forward kwargs."""
+
     pos_cond_kwargs: dict[str, Any] | None = None
     neg_cond_kwargs: dict[str, Any] | None = None
-    guidance: torch.Tensor | None = None
 
 
 @dataclass

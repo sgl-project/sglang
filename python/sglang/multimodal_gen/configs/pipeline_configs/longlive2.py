@@ -10,11 +10,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
+from sglang.multimodal_gen.configs.post_training.denoising_env import (
+    register_denoising_env_args,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 
+# A different DiT from the Wan base, so the base env args do not apply.
+@register_denoising_env_args(None)
 @dataclass
 class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
     is_causal: bool = True

@@ -2054,12 +2054,25 @@ class DenoisingStage(PipelineStage):
         Run the denoising loop.
         """
         ctx = self._prepare_denoising_loop(batch, server_args)
+        forward = getattr(self.transformer, "forward", self.transformer)
+        guidance_kwargs = self.prepare_extra_func_kwargs(
+            forward, {"guidance": ctx.guidance}
+        )
+        # The kwargs CFGPolicy.build gives each branch; a negative cond built without
+        # CFG runs no branch but still goes into the env.
         init_rollout_env_if_enabled(
             batch=batch,
-            image_kwargs=ctx.image_kwargs,
-            pos_cond_kwargs=ctx.pos_cond_kwargs,
-            neg_cond_kwargs=ctx.neg_cond_kwargs,
-            guidance=ctx.guidance,
+            pos_cond_kwargs={
+                **guidance_kwargs,
+                **ctx.image_kwargs,
+                **ctx.pos_cond_kwargs,
+            },
+            neg_cond_kwargs=(
+                {**guidance_kwargs, **ctx.image_kwargs, **ctx.neg_cond_kwargs}
+                if ctx.neg_cond_kwargs
+                else None
+            ),
+            pipeline_config=server_args.pipeline_config,
         )
         timesteps_cpu = self._run_denoising_loop(ctx, batch, server_args)
 

@@ -4,7 +4,7 @@
 A loop runs inside ``rollout_scope``. Before SP sharding and before reading
 ``batch.timesteps`` it calls ``prepare_rollout_if_enabled`` for each of its
 latent streams. It calls
-``init_rollout_env_if_enabled`` at the loop start, passes
+``init_rollout_env_if_enabled`` once before the loop, passes
 ``**rollout_step_kwargs(batch, stream=...)`` to each stream's ``scheduler.step``,
 calls ``finalize_rollout_if_enabled`` for each stream at the loop end and then
 ``publish_rollout_if_enabled`` once.
@@ -20,6 +20,9 @@ from typing import Any, Callable
 
 import torch
 
+from sglang.multimodal_gen.configs.post_training.denoising_env import (
+    denoising_env_args_of,
+)
 from sglang.multimodal_gen.configs.post_training.rl_rollout import (
     PRIMARY_STREAM,
     stream_sde_kernel_settings,
@@ -210,41 +213,52 @@ def prepare_rollout_if_enabled(
 def init_rollout_env_if_enabled(
     *,
     batch: Req,
-    image_kwargs: dict[str, Any],
-    pos_cond_kwargs: dict[str, Any],
-    neg_cond_kwargs: dict[str, Any],
-    guidance: torch.Tensor | None,
+    pos_cond_kwargs: dict[str, Any] | None,
+    neg_cond_kwargs: dict[str, Any] | None,
+    pipeline_config: Any,
 ) -> None:
-    """Snapshot the DiT conditioning that the trainer replays."""
-    if not batch.rollout:
-        return
-    collect_env = batch.rollout_return_denoising_env
-    collect_traj = batch.rollout_return_dit_trajectory
-    if not (collect_env or collect_traj):
-        batch._rollout_denoising_env_state = None
-        return
+    """Record the denoising env: the conditional and the unconditional CFG branch's
+    DiT forward kwargs that stay fixed for the whole loop, filtered by the env args
+    registered for the pipeline config.
 
-    if collect_env:
-        env = RolloutDenoisingEnv(
-            image_kwargs=_kwargs_to_cpu(image_kwargs),
-            pos_cond_kwargs=_kwargs_to_cpu(pos_cond_kwargs),
-            neg_cond_kwargs=(
-                _kwargs_to_cpu(neg_cond_kwargs) if neg_cond_kwargs else None
-            ),
-            guidance=guidance.detach().cpu() if guidance is not None else None,
-        )
-        pos_src = pos_cond_kwargs
-        neg_src = neg_cond_kwargs
-    else:
-        env = None
-        pos_src = None
-        neg_src = None
+    Called once, before the loop, with the kwargs in the form the stage builds them,
+    before any engine rewrite (BCG padding, prompt K/V caching, CFG batching).
+    ``neg_cond_kwargs`` is None when the request builds no negative cond.
+    """
+    if not (batch.rollout and batch.rollout_return_denoising_env):
+        return
+    if batch._rollout_denoising_env_state is not None:
+        raise RuntimeError("The denoising env of this request was already recorded")
+    if pos_cond_kwargs is None:
+        raise ValueError("The denoising stage recorded no conditional branch")
+    env_args = denoising_env_args_of(pipeline_config)
+    batch._rollout_denoising_env_state = RolloutDenoisingEnv(
+        pos_cond_kwargs=_env_kwargs(pos_cond_kwargs, env_args),
+        neg_cond_kwargs=(
+            _env_kwargs(neg_cond_kwargs, env_args)
+            if neg_cond_kwargs is not None
+            else None
+        ),
+    )
 
-    batch._rollout_denoising_env_state = {
-        "env": env,
-        "pos_cond_kwargs_src": pos_src,
-        "neg_cond_kwargs_src": neg_src,
+
+def _env_kwargs(
+    kwargs: dict[str, Any], env_args: frozenset[str] | None
+) -> dict[str, Any]:
+    """A copy of ``kwargs`` without the args passed as None or not registered."""
+    return {
+        k: v
+        for k, v in kwargs.items()
+        if v is not None and (env_args is None or k in env_args)
     }
+
+
+def _gathered_env_kwargs_on_cpu(
+    batch: Req, kwargs: dict[str, Any], pipeline_config: Any
+) -> dict[str, Any]:
+    return _kwargs_to_cpu(
+        pipeline_config.gather_denoising_env_static_for_sp(batch, kwargs)
+    )
 
 
 def finalize_rollout_if_enabled(
@@ -299,20 +313,26 @@ def publish_rollout_if_enabled(*, batch: Req, pipeline_config: Any) -> None:
             f"Requested rollout streams {unfinalized} were not finalized by the "
             "denoising stage"
         )
-    state = batch._rollout_denoising_env_state
-    env = state["env"] if state is not None else None
-    if env is not None:
-        env.pos_cond_kwargs = _kwargs_to_cpu(
-            pipeline_config.gather_denoising_env_static_for_sp(
-                batch, state["pos_cond_kwargs_src"]
+    env = None
+    if batch.rollout_return_denoising_env:
+        recorded = batch._rollout_denoising_env_state
+        if recorded is None:
+            raise RuntimeError(
+                "The request asked for the denoising env but the denoising stage "
+                "recorded none"
             )
-        )
-        if env.neg_cond_kwargs is not None:
-            env.neg_cond_kwargs = _kwargs_to_cpu(
-                pipeline_config.gather_denoising_env_static_for_sp(
-                    batch, state["neg_cond_kwargs_src"]
+        env = RolloutDenoisingEnv(
+            pos_cond_kwargs=_gathered_env_kwargs_on_cpu(
+                batch, recorded.pos_cond_kwargs, pipeline_config
+            ),
+            neg_cond_kwargs=(
+                _gathered_env_kwargs_on_cpu(
+                    batch, recorded.neg_cond_kwargs, pipeline_config
                 )
-            )
+                if recorded.neg_cond_kwargs is not None
+                else None
+            ),
+        )
     # One assignment: a failure before it leaves no partial trajectory.
     batch.rollout_trajectory_data = RolloutTrajectoryData(
         denoising_env=env,
