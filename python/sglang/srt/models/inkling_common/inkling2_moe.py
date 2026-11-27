@@ -27,6 +27,9 @@ from sglang.kernels.ops.gemm.inkling2_linear import (
     linear_k_group_partials,
     uses_k_groups,
 )
+from sglang.kernels.ops.gemm.inkling2_moe_gemm_lowm_sm120 import (
+    mxfp8_expert_matmul_lowm,
+)
 from sglang.kernels.ops.gemm.inkling2_mxfp8 import (
     routed_expert_matmul as mxfp8_routed_matmul,
 )
@@ -857,6 +860,28 @@ class Inkling2Experts(nn.Module):
             tokens,
         )
 
+    def _forward_sm120_lowm_mxfp8(self, x, src2dst, dst2src, gammas, offsets, combine):
+        x_c = x.contiguous()
+        values, scales = experts_sm120.mxfp8_routed_quantize(
+            x=x_c, dst2src=dst2src, top_k=8, offsets=offsets
+        )
+        gate_up = mxfp8_expert_matmul_lowm(
+            values, scales, self.w13_weight, self.w13_scale, offsets
+        )
+        values, scales = experts_sm120.mxfp8_routed_swiglu_quantize(
+            acc=gate_up,
+            gammas=gammas,
+            offsets=offsets,
+            gate_cap=self.gate_cap,
+            up_cap=self.up_cap,
+        )
+        down = mxfp8_expert_matmul_lowm(
+            values, scales, self.w2_weight, self.w2_scale, offsets
+        )
+        if not combine:
+            return RoutedOutput(down, src2dst, 8)
+        return moe_lowm_sm120.moe_combine_bf16(down, src2dst, 8)
+
     def _forward_sm120_routed(
         self, x, src2dst, dst2src, gammas, offsets, top_k, tokens, combine
     ):
@@ -899,6 +924,10 @@ class Inkling2Experts(nn.Module):
             src2dst, dst2src, gammas, offsets = moe_lowm_sm120.route_metadata_lowm(
                 ids, weights, self.num_global_experts
             )
+            if self._routed_kernels != torch.uint8:
+                return self._forward_sm120_lowm_mxfp8(
+                    x, src2dst, dst2src, gammas, offsets, combine
+                )
         else:
             src2dst, dst2src, gammas, offsets = self._sm120_route(ids, weights)
         return self._forward_sm120_routed(
@@ -1282,6 +1311,10 @@ class Inkling2MoE(nn.Module):
                     self.gate._one,
                 )
             )
+            if self.experts._routed_kernels != torch.uint8:
+                return self.experts._forward_sm120_lowm_mxfp8(
+                    x, src2dst, dst2src, gammas, offsets, combine=combine
+                )
             return self.experts._forward_sm120_routed(
                 x,
                 src2dst,
