@@ -362,7 +362,7 @@ sgl-eval run mmmu_pro \\
     mi300x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261028",
     mi355x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261028",
     // TODO(NPU): `a3:` / `a5:` images (kimi-k3: quay.io/ascend/sglang:
-    // main-cann9.1.0-a3 and the swr.cn-southwest-2 950PR/DT tag).
+    // main-cann9.2.0-a3 and the swr.cn-southwest-2 950PR/DT tag).
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".

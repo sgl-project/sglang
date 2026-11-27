@@ -183,13 +183,11 @@ def handle_gpu_memory_settings(server_args: Any):
         if decode_cuda_graph_config.max_bs is None:
             decode_cuda_graph_config.max_bs = 160
 
-    if (
-        decode_max_bs_is_default
-        and cfg.max_running_requests is not None
-        and decode_cuda_graph_config.max_bs is not None
-        and decode_cuda_graph_config.max_bs > cfg.max_running_requests
-    ):
-        decode_cuda_graph_config.max_bs = cfg.max_running_requests
+    # Cover every batch one DP rank can run, so the default never runs eager.
+    if decode_max_bs_is_default and cfg.max_running_requests is not None:
+        decode_cuda_graph_config.max_bs = max(
+            1, cfg.max_running_requests // cfg.attn_dp_size
+        )
 
     from sglang.srt.arg_groups.model_overrides.qwen3_vl import (
         expand_multimodal_decode_graph_to_running_limit,

@@ -1463,7 +1463,10 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             # still needs to reduce-scatter its TP-partial MLP output here.
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
-            if fine_grained_overlap:
+            if fine_grained_overlap or (_is_npu and get_is_capture_mode()):
+                # NPU-only: under capture the deferred path leaves an
+                # unconsumed event on the capture stream (EndCapture "events
+                # not joined"); record_stream is capture-safe.
                 shared_output.record_stream(current_stream)
             else:
                 shared_alt_output = shared_output
@@ -3906,8 +3909,11 @@ class KimiK3LinearForCausalLM(nn.Module):
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
-            if input_ids is None and layernorm_sp.runs_sp(
-                forward_batch.forward_mode, embeds.shape[0]
+            if (
+                self.pp_group.world_size == 1
+                and input_ids is None
+                and embeds is not None
+                and layernorm_sp.runs_sp(forward_batch.forward_mode, embeds.shape[0])
             ):
                 # The multimodal routine passes embeddings only, and the logits
                 # processor gathers by the ids' count.
