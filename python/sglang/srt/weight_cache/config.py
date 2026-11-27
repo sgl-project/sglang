@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
 from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 from sglang.srt.model_loader.loader import PreshardedModelLoader
+from sglang.srt.model_loader.utils import get_model_architecture
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 
 from .protocol import compute_env_stamp, hash_quant_config, resolve_cache_quantization
@@ -86,6 +87,18 @@ def _quant_files_hash(model_config: ModelConfig, quant_method: str) -> str:
     return hashlib.sha256(json.dumps(digests, sort_keys=True).encode()).hexdigest()
 
 
+def _model_class(model_config: ModelConfig) -> str:
+    """The class get_model_architecture builds the model from.
+
+    It can import a model's remote code; the loader does the same when it builds
+    the model.
+    """
+    if not getattr(model_config.hf_config, "architectures", None):
+        return ""
+    model_cls, _ = get_model_architecture(model_config)
+    return f"{model_cls.__module__}.{model_cls.__qualname__}"
+
+
 def build_load_spec(
     model_config: ModelConfig,
     *,
@@ -117,6 +130,7 @@ def build_load_spec(
         # Model config.
         checkpoint_id=checkpoint_id,
         model_arch=architectures[0] if architectures else "",
+        model_class=_model_class(model_config),
         hf_config_hash=_hf_config_hash(model_config.hf_config),
         dtype=str(model_config.dtype),
         role="draft" if model_config.is_draft_model else "target",

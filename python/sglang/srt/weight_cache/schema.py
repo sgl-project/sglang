@@ -25,6 +25,9 @@ class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
     # A content digest or pinned commit; the cache daemon passes path[@revision].
     checkpoint_id: str
     model_arch: str
+    # The class the model is built from ("module.QualName"): one model_arch can
+    # resolve to several, for example with --model-impl transformers.
+    model_class: str
     hf_config_hash: str  # effective HF config after model overrides, without paths
     dtype: str
     # "draft" for a speculative-decoding draft model. It can have its target's

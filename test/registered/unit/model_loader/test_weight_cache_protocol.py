@@ -30,7 +30,7 @@ from unittest import mock
 
 import msgspec
 import torch
-from transformers import PretrainedConfig
+from transformers import LlamaConfig, PretrainedConfig
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.environ import envs
@@ -203,7 +203,8 @@ class TestLoadSpec(CustomTestCase):
             LoadSpec.__struct_fields__,
             (
                 # Model config.
-                *("checkpoint_id", "model_arch", "hf_config_hash", "dtype"),
+                *("checkpoint_id", "model_arch", "model_class", "hf_config_hash"),
+                "dtype",
                 *("role", "draft_model_idx"),
                 # Quantization config.
                 *("quant_method", "quant_config_hash", "quant_files_hash"),
@@ -234,6 +235,15 @@ class TestLoadSpec(CustomTestCase):
             spec.dtype = "torch.float16"
 
     def test_every_model_and_quantization_field_changes_both_digests(self):
+        class OtherModel:
+            pass
+
+        self.enterContext(
+            mock.patch(
+                "sglang.srt.weight_cache.config.get_model_architecture",
+                return_value=(OtherModel, "OtherModel"),
+            )
+        )
         base = _make_load_spec()
         quant_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
         checkpoint = tempfile.TemporaryDirectory()
@@ -254,6 +264,7 @@ class TestLoadSpec(CustomTestCase):
             draft_model_idx=1,
         )
         self.assertEqual(other.role, "draft")
+        self.assertTrue(other.model_class.endswith(".OtherModel"))
         self.assertEqual(other.model_arch, "OtherModel")
         self.assertEqual(other.dtype, "torch.bfloat16")
         self.assertEqual(other.quant_method, "fp8")
@@ -386,6 +397,39 @@ class TestLoadSpec(CustomTestCase):
                 target.digest(include_rank=include_rank),
                 draft.digest(include_rank=include_rank),
             )
+
+    def test_the_resolved_model_class_is_part_of_the_spec(self):
+        def spec(model_impl, is_generation=True):
+            hf_config = LlamaConfig(
+                architectures=["LlamaForCausalLM"],
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                vocab_size=256,
+            )
+            model_config = _model_config(hf_config=hf_config)
+            model_config.hf_text_config = hf_config
+            model_config.model_impl = model_impl
+            model_config.is_generation = is_generation
+            model_config.is_multimodal = False
+            return _make_load_spec(model_config)
+
+        # One architecture string, two classes with other weight layouts.
+        native, generic = spec("auto"), spec("transformers")
+        self.assertEqual(
+            load_spec_mismatches(
+                msgspec.to_builtins(native), msgspec.to_builtins(generic)
+            ),
+            {"model_class": (native.model_class, generic.model_class)},
+        )
+        self.assertTrue(generic.model_class.endswith(".TransformersForCausalLM"))
+        # Another request that resolves the same class is the same load.
+        self.assertEqual(spec("sglang"), native)
+        # The same request can resolve another class.
+        embedding = spec("transformers", is_generation=False)
+        self.assertTrue(embedding.model_class.endswith(".TransformersEmbeddingModel"))
 
     def test_an_unknown_role_is_refused(self):
         fields = msgspec.to_builtins(_make_load_spec())
