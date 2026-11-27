@@ -124,8 +124,12 @@ def _qwen3vl_hopper_serving_overrides(server_args: Any, hf_config: Any) -> dict:
         and not cfg._radix_eviction_policy_explicitly_set
     ):
         updates["radix_eviction_policy"] = "priority"
-    if cfg.prefill_decode_interval is None:
-        updates["prefill_decode_interval"] = 22
+
+    # No prefill_decode_interval default: deferring prefill for 22 rounds lowered
+    # request throughput on text, long-prompt and image traffic (sgl-project/sglang
+    # #50103) for a lower TPOT. Deployments that prefer decode latency can still
+    # pass --prefill-decode-interval.
+
     if cfg.attention_backend is None and cfg.decode_attention_backend is None:
         updates["decode_attention_backend"] = "flashinfer"
 

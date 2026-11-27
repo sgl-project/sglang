@@ -4822,7 +4822,6 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
                 "mm_preprocess_cache_size_mb": 0,
                 "mm_feature_transport": "cuda_ipc",
                 "radix_eviction_policy": "priority",
-                "prefill_decode_interval": 22,
                 "decode_attention_backend": "flashinfer",
             },
         )
