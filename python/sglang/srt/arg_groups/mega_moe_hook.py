@@ -33,7 +33,11 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
             "--enable-single-batch-overlap."
         )
     platform = get_platform()
-    if not (
+    if platform.is_sail:
+        from sglang.srt.hardware_backend.sail.moe.mega_moe import validate_mega_moe
+
+        validate_mega_moe(platform.device_sm)
+    elif not (
         (platform.is_cuda and (platform.is_sm90 or platform.is_sm100))
         or platform.is_hip
     ):
@@ -50,6 +54,8 @@ MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
     {
         "DeepseekV4ForCausalLM",
         "KimiK31ForConditionalGeneration",
+        "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
         "Qwen2MoeForCausalLM",

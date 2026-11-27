@@ -50,7 +50,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_pin_memory_available
+from sglang.srt.utils import is_pin_memory_available, is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
@@ -1411,6 +1411,14 @@ class HybridLinearAttnBackend(AttentionBackend):
             and not mode.is_draft_extend_v2()
         )
 
+    @staticmethod
+    def _is_rewritten_idle(forward_batch: ForwardBatch) -> bool:
+        """Whether DP sync rewrote a logical IDLE batch for SSM verification."""
+        return (
+            getattr(forward_batch, "_original_forward_mode", None) == ForwardMode.IDLE
+            and not forward_batch.forward_mode.is_idle()
+        )
+
     def linear_extend_in_graph(self) -> bool:
         """Whether the linear layers of the prefill being captured run inside
         the graph (no eager break)."""
@@ -1466,6 +1474,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model; skip
             # linear/mamba metadata (it requires query_start_loc).
             self.full_attn_backend.init_forward_metadata(forward_batch)
+            return
+        if self._is_rewritten_idle(forward_batch):
+            # Hybrid speculative DP rewrites IDLE to TARGET_VERIFY so linear
+            # ReplaySSM can participate in synchronization. The empty rank has no
+            # full-attention metadata, so FlashMLA/other MHA backends must be skipped.
+            self.linear_attn_backend.init_forward_metadata(forward_batch)
             return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
@@ -1604,10 +1618,15 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
-                return mixed_qkv.new_empty(
+                return mixed_qkv.new_zeros(
                     mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
                 )
-            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            return q.new_zeros(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+        elif self._is_rewritten_idle(forward_batch) and not is_linear_attn:
+            # Rewritten idle batches can carry physical DP-padding rows. Their
+            # attention contribution must be zero; uninitialized rows would flow
+            # through o_proj/residual and poison the rank-synchronous MLP result.
+            return q.new_zeros(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif dispatch_mode.is_decode():
             return self.forward_decode(
                 layer,
@@ -1678,11 +1697,16 @@ class HybridLinearAttnBackend(AttentionBackend):
                 commit_kda_replayssm_after_verify,
             )
 
+            if is_sail():
+                from sglang.srt.hardware_backend.sail.kernels.kda import (
+                    commit_after_verify_or_fallback as commit_kda_replayssm_after_verify,
+                )
+
             ring_indices = None
             if mamba_pool.replayssm_request_ring:
                 assert state_slots.ring is not None, "request-scoped ring without rows"
                 ring_indices = state_slots.ring[:request_number]
-            commit_kda_replayssm_after_verify(
+            commit_kwargs = dict(
                 spec_state=mamba_caches,
                 state_batch_indices=state_indices_tensor,
                 accept_lens=last_correct_step_indices + 1,
@@ -1693,6 +1717,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 null_block_id=-1,
                 ring_indices=ring_indices,
             )
+            commit_kda_replayssm_after_verify(**commit_kwargs)
             return
 
         # ReplaySSM-GDN (the request cursors exist only there): the verify

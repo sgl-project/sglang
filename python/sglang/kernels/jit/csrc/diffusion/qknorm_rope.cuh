@@ -441,7 +441,20 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
           }
         }
       }
+#ifdef USE_SAIL
+      if constexpr (std::is_same_v<DType, bf16_t> && kHeadDim == 128) {
+        // HGGC 2.2 cannot select the local BF16 aggregate bitcast generated
+        // after scalar RoPE updates. Store the same bits as 32-bit pairs.
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          store_as<Packed>(output, output_vec[j], lane_id * kVecSize + j);
+        }
+      } else {
+        store_as<Storage>(output, output_vec, lane_id);
+      }
+#else
       store_as<Storage>(output, output_vec, lane_id);
+#endif
       continue;
     }
 

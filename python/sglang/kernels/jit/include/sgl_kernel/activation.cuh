@@ -20,7 +20,7 @@
 
 #include <cmath>
 
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_SAIL)
 extern "C" __device__ float __nv_expf(float);
 extern "C" __device__ float __nv_log1pf(float);
 extern "C" __device__ float __nv_tanhf(float);
@@ -82,7 +82,7 @@ SGL_DEVICE float sqrt_approx_ftz(float x) {
 namespace libdevice {
 
 SGL_DEVICE float exp(float x) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_SAIL)
   return __nv_expf(x);
 #else
   return expf(x);
@@ -90,7 +90,7 @@ SGL_DEVICE float exp(float x) {
 }
 
 SGL_DEVICE float log1p(float x) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_SAIL)
   return __nv_log1pf(x);
 #else
   return log1pf(x);
@@ -98,7 +98,7 @@ SGL_DEVICE float log1p(float x) {
 }
 
 SGL_DEVICE float tanh(float x) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_SAIL)
   return __nv_tanhf(x);
 #else
   return tanhf(x);
@@ -106,7 +106,7 @@ SGL_DEVICE float tanh(float x) {
 }
 
 SGL_DEVICE float erf(float x) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_SAIL)
   return __nv_erff(x);
 #else
   return erff(x);

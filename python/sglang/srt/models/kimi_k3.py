@@ -162,7 +162,7 @@ from sglang.srt.runtime_context import (
     linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_sail
 from sglang.srt.utils.common import BumpAllocator, LazyValue, get_bool_env_var
 from sglang.srt.utils.log_utils import print_warning_once, rank0_log
 
@@ -177,6 +177,7 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
 _is_npu = is_npu()
+_is_sail = is_sail()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 if _is_gfx95:
     from sglang.srt.models.kimi_k3_amd.kimi_k3_hip import (
@@ -1010,6 +1011,12 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         )
 
     def _mega_moe_buffer(self):
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.moe.mega_moe import (
+                mega_moe_buffer_kimi,
+            )
+
+            return mega_moe_buffer_kimi(self)
         from sglang.srt.layers.moe.mega_moe import (
             _get_mega_moe_symm_buffer,
             _mega_moe_mma_type,
@@ -1039,6 +1046,14 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         equivalent to `self.experts(routed_input, topk_output)` on an a2a
         backend (combine returns fully-summed rows; `_reduce_latent` then only
         applies the norm)."""
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.moe.mega_moe import (
+                forward_mega_experts_kimi,
+            )
+
+            return forward_mega_experts_kimi(
+                self, routed_input, topk_output, valid_token_count=valid_token_count
+            )
         import deep_gemm
 
         from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
@@ -2568,8 +2583,18 @@ class KimiK3DeltaAttention(nn.Module):
 
         heads = self.local_num_heads
         seg = heads * 128
+        # SAIL serves the same path through PLA, which covers a wider head set.
+        sail_kda = None
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.kernels import kda as sail_kda
+
+        supported_heads = (
+            sail_kda.supported_fused_decode_heads(kda_fused_decode.SUPPORTED_HEADS)
+            if sail_kda is not None
+            else kda_fused_decode.SUPPORTED_HEADS
+        )
         if (
-            heads not in kda_fused_decode.SUPPORTED_HEADS
+            heads not in supported_heads
             or w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
@@ -2583,7 +2608,7 @@ class KimiK3DeltaAttention(nn.Module):
         ):
             rank0_log(
                 f"K3 fused KDA decode disabled: {heads} local heads "
-                f"(kernel supports {sorted(kda_fused_decode.SUPPORTED_HEADS)}) or "
+                f"(kernel supports {sorted(supported_heads)}) or "
                 "unexpected conv/A_log/dt_bias "
                 f"layout (conv {None if w is None else tuple(w.shape)}, "
                 f"A_log {None if layer.A_log is None else tuple(layer.A_log.shape)}, "
@@ -2615,6 +2640,8 @@ class KimiK3DeltaAttention(nn.Module):
                 target.copy_(source)
         else:
             layer._k3_fused_decode_args = fused_decode_args
+        if sail_kda is not None:
+            sail_kda.bind_fused_decode_weight(layer)
         self._kda_fused_decode_ready = True
 
     def forward_qkvbfg_fused(
@@ -3383,8 +3410,13 @@ class KimiK3DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
-        # (matching the idle skip in other DP-attention models).
-        if forward_batch.forward_mode.is_idle():
+        # (matching the idle skip in other DP-attention models). Hybrid
+        # speculative sync temporarily rewrites IDLE to TARGET_VERIFY, so use
+        # the saved logical mode as well as the physical routing mode.
+        original_mode = getattr(forward_batch, "_original_forward_mode", None)
+        if forward_batch.forward_mode.is_idle() or (
+            original_mode is not None and original_mode.is_idle()
+        ):
             return hidden_states
 
         # MLA layers with q_lora_rank read their latent inputs from the
@@ -4034,6 +4066,20 @@ class KimiK3LinearForCausalLM(nn.Module):
             _EXPERT_WEIGHT_NAME.fullmatch(key) for key in expert_params_lookup
         ), "ckpt expert names diverged from _EXPERT_WEIGHT_NAME; no expert would load"
 
+        # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
+        # (NPU keeps weight_packed for NPUCompressedTensorsW4A8mxfp4MoE).
+        remap_weight_packed = not _is_npu
+        if _is_sail:
+            # SAIL also serves WNA16, which keeps weight_packed, so only MXFP4 is
+            # remapped. compressed-tensors reports its own name, so ask it to
+            # detect MXFP4 from the format or the resolved target scheme -- a
+            # mixed-precision checkpoint puts neither in quant_format.
+            detect_mxfp4 = getattr(self.quant_config, "_is_mxfp4_moe", None)
+            remap_weight_packed = self.quant_config is not None and (
+                self.quant_config.get_name() == "mxfp4"
+                or (detect_mxfp4 is not None and detect_mxfp4(layer_name=""))
+            )
+
         num_hidden_layers = self.config.num_hidden_layers
         for args in weights:
             name, loaded_weight = args[:2]
@@ -4055,9 +4101,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if _lid.isdigit() and int(_lid) >= num_hidden_layers:
                     continue
 
-            # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
-            # (NPU keeps weight_packed for NPUCompressedTensorsW4A8mxfp4MoE).
-            if "weight_packed" in name and not _is_npu:
+            if "weight_packed" in name and remap_weight_packed:
                 name = name.replace("weight_packed", "weight")
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa
@@ -4299,8 +4343,10 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
-                if layer.mlp._use_mega_moe and get_parallel().attn_cp_size > 1:
-                    # Under prefill CP the shared EP workspace must count
+                if layer.mlp._use_mega_moe and (
+                    _is_sail or get_parallel().attn_cp_size > 1
+                ):
+                    # Under SAIL or prefill CP the shared EP workspace must count
                     # against the KV budget, not first appear during warmup or
                     # graph capture. Other MegaMoE recipes are sized with the
                     # workspace taken from the non-static slack, as on main.

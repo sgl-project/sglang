@@ -18,7 +18,9 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils.device import is_sail
 
+_is_sail = is_sail()
 # Per-forward cache of the gate's row masks, installed by mega_gate_forward_scope.
 _ROW_MASKS_ATTR = "_mega_gate_row_masks"
 
@@ -30,9 +32,23 @@ class MegaGateRouting(NamedTuple):
     in_buffer: bool
 
 
+def _log_platform_fallback() -> None:
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.moe.mega_gate import log_fallback
+
+        log_fallback()
+
+
 def mega_gate_supported(moe) -> bool:
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.moe.mega_gate import (
+            _sail_mega_gate_available,
+        )
+
+        if not _sail_mega_gate_available():
+            return False
     if (
-        _device_sm // 10 != 10
+        (not _is_sail and _device_sm // 10 != 10)
         or moe.config.model_type != "deepseek_v41"
         or moe.topk.enable_waterfill
         or moe.num_fused_shared_experts
@@ -80,6 +96,12 @@ def mega_gate_supported(moe) -> bool:
 
 
 def should_use_mega_gate(moe, hidden_states: torch.Tensor, forward_batch) -> bool:
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.moe.mega_gate import (
+            should_use_mega_gate as sail_should_use_mega_gate,
+        )
+
+        return sail_should_use_mega_gate(moe, hidden_states, forward_batch)
     if not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get() or forward_batch is None:
         return False
     # Prefill, decode and verify; draft extend keeps the regular router.
@@ -180,8 +202,10 @@ def run_mega_gate(
         "lp",
         "fake",
     ):
+        _log_platform_fallback()
         return None
     if moe.is_hash and input_ids is None:
+        _log_platform_fallback()
         return None
     num_tokens = hidden_states.shape[0]
     use_image = (

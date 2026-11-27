@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils.common import is_sail_runtime
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -20,12 +21,18 @@ def _jit_per_token_quant_fp8_module(dtype: torch.dtype) -> Module:
         )
     use_fast_math = current_arch().is_sm(9, 0)
     math_mode = "fast_math" if use_fast_math else "precise_math"
+    # SAIL ships its own persistent-prefill / small-batch-decode kernels.
+    cuda_file = (
+        "sail/per_token_quant_fp8.cuh"
+        if is_sail_runtime()
+        else "gemm/per_token_quant_fp8.cuh"
+    )
     args = make_cpp_args(dtype)
     return load_jit(
         "per_token_quant_fp8",
         math_mode,
         *args,
-        cuda_files=["gemm/per_token_quant_fp8.cuh"],
+        cuda_files=[cuda_file],
         cuda_wrappers=[("per_token_quant_fp8", f"per_token_quant_fp8<{args}>")],
         extra_cuda_cflags=["--use_fast_math"] if use_fast_math else [],
     )
