@@ -173,7 +173,7 @@ class SpeculativeAlgorithm(Enum):
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no
-        per-topk page rounding; see get_spec_decode_reserve."""
+        per-topk page rounding; see get_decode_ahead."""
         return not self.is_ngram()
 
     def carries_draft_hidden_states(self) -> bool:
