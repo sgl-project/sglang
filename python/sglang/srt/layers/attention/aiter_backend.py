@@ -786,14 +786,14 @@ class AiterAttnBackend(AttentionBackend):
         self.speculative_num_steps = get_spec().speculative_num_steps
         # DSpark block-verification has no custom_mask. Cache this so the
         # CUDA-graph verify path uses None at both capture and replay (see below).
-        from sglang.srt.speculative.spec_info import (
-            SpeculativeAlgorithm as _SpecAlgo,
-        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         _spec = get_spec()
         self._dspark_block_verify = bool(
             _spec is not None
-            and _SpecAlgo.from_string(_spec.speculative_algorithm).is_dspark()
+            and SpeculativeAlgorithm.from_string(
+                _spec.speculative_algorithm
+            ).is_dspark()
             and getattr(_spec, "speculative_use_block_verification", False)
         )
         self.topk = topk
