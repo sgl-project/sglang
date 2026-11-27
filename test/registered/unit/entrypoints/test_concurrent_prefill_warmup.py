@@ -28,6 +28,7 @@ def _limits(**overrides):
         max_running_requests=32,
         max_queued_requests=None,
         chunked_prefill_size=16384,
+        max_prefill_tokens=16384,
         context_len=131072,
         max_req_input_len=131066,
         num_reserved_tokens=0,
@@ -45,6 +46,7 @@ def _internal_state(**overrides):
         "max_queued_requests": None,
         "chunked_prefill_size": 16384,
         "effective_chunked_prefill_size": 16384,
+        "max_prefill_tokens": 16384,
         "load_balance_method": "round_robin",
         "page_size": 1,
         "memory_usage": {
@@ -248,6 +250,31 @@ class TestConcurrentPrefillPlan(CustomTestCase):
         longest = max(max(r) for r in concurrent_prefill_plan(limits).rounds)
         charged = -(-longest // page) * page + page + 8
         self.assertLessEqual(charged, 32768)
+
+    def test_unchunked_prompts_stay_inside_one_forward_budget(self):
+        """Chunking off on a 128K context with --max-prefill-tokens 4096 (an
+        Ascend fused MoE prefill takes 4,096 rows): the scheduler admits a
+        40,001-token prompt alone in one forward, which overflows the backend's
+        buffer, so every prompt must fit the per-forward budget."""
+        limits = concurrent_prefill_limits(
+            [
+                _internal_state(
+                    effective_chunked_prefill_size=None, max_prefill_tokens=4096
+                )
+            ],
+            context_len=131072,
+            max_req_input_len=131066,
+            num_reserved_tokens=0,
+        )
+        plan = concurrent_prefill_plan(limits)
+        self.assertEqual([len(r) for r in plan.rounds], [1, 4, 32])
+        self.assertLessEqual(max(max(r) for r in plan.rounds), 4096)
+        self.assertEqual(plan.logprob_sizes, [513, 512])
+        # With chunking the scheduler splits prompts itself: plan unchanged.
+        self.assertEqual(
+            concurrent_prefill_plan(_limits(max_prefill_tokens=4096)),
+            concurrent_prefill_plan(_limits()),
+        )
 
     def test_skips_logprob_probes_the_server_refuses(self):
         for overrides in (

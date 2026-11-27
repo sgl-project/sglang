@@ -199,6 +199,9 @@ class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
     tokenizer_workers: int = 1
     # The scheduler's own chunk size; None when chunked prefill is off.
     chunked_prefill_size: Optional[int]
+    # Prefill tokens the scheduler packs into one forward. Without chunking it
+    # still admits one longer prompt alone, past what the forward is sized for.
+    max_prefill_tokens: int
     context_len: int
     max_req_input_len: int
     # Speculative slots the tokenizer adds to each prompt's length.
@@ -246,6 +249,7 @@ def concurrent_prefill_limits(
         max_queued_requests=None if pd_prefill else state["max_queued_requests"],
         tokenizer_workers=state["tokenizer_worker_num"],
         chunked_prefill_size=state["effective_chunked_prefill_size"],
+        max_prefill_tokens=state["max_prefill_tokens"],
         context_len=context_len,
         max_req_input_len=max_req_input_len,
         num_reserved_tokens=num_reserved_tokens,
@@ -290,6 +294,11 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
         (limits.kv_pool_tokens - limits.num_reserved_tokens - new_tokens) // page * page
         - 2 * page,
     )
+    if chunk is None:
+        # Never rely on the lone-long-prompt exception: backends size their
+        # per-forward buffers to this budget (the Ascend fused MoE prefill
+        # takes at most min(max_prefill_tokens, 4096) rows).
+        max_prompt = min(max_prompt, limits.max_prefill_tokens)
     skip_reason = None
     if chunk is None and limits.has_window_pool:
         # Without chunking a prompt must fit every pool in one piece; a
