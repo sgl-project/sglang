@@ -16,6 +16,7 @@ set -uo pipefail
 #
 # Settings (runner .env):
 #   XPU_RUNNER_GUARD_MODE       log (default): log refusals only; enforce: fail the job.
+#                               Any other value fails every job, so a typo cannot disable enforcement.
 #   XPU_RUNNER_GUARD_WORKFLOWS  optional space-separated workflow file names allowed on
 #                               this runner, e.g. "nightly-test-intel.yml nightly-test-intel-wheel.yml".
 # A missing GITHUB_* variable counts as a refusal, so the hook fails closed.
@@ -31,12 +32,19 @@ workflow_path="${workflow_ref%%@*}"
 workflow_git_ref="${workflow_ref#*@}"
 workflow_file="${workflow_path##*/}"
 
+if [[ "${mode}" != "log" && "${mode}" != "enforce" ]]; then
+  echo "::error title=XPU runner guard::Refusing this job: XPU_RUNNER_GUARD_MODE='${mode}' is not 'log' or 'enforce'"
+  exit 1
+fi
+
 reason=""
 if [[ "${GITHUB_REPOSITORY:-}" != "${repo}" ]]; then
   reason="repository '${GITHUB_REPOSITORY:-unset}' is not ${repo}"
+elif [[ -z "${event}" ]]; then
+  reason="GITHUB_EVENT_NAME is unset"
 elif [[ "${event}" == "pull_request" ]]; then
   reason="pull_request runs the PR's own workflow files"
-elif [[ "${workflow_ref}" != *@* || "${workflow_path}" != "${repo}/.github/workflows/${workflow_file}" ]]; then
+elif [[ "${workflow_ref}" != *@* || -z "${workflow_file}" || "${workflow_path}" != "${repo}/.github/workflows/${workflow_file}" ]]; then
   reason="workflow ref '${workflow_ref:-unset}' is not a workflow file of ${repo}"
 else
   case "${workflow_git_ref}" in
