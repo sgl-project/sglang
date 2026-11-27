@@ -660,6 +660,7 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
         runner.buffers = None
         runner.seq_len_fill_value = 1
         runner.is_encoder_decoder = False
+        runner.encoder_len_fill_value = 0
         runner._global_num_tokens_for_graph = lambda num_tokens: None
         views = []
 
@@ -709,6 +710,83 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
         glue = _RecordingGlue(captured_keys=[key])
         views, eager = self._replay(glue, raw_bs=0, padded_glue=True)
         self.assertEqual((glue.calls, eager), ([], views))
+
+
+class TestEncoderLensHostMirror(CustomTestCase):
+    """Encoder-decoder decode replays take encoder lengths from the host instead
+    of reading the device tensor back, which would sync every step."""
+
+    def test_graph_admission_reads_host_lengths(self):
+        def all_positive(encoder_lens_cpu, encoder_lens=None):
+            # With encoder_lens=None, reading the device tensor would raise.
+            return DecodeCudaGraphRunner._all_encoder_lens_positive(
+                SimpleNamespace(
+                    encoder_lens_cpu=encoder_lens_cpu, encoder_lens=encoder_lens
+                )
+            )
+
+        self.assertTrue(all_positive([1500, 1500]))
+        self.assertFalse(all_positive([1500, 0]))
+        # Without host lengths the device tensor is still the source.
+        self.assertFalse(all_positive(None, torch.tensor([1500, 0])))
+
+    def test_replay_mirror_matches_padded_buffer(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        fill = 1500
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=4,
+            seq_len_fill_value=1,
+            cache_loc_dtype=torch.int64,
+            is_encoder_decoder=True,
+            encoder_len_fill_value=fill,
+            share_pool=False,
+        )
+        buf = reg.get_slot("encoder_lens").buffer
+        # Replays in order: a full batch leaves its lengths in every row, so the
+        # padded batches after it check that their tail is reset, not inherited.
+        for lengths, bs in (([7, 7, 7, 7], 4), ([3, 5], 4), ([9], 2), ([], 2)):
+            with self.subTest(lengths=lengths, bs=bs):
+                raw_bs = len(lengths)
+                fb = SimpleNamespace(
+                    batch_size=raw_bs,
+                    encoder_lens=torch.tensor(lengths, dtype=torch.int32),
+                    encoder_lens_cpu=list(lengths),
+                )
+                reg.fill_from(
+                    fb,
+                    raw_bs=raw_bs,
+                    padded_bs=bs,
+                    raw_num_tokens=raw_bs,
+                    padded_num_tokens=bs,
+                )
+                mirror = mod._replay_encoder_lens_cpu(
+                    forward_batch=fb,
+                    bs=bs,
+                    raw_bs=raw_bs,
+                    encoder_len_fill_value=fill,
+                )
+                self.assertEqual(mirror, buf[:bs].tolist())
+
+    def test_no_mirror_without_consistent_host_lengths(self):
+        fb = SimpleNamespace(encoder_lens=torch.tensor([3, 5]), encoder_lens_cpu=[3, 5])
+
+        def mirror(fill=1500):
+            return mod._replay_encoder_lens_cpu(
+                forward_batch=fb, bs=4, raw_bs=2, encoder_len_fill_value=fill
+            )
+
+        # The caller did not say what the padded rows hold.
+        self.assertIsNone(mirror(fill=None))
+        # Host lengths missing, or not one per request.
+        fb.encoder_lens_cpu = None
+        self.assertIsNone(mirror())
+        fb.encoder_lens_cpu = [3]
+        self.assertIsNone(mirror())
 
 
 if __name__ == "__main__":

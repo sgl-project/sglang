@@ -887,6 +887,9 @@ class FlashInferAttnBackend(AttentionBackend):
         seq_lens_cpu = forward_batch.seq_lens_cpu
         seq_lens_sum = forward_batch.seq_lens_sum
         encoder_lens = forward_batch.encoder_lens
+        encoder_lens_cpu = (
+            forward_batch.encoder_lens_cpu if encoder_lens is not None else None
+        )
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
@@ -915,6 +918,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=self.disable_cuda_graph_kv_split,
                 req_pool_indices=req_pool_indices,
                 plan=forward_batch.iteration_ids,
+                encoder_lens_cpu=(
+                    encoder_lens_cpu[:bs] if encoder_lens_cpu is not None else None
+                ),
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -1158,6 +1164,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=False,
                 req_pool_indices=forward_batch.req_pool_indices,
                 plan=forward_batch.iteration_ids,
+                encoder_lens_cpu=(
+                    forward_batch.encoder_lens_cpu
+                    if forward_batch.encoder_lens is not None
+                    else None
+                ),
             )
             self.forward_metadata = DecodeMetadata(
                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
@@ -1833,6 +1844,7 @@ class FlashInferIndicesUpdaterDecode:
         *,
         plan: IterationIds,
         req_pool_indices: torch.Tensor,
+        encoder_lens_cpu: Optional[List[int]] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1850,6 +1862,7 @@ class FlashInferIndicesUpdaterDecode:
         *,
         plan: IterationIds,
         req_pool_indices: torch.Tensor,
+        encoder_lens_cpu: Optional[List[int]] = None,
     ):
         self.call_begin_forward(
             decode_wrappers[0],
@@ -1878,6 +1891,7 @@ class FlashInferIndicesUpdaterDecode:
         *,
         plan: IterationIds,
         req_pool_indices: torch.Tensor,
+        encoder_lens_cpu: Optional[List[int]] = None,
     ):
         assert self.sliding_window_size is not None
         for wrapper_id in range(2):
@@ -1938,9 +1952,16 @@ class FlashInferIndicesUpdaterDecode:
         *,
         plan: IterationIds,
         req_pool_indices: torch.Tensor,
+        encoder_lens_cpu: Optional[List[int]] = None,
     ):
-        # Cache encoder_lens on CPU to avoid GPU→CPU transfer per call
-        encoder_lens_cpu = encoder_lens.cpu() if encoder_lens is not None else None
+        # Plan from the host mirror when it covers every row: reading encoder_lens
+        # back is a device-to-host sync on every decode step.
+        if encoder_lens is None:
+            encoder_lens_host = None
+        elif encoder_lens_cpu is None or len(encoder_lens_cpu) != len(encoder_lens):
+            encoder_lens_host = encoder_lens.cpu()
+        else:
+            encoder_lens_host = torch.tensor(encoder_lens_cpu, dtype=encoder_lens.dtype)
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 paged_kernel_lens = seq_lens
@@ -1950,8 +1971,8 @@ class FlashInferIndicesUpdaterDecode:
                 # Cross-attention: attend to encoder tokens only
                 paged_kernel_lens = encoder_lens
                 kv_start_idx = torch.zeros_like(encoder_lens)
-                seq_lens_sum = encoder_lens.sum().item()
-                kv_lens_cpu = encoder_lens_cpu
+                seq_lens_sum = int(encoder_lens_host.sum())
+                kv_lens_cpu = encoder_lens_host
 
             self.call_begin_forward(
                 decode_wrappers[wrapper_id],

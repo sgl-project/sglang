@@ -9,7 +9,10 @@ import torch
 
 from sglang.srt.layers.attention import flashinfer_mla_backend as mla
 from sglang.srt.layers.attention import trtllm_mla_backend as trtllm_mla
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.flashinfer_backend import (
+    FlashInferAttnBackend,
+    FlashInferIndicesUpdaterDecode,
+)
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -194,6 +197,61 @@ class TestTRTLLMMLAGraphMetadata(unittest.TestCase):
             backend.forward_decode_metadata.seq_lens_k.data_ptr(),
             captured[0].data_ptr(),
         )
+
+
+def _cross_attention_plan_inputs(encoder_lens, encoder_lens_cpu):
+    """(kv length sum, host kv lengths) planned for each of the two wrappers."""
+    updater = FlashInferIndicesUpdaterDecode.__new__(FlashInferIndicesUpdaterDecode)
+    updater.kv_indptr = [torch.zeros(8, dtype=torch.int32) for _ in range(2)]
+    planned = []
+
+    def call_begin_forward(
+        wrapper,
+        paged_kernel_lens,
+        paged_kernel_lens_sum,
+        kv_indptr,
+        kv_start_idx,
+        spec_info,
+        seq_lens_cpu=None,
+        **kwargs,
+    ):
+        planned.append((paged_kernel_lens_sum, seq_lens_cpu.tolist()))
+
+    updater.call_begin_forward = call_begin_forward
+    updater.update_cross_attention(
+        seq_lens=torch.tensor([4, 6]),
+        seq_lens_cpu=torch.tensor([4, 6]),
+        seq_lens_sum=10,
+        decode_wrappers=[object(), object()],
+        encoder_lens=encoder_lens,
+        spec_info=None,
+        plan=None,
+        req_pool_indices=torch.tensor([0, 1]),
+        encoder_lens_cpu=encoder_lens_cpu,
+    )
+    return planned
+
+
+class TestFlashInferCrossAttentionHostLens(unittest.TestCase):
+    """The cross-attention decode plan reads the batch's host encoder lengths
+    instead of copying the device tensor back on every step."""
+
+    def test_plan_uses_host_lengths(self):
+        # The device tensor holds other values so the plan's source is visible.
+        self_attn, cross_attn = _cross_attention_plan_inputs(
+            torch.tensor([9, 9]), [1500, 3]
+        )
+        self.assertEqual(self_attn, (10, [4, 6]))
+        self.assertEqual(cross_attn, (1503, [1500, 3]))
+
+    def test_falls_back_to_device_lengths(self):
+        # No host lengths, or fewer than the device rows (e.g. a padded batch).
+        for encoder_lens_cpu in (None, [1500]):
+            with self.subTest(encoder_lens_cpu=encoder_lens_cpu):
+                _, cross_attn = _cross_attention_plan_inputs(
+                    torch.tensor([9, 9]), encoder_lens_cpu
+                )
+                self.assertEqual(cross_attn, (18, [9, 9]))
 
 
 if __name__ == "__main__":
