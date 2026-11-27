@@ -604,7 +604,7 @@ class Gemma3nDecoderLayer(nn.Module):
             first_prediction = self.altup.scale_corrected_output(first_prediction)
 
         # per_layer_input_gate
-        first_prediction = first_prediction.to(self.per_layer_input_gate.weight.dtype)
+        first_prediction = first_prediction.to(self.per_layer_input_gate.params_dtype)
         first_prediction, _ = self.per_layer_input_gate(first_prediction)
         first_prediction = F.gelu(first_prediction, approximate="tanh")
         first_prediction = torch.multiply(first_prediction, per_layer_input)
