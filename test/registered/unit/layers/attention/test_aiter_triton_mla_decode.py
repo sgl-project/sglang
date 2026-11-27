@@ -48,7 +48,7 @@ def _metadata(bs, triton):
         qo_indptr=torch.arange(bs + 1, dtype=torch.int32),
         kv_last_page_len=None,
         max_q_len=1,
-        max_kv_len=100,
+        batch_max_kv_len=100,
         triton_mla_block_tables=(
             torch.arange(bs, dtype=torch.int32)[:, None] + 1 if triton else None
         ),
@@ -253,7 +253,7 @@ class TestTritonMlaBlockTables(CustomTestCase):
                 tables = atm.triton_mla_block_tables(
                     req_to_token=req_to_token,
                     req_pool_indices=torch.tensor([0]),
-                    max_kv_len=page_size + 1,
+                    batch_max_kv_len=page_size + 1,
                     page_size=page_size,
                 )
                 expected = [p * ratio + i for p in pages for i in range(ratio)]
@@ -267,7 +267,7 @@ class TestTritonMlaBlockTables(CustomTestCase):
         tables = atm.triton_mla_block_tables(
             req_to_token=req_to_token,
             req_pool_indices=torch.tensor([1, 0]),
-            max_kv_len=3,
+            batch_max_kv_len=3,
             page_size=1,
         )
         torch.testing.assert_close(tables, req_to_token[[1, 0], :3])
@@ -284,12 +284,12 @@ class TestTritonMlaBlockTables(CustomTestCase):
                 for row in pages
             ]
         )
-        for max_kv_len, width in ((64, 1), (65, 2), (128, 2), (129, 3)):
-            with self.subTest(max_kv_len=max_kv_len):
+        for batch_max_kv_len, width in ((64, 1), (65, 2), (128, 2), (129, 3)):
+            with self.subTest(batch_max_kv_len=batch_max_kv_len):
                 tables = atm.triton_mla_block_tables(
                     req_to_token=req_to_token,
                     req_pool_indices=torch.tensor([1, 0]),
-                    max_kv_len=max_kv_len,
+                    batch_max_kv_len=batch_max_kv_len,
                     page_size=_PAGE_SIZE,
                 )
                 torch.testing.assert_close(

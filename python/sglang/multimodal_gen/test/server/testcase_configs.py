@@ -353,6 +353,7 @@ class DiffusionTestCase:
     run_models_api_check: bool = True
     expected_model_id: str | None = None
     run_t2v_input_reference_check: bool = True
+    min_input_first_frame_psnr: float | None = None
     run_lora_basic_api_check: bool = False
     run_lora_dynamic_load_check: bool = False
     run_lora_dynamic_switch_check: bool = False
@@ -965,6 +966,13 @@ SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
     output_size="384x640",
     num_frames=17,
     extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
+)
+
+LINGBOT_VIDEO_TI2V_CI_sampling_params = replace(
+    LINGBOT_VIDEO_T2V_CI_sampling_params,
+    image_path="https://raw.githubusercontent.com/Robbyant/lingbot-video/dd5c231e793406c6a8893e9e4307008a9c2adfe4/assets/cases/ti2v/example_4/first_frame.png",
+    output_size="320x192",
+    direct_url_test=True,
 )
 
 LONGLIVE2_T2V_CI_sampling_params = replace(

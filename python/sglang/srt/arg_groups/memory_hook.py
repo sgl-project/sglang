@@ -27,6 +27,29 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 
 
+def finalize_prefill_token_budget(server_args: Any) -> None:
+    """Raise ``max_prefill_tokens`` to the resolved chunk size when it is smaller.
+
+    Compares with the raw input rather than an earlier resolution, so a caller
+    that later changes the chunk size can run it again to refit the budget.
+    """
+    cfg = resolving_view(server_args)
+    requested = server_args.max_prefill_tokens
+    chunk = cfg.chunked_prefill_size
+    target = requested if chunk is None or chunk <= 0 else max(chunk, requested)
+    if target == cfg.max_prefill_tokens:
+        return
+    declare_resolution(
+        server_args, "finalize_prefill_token_budget", max_prefill_tokens=target
+    )
+    if target > requested:
+        logger.info(
+            "Raising max_prefill_tokens from %d to the chunked prefill size %d.",
+            requested,
+            target,
+        )
+
+
 def handle_offload_compatibility(server_args: Any) -> None:
     """Flag-only check; re-run after the model overrides fill in the PLE default."""
     cfg = resolving_view(server_args)
