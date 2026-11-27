@@ -9,9 +9,27 @@ from pathlib import Path
 from transformers import PretrainedConfig
 from transformers.utils import cached_file
 
+PACKED_ATTENTION_LAYOUT = "state_sees_no_questions"
+
 
 def is_nemotron_decision(config: PretrainedConfig) -> bool:
     return "NemotronForDecision" in (config.architectures or [])
+
+
+def nemotron_decision_attention_layout(config: PretrainedConfig) -> str:
+    layout = vars(config).get("decision_attention_layout", "state_sees_own_question")
+    if layout not in ("state_sees_own_question", PACKED_ATTENTION_LAYOUT):
+        raise ValueError(
+            "Nemotron Decision decision_attention_layout must be "
+            "'state_sees_own_question' or 'state_sees_no_questions', "
+            f"got {layout!r}"
+        )
+    state_end = vars(config).get("state_end_token_id")
+    if state_end is not None and (type(state_end) is not int or state_end < 0):
+        raise ValueError("state_end_token_id must be a nonnegative integer")
+    if layout == PACKED_ATTENTION_LAYOUT and state_end is None:
+        raise ValueError("state_sees_no_questions requires state_end_token_id")
+    return layout
 
 
 def load_nemotron_decision_config(model_path: str, revision: str | None) -> dict:
@@ -49,7 +67,9 @@ def load_nemotron_decision_config(model_path: str, revision: str | None) -> dict
     return config
 
 
-def validate_packed_decision_layout(layout, input_ids, mask_token_id, max_questions):
+def validate_packed_decision_layout(
+    layout, input_ids, mask_token_id, max_questions, state_end_token_id
+):
     if (
         not isinstance(layout, list)
         or len(layout) < 2
@@ -59,6 +79,13 @@ def validate_packed_decision_layout(layout, input_ids, mask_token_id, max_questi
     ):
         raise ValueError(
             "decision_layout needs a positive shared length and valid question lengths covering the prompt"
+        )
+    if (
+        input_ids[layout[0] - 1] != state_end_token_id
+        or input_ids.count(state_end_token_id) != 1
+    ):
+        raise ValueError(
+            "packed Decision shared state must end at its only state-end token"
         )
     slots, end = [], layout[0]
     for length in layout[1:]:

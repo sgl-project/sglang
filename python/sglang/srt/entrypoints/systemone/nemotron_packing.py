@@ -1,6 +1,6 @@
 # Copyright 2026 SGLang Team
 # Licensed under the Apache License, Version 2.0.
-"""Opt-in shared-state scoring for Nemotron Decision."""
+"""Shared-state scoring selected by Nemotron Decision checkpoint settings."""
 
 import math
 
@@ -19,13 +19,13 @@ def pack_decision_prompts(prompts, max_tokens, shared_prefix):
         raise ValueError(
             "Each question’s full prompt, including the state and answer options, must fit within the input token limit"
         )
-    shared = 0
-    for tokens in zip(shared_prefix, *prompts):
-        if len(set(tokens)) != 1:
-            break
-        shared += 1
-    if shared == 0:
-        return [(prompt, None, [i]) for i, prompt in enumerate(prompts)]
+    shared = len(shared_prefix)
+    if not shared or any(
+        prompt[:shared] != shared_prefix or len(prompt) <= shared for prompt in prompts
+    ):
+        raise ValueError(
+            "packed Decision prompts must share the exact state-end boundary"
+        )
     groups, ids, indices, lengths = [], list(prompts[0][:shared]), [], []
     for i, prompt in enumerate(prompts):
         tail = prompt[shared:]
@@ -53,43 +53,31 @@ async def score_packed_decisions(
     )
     scores, logprobs, prompt_tokens = [None] * len(prompts), [None] * len(prompts), 0
     for ids, layout, indices in pack_decision_prompts(prompts, limit, shared_prefix):
-        if layout is None:
-            result = await manager.score_prompts(
-                prompts=[ids],
-                label_token_ids=[label_ids[indices[0]]],
-                apply_softmax=True,
-                return_token_logprobs=True,
-                request=request,
-                lora_path=lora_path,
-            )
-            rows = result.token_logprobs
-            prompt_tokens += result.prompt_tokens
-        else:
-            labels = sorted({token for i in indices for token in label_ids[i]})
-            end, slots = layout[0], []
-            for length in layout[1:]:
-                end += length
-                slots.append(end - 1)
-            batch = GenerateReqInput(
-                input_ids=ids,
-                decision_layout=layout,
-                token_indices_to_pool=slots,
-                lora_path=lora_path,
-                sampling_params={"max_new_tokens": 0},
-                return_logprob=True,
-                logprob_start_len=0,
-                token_ids_logprob=labels,
-            )
-            response = await manager.generate_request(batch, request).__anext__()
-            meta = response["meta_info"]
-            raw_rows = meta["input_token_ids_logprobs"]
-            if len(raw_rows) != len(indices):
-                raise RuntimeError("packed Decision did not return every mask readout")
-            rows = []
-            for i, raw in zip(indices, raw_rows):
-                values = {token: value for value, token, *_ in raw}
-                rows.append([values[token] for token in label_ids[i]])
-            prompt_tokens += meta["prompt_tokens"]
+        labels = sorted({token for i in indices for token in label_ids[i]})
+        end, slots = layout[0], []
+        for length in layout[1:]:
+            end += length
+            slots.append(end - 1)
+        batch = GenerateReqInput(
+            input_ids=ids,
+            decision_layout=layout,
+            token_indices_to_pool=slots,
+            lora_path=lora_path,
+            sampling_params={"max_new_tokens": 0},
+            return_logprob=True,
+            logprob_start_len=0,
+            token_ids_logprob=labels,
+        )
+        response = await manager.generate_request(batch, request).__anext__()
+        meta = response["meta_info"]
+        raw_rows = meta["input_token_ids_logprobs"]
+        if len(raw_rows) != len(indices):
+            raise RuntimeError("packed Decision did not return every mask readout")
+        rows = []
+        for i, raw in zip(indices, raw_rows):
+            values = {token: value for value, token, *_ in raw}
+            rows.append([values[token] for token in label_ids[i]])
+        prompt_tokens += meta["prompt_tokens"]
         for i, row in zip(indices, rows):
             maximum = max(row)
             weights = [math.exp(value - maximum) for value in row]

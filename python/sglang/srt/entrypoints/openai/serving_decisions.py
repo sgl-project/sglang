@@ -157,7 +157,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
         # Token IDs alone cannot replay the packed attention mask.
         if (
             self.question_encoder is not None
-            and request.packing == "shared"
+            and self.question_encoder.packed
             and request.return_prompt_token_ids
         ):
             return "return_prompt_token_ids cannot replay shared attention through /v1/score"
@@ -425,12 +425,11 @@ class OpenAIServingDecisions(OpenAIServingBase):
         raw_request: Request,
         temperature: float = 1.0,
         lora_path: Optional[str] = None,
-        shared_prefix: Optional[List[int]] = None,
     ):
         """Encode and score the questions."""
         prompts, label_token_ids, image_data = await _encode_all(adapted_request)
         adapter = {"lora_path": lora_path} if lora_path is not None else {}
-        if shared_prefix is not None:
+        if self.question_encoder is not None and self.question_encoder.packed:
             from sglang.srt.entrypoints.systemone.nemotron_packing import (
                 score_packed_decisions,
             )
@@ -441,7 +440,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
                 prompts,
                 label_token_ids,
                 raw_request,
-                shared_prefix,
+                self.question_encoder.packing_prefix(prompts[0]),
                 lora_path=lora_path,
             )
             return prompts, label_token_ids, result
@@ -468,17 +467,11 @@ class OpenAIServingDecisions(OpenAIServingBase):
             if self.question_encoder is not None
             else None
         )
-        shared_prefix = (
-            await asyncio.to_thread(self.question_encoder.packing_prefix, request.input)
-            if self.question_encoder is not None and request.packing == "shared"
-            else None
-        )
         # Checkpoint temperatures vary by question type, so calibrate after scoring.
         prompts, label_token_ids, result = await self._score(
             adapted_request=adapted_request,
             raw_request=raw_request,
             temperature=request.temperature if self.question_encoder is None else 1.0,
-            shared_prefix=shared_prefix,
             **({"lora_path": adapter} if adapter is not None else {}),
         )
         answers = {}

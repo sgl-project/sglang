@@ -171,16 +171,20 @@ SGL_DEVICE void select_at_least(const uint64_t (&keys)[kN], uint64_t t, bool (&s
     sel[i] = t != 0 && keys[i] >= t;
 }
 
+SGL_DEVICE uint64_t low_mask(int n) {
+  return n >= 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1;
+}
+
 // v[j] = *addr(j) for every bit j of `pending`, once each carries `tag`
 template <int kPer, typename Addr>
-SGL_DEVICE void poll_tagged_at(Addr addr, uint64_t tag, uint64_t (&v)[kPer], unsigned pending = (1u << kPer) - 1) {
+SGL_DEVICE void poll_tagged_at(Addr addr, uint64_t tag, uint64_t (&v)[kPer], uint64_t pending = low_mask(kPer)) {
   while (pending) {
 #pragma unroll
     for (int j = 0; j < kPer; ++j)
       if (pending >> j & 1) v[j] = device::ptx::load_relaxed_sys(addr(j));
 #pragma unroll
     for (int j = 0; j < kPer; ++j)
-      if ((v[j] & 255) == tag) pending &= ~(1u << j);
+      if ((v[j] & 255) == tag) pending &= ~(uint64_t{1} << j);
   }
 }
 
@@ -276,7 +280,7 @@ SGL_DEVICE uint64_t fallback_kth_regs(
       [&](int j) { return (j < kPerThread ? src0 : src1) + (j % kPerThread) * kThreads; },
       tag,
       f,
-      (1u << (two ? 2 * kPerThread : kPerThread)) - 1);
+      low_mask(two ? 2 * kPerThread : kPerThread));
 #pragma unroll
   for (int j = 0; j < 2 * kPerThread; ++j)
     f[j] = j < kPerThread || two ? entry_key(f[j]) : 0;
@@ -303,7 +307,9 @@ SGL_DEVICE int local_len(int L, int q) {
 template <int kNumRanks, int kTopK, int kCandK>
 __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 3 : 1)
     merge_kernel(const __grid_constant__ Params p) {
-  static_assert(kNumRanks == 8 || kNumRanks == 16, "one warp per rank: 8 or 16 ranks");
+  static_assert(
+      kNumRanks == 2 || kNumRanks == 4 || kNumRanks == 8 || kNumRanks == 16, "one warp per rank: 2, 4, 8 or 16 ranks");
+  static_assert(kCandK / 32 <= 64 && 2 * kTopK / (32 * kNumRanks) <= 64, "poll masks are 64 bits");
   constexpr int kThreads = 32 * kNumRanks;
   static_assert(kCandK % 32 == 0 && kTopK % kThreads == 0 && kCandK <= kTopK);
   constexpr int kPerThread = kTopK / kThreads;

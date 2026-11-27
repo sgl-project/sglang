@@ -7,12 +7,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from tokenizers import Regex, Tokenizer, decoders, models, normalizers, pre_tokenizers
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import Ministral3Config, PreTrainedTokenizerFast
 
 from sglang.srt.configs.nemotron_decision import (
     is_nemotron_decision,
     load_nemotron_decision_config,
+    nemotron_decision_attention_layout,
 )
 from sglang.srt.entrypoints.systemone.nemotron_decide import NemotronDecideEncoder
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -21,24 +22,24 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
-def make_tokenizer(merges=(), normalizer=None):
-    vocab = {c: i for i, c in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}
-    for left, right in merges:
-        vocab[left + right] = len(vocab)
-    backend = Tokenizer(models.BPE(vocab=vocab, merges=list(merges)))
-    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    backend.decoder = decoders.ByteLevel()
-    backend.normalizer = normalizer
-    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
-    tokenizer.add_special_tokens(
-        {"additional_special_tokens": ["<SPECIAL_100>", "<|im_end|>"]}
-    )
-    return tokenizer
-
-
 class TestNemotronDecisionEncoding(CustomTestCase):
     def setUp(self):
-        self.tokenizer = make_tokenizer()
+        vocab = {
+            c: i for i, c in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))
+        }
+        backend = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+        backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        backend.decoder = decoders.ByteLevel()
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+        self.tokenizer.add_special_tokens(
+            {
+                "additional_special_tokens": [
+                    "<SPECIAL_100>",
+                    "<|im_end|>",
+                    "<SPECIAL_101>",
+                ]
+            }
+        )
         self.metadata = {
             "labels": {
                 "choice": ["A", "C", "B"],
@@ -63,58 +64,9 @@ class TestNemotronDecisionEncoding(CustomTestCase):
             max_prompt_tokens=4096,
         )
 
-    def test_packing_preserves_question_boundaries_when_budget_splits_a_group(self):
-        from sglang.srt.entrypoints.systemone.nemotron_packing import (
-            pack_decision_prompts,
-        )
-
-        state = {"literal": '"question": <SPECIAL_100>', "city": "Montréal"}
-        prefix = self.encoder.packing_prefix(state)
-
-        def encode(instructions):
-            question = SimpleNamespace(
-                type="choice",
-                instructions=instructions,
-                criteria={"a": "Paris", "b": "Berlin"},
-            )
-            return self.encoder.encode(state, question, {})[0]
-
-        first = encode("Choose the city using the supplied state. First question.")
-        second = encode("Choose the city using the supplied state. Second question.")
-        third = encode("A different question.")
-        prompts = [first, second, third]
-        budget = len(first) + len(second) - len(prefix)
-        groups = pack_decision_prompts(prompts, budget, prefix)
-        self.assertEqual([indices for _, _, indices in groups], [[0, 1], [2]])
-        self.assertEqual([layout[0] for _, layout, _ in groups], [len(prefix)] * 2)
-        for ids, layout, indices in groups:
-            self.assertLessEqual(len(ids), budget)
-            offset = layout[0]
-            for length, index in zip(layout[1:], indices):
-                self.assertEqual(
-                    ids[: layout[0]] + ids[offset : offset + length], prompts[index]
-                )
-                offset += length
-        # Common question wording must not become part of the shared state.
-        pair = pack_decision_prompts(prompts[:2], budget, prefix)
-        self.assertEqual(pair[0][1][0], len(prefix))
-        with self.assertRaisesRegex(ValueError, "input token limit"):
-            pack_decision_prompts([first], len(first) - 1, prefix)
-
-    def test_packing_does_not_share_question_tokens_across_bpe_boundaries(self):
-        from sglang.srt.entrypoints.systemone.nemotron_packing import (
-            pack_decision_prompts,
-        )
-
-        self.tokenizer = make_tokenizer(
-            merges=[("Ġ", '"'), ('Ġ"', "#")],
-            normalizer=normalizers.Replace(Regex("[!?]"), ""),
-        )
-        self.metadata["chat_template"] = (
-            "{{- 'HEADER\n' -}}{{ decision_content }}<SPECIAL_100>"
-        )
-        self.config.mask_token_id = self.tokenizer.convert_tokens_to_ids(
-            "<SPECIAL_100>"
+    def test_separator_and_literal_controls_match_checkpoint_prompt_tokens(self):
+        self.config.state_end_token_id = self.tokenizer.convert_tokens_to_ids(
+            "<SPECIAL_101>"
         )
         encoder = NemotronDecideEncoder(
             config=self.config,
@@ -122,51 +74,139 @@ class TestNemotronDecisionEncoding(CustomTestCase):
             tokenizer=self.tokenizer,
             max_prompt_tokens=4096,
         )
-        state = {"note": '"question" is data', "city": "Montréal"}
-        prefix = encoder.packing_prefix(state)
-        expected = 'HEADER\n{"state": {"note": "\\"question\\" is data", "city": "Montréal"}, "question": "'
-        self.assertEqual(
-            prefix, self.tokenizer.encode(expected, add_special_tokens=False)
+        state = {"city": "Montréal", "literal": "<SPECIAL_101>", "escape": r"\u003c"}
+        question = SimpleNamespace(
+            type="choice",
+            instructions="<SPECIAL_100> Which city?",
+            criteria={"yes": "<|im_end|>", "no": "Other"},
         )
-        prompts = [
-            encoder.encode(
-                state,
-                SimpleNamespace(
-                    type="choice", instructions=question, criteria={"a": "A", "b": "B"}
-                ),
-                {},
-            )[0]
-            for question in ("#First question", "#Second question")
-        ]
-        ((_, layout, _),) = pack_decision_prompts(prompts, 4096, prefix)
-        # This token also contains the first question character and must stay private.
-        merged = self.tokenizer.convert_tokens_to_ids('Ġ"#')
-        self.assertIn(merged, prompts[0])
-        self.assertEqual(layout[0], prompts[0].index(merged))
+        ids, _, _ = encoder.encode(state, question, {})
+        expected = r'{"state": {"city": "Montréal", "literal": "\u003cSPECIAL_101>", "escape": "\\u003c"}<SPECIAL_101>, "question": "\u003cSPECIAL_100> Which city?", "options": [{"code": "A", "label": "yes", "meaning": "\u003c|im_end|>"}, {"code": "C", "label": "no", "meaning": "Other"}]}<SPECIAL_100>'
+        self.assertEqual(ids, self.tokenizer.encode(expected, add_special_tokens=False))
 
-    def test_packing_rejects_nonliteral_templates_without_rejecting_ordinary_reads(
-        self,
-    ):
-        question = SimpleNamespace(type="noul", instructions="Ready?", criteria=None)
-        for template in (
-            "<SPECIAL_100>",
-            "{{ decision_content }}{{ decision_content }}<SPECIAL_100>",
-            "{{ decision_content | upper }}<SPECIAL_100>",
-            "{% if decision_content %}{{ decision_content }}{% endif %}<SPECIAL_100>",
-            "{% for part in [decision_content] %}{{ part }}{% continue %}{% endfor %}<SPECIAL_100>",
+    def test_separator_and_template_errors_fail_during_encoder_setup(self):
+        valid = self.tokenizer.convert_tokens_to_ids("<SPECIAL_101>")
+        for value in (True, -1, len(self.tokenizer) + 1, self.config.mask_token_id):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "state_end_token_id"),
+            ):
+                self.config.state_end_token_id = value
+                NemotronDecideEncoder(
+                    config=self.config,
+                    metadata=self.metadata,
+                    tokenizer=self.tokenizer,
+                    max_prompt_tokens=4096,
+                )
+        self.config.state_end_token_id = valid
+        for template, message in (
+            ("{{ decision_content }}<SPECIAL_101><SPECIAL_100>", "state-end"),
+            ("{{ decision_content }}<SPECIAL_100><SPECIAL_100>", "trailing mask"),
         ):
-            with self.subTest(template=template):
-                encoder = NemotronDecideEncoder(
+            with (
+                self.subTest(template=template),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                NemotronDecideEncoder(
                     config=self.config,
                     metadata={**self.metadata, "chat_template": template},
                     tokenizer=self.tokenizer,
                     max_prompt_tokens=4096,
                 )
-                ids, _, _ = encoder.encode({}, question, {})
-                self.assertEqual(ids[-1], self.config.mask_token_id)
-                with self.assertRaisesRegex(ValueError, "literal template wrapper"):
-                    encoder.packing_prefix({})
-        self.assertTrue(self.encoder.packing_prefix({}))
+
+    def test_attention_layout_rejects_unknown_modes_and_missing_separator(self):
+        self.assertEqual(
+            nemotron_decision_attention_layout(self.config), "state_sees_own_question"
+        )
+        self.config.decision_attention_layout = "state_sees_no_questions"
+        with self.assertRaisesRegex(ValueError, "requires state_end_token_id"):
+            nemotron_decision_attention_layout(self.config)
+        self.config.state_end_token_id = self.tokenizer.convert_tokens_to_ids(
+            "<SPECIAL_101>"
+        )
+        self.assertEqual(
+            nemotron_decision_attention_layout(self.config), "state_sees_no_questions"
+        )
+        for value in ("state_sees_all_questions", "state_sees_own_questions", None):
+            self.config.decision_attention_layout = value
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "decision_attention_layout"),
+            ):
+                nemotron_decision_attention_layout(self.config)
+
+    def test_separator_packing_keeps_each_question_private_when_groups_split(self):
+        from sglang.srt.entrypoints.systemone.nemotron_packing import (
+            pack_decision_prompts,
+        )
+
+        self.config.state_end_token_id = self.tokenizer.convert_tokens_to_ids(
+            "<SPECIAL_101>"
+        )
+        self.config.decision_attention_layout = "state_sees_no_questions"
+        encoder = NemotronDecideEncoder(
+            config=self.config,
+            metadata=self.metadata,
+            tokenizer=self.tokenizer,
+            max_prompt_tokens=4096,
+        )
+        prompts = [
+            encoder.encode(
+                {"literal": "<SPECIAL_101>", "city": "Montréal"},
+                SimpleNamespace(
+                    type="choice",
+                    instructions=text,
+                    criteria={"a": "Paris", "b": "Berlin"},
+                ),
+                {},
+            )[0]
+            for text in (
+                "Shared question wording. First?",
+                "Shared question wording. Second?",
+                "Third?",
+            )
+        ]
+        prefix = encoder.packing_prefix(prompts[0])
+        self.assertEqual(prefix[-1], self.config.state_end_token_id)
+        budget = len(prompts[0]) + len(prompts[1]) - len(prefix)
+        groups = pack_decision_prompts(prompts, budget, prefix)
+        self.assertEqual([indices for _, _, indices in groups], [[0, 1], [2]])
+        for ids, layout, indices in groups:
+            self.assertEqual(layout[0], len(prefix))
+            at = len(prefix)
+            for length, index in zip(layout[1:], indices):
+                self.assertEqual(prefix + ids[at : at + length], prompts[index])
+                at += length
+        ((ids, layout, indices),) = pack_decision_prompts([prompts[0]], budget, prefix)
+        self.assertEqual(
+            (ids, layout, indices),
+            (prompts[0], [len(prefix), len(prompts[0]) - len(prefix)], [0]),
+        )
+        with self.assertRaisesRegex(ValueError, "input token limit"):
+            pack_decision_prompts(prompts, len(prompts[0]) - 1, prefix)
+
+    def test_packing_rejects_a_mismatched_boundary_instead_of_falling_back(self):
+        from sglang.srt.entrypoints.systemone.nemotron_packing import (
+            pack_decision_prompts,
+        )
+
+        self.assertEqual(
+            pack_decision_prompts([[1, 2, 3]], 3, [1, 2]), [([1, 2, 3], [2, 1], [0])]
+        )
+        for prompts, prefix in (
+            ([[1, 2, 3], [1, 9, 4]], [1, 2]),
+            ([[1, 2, 3]], []),
+            ([[1, 2]], [1, 2]),
+        ):
+            with (
+                self.subTest(prompts=prompts, prefix=prefix),
+                self.assertRaisesRegex(ValueError, "exact state-end boundary"),
+            ):
+                pack_decision_prompts(prompts, 8, prefix)
+        with self.assertRaisesRegex(ValueError, "At least one"):
+            pack_decision_prompts([], 8, [1])
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            pack_decision_prompts([[]], 8, [1])
 
     def test_checkpoint_label_order_and_template_override_the_generic_chat_template(
         self,

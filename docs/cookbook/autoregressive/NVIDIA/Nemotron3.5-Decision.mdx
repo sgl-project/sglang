@@ -43,7 +43,7 @@ Send requests through `/v1/systemone` or `/v1/decisions`. Both use the checkpoin
 ## 2. Configuration tips
 
 - **Complete reads.** Each question reads its full state and question together. SGLang disables prefix caching and chunked prefill because every token must attend to the complete question. By default, a request with several questions runs one read per question. Use opt-in shared-state packing below to read the state once per packed group. This changes the attention pattern and may change answer probabilities.
-- **Input budget.** The default prefill budget is 128K tokens on GPUs with at least 60 GiB of memory, or 16K when memory is smaller or unknown. The checkpoint allows up to 131,072 tokens per complete prompt, but the server's prefill budget, context length, and available memory can impose a smaller limit. Increase `--max-prefill-tokens` only when the GPU has room for the full read. Oversized prompts return an error rather than being truncated.
+- **Input budget.** With automatic memory sizing, the default prefill budget is 128K tokens on GPUs with at least 60 GiB of memory, or 16K when memory is smaller or unknown. Setting `--mem-fraction-static` makes the default 16K because automatic activation-memory sizing is skipped. An explicit `--max-prefill-tokens` overrides this default. The checkpoint allows up to 131,072 tokens per complete prompt, but the server's prefill budget, context length, and available memory can impose a smaller limit. Increase `--max-prefill-tokens` only when the GPU has room for the full read. Oversized prompts return an error rather than being truncated.
 - **Question limits.** The BF16 checkpoint allows up to 512 questions per request and 2–501 options or score levels per question. Options retain their input order. These limits are read from `decision.json` in the model repository.
 - **API formats.** `/v1/systemone` takes a `state` and a dictionary of named questions. `/v1/decisions` takes `input` and a list of questions with IDs. Its `prompt_format_version` is 2 for this checkpoint; requesting a different version returns an error.
 - **Calibration.** The checkpoint sets calibration temperatures by question type. `/v1/decisions` also accepts a request `temperature` to adjust answer probabilities. It does not change `label_mass`, the full-vocabulary probability assigned to the candidate labels.
@@ -167,6 +167,16 @@ Captured on one H100. Probabilities can vary with hardware and numerical backend
 
 </Accordion>
 
+### Checkpoint prompt settings
+
+`state_end_token_id` in the model repository's `config.json` names the separator
+written immediately after the state value. User-supplied control-token strings
+are escaped within JSON so they remain text rather than prompt control tokens.
+
+`decision_attention_layout` selects the attention pattern for the server. The
+default `state_sees_own_question` gives each question a separate bidirectional
+read. `state_sees_all_questions` is not supported.
+
 ## 4. LoRA adapters
 
 Start the server with an adapter directory:
@@ -181,11 +191,30 @@ The server reads the adapter rank and target modules from `adapter_config.json`.
 
 Adapters can change the answer probabilities and selected answer. Validate your adapter on examples from its intended task before using its scores.
 
-
 ## 5. Shared-state packing
 
-Add `"packing": "shared"` to either request example to share the state across its questions. The server packs questions within the complete-read token budget, splitting them into groups when needed. `"packing": "none"` is the default.
+Packing is selected for the server by `decision_attention_layout`, using the
+checkpoint value or the override below. It is not a request field. The server
+packs questions within the complete-read token budget, splitting groups when
+needed. State tokens attend only to the state; each question attends to the
+state and its own tokens, at the positions it has in a separate prompt. The
+same rule applies when a request has only one question.
 
-State tokens attend only to the state. Each question attends to the state and its own tokens, with question positions restarting after the state. Questions cannot attend to each other. Because the state no longer attends to each question, packed probabilities can differ from separate reads. Validate the mode on your task before relying on its scores.
+The same `model:adapter` selection works with packed reads. Input-token usage
+counts the tokens actually read. Packed reads run eagerly; separate reads keep
+their default graph behavior. `return_prompt_token_ids` is unavailable with
+packing because token IDs alone do not describe its attention mask.
 
-The same `model:adapter` selection works with packed reads. Input-token usage counts the tokens actually read across packed groups. Packed reads use the existing eager path for multiple readout positions. Ordinary reads keep their default graph behavior. `return_prompt_token_ids` is unavailable with packing because token IDs alone do not describe the attention mask.
+
+To share the state, launch with the packed layout (or use a checkpoint that sets it):
+
+```bash
+sglang serve nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16 \
+  --json-model-override-args '{"decision_attention_layout":"state_sees_no_questions"}'
+```
+
+In this mode, the state attends only to itself and each question attends to the
+state and its own tokens. The same rule applies to a request with one question.
+Send ordinary request bodies to either API; packing is selected by the server,
+not by a request field. It can change answers and probabilities compared with
+separate reads.
