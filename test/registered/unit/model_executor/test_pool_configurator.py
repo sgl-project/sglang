@@ -2398,7 +2398,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
         ):
             for owners in ({}, {4: [0], 128: [1]}):
                 planner.stage_owner_layers = owners
-                self.assertEqual(planner._get_variable_pool_byte_adjustment(256), 0)
+                self.assertEqual(planner._get_low_ratio_kv_padding_bytes(256), 0)
 
     def test_other_backends_keep_existing_byte_contract(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
@@ -2430,7 +2430,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
                             planner._compressed_bytes_per_full_token(ratio),
                             (kv_bytes + 68) / ratio,
                         )
-                    self.assertEqual(planner._get_variable_pool_byte_adjustment(256), 0)
+                    self.assertEqual(planner._get_low_ratio_kv_padding_bytes(256), 0)
 
 
 if __name__ == "__main__":

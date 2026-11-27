@@ -1553,29 +1553,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             + state_rows * state_row_bytes * torch.float32.itemsize * self.num_layers(4)
         )
 
-    def _npu_variable_pool_bytes(self, full_tokens: int) -> float:
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV41_INDEX_PAGE_SIZE
-
-        total = 0
-        if self.swa_cap_tokens is None:
-            total += self._npu_swa_pool_bytes(
-                self._get_swa_tokens(full_tokens, self.page_size)
-            )
-        for ratio, layers in self.stage_owner_layers.items():
-            size = full_tokens // ratio
-            page = self._npu_c128_page_size if ratio == 128 else self.page_size // ratio
-            rows = ((size + page + 1) // page) * page
-            layer_bytes = rows * self._npu_kv_row_bytes[ratio]
-            if ratio == 4:
-                layer_bytes += rows * self.indexer_bytes_per_token
-            elif ratio in (1, 2):
-                index_size = (full_tokens + self.page_size) // ratio
-                index_page = DSV41_INDEX_PAGE_SIZE
-                index_rows = ((index_size + index_page + 1) // index_page) * index_page
-                layer_bytes += index_rows * self.low_ratio_index_bytes
-            total += layer_bytes * len(layers)
-        return total * self._spec_infl
-
     def num_layers(self, ratio: int) -> int:
         """Layers of this stage owning ratio's compressed storage."""
         return len(self.stage_owner_layers.get(ratio, ()))
@@ -1700,14 +1677,38 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         assert ratio == 128, f"unsupported compression ratio: {ratio}"
         return 1 / 128 * self._get_paged_kv_bytes_per_token(128)
 
-    def _get_variable_pool_byte_adjustment(self, full_tokens: int) -> float:
+    def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
         """Adjust the linear estimate for physical pool sizes."""
         if _is_npu:
-            # SWA ratio sizing rounds down, so this adjustment can be negative.
-            return (
-                self._npu_variable_pool_bytes(full_tokens)
-                - full_tokens * self.bytes_per_full_token
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                DSV41_INDEX_PAGE_SIZE,
             )
+
+            padding_bytes = 0
+            if self.swa_cap_tokens is None:
+                # SWA ratio sizing rounds down, so this difference can be negative.
+                swa_tokens = self._get_swa_tokens(full_tokens, self.page_size)
+                logical_swa_bytes = (
+                    full_tokens * self.swa_ratio * self._get_bytes_per_swa_token()
+                )
+                padding_bytes += self._npu_swa_pool_bytes(swa_tokens) - logical_swa_bytes
+            for ratio, layers in self.stage_owner_layers.items():
+                size = full_tokens // ratio
+                page = self._npu_c128_page_size if ratio == 128 else self.page_size // ratio
+                rows = ((size + page + 1) // page) * page
+                layer_bytes = rows * self._npu_kv_row_bytes[ratio]
+                if ratio == 4:
+                    layer_bytes += rows * self.indexer_bytes_per_token
+                elif ratio in (1, 2):
+                    index_size = (full_tokens + self.page_size) // ratio
+                    index_page = DSV41_INDEX_PAGE_SIZE
+                    index_rows = ((index_size + index_page + 1) // index_page) * index_page
+                    layer_bytes += index_rows * self.low_ratio_index_bytes
+                logical_layer_bytes = (
+                    full_tokens * self._compressed_bytes_per_full_token(ratio)
+                )
+                padding_bytes += (layer_bytes - logical_layer_bytes) * len(layers)
+            return padding_bytes * self._spec_infl
         if self._unified or get_exec().kernel.dsv4_attn_backend == "trtllm":
             return 0
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -1988,7 +1989,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         while full_token > 0 and (
             full_token * self.bytes_per_full_token
-            + self._get_variable_pool_byte_adjustment(full_token)
+            + self._get_low_ratio_kv_padding_bytes(full_token)
             > available_bytes_for_tokens
         ):
             full_token -= page_size
@@ -1997,7 +1998,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             next_token = full_token + page_size
             while (
                 next_token * self.bytes_per_full_token
-                + self._get_variable_pool_byte_adjustment(next_token)
+                + self._get_low_ratio_kv_padding_bytes(next_token)
                 <= available_bytes_for_tokens
             ):
                 full_token = next_token
