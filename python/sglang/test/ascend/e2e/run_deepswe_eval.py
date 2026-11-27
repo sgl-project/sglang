@@ -304,6 +304,42 @@ def start_docker_heartbeat(interval=60):
     return stop
 
 
+# pier keeps the agent/verifier output in per-trial files on the shared PVC;
+# a trial that dies before writing reward.txt surfaces only as
+# RewardFileNotFoundError, so print those files (they also land in the saved
+# eval log artifact) to make the failure diagnosable.
+TRIAL_LOG_PATTERNS = (
+    "deep_swe_jobs/**/agent/mini-swe-agent.txt",
+    "deep_swe_jobs/**/verifier/test-stdout.txt",
+    "deep_swe_jobs/**/verifier/run.log",
+    "deep_swe_jobs/**/exception.txt",
+)
+
+
+def dump_trial_logs(config, tail_chars=8000, max_files=10):
+    work_dir = config.get("work_dir")
+    if not work_dir:
+        return
+    seen = 0
+    for pattern in TRIAL_LOG_PATTERNS:
+        for path in sorted(glob.glob(os.path.join(work_dir, pattern), recursive=True)):
+            if seen >= max_files:
+                return
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError as e:  # noqa: BLE001 - diagnostics only
+                print(f"WARNING: failed to read {path}: {e}", flush=True)
+                continue
+            seen += 1
+            print(
+                f"===== trial log: {os.path.relpath(path, work_dir)} (last "
+                f"{min(len(text), tail_chars)} chars) =====",
+                flush=True,
+            )
+            print(text[-tail_chars:], flush=True)
+
+
 def find_report_path(output_lines, work_dir):
     """Locate the evalscope report.
 
@@ -336,6 +372,7 @@ def main():
         returncode, output_lines = run_evalscope(config)
     finally:
         stop_heartbeat.set()
+    dump_trial_logs(config)
     if returncode != 0:
         print(f"ERROR: DeepSWE evalscope exited with code {returncode}")
         return returncode or 1

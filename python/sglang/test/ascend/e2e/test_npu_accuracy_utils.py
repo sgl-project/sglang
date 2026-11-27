@@ -510,7 +510,15 @@ def _build_deepswe_eval_pod(pod_name, namespace, env_vars, share_volume, share_s
         env=[k8s.V1EnvVar(name="DOCKER_TLS_CERTDIR", value="")],
         args=dind_args,
         volume_mounts=[
-            k8s.V1VolumeMount(name="dind-storage", mount_path="/var/lib/docker")
+            k8s.V1VolumeMount(name="dind-storage", mount_path="/var/lib/docker"),
+            # pier hands compose bind mounts whose sources live under
+            # /root/.cache (the shared "share" volume): the per-trial
+            # agent/verifier/artifacts dirs and the evalscope snapshot. The
+            # daemon resolves those sources inside ITS container, so mount the
+            # same volume at the same path here. Otherwise they resolve to an
+            # empty dind-private dir and the eval container never sees the
+            # agent trajectory, reward.txt or model.patch.
+            k8s.V1VolumeMount(name="share", mount_path="/root/.cache"),
         ],
         # Nested build containers inherit this cgroup, and the per-task
         # ``docker compose build`` (apt + ~80 uv packages) is CPU/IO bound:
