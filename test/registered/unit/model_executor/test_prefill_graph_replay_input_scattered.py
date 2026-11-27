@@ -83,6 +83,7 @@ class FakePrefillGraphRunner(PrefillCudaGraphRunner):
         self.replays = 0
         self.backend = SimpleNamespace(replay_session=nullcontext)
         self.enable_cp_bcg_capture = False
+        self._rank_barrier_shapes = frozenset()
         self.raw_num_tokens = 0
         self.model_runner = None
         self.device_module = None
