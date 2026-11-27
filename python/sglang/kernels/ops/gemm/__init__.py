@@ -450,7 +450,10 @@ for _name, _backend in (
         )
     )
 del _name, _backend
-for _name in ("mxfp8_expert_matmul_lowm",):
+for _name in (
+    "nvfp4_expert_matmul_lowm_scaled",
+    "mxfp8_expert_matmul_lowm",
+):
     register_kernel(
         KernelSpec(
             op=f"gemm.inkling2_{_name}_sm120",
