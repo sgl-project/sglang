@@ -31,8 +31,6 @@ class _HeaderTensor:
     """Shape-only stand-in so detect_unet_config does not load 66GB weights."""
 
     def __init__(self, shape):
-        import torch
-
         self.shape = torch.Size(shape)
 
     def numel(self):
@@ -333,7 +331,6 @@ class SGLDiffusionGenerator:
     """
 
     def __init__(self):
-        self.model_path = None
         self.generator = None
         self.executor = None
         # Executor that sent the last request; differs from self.executor
@@ -459,8 +456,6 @@ class SGLDiffusionGenerator:
         """Worker summary from ServerArgs and the worker's RequestMetrics."""
         if self.generator is None:
             return "SGLD worker: not started (run the workflow once to load a model)"
-        import torch
-
         import sglang
 
         args = self.generator.server_args
@@ -614,7 +609,6 @@ class SGLDiffusionGenerator:
                 logger.warning("DiffGenerator.shutdown failed", exc_info=True)
             self.kill_generator()
         self.last_options = None
-        self.model_path = None
         self.generator = None
         self.executor = None
         self._active_executor = None
@@ -626,7 +620,6 @@ class SGLDiffusionGenerator:
         """Get ComfyUI model from model path."""
         if model_options is None:
             model_options = {}
-        dtype = model_options.get("dtype", None)
         # Header-only read: H3 BF16 is ~66GB and we only need keys + shapes
         # for detect_unet_config. SGLD loads the real weights later.
         from comfy import model_detection, model_management
@@ -679,13 +672,10 @@ class SGLDiffusionGenerator:
                 for k in diffusers_keys:
                     if k in sd:
                         new_sd[diffusers_keys[k]] = sd.pop(k)
-        if dtype is None:
-            unet_dtype = model_management.unet_dtype(
-                model_params=parameters,
-                supported_dtypes=model_config.supported_inference_dtypes,
-            )
-        else:
-            unet_dtype = dtype
+        unet_dtype = model_management.unet_dtype(
+            model_params=parameters,
+            supported_dtypes=model_config.supported_inference_dtypes,
+        )
 
         manual_cast_dtype = model_management.unet_manual_cast(
             unet_dtype, load_device, model_config.supported_inference_dtypes
@@ -783,7 +773,6 @@ class SGLDiffusionGenerator:
         # Checks above run first so a rejected config keeps the current worker.
         self.close_generator()
         self.last_options = gather_options
-        self.model_path = detect_path
 
         pipeline_class_name = self.pipeline_class_dict[model_type]
         worker_model_path = runtime_model_path or detect_path

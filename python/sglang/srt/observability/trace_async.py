@@ -466,12 +466,6 @@ class _TraceExporterProcess(multiprocessing.Process):
                         op["name"], op["level"], op.get("ts"), op.get("attrs")
                     )
 
-                elif op_type == "set_root_attrs":
-                    trace_ctx.trace_set_root_attrs(op["attrs"])
-
-                elif op_type == "set_thread_attrs":
-                    trace_ctx.trace_set_thread_attrs(op["attrs"])
-
                 elif op_type == "rebuild_thread_context":
                     caller_pid = op.get("caller_pid")
                     # Deserialized copy carries root_span_carrier here
@@ -611,9 +605,6 @@ class TraceReqContextAsync:
         )
 
     # -- helpers --------------------------------------------------------
-
-    def is_tracing_enabled(self) -> bool:
-        return self.tracing_enable
 
     def _check_fast_return(self, level: Optional[int] = None) -> bool:
         if not self.tracing_enable:
@@ -833,18 +824,6 @@ class TraceReqContextAsync:
                 "attrs": attrs,
             }
         )
-
-    def trace_set_root_attrs(self, attrs: Dict[str, Any]):
-        if not self.tracing_enable:
-            return
-        if self.root_span:
-            self.root_span.set_attributes(attrs)
-        self._append_op({"type": "set_root_attrs", "attrs": attrs})
-
-    def trace_set_thread_attrs(self, attrs: Dict[str, Any]):
-        if not self.tracing_enable:
-            return
-        self._append_op({"type": "set_thread_attrs", "attrs": attrs})
 
     def rebuild_thread_context(self, ts: Optional[int] = None) -> None:
         if not self.tracing_enable:

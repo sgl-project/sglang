@@ -6,7 +6,7 @@ You can install SGLang using any of the methods below. Please go through [`Syste
 
 ## Component Version Mapping For SGLang
 
-Each CANN version requires its own matched set of component versions — do not mix versions across sets.
+The table describes the published B051 images. Each CANN version requires its own matched set of component versions — do not mix versions across sets.
 
 <Tabs>
   <Tab title="A3 Series">
@@ -27,43 +27,33 @@ Each CANN version requires its own matched set of component versions — do not 
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>25.5.2</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.1.0&driver=Ascend+HDK+25.5.2">HDK driver download</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26.2.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers?ids=d803%2Cbcc87fc38cd74df28cf5c415cf2aea75%2C31%2CAArch64%2Coffline_run_file">HDK driver download</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>9.1.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>9.2.0</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#obtain-cann-image">Obtain Images</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.10.0.post6</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.13.0</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">TorchNPU releases</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.2.1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[memfabric_hybrid-1.2.1](https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/mf/v1.2.1/20260923.4/memfabric_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl)<br/>(x86_64 host: use the manylinux_2_27_x86_64.manylinux_2_28_x86_64 wheel from the same directory)</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>memcache</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.2.1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[memcache_hybrid-1.2.1](https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/memcache/v1.2.1/20260923.4/memcache_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl)<br/>(x86_64 host: use the manylinux_2_27_x86_64.manylinux_2_28_x86_64 wheel from the same directory)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.5.0.dev20261119</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-hybrid==1.5.0.dev20261119 --extra-index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.2.2</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[triton_ascend-3.2.2](https://github.com/triton-lang/triton-ascend/releases/download/v3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl)<br/>(x86_64 host: replace aarch64 with x86_64)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.6.0+dev20261105160244</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[triton_ascend-3.6.0+dev20261105160244](https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/triton-ascend/20261105160244/triton_ascend-3.6.0%2Bdev20261105160244-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_34_aarch64.whl)<br/>(x86_64 host: replace aarch64 with x86_64)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.9.0.post9</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post9">sgl-kernel-npu releases</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric-zbal</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.1.3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-zbal==1.1.3`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.11.0.post12</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.11.0.post12">sgl-kernel-npu releases</a></td>
     </tr>
   </tbody>
 </table>
@@ -87,44 +77,67 @@ Each CANN version requires its own matched set of component versions — do not 
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>25.5.2</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.1.0&driver=Ascend+HDK+25.5.2">HDK driver download</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26.2.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers?ids=d803%2Cbcc87fc38cd74df28cf5c415cf2aea75%2C31%2CAArch64%2Coffline_run_file">HDK driver download</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>9.1.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>9.2.0</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#obtain-cann-image">Obtain Images</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.10.0.post6</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.13.0</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">TorchNPU releases</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.2.1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[memfabric_hybrid-1.2.1](https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/mf/v1.2.1/20260923.4/memfabric_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl)<br/>(x86_64 host: use the manylinux_2_27_x86_64.manylinux_2_28_x86_64 wheel from the same directory)</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>memcache</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.2.1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[memcache_hybrid-1.2.1](https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/memcache/v1.2.1/20260923.4/memcache_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl)<br/>(x86_64 host: use the manylinux_2_27_x86_64.manylinux_2_28_x86_64 wheel from the same directory)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.5.0.dev20261119</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-hybrid==1.5.0.dev20261119 --extra-index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.2.2</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[triton_ascend-3.2.2](https://github.com/triton-lang/triton-ascend/releases/download/v3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl)<br/>(x86_64 host: replace aarch64 with x86_64)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.6.0+dev20261105160244</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[triton_ascend-3.6.0+dev20261105160244](https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/triton-ascend/20261105160244/triton_ascend-3.6.0%2Bdev20261105160244-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_34_aarch64.whl)<br/>(x86_64 host: replace aarch64 with x86_64)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.9.0.post9</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post9">sgl-kernel-npu releases</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.11.0.post12</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.11.0.post12">sgl-kernel-npu releases</a></td>
     </tr>
   </tbody>
 </table>
 
   </Tab>
 </Tabs>
+
+### DeepSeek-V4.1 on Ascend910
+
+On Ascend910 (`ascend910_93`, architecture `2201`), the low-ratio attention
+backend needs five `sgl-kernel-npu` operators:
+`sparse_flash_mla`, `sparse_flash_mla_metadata`, `lightning_indexer_v2` (including
+candidate selection), `sparse_lightning_indexer`, and `compressor_v2`. A wheel
+with only the Python wrappers is not sufficient. This requirement is specific
+to DeepSeek-V4.1 on this target; it does not change the general installation matrix above.
+
+To build the [CANN 9.2.0 operator bundle](https://github.com/sgl-project/sgl-kernel-npu/blob/9503fb118bf919bc35be1756b2f713587fc2f272/third_party/profiles/cann-9.2.0/ops_transformer.json),
+start from a fresh checkout of that kernel revision on Ascend910 with CANN 9.2.0 and
+its environment loaded. The [CompressorV2 component tests](https://github.com/sgl-project/sgl-kernel-npu/pull/958)
+used Python 3.12.15 and torch/torch-npu 2.13.0. From the kernel repository root, run:
+
+```bash
+python3 setup.py --arch-version 2201 --ops all --artifact wheel --third-party ops_transformer -j8
+python3 -m pip install --no-deps --force-reinstall output/sgl_kernel_npu-*.whl
+```
+
+If imports succeed but a native operator is missing or has the wrong signature,
+test the installed wheel on the target device before starting the server:
+
+```bash
+python3 -m pytest -rs --enable-perf=false tests/python/operators/attention/test_sparse_flash_mla.py \
+  tests/python/operators/indexer/test_lightning_indexer_v2.py \
+  tests/python/operators/attention/test_compressor_v2.py
+```
 
 ### Obtain CANN Image
 
@@ -138,14 +151,14 @@ You can obtain the dependency of a specified version of CANN through an image.
   <Tab title="A3 Series">
 
 ```bash Command
-docker pull quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.12
+docker pull quay.io/ascend/cann:9.2.0-a3-ubuntu22.04-py3.12
 ```
 
   </Tab>
   <Tab title="950PR/DT Series">
 
 ```bash Command
-docker pull quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12
+docker pull quay.io/ascend/cann:9.2.0-950-ubuntu22.04-py3.12
 ```
 
   </Tab>
@@ -186,11 +199,11 @@ the version mapping table and do not mix versions across CANN sets.
 
 ### Method 1: Installing from source with prerequisites
 
-The steps in this method install the component set from the [version mapping table](#component-version-mapping-for-sglang).
+These commands follow the source-build versions in the [NPU Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/npu.Dockerfile). The source build uses MemFabric-Hybrid `1.5.0.dev20261124` with Mooncake Transfer Engine for MemFabric `0.3.14`. Follow the Dockerfile for the torch_npu Dynamo patch, runtime libraries, and libmmpa loader setup.
 
 #### Python Version
 
-**The CANN 9.1.0 set requires `python==3.12`.** If you don't want to break
+**The CANN 9.2.0 set requires `python==3.12`.** If you don't want to break
 system pre-installed python, try installing with [conda](https://github.com/conda/conda).
 
 ```bash Command
@@ -222,41 +235,26 @@ conda activate sglang_npu
 
 #### CANN
 
-Prior to starting work with SGLang on Ascend, you need to install CANN Toolkit, Kernels operator package and NNAL version 9.1.0, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/softwareinst/instg/instg_0008.html?OS=openEuler&InstallType=local)
+Prior to starting work with SGLang on Ascend, you need to install CANN Toolkit, Kernels operator package and NNAL version 9.2.0, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/920/softwareinst/instg/instg_0008.html?OS=openEuler&InstallType=local)
 
 #### MemFabric-Hybrid
 
 If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid. MemFabric-Hybrid is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
 
 ```bash Command
-# On an x86_64 host, use memfabric_hybrid-1.2.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl from the same directory instead
-pip install https://obs-memfabric-hybrid.obs.cn-north-4.myhuaweicloud.com/mf/v1.2.1/20260923.4/memfabric_hybrid-1.2.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl
+pip install memfabric-hybrid==1.5.0.dev20261124 --index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly/
+pip install --no-deps "https://github.com/kvcache-ai/Mooncake/releases/download/v0.3.14/mooncake_transfer_engine_memfabric-0.3.14-cp312-cp312-manylinux_2_35_$(uname -m).whl"
 
 # Install the device-specific MemFabric kernels:
-# --soc-version is A5 on the 950PR/DT Series, A3 on the A3 Series
-mfcli kernel install --soc-version A5
-```
-
-#### MemFabric-zbal
-
-MemFabric-zbal is a Zero Buffer Acceleration Library of high-performance operators for LLM inference and training on Ascend,
-accelerating computation by eliminating intermediate memory buffers; it is required only on **aarch64** clusters and is
-installed in addition to MemFabric-Hybrid.
-
-```bash Command
-# Only needed on aarch64 (arm64) hosts
-# A3 Series:
-pip install memfabric-zbal==1.1.3
+SOC_VERSION=A3  # Use A5 for 950PR/DT Series.
+mfcli kernel install --soc-version "$SOC_VERSION"
 ```
 
 #### PyTorch and PyTorch Framework Adapter on Ascend
 
 ```bash Command
-PYTORCH_VERSION=2.10.0
-TORCHVISION_VERSION=0.25.0
-TORCH_NPU_VERSION=2.10.0.post6
-pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
-pip install torch_npu==$TORCH_NPU_VERSION --extra-index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/
+pip install torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+pip install "https://gitcode.com/Ascend/pytorch/releases/download/v26.2.0-pytorch2.13.0/torch_npu-2.13.0-cp312-cp312-manylinux_2_28_$(uname -m).whl"
 ```
 
 If you are using other versions of `torch` and install `torch_npu`, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
@@ -276,21 +274,21 @@ device. You may also see some compatibility warnings caused by device difference
 We provide our own implementation of Triton for Ascend.
 
 ```bash Command
-# On an x86_64 host, replace aarch64 with x86_64 in the wheel URL
-pip install https://github.com/triton-lang/triton-ascend/releases/download/v3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+ARCH=$(uname -m)
+pip install "https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/triton-ascend/20261105160244/triton_ascend-3.6.0%2Bdev20261105160244-cp312-cp312-manylinux_2_27_${ARCH}.manylinux_2_34_${ARCH}.whl"
 ```
 
 For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://github.com/triton-lang/triton-ascend/blob/main/docs/en/installation_guide.md)
 
 #### SGLang Kernels NPU
 
-We provide SGL kernels for Ascend NPU, check [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
+Download the [2026.11.0.post14 release](https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.11.0.post14) for PyTorch 2.13.0, Python 3.12, CANN 9.2.0, your host architecture, and your device. Follow the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
 
 <Note>
 Gemma-family models (including Qwen3.5) call `sgl_kernel_npu.norm.gemma_rmsnorm`,
 whose implementation is chosen when the wheel is built: the native `torch_npu`
-operator for A2/A3 series, and ACLNN RMSNorm for 950PR/DT series, which does not
-register that operator. **950PR/DT series must install the `950` release
+operator for A2/A3 Series, and ACLNN RMSNorm for 950PR/DT Series, which does not
+register that operator. **950PR/DT Series must install the `950` release
 package** (`950` appears in the asset name), or build from source with
 `bash build.sh -a kernels Ascend950PR_9599`, the target that package is built
 with. On 950PR/DT, an `a2` or `a3` package fails on the first Gemma forward,
@@ -328,6 +326,57 @@ pip install -e python[all_npu]
 
 ### Method 2: Using Docker Image
 
+#### Install Ascend Docker Runtime
+
+The container commands in this documentation rely on
+[Ascend Docker Runtime](https://www.hiascend.com/document/detail/en/mindcluster/latest/clustersched/schedulingug/docs/en/scheduling/01_introduction/01_component_description.md#ascend-docker-runtime) on the host.
+It is a container runtime plugin (an OCI prestart hook) that reads the `ASCEND_VISIBLE_DEVICES` environment variable
+passed to `docker run`: it binds the selected NPU device nodes (including `/dev/davinci_manager` and `/dev/hisi_hdc`)
+into the container and mounts the host driver dependencies the NPU stack needs. Without the runtime,
+`ASCEND_VISIBLE_DEVICES` is ignored and none of this is mounted automatically.
+
+Install it once per host as `root` (skip this step if the host already has it). Download the `.run` package
+from the [MindCluster releases page](https://gitcode.com/Ascend/mind-cluster/releases), then:
+
+```bash Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <version>: Ascend Docker Runtime package version you downloaded
+#   <arch>: host architecture, e.g. aarch64 or x86_64
+# ============================================================
+
+chmod u+x Ascend-docker-runtime_<version>_linux-<arch>.run
+./Ascend-docker-runtime_<version>_linux-<arch>.run --install
+systemctl daemon-reload && systemctl restart docker
+```
+
+Verify that the runtime is registered as Docker's default runtime:
+
+```bash Command
+docker info --format 'default={{.DefaultRuntime}}'
+```
+
+The output must be `default=ascend`. If it prints `default=runc`:
+
+1. If the `Runtimes:` line of `docker info` lists `ascend`, either pass `--runtime ascend` to every `docker run`,
+or set `"default-runtime": "ascend"` in `/etc/docker/daemon.json` and restart Docker.
+2. If `ascend` is missing from `Runtimes:`, rerun the installation above and restart Docker.
+
+**What the runtime handles and what stays in the command:**
+
+| Handled automatically by the runtime | Still set by the `docker run` command |
+|---|---|
+| NPU device nodes (`/dev/davinci*`, `/dev/davinci_manager`, `/dev/hisi_hdc`) for the ids in `ASCEND_VISIBLE_DEVICES` | The image tag |
+| Driver libraries (`/usr/local/Ascend/driver/lib64`, `/usr/local/Ascend/driver/include`) | The device ids in `ASCEND_VISIBLE_DEVICES`: `0-15` for a full A3 Series node (ids are DIE-level, see the [glossary](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware)), `0-7` for a full 950PR/DT Series node |
+| `/usr/local/dcmi`, `/usr/local/bin/npu-smi`, `/var/queue_schedule` | Extra mounts such as `/usr/local/Ascend/driver`, `/usr/local/Ascend/firmware`, `/etc/ascend_install.info`, `/usr/local/sbin`, model weights, and the HF cache |
+
+`ASCEND_VISIBLE_DEVICES` accepts a single id (`0`), a comma-separated list (`0,1`), an inclusive range (`0-15`),
+a mixed form (`0-3,7`), and `void` for a container without any NPU.
+
+If the runtime cannot be installed on the host (for example, no `root` access), containers can still be started
+with explicit `--device` and `--volume` flags — see
+[Running containers without Ascend Docker Runtime](/docs/hardware-platforms/ascend-npus/faq#9-running-containers-without-ascend-docker-runtime) in the FAQ.
+
 #### Obtain Image
 
 You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
@@ -339,25 +388,25 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 1. Download SGLang image
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version, or a daily build tag (e.g., `main-cann9.1.0-a3`, `main-cann9.1.0-950`) if you need the latest development changes.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version, or a daily build tag if you need the latest development changes. CANN 9.2.0 has no daily builds published yet, so daily-build tags are currently available only for CANN 9.1.0 (e.g., `main-cann9.1.0-a3`, `main-cann9.1.0-950`).
 
-CANN 9.1.0 has no stable release yet, so use a validated build for now. The `cann9.1.0-<device>-B<NN>` tags (e.g., `cann9.1.0-a3-B105`, `cann9.1.0-950-B105`) are validated builds rather than stable releases; they stand in until a stable release is published. The exact component versions inside each build are listed in the [image dependency manifest](https://ascend.github.io/sglang/) — see for example the `cann9.1.0-950-B105` entry for the 950PR/DT Series.
+CANN 9.2.0 has no stable release yet, so use a validated build for now. The `cann9.2.0-<device>-B<NN>` tags (e.g., `cann9.2.0-a3-B051`, `cann9.2.0-950-B051`) are validated builds rather than stable releases; they stand in until a stable release is published. The exact component versions inside each build are listed in the [image dependency manifest](https://ascend.github.io/sglang/) — see for example the `cann9.2.0-950-B051` entry for the 950PR/DT Series.
 
-{/* TODO: Interim explanation (CANN 9.1.0 has no stable release yet). Remove it and switch the tags below to the stable release once it is published. */}
+{/* TODO: Interim explanation (CANN 9.2.0 has no stable release yet). Remove it and switch the tags below to the stable release once it is published. */}
 </Tip>
 
 <Tabs>
   <Tab title="A3 Series">
 
 ```bash Command
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
 ```
 
   </Tab>
   <Tab title="950PR/DT Series">
 
 ```bash Command
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B105
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B051
 ```
 
   </Tab>
@@ -365,22 +414,36 @@ docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/s
 
 2. Build an image based on Dockerfile
 
+The Dockerfile clones SGLang from GitHub during the build and does not use the local checkout, which only provides
+`npu.Dockerfile`. Pass `SGLANG_TAG` to build a specific branch or tag.
+
 ```bash Command
-# Clone the SGLang repository
+# Clone the SGLang repository to obtain the Dockerfile
 git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
-# Replace <arch_tag> with the target architecture, e.g., amd64, arm64.
-# Optional build arguments:
-#   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror to improve download speed
+# Required arguments:
+#   TARGETARCH: target architecture, e.g., amd64, arm64
+#   DEVICE_TYPE: target hardware, a3 or 950. The Dockerfile defaults to 950, so A3 Series builds must set a3.
+# Optional arguments:
+#   SGLANG_TAG: SGLang branch or tag to clone, e.g., main (default)
+#   CANN_VERSION: CANN version, e.g., 9.2.0 (default)
+#   SGLANG_KERNEL_NPU_TAG: sgl-kernel-npu release tag (default 2026.11.0.post14)
 # If there are network errors, please modify the Dockerfile to add ARG HTTP_PROXY/HTTPS_PROXY and set them as ENV.
-docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
+docker build \
+    --build-arg TARGETARCH=<arch_tag> \
+    --build-arg DEVICE_TYPE=<a3|950> \
+    --build-arg SGLANG_TAG=<branch_or_tag> \
+    -t <image_name> -f npu.Dockerfile .
 ```
 
 #### Create Docker Container
 
 **Notice:** `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
+
+The `drun` aliases below require [Ascend Docker Runtime](#install-ascend-docker-runtime) on the host and select
+all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
 
 Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
 weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
@@ -389,17 +452,20 @@ weights path — see [How do I provide model weights?](#how-do-i-provide-model-w
   <Tab title="A3 Series">
 
 ```bash Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <secret>: your Hugging Face access token
+#   <image_name>: SGLang container image
+# ============================================================
+
 # Create a shortcut 'drun' to launch a privileged Docker container
+# ASCEND_VISIBLE_DEVICES=0-15 selects all 16 DIE devices of a full A3 Series node
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
-    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
-    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
-    --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11 \
-    --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15 \
-    --device=/dev/davinci_manager --device=/dev/hisi_hdc \
+    --env ASCEND_VISIBLE_DEVICES=0-15 \
     --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
     --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
-    --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
+    --volume ~/.cache/:/root/.cache/'
 
 # The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
 drun --env "HF_TOKEN=<secret>" \
@@ -411,18 +477,22 @@ drun --env "HF_TOKEN=<secret>" \
   <Tab title="950PR/DT Series">
 
 ```bash Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <secret>: your Hugging Face access token
+#   <image_name>: SGLang container image
+# ============================================================
+
 # Create a shortcut 'drun' to launch a privileged Docker container
-# The 950PR/DT Series exposes 8 devices: /dev/davinci0 through /dev/davinci7
+# ASCEND_VISIBLE_DEVICES=0-7 selects all 8 devices of a full 950PR/DT Series node
 # ASCEND_USE_FIA=1 is required on the 950PR/DT Series
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --env ASCEND_USE_FIA=1 \
-    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
-    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
-    --device=/dev/davinci_manager --device=/dev/hisi_hdc \
+    --env ASCEND_VISIBLE_DEVICES=0-7 \
     --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
     --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
-    --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
+    --volume ~/.cache/:/root/.cache/'
 
 # The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
 drun --env "HF_TOKEN=<secret>" \

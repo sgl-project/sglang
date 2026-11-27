@@ -91,6 +91,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     world_group_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.attention import layer as attention_layer
 from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
     set_request_skip_softmax_params,
 )
@@ -120,6 +121,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
+    streams_layers_every_forward,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.component_loading import (
     load_transformer_if_needed,
@@ -173,6 +175,8 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 )
 
 logger = init_logger(__name__)
+
+_BATCHED_CFG_MARGIN_BYTES = 1 * 1024**3
 
 # Request-gated DiT fusions and the lowest quality level that may mount each
 # one. A fusion belongs to "lossless" when it keeps the reference math and the
@@ -1896,6 +1900,11 @@ class DenoisingStage(PipelineStage):
             return 1
         return get_sp_world_size()
 
+    def _tp_world_size(self) -> int:
+        if not model_parallel_is_initialized():
+            return 1
+        return get_tp_group().world_size
+
     def step_profile(self):
         profiler = SGLDiffusionProfiler.get_instance()
         if profiler:
@@ -2192,6 +2201,93 @@ class DenoisingStage(PipelineStage):
             return kwargs
         return {k: v for k, v in kwargs.items() if k in param_names}
 
+    def _should_batch_cfg(
+        self, current_model, cfg_policy, latent_model_input, server_args, batch
+    ) -> bool:
+        # A streamed DiT is copied from host once per forward, so one batch-2
+        # forward halves the copies per step. With the DiT resident in eager mode
+        # one batch-2 forward was slightly slower than two serial ones.
+        return (
+            self._dit_streams_when_serving(current_model)
+            and type(cfg_policy) is CFGPolicy
+            and len(cfg_policy.branches) == 2
+            and cfg_policy.branches[0].is_conditional
+            and not cfg_policy.branches[1].is_conditional
+            and isinstance(latent_model_input, torch.Tensor)
+            and latent_model_input.shape[0] == 1
+            # Batching changes the reduction order, so the bit-exact tier stays serial.
+            and batch.sampling_params.quality != "exact"
+            and not server_args.enable_breakable_cuda_graph
+            and not self._cache_dit_enabled
+            and self._sp_world_size() <= 1
+            # Each rank checks its own free memory; under TP two ranks could pick
+            # different paths and run mismatched collectives.
+            and self._tp_world_size() <= 1
+        )
+
+    def _cfg_mask_keeps_attention(
+        self, current_model, batch, server_args, device, dtype
+    ) -> bool:
+        # Unequal prompt lengths add a padding mask. USPAttention serves a masked
+        # call with FA varlen (FA only, SGLANG_VARLEN_FA on) or dense SDPA and
+        # refuses Skip Softmax, so any other selected backend would be replaced
+        # or fail. Autotune can swap the impl behind an unchanged enum.
+        if (
+            batch.sampling_params.skip_softmax_params is not None
+            or server_args.enable_attention_backend_autotune
+        ):
+            return False
+        kept = {AttentionBackendEnum.TORCH_SDPA}
+        # Same device and dtype conditions as the varlen call in USPAttention;
+        # elsewhere (e.g. Ascend) the masked call falls back to SDPA.
+        if (
+            attention_layer._VARLEN_FA_ENABLED
+            and device.type == "cuda"
+            and dtype in (torch.float16, torch.bfloat16)
+        ):
+            kept.add(AttentionBackendEnum.FA)
+        return all(
+            module.backend in kept
+            for module in current_model.modules()
+            if isinstance(module, USPAttention)
+        )
+
+    def _batched_cfg_fits(self, need_bytes: int) -> bool:
+        # Aims to keep a request that just fits with serial CFG from running out of
+        # memory in the batch-2 forward. Same free-memory source and 1 GiB margin as
+        # the component prefetch check (component_residency_strategies.py).
+        device = get_local_torch_device()
+        free_bytes = int(
+            current_platform.get_available_gpu_memory(
+                device_id=device.index or 0, empty_cache=False
+            )
+            * 1024**3
+        )
+        if device.type == "cuda":
+            # The previous step's activations stay in the caching allocator: the
+            # driver reports them as used, but the batch-2 forward can reuse them.
+            free_bytes += torch.cuda.memory_reserved(
+                device
+            ) - torch.cuda.memory_allocated(device)
+        if need_bytes + _BATCHED_CFG_MARGIN_BYTES <= free_bytes:
+            return True
+        logger.info_once(
+            "Running the CFG branches serially: batching them needs about %.2f GiB "
+            "(estimate plus margin) and %.2f GiB is free.",
+            (need_bytes + _BATCHED_CFG_MARGIN_BYTES) / 1024**3,
+            free_bytes / 1024**3,
+        )
+        return False
+
+    def _dit_streams_when_serving(self, module) -> bool:
+        # A DiT offloaded only for the compile warmup is resident afterwards, so
+        # the warmup must trace the serial path that requests will run.
+        if not streams_layers_every_forward(module):
+            return False
+        return self._explicit_dit_layerwise_offload() or not any(
+            m is module for m in self._offloaded_dit_modules_for_compile
+        )
+
     def _predict_noise_with_cfg(
         self,
         current_model: nn.Module,
@@ -2235,6 +2331,59 @@ class DenoisingStage(PipelineStage):
                     server_args.pipeline_config.slice_noise_pred(pred_t[0], latents),
                 )
             return _unwrap(pred_t)
+
+        def predict_batched_fn(cond_branch, uncond_branch):
+            kwargs = server_args.pipeline_config.batch_cfg_branch_kwargs(
+                cond_branch.kwargs, uncond_branch.kwargs
+            )
+            if kwargs is None:
+                return None
+            if kwargs[
+                "encoder_hidden_states_mask"
+            ] is not None and not self._cfg_mask_keeps_attention(
+                current_model,
+                batch,
+                server_args,
+                device=latent_model_input.device,
+                dtype=target_dtype,
+            ):
+                return None
+            # The DiT activations of both rows are not allocated yet at this point,
+            # so the estimate covers both, not only the extra row.
+            row_bytes = server_args.pipeline_config.batch_cfg_row_bytes(
+                latent_model_input.shape[1],
+                kwargs["encoder_hidden_states"].shape[1],
+                target_dtype,
+            )
+            if not self._batched_cfg_fits(2 * row_bytes):
+                return None
+
+            def twice(x):
+                if isinstance(x, torch.Tensor) and x.dim() > 0 and x.shape[0] == 1:
+                    return torch.cat([x, x])
+                return x
+
+            cond_branch.configure_batch(batch)
+            with set_forward_context(
+                current_timestep=timestep_index,
+                attn_metadata=attn_metadata,
+                forward_batch=batch,
+                quality=batch.sampling_params.quality,
+            ):
+                raw = self._predict_noise(
+                    current_model=current_model,
+                    latent_model_input=twice(latent_model_input),
+                    timestep=twice(timestep),
+                    target_dtype=target_dtype,
+                    guidance=twice(guidance),
+                    **kwargs,
+                )
+            cond_t, uncond_t = zip(*(t.chunk(2) for t in _wrap(raw)))
+            if len(cond_t) == 1:
+                slice_pred = server_args.pipeline_config.slice_noise_pred
+                cond_t = (slice_pred(cond_t[0], latents),)
+                uncond_t = (slice_pred(uncond_t[0], latents),)
+            return [_unwrap(cond_t), _unwrap(uncond_t)]
 
         if (
             cfg_gate_state
@@ -2294,8 +2443,14 @@ class DenoisingStage(PipelineStage):
             # perform cfg branches in parallel, following the cfg policy
             predictions = run_cfg_parallel(cfg_policy, predict_fn)
         else:
-            # perform cfg branches one-by-one locally
-            predictions = [predict_fn(branch) for branch in cfg_policy.branches]
+            predictions = None
+            if self._should_batch_cfg(
+                current_model, cfg_policy, latent_model_input, server_args, batch
+            ):
+                predictions = predict_batched_fn(*cfg_policy.branches)
+            if predictions is None:
+                # perform cfg branches one-by-one locally
+                predictions = [predict_fn(branch) for branch in cfg_policy.branches]
 
         return cfg_policy.combine(
             predictions,
@@ -2449,13 +2604,9 @@ class DenoisingStage(PipelineStage):
         elif self.attn_backend.get_enum() in [
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
+            AttentionBackendEnum.ASCEND_SPARSE_ATTN,
         ]:
-            sparse_config = server_args.attention_backend_config
-
-            current_timestep = i
-            skip_first_steps = sparse_config.get("skip_first_steps", 10)
-            sparsity = sparse_config.get("sparsity", 0.2)
-
+            sparse_config = server_args.attention_backend_config or {}
             raw_latent_shape = batch.raw_latent_shape
             patch_size = server_args.pipeline_config.dit_config.patch_size
 
@@ -2468,13 +2619,25 @@ class DenoisingStage(PipelineStage):
                 else:
                     patch_size = (patch_size, patch_size, patch_size)
 
-            attn_metadata = self.attn_metadata_builder.build(
-                current_timestep=current_timestep,
-                skip_first_steps=skip_first_steps,
-                sparsity=sparsity,
-                raw_latent_shape=raw_latent_shape,
-                patch_size=patch_size,
-            )
+            if self.attn_backend.get_enum() == AttentionBackendEnum.ASCEND_SPARSE_ATTN:
+                metadata_kwargs = dict(sparse_config)
+                metadata_kwargs.update(
+                    current_timestep=i,
+                    num_steps=None if timesteps is None else len(timesteps),
+                    raw_latent_shape=raw_latent_shape,
+                    patch_size=patch_size,
+                )
+                if metadata_kwargs.get("video_spans") is not None:
+                    metadata_kwargs["raw_latent_shape"] = None
+                attn_metadata = self.attn_metadata_builder.build(**metadata_kwargs)
+            else:
+                attn_metadata = self.attn_metadata_builder.build(
+                    current_timestep=i,
+                    skip_first_steps=sparse_config.get("skip_first_steps", 10),
+                    sparsity=sparse_config.get("sparsity", 0.2),
+                    raw_latent_shape=raw_latent_shape,
+                    patch_size=patch_size,
+                )
         else:
             # attn_metadata can be None for SDPA attention backend
             return None
@@ -2634,10 +2797,11 @@ class DenoisingStage(PipelineStage):
         Prepare Sliding Tile Attention (STA) parameters and settings.
         """
         # TODO(kevin): STA mask search, currently only support Wan2.1 with 69x768x1280
+        configured_mode = server_args.attention_backend_config.STA_mode
         try:
-            STA_mode = STA_Mode[server_args.attention_backend_config.STA_mode]
+            STA_mode = STA_Mode[configured_mode]
         except Exception as e:
-            logger.error(f"Passed STA_mode: {STA_mode} doesn't exist")
+            logger.error(f"Passed STA_mode: {configured_mode} doesn't exist")
             raise e
         skip_time_steps = server_args.attention_backend_config.skip_time_steps
         if batch.timesteps is None:
@@ -2726,8 +2890,6 @@ class DenoisingStage(PipelineStage):
                 timesteps=timesteps_num,
             )
         elif STA_mode == STA_Mode.STA_INFERENCE:
-            import sglang.multimodal_gen.envs as envs
-
             config_file = envs.SGLANG_DIFFUSION_ATTENTION_CONFIG
             if config_file is None:
                 raise ValueError("SGLANG_DIFFUSION_ATTENTION_CONFIG is not set")
@@ -2750,6 +2912,10 @@ class DenoisingStage(PipelineStage):
         Args:
             batch: The current batch information.
         """
+        artifact_id = batch.extra.get("sta_search_artifact_id")
+        if artifact_id is None:
+            logger.warning("Skipping STA calibration export: no search artifact ID")
+            return
         size = (batch.width, batch.height)
         if size == (1280, 768):
             # TODO: make it configurable
@@ -2769,14 +2935,14 @@ class DenoisingStage(PipelineStage):
         if batch.mask_search_final_result_pos is not None and batch.prompt is not None:
             save_mask_search_results(
                 [dict(layer_data) for layer_data in batch.mask_search_final_result_pos],
-                prompt=str(batch.prompt),
+                artifact_id=artifact_id,
                 mask_strategies=sparse_mask_candidates_searching,
                 output_dir=f"output/mask_search_result_pos_{size[0]}x{size[1]}/",
             )
         if batch.mask_search_final_result_neg is not None and batch.prompt is not None:
             save_mask_search_results(
                 [dict(layer_data) for layer_data in batch.mask_search_final_result_neg],
-                prompt=str(batch.prompt),
+                artifact_id=artifact_id,
                 mask_strategies=sparse_mask_candidates_searching,
                 output_dir=f"output/mask_search_result_neg_{size[0]}x{size[1]}/",
             )
