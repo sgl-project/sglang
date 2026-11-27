@@ -3490,6 +3490,15 @@ def is_layerwise_offloaded_module(module: torch.nn.Module) -> bool:
     )
 
 
+def streams_layers_every_forward(module: torch.nn.Module) -> bool:
+    """True if at least one layer is copied from host memory on every forward,
+    i.e. the module is layerwise offloaded and not every layer is resident."""
+    return isinstance(module, LayerwiseOffloadableModuleMixin) and any(
+        manager.enabled and manager.resident_layers < manager.num_layers
+        for manager in module.layerwise_offload_managers
+    )
+
+
 def is_resident_layerwise_module(module: torch.nn.Module) -> bool:
     """True if the module keeps a resident DiT layer set beyond the streaming
     prefetch window.
