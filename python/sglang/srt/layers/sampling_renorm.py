@@ -95,6 +95,11 @@ def _top_k_renorm_prob(
     return _platform.top_k_renorm_prob(probs, top_k)
 
 
+def has_joint_top_k_top_p_renorm() -> bool:
+    """Whether the active platform provides the fused top-k/top-p renorm kernel."""
+    return _platform.top_k_top_p_renorm_prob is not None
+
+
 def joint_top_k_top_p_renorm_prob(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -127,6 +132,7 @@ top_k_renorm_prob = (
 )
 
 __all__ = [
+    "has_joint_top_k_top_p_renorm",
     "joint_top_k_top_p_renorm_prob",
     "min_p_renorm_prob",
     "renorm_deterministic",

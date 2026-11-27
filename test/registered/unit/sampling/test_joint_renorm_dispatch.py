@@ -12,7 +12,6 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.sampling import renorm as platform
-from sglang.srt.layers import sampling_renorm
 from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -87,8 +86,8 @@ class TestJointRenormDispatch(CustomTestCase):
         fused.assert_not_called()
 
     def test_two_step_without_platform_kernel(self):
-        # A sgl-kernel-npu wheel that predates the fused operator: the fused
-        # branch is taken but the wrapper falls back to the two kernels.
+        # A sgl-kernel-npu wheel that predates the fused operator: the branch
+        # is skipped, so the filters the call site passed in must run.
         probs = torch.rand(2, 8)
         order = []
 
@@ -101,13 +100,7 @@ class TestJointRenormDispatch(CustomTestCase):
             return probs
 
         with mock.patch.object(platform, "top_k_top_p_renorm_prob", None):
-            with mock.patch.object(
-                sampling_renorm, "_top_p_renorm_prob", side_effect=top_p
-            ):
-                with mock.patch.object(
-                    sampling_renorm, "_top_k_renorm_prob", side_effect=top_k
-                ):
-                    out = self._apply(probs, _sampling_info())
+            out = self._apply(probs, _sampling_info(), top_k=top_k, top_p=top_p)
 
         self.assertIs(out, probs)
         self.assertEqual(order, ["top_p", "top_k"])

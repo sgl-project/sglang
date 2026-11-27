@@ -27,6 +27,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
 from sglang.srt.layers.sampling_renorm import (
+    has_joint_top_k_top_p_renorm,
     joint_top_k_top_p_renorm_prob,
     min_p_renorm_prob,
     top_k_renorm_prob,
@@ -704,9 +705,12 @@ def _apply_joint_top_k_top_p(
         sampling_info.need_top_p_sampling
         and sampling_info.need_top_k_sampling
         and sampling_info.max_top_k
+        and has_joint_top_k_top_p_renorm()
     ):
         # One kernel for both filters; max_top_k bounds the rows that can
-        # survive, so the fusion does not need a full-vocabulary pass.
+        # survive, so the fusion does not need a full-vocabulary pass. Only
+        # take this branch when the platform has the kernel: the two-step
+        # path below must keep using the filters the call site passed in.
         probs = joint_top_k_top_p_renorm_prob(
             probs,
             torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
