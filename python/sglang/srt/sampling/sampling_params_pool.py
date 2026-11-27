@@ -113,6 +113,11 @@ class SamplingParamsTable:
         floats[self.TOP_P] = 1.0
         self.values[self.TOP_K] = TOP_K_ALL
         self.values[self.PENALTY_INDEX] = -1
+        # Slot 0 is the request table's padding slot: a graph's padded rows read it,
+        # and no request is written to it. Greedy (top_k 1 at temperature 1, as a
+        # greedy request is normalized), so those discarded rows draft by argmax
+        # instead of sampling.
+        self.values[self.TOP_K, 0] = 1
 
     def temperatures(self, slots: torch.Tensor) -> torch.Tensor:
         """[n] fp32, capturable."""

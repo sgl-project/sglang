@@ -110,6 +110,15 @@ class TestSamplerParams(_PoolTestCase):
         for field in (params.temperatures, params.top_ps, params.top_ks, params.min_ps):
             self.assertTrue(field.is_contiguous())
 
+    def test_padding_slot_is_greedy(self):
+        """A graph's padded rows read slot 0, which drafts greedily; an unwritten
+        request slot keeps the whole vocabulary."""
+        table = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE).table
+        slots = torch.tensor([0, 1])
+
+        self.assertEqual(table.top_ks(slots).tolist(), [1, TOP_K_ALL])
+        self.assertEqual(table.temperatures(slots).tolist(), [1.0, 1.0])
+
     def test_rewritten_slot_reads_the_new_request(self):
         """A freed slot that a later admission reuses holds the new request's
         params, host flags included."""

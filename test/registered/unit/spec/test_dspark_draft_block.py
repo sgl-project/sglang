@@ -30,7 +30,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 VOCAB, RANK, HIDDEN, BS, GAMMA = 211, 8, 16, 4, 5
-# The draft batch's slots: each row reads the sampling table's default entry.
+# The draft batch's slots: each row reads the padding slot's greedy entry.
 SLOTS = torch.zeros(BS, dtype=torch.int64)
 
 
