@@ -4992,6 +4992,115 @@ class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
         self.assertEqual(updates, {})
 
 
+class TestDefaultAttentionBackendOnXpu(unittest.TestCase):
+    @staticmethod
+    def _server_args(spec_algorithm=None):
+        return SimpleNamespace(
+            speculative_algorithm=spec_algorithm,
+            speculative_eagle_topk=None,
+            page_size=None,
+            tp_size=1,
+            _resolved_overrides=[],
+        )
+
+    @staticmethod
+    def _model_config():
+        return SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            has_asymmetric_kv=False,
+            has_attention_sinks=False,
+            get_num_kv_heads=lambda _tp: 8,
+        )
+
+    def _resolve(self, *, use_mla, spec_algorithm=None, **facts):
+        platform_facts = dict(
+            is_sail=False,
+            is_hopper_with_cuda_12_3=False,
+            is_sm100=False,
+            is_hip=False,
+            is_mlu=False,
+            is_xpu=False,
+            has_flashinfer=False,
+        )
+        platform_facts.update(facts)
+        platform = SimpleNamespace(**platform_facts)
+        with (
+            patch.object(base_module, "get_platform", return_value=platform),
+            patch.object(
+                base_module.current_platform, "is_out_of_tree", return_value=False
+            ),
+            patch.object(base_module, "is_mps", return_value=False),
+        ):
+            return base_module.get_default_attn_backend(
+                self._server_args(spec_algorithm), use_mla, self._model_config()
+            )
+
+    def test_xpu_mha_selects_intel_xpu(self):
+        self.assertEqual(self._resolve(use_mla=False, is_xpu=True), "intel_xpu")
+
+    def test_xpu_mla_keeps_triton(self):
+        self.assertEqual(self._resolve(use_mla=True, is_xpu=True), "triton")
+
+    def test_amd_mha_unchanged(self):
+        self.assertEqual(self._resolve(use_mla=False, is_hip=True), "aiter")
+
+    def test_cuda_mha_unchanged(self):
+        self.assertEqual(
+            self._resolve(use_mla=False, has_flashinfer=True), "flashinfer"
+        )
+        self.assertEqual(self._resolve(use_mla=False, has_flashinfer=False), "triton")
+
+    def test_hopper_mha_unchanged(self):
+        self.assertEqual(
+            self._resolve(use_mla=False, is_hopper_with_cuda_12_3=True), "fa3"
+        )
+
+    def test_xpu_spec_decode_stays_on_triton(self):
+        self.assertEqual(
+            self._resolve(use_mla=False, is_xpu=True, spec_algorithm="EAGLE"),
+            "triton",
+        )
+
+    def test_xpu_without_spec_decode_selects_intel_xpu(self):
+        self.assertEqual(
+            self._resolve(use_mla=False, is_xpu=True, spec_algorithm=None),
+            "intel_xpu",
+        )
+
+
+class TestIntelXpuPageConstraint(unittest.TestCase):
+    @staticmethod
+    def _view(page_size, attention_backend="intel_xpu"):
+        return SimpleNamespace(
+            page_size=page_size,
+            attention_backend=attention_backend,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            model_path="meta-llama/Llama-3.1-8B-Instruct",
+        )
+
+    def _run(self, page_size, *, use_mla, attention_backend="intel_xpu"):
+        with patch.object(overrides_module, "use_mla_backend", return_value=use_mla):
+            return overrides_module._intel_xpu_page_constraint(
+                self._view(page_size, attention_backend)
+            )
+
+    def test_mha_unset_page_size_becomes_128(self):
+        self.assertEqual(self._run(None, use_mla=False), {"page_size": 128})
+
+    def test_mha_keeps_page_size_1(self):
+        self.assertEqual(self._run(1, use_mla=False), {})
+
+    def test_mla_rejects_page_size_1(self):
+        self.assertEqual(self._run(1, use_mla=True), {"page_size": 128})
+
+    def test_other_backend_untouched(self):
+        self.assertEqual(
+            self._run(1, use_mla=False, attention_backend="triton"),
+            {},
+        )
+
+
 class TestGlm5NextAgenticMambaPool(CustomTestCase):
     ARCH = "Glm5NextForConditionalGeneration"
 
