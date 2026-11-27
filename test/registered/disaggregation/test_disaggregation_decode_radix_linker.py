@@ -9,6 +9,7 @@ import time
 import unittest
 
 import requests
+from prometheus_client.parser import text_string_to_metric_families
 
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer
@@ -49,7 +50,7 @@ SERVER_ARGS = [
 ]
 
 
-class TestDisaggregationDecodeRadixLinker(PDDisaggregationServerBase):
+class _DecodeRadixLinkerBase(PDDisaggregationServerBase):
     extra_prefill_args = SERVER_ARGS
     extra_decode_args = [*SERVER_ARGS, "--disaggregation-decode-enable-radix-cache"]
 
@@ -98,6 +99,8 @@ class TestDisaggregationDecodeRadixLinker(PDDisaggregationServerBase):
             )
         ]
 
+
+class TestDisaggregationDecodeRadixLinker(_DecodeRadixLinkerBase):
     def test_prefill_restores_decode_output_after_flush(self):
         num_rounds, output_len = 4, 600
         history = self._sample_token_ids(input_len=1500, num_prompts=1)[0]
@@ -118,6 +121,43 @@ class TestDisaggregationDecodeRadixLinker(PDDisaggregationServerBase):
                 history.extend(suffixes[round_idx])
                 time.sleep(2)
                 self._flush_device_caches()
+
+
+class TestDisaggregationDecodeLinkerPrefetch(_DecodeRadixLinkerBase):
+    extra_prefill_args = [*SERVER_ARGS, "--enable-metrics"]
+    extra_decode_args = [
+        *_DecodeRadixLinkerBase.extra_decode_args,
+        "--unified-cache-external-linker-config",
+        '{"load_mode":"prefetch","decode_prefetch":true,"prefetch_policy":"wait_complete"}',
+    ]
+
+    def _prefill_transfer_mb(self):
+        response = requests.get(f"{self.prefill_url}/metrics", timeout=10)
+        response.raise_for_status()
+        return sum(
+            sample.value
+            for family in text_string_to_metric_families(response.text)
+            for sample in family.samples
+            if sample.name == "sglang:kv_transfer_total_mb_sum"
+        )
+
+    def test_decode_restores_prefix_from_store(self):
+        (input_ids,) = self._sample_token_ids(input_len=1537, num_prompts=1)
+
+        before = self._prefill_transfer_mb()
+        cold = self._generate(input_ids, output_len=16)
+        self._flush_device_caches()
+        after_cold = self._prefill_transfer_mb()
+
+        warm = self._generate(input_ids, output_len=16)
+        self._flush_device_caches()
+        after_warm = self._prefill_transfer_mb()
+
+        cold_mb = after_cold - before
+        warm_mb = after_warm - after_cold
+        self.assertGreater(warm_mb, 0)
+        self.assertLess(warm_mb, cold_mb)
+        self.assertEqual(warm.output_ids, cold.output_ids)
 
 
 if __name__ == "__main__":

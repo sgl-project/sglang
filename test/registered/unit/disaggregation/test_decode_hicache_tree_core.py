@@ -28,7 +28,10 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             get_prefix_hash_values=Mock(),
             prefetch_from_storage=Mock(),
         )
-        harness = SimpleNamespace(tree_cache=tree_cache)
+        harness = SimpleNamespace(
+            tree_cache=tree_cache,
+            scheduler=SimpleNamespace(enable_decode_linker_prefetch=False),
+        )
         req = SimpleNamespace(
             rid="req-0",
             cache_request_handle=CacheRequestHandle("req-0", 0),

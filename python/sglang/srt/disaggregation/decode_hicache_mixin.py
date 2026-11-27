@@ -123,10 +123,7 @@ class DecodeHiCachePreallocMixin:
         Clears the L3 span unless the prefetch was taken, so prefill is never
         promised tokens nothing will load.
         """
-        if (
-            prefix_match is not None
-            and self.scheduler.enable_unified_cache_external_linker
-        ):
+        if prefix_match is not None and self.scheduler.enable_decode_linker_prefetch:
             prefix_match.l3_storage_hit_length = (
                 self.tree_cache.linker.prefetch(req, prefix_match.max_prefix_len) or 0
             )
@@ -178,7 +175,7 @@ class DecodeHiCachePreallocMixin:
         """Total device tokens reserved for pending HiCache L2/L3 load_back."""
         if (
             not self.scheduler.enable_decode_hicache
-            or self.scheduler.enable_unified_cache_external_linker
+            or self.scheduler.enable_decode_linker_prefetch
         ):
             return 0
         return sum(
@@ -313,7 +310,7 @@ class DecodeHiCacheTransferMixin:
 
         # Phase B: queue new load_back ops if the next slot is free on every rank.
         if (
-            not self.scheduler.enable_unified_cache_external_linker
+            not self.scheduler.enable_decode_linker_prefetch
             and not self.tree_cache.has_free_load_back_slot()
         ):
             return
@@ -331,7 +328,7 @@ class DecodeHiCacheTransferMixin:
         if not queued:
             return
 
-        if self.scheduler.enable_unified_cache_external_linker:
+        if self.scheduler.enable_decode_linker_prefetch:
             # Prefetch publishes device KV only after every rank finishes the read.
             for dr in queued:
                 dr.hicache_restore_status = HiCacheRestoreResult.READY
