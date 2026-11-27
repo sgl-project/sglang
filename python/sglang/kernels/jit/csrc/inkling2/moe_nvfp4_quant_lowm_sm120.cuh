@@ -4,6 +4,7 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#include "routed_quant.cuh"
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -18,45 +19,21 @@ namespace {
 
 constexpr int32_t kNumExperts = 128;
 constexpr int32_t kTopK = 8;
-constexpr float kFltMax = 3.4028234663852886e38f;
+
+// One definition of the NVFP4 numerics with the general routed path.
+using inkling2_routed_quant::capped_swiglu;
+using inkling2_routed_quant::e2m1_pack;
+using inkling2_routed_quant::e4m3_round;
+using inkling2_routed_quant::kFltMax;
+using inkling2_routed_quant::load_offsets;
+using inkling2_routed_quant::part_max;
+using inkling2_routed_quant::row_expert;
+using inkling2_routed_quant::scale_base;
 
 SGL_DEVICE uint4 ld_cs_u4(void const* ptr) {
   uint4 v;
   asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(ptr));
   return v;
-}
-
-SGL_DEVICE float e4m3_round(float v, uint8_t& bits) {
-  uint16_t pair;
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(pair) : "f"(0.0f), "f"(v));
-  bits = static_cast<uint8_t>(pair & 0xFFu);
-  uint32_t halves;
-  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(halves) : "h"(pair));
-  return __half2float(__ushort_as_half(static_cast<uint16_t>(halves & 0xFFFFu)));
-}
-
-SGL_DEVICE uint32_t e2m1_pack(float low, float high, float& rlow, float& rhigh) {
-  uint32_t packed = 0u, halves = 0u;
-#if defined(__CUDA_ARCH__)
-  asm("{ .reg .b8 b; cvt.rn.satfinite.e2m1x2.f32 b, %3, %2; "
-      "cvt.u32.u8 %0, b; cvt.rn.f16x2.e2m1x2 %1, b; }"
-      : "=r"(packed), "=r"(halves)
-      : "f"(low), "f"(high));
-#endif
-  rlow = __half2float(__ushort_as_half(static_cast<uint16_t>(halves & 0xFFFFu)));
-  rhigh = __half2float(__ushort_as_half(static_cast<uint16_t>(halves >> 16)));
-  return packed;
-}
-
-SGL_DEVICE float part_max4(float const (&x)[4]) {
-  float m = 0.0f;
-#pragma unroll
-  for (int32_t i = 0; i < 4; ++i) {
-    m = fmaxf(m, fabsf(x[i]));
-  }
-  m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, 1));
-  m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, 2));
-  return m;
 }
 
 template <int32_t kThreads>
@@ -124,49 +101,6 @@ SGL_DEVICE void quantize_part_fast4(
   scale = choose4 ? bits4 : bits6;
 }
 
-SGL_DEVICE int64_t scale_base(int32_t const* offsets, int32_t expert, int32_t scale_k) {
-  return static_cast<int64_t>(((offsets[expert] + expert * 127) / 128) * 128) * scale_k;
-}
-
-SGL_DEVICE int32_t row_expert(int32_t const* offsets, int32_t row) {
-  int32_t lo = 0, hi = kNumExperts;
-  while (hi - lo > 1) {
-    int32_t const mid = (lo + hi) >> 1;
-    if (offsets[mid] <= row)
-      lo = mid;
-    else
-      hi = mid;
-  }
-  return lo;
-}
-
-SGL_DEVICE void load_offsets(int32_t const* offsets, int32_t* s_offsets) {
-  for (int32_t i = static_cast<int32_t>(threadIdx.x); i <= kNumExperts; i += static_cast<int32_t>(blockDim.x)) {
-    s_offsets[i] = offsets[i];
-  }
-  __syncthreads();
-}
-
-SGL_DEVICE float capped_swiglu(float gate, float up, float gamma, float gate_cap, float up_cap) {
-  float sigmoid;
-  asm("{ .reg .f32 t; mul.rn.f32 t, %1, 0fBFB8AA3B; "
-      "ex2.approx.ftz.f32 t, t; add.rn.f32 t, t, 0f3F800000; "
-      "rcp.approx.ftz.f32 %0, t; }"
-      : "=f"(sigmoid)
-      : "f"(gate));
-  if (gate_cap > 0.0f) {
-    float t;
-    asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(__fdiv_rn(gate, gate_cap)));
-    gate = __fmul_rn(gate_cap, t);
-  }
-  if (up_cap > 0.0f) {
-    float t;
-    asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(__fdiv_rn(up, up_cap)));
-    up = __fmul_rn(up_cap, t);
-  }
-  return __fmul_rn(__fmul_rn(__fmul_rn(gate, sigmoid), up), gamma);
-}
-
 }  // namespace
 
 template <int32_t K>
@@ -190,7 +124,7 @@ __global__ void __launch_bounds__((K / 16) * 4) nvfp4_quant_dedup_lowm_kernel(
   __shared__ int64_t s_scale_row_off[2][kTopK];
 
   device::PDLWaitPrimary<true>();
-  load_offsets(offsets, s_offsets);
+  load_offsets(offsets, kNumExperts, s_offsets);
   int32_t const max_rows = T * kTopK;
   int32_t const total_routed = (s_offsets[kNumExperts] < max_rows) ? s_offsets[kNumExperts] : max_rows;
 
@@ -232,7 +166,7 @@ __global__ void __launch_bounds__((K / 16) * 4) nvfp4_quant_dedup_lowm_kernel(
     for (int32_t i = 0; i < 4; ++i)
       v[i] = __bfloat162float(h[i]);
 
-    float const block_max = part_max4(v);
+    float const block_max = part_max<4>(v);
     float const amax = block_max_reduce_with_enc<kThreads>(block_max, red[parity], s_enc[parity]);
     uint32_t packed;
     uint8_t scale;
@@ -292,7 +226,7 @@ __global__ void __launch_bounds__((N / 16) * 4) nvfp4_swiglu_quant_bf16_lowm_ker
   __shared__ int64_t s_scale_row_off[2];
 
   device::PDLWaitPrimary<true>();
-  load_offsets(offsets, s_offsets);
+  load_offsets(offsets, kNumExperts, s_offsets);
 
   int32_t const block = static_cast<int32_t>(threadIdx.x >> 2);
   int32_t const part = static_cast<int32_t>(threadIdx.x & 3);
@@ -305,7 +239,7 @@ __global__ void __launch_bounds__((N / 16) * 4) nvfp4_swiglu_quant_bf16_lowm_ker
   for (int32_t row = static_cast<int32_t>(blockIdx.x); row < total_rows;
        row += static_cast<int32_t>(gridDim.x), parity ^= 1) {
     if (threadIdx.x == 0) {
-      int32_t const expert = row_expert(s_offsets, row);
+      int32_t const expert = row_expert(s_offsets, kNumExperts, row);
       int32_t const local_r = row - s_offsets[expert];
       s_scale_row_off[parity] = scale_base(s_offsets, expert, kScaleK) +
                                 static_cast<int64_t>(local_r >> 7) * (kScaleK / 4) * 512 + (local_r & 31) * 16 +
@@ -324,7 +258,7 @@ __global__ void __launch_bounds__((N / 16) * 4) nvfp4_swiglu_quant_bf16_lowm_ker
       v[i] = __bfloat162float(__float2bfloat16_rn(capped_swiglu(gate, up, gamma, gate_cap, up_cap)));
     }
 
-    float const block_max = part_max4(v);
+    float const block_max = part_max<4>(v);
     float const amax = block_max_reduce_with_enc<kThreads>(block_max, red[parity], s_enc[parity]);
     uint32_t packed;
     uint8_t scale_bits;
