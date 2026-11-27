@@ -8,9 +8,11 @@ import numpy as np
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mori import conn as mori_conn
+from sglang.srt.disaggregation.mori.buffers import BufferKeys
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=5, suite="stage-a-test-1-gpu-small-amd")
+register_amd_ci(est_time=5, suite="base-a-test-1-gpu-small-amd")
 
 
 class _EngineDesc:
@@ -92,10 +94,10 @@ class TestMoriDCP(unittest.TestCase):
 
     def test_pp_local_descriptors_map_by_layer(self):
         manager = object.__new__(mori_conn.MoriKVManager)
-        manager.kv_mem_descs = ["src-17", "src-23"]
+        manager._local_keys = SimpleNamespace(kv=["src-17", "src-23"])
         manager.kv_args = SimpleNamespace(kv_layer_ids=[17, 23])
 
-        src, dst, count = manager._get_mla_mem_desc_slices(
+        src, dst, count = manager._get_mla_kv_key_slices(
             ["dst-11", "dst-17", "dst-23"], [11, 17, 23]
         )
 
@@ -114,7 +116,8 @@ class TestMoriDCP(unittest.TestCase):
             page_size=64, kv_item_lens=[4096], num_draft_entries=0, aux_data_ptrs=[]
         )
         manager.decode_kv_args_table = {}
-        manager.engine = Mock()
+        manager.transport = Mock()
+        manager._peers = {}
         info = mori_conn.KVArgsRegisterInfo(
             endpoint="127.0.0.1",
             dst_port=1,
@@ -140,6 +143,38 @@ class TestMoriDCP(unittest.TestCase):
         self.assertEqual(info.dcp_token_item_lens, [64])
 
 
+class TestMoriLocalRegistration(CustomTestCase):
+    @staticmethod
+    def _register(*, kv_len=64, aux_len=8, state_len=32):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.kv_args = SimpleNamespace(
+            gpu_id=0,
+            kv_data_ptrs=[0x1000],
+            kv_data_lens=[kv_len],
+            aux_data_ptrs=[0x2000],
+            aux_data_lens=[aux_len],
+            state_data_ptrs=[[0x3000]],
+            state_data_lens=[[state_len]],
+        )
+        manager._local_keys = BufferKeys.for_buffers([0x1000], [0x2000], [[0x3000]])
+        manager.transport = Mock()
+        manager._register_local_buffers()
+        return manager.transport.register
+
+    def test_only_a_state_buffer_may_be_zero_length(self):
+        """Peers accept a None slot only in the state list of the registration
+        message, so a zero-length KV or aux buffer must fail at startup instead
+        of reaching a peer as None."""
+        for field in ("kv_len", "aux_len"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "zero-length"):
+                    self._register(**{field: 0})
+
+        register = self._register(state_len=0)
+        self.assertEqual(register.call_count, 3)
+        self.assertEqual(register.call_args.kwargs["length"], 0)
+
+
 class TestMoriDsaStateElision(unittest.TestCase):
     """_send_swa_dsa_state must read the dst length of the paired dst entry.
 
@@ -154,10 +189,11 @@ class TestMoriDsaStateElision(unittest.TestCase):
         manager.attn_tp_size = 1
         manager._build_contiguous_transfer_plan = Mock(return_value="plan")
         manager._submit_batch_transfer_plan = Mock(return_value=[])
+        manager._peers = {"peer": SimpleNamespace(remote="remote")}
         indices = np.array([1, 2], dtype=np.int32)
 
         manager._send_swa_dsa_state(
-            SimpleNamespace(decode_tp_size=1),
+            SimpleNamespace(decode_tp_size=1, engine_key="peer"),
             indices,
             indices,
             [f"s{layer}" for layer in src_layers],
@@ -177,12 +213,103 @@ class TestMoriDsaStateElision(unittest.TestCase):
         # Decode elided layer 2 only. Both prefill layers must still be sent;
         # reading dst_lens[i] instead of dst_lens[j] drops layer 3.
         calls = self._send([3, 4], [2, 3, 4], [132, 132], [0, 132, 132])
-        self.assertEqual(calls, [call("s3", "d3", "plan"), call("s4", "d4", "plan")])
+        self.assertEqual(
+            calls,
+            [
+                call(remote="remote", src="s3", dst="d3", plan="plan"),
+                call(remote="remote", src="s4", dst="d4", plan="plan"),
+            ],
+        )
 
     def test_elided_dst_entry_is_never_written(self):
         # Decode elided layer 4. Writing to it would use a None descriptor.
         calls = self._send([4, 5], [3, 4, 5], [132, 132], [132, 0, 132])
-        self.assertEqual(calls, [call("s5", "d5", "plan")])
+        self.assertEqual(
+            calls, [call(remote="remote", src="s5", dst="d5", plan="plan")]
+        )
+
+
+# GLM-5.2 under PP4: get_pp_indices splits its 78 layers 19/19/20/20;
+# the last stage also holds the MTP draft entry.
+_DECODE_DSA_ENTRIES = 79
+_PP4_STAGES = ((0, 19), (19, 19), (38, 20), (58, 21))
+
+
+class TestMoriPpDsaStatePairing(CustomTestCase):
+    def _manager(self, start_layer, *, hybrid=False):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.pp_size = 4
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = hybrid
+        manager.attn_tp_size = 1
+        manager.kv_args = SimpleNamespace(prefill_start_layer=start_layer)
+        manager._build_contiguous_transfer_plan = Mock(return_value="plan")
+        manager._submit_batch_transfer_plan = Mock(return_value=[])
+        manager._peers = {"peer": SimpleNamespace(remote="remote")}
+        return manager
+
+    def _send_unlabeled_state(
+        self, manager, *, state_type, num_src, num_dst=_DECODE_DSA_ENTRIES
+    ):
+        manager._send_swa_dsa_state(
+            peer_info=SimpleNamespace(decode_tp_size=4, engine_key="peer"),
+            src_state_indices=np.array([3, 4, 9], dtype=np.int32),
+            dst_state_indices=np.array([7, 8, 12], dtype=np.int32),
+            src_keys=[f"P{i}" for i in range(num_src)],
+            src_state_item_lens=[64] * num_src,
+            dst_keys=[f"D{j}" for j in range(num_dst)],
+            dst_state_item_lens=[64] * num_dst,
+            state_type=state_type,
+            src_layer_ids=[],
+            dst_layer_ids=[],
+        )
+
+    def test_each_stage_writes_decode_entries_at_its_layer_offset(self):
+        """DSA state has no layer ids, so a PP>1 prefill used to fail every state send;
+        each stage must write its entries from its first layer, draft included."""
+        for start_layer, num_src in _PP4_STAGES:
+            with self.subTest(start_layer=start_layer):
+                manager = self._manager(start_layer)
+
+                self._send_unlabeled_state(manager, state_type="dsa", num_src=num_src)
+
+                self.assertEqual(
+                    manager._submit_batch_transfer_plan.call_args_list,
+                    [
+                        call(
+                            remote="remote",
+                            src=f"P{i}",
+                            dst=f"D{start_layer + i}",
+                            plan="plan",
+                        )
+                        for i in range(num_src)
+                    ],
+                )
+
+    def test_unpairable_layouts_still_fail_before_any_write(self):
+        """Only plain DSA state pairs by stage offset; SWA, a hybrid linear+DSA pool,
+        and a stage overrunning the decode entries all raise before any write."""
+        for state_type, hybrid, start_layer, num_src, num_dst, error in (
+            ("swa", False, 40, 20, _DECODE_DSA_ENTRIES, "requires layer ids"),
+            ("dsa", False, 70, 19, _DECODE_DSA_ENTRIES, "do not match prefill pp"),
+            # Hybrid, half the layers full attention: decode lists 40 entries,
+            # the stage at layer 20 has 10.
+            ("dsa", True, 20, 10, 40, "requires layer ids"),
+        ):
+            with self.subTest(
+                state_type=state_type, hybrid=hybrid, start_layer=start_layer
+            ):
+                manager = self._manager(start_layer, hybrid=hybrid)
+
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self._send_unlabeled_state(
+                        manager,
+                        state_type=state_type,
+                        num_src=num_src,
+                        num_dst=num_dst,
+                    )
+
+                manager._submit_batch_transfer_plan.assert_not_called()
 
 
 if __name__ == "__main__":

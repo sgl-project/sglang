@@ -294,7 +294,7 @@ class MockMLAModelRunner(ModelRunner):
         self.max_running_requests = pool_batch_size
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
         )
@@ -314,6 +314,7 @@ class MockMLAModelRunner(ModelRunner):
             page_size=case.page_size,
             hands_out_virtual_ids=False,
             state_id_spaces=lambda: {},
+            request_id_spaces=lambda: {},
         )
         self.is_draft_worker = False
         self.init_runner_ids()

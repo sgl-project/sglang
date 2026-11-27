@@ -376,7 +376,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         window outruns the splice left by a device prefix of 6."""
         handle = CacheRequestHandle("r", 0)
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
-        pipeline._cache = mock.Mock()
+        pipeline._cache = mock.Mock(page_size=swa_page_size)
         pipeline._cache.components = {}
         pipeline._swa_component = SimpleNamespace(
             pool_name=PoolName.SWA,
@@ -1200,7 +1200,6 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host.staging_buffer = torch.empty(
             4, host.layer_num, 1, host.indexer_page_stride_size, dtype=torch.uint8
         )
-        host.can_use_jit = False
         host.can_use_write_back_jit = True
         src_registry = {_ptr_key_from_layers(device_layers): device_layers}
 

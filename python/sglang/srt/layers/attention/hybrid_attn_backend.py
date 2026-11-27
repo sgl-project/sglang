@@ -49,11 +49,13 @@ class HybridAttnBackend(AttentionBackend):
         self.needs_cpu_seq_lens = decode_backend.needs_cpu_seq_lens or (
             self.spec_attn_is_prefill and prefill_backend.needs_cpu_seq_lens
         )
-        self.max_context_len = model_runner.model_config.context_len
         # _select_backend routes EXTEND to prefill_backend unconditionally.
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             prefill_backend, "extend_dummy_seqs_capped_by_req_pool", False
         )
+
+    def window_capacity_children(self) -> list:
+        return [self.prefill_backend, self.decode_backend]
 
     @property
     def supports_ragged_verify_graph(self) -> bool:
@@ -232,11 +234,12 @@ class HybridAttnBackend(AttentionBackend):
         return backend.get_indexer_metadata(layer_id, forward_batch)
 
     def update_mamba_state_after_mtp_verify(self, *args, **kwargs):
-        if self.spec_attn_is_decode:
-            backend = self.decode_backend
-        else:
-            backend = self.prefill_backend
-        return backend.update_mamba_state_after_mtp_verify(*args, **kwargs)
+        return self.target_verify_backend().update_mamba_state_after_mtp_verify(
+            *args, **kwargs
+        )
+
+    def forward_state_slots(self, *args, **kwargs):
+        return self.target_verify_backend().forward_state_slots(*args, **kwargs)
 
     def forward(
         self,

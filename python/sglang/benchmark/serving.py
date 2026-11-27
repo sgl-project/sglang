@@ -39,7 +39,7 @@ import numpy as np
 import orjson
 import requests
 from tqdm.asyncio import tqdm
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
@@ -54,10 +54,11 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
+from sglang.srt.constants import ROUTING_KEY_HEADER
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.environ import envs
+from sglang.srt.utils.auth import admin_auth_headers
 from sglang.srt.utils.network import resolve_base_url, resolve_host_port
-
-_ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
 _EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
 
@@ -66,12 +67,6 @@ TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) a
 )
 
 global args
-
-
-# don't want to import sglang package here
-def _get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
 
 
 def _create_bench_client_session():
@@ -332,7 +327,7 @@ async def async_request_openai_completions(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -488,7 +483,7 @@ async def async_request_openai_chat_completions(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -725,7 +720,7 @@ async def async_request_sglang_generate(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -839,7 +834,7 @@ async def async_request_openai_embeddings(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -888,7 +883,7 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
 
                 output_dir = getattr(args, "profile_output_dir", None)
                 if output_dir is None:
-                    output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+                    output_dir = envs.SGLANG_TORCH_PROFILER_DIR.get()
                 output_dir = Path(os.path.abspath(os.path.normpath(output_dir))) / str(
                     time.time()
                 )
@@ -915,7 +910,10 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                 body["start_step"] = str(args.profile_start_step)
             if hasattr(args, "profile_steps") and args.profile_steps is not None:
                 body["num_steps"] = str(args.profile_steps)
-            async with session.post(url=api_url, json=body) as response:
+            headers = admin_auth_headers(getattr(args, "admin_api_key", None))
+            async with session.post(
+                url=api_url, json=body, headers=headers
+            ) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -1015,6 +1013,7 @@ def flush_server_cache(
     base_url: str,
     backend: str,
     flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
+    admin_api_key: Optional[str] = None,
 ) -> None:
     """Flush an engine's prefix cache after benchmark warmup."""
     if backend.startswith("vllm"):
@@ -1024,7 +1023,7 @@ def flush_server_cache(
     elif backend.startswith("sglang"):
         response = requests.post(
             base_url + "/flush_cache",
-            headers=get_auth_headers(),
+            headers=admin_auth_headers(admin_api_key) or get_auth_headers(),
             params={"timeout": flush_cache_timeout},
         )
     else:
@@ -1096,6 +1095,10 @@ async def get_request(
     slowdown_factor: float = 1.0,
 ) -> AsyncGenerator[DatasetRow, None]:
     if use_trace_timestamps:
+        if any(request.timestamp is None for request in input_requests):
+            raise ValueError(
+                "--use-trace-timestamps requires every request to have a timestamp"
+            )
         print(
             f"Using trace timestamps for request generation with slowdown factor {slowdown_factor}."
         )
@@ -1517,10 +1520,15 @@ async def benchmark(
     # request-local prefix reuse. vLLM exposes a different, development-mode
     # endpoint for the same purpose.
     should_flush_cache = (
-        "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
+        "sglang" in backend and envs.SGLANG_IS_IN_CI.get()
     ) or flush_cache
     if should_flush_cache:
-        flush_server_cache(base_url, backend, flush_cache_timeout)
+        flush_server_cache(
+            base_url,
+            backend,
+            flush_cache_timeout,
+            getattr(args, "admin_api_key", None),
+        )
 
     await asyncio.sleep(1.0)
 
@@ -1563,7 +1571,12 @@ async def benchmark(
         )
         pbar_total *= args.mooncake_num_rounds
     else:
-        request_generator = get_request(input_requests, request_rate)
+        request_generator = get_request(
+            input_requests,
+            request_rate,
+            use_trace_timestamps=use_trace_timestamps,
+            slowdown_factor=mooncake_slowdown_factor,
+        )
 
     # Prepare LoRA request distribution parameters
     if lora_request_distribution == "distinct":
@@ -1968,13 +1981,10 @@ async def benchmark(
     return result | result_details
 
 
-def check_chat_template(model_path):
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        return "chat_template" in tokenizer.init_kwargs
-    except Exception as e:
-        print(f"Fail to load tokenizer config with error={e}")
-        return False
+def has_chat_template(tokenizer) -> bool:
+    return bool(getattr(tokenizer, "chat_template", None)) or (
+        "chat_template" in getattr(tokenizer, "init_kwargs", {})
+    )
 
 
 def set_global_args(args_: argparse.Namespace):
@@ -2027,9 +2037,6 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
-    if not hasattr(args, "mooncake_slowdown_factor"):
-        args.mooncake_slowdown_factor = 1.0
-
     if not hasattr(args, "mooncake_slowdown_factor"):
         args.mooncake_slowdown_factor = 1.0
 
@@ -2136,12 +2143,6 @@ def run_benchmark(args_: argparse.Namespace):
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 
-    if args.backend not in _EMBEDDING_BACKENDS and not check_chat_template(args.model):
-        print(
-            "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
-            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
-        )
-
     if (
         args.backend in _EMBEDDING_BACKENDS
         and args.dataset_name in _EMBEDDING_UNSUPPORTED_DATASETS
@@ -2184,6 +2185,11 @@ def run_benchmark(args_: argparse.Namespace):
         tokenizer_id = args.model
 
     tokenizer = get_tokenizer(tokenizer_id)
+    if args.backend not in _EMBEDDING_BACKENDS and not has_chat_template(tokenizer):
+        print(
+            "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
+            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
+        )
     input_requests = get_dataset(args, tokenizer, model_id)
 
     # compatible with SimpleNamespace
@@ -2243,6 +2249,15 @@ def _finite_positive_float(value) -> float:
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a finite float > 0, got {value!r}")
     return parsed
+
+
+def _parse_request_rate(value: str) -> float:
+    rate = float(value)
+    if not rate > 0:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive rate or 'inf', got {value!r}"
+        )
+    return rate
 
 
 def _goodput_slo(pair: str) -> Tuple[str, float]:
@@ -2464,7 +2479,7 @@ def cli_main():
     )
     parser.add_argument(
         "--request-rate",
-        type=float,
+        type=_parse_request_rate,
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
@@ -2586,6 +2601,13 @@ def cli_main():
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which --profile requires and "
+        "--flush-cache uses when the server has one (default: SGLANG_ADMIN_API_KEY).",
     )
     parser.add_argument(
         "--plot-throughput",
@@ -2762,7 +2784,7 @@ def cli_main():
     group.add_argument(
         "--gsp-send-routing-key",
         action="store_true",
-        help="Send routing key in requests via X-SMG-Routing-Key header. Requests with the same prefix share the same routing key.",
+        help="Send routing key in requests via X-SGL-Routing-Key header. Requests with the same prefix share the same routing key.",
     )
     group.add_argument(
         "--gsp-num-turns",

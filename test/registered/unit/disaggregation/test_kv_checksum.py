@@ -11,7 +11,9 @@ import torch
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
+    _state_indices,
     is_health_check_req,
+    page_indices_for_request,
 )
 from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
@@ -21,6 +23,10 @@ from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixi
 from sglang.srt.disaggregation.utils import MetadataBuffers, kv_layout_signature
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -120,6 +126,11 @@ class TestKvLayoutSignature(unittest.TestCase):
         self.assertNotEqual(same, make(kv_cache_dtype_str="fp16"))
         self.assertNotEqual(same, make(kv_layout="bucketed"))
         self.assertNotEqual(same, make(state_types=[StateType.DSA]))
+        # A prefill keeping a longer window tail than its decode, a pairing
+        # the PD bootstrap accepts, digests more pages of that window.
+        tails = make(state_window_tails=[128])
+        self.assertEqual(tails, make(state_window_tails=[128]))
+        self.assertNotEqual(tails, make(state_window_tails=[192]))
 
 
 class TestKvChecksumComputerConfig(unittest.TestCase):
@@ -134,6 +145,73 @@ class TestKvChecksumComputerConfig(unittest.TestCase):
 
         self.assertEqual(computer._state_data_ptrs, [55, 66, 77])
         self.assertEqual(computer._state_item_lens, [88, 99, 111])
+
+    def test_leaves_out_the_dflash_draft_kv_ring(self):
+        kv_args = SimpleNamespace(
+            kv_data_ptrs=[11],
+            kv_item_lens=[33],
+            state_types=[StateType.MAMBA, StateType.DRAFT_RING, StateType.REQUEST_ROW],
+            state_data_ptrs=[[55, 66], [77, 78], [79]],
+            state_item_lens=[[88, 99], [111, 112], [4]],
+        )
+        computer = KvChecksumComputer.for_kv_args(kv_args, torch.device("cpu"))
+        self.assertEqual(computer._state_data_ptrs, [55, 66])
+        self.assertEqual(computer._state_item_lens, [88, 99])
+        self.assertEqual(computer._state_entry_sizes, [2])
+
+        kv_args.state_types = [StateType.MAMBA, StateType.REQUEST_ROW]
+        kv_args.state_data_ptrs = [[55, 66], [79]]
+        kv_args.state_item_lens = [[88, 99], [4]]
+        computer = KvChecksumComputer.for_kv_args(kv_args, torch.device("cpu"))
+        self.assertEqual(computer._state_data_ptrs, [55, 66, 79])
+
+
+class TestKvChecksumStateIndices(unittest.TestCase):
+    def test_checksum_translates_only_the_transferred_kv_suffix(self):
+        for pages in ([0, 7, 3, 2], [0, 2, 9, 4]):
+            with self.subTest(pages=pages):
+
+                def translate(ids):
+                    return torch.tensor(pages)[ids // 4] * 4 + ids % 4
+
+                scheduler = SimpleNamespace(
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        page_size=4,
+                        translate_kv_indices_for_transfer=translate,
+                    ),
+                    req_to_token_pool=SimpleNamespace(
+                        req_to_token=torch.arange(16).reshape(1, -1)
+                    ),
+                )
+                req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0))
+                result = page_indices_for_request(
+                    scheduler, req, end_idx=11, start_idx=4
+                )
+                self.assertEqual(result.tolist(), pages[1:3])
+
+    def test_mamba_checksum_uses_physical_state_slots(self):
+        # Unified memory moves state independently of its stable request ID.
+        # The checksum must read the same physical slot as the PD payload.
+        for slots in ([0, 7, 3], [0, 2, 9]):
+            with self.subTest(slots=slots):
+                ids = SimpleNamespace(ids=lambda idx: torch.tensor(slots)[idx])
+                allocator = SimpleNamespace(
+                    get_kvcache=lambda: SimpleNamespace(
+                        layer_router=SimpleNamespace(wrapped_view=lambda: object())
+                    ),
+                    state_ids=Mock(return_value=ids),
+                )
+                scheduler = SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator,
+                    req_to_token_pool=SimpleNamespace(
+                        state_sub_pool="mamba",
+                        req_index_to_mamba_index_mapping=torch.tensor([0, 1, 2]),
+                    ),
+                )
+                req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=1))
+                result = _state_indices(scheduler, req, seq_len=32, start_idx=0)
+                self.assertEqual(result.tolist(), [slots[1]])
+                allocator.state_ids.assert_called_once_with("mamba")
 
 
 class TestKvChecksumHealthCheck(unittest.TestCase):
@@ -253,8 +331,13 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.kv_checksum_computer = computer
         self.enable_overlap = False
         self.waiting_queue = []
+        self.running_reqs = KeyedReqList(ListKind.DECODING)
+        # A static pool: no unified storage.
         self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=1, get_kvcache=_plain_kv_pool
+            page_size=1,
+            get_kvcache=_plain_kv_pool,
+            storage=None,
+            translate_kv_indices_for_transfer=lambda ids: ids,
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
@@ -584,7 +667,7 @@ class TestKvChecksumMismatchHiSparse(unittest.TestCase):
         sched = _FakeScheduler(None, None)
         calls = []
         hisparse_coordinator = Mock()
-        hisparse_coordinator.request_finished.side_effect = lambda req: calls.append(
+        hisparse_coordinator.release_request.side_effect = lambda req: calls.append(
             ("hisparse", req)
         )
         sched.request_retirer = release_only_retirer(Mock(), hisparse_coordinator)

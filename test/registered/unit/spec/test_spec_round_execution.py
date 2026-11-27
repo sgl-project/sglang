@@ -315,12 +315,13 @@ def test_target_uses_actual_dispatch_not_prepare_eligibility(actual_graph):
         has_grammar=False,
     )
     target = NS(
+        model_runner=NS(attn_backend=NS(verify_mask=None), watermark=None),
         forward_batch_generation=MagicMock(
             return_value=NS(logits_output=None, can_run_cuda_graph=actual_graph)
         )
     )
     # Stop after the real target forward observation, before GPU sampling.
-    allocator = NS(get_kvcache=MagicMock(side_effect=StopIteration))
+    allocator = NS()
     # The newer provider binding adds a required runtime-hooks argument. This
     # test stops before sampling and only observes the target forward boundary.
     runtime_kwargs = (
@@ -338,6 +339,10 @@ def test_target_uses_actual_dispatch_not_prepare_eligibility(actual_graph):
         patch(
             "sglang.srt.speculative.eagle_worker_common.eagle_prepare_for_verify",
             return_value=(NS(), True),
+        ),
+        patch(
+            "sglang.srt.speculative.eagle_worker_common.TargetVerify.prepare",
+            side_effect=StopIteration,
         ),
         pytest.raises(StopIteration),
     ):

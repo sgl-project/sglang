@@ -55,6 +55,21 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 logger = init_logger(__name__)
 
 
+def decode_parallelism_type(vae) -> StageParallelismType:
+    """Every rank decodes unless CFG parallel duplicates the latents on ranks
+    whose output is dropped: then only the main CFG rank does, or all of them
+    when the VAE shards the decode over the ranks."""
+    if not get_global_server_args().enable_cfg_parallel:
+        return StageParallelismType.REPLICATED
+    if (
+        model_parallel_is_initialized()
+        and get_decode_parallel_world_size() > 1
+        and vae.use_parallel_decode
+    ):
+        return StageParallelismType.REPLICATED
+    return StageParallelismType.MAIN_RANK_ONLY
+
+
 def scale_and_shift_latents(latents: torch.Tensor, server_args, vae) -> torch.Tensor:
     """De-normalize latents before VAE decode (single shared implementation).
 
@@ -145,19 +160,7 @@ class DecodingStage(PipelineStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        server_args = get_global_server_args()
-        if server_args.enable_cfg_parallel:
-            if self._can_use_parallel_decode():
-                return StageParallelismType.REPLICATED
-            return StageParallelismType.MAIN_RANK_ONLY
-        return StageParallelismType.REPLICATED
-
-    def _can_use_parallel_decode(self) -> bool:
-        return (
-            model_parallel_is_initialized()
-            and get_decode_parallel_world_size() > 1
-            and self.vae.use_parallel_decode
-        )
+        return decode_parallelism_type(self.vae)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify decoding stage inputs."""
@@ -425,15 +428,18 @@ class DecodingStage(PipelineStage):
                 vae,
                 quality_allows(batch.sampling_params.quality, "lossless"),
             ):
+                decode_latents = server_args.pipeline_config.prepare_decoding_latents(
+                    batch, server_args=server_args, vae=vae
+                )
                 try:
                     if stream is None:
                         # Model-specific decode overrides need not support streaming.
                         frames = self.decode(
-                            batch.latents, server_args, vae_dtype=vae_dtype
+                            decode_latents, server_args, vae_dtype=vae_dtype
                         )
                     else:
                         frames = self.decode(
-                            batch.latents,
+                            decode_latents,
                             server_args,
                             vae_dtype=vae_dtype,
                             on_frames=stream,
@@ -473,6 +479,9 @@ class DecodingStage(PipelineStage):
 
         if output_file_paths is None:
             frames = server_args.pipeline_config.post_decoding(frames, server_args)
+            frames = server_args.pipeline_config.postprocess_decoded_batch(
+                frames, batch, server_args
+            )
         else:
             frames = None
 
@@ -480,6 +489,8 @@ class DecodingStage(PipelineStage):
         output_batch = OutputBatch(
             output=frames,
             output_file_paths=output_file_paths,
+            audio=batch.audio,
+            audio_sample_rate=batch.audio_sample_rate,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             rollout_trajectory_data=batch.rollout_trajectory_data,

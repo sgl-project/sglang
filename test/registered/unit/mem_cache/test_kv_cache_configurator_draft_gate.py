@@ -129,6 +129,7 @@ def _swa_cache_params(*, sliding_window_size, draft_swa_window):
     allocator = SimpleNamespace(
         storage=None,
         window_pool_names=lambda: ("swa",),
+        target_window_pool=lambda: "swa",
         get_kvcache=lambda: SimpleNamespace(request_window=None),
     )
     kv_storage_of(None, allocator).bind_window_retention(
@@ -194,7 +195,12 @@ class TestDraftBindingDispatch(CustomTestCase):
         )
         total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
         placement = (
-            FusedDraftPlacement.from_counts(counts={host: [1]}, regions={host: region})
+            FusedDraftPlacement.from_counts(
+                counts={host: [1]},
+                regions={host: region},
+                # These pools name their window sub-pool `swa`.
+                hosted={"swa": "window"} if host == "swa" else None,
+            )
             if region is not None
             else None
         )
@@ -221,7 +227,7 @@ class TestDraftBindingDispatch(CustomTestCase):
             forward_stream=None,
         )
         # The target's KV storage, as far as draft binding reads it.
-        alloc.storage = SimpleNamespace(plan=plan_stand_in(pool, placement))
+        alloc.plan = plan_stand_in(pool, placement)
         return alloc
 
     def _run(
@@ -238,7 +244,7 @@ class TestDraftBindingDispatch(CustomTestCase):
             req_to_token_pool = RequestTable(
                 size=8,
                 pre_alloc_size=0,
-                max_context_len=64,
+                row_width=64,
                 state_sub_pool=None,
                 tracking=None,
                 device="cpu",
@@ -490,7 +496,7 @@ class TestSWARetainWindow(CustomTestCase):
 
     def _fixture(self, cache_cls, *, draft_swa_window, num_tokens=40, disable=False):
         req_to_token_pool = ReqToTokenPool(
-            size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+            size=4, row_width=64, device="cpu", enable_memory_saver=False
         )
         kv_pool = SWAKVPool(
             size=64,

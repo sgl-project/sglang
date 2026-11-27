@@ -93,7 +93,7 @@ class TestOnlineMXFP4Loading(unittest.TestCase):
         layer.num_fused_shared_experts = 0
         layer.moe_ep_size = layer.moe_tp_size = 2
         layer.moe_tp_rank = 1
-        layer.use_triton_kernels = layer.use_flashinfer_trtllm_moe = False
+        layer.use_flashinfer_trtllm_moe = False
         layer.use_padded_loading = layer.use_presharded_weights = False
         layer.moe_runner_config = SimpleNamespace(is_gated=True)
         method = NPUW4A8MXFP4OnlineMoEMethod(layer.quant_config)
