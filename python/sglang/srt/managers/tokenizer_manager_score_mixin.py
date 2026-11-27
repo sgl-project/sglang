@@ -1055,6 +1055,10 @@ class TokenizerManagerScoreMixin:
                 input_ids = [combined_input_ids]
             else:
                 # Single-item scoring: create separate prompts for each item
+                if not all(isinstance(item, str) for item in items_list):
+                    raise ValueError(
+                        "Invalid combination of query/items types for score_request."
+                    )
                 if item_first:
                     text_prompts = [f"{item}{query}" for item in items_list]
                 else:
