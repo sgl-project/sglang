@@ -72,8 +72,8 @@ def _host_group(parent):
 class HostKVPool:
     """Own the MF allocations; non-owner ranks only wrap broadcast GVAs.
 
-    CKV and KPE are separate allocations. Every exported base is 2 MiB aligned
-    so PD registration cannot include pages belonging to another allocation.
+    Each payload component has its own allocation. Every exported base is
+    2 MiB aligned so PD registration cannot include another allocation's pages.
     """
 
     alignment = 2 * 1024 * 1024

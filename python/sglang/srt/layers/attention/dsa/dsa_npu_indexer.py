@@ -661,8 +661,6 @@ class DSANPUIndexerMixin:
                         "query_scale": query_scale,
                         "key_scale": pool.get_index_k_scale_buffer(layer_id),
                     }
-                else:
-                    query = q.view(-1, self.n_heads, self.head_dim)
                 plan = manager.lim_adapter.select(
                     query=query,
                     weights=weights,
