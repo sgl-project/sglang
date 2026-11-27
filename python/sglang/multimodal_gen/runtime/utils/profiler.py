@@ -107,7 +107,7 @@ class SGLDiffusionProfiler:
             self.profile_mode_id = "full stages"
         else:
             # profile denoising stage only
-            warmup = 1
+            warmup = 0 if num_steps == -1 else 1
             num_actual_steps = num_inference_steps if num_steps == -1 else num_steps
             self.num_active_steps = num_actual_steps + warmup
             self.profiler = torch.profiler.profile(
@@ -116,7 +116,7 @@ class SGLDiffusionProfiler:
                     skip_first=0,
                     wait=0,
                     warmup=warmup,
-                    active=self.num_active_steps,
+                    active=num_actual_steps,
                     repeat=1,
                 ),
             )

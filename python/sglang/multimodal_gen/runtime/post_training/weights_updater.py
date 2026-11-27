@@ -591,6 +591,8 @@ class WeightsUpdater:
             try:
                 payload = module_payloads[module_name]
                 weights_iter = self._materialize_weights_iter(payload, load_format)
+                if isinstance(module, BaseDiT):
+                    weights_iter = module.load_non_parameter_weights(list(weights_iter))
                 _load_weights_into_module(module, weights_iter)
                 updated_modules.append(module_name)
             except Exception as e:

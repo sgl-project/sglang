@@ -41,6 +41,7 @@
 //                      builder while reusing this engine's overlay composition and
 //                      command rendering. Shape:
 //                      {defaultSelection, resource: {limits, verifiedRecipes,
+//                      recommendedRecipe?(sel),
 //                      autoTopology(sel), validateTopology(sel)},
 //                      resolveDeployment(sel)}. Recipes may use verifiedWhen(sel)
 //                      to qualify the recommendation badge by checkpoint or mode.
@@ -72,7 +73,7 @@
 //                      dockerMounts carry role-specific rendering metadata.
 //   modelNames         HF slug lookup, `hw|variant|quant`, `variant|quant`,
 //                      `hw|quant`, `quant`, `hw`, then `default`
-//   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
+//   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?, showWhen?(sel)}
 //   curl               cURL template (uses {{MODEL_NAME}} + placeholders), or
 //                      `(selection, cell) => template` when the request payload
 //                      depends on a custom match/overlay dimension
@@ -1654,7 +1655,12 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     return out;
   };
 
-  const recommendedBuilderRecipe = (hw) => {
+  const recommendedBuilderRecipe = (hw, selection) => {
+    // Model-specific recommendations can preserve the selected capacity and
+    // workload. Hardware switches still use the platform default below.
+    if (selection && typeof commandBuilder.resource?.recommendedRecipe === "function") {
+      return commandBuilder.resource.recommendedRecipe(selection);
+    }
     const recipes = commandBuilder.resource?.verifiedRecipes || [];
     return recipes.find((entry) => entry.hw === hw && entry.default)
       || recipes.find((entry) => entry.hw === hw);
@@ -1667,11 +1673,21 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         if (dim === "hw") {
           const currentRecipe = recommendedBuilderRecipe(prev.hw);
           const nextRecipe = recommendedBuilderRecipe(value);
-          const resourcesFollowPlatformDefault = !!currentRecipe
+          const gpuBounds = commandBuilder.resource?.limits?.gpus_per_node;
+          const fixedGpuCount = typeof gpuBounds?.disabledWhen === "function"
+            && gpuBounds.disabledWhen(next);
+          const previousFixedGpuCount = typeof gpuBounds?.disabledWhen === "function"
+            && gpuBounds.disabledWhen(prev);
+          const resourcesFollowPlatformDefault = fixedGpuCount || previousFixedGpuCount || (!!currentRecipe
             && Number(prev.nodes) === Number(currentRecipe.nodes)
-            && Number(prev.gpus_per_node) === Number(currentRecipe.gpus_per_node);
+            && Number(prev.gpus_per_node) === Number(currentRecipe.gpus_per_node));
           next = {
             ...next,
+            ...Object.fromEntries(resourcesFollowPlatformDefault && nextRecipe
+              ? overlayDimSpecs
+                .filter((spec) => spec.scope === "serve" && nextRecipe[spec.id] !== undefined)
+                .map((spec) => [spec.id, nextRecipe[spec.id]])
+              : []),
             nodes: resourcesFollowPlatformDefault
               ? (nextRecipe?.nodes ?? next.nodes)
               : next.nodes,
@@ -1824,6 +1840,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   const placeholderGroups = (() => {
     const out = { command: [], curl: [] };
     for (const [key, meta] of Object.entries(config.placeholders || {})) {
+      if (typeof meta.showWhen === "function" && !meta.showWhen(sel)) continue;
       (out[meta.target] || (out[meta.target] = [])).push({ key, ...meta });
     }
     return out;
@@ -1930,9 +1947,13 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       || selectedOption(dim)?.label
       || sel[dim.id]
       || "—";
-    const recommendedRecipe = recommendedBuilderRecipe(sel.hw);
+    const hardwareLabel = hwGroups.flatMap((group) => group.items)
+      .find((hardware) => hardware.id === sel.hw)?.label || sel.hw.toUpperCase();
+    const recommendedRecipe = recommendedBuilderRecipe(sel.hw, sel);
     const recommendedIsVerified = !!recommendedRecipe && !recommendedRecipe.unverified
       && (typeof recommendedRecipe.verifiedWhen !== "function" || recommendedRecipe.verifiedWhen(sel));
+    const recommendedLabel = recommendedIsVerified ? "Verified"
+      : recommendedRecipe?.unverified ? "Derived" : "Recommended";
     const recommendedInUse = !!recommendedRecipe
       && Number(sel.nodes) === recommendedRecipe.nodes
       && Number(sel.gpus_per_node) === recommendedRecipe.gpus_per_node
@@ -1941,7 +1962,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         const expected = recommendedRecipe[dim.id] ?? dim.default;
         if (dim.id === "attention") return sel.attention === "platform";
         return expected === undefined || sel[dim.id] === expected
-          || (["placement", "encoder"].includes(dim.id) && sel[dim.id] === "auto");
+          || (dim.id === "placement" && sel[dim.id] === "auto");
       });
 
     const restoreRecommendedRecipe = () => {
@@ -2055,17 +2076,18 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         {recommendedRecipe && (
           <section className="sgd-builder-recipe">
             <div>
-              {/* This is the verified operating point, not sizing advice — a
-                  hardware whose validation ran on 8 GPUs is not "recommending"
-                  8 over a smaller deployment. */}
-              <span>{recommendedIsVerified ? "Verified recipe" : "Derived recipe"} · {sel.hw.toUpperCase()}</span>
+              {/* Derived marks an estimated hardware recipe; an untested
+                  request does not turn a measured server into an estimate. */}
+              <span>{recommendedLabel} recipe · {hardwareLabel}</span>
               <strong>
                 {[
-                  `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPUs`,
+                  `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPU${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node === 1 ? "" : "s"}`,
                   recommendedRecipe.tp_size > 1 && `TP ${recommendedRecipe.tp_size}`,
                   `Ulysses ${recommendedRecipe.ulysses_degree}`,
                   recommendedRecipe.ring_degree > 1 && `Ring ${recommendedRecipe.ring_degree}`,
-                  { resident: "Resident", fsdp: "FSDP", offload: "Layerwise offload" }[recommendedRecipe.placement],
+                  overlayDimSpecs.find((dim) => dim.id === "placement")?.options
+                    ?.find((option) => option.id === recommendedRecipe.placement)?.label
+                    || { resident: "Resident", fsdp: "FSDP", offload: "Offload" }[recommendedRecipe.placement],
                 ].filter(Boolean).join(" · ")}
               </strong>
             </div>
@@ -2073,7 +2095,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               {renderStatus(recommendedIsVerified ? "verified" : "unverified")}
               {recommendedInUse
                 ? <small>In use</small>
-                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedIsVerified ? "Use verified recipe" : "Use derived recipe"}</button>}
+                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>Use {recommendedLabel.toLowerCase()} recipe</button>}
             </div>
           </section>
         )}
@@ -2114,7 +2136,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
           </div>
           {Number(sel.nodes) > 1 && (
             <p className="sgd-builder-resource-summary">
-              {sel.nodes} nodes × {sel.gpus_per_node} {sel.hw.toUpperCase()} = {totalGpus} GPUs
+              {sel.nodes} nodes × {sel.gpus_per_node} {hardwareLabel} = {totalGpus} GPUs
             </p>
           )}
           <button
@@ -2205,7 +2227,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
                   [dim.id]: Math.min(dim.max, Number(prev[dim.id]) + 1),
                 }))}
               >+</button>
-              <span>{dim.unit || "outputs"}</span>
+              <span>{dim.unit ?? "outputs"}</span>
             </div>
           ) : (
             <div className="sgd-builder-context-options">
@@ -2314,7 +2336,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               <strong>{serve ? "Serve" : "Request"}</strong>
               <span>
                 {serve
-                  ? `${sel.hw.toUpperCase()} · ${activeRunMode === "docker" ? "Docker" : "Python"}`
+                  ? `${hardwareLabel} · ${activeRunMode === "docker" ? "Docker" : "Python"}`
                   : "cURL"}
               </span>
             </div>

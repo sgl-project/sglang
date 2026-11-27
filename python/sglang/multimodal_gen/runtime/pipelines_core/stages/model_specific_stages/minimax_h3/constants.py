@@ -15,7 +15,8 @@ MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY = "minimax_h3_text_embeddings"
 #   "canvas_width": int, "keyframes": [...],
 #   "semantic_frame_indices": [...], "pixel_frame_indices": [...]}
 MINIMAX_H3_KEYFRAME_COND_ROWS_EXTRA_KEY = "minimax_h3_keyframe_cond_rows"
-# Direct sigma schedules: {"video": [float], "audio": [float]}
+# Direct sigma schedules: {"video": [float], "audio": [float]}; image warmup
+# also carries "full" for AdaLN preparation without extra denoising steps.
 MINIMAX_H3_SIGMAS_EXTRA_KEY = "minimax_h3_sigmas"
 # Direct denoise state: {"initial_video_rows", "initial_audio_rows",
 #   "latent_t", "latent_h", "latent_w", "audio_t"}

@@ -26,6 +26,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     LINGBOT_VIDEO_T2V_CI_sampling_params,
     LONGLIVE2_I2V_CI_sampling_params,
     LONGLIVE2_T2V_CI_sampling_params,
+    MINIMAX_H3_IMAGE_EDIT_sampling_params,
+    MINIMAX_H3_IMAGE_T2I_sampling_params,
     MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
@@ -789,6 +791,33 @@ else:
             run_perf_check=True,
         ),
     ]
+
+# MiniMax-H3-Image weights are not public yet, so PR CI cannot download them.
+# Add these cases back to ONE_GPU_B200_CASES together with their B200
+# consistency GT and perf baselines once the checkpoint is published.
+MINIMAX_H3_IMAGE_B200_CASES = [
+    DiffusionTestCase(
+        f"minimax_h3_image_{task}",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3-Image",
+            modality="image",
+            extras=["--component-residency", "all=resident"],
+        ),
+        sampling,
+        perf_warmup_requests=1,
+        perf_repeat_requests=2,
+        # Consistency remains required; pre-release goldens stay private until
+        # the checkpoint and its authorized golden artifacts are published.
+        run_consistency_check=True,
+        # The release provides a native SGLang reference, not a Diffusers pipeline.
+        run_component_accuracy_check=False,
+        run_t2v_input_reference_check=False,
+    )
+    for task, sampling in (
+        ("t2i", MINIMAX_H3_IMAGE_T2I_sampling_params),
+        ("edit", MINIMAX_H3_IMAGE_EDIT_sampling_params),
+    )
+]
 
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 

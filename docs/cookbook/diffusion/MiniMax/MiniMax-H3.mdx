@@ -69,6 +69,11 @@ The same FL2VA / Ref2VA split applies in
 Review the license and usage terms in the MiniMax-H3 model card before production or commercial use. SGLang support does not grant additional model usage rights.
 </Warning>
 
+### Image checkpoints
+
+For the separate six-step text-to-image and editing checkpoint, see
+[MiniMax-H3-Image](/cookbook/diffusion/MiniMax/MiniMax-H3-Image).
+
 ## 3. Deployment details
 
 The builder accepts legal custom GPU counts and topologies, marking them
@@ -867,6 +872,25 @@ sglang serve \
 Keep `pdd_config.json` beside `pdd_fused_heads.safetensors`, outside the
 `transformer/` directory. For Ref2VA, use its adapter and base transformer,
 a separate output directory, and `--model-variant ref2va`.
+
+The fused heads are served from that file, not from `transformer/` parameters.
+A full-weight update sent as tensors or over a distributed group, without
+`weight_update_mode`, replaces a head stack when it carries it as
+`final_layer.pdd_fused_heads.<key>`, with the key and the full tensor of
+`pdd_fused_heads.safetensors` (for example
+`final_layer.pdd_fused_heads.video_out.weight`, `[steps, out_features,
+in_features]`). The stacks of one update are checked together: a stack with
+another step count fails the update before any of them is replaced.
+
+No other update reaches the head stacks, which stay the startup file's or the
+last such update's:
+
+- A `lora_merge` update loads adapters only.
+- A server with an AdaLN cache rejects every full-weight tensor or distributed
+  update. To update the heads, serve with `--minimax-h3-adaln-online false`
+  and without `--minimax-h3-adaln-cache-path`.
+- A disk weight update reads module directories such as `transformer/`, never
+  the fused heads file.
 
 Use the requests in [Generate video and audio](#4-generate-video-and-audio)
 with `num_inference_steps: 8`, `flow_shift: 12.0`, and `audio_flow_shift: 3.0`.
