@@ -556,6 +556,9 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             modality="video",
             num_gpus=1,
             text_encoder_cpu_offload=True,
+            extras=[
+                f"--warmup-resolutions {LINGBOT_VIDEO_TI2V_CI_sampling_params.output_size}"
+            ],
         ),
         LINGBOT_VIDEO_TI2V_CI_sampling_params,
         min_input_first_frame_psnr=18.0,
