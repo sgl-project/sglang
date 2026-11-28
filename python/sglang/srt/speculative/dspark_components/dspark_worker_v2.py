@@ -1490,7 +1490,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             else None
         )
         if in_graph is not None:
-            return in_graph
+            # A view of block_accept_lens_buf would be overwritten by the next
+            # graph replay before the delayed D2H copy reads it; hand out a copy.
+            # Do not clone inside read_block_accept_lens: it is also the out=
+            # target of the in-graph writers.
+            return in_graph.clone()
         return accept.commit_lens + accept.cap_trim_lens
 
     def _commit_target_mamba_states_after_verify(
