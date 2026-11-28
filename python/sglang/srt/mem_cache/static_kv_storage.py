@@ -188,6 +188,8 @@ class StaticKVStorage:
         table, was told at startup."""
         self._shape = other._shape
         self._window_retention = other._window_retention
+        # The rows index the same allocator state: a pending reset survives the swap.
+        self._row_resets = other._row_resets
         self.bind_transfer_draft(
             other._draft_token_to_kv_pool, other._num_hidden_layers
         )
@@ -375,8 +377,9 @@ class StaticKVStorage:
         rows: Optional[torch.Tensor],
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
+        last_loc: Optional[torch.Tensor],
         make_room: Callable[[int], Any],
+        req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         tree_cache: Optional[BasePrefixCache] = None,
         batch: Optional[ScheduleBatch] = None,
     ) -> Optional[torch.Tensor]:
@@ -388,6 +391,8 @@ class StaticKVStorage:
         # returns a DSV4OutCacheLoc bundle; hasattr-gated so others stay unchanged.
         is_dsv4 = rows is not None and hasattr(allocator, "c128_attn_allocator")
         extra_alloc_kwargs = {}
+        if req_to_token_write is not None:
+            extra_alloc_kwargs["req_to_token_write"] = req_to_token_write
         if is_dsv4:
             c128_num_pages = allocator.c128_num_pages_needed(
                 (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu
@@ -737,6 +742,10 @@ class StaticKVStorage:
             )
         return tuple(usage)
 
+    def kv_bytes_usage(self, full_tokens: int, swa_tokens: int) -> None:
+        # Static pools are sized one by one, not out of one byte budget.
+        return None
+
     # -- what a PD peer registers --
 
     def view(self, sub_pool: str) -> Any:
@@ -871,21 +880,20 @@ class _StaticStateEntries(msgspec.Struct, frozen=True, kw_only=True):
 
 def _static_owner_region(token_to_kv_pool) -> Region:
     """The KV entries a static pool registers."""
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         ptrs, lens, item_lens = token_to_kv_pool.get_sparse_kv_buf_infos()
     else:
         ptrs, lens, item_lens = token_to_kv_pool.get_contiguous_buf_infos()
-    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
-
-    # A pool wrapping one token KV view (its other layers hold state), or one
-    # whose main page rows pair by layer id, reports per-entry layer ids for the
-    # peers to pair by.
+    # Wrapped pools, MiniMax sparse pools, and NPU MLA/DSV4 pools report
+    # per-entry layer ids for the peers to pair by.
     layer_ids = (
         token_to_kv_pool.get_kv_layer_ids()
         if token_to_kv_pool.layer_router.wrapped_view() is not None
-        or isinstance(token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+        or isinstance(token_to_kv_pool, (MiniMaxSparseKVPool, NPUMLATokenToKVPool))
+        or (is_npu() and _is_dsv4_npu(token_to_kv_pool))
         else ()
     )
     return Region(
@@ -965,18 +973,6 @@ def _static_state_entries(
             )
         )
 
-    def append_dsa_tail(pool) -> None:
-        if not pool.kpool_use_compress:
-            return
-        tail_ptrs, tail_lens, tail_item_lens = pool.get_compress_tail_buf_infos()
-        if tail_ptrs:
-            add(
-                StateType.DSA_TAIL,
-                tail_ptrs,
-                tail_lens,
-                tail_item_lens,
-            )
-
     if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
         add(
             StateType.BLOCK_SCALE,
@@ -989,16 +985,30 @@ def _static_state_entries(
                 "PD disaggregation for MiniMax sparse layers with index value "
                 "(index_kv_pool) is not yet supported; only K-only sparse layers are."
             )
+        # Both components hold only this PP stage's layers, so publish global
+        # layer ids for the peers to pair entries by.
         if token_to_kv_pool.index_k_pool is not None:
             dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
-            add(StateType.MINIMAX_INDEX_K, dp, dl, il)
+            add(
+                StateType.MINIMAX_INDEX_K,
+                dp,
+                dl,
+                il,
+                layer_ids=token_to_kv_pool.get_index_k_state_layer_ids(),
+            )
         dense_ptrs, dense_lens, dense_item_lens = (
             token_to_kv_pool.get_dense_kv_state_buf_infos()
         )
         # An all-sparse pool has no dense layers; registering an empty component
         # would make every transfer carry a state with nothing to move.
         if dense_ptrs:
-            add(StateType.MINIMAX_DENSE_KV, dense_ptrs, dense_lens, dense_item_lens)
+            add(
+                StateType.MINIMAX_DENSE_KV,
+                dense_ptrs,
+                dense_lens,
+                dense_item_lens,
+                layer_ids=token_to_kv_pool.get_dense_kv_state_layer_ids(),
+            )
     elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
@@ -1012,11 +1022,15 @@ def _static_state_entries(
                 router.view(IdSpaceKind.SLIDING_WINDOW), MHATokenToKVPool
             ):
                 swa_kv_layout = router.view(IdSpaceKind.SLIDING_WINDOW).kv_cache_layout
+            swa_layer_ids = None
+            if is_npu() and _is_dsv4_npu(token_to_kv_pool):
+                swa_layer_ids = token_to_kv_pool.get_swa_state_layer_ids()
             add(
                 StateType.SWA,
                 data_ptrs,
                 data_lens,
                 item_lens,
+                layer_ids=swa_layer_ids,
                 kv_layout=swa_kv_layout,
                 # Read when asked, as the window's view was: not every pool
                 # with window state keeps a window pool of its own.
@@ -1093,16 +1107,37 @@ def _static_state_entries(
             )
             # Hybrid DSA pools keep their index cache and kpool tail in the
             # full-attention sub-pool rather than in the Mamba state above.
-            if getattr(token_to_kv_pool, "use_dsa", False):
+            # Ascend registers index-K alongside K/V in its KV entry groups.
+            # Registering it again as DSA state gives split ranks a different
+            # state schema from decode (including ranks owning no layers).
+            if getattr(token_to_kv_pool, "use_dsa", False) and not isinstance(
+                token_to_kv_pool.full_kv_pool, NPUMLATokenToKVPool
+            ):
                 dsa_pool = token_to_kv_pool.full_kv_pool
                 dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
-                add(
-                    StateType.DSA,
-                    dsa_ptrs,
-                    dsa_lens,
-                    dsa_item_lens,
+                tail_ptrs, tail_lens, tail_item_lens = (
+                    dsa_pool.get_compress_tail_buf_infos()
                 )
-                append_dsa_tail(dsa_pool)
+                # The draft's index cache and tail follow the target's in the
+                # same components, as in the plain DSA branch below.
+                if isinstance(draft_token_to_kv_pool, DSATokenToKVPool):
+                    draft_ptrs, draft_lens, draft_item_lens = (
+                        draft_token_to_kv_pool.get_state_buf_infos()
+                    )
+                    dsa_ptrs = list(dsa_ptrs) + list(draft_ptrs)
+                    dsa_lens = list(dsa_lens) + list(draft_lens)
+                    dsa_item_lens = list(dsa_item_lens) + list(draft_item_lens)
+                    draft_tail_ptrs, draft_tail_lens, draft_tail_item_lens = (
+                        draft_token_to_kv_pool.get_compress_tail_buf_infos()
+                    )
+                    tail_ptrs = list(tail_ptrs) + list(draft_tail_ptrs)
+                    tail_lens = list(tail_lens) + list(draft_tail_lens)
+                    tail_item_lens = list(tail_item_lens) + list(draft_tail_item_lens)
+                # NPU includes index buffers in its main KV entries.
+                if not isinstance(dsa_pool, NPUMLATokenToKVPool):
+                    add(StateType.DSA, dsa_ptrs, dsa_lens, dsa_item_lens)
+                if tail_ptrs:
+                    add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()
@@ -1189,26 +1224,14 @@ def _static_state_entries(
                     add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
 
     if is_npu() and _is_dsv4_npu(token_to_kv_pool):
-        from sglang.srt.disaggregation.ascend.conn import AscendStateType
-
         c128_ptrs, c128_lens, c128_item_lens = token_to_kv_pool.get_c128_kv_buf_infos()
         if c128_ptrs:
             add(
-                AscendStateType.DSV4_C128,
+                StateType.DSV4_C128,
                 c128_ptrs,
                 c128_lens,
                 c128_item_lens,
-            )
-
-        # Register C4 state by row on both A3 and Ascend 950 so prefill and
-        # decode can pair logical positions even when their ring sizes differ.
-        c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
-        if c4_ptrs:
-            add(
-                AscendStateType.DSV4_C4_STATE,
-                c4_ptrs,
-                c4_lens,
-                c4_item_lens,
+                layer_ids=token_to_kv_pool.get_c128_layer_ids(),
             )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same

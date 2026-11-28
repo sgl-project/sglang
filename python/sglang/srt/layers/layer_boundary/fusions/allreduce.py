@@ -20,6 +20,7 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.contracts import FfnInputFusion
 from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.output import UnreducedOutput
@@ -36,7 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter = envs.SGLANG_USE_AITER.get() and is_hip()
 logger = logging.getLogger(__name__)
 
 

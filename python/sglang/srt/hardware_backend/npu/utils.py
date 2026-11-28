@@ -1,6 +1,5 @@
 import functools
 import logging
-import os
 import sys
 from enum import IntEnum
 from typing import TYPE_CHECKING, Callable, Optional
@@ -26,15 +25,43 @@ indexer_weight_stream = None
 gva_is_inited = False
 
 
-@functools.lru_cache(maxsize=1)
-def is_npu_arch35() -> bool:
-    """Whether the runtime is on NPU architecture 35."""
+def _is_npu_arch(arch: int) -> bool:
     if not is_npu():
         return False
 
     import acl
 
-    return acl.rt.get_device_info(0, 601) == (3510, 0)
+    return acl.rt.get_device_info(0, 601) == (arch, 0)
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch22() -> bool:
+    """Whether the runtime is on NPU architecture 22 (Atlas A2/A3)."""
+    return _is_npu_arch(2201)
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch35() -> bool:
+    """Whether the runtime is on NPU architecture 35."""
+    return _is_npu_arch(3510)
+
+
+# SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
+# SoCs report higher values and share the same capability gates.
+ASCEND_950_SOC_VERSION = 260
+
+
+def is_ascend_950() -> bool:
+    """Whether the runtime SoC is Ascend 950 (Atlas A5) or a later aclnn-only SoC.
+
+    The SoC query initializes NPU state, so this must not be called before
+    device selection (see the deferred setup in ``init_npu_backend``).
+    """
+    if not _is_npu:
+        return False
+    from torch_npu.npu._backends import get_soc_version
+
+    return get_soc_version() >= ASCEND_950_SOC_VERSION
 
 
 def use_npu_arch35_mxfp8_wo_a(
@@ -195,10 +222,8 @@ def set_default_server_args(args: "ServerArgs"):
         )
         from sglang.srt.configs.model_config import is_deepseek_v4
 
-        # Only DSV4 and MLA have migrated to AIV transfers so far;
-        # all remaining paths will migrate soon.
+        # DSV4 and MLA require their own host layouts; other models use direct pages.
         if is_deepseek_v4(model_config_of(args).hf_config):
-            os.environ.setdefault("SGLANG_HICACHE_HOST_MEM_BACKEND", "acl")
             declare_resolution(
                 args,
                 "set_default_server_args",
@@ -209,7 +234,6 @@ def set_default_server_args(args: "ServerArgs"):
                 ),
             )
         elif use_mla_backend(args):
-            os.environ.setdefault("SGLANG_HICACHE_HOST_MEM_BACKEND", "acl")
             declare_resolution(
                 args,
                 "set_default_server_args",
@@ -227,6 +251,41 @@ def set_default_server_args(args: "ServerArgs"):
             )
 
 
+def _patch_npu_seed_trace_rules():
+    """Keep aliased CUDA/NPU seed functions consistent with Dynamo's RNG rules."""
+    try:
+        from torch._dynamo import trace_rules
+        from torch._dynamo.variables import (
+            SkipFunctionVariable,
+            TorchInGraphFunctionVariable,
+        )
+        from torch_npu.dynamo.trace_rule import (
+            torch_non_c_binding_in_graph_functions_npu as npu_rules,
+        )
+    except ImportError:
+        # Older torch_npu releases do not register aliases through this rule map.
+        return
+
+    changed = False
+    for name in ("manual_seed", "manual_seed_all"):
+        npu_name = f"torch.npu.random.{name}"
+        if npu_rules.get(npu_name) is TorchInGraphFunctionVariable and any(
+            trace_rules.manual_torch_name_rule_map.get(f"{prefix}.{name}")
+            is SkipFunctionVariable
+            and getattr(module, name) is getattr(torch.npu.random, name)
+            for prefix, module in (
+                ("torch.cuda", torch.cuda),
+                ("torch.cuda.random", torch.cuda.random),
+            )
+        ):
+            # CUDA's top-level and random entries may alias different functions.
+            # Patch the source dict to also cover lazy NPU rule registration.
+            npu_rules[npu_name] = SkipFunctionVariable
+            changed = True
+    if changed:
+        trace_rules.clear_lru_cache()
+
+
 @_call_once
 def init_npu_backend():
     """
@@ -242,15 +301,34 @@ def init_npu_backend():
 
     import torch_npu
 
+    def register_dsv41_vendor_ops():
+        if is_npu_arch35():
+            try:
+                import cann_ops_transformer  # noqa: F401
+            except ImportError as e:
+                logger.warning("DeepSeek-V4.1 A5 operator extension unavailable: %s", e)
+
+    # The A3 bundle registers overlapping Torch schemas (e.g. sparse_flash_mla).
+    # Don't register them again through the standalone CANN wheel.
+    torch_npu.npu._lazy_call(register_dsv41_vendor_ops)
+
     # These imports lead to unpredictable behavior in diffusion models
     # and a significant reduction in performance.
     if "sglang.multimodal_gen" not in sys.modules:
         from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
+        _patch_npu_seed_trace_rules()
+
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
-        torch_npu.npu.config.allow_internal_format = True
         torch.cuda.get_device_capability = lambda device=None: (0, 0)
+
+        def configure_internal_format():
+            if not is_ascend_950():
+                torch_npu.npu.config.allow_internal_format = True
+
+        # The SoC query initializes NPU state; defer it until device selection.
+        torch_npu.npu._lazy_call(configure_internal_format)
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 

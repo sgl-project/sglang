@@ -22,6 +22,9 @@ from sglang.multimodal_gen.runtime.layers.attention import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.models.dits.flux3_image import Packed
+from sglang.multimodal_gen.runtime.models.dits.ming_image import (
+    MingImageTransformer2DModel,
+)
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     _attn_mask_meta_local_pad,
 )
@@ -568,6 +571,21 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(_signature_kwargs(short), _signature_kwargs(short_again))
         self.assertNotEqual(_signature_kwargs(short), _signature_kwargs(longer))
 
+    def test_ming_image_keeps_its_caption_length_when_a_prompt_mask_is_present(self):
+        """Ming-Image's caption length sets every image token's first RoPE
+        coordinate, so a masked caption must not be padded to a text bucket."""
+        ming_model = MingImageTransformer2DModel.__new__(MingImageTransformer2DModel)
+        torch.nn.Module.__init__(ming_model)
+        kwargs = {
+            "encoder_hidden_states": torch.zeros(1, 19, 16),
+            "prompt_attention_mask": torch.ones(1, 19, dtype=torch.bool),
+        }
+        with self._patch_buckets(64, 128):
+            out = self.stage._bcg_pad_prompt_kwargs(kwargs, current_model=ming_model)
+
+        self.assertIs(out, kwargs)
+        self.assertEqual(out["encoder_hidden_states"].shape, (1, 19, 16))
+
     def _minimax_h3_kwargs(self, text_seq: int):
         image_seq = 4
         audio_seq = 2
@@ -598,23 +616,95 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             "packed_seq_params": {
                 "cu_seqlens_q": torch.tensor([0, used, packed_seq], dtype=torch.int32),
                 "max_seqlen_q": used,
+                "cu_seqlens_q_host": (0, used, packed_seq),
+                "txt_len": text_seq,
+                "video_spans": [(text_seq + audio_seq, used)],
             },
             "refiner_packed_seq_params": {
                 "cu_seqlens_q": torch.tensor(
                     [0, text_seq, text_seq], dtype=torch.int32
                 ),
                 "max_seqlen_q": text_seq,
+                "cu_seqlens_q_host": (0, text_seq, text_seq),
             },
         }
 
+    def test_minimax_h3_keeps_unrecognized_packing_unchanged(self):
+        from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+            supports_live_packed_bounds,
+        )
+
+        for which, bounds in [
+            ("packed_seq_params", (0, 10, 25, 64)),
+            ("packed_seq_params", (0, 53, 64)),
+            ("refiner_packed_seq_params", (0, 5, 19)),
+        ]:
+            kwargs = self._minimax_h3_kwargs(19)
+            kwargs[which].update(
+                cu_seqlens_q=torch.tensor(bounds, dtype=torch.int32),
+                cu_seqlens_q_host=bounds,
+            )
+            self.assertFalse(supports_live_packed_bounds(kwargs))
+            with self._patch_buckets(64):
+                self.assertIs(
+                    self.stage._bcg_pad_prompt_kwargs(
+                        kwargs, current_model=self.minimax_h3_model
+                    ),
+                    kwargs,
+                )
+
     def test_minimax_h3_prompt_lengths_share_bucket_signature(self):
+        from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+            H3PackedPrompt,
+            live_packed_prompt,
+            supports_live_packed_bounds,
+        )
+
+        def pad(n, *, two=False):
+            kw = self._minimax_h3_kwargs(n)
+            if two:
+                main = kw["packed_seq_params"]
+                main.update(
+                    cu_seqlens_q=torch.tensor([0, 64], dtype=torch.int32),
+                    cu_seqlens_q_host=(0, 64),
+                )
+                ref = kw["refiner_packed_seq_params"]
+                ref.update(
+                    cu_seqlens_q=torch.tensor([0, n], dtype=torch.int32),
+                    cu_seqlens_q_host=(0, n),
+                )
+            self.assertTrue(supports_live_packed_bounds(kw))
+            token = live_packed_prompt.set(
+                H3PackedPrompt(tuple(kw["packed_seq_params"]["cu_seqlens_q_host"]), n)
+            )
+            try:
+                result = self.stage._bcg_pad_prompt_kwargs(
+                    kw, current_model=self.minimax_h3_model
+                )
+                updated = {
+                    **kw,
+                    "unique_timesteps": torch.ones_like(kw["unique_timesteps"]),
+                }
+                again = self.stage._bcg_pad_prompt_kwargs(
+                    updated, current_model=self.minimax_h3_model
+                )
+                self.assertIs(again["unique_timesteps"], updated["unique_timesteps"])
+                self.assertIs(
+                    again["refiner_packed_seq_params"],
+                    result["refiner_packed_seq_params"],
+                )
+                self.assertIs(again["prompt_embeds"], result["prompt_embeds"])
+                self.assertIs(again["text_pos_info"], result["text_pos_info"])
+                return result
+            finally:
+                live_packed_prompt.reset(token)
+
         with self._patch_buckets(64, 128):
-            short = self.stage._bcg_pad_prompt_kwargs(
-                self._minimax_h3_kwargs(19), current_model=self.minimax_h3_model
-            )
-            longer = self.stage._bcg_pad_prompt_kwargs(
-                self._minimax_h3_kwargs(47), current_model=self.minimax_h3_model
-            )
+            short, longer, aligned = pad(19), pad(47), pad(58, two=True)
+        self.assertEqual(
+            aligned["packed_seq_params"]["cu_seqlens_q"].tolist(), [0, 64, 64]
+        )
+        self.assertEqual(_signature_kwargs(short), _signature_kwargs(aligned))
 
         # H3 keeps the original aligned main sequence: growing it changes SP
         # row partitions and loses bitwise eager equivalence.
@@ -625,12 +715,8 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(longer["prompt_embeds"].shape, (64, 8))
         self.assertNotIn("local_embedding_layout", short)
         self.assertNotIn("local_embedding_layout", longer)
-        self.assertEqual(
-            short["refined_prompt_embeds_length"].shape,
-            torch.Size([]),
-        )
-        self.assertEqual(short["refined_prompt_embeds_length"].item(), 19)
-        self.assertEqual(longer["refined_prompt_embeds_length"].item(), 47)
+        self.assertEqual(short["refined_prompt_embeds_length"], 64)
+        self.assertEqual(longer["refined_prompt_embeds_length"], 64)
         self.assertEqual(
             short["packed_seq_params"]["cu_seqlens_q"].tolist(), [0, 25, 64]
         )
@@ -641,7 +727,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(short["refiner_packed_seq_params"]["max_seqlen_q"], 64)
         self.assertEqual(
             short["refiner_packed_seq_params"]["cu_seqlens_q"].tolist(),
-            [0, 19, 64],
+            [0, 19, 19],
         )
         # Dummy prompt rows occupy the independent packed-attention segment;
         # real text/media remain in the first segment.

@@ -8,7 +8,7 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_sm90_supported
 
 tilelang.set_log_level("WARNING")
 
@@ -46,6 +46,7 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
 
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_sm90 = is_sm90_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 BF16 = "bfloat16"
@@ -57,20 +58,37 @@ UINT8 = "uint8"
 
 
 @lru_cache(maxsize=8)
-def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
+def _pick_inner_iter(
+    seq: int,
+    ni: int,
+    cu: int,
+    block_per_cu: int,
+    any_divisor: bool = False,
+    head_blocks: int = 1,
+) -> int:
     """
-    Pick the largest valid inner_iter (power-of-two divisor of ni) that keeps
-    enough work per CU (seq * ni / inner_iter / cu >= block_per_cu), so we avoid
-    under-utilization while minimizing the number of partial groups.
+    Pick the largest valid inner_iter (a divisor of ni) that keeps enough work
+    per CU (seq * ni / inner_iter / cu >= block_per_cu), so we avoid
+    under-utilization while minimizing the number of partial groups. Only ni,
+    ni // 2, ni // 4, ... are tried; with any_divisor, a larger divisor is taken
+    when its seq * head_blocks * ni / inner_iter blocks fill the waves they need.
     """
 
     max_it = int(seq * ni / (cu * block_per_cu))
     it = ni
     while it >= 2:
         if it <= max_it and ni % it == 0:
-            return it
+            break
         it //= 2
-    return 1
+    if any_divisor:
+        # Two blocks of the FP8 partial kernel run on each SM; fewer, or a mostly
+        # empty last wave, was slower on H200 with 8 to 64 heads.
+        slots = 2 * cu
+        for larger in range(min(ni, max_it), it, -1):
+            blocks = seq * head_blocks * (ni // larger)
+            if ni % larger == 0 and blocks >= 0.8 * slots * -(-blocks // slots):
+                return larger
+    return it
 
 
 @tilelang.jit(
@@ -274,7 +292,10 @@ def sparse_attention_fwd_kernel_v2(
     kv_group: int = 1,
     sm_scale: Optional[float] = None,
     block_I: int = 64,
+    head_tile: int = 64,
 ):
+    assert block_I % 16 == 0, "the cooperative KV loader processes 16 rows per step"
+    assert head_tile in (16, 32, 64), "head_tile must be 16, 32 or 64"
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"haven't check padding correctness yet, dim={dim}"
     )
@@ -312,13 +333,11 @@ def sparse_attention_fwd_kernel_v2(
     assert NI % 2 == 0, "NI should be a multiple of 2"
     D = dim
     D_tail = tail_dim
-    if num_heads > 64:
+    if num_heads > 64 and head_tile == 64:
         assert num_heads % 64 == 0, "head_kv should be a multiple of 64"
-        REPLICATE_H = num_heads // 64
-    else:
-        REPLICATE_H = 1
 
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    H_per_block = min(padded_H, head_tile)
+    REPLICATE_H = tilelang.cdiv(num_heads, H_per_block)
 
     @T.prim_func
     def main(
@@ -378,7 +397,7 @@ def sparse_attention_fwd_kernel_v2(
             b_i, g_i = by, bz
             s_i = bx if REPLICATE_H == 1 else bx // REPLICATE_H
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
+            H0 = g_i * padded_H + (bx % REPLICATE_H) * H_per_block
             H1 = H0 + H_per_block
 
             tx = T.get_thread_binding()
@@ -538,7 +557,7 @@ def sparse_attention_fwd_kernel_v2(
                     T.barrier_arrive(bar_2_128)
                     T.barrier_wait(bar_2_128, 0)
 
-                    for r in T.serial(4):
+                    for r in T.serial(BI // 16):
                         indices_tmp[0] = Indices[
                             b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 256) // 8
                         ]
@@ -585,7 +604,7 @@ def sparse_attention_fwd_kernel_v2(
                     T.barrier_arrive(bar_2_128)
                     T.barrier_wait(bar_2_128, 1)
 
-                    for r in T.serial(4):
+                    for r in T.serial(BI // 16):
                         indices_tmp[0] = Indices[
                             b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8
                         ]
@@ -1178,6 +1197,19 @@ def sparse_mla_fwd_decode_partial_fp8(
     return main
 
 
+# Measured on H200 over 8-128 heads, cold L2: split wins at <= 1024 on every shape;
+# it first loses at 1536-2048. Re-tune when either kernel changes.
+_CUDA_BF16_SPLIT_MAX_TOKEN_HEADS = 1024
+
+
+def _use_cuda_bf16_split(*, num_tokens: int, num_heads: int) -> bool:
+    # Only swept on SM90; Blackwell keeps the single-pass kernel until measured.
+    if num_heads % 4 != 0 or not _is_sm90:
+        return False
+    padded_heads = max(1 << (num_heads - 1).bit_length(), 16)
+    return num_tokens * padded_heads <= _CUDA_BF16_SPLIT_MAX_TOKEN_HEADS
+
+
 def tilelang_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1193,7 +1225,10 @@ def tilelang_sparse_fwd(
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-    if _is_hip or is_fp8_kv:
+    use_cuda_bf16_split = not (_is_hip or is_fp8_kv) and _use_cuda_bf16_split(
+        num_tokens=q.shape[0], num_heads=num_heads
+    )
+    if _is_hip or is_fp8_kv or use_cuda_bf16_split:
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
@@ -1205,7 +1240,16 @@ def tilelang_sparse_fwd(
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
             ni = topk // block_I
-            inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            # Any divisor is measured on CUDA only; ROCm keeps trying ni, ni // 2, ...
+            inner_iter = _pick_inner_iter(
+                q.shape[0],
+                ni,
+                cu,
+                block_per_cu,
+                any_divisor=not _is_hip,
+                # sparse_mla_fwd_decode_partial_fp8 runs 16 heads per block.
+                head_blocks=(num_heads + 15) // 16,
+            )
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
                 num_heads,
                 d_v,
@@ -1217,12 +1261,18 @@ def tilelang_sparse_fwd(
                 threads=threads,
             )
         else:
-            if _is_gfx95_supported:
-                block_I, threads, block_per_cu, cu = 64, 256, 2, 256
+            if use_cuda_bf16_split:
+                # One KV tile per CTA: the batch is too small to fill the GPU.
+                block_I, threads = 64, 256
+                ni = topk // block_I
+                inner_iter = 1
             else:
-                block_I, threads, block_per_cu, cu = 32, 128, 1, 304
-            ni = topk // block_I
-            inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+                if _is_gfx95_supported:
+                    block_I, threads, block_per_cu, cu = 64, 256, 2, 256
+                else:
+                    block_I, threads, block_per_cu, cu = 32, 128, 1, 304
+                ni = topk // block_I
+                inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
             kernel_partial = sparse_mla_fwd_decode_partial(
                 num_heads,
                 d_v,
@@ -1252,7 +1302,21 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
+        # Bound each SM12x block to 18 KiB of Q and 72 KiB of double-buffered
+        # KV, leaving room for scratch/barriers within its 99 KiB limit.
+        # Additional heads use separate blocks with the same shared layout.
+        if current_arch().is_sm(12) and d_v == 512 and tail_dim == 64:
+            kernel = sparse_attention_fwd_kernel_v2(
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                block_I=32,
+                head_tile=16,
+            )
+        else:
+            kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 

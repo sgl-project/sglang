@@ -10,12 +10,15 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 # Measured fastest for 1-64 rows, where the per-block Philox work sets latency.
 _BLOCK = 1024
+# block width when the kernel computes the step bias (fold): the fold weight dominates
+_FOLD_BLOCK = 128
 _NO_INDEX = tl.constexpr(2147483647)
 # 2**-32: maps a 32-bit Philox word to a uniform in (0, 1].
 _UNIFORM_SCALE = tl.constexpr(2.3283064365386963e-10)
@@ -49,6 +52,8 @@ def _markov_sample_partial_kernel(
     PARTS,
     KEY,
     STEP,
+    softcap,
+    vocab_limit,
     BLOCK: tl.constexpr,
     ROUND: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -56,15 +61,35 @@ def _markov_sample_partial_kernel(
     SELECT: tl.constexpr,
     SAMPLE: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
+    SOFTCAP: tl.constexpr = False,
+    LIMIT: tl.constexpr = False,
+    FW=None,
+    FB=None,
+    FOLD: tl.constexpr = False,
+    RANK: tl.constexpr = 1,
 ):
     row, part = tl.program_id(0), tl.program_id(1)
     i = part * BLOCK + tl.arange(0, BLOCK)
     valid = i < WIDTH
     in_shard = i < PADDED
     value = tl.load(X + row * XS + i, in_shard, 0).to(tl.float32)
-    if HAS_BIAS:
+    if FOLD:
+        # The bias as torch.addmm(FB, B, FW.T) gives it (B: the rows' latents), in
+        # FW's dtype; the sum order is not the GEMM's.
+        k = tl.arange(0, RANK)
+        latent = tl.load(B + row * BS + k).to(FW.dtype.element_ty).to(tl.float32)
+        w = tl.load(FW + i[:, None] * RANK + k[None, :], valid[:, None], 0)
+        bias = tl.sum(w.to(tl.float32) * latent[None, :], 1)
+        bias += tl.load(FB + i, valid, 0).to(tl.float32)
+        value += bias.to(FW.dtype.element_ty).to(tl.float32)
+    elif HAS_BIAS:
         value += tl.load(B + row * BS + i, valid, 0).to(tl.float32)
     value = _round_to_step_dtype(value, ROUND)
+    if SOFTCAP:
+        # softcap_inplace_logits on the rounded step logits.
+        value = _round_to_step_dtype(libdevice.tanh(value / softcap) * softcap, ROUND)
+    if LIMIT:
+        value = tl.where(i + VOCAB_START < vocab_limit, value, -float("inf"))
     if STORE:
         tl.store(L + row * LS + i, value.to(L.dtype.element_ty), in_shard)
     if SELECT:
@@ -200,12 +225,26 @@ def _launch_partial(
     has_sampled_rows,
     vocab_start=0,
     select=True,
+    softcap=None,
+    vocab_limit=None,
+    parts_multiple=1,
+    fold=None,
 ):
     # Returns the [rows, parts * 2] (value, index bits) candidates of each block.
+    # fold=(fold weight, fold bias): bias holds the rows' latents and the kernel
+    # computes the step bias, in narrower blocks that spread that GEMV's reads.
     rows, padded = base_logits.shape
+    block = _BLOCK if fold is None else _FOLD_BLOCK
     # The padded width fixes the transport shape on every rank; WIDTH masks padding.
-    parts = triton.cdiv(padded, _BLOCK)
+    # Blocks past the shard (parts_multiple) write (-inf, no index) candidates.
+    parts = triton.cdiv(triton.cdiv(padded, block), parts_multiple) * parts_multiple
     assert parts > 0
+    fold_args = {}
+    if fold is not None:
+        fold_weight, fold_bias = fold
+        fold_args = dict(
+            FW=fold_weight, FB=fold_bias, FOLD=True, RANK=fold_weight.shape[1]
+        )
     partial = torch.empty(
         (rows, parts, 2), device=base_logits.device, dtype=torch.float32
     )
@@ -225,13 +264,18 @@ def _launch_partial(
         parts,
         key,
         step,
-        _BLOCK,
+        float(softcap or 0.0),
+        int(vocab_limit or 0),
+        block,
         _ROUND_CODE[step_dtype],
         bias is not None,
         store is not None,
         select,
         has_sampled_rows is not False,
         _PHILOX_ROUNDS,
+        softcap is not None,
+        vocab_limit is not None,
+        **fold_args,
         num_warps=4,
     )
     return partial.view(rows, parts * 2)
@@ -242,7 +286,10 @@ class MarkovSampleStep:
     the rank's padded shard ``base_logits``. Sharded, ``gather`` exchanges
     per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole;
     without ``gather_logits`` the kept logits stay on the shard.
-    ``has_sampled_rows=False`` argmaxes every row."""
+    ``has_sampled_rows=False`` argmaxes every row. ``fold=(weight, bias)``:
+    ``bias`` holds the rows' latents and the step bias is
+    ``torch.addmm(fold bias, latents, weight.T)`` over ``weight``'s rows, which the
+    Triton path computes in the candidate kernel."""
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
@@ -265,11 +312,20 @@ class MarkovSampleStep:
         gather,
         gather_logits,
         logits_out,
+        fold=None,
     ):
         assert base_logits.ndim == bias.ndim == 2
         assert bias.shape[0] == base_logits.shape[0]
-        assert bias.shape[1] <= base_logits.shape[1]
         assert bias.stride(1) == base_logits.stride(1) == 1
+        if fold is None:
+            assert bias.shape[1] <= base_logits.shape[1]
+        else:
+            assert gather_logits is None
+            weight, fold_bias = fold
+            assert weight.is_contiguous() and fold_bias.is_contiguous()
+            assert weight.shape == (fold_bias.shape[0], bias.shape[1])
+            assert weight.shape[0] <= base_logits.shape[1]
+            assert triton.next_power_of_2(weight.shape[1]) == weight.shape[1]
         assert temperatures.shape == (base_logits.shape[0],)
         assert temperatures.dtype == torch.float32 and temperatures.stride(0) == 1
         assert offset.dtype == torch.int64 and offset.numel() == 1
@@ -300,6 +356,9 @@ class MarkovSampleStep:
         gather_logits: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
+        softcap: Optional[float] = None,
+        vocab_limit: Optional[int] = None,
+        fold: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         cls._check(
             base_logits,
@@ -311,8 +370,9 @@ class MarkovSampleStep:
             gather,
             gather_logits,
             logits_out,
+            fold,
         )
-        rows, width = bias.shape
+        rows, width = bias.shape if fold is None else (bias.shape[0], fold[0].shape[0])
         launch = functools.partial(
             _launch_partial,
             temperatures=temperatures,
@@ -326,16 +386,32 @@ class MarkovSampleStep:
             local = torch.empty(
                 base_logits.shape, device=base_logits.device, dtype=step_dtype
             )
-            launch(base_logits, bias, width=width, store=local, select=False)
+            launch(
+                base_logits,
+                bias,
+                width=width,
+                store=local,
+                select=False,
+                vocab_start=vocab_start,
+                softcap=softcap,
+                vocab_limit=vocab_limit,
+            )
             full = gather_logits(local)[:, : logits_out.shape[1]]
             gathered = launch(full, None, width=full.shape[1], store=logits_out)
         else:
+            # Kept shards on ROCm: candidate rows of 16-byte multiples, which aiter's
+            # all-gather requires.
+            keeps_shard = _is_hip and gather is not None and logits_out is not None
             partial = launch(
                 base_logits,
                 bias,
                 width=width,
                 store=logits_out,
                 vocab_start=vocab_start,
+                softcap=softcap,
+                vocab_limit=vocab_limit,
+                parts_multiple=2 if keeps_shard else 1,
+                fold=fold,
             )
             gathered = partial if gather is None else gather(partial)
         parts = gathered.shape[1] // 2
@@ -368,6 +444,8 @@ class MarkovSampleStep:
         gather_logits: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
+        softcap: Optional[float] = None,
+        vocab_limit: Optional[int] = None,
     ) -> torch.Tensor:
         # None draws the noise for every row: reading the temperatures on the
         # host would break a graph capture.
@@ -386,6 +464,11 @@ class MarkovSampleStep:
         value = base_logits.to(torch.float32, copy=True)
         value[:, :width] += bias.float()
         value = value.to(step_dtype).float()
+        if softcap is not None:
+            value = (torch.tanh(value / softcap) * softcap).to(step_dtype).float()
+        if vocab_limit is not None:
+            columns = vocab_start + torch.arange(value.shape[1], device=value.device)
+            value[:, columns >= vocab_limit] = float("-inf")
         if gather_logits is not None and logits_out is not None:
             full = gather_logits(value.to(step_dtype))[:, : logits_out.shape[1]]
             return cls.torch(

@@ -34,6 +34,7 @@ from sglang.multimodal_gen.configs.sample.cosmos3_multiview import (
     closest_multiview_aspect_ratio,
     multiview_canvas,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -185,15 +186,20 @@ def media_hw(path: str) -> tuple[int, int]:
     try:
         import av
 
-        with av.open(path) as container:
+        # A local file is probed as bytes; a URL fails to open here and is
+        # downloaded by load_video under the media URL policy.
+        with (
+            open(path, "rb") as source,
+            av.open(source, options={"protocol_whitelist": "data"}) as container,
+        ):
             stream = container.streams.video[0]
             if stream.height and stream.width:
                 return int(stream.height), int(stream.width)
-    except Exception:  # PyAV missing or metadata unreadable: decode instead.
+    except Exception:  # PyAV missing, not a local file, or metadata unreadable.
         pass
     decoded = load_video(path, max_frames=1)
     if not decoded:
-        raise ValueError(f"No frames decoded from Cosmos3 multiview media {path!r}.")
+        raise ValueError("No frames decoded from Cosmos3 multiview media.")
     first = decoded[0]
     return int(first.height), int(first.width)
 
@@ -212,9 +218,7 @@ def load_media_uint8_cthw(
     else:
         decoded = load_video(path, max_frames=max_frames)
         if not decoded:
-            raise ValueError(
-                f"No frames decoded from Cosmos3 multiview media {path!r}."
-            )
+            raise ValueError("No frames decoded from Cosmos3 multiview media.")
         frames = [frame.convert("RGB") for frame in decoded]
     first = _pil_to_uint8_tensor(frames[0])
     if first.ndim != 3 or first.shape[0] != 3:
@@ -1083,7 +1087,7 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
         for view in range(num_views):
             clip = pixels[:, :, view * frames_per_view : (view + 1) * frames_per_view]
             clip = clip.to(device=device, dtype=vae_dtype).div(127.5).sub(1.0)
-            with torch.no_grad():
+            with torch.no_grad(), use_gpu_conditioning_hash():
                 latent = self.vae.encode(clip).mode()
             latent = (latent - mean.to(latent)) / std.to(latent)
             latents.append(latent.to(dtype))

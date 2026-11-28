@@ -236,6 +236,9 @@ class WeightUpdater:
             return iter
 
         def model_load_weights(model, iter):
+            # A half held by an earlier load (a failed one, say) must not pair
+            # with this load's other half.
+            _discard_pending_weight_halves(model)
             # Expert loaders may copy in parallel; restore before any thread writes.
             DefaultModelLoader.restore_weights_before_loading(model, target_device)
             loader.load_weights_and_postprocess(model, iter, target_device)
@@ -341,16 +344,21 @@ class WeightUpdater:
         return bucket.reconstruct_tensors()
 
     def begin_weight_update(self: WeightUpdater) -> None:
+        model = self.get_model()
         DefaultModelLoader.restore_weights_before_loading(
-            self.get_model(), torch.device(self.device)
+            model, torch.device(self.device)
         )
+        # A load outside a session (startup, update from disk) may have left a
+        # half that would otherwise pair with this session's other half.
+        _discard_pending_weight_halves(model)
 
-    def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
+    def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> Optional[str]:
+        """Finish the session; return why the update is incomplete, or None."""
+        model = self.get_model()
         if run_post_load:
-            post_load_weights(self.get_model())
-        DefaultModelLoader.postprocess_weights(
-            self.get_model(), torch.device(self.device)
-        )
+            post_load_weights(model)
+        DefaultModelLoader.postprocess_weights(model, torch.device(self.device))
+        return _unpaired_weight_halves_error(model)
 
     def load_weights_from_distributed(
         self: WeightUpdater, named_tensors: List[Tuple[str, torch.Tensor]]
@@ -394,12 +402,23 @@ class WeightUpdater:
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
 
-        # The payload lists one entry per deployment TP rank. An
-        # attention-owning draft records its narrowed rank at init, so read the
-        # deployment rank here, on the scheduler thread outside any draft scope.
-        tp_rank = get_parallel().tp_rank
+        # The payload lists one entry per engine rank. An attention-owning
+        # draft records its narrowed rank at init, so read the deployment rank
+        # here, on the scheduler thread outside any draft scope.
+        parallel = get_parallel()
+        copies = parallel.tp_size * parallel.pp_size
+        for name, tensor in named_tensors:
+            if (
+                isinstance(tensor, LocalSerializedTensor)
+                and len(tensor.values) != copies
+            ):
+                return False, (
+                    f"{name}: expected one serialized copy per engine rank "
+                    f"({copies}), got {len(tensor.values)}"
+                )
+        rank = _engine_rank()
         named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=tp_rank, device=infered_device))
+            (name, _unwrap_tensor(tensor, rank=rank, device=infered_device))
             for name, tensor in named_tensors
         ]
         if load_format == "direct":
@@ -457,9 +476,16 @@ class WeightUpdater:
                 SGLangCheckpointEngineWorkerExtensionImpl,
             )
 
+            # An IPC update loads its buckets in several load_weights calls with
+            # no session around them: drop halves held from before, and log any
+            # left after.
+            _discard_pending_weight_halves(self.get_model())
             # Create a worker extension that integrates with SGLang's model
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self.get_model_runner())
             worker.update_weights_from_ipc(recv_req.zmq_handles)
+            error = _unpaired_weight_halves_error(self.get_model())
+            if error is not None:
+                logger.error(error)
             return True, "IPC weight update completed successfully"
         except ImportError as e:
             return False, f"IPC weight update failed: ImportError {e}"
@@ -468,22 +494,64 @@ class WeightUpdater:
             return False, str(e)
 
 
+def _discard_pending_weight_halves(model: torch.nn.Module) -> List[str]:
+    """Loaders that fuse several checkpoint tensors into one param hold a half
+    until its pair arrives, possibly in a later load_weights call. A wrapper
+    model (a VLM, say) holds such a loader as a submodule."""
+    return [
+        name
+        for module in model.modules()
+        if hasattr(module, "discard_pending_weight_halves")
+        for name in module.discard_pending_weight_halves()
+    ]
+
+
+def _unpaired_weight_halves_error(model: torch.nn.Module) -> Optional[str]:
+    """Drop the halves still waiting for their pair; say which, if any."""
+    pending = _discard_pending_weight_halves(model)
+    if not pending:
+        return None
+    shown = ", ".join(pending[:8]) + (", ..." if len(pending) > 8 else "")
+    return (
+        f"The update sent only one half of {len(pending)} fused weights, "
+        f"so their params keep the old values: {shown}"
+    )
+
+
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
     for name, tensor in named_tensors:
         default_weight_loader(params_dict[name], tensor)
 
 
-def _unwrap_tensor(tensor, tp_rank, device):
+def _engine_rank():
+    parallel = get_parallel()
+    return parallel.tp_size * parallel.pp_rank + parallel.tp_rank
+
+
+def _unwrap_tensor(tensor, rank, device):
     if isinstance(tensor, LocalSerializedTensor):
-        tensor = tensor.get(tp_rank)
+        tensor = tensor.get(rank)
     return tensor.to(device)
+
+
+def unwrap_local_serialized_tensors(named_tensors, device: str):
+    if not any(isinstance(t, LocalSerializedTensor) for _, t in named_tensors):
+        return named_tensors
+    monkey_patch_torch_reductions()
+    rank = _engine_rank()
+    current_device = torch.get_device_module(device).current_device()
+    return [
+        (name, _unwrap_tensor(tensor, rank=rank, device=current_device))
+        for name, tensor in named_tensors
+    ]
 
 
 @dataclass
 class LocalSerializedTensor:
     """torch.Tensor that gets serialized by MultiprocessingSerializer (which only serializes a pointer and not the data).
-    The i-th element in the list corresponds to i-th rank's GPU."""
+    The i-th element in the list is the copy for engine rank i
+    (tp_size * pp_rank + tp_rank)."""
 
     values: List[bytes]
 

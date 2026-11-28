@@ -49,6 +49,7 @@ def _limits_worker(rank, path):
     from datetime import timedelta
     from types import SimpleNamespace as NS
 
+    import torch
     import torch.distributed as dist
 
     from sglang.srt.managers.req_types import FINISH_ABORT
@@ -82,7 +83,7 @@ def _limits_worker(rank, path):
     runner.token_to_kv_pool_allocator = allocator
     runner.req_to_token_pool = ReqToTokenPool.__new__(ReqToTokenPool)
     runner.req_to_token_pool.size = 4
-    runner.req_to_token_pool.max_context_len = 1 << 14
+    runner.req_to_token_pool.req_to_token = torch.empty(0, 1 << 14, dtype=torch.int32)
     runner.req_to_token_pool._aux_cache = None
     runner.forward_stream = None
     worker = NS(
@@ -312,6 +313,7 @@ def _loop_worker(rank, path, level, drift_round):
                 may_launch=lambda: True,
             )
             self.request_receiver = NS(recv_requests=self._recv_requests)
+            self.flush_wrapper = NS(prepare_pp_probe=lambda vote: False)
             self.metrics_reporter = NS(record_scheduler_active=lambda start: None)
             self.invariant_checker = NS(run=lambda *args: None)
             self.new_token_ratio_tracker = NS(current=0.5)

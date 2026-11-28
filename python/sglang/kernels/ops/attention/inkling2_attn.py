@@ -4,6 +4,10 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+_IS_HIP = tl.constexpr(_is_hip)
 
 # Below this many rows the Triton _gate_sink_kernel is faster.
 GATE_SINK_CUDA_MIN_ROWS = 64
@@ -12,23 +16,26 @@ GATE_SINK_CUDA_MIN_ROWS = 64
 @triton.jit
 def _sigmoid(x):
     exponent = -x * 1.4426950408889634
-    exp = tl.inline_asm_elementwise(
-        "ex2.approx.f32 $0, $1;",
-        constraints="=f,f",
-        args=[exponent],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-    denominator = exp + 1.0
-    return tl.inline_asm_elementwise(
-        "rcp.approx.f32 $0, $1;",
-        constraints="=f,f",
-        args=[denominator],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    if _IS_HIP:
+        return 1.0 / (tl.exp2(exponent) + 1.0)
+    else:
+        exp = tl.inline_asm_elementwise(
+            "ex2.approx.f32 $0, $1;",
+            constraints="=f,f",
+            args=[exponent],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        denominator = exp + 1.0
+        return tl.inline_asm_elementwise(
+            "rcp.approx.f32 $0, $1;",
+            constraints="=f,f",
+            args=[denominator],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
 
 
 @triton.jit
@@ -186,6 +193,69 @@ def combine_gate_sink(o_partial, m_partial, l_partial, *, gate, sinks):
     return out
 
 
+def rel_bias_partials(
+    q,
+    k_cache,
+    v_cache,
+    page_table,
+    seqused_k,
+    rel_bias,
+    softmax_scale,
+    out,
+    *,
+    window_size_left,
+    verify,
+    k_scale=None,
+    v_scale=None,
+):
+    """Split-KV partials of paged attention with the compact relative bias, for
+    combine_gate_sink; verify: several queries per sequence (MTP verify).
+    k/v_scale: the UE8M0 scales of an MXFP8 cache (SM90 and SM120 kernel only)."""
+    from sglang.srt.runtime_context import get_platform
+    from sglang.srt.utils import get_device_core_count
+
+    # The SM100 kernel needs tcgen05, which SM90 and SM120 lack.
+    if not (get_platform().is_sm90 or get_platform().is_sm120):
+        assert k_scale is None, "the SM100 bias decode reads a 16-bit cache"
+        from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100_bias_decode import (
+            paged_rel_bias_decode,
+        )
+
+        return paged_rel_bias_decode(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            seqused_k,
+            rel_bias,
+            softmax_scale,
+            out,
+            window_size_left=window_size_left,
+            reduce=False,
+            num_sms=(
+                get_device_core_count(q.device.index)
+                if verify and window_size_left is None
+                else None
+            ),
+        )
+    from sglang.kernels.ops.attention.inkling2_decode_attention_sm90 import (
+        decode_partials,
+    )
+
+    return decode_partials(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        seqused_k,
+        rel_bias,
+        softmax_scale,
+        window_size_left=window_size_left,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+
 @cache_once
 def _gate_sink_module(heads, head_dim, group, padded_group):
     args = f"{heads}, {head_dim}, {group}, {padded_group}"
@@ -199,6 +269,8 @@ def _gate_sink_module(heads, head_dim, group, padded_group):
 
 def _cuda_gate_sink(output, gate, lse, sinks, result, group, padded_group):
     """_gate_sink_kernel in CUDA; False when an operand layout is unsupported."""
+    if _is_hip:
+        return False
     heads = sinks.shape[-1]
     head_dim = result.shape[1] // heads
     if not (

@@ -11,7 +11,10 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=12000, suite="full-acc-test-2-npu-a3", nightly=True)
 
-_is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
+# The PR pipeline (pr-test-npu.yml) runs on both `pull_request` and a daily
+# `schedule`, so match the workflow file instead of the event name. Every other
+# caller (nightly, full test) still gets the full run.
+_is_pr_pipeline = "pr-test-npu.yml" in os.environ.get("GITHUB_WORKFLOW_REF", "")
 
 ENVS = {
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",

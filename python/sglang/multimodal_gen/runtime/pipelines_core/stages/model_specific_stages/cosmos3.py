@@ -14,7 +14,7 @@ import json
 import math
 from collections import deque
 from collections.abc import Iterator
-from contextlib import closing
+from contextlib import closing, contextmanager
 from fractions import Fraction
 from itertools import islice
 from typing import Any
@@ -28,7 +28,10 @@ import torch.nn.functional as F
 from sglang.kernels import get_kernel
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.configs.task_type import DataType
-from sglang.multimodal_gen.runtime.cache.conditioning import _inference_cache
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    _inference_cache,
+    use_gpu_conditioning_hash,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_world_size,
@@ -57,6 +60,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    decode_parallelism_type,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
@@ -96,6 +102,7 @@ from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.vision import (
     load_image,
     load_video,
+    open_video_source,
     preprocess_image,
 )
 from sglang.srt.environ import envs
@@ -250,9 +257,12 @@ def _iter_video_frames_pyav(
     if keep not in ("first", "last"):
         raise ValueError("keep must be 'first' or 'last'")
 
-    with av.open(video_path) as container:
+    with (
+        open_video_source(video_path) as source,
+        av.open(source, options={"protocol_whitelist": "data"}) as container,
+    ):
         if not container.streams.video:
-            raise ValueError(f"No video stream in {video_path!r}")
+            raise ValueError("Input media has no video stream.")
         stream = container.streams.video[0]
         stream.codec_context.thread_type = "SLICE"
         stream.codec_context.thread_count = 1
@@ -335,7 +345,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         """Load transfer media as CPU ``uint8 [1, 3, T, H, W]``."""
         frames = load_video(control_path, max_frames=max_frames)
         if not frames:
-            raise ValueError(f"No frames decoded from transfer video: {control_path!r}")
+            raise ValueError("No frames decoded from transfer video.")
         frames = frames[:max_frames]
         frames_cthw = torch.stack(
             [_pil_to_uint8_tensor(frame.convert("RGB")) for frame in frames],
@@ -565,7 +575,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
                 else:
                     processed = _preprocess_video_frames_gpu(frames, target_h, target_w)
             if not processed:
-                raise ValueError(f"No frames decoded from video: {video_path!r}")
+                raise ValueError("No frames decoded from input video.")
             # Pad CUDA frames after conversion to the VAE dtype instead.
             if force_cpu:
                 if len(processed) < num_source_frames:
@@ -1296,6 +1306,9 @@ class Cosmos3DenoisingStage(PipelineStage):
         # ``batch.extra["transformer_extra_kwargs"]`` (e.g. the Cosmos3
         # multiview attention layout and temporal wrap period).
         self._extra_transformer_kwargs: dict[str, Any] = {}
+        # The request being denoised; bound only for one denoising loop so the
+        # stage never keeps a finished request (and its tensors) alive.
+        self._request_batch: Req | None = None
 
         # Apply torch.compile if enabled
         if server_args is not None:
@@ -1409,7 +1422,11 @@ class Cosmos3DenoisingStage(PipelineStage):
         """
         if current_timestep is None:
             current_timestep = int(timestep.flatten()[0].item())
-        with set_forward_context(current_timestep=current_timestep, attn_metadata=None):
+        with set_forward_context(
+            current_timestep=current_timestep,
+            attn_metadata=None,
+            forward_batch=self._request_batch,
+        ):
             return self.transformer(
                 hidden_states=latents,
                 encoder_hidden_states=None,  # Not used by Cosmos3
@@ -1548,10 +1565,11 @@ class Cosmos3DenoisingStage(PipelineStage):
                 :, :, current_conditional_frames - 1 : current_conditional_frames
             ].expand(-1, -1, chunk_frames - current_conditional_frames, -1, -1)
 
-        control_latents = [
-            self._encode_transfer_video(control, latent_dtype)
-            for control in control_norms
-        ]
+        with use_gpu_conditioning_hash():
+            control_latents = [
+                self._encode_transfer_video(control, latent_dtype)
+                for control in control_norms
+            ]
         condition_latents = self._encode_transfer_video(target_norm, latent_dtype)
         noise = torch.randn(
             condition_latents.shape,
@@ -1609,10 +1627,13 @@ class Cosmos3DenoisingStage(PipelineStage):
                 batch.num_inference_steps, device=batch.latents.device
             )
             batch.timesteps = self.scheduler.timesteps
-            with self.use_declared_component(
-                component_name="transformer",
-                module=self.transformer,
-                phase="denoise",
+            with (
+                self.use_declared_component(
+                    component_name="transformer",
+                    module=self.transformer,
+                    phase="denoise",
+                ),
+                self._bind_request(batch),
             ):
                 self._denoise_once(batch, server_args, generator=generator)
             with self.use_declared_component(
@@ -1747,6 +1768,9 @@ class Cosmos3DenoisingStage(PipelineStage):
         cfg_world_size = (
             get_classifier_free_guidance_world_size() if enable_cfg_parallel else 1
         )
+        # FSDP shards span the CFG ranks, so every CFG rank must issue the same
+        # all-gathers: the same number of forwards and the same UND cache misses.
+        cfg_lockstep = enable_cfg_parallel and bool(server_args.use_fsdp_inference)
 
         sp_size = get_sp_world_size()
         sp_rank = get_sp_parallel_rank() if sp_size > 1 else 0
@@ -1783,6 +1807,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         # host copy for the per-step CFG window checks: a device read per step
         # would stall the host on every step's kernels
         timestep_values = timesteps.tolist()
+        # UND cache keys of the branches the previous step split across CFG ranks.
+        prev_step_cfg_split: tuple[str, ...] | None = None
 
         for i, t in progress_bar:
             # Precision is chosen once per step, before any transformer call,
@@ -1806,12 +1832,11 @@ class Cosmos3DenoisingStage(PipelineStage):
                 and control_guidance != 1.0
                 and self._cfg_active_at(timestep_values[i], control_guidance_interval)
             )
-
-            if control_cfg_active:
-                # Control-CFG owns the step: 2 branches (text guidance off) or 3
-                # (text guidance on), distributed across CFG ranks and reduced by
-                # ``_predict_noise_cfg`` (sequential per rank, no batching).
-                branches = self._control_cfg_branches(
+            # Control-CFG owns the step: 2 branches (text guidance off) or 3
+            # (text guidance on), distributed across CFG ranks and reduced by
+            # ``_predict_noise_cfg`` (sequential per rank, no batching).
+            control_branches = (
+                self._control_cfg_branches(
                     cond_text_ids,
                     cond_text_mask,
                     uncond_text_ids,
@@ -1822,14 +1847,33 @@ class Cosmos3DenoisingStage(PipelineStage):
                     text_guidance_scale=effective_scale,
                     control_guidance_scale=control_guidance,
                 )
+                if control_cfg_active
+                else None
+            )
+            if not cfg_lockstep:
+                step_cfg_split = None
+            elif control_branches is not None:
+                step_cfg_split = tuple(b["cache_key"] for b in control_branches)
+            elif do_cfg and effective_scale != 1.0:
+                step_cfg_split = ("cond", "uncond")
+            else:
+                step_cfg_split = None
+            if i > 0 and step_cfg_split != prev_step_cfg_split:
+                # Each rank caches only its share of the split branches; once that
+                # changes, a miss on one rank alone would issue unmatched all-gathers.
+                self.transformer.reset_cache()
+            prev_step_cfg_split = step_cfg_split
+
+            if control_branches is not None:
                 noise_pred = self._predict_noise_cfg(
-                    branches,
+                    control_branches,
                     latents=latents,
                     timestep=timestep,
                     video_shape=video_shape,
                     fps=fps,
                     cfg_rank=cfg_rank,
                     cfg_world_size=cfg_world_size,
+                    cfg_lockstep=cfg_lockstep,
                     noisy_frame_mask=velocity_mask,
                     current_timestep=i,
                     sound_latents=sound_latents,
@@ -1932,6 +1976,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         fps=fps,
                         cfg_rank=cfg_rank,
                         cfg_world_size=cfg_world_size,
+                        cfg_lockstep=cfg_lockstep,
                         noisy_frame_mask=velocity_mask,
                         current_timestep=i,
                         sound_latents=sound_latents,
@@ -2060,12 +2105,23 @@ class Cosmos3DenoisingStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if batch.extra.get("transfer_plan") is not None:
             return self._forward_transfer(batch, server_args)
-        with self.use_declared_component(
-            component_name="transformer",
-            module=self.transformer,
-            phase="denoise",
+        with (
+            self.use_declared_component(
+                component_name="transformer",
+                module=self.transformer,
+                phase="denoise",
+            ),
+            self._bind_request(batch),
         ):
             return self._denoise_once(batch, server_args)
+
+    @contextmanager
+    def _bind_request(self, batch: Req):
+        self._request_batch = batch
+        try:
+            yield
+        finally:
+            self._request_batch = None
 
     def _predict_noise_cfg(
         self,
@@ -2077,6 +2133,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         fps: float,
         cfg_rank: int,
         cfg_world_size: int,
+        cfg_lockstep: bool = False,
         noisy_frame_mask: torch.Tensor | None = None,
         current_timestep: int | None = None,
         sound_latents: torch.Tensor | None = None,
@@ -2107,9 +2164,14 @@ class Cosmos3DenoisingStage(PipelineStage):
         of the single-GPU control-free text CFG paths.
         """
         local_preds: dict[int, tuple[torch.Tensor, ...]] = {}
-        for i, branch in enumerate(branches):
-            if i % cfg_world_size != cfg_rank:
-                continue
+        for round_start in range(0, len(branches), cfg_world_size):
+            i = round_start + cfg_rank
+            # Under lockstep a rank with no branch left reruns the round's first one
+            # and discards it, so every rank runs the same number of forwards.
+            is_pad = i >= len(branches)
+            if is_pad and not cfg_lockstep:
+                break
+            branch = branches[round_start] if is_pad else branches[i]
             out = self._run_transformer(
                 latents=latents,
                 timestep=timestep,
@@ -2129,6 +2191,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                 action_start_frame_offset=action_start_frame_offset,
                 control_latents=branch["control_latents"],
             )
+            if is_pad:
+                continue
             local_preds[i] = out if isinstance(out, tuple) else (out,)
 
         if cfg_world_size > 1:
@@ -2522,8 +2586,6 @@ class Cosmos3DecodingStage(PipelineStage):
     Returns OutputBatch instead of Req to signal pipeline completion.
     """
 
-    parallelism_type = StageParallelismType.REPLICATED
-
     def __init__(self, vae, guardrails: bool = False, sound_tokenizer=None):
         super().__init__()
         self.vae = vae
@@ -2537,6 +2599,10 @@ class Cosmos3DecodingStage(PipelineStage):
             )
 
             _init_guardrails()
+
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        return decode_parallelism_type(self.vae)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()

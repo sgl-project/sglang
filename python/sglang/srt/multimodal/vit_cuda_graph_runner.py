@@ -67,7 +67,7 @@ class ViTCudaGraphRunner:
         self._sin_cos_ws_by_graph: Dict[
             Hashable, Tuple[torch.Tensor, torch.Tensor]
         ] = {}
-        self.max_context_len = getattr(vit, "max_context_len", None)
+        self.max_position_embeddings = getattr(vit, "max_position_embeddings", None)
 
         # Qwen2.5-VL specific viarable.
         self._fullatt_block_indexes = set(getattr(vit, "fullatt_block_indexes", ()))
@@ -113,7 +113,7 @@ class ViTCudaGraphRunner:
             previous_seq_len = previous[0].size(0) if previous is not None else 0
             previous_head_dim = previous[0].size(1) if previous is not None else 0
             max_shape = max(
-                self.max_context_len or 0,
+                self.max_position_embeddings or 0,
                 previous_seq_len * 2,
                 seq_len,
             )
