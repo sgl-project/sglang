@@ -8,7 +8,7 @@ A hybrid model's linear-attention layers carry a recurrent state instead of per-
 
 | Level | Checkpoints | Best for |
 |---|---|---|
-| `2` (default) | Where two requests' prompts diverge, and where each request ends (on a PD prefill worker, where its prompt ends). A soft cap of one checkpoint per path, unless explicitly overridden. | Multi-turn chat, agents and tool loops, where each request extends the previous one's full context. |
+| `2` (default) | Where two requests' prompts diverge, where each request's prompt ends, and where each request ends. A soft cap of one checkpoint per path, unless explicitly overridden. | Multi-turn chat, agents and tool loops, where each request extends the previous one's prompt or full context. |
 | `3` | Also every prefill chunk and every `--mamba-track-interval` decode tokens. | Traffic that reuses the middle of an earlier prompt that no other request has diverged from yet. |
 
 The per-path cap is a pruning target, not a strict state-slot bound. Tail, fork, locked, and device-leaf states can be preserved, so a path may retain multiple checkpoints. Size the state pool for running requests and retained checkpoints, and verify actual occupancy.
@@ -17,10 +17,10 @@ With HiCache in its default `cache` host memory mode, the cap also counts host c
 
 ## What level 2 changes
 
-- **Request-end checkpoints support continued conversations.** Level 2 preserves the checkpointing path used when the next turn extends the previous request's full context. Actual reuse still depends on checkpoint placement, KV and state capacity, eviction, and usable host backups; equal hit rates across levels are not guaranteed.
+- **Prompt-end and request-end checkpoints support continued conversations.** The next turn resumes from the request end when it extends the previous request's full context, and from the prompt end when the chat template does not replay the generated turn (for example, one that drops the reasoning). Actual reuse still depends on checkpoint placement, KV and state capacity, eviction, and usable host backups; equal hit rates across levels are not guaranteed.
 - **Fewer intermediate checkpoints can reduce host and storage writes.** HiCache, storage backends and the external linker receive published checkpoints, including fork and request-end states. Skipping intermediate checkpoints can reduce write traffic and pressure on other sessions' checkpoints; the benefit depends on the workload and cache configuration.
 - **A late fork may need more recomputation.** If a request shares only the first part of an earlier prompt and lacks a matching checkpoint there, it resumes from the nearest usable earlier checkpoint, even if more KV is cached. Publishing a checkpoint at an eligible divergence point can help later siblings while that checkpoint and its KV remain available. Level 3 offers more intermediate checkpoints, but does not guarantee a checkpoint at every possible divergence position.
-- **Ordinary requests defer intermediate cache publication.** Away from fork points and the PD prefill exception, a prompt joins the tree at request finish rather than chunk by chunk, limiting sharing with concurrent requests during prefill.
+- **Ordinary requests defer intermediate cache publication.** Away from fork points, a prompt joins the tree when it is complete rather than chunk by chunk, limiting sharing with concurrent requests during prefill.
 
 Models with both sliding-window and linear-attention layers keep checkpointing every prefill chunk at level 2.
 

@@ -2754,6 +2754,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             mask = boundary is not None
             mamba_track_seqlen_aligned = prefix_len if boundary is None else boundary
+        earlier = mamba_track_seqlen_aligned - checkpoint_grid
+        prompt_end_checkpoint = (
+            mask
+            and mamba_track_seqlen_aligned == seq_end == len(req.origin_input_ids)
+            and get_exec().mamba.hybrid_cache_checkpoints_level < 3
+            and get_disagg().disaggregation_mode != "prefill"
+            and not self.tree_cache.supports_swa()
+        )
+        if (
+            prompt_end_checkpoint
+            and earlier == prefix_len == req.kv.mamba_last_track_seqlen
+            and branch_checkpoint(
+                prefix_len, req.mamba_branching_seqlen, seq_end, cache_chunk_size
+            )
+            is None
+        ):
+            # A final one-grid chunk has no intermediate h snapshot. Keep the
+            # previous chunk's deferred state so prompt completion can publish it.
+            mask = False
         track_position = req.kv.mamba_next_track_idx
         mamba_track_seqlen = -1
         if mask:
@@ -2789,6 +2808,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # See _force_track_h() for more details.
                 mamba_track_seqlen = _force_track_h(branch)
                 mamba_track_seqlen_aligned = branch
+            elif (
+                prompt_end_checkpoint
+                and earlier > prefix_len
+                and (earlier - prefix_len) % cache_chunk_size == 0
+            ):
+                # Chat templates may rewrite the prompt's last token next turn.
+                # Keep a resumable state before it, without displacing a branch.
+                mamba_track_seqlen_aligned = earlier
+                mamba_track_seqlen = _force_track_h(earlier)
             kv_storage_of(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).advance(
