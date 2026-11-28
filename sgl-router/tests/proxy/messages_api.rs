@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
+use crate::common::cache_aware_fixture;
 use crate::common::mock_worker::MockWorker;
 use crate::common::streaming::collect_body;
 
@@ -450,4 +451,73 @@ async fn oversized_body_uses_the_anthropic_envelope() {
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_anthropic_error(&body, "request_too_large");
+}
+
+#[tokio::test]
+async fn cache_salt_is_forwarded_and_isolates_radix_routing() {
+    use sgl_router::state::kv_events::{CacheNamespace, HashTree, KvWorkerId};
+    use sgl_router::tokenizer::prompt::request_tokens_for;
+
+    let worker_a = MockWorker::start(vec![]).await;
+    let worker_b = MockWorker::start(vec![]).await;
+    let model = cache_aware_fixture::MODEL;
+    let tokenizers = TokenizerRegistry::load_from_config(&cache_aware_fixture::config()).unwrap();
+    let messages = json!([{"role": "user", "content": "same prompt, two tenants"}]);
+    let chat_body = json!({"model": model, "messages": messages});
+    let ids = request_tokens_for(&tokenizers, &ModelId(model.into()), &chat_body)
+        .expect("test prompt tokenizes")
+        .ids;
+
+    // Same prompt tokens, isolated by `cache_salt` across two workers.
+    let tree = HashTree::new();
+    for (worker, salt) in [(&worker_a, "tenant-a"), (&worker_b, "tenant-b")] {
+        let ns = CacheNamespace {
+            cache_salt: Some(salt.into()),
+            ..Default::default()
+        };
+        tree.insert(
+            &KvWorkerId::new(worker.url.clone(), 0),
+            None,
+            &ns.block_hashes(&ids, 1, false),
+        );
+    }
+    let router = cache_aware_fixture::radix_router(
+        &[
+            (&worker_a, WorkerMode::Plain),
+            (&worker_b, WorkerMode::Plain),
+        ],
+        tree,
+    );
+
+    for (salt, expected, other) in [
+        ("tenant-a", &worker_a, &worker_b),
+        ("tenant-b", &worker_b, &worker_a),
+        ("tenant-a", &worker_a, &worker_b),
+        ("tenant-b", &worker_b, &worker_a),
+    ] {
+        for worker in [&worker_a, &worker_b] {
+            worker.captured.lock().unwrap().last_body = None;
+        }
+        let body = json!({
+            "model": model,
+            "max_tokens": 16,
+            "cache_salt": salt,
+            "messages": messages,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let sent = captured(expected).expect("salted request must route to its cached worker");
+        assert!(
+            captured(other).is_none(),
+            "other tenant's worker must not receive the request"
+        );
+        assert_eq!(sent["cache_salt"], salt);
+    }
 }
