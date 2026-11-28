@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
+import socket
 import threading
 import time
 import uuid
@@ -22,6 +24,138 @@ logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
 STORAGE_BATCH_SIZE = 128
+
+
+HICACHE_PREFETCH_TIMING_MARKER = "HICACHE_PREFETCH_TIMING"
+
+_PREFETCH_TIMING_BOUNDARY_FIELDS = (
+    "enqueue_ts",
+    "lookup_start_ts",
+    "lookup_end_ts",
+    "lookup_io_end_ts",
+    "read_start_ts",
+    "read_end_ts",
+    "ack_ready_ts",
+)
+
+
+class PrefetchTimingMixin:
+    """Monotonic timestamps carried by a HiCache prefetch operation."""
+
+    enqueue_ts: Optional[int] = None
+    lookup_start_ts: Optional[int] = None
+    lookup_end_ts: Optional[int] = None
+    read_start_ts: Optional[int] = None
+    read_end_ts: Optional[int] = None
+    lookup_io_end_ts: Optional[int] = None
+    ack_ready_ts: Optional[int] = None
+
+
+def hicache_prefetch_timing_enabled() -> bool:
+    return envs.SGLANG_HICACHE_PREFETCH_TIMING_TRACE.get()
+
+
+def mark_prefetch_timing(operation, field: str) -> None:
+    """Record a lifecycle boundary when timing trace is enabled."""
+    if hicache_prefetch_timing_enabled():
+        timestamp = time.perf_counter_ns()
+        setattr(operation, field, timestamp)
+        log_hicache_prefetch_timing(
+            field.removesuffix("_ts"),
+            timestamp_monotonic_ns=timestamp,
+            **_prefetch_timing_identity(operation),
+        )
+
+
+def log_hicache_prefetch_timing(event: str, **fields: Any) -> None:
+    """Emit one structured record without prompt, token, or hash content."""
+    if not hicache_prefetch_timing_enabled():
+        return
+    payload = {
+        "event": event,
+        "run_id": envs.SGLANG_HICACHE_TRACE_RUN_ID.get(),
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        **fields,
+    }
+    logger.info(
+        "%s %s",
+        HICACHE_PREFETCH_TIMING_MARKER,
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+    )
+
+
+def _prefetch_timing_durations(operation, consume_ts: int) -> dict:
+    durations = {}
+    stage_pairs = (
+        ("lookup_queue_ns", "enqueue_ts", "lookup_start_ts"),
+        ("lookup_ns", "lookup_start_ts", "lookup_end_ts"),
+        ("lookup_io_ns", "lookup_start_ts", "lookup_io_end_ts"),
+        ("lookup_sync_ns", "lookup_io_end_ts", "lookup_end_ts"),
+        ("read_queue_ns", "lookup_end_ts", "read_start_ts"),
+        ("read_ns", "read_start_ts", "read_end_ts"),
+        ("done_wait_consume_ns", "read_end_ts", None),
+        ("read_ack_wait_ns", "read_end_ts", "ack_ready_ts"),
+        ("ack_wait_consume_ns", "ack_ready_ts", None),
+    )
+    for name, start_field, end_field in stage_pairs:
+        start = getattr(operation, start_field, None)
+        end = consume_ts if end_field is None else getattr(operation, end_field, None)
+        if start is not None and end is not None:
+            delta = end - start
+            if delta >= 0:
+                durations[name] = delta
+    return durations
+
+
+def log_hicache_prefetch_consume(operation, **extra_fields: Any) -> None:
+    """Emit the consume boundary and derived per-stage durations."""
+    if not hicache_prefetch_timing_enabled() or getattr(
+        operation, "_prefetch_consume_logged", False
+    ):
+        return
+    operation._prefetch_consume_logged = True
+    consume_ts = time.perf_counter_ns()
+    fields: dict[str, Any] = {"timestamp_monotonic_ns": consume_ts}
+    fields.update(_prefetch_timing_identity(operation))
+    for name in _PREFETCH_TIMING_BOUNDARY_FIELDS:
+        timestamp = getattr(operation, name, None)
+        if timestamp is not None:
+            fields[name] = timestamp
+    fields.update(_prefetch_timing_durations(operation, consume_ts))
+    fields.update(extra_fields)
+    log_hicache_prefetch_timing("consume", **fields)
+
+
+def log_hicache_prefetch_forward_entries(reqs, timestamp_monotonic_ns=None) -> None:
+    """Emit one forward-entry boundary for each scheduled request."""
+    if not hicache_prefetch_timing_enabled():
+        return
+    timestamp = (
+        timestamp_monotonic_ns
+        if timestamp_monotonic_ns is not None
+        else time.perf_counter_ns()
+    )
+    for req in reqs:
+        rid = getattr(req, "rid", None)
+        if rid is not None:
+            log_hicache_prefetch_timing(
+                "forward_entry",
+                rid=rid,
+                timestamp_monotonic_ns=timestamp,
+                attempt_id=getattr(
+                    getattr(req, "cache_request_handle", None), "attempt_id", None
+                ),
+            )
+
+
+def _prefetch_timing_identity(operation) -> dict:
+    handle = getattr(operation, "handle", None)
+    return {
+        "rid": operation.request_id,
+        "operation_id": getattr(operation, "id", None),
+        "attempt_id": getattr(handle, "attempt_id", None),
+    }
 
 
 @dataclass
