@@ -32,6 +32,9 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import layernorm_sp, zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
+from sglang.srt.layers.attention.dsa.utils import (
+    maybe_prefetch_next_kimi_full_attention_kv,
+)
 from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -93,6 +96,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    filter_moe_weight_param_global_expert,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
@@ -162,7 +166,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
-from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
+from sglang.srt.utils.common import BumpAllocator, LazyValue, get_bool_env_var
 from sglang.srt.utils.log_utils import print_warning_once, rank0_log
 
 if TYPE_CHECKING:
@@ -596,12 +600,16 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         kda_dwdp: Optional[KdaDwdp] = None,
     ):
         super().__init__()
-        # K3 allocates one weight slot per logical expert. Online relocation
-        # and extra replicas require a separate weight-layout implementation.
-        if get_exec().moe.enable_eplb or get_exec().moe.ep_num_redundant_experts:
-            raise ValueError(
-                "Kimi-K3 supports initial expert placement without online EPLB "
-                "or redundant experts."
+        # K3 allocates one weight slot per logical expert, so EPLB relocates
+        # experts but cannot add replicas.
+        if get_exec().moe.ep_num_redundant_experts:
+            raise ValueError("Kimi-K3 does not support redundant experts.")
+        if get_moe_a2a_backend().is_megamoe() and not _is_hip:
+            from sglang.srt.layers.moe.mega_moe import check_mega_moe_num_experts
+
+            check_mega_moe_num_experts(
+                getattr(config, "n_routed_experts", config.num_experts),
+                get_parallel().moe_ep_size,
             )
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
@@ -861,6 +869,16 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
             and self.routed_expert_up_proj.weight.is_contiguous()
         )
+
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
+        ]
 
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
@@ -1365,6 +1383,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         shared_output = None
         shared_event = None
         shared_compute_event = None
+        shared_alt_output = None
 
         def issue_shared():
             nonlocal shared_input, shared_output, shared_event
@@ -1386,7 +1405,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 shared_input = hidden_states
                 if self._shared_experts_tp_comm:
                     shared_input = self._gather_shared_expert_inputs(hidden_states)
-                shared_input.record_stream(self.alt_stream)
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
@@ -1441,18 +1459,30 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 pre_handle.remove()
 
         def wait_and_finalize_shared_experts():
-            nonlocal shared_output
+            nonlocal shared_output, shared_alt_output
             if shared_event is None:
                 return
             # Join just before consuming the shared result. The legacy path
             # still needs to reduce-scatter its TP-partial MLP output here.
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
-            shared_output.record_stream(current_stream)
+            # TODO: Remove this workaround once PTA fixes side-stream graph capture.
+            if _is_npu:
+                shared_output.record_stream(current_stream)
+            else:
+                shared_alt_output = shared_output
             if self._shared_experts_tp_comm and not fine_grained_overlap:
                 shared_output = self._reduce_scatter_shared_experts(
                     shared_output, hidden_states
                 )
+                if shared_output is not shared_alt_output:
+                    release_shared_output()
+
+        def release_shared_output():
+            nonlocal shared_alt_output
+            if shared_alt_output is not None:
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                shared_alt_output = None
 
         # Give the NPU shared-expert branch a head start. At this point
         # hidden_states is the decoder layer's post-attention RMSNorm output.
@@ -1484,6 +1514,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             wait_and_finalize_shared_experts()
             if shared_output is not None:
                 expert_output = expert_output + shared_output
+            release_shared_output()
             return expert_output
 
         # Latent MoE: compress after routing, before experts
@@ -1522,7 +1553,10 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 and not self._shared_experts_tp_comm
             ):
                 shared_output = self._reduce_shared(shared_output)
+                if shared_output is not shared_alt_output:
+                    release_shared_output()
             out = _add3(out, shared_output, prefix_sum)
+            release_shared_output()
             return out
         out = out if prefix_sum is None else out + prefix_sum
         return out
@@ -3188,6 +3222,7 @@ class KimiK3DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self._is_moe_layer = _is_moe_layer(config, layer_idx)
+        self.next_full_attention_layer_id = None
         # SP-MoE: with an EP a2a backend and attention TP, a MoE layer runs on
         # this rank's attention-TP shard of the rows.
         self._sp_moe = self._is_moe_layer and _shards_moe_rows()
@@ -3380,6 +3415,9 @@ class KimiK3DecoderLayer(nn.Module):
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
 
+        maybe_prefetch_next_kimi_full_attention_kv(
+            forward_batch, self.next_full_attention_layer_id
+        )
         return result
 
     def forward(
@@ -3553,6 +3591,17 @@ class KimiK3LinearModel(nn.Module):
                 config, idx, sp_collective=sp_collective
             ),
         )
+        local_full_layers = [
+            i
+            for i in config.full_attention_layer_ids
+            if self.start_layer <= i < self.end_layer
+        ]
+        for layer_id, next_layer_id in zip(local_full_layers, local_full_layers[1:]):
+            self.layers[layer_id].next_full_attention_layer_id = next_layer_id
+        # A leading KDA layer can prefetch the first local Full Attention layer.
+        if local_full_layers and self.start_layer < local_full_layers[0]:
+            first_layer = self.layers[self.start_layer]
+            first_layer.next_full_attention_layer_id = local_full_layers[0]
         if self.kda_dwdp is not None:
             self.kda_dwdp.build()
         if _is_gfx95:
@@ -3750,6 +3799,10 @@ class KimiK3LinearForCausalLM(nn.Module):
             num_groups=config.num_expert_group,
         )
 
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
+
     # ModelSlim describes quantization with the original checkpoint module
     # names. Register the runtime fused QKVG module so it can resolve the
     # q_proj scheme while the weight loader packs q/k/v/g into its shards.
@@ -3812,6 +3865,13 @@ class KimiK3LinearForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, KimiK3MoE)
+            }
+        )
         self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self):
@@ -3865,8 +3925,11 @@ class KimiK3LinearForCausalLM(nn.Module):
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
-            if input_ids is None and layernorm_sp.runs_sp(
-                forward_batch.forward_mode, embeds.shape[0]
+            if (
+                self.pp_group.world_size == 1
+                and input_ids is None
+                and embeds is not None
+                and layernorm_sp.runs_sp(forward_batch.forward_mode, embeds.shape[0])
             ):
                 # The multimodal routine passes embeddings only, and the logits
                 # processor gathers by the ids' count.
@@ -4311,6 +4374,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return KimiK3LinearForCausalLM.get_model_config_for_expert_location(
             config.text_config
         )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self.language_model.routed_experts_weights_of_layer
 
     supports_cuda_vmm_feature_transport = True
 

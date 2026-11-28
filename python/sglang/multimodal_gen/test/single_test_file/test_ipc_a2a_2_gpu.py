@@ -197,7 +197,8 @@ def _worker() -> int:
 
 def _tp_worker() -> int:
     """One rank: a row-parallel layer's all-reduce folded into the Z-Image norm
-    kernel against the all-reduce followed by the unfused kernels."""
+    kernel, Qwen-Image-2.1's gate and MiniMax-H3's gate kernels, against the
+    all-reduce followed by the unfused kernels."""
     import torch.distributed as dist
 
     from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -209,9 +210,17 @@ def _tp_worker() -> int:
     torch.set_grad_enabled(False)  # as when serving; the staged GEMM needs it
     maybe_init_distributed_environment_and_model_parallel(tp_size=_WORLD, sp_size=1)
 
-    from sglang.kernels.ops.diffusion import residual_gate_add
+    from sglang.kernels.ops.diffusion import (
+        can_use_indexed_gate_bf16_sum2,
+        indexed_gate_bf16_,
+        indexed_gate_bf16_sum2_,
+        indexed_gate_rmsnorm_scale_shift_,
+        indexed_gate_rmsnorm_scale_shift_sum2_,
+        residual_gate_add,
+    )
     from sglang.multimodal_gen.runtime.distributed.device_communicators.tp_peer_partial import (
         TP_PEER_PARTIALS,
+        staged_partials,
     )
     from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
     from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
@@ -287,6 +296,60 @@ def _tp_worker() -> int:
                     failures.append(f"gate declined {where}")
                 if not torch.equal(raw(gated), raw(gated_ref)):
                     failures.append(f"gate {where}")
+
+    # MiniMax-H3: out_proj -> gate + norm2 modulation, fc2 -> gate, per-token
+    # rows of small AdaLN tables picked by index; H3's 5376-wide rows (three
+    # 2048-column tiles, the last one masked) and a narrower power of two
+    for dim, tokens in ((5376, 4133), (5376, 77), (1024, 2048)):
+        shared = torch.Generator(device="cuda").manual_seed(11)
+        mine = torch.Generator(device="cuda").manual_seed(200 + rank)
+
+        def randn(*shape, generator):
+            return torch.randn(
+                *shape, dtype=torch.bfloat16, device="cuda", generator=generator
+            )
+
+        layer = RowParallelLinear(2048, dim, bias=False, input_is_parallel=True)
+        layer.weight.data = randn(dim, 1024, generator=mine) / 32
+        tables = 6
+        gate = randn(tables, dim, generator=shared)
+        # shift and scale as the chunk views of one [tables, 2 * dim] tensor
+        shift, scale = (0.1 * randn(tables, 2 * dim, generator=shared)).chunk(2, -1)
+        weight = 1 + 0.1 * randn(dim, generator=shared)
+        indices = torch.randint(
+            0, tables, (tokens,), device="cuda", generator=shared
+        ).to(torch.int64)
+        for _ in range(3):
+            hidden = randn(tokens, 1024, generator=mine)
+            residual = randn(tokens, dim, generator=shared)
+            reduced, _ = layer(hidden)
+            where = f"h3 dim={dim} tokens={tokens}"
+
+            x_ref = indexed_gate_bf16_(residual.clone(), gate, reduced, indices)
+            calls = TP_PEER_PARTIALS.calls
+            partials = staged_partials(layer, hidden, residual)
+            if partials is None or TP_PEER_PARTIALS.calls == calls:
+                failures.append(f"declined {where}")
+                continue
+            if not can_use_indexed_gate_bf16_sum2(residual, gate, *partials, indices):
+                failures.append(f"gate operands rejected {where}")
+            x = indexed_gate_bf16_sum2_(residual.clone(), gate, *partials, indices)
+            if not torch.equal(raw(x), raw(x_ref)):
+                failures.append(f"gate {where}")
+
+            x_ref = residual.clone()
+            y_ref = indexed_gate_rmsnorm_scale_shift_(
+                x_ref, gate, reduced, weight, shift, scale, indices, 1e-6
+            )
+            partials = staged_partials(layer, hidden, residual)
+            x = residual.clone()
+            y = indexed_gate_rmsnorm_scale_shift_sum2_(
+                x, gate, *partials, weight, shift, scale, indices, 1e-6
+            )
+            if not torch.equal(raw(x), raw(x_ref)):
+                failures.append(f"gate + norm2 residual {where}")
+            if not torch.equal(raw(y), raw(y_ref)):
+                failures.append(f"gate + norm2 modulation {where}")
 
     # both arms taking the all-reduce would pass while testing nothing
     if not TP_PEER_PARTIALS.inited or not TP_PEER_PARTIALS.calls:

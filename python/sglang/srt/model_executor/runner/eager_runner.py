@@ -57,13 +57,11 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_mlu, is_npu
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 logger = logging.getLogger(__name__)
-
-_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -203,10 +201,17 @@ class EagerRunner(BaseRunner):
     ) -> Any:
         with self.model_context():
             mode = forward_batch.forward_mode
-            if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
+            mixed_as_extend = (
+                mode.is_mixed()
+                and not is_mlu()
+                and not is_npu()
+                and get_cp_strategy() is None
+            )
+            if mixed_as_extend:
                 # A mixed batch is extend-shaped (decode tails are 1-token
-                # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
-                # kernel; CP keeps it to skip the zigzag split.
+                # extends); run it as EXTEND. MLU and NPU keep MIXED for their
+                # dedicated paths; CP keeps it to skip the zigzag split.
+                forward_batch.eager_mixed_as_extend = True
                 forward_batch.forward_mode = ForwardMode.EXTEND
                 mode = ForwardMode.EXTEND
             if mode.is_decode():
@@ -214,7 +219,9 @@ class EagerRunner(BaseRunner):
             if mode.is_idle():
                 return self._execute_idle(forward_batch, pp_proxy_tensors)
             if mode.is_extend(include_draft_extend_v2=True):
-                return self._execute_extend(forward_batch, pp_proxy_tensors)
+                return self._execute_extend(
+                    forward_batch, pp_proxy_tensors, mixed_as_extend=mixed_as_extend
+                )
             raise ValueError(f"Invalid forward mode for eager runner: {mode}")
 
     def _execute_decode(
@@ -250,11 +257,14 @@ class EagerRunner(BaseRunner):
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors=None,
+        mixed_as_extend: bool = False,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
 
         forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+        if mixed_as_extend:
+            forward_batch.eager_mixed_as_extend = True
 
         cp_active = is_cp_active(forward_batch)
         if cp_active:

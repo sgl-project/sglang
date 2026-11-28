@@ -159,6 +159,7 @@ from sglang.srt.utils import (
     numa_utils,
     set_ulimit,
 )
+from sglang.srt.utils.foundry_adapter import activate_foundry
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -911,8 +912,9 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
+        # Elastic EP offset joiners always use the DPC; the primary owns the tokenizer.
         use_dp_controller = (
-            get_parallel().num_dp_ranks > 1 or get_exec().moe.ep_join_mode == "scale"
+            get_parallel().num_dp_ranks > 1 or get_exec().moe.is_ep_offset_joiner
         )
         prelaunch_dp_schedulers = (
             use_dp_controller
@@ -923,6 +925,9 @@ class Engine(EngineScoreMixin, EngineBase):
         prelaunched_schedulers = {}
         rust_listener_procs = []
 
+        # Foundry (--cuda-graph-persistence) is activated here at the latest;
+        # it wraps every spawn below with its hook preload and environment pins.
+        foundry_adapter = activate_foundry(server_args)
         if not use_dp_controller or prelaunch_dp_schedulers:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -937,10 +942,13 @@ class Engine(EngineScoreMixin, EngineBase):
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=prelaunch_dp_schedulers)
-                    gpu_id = (
-                        get_device().base_gpu_id
-                        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                        + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
+                    gpu_id = compute_local_gpu_id(
+                        pp_rank,
+                        tp_rank,
+                        pp_size_per_node,
+                        tp_size_per_node,
+                        base_gpu_id=get_device().base_gpu_id,
+                        gpu_id_step=get_device().gpu_id_step,
                     )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
@@ -961,6 +969,7 @@ class Engine(EngineScoreMixin, EngineBase):
                         proc = mp.Process(target=target, args=args)
                         with (
                             memory_saver_adapter.configure_subprocess(),
+                            foundry_adapter.configure_subprocess(server_args),
                             numa_utils.configure_subprocess(server_args, gpu_id),
                         ):
                             proc.start()
@@ -992,7 +1001,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 ),
             )
             try:
-                proc.start()
+                # The controller passes the hook preload on to its schedulers.
+                with foundry_adapter.configure_subprocess(server_args):
+                    proc.start()
             finally:
                 for _, init_pipe in prelaunched_schedulers.values():
                     init_pipe.close()
@@ -1416,9 +1427,9 @@ class Engine(EngineScoreMixin, EngineBase):
             )
 
             # Get back some info from scheduler to tokenizer_manager
-            tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
-                0
-            ]["max_req_input_len"]
+            scheduler_info = scheduler_init_result.scheduler_infos[0]
+            tokenizer_manager.max_req_len = scheduler_info["max_req_len"]
+            tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
 
             # Set up subprocess liveness watchdog to detect crashes
             # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
@@ -1460,6 +1471,7 @@ class Engine(EngineScoreMixin, EngineBase):
             port_args,
             TokenizerManagerClass=get_tokenizer_worker_class(server_args),
         )
+        tokenizer_manager.max_req_len = scheduler_info["max_req_len"]
         tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
         tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
         return tokenizer_manager, template_manager
@@ -1748,7 +1760,7 @@ class Engine(EngineScoreMixin, EngineBase):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
-        serialized_named_tensors = self._serialize_tensors_per_rank(
+        serialized_named_tensors = self.serialize_tensors_per_rank(
             named_tensors, load_format
         )
         obj = UpdateWeightsFromTensorReqInput(
@@ -1801,22 +1813,24 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
-    def _serialize_tensors_per_rank(
+    def serialize_tensors_per_rank(
         self,
         tensors,
         load_format: Optional[str],
     ) -> List[bytes]:
-        """One serialized payload per TP rank: each rank deserializes only its
-        own copy, so producer-side CUDA-IPC refcounts drop cleanly after every
-        load. flattened_bucket callers pass pre-serialized per-rank payloads."""
+        """One serialized payload per engine rank (tp_size * pp_size, in world
+        rank order): each rank deserializes only its own copy, so producer-side
+        CUDA-IPC refcounts drop cleanly after every load. flattened_bucket
+        callers pass pre-serialized per-rank payloads."""
         if load_format == "flattened_bucket":
             return normalize_serialized_named_tensor_payloads(
                 cast(List[SerializedTensorPayload], tensors)
             )
         else:
+            parallel = get_parallel()
             return [
                 MultiprocessingSerializer.serialize(tensors)
-                for _ in range(get_parallel().tp_size)
+                for _ in range(parallel.tp_size * parallel.pp_size)
             ]
 
     def load_lora_adapter_from_tensors(
@@ -1826,9 +1840,7 @@ class Engine(EngineScoreMixin, EngineBase):
         config_dict: Dict,
         load_format: Optional[str] = None,
     ):
-        serialized_named_tensors = self._serialize_tensors_per_rank(
-            tensors, load_format
-        )
+        serialized_named_tensors = self.serialize_tensors_per_rank(tensors, load_format)
         lora_req = LoadLoRAAdapterFromTensorsReqInput(
             lora_name=lora_name,
             config_dict=config_dict,
@@ -1925,7 +1937,8 @@ class Engine(EngineScoreMixin, EngineBase):
         result = self.loop.run_until_complete(
             self.tokenizer_manager.collective_rpc(obj)
         )
-        assert result.success, result.message
+        if not result.success:
+            raise RuntimeError(f"collective_rpc {method!r} failed: {result.message}")
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)

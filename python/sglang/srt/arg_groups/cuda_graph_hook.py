@@ -223,7 +223,13 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
             "unvalidated a2a backend",
             lambda: (
                 resolved_view(server_args).moe_a2a_backend
-                not in ("none", "deepep", "megamoe", "flashinfer_nvlink_one_sided")
+                not in (
+                    "none",
+                    "deepep",
+                    "megamoe",
+                    "flashinfer_nvlink_one_sided",
+                    "flashinfer_megamoe",
+                )
             ),
         ),
         # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
@@ -346,6 +352,61 @@ def apply_deepep_adjustments(server_args: Any):
             )
 
 
+def handle_cuda_graph_persistence(server_args: Any):
+    """Activate Foundry and pin what a restored graph cannot replay;
+    runs before the prefill defaults, a contrary explicit value falls back natively."""
+    cfg = resolving_view(server_args)
+    if cfg.cuda_graph_persistence is None:
+        if cfg.cuda_graph_persistence_config is not None:
+            raise ValueError(
+                "--cuda-graph-persistence-config requires --cuda-graph-persistence "
+                "{save,load}"
+            )
+        return
+    # Decided before Foundry is activated: activation pins this process's environment.
+    if (
+        cfg.disable_cuda_graph
+        or cfg.disable_decode_cuda_graph
+        or cfg.cuda_graph_backend_decode == Backend.DISABLED
+    ):
+        logger.info(
+            "--cuda-graph-persistence is inactive: decode CUDA graphs are disabled, "
+            "so there is nothing to persist."
+        )
+        _drop_cuda_graph_persistence(server_args)
+        return
+    if cfg.enable_unified_memory:
+        logger.warning(
+            "--cuda-graph-persistence does not support --enable-unified-memory; "
+            "persistence is disabled and the server initializes natively."
+        )
+        _drop_cuda_graph_persistence(server_args)
+        return
+    from sglang.srt.utils.foundry_adapter import activate_foundry
+
+    activate_foundry(server_args).pin_server_args(server_args)
+
+
+def _drop_cuda_graph_persistence(server_args: Any) -> None:
+    # The record then resolves as without the flag, in this process and its spawns.
+    declare_resolution(
+        server_args,
+        "handle_cuda_graph_persistence",
+        cuda_graph_persistence=None,
+        cuda_graph_persistence_config=None,
+    )
+
+
+def validate_cuda_graph_persistence(server_args: Any):
+    """After handle_other_validations: reject features Foundry cannot persist,
+    re-check the pins and the resolved graph config."""
+    if resolving_view(server_args).cuda_graph_persistence is None:
+        return
+    from sglang.srt.utils.foundry_adapter import get_foundry_adapter
+
+    get_foundry_adapter().validate_resolved_server_args(server_args)
+
+
 def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     """Inkling opts into full-graph prefill CUDA-graph capture. Must run
     before _handle_cuda_graph_config: the generic breakable default is
@@ -360,11 +421,13 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
         or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
     ):
         return
+    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
+
     arch = model_config_of(server_args).hf_config.architectures[0]
     if arch in (
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
-        "Inkling2ForConditionalGeneration",
+        *INKLING2_ARCHS,
     ):
         declare_resolution(
             server_args,
