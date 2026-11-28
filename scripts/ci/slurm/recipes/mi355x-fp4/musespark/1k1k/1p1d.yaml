@@ -1,0 +1,75 @@
+# MI355X Muse Spark Open (MXFP4) 2-node 1P1D disaggregation recipe (base).
+#
+# Basic PD coverage for Muse Spark: one TP8/EP8 prefill node and one TP8/EP8
+# decode node over MORI, no speculative decoding. Server settings follow the
+# single-node registered test
+# test/registered/amd/accuracy/mi35x/test_muse_spark_mxfp4_eval_mi35x.py
+# (aiter attention, page size 16, FP8 KV cache, SWA full-tokens ratio 0.2,
+# muse reasoning/tool parsers) minus DFlash2, which this launcher does not wire.
+# On ROCm the model runs through sglang.srt.rocm_muse_spark automatically.
+#
+# Consumed by:
+#   * scripts/ci/slurm/process_result.py reads `resources` and
+#     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
+#   * scripts/ci/slurm/launch_mi355x.sh reads `runtime`, `bench`, `model`.
+
+resources:
+  prefill_workers: 1
+  decode_workers: 1
+
+backend:
+  sglang_config:
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 8
+      data-parallel-size: 1
+    decode:
+      tensor-parallel-size: 8
+      expert-parallel-size: 8
+      data-parallel-size: 1
+
+# Model-specific docker env + sglang server args (written verbatim via
+# model_flags.sh). Each server arg + value is a SEPARATE list item.
+model:
+  env:
+    SGLANG_USE_AITER: 1
+    SGLANG_USE_AITER_UNIFIED_ATTN: 1
+  server_args:
+    - --kv-cache-dtype
+    - fp8_e4m3
+    # Loading the ~470 GB checkpoint must not be mistaken for a hang.
+    - --watchdog-timeout
+    - 1800
+    - --reasoning-parser
+    - muse
+    - --tool-call-parser
+    - muse
+
+runtime:
+  attention_backend: aiter
+  # RoCE HCAs MORI uses for cross-node KV transfer.
+  ib_devices: rdma0,rdma1,rdma2,rdma3
+  prefill_port: 30025
+  decode_port: 30026
+  prefill_bootstrap_port: 8998
+  decode_bootstrap_port: 9001
+  lb_port: 8000
+  mem_fraction_static: 0.85
+  page_size: 16
+  max_running_requests: 256
+  chunked_prefill_size: 8192
+  swa_full_tokens_ratio: 0.2
+
+bench:
+  # bench_serving --max-concurrency sweep; one result JSON per concurrency.
+  concurrencies: [1, 8, 16, 32, 64, 128, 256]
+  num_prompts_factor: 4      # num-prompts = concurrency * factor
+  random_range_ratio: 1.0
+
+  # Correctness gate run through the PD path before the perf sweep
+  # (full GSM8K, 8-shot, accuracy > 0.91).
+  accuracy:
+    enabled: true
+    num_shots: 8
+    num_questions: 1319    # full GSM8K test set
+    threshold: 0.91
