@@ -1664,13 +1664,61 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         out_dtype: Optional[torch.dtype] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run decode, optionally sorting and splitting requests by KV length."""
-
+        """Run decode on the query rows the plan covers (requests x q_len_per_req)."""
         resolved_out_dtype = (
             out_dtype
             if out_dtype is not None
             else (out.dtype if out is not None else self.q_data_type)
         )
+        planned_rows = seq_lens.shape[0] * q_len_per_req
+        padded_output = None
+        if planned_rows < query.shape[0]:
+            # DP-attention padding added after a pre-pad plan (eager EAGLE draft);
+            # the kernel takes its batch from the query and would read past the plan.
+            padded_output = (
+                query.new_empty(query.shape, dtype=resolved_out_dtype)
+                if out is None
+                else out
+            )
+            padded_output[planned_rows:].zero_()
+            if planned_rows == 0:
+                return padded_output
+            query, out = query[:planned_rows], padded_output[:planned_rows]
+        output = self._run_decode_groups(
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            window_left=window_left,
+            sinks=sinks,
+            q_len_per_req=q_len_per_req,
+            kv_cache_sf=kv_cache_sf,
+            out=out,
+            out_dtype=resolved_out_dtype,
+            mask=mask,
+        )
+        return output if padded_output is None else padded_output
+
+    def _run_decode_groups(
+        self,
+        *,
+        query: torch.Tensor,
+        kv_cache,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        bmm1_scale,
+        bmm2_scale,
+        window_left: int,
+        sinks: Optional[torch.Tensor],
+        q_len_per_req: int,
+        kv_cache_sf,
+        out: Optional[torch.Tensor],
+        out_dtype: torch.dtype,
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run decode, optionally sorting and splitting requests by KV length."""
 
         def run_group(group_query, group_block_tables, group_seq_lens, group_out=None):
             kwargs = {}
@@ -1696,7 +1744,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     sinks=sinks,
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                     out=group_out,
-                    out_dtype=None if group_out is not None else resolved_out_dtype,
+                    out_dtype=None if group_out is not None else out_dtype,
                     kv_cache_sf=kv_cache_sf,
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                     **kwargs,
@@ -1717,7 +1765,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 num_splits=num_splits,
                 q_len_per_req=q_len_per_req,
                 out=out,
-                out_dtype=resolved_out_dtype,
+                out_dtype=out_dtype,
                 run_group=run_group,
             )
 
@@ -1730,7 +1778,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if out is not None
             else torch.empty(
                 query_by_request.shape,
-                dtype=resolved_out_dtype,
+                dtype=out_dtype,
                 device=query.device,
             )
         )

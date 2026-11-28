@@ -1482,6 +1482,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return self._forward_extend_in_graph(
                 layer=layer, mixed_qkv=mixed_qkv, a=a, b=b
             )
+        verify_pad_rows = 0
+        if is_target_verify:
+            # MLP-sync pads the token axis to the attention TP multiple, which need
+            # not be a multiple of the draft width; those rows belong to no request.
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            verify_rows = seq_len // draft_token_num * draft_token_num
+            verify_pad_rows = seq_len - verify_rows
+            if verify_pad_rows:
+                mixed_qkv = mixed_qkv[:verify_rows]
+                a = a[:verify_rows]
+                b = b[:verify_rows]
+                seq_len = verify_rows
         forward_metadata = self.forward_metadata
 
         query_start_loc = forward_metadata.query_start_loc
@@ -1752,6 +1764,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     h_track_buf=h_track_buf,
                 )
 
+        if verify_pad_rows:
+            # Token axis is dim -3 in both output layouts ([1, T, HV, V], [T, HV, V]).
+            core_attn_out = torch.nn.functional.pad(
+                core_attn_out, (0, 0, 0, 0, 0, verify_pad_rows)
+            )
         return core_attn_out
 
     def _forward_extend_mis(
