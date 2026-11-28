@@ -12,9 +12,27 @@ import msgspec
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    Derived,
 )
 from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 from sglang.srt.utils.common import human_readable_int
+
+# Fallback for --mamba-full-memory-ratio when neither the caller nor a model
+# override supplies one.
+MAMBA_FULL_MEMORY_RATIO_FALLBACK = 0.9
+
+
+def max_running_requests_is_explicit_of(cfg) -> bool:
+    from sglang.srt.arg_groups.model_override_base import record_of
+
+    return record_of(cfg).max_running_requests is not None
+
+
+def mamba_full_memory_ratio_is_fallback_of(cfg) -> bool:
+    """True when nobody chose the Mamba/KV memory split: the caller left
+    --mamba-full-memory-ratio unset and no model override declared one, so
+    the field falls back to MAMBA_FULL_MEMORY_RATIO_FALLBACK."""
+    return cfg.mamba_full_memory_ratio is None
 
 
 class Schedule(msgspec.Struct):
@@ -33,6 +51,10 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of running requests.",
     ] = None
+    max_running_requests_is_explicit = Derived(
+        doc="Whether the caller supplied a request limit before resolution.",
+        fn="sglang.srt.arg_groups.fields.schedule.max_running_requests_is_explicit_of",
+    )
     # Recorded by the cache hook from the raw input: a value resolved for the model
     # (DeepSeek-V4's default) leaves it False.
     _max_running_requests_explicitly_set: A[
@@ -264,9 +286,16 @@ class Schedule(msgspec.Struct):
         Arg(
             help="The ratio of mamba state memory to full kv cache memory.",
             resolvable=True,
-            fallback=0.9,
+            fallback=MAMBA_FULL_MEMORY_RATIO_FALLBACK,
         ),
     ] = None
+    mamba_full_memory_ratio_is_fallback = Derived(
+        doc=(
+            "Whether the Mamba/KV memory split is the fallback ratio, i.e. "
+            "neither the caller nor a model override chose it."
+        ),
+        fn="sglang.srt.arg_groups.fields.schedule.mamba_full_memory_ratio_is_fallback_of",
+    )
 
     # -------------------------------------------------------------------------
     # Prefill delayer
