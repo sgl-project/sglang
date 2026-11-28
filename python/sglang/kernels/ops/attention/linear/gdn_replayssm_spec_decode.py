@@ -60,6 +60,7 @@ def gdn_replayssm_spec_circular_kernel(
     dt_bias,  # [HV] fp32
     o,  # [total_tokens, HV, V]  preallocated output
     h0,  # [num_slots, HV, V, K]  checkpoint (read-only in verify)
+    h0_scale,  # [num_slots, HV, V] fp32 (layer slice)
     d_cache,  # [num_slots, HV, L, V]  chunked deltas (output reconstruction only)
     k_cache,  # [num_slots, H, L, K]  L2-normalized keys (output reconstruction only)
     g_cache,  # [num_slots, HV, L]  fp32
@@ -80,6 +81,8 @@ def gdn_replayssm_spec_circular_kernel(
     stride_b_t: tl.constexpr,
     stride_o_t: tl.constexpr,  # per-token stride of o (= HV*V)
     stride_state_slot: tl.constexpr,
+    stride_scale_slot: tl.constexpr,
+    stride_scale_hv: tl.constexpr,
     stride_d_slot: tl.constexpr,
     stride_k_slot: tl.constexpr,
     stride_g_slot: tl.constexpr,
@@ -103,6 +106,7 @@ def gdn_replayssm_spec_circular_kernel(
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     STATE_FP32: tl.constexpr,
+    TEMPORAL_INT8: tl.constexpr,
     STORE_EXACT_RAW: tl.constexpr,
     STORE_D_RESIDUAL: tl.constexpr,
     STORE_K_RESIDUAL: tl.constexpr,
@@ -197,6 +201,13 @@ def gdn_replayssm_spec_circular_kernel(
     beta_s = tl.where(mask_s, 1.0 / (1.0 + tl.exp(-b_s)), 0.0)
     G_s = tl.cumsum(g_s, axis=0)
     expG_s = tl.exp(G_s)
+
+    if TEMPORAL_INT8:
+        scale_v = tl.load(
+            h0_scale + state_idx * stride_scale_slot + i_hv * stride_scale_hv + o_v,
+            mask=mask_v,
+            other=1.0,
+        ).to(tl.float32)
 
     if USE_QK_L2NORM_IN_KERNEL:
         qnorm_acc = tl.zeros([BS], dtype=tl.float32)
@@ -358,6 +369,10 @@ def gdn_replayssm_spec_circular_kernel(
                 k_store_tile,
                 mask=spec_kt_mask,
             )
+
+    if TEMPORAL_INT8:
+        hw_q *= scale_v[:, None]
+        hw_k *= scale_v[:, None]
 
     if not IS_FLUSH:
         if has_history:
@@ -956,6 +971,7 @@ def _launch_gdn_spec(
     dt_bias,
     out,
     checkpoint_state,
+    checkpoint_scale,
     d_cache,
     k_cache,
     g_cache,
@@ -1010,6 +1026,17 @@ def _launch_gdn_spec(
     rawk_buf = rawk_cache if rawk_cache is not None else k_cache
     beta_buf = beta_cache if beta_cache is not None else g_cache
 
+    temporal_int8 = checkpoint_state.dtype == torch.int8
+    if temporal_int8:
+        assert checkpoint_scale is not None, "checkpoint_scale required for int8 h0"
+        scale_buf = checkpoint_scale
+        stride_scale_slot = checkpoint_scale.stride(0)
+        stride_scale_hv = checkpoint_scale.stride(1)
+    else:
+        scale_buf = d_cache
+        stride_scale_slot = 0
+        stride_scale_hv = 0
+
     grid = (triton.cdiv(V, BV), B, HV)
     gdn_replayssm_spec_circular_kernel[grid](
         q,
@@ -1021,6 +1048,7 @@ def _launch_gdn_spec(
         dt_bias,
         out,
         checkpoint_state,
+        scale_buf,
         d_cache,
         k_cache,
         g_cache,
@@ -1041,6 +1069,8 @@ def _launch_gdn_spec(
         b.stride(0),
         out.stride(0),
         checkpoint_state.stride(0),
+        stride_scale_slot,
+        stride_scale_hv,
         d_cache.stride(0),
         k_cache.stride(0),
         g_cache.stride(0),
@@ -1064,6 +1094,7 @@ def _launch_gdn_spec(
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         STATE_FP32=checkpoint_state.dtype == torch.float32,
+        TEMPORAL_INT8=temporal_int8,
         STORE_EXACT_RAW=store_exact_raw,
         STORE_D_RESIDUAL=store_residual,
         STORE_K_RESIDUAL=store_residual,
@@ -1150,7 +1181,7 @@ def gdn_replayssm_spec_decode(
     b: torch.Tensor,  # [total_tokens, HV]
     A_log: torch.Tensor,  # [HV] fp32
     dt_bias: torch.Tensor,  # [HV] fp32
-    checkpoint_state: torch.Tensor,  # [num_slots, HV, V, K]  fp32 (folded in-place)
+    checkpoint_state: torch.Tensor,  # [num_slots, HV, V, K]
     d_cache: torch.Tensor,  # [num_slots, HV, L, V]
     k_cache: torch.Tensor,  # [num_slots, H, L, K]
     g_cache: torch.Tensor,  # [num_slots, HV, L]  fp32
@@ -1181,6 +1212,7 @@ def gdn_replayssm_spec_decode(
     launch_mode: str = "both",
     # Triton only accepts TF32 input precision on Ampere-or-newer NVIDIA GPUs.
     dot_precision: str = "tf32" if is_tf32_supported else "ieee",
+    checkpoint_scale: torch.Tensor | None = None,
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
@@ -1194,7 +1226,29 @@ def gdn_replayssm_spec_decode(
          checkpoint (statically empty history).
     The circular history and cursors are request-keyed by ``replay_indices``;
     the checkpoint remains keyed by physical ``ssm_state_indices``.
+
+    An INT8 checkpoint requires ``launch_mode="verify"`` and FP32 row scales
+    of shape ``[num_slots, HV, V]``. Only the V dimension must be contiguous.
+    The caller owns materialization and must resolve pending flushes before
+    consuming output. A pending-flush row is skipped, leaving its output and
+    ring untouched. The existing D/K residual buffers use their usual format.
     """
+    temporal_int8 = checkpoint_state.dtype == torch.int8
+    if temporal_int8:
+        if launch_mode != "verify":
+            raise ValueError("INT8 checkpoints support only launch_mode='verify'")
+        if (
+            checkpoint_scale is None
+            or checkpoint_scale.shape != checkpoint_state.shape[:-1]
+            or checkpoint_scale.dtype != torch.float32
+            or checkpoint_scale.device != checkpoint_state.device
+            or checkpoint_scale.stride(-1) != 1
+        ):
+            raise ValueError(
+                "INT8 checkpoint_scale must be FP32 on the checkpoint device "
+                "with shape [num_slots, HV, V] and contiguous V rows"
+            )
+
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
     batch_size = query_start_loc.shape[0] - 1
@@ -1209,6 +1263,25 @@ def gdn_replayssm_spec_decode(
         and v.shape[-1] == 128
     ):
         block_v, num_stages = 128, 1
+    elif (
+        temporal_int8
+        and not _IS_GFX95
+        and checkpoint_state.is_cuda
+        and torch.cuda.get_device_capability(checkpoint_state.device)[0] == 12
+    ):
+        num_warps = 2
+        nk = 2
+        # The wider tile helps the measured T8/R32, K=V=128 workload
+        # at B32, while it regresses B24/25, especially with history.
+        if (
+            batch_size >= 32
+            and max_spec_len == 8
+            and max_cache_len == 32
+            and q.shape[-1] == v.shape[-1] == 128
+        ):
+            block_v, num_stages = 128, 2
+        else:
+            block_v, num_stages = 64, 1
     if is_flush.dtype != torch.int8:
         is_flush = is_flush.to(torch.int8)
 
@@ -1244,6 +1317,7 @@ def gdn_replayssm_spec_decode(
             dt_bias,
             out,
             checkpoint_state,
+            checkpoint_scale,
             d_cache,
             k_cache,
             g_cache,
@@ -1280,6 +1354,7 @@ def gdn_replayssm_spec_decode(
             dt_bias,
             out,
             checkpoint_state,
+            checkpoint_scale,
             d_cache,
             k_cache,
             g_cache,
