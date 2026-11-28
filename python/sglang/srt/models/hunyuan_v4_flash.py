@@ -141,6 +141,7 @@ class _MRopePositionStore:
         if self.buffer is None:
             pool = get_token_to_kv_pool()
             slots = pool.size + 2 * pool.page_size + 1
+            # Priced per KV token by HYV4FlashTextConfig.kv_side_bytes_per_token.
             self.buffer = torch.zeros(
                 (slots, 3), dtype=torch.int32, device=positions.device
             )
@@ -337,6 +338,7 @@ class FlashIndexPool(nn.Module):
         if self._raw_keys is None:
             pool = get_token_to_kv_pool()
             slots = pool.size + 2 * pool.page_size + 1
+            # Priced per KV token by HYV4FlashTextConfig.kv_side_bytes_per_token.
             self._raw_keys = torch.zeros(
                 (slots, INDEX_DIM), dtype=torch.bfloat16, device=device
             )
@@ -1365,11 +1367,7 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         self.num_fused_shared_experts = 0
         self.visual = None
         self.visual_token_ids = None
-        if (
-            isinstance(config, HYV4FlashConfig)
-            and config.vision_config is not None
-            and not config.language_model_only
-        ):
+        if isinstance(config, HYV4FlashConfig) and config.serves_vision:
             if text_config.mrope_section is None:
                 raise ValueError("Hy4-Flash vision serving requires mrope_section")
             self.visual = HYV4VisionTransformer(

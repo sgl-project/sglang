@@ -387,6 +387,49 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
 
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=656,
+    )
+    def test_hy4_flash_side_buffers_fit_the_budget(self, _):
+        """The pool leaves room for the per-slot buffers Hy4-Flash allocates on its
+        first forward: bf16 IndexPool raw keys on DSA layers, plus int32 M-RoPE
+        positions when serving vision."""
+        from sglang.srt.configs.hy_v4_flash import (
+            SLIDING_ATTENTION,
+            SPARSE_ATTENTION,
+            HYV4FlashConfig,
+        )
+        from sglang.srt.model_executor.pool_configurator import (
+            DefaultPoolConfigurator,
+        )
+
+        layer_types = [SPARSE_ATTENTION] + [SLIDING_ATTENTION] * 2 + [SPARSE_ATTENTION]
+        pool_bytes = (656 + 132) * len(layer_types)
+        raw_key_bytes = 2 * 128 * 2
+        for vision_config, side_bytes in (
+            (None, raw_key_bytes),
+            ({}, raw_key_bytes + 3 * 4),
+        ):
+            with self.subTest(serves_vision=vision_config is not None):
+                mr = _make_model_runner(
+                    self, num_layers=len(layer_types), use_mla_backend=True
+                )
+                mr.model_config.hf_config = HYV4FlashConfig(
+                    text_config={
+                        "num_hidden_layers": len(layer_types),
+                        "layer_types": layer_types,
+                    },
+                    vision_config=vision_config,
+                    architectures=["HYV4FlashForConditionalGeneration"],
+                )
+                budget = 1000 * (pool_bytes + side_bytes)
+                with mock_cpu_env(kv_size=1):
+                    config = DefaultPoolConfigurator(mr).calculate_pool_sizes(
+                        budget, page_size=1
+                    )
+                self.assertEqual(config.max_total_num_tokens, 1000)
+
     def test_fused_draft_entry_overrides_the_layer_ratio(self):
         """A fused draft prices the exact fused entry (host + draft + pad);
         the per-draft-layer ratio under-reserves the pad."""

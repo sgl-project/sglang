@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
     DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO,
 )
+from sglang.srt.configs.hy_v4_flash import HYV4FlashConfig, HYV4FlashTextConfig
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -134,6 +135,14 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * kvc.dflash_draft_loc_space_scale
+
+
+def _kv_side_bytes_per_token(hf_config) -> int:
+    # The model sizes these buffers by the pool and allocates them on its first
+    # forward, so they come out of the same static budget as the pool.
+    if isinstance(hf_config, (HYV4FlashConfig, HYV4FlashTextConfig)):
+        return hf_config.kv_side_bytes_per_token()
+    return 0
 
 
 def _eagle_draft_kv_cache_dtype(kvc: KVCacheConfigurator) -> torch.dtype:
@@ -462,6 +471,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * kvc.dflash_draft_loc_space_scale,
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
+
+        self._cell_size += _kv_side_bytes_per_token(kvc.model_config.hf_config)
 
     def _compute_cell_size(
         self,

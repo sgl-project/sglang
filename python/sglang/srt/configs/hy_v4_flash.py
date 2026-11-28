@@ -9,6 +9,7 @@ detection, MLA geometry, quantization) see them.
 from copy import deepcopy
 from typing import Any, Optional
 
+import torch
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.hy_v4 import HYV4VLVisionConfig
@@ -333,6 +334,17 @@ class HYV4FlashTextConfig(PretrainedConfig):
     def is_sliding_layer(self, layer_id: int) -> bool:
         return self.layer_types[layer_id] == SLIDING_ATTENTION
 
+    def kv_side_bytes_per_token(self, *, serves_vision: bool = False) -> int:
+        # Must match the per-slot buffers models/hunyuan_v4_flash.py keeps outside
+        # the KV pool: FlashIndexPool's bf16 raw keys and the M-RoPE int32 x/y/z.
+        dsa_layers = sum(
+            not self.is_sliding_layer(i) for i in range(self.num_hidden_layers)
+        )
+        side = dsa_layers * self.index_head_dim * torch.bfloat16.itemsize
+        if serves_vision:
+            side += 3 * torch.int32.itemsize
+        return side
+
     def _validate(self):
         n = self.num_hidden_layers
         for name in ("mlp_layer_types", "layer_types", "indexer_types"):
@@ -438,6 +450,15 @@ class HYV4FlashConfig(PretrainedConfig):
 
     def get_text_config(self, *args, **kwargs):
         return self.text_config
+
+    @property
+    def serves_vision(self) -> bool:
+        return self.vision_config is not None and not self.language_model_only
+
+    def kv_side_bytes_per_token(self) -> int:
+        return self.text_config.kv_side_bytes_per_token(
+            serves_vision=self.serves_vision
+        )
 
 
 __all__ = ["HYV4FlashConfig", "HYV4FlashTextConfig"]
