@@ -814,6 +814,29 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         self._assert_balanced(cache, allocator)
         cache.sanity_check()
 
+    def test_refused_or_evicted_prefetch_loads_layer_wise_at_admission(self):
+        for unavailable in ("refused", "evicted"):
+            with self.subTest(unavailable=unavailable):
+                cache, backend, req, allocator = self._fixture()
+                if unavailable == "refused":
+                    with patch.object(backend, "prefetch", return_value=None):
+                        self._enqueue(cache, req)
+                else:
+                    self._enqueue(cache, req)
+                    backend.prefetch_futures[-1].set_result(True)
+                    cache.check_hicache_events()
+                    cache.evict(EvictParams(num_tokens=6))
+                assert backend.lookup.call_count == 1
+                assert cache.check_prefetch_progress(req.cache_request_handle)
+                req.init_next_round_input(cache)
+                assert backend.lookup.call_count == 2
+                assert req.prefix_len == 0 and req.host_hit_length == 6
+                assert cache.linker.load_back(req)[0] == 6
+                assert len(backend.queued_loads) == 1
+                assert allocator.available_size() == 26
+                assert cache.linker.finish_loads() == []
+                cache.sanity_check()
+
     def test_layer_wise_still_uses_queued_loads_without_prefetch(self):
         cache, backend, req, allocator = self._fixture()
         cache.linker.load_mode = backend.load_mode = "layer_wise"

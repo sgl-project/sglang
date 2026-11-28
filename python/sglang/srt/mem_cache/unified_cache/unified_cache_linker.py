@@ -369,6 +369,8 @@ class UnifiedCacheLinkerWrapper:
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         self.prefetches: dict[CacheRequestHandle, _ExternalCachePrefetch] = {}
+        # The request prefetch is matching; its own lookup follows the match.
+        self.staging_request: Optional[CacheRequestHandle] = None
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -401,8 +403,10 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
-        if self.load_mode == "prefetch":
-            # Prefetch is issued on enqueue; only completed GPU KV is matchable.
+        if (
+            self.staging_request is not None
+            and req.cache_request_handle == self.staging_request
+        ):
             return result
         if device_hit_len >= len(key):
             return result
@@ -464,7 +468,13 @@ class UnifiedCacheLinkerWrapper:
                 self._cancel_prefetch(previous, reason="released")
         if self.cache.disable or request in self.prefetches:
             return
-        req.init_next_round_input(self.cache, cow_mamba=False)
+        # A prefetch only speeds the hit up: a refused or evicted one leaves
+        # admission's match to find the hit again and load it layer-wise.
+        self.staging_request = request
+        try:
+            req.init_next_round_input(self.cache, cow_mamba=False)
+        finally:
+            self.staging_request = None
         if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
             return
         page = self.cache.page_size
