@@ -22,6 +22,23 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestHiSparseSpecCoordinator(CustomTestCase):
+    def test_b12_metadata_bucket_does_not_inflate_physical_scratch(self):
+        coordinator = MagicMock(
+            mem_pool_device=SimpleNamespace(layer_num=3),
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.empty((2, 16))),
+            device="cpu",
+            is_dsv4_hisparse=False,
+            top_k=2048,
+            device_buffer_size=4096,
+        )
+        manager = HiSparseSpecSwapManager(coordinator, num_draft_tokens=12)
+        self.assertEqual(manager.scratch_capacity, 20480)
+        self.assertEqual(tuple(manager.req_to_scratch.shape), (3, 2, 20480))
+        self.assertEqual(manager.states[0].scratch_state.shape[1], 5 * 32768)
+        self.assertEqual(tuple(manager.top_k_device_locs.shape), (2, 12, 2048))
+        with self.assertRaises(ValueError):
+            HiSparseSpecSwapManager(coordinator, num_draft_tokens=13)
+
     def test_spec_decode_reserve_allocates_logical_pages_only(self):
         logical_locs = torch.tensor([64, 65, 66, 67], dtype=torch.int64)
         allocator = SimpleNamespace(

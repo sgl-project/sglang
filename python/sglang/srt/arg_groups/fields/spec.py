@@ -41,6 +41,21 @@ class Spec(msgspec.Struct):
             aliases=["--speculative-draft-model"],
         ),
     ] = None
+    speculative_draft_kv_layout: A[
+        Literal["shared", "independent", "hybrid"],
+        Arg(
+            help="DFLASH experimental draft cache: shared target IDs (default), independent full slots, or independent native full/SWA slots. Draft cohorts use eager execution.",
+            choices=["shared", "independent", "hybrid"],
+        ),
+    ] = "shared"
+    speculative_draft_cohort_size: A[
+        int,
+        "Experimental DFLASH: number of target attention-DP owners sharing one draft TP group; fixed at startup.",
+    ] = 1
+    speculative_draft_cohort_cuda_graph: A[
+        bool,
+        "Experimental CUDA cohort2/4 draft-forward graphs; target decode graphs must be enabled. CPU PLAN/COMMIT, selector and B1 remain on their existing paths.",
+    ] = False
     speculative_boundary_reduction: A[
         Literal["ar", "rs", "rsv", "rs+rsv"],
         Arg(no_cli=True, resolvable=True),
