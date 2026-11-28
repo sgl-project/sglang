@@ -88,6 +88,14 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
 
 
 class AudioOpenAITestMixin(TestOpenAIMLLMServerBase):
+    _SPEECH_PROMPT = (
+        "Listen to this audio and write down the audio transcription in English."
+    )
+    _AMBIENT_PROMPT = (
+        "Please listen to the audio snippet carefully and transcribe the content "
+        "in English."
+    )
+
     def verify_speech_recognition_response(self, text):
         check_list = [
             "thank you",
@@ -120,42 +128,86 @@ class AudioOpenAITestMixin(TestOpenAIMLLMServerBase):
 
         return messages
 
+    def prepare_input_audio_messages(self, prompt, audio_b64: str, audio_format: str):
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": audio_b64,
+                            "format": audio_format,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+            }
+        ]
+
     def get_audio_request_kwargs(self):
         return self.get_request_kwargs()
 
-    def get_audio_response(self, url: str, prompt, category):
+    def _audio_file_to_base64(self, url: str) -> tuple[str, str]:
+        """Download (or cache) an audio URL and return (base64, format)."""
         audio_file_path = self.get_or_download_file(url)
-        client = openai.Client(api_key="sk-123456", base_url=self.base_url)
+        with open(audio_file_path, "rb") as f:
+            audio_b64 = pybase64.b64encode(f.read()).decode("utf-8")
+        ext = os.path.splitext(audio_file_path)[1].lstrip(".").lower() or "mp3"
+        return audio_b64, ext
 
-        messages = self.prepare_audio_messages(prompt, audio_file_path)
-
-        response = client.chat.completions.create(
+    def _run_audio_chat(
+        self,
+        messages,
+        *,
+        category: str,
+        stream: bool = False,
+        max_tokens: int = 128,
+    ) -> str:
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        kwargs = dict(
             model="default",
             messages=messages,
             temperature=0,
-            max_tokens=128,
-            stream=False,
+            max_tokens=max_tokens,
+            stream=stream,
             **(self.get_audio_request_kwargs()),
         )
 
-        audio_response = response.choices[0].message.content
+        if stream:
+            chunks = []
+            for chunk in client.chat.completions.create(**kwargs):
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    chunks.append(delta)
+            audio_response = "".join(chunks)
+        else:
+            response = client.chat.completions.create(**kwargs)
+            audio_response = response.choices[0].message.content
 
         print("-" * 30)
         print(f"audio {category} response:\n{audio_response}")
         print("-" * 30)
 
-        audio_response = audio_response.lower()
-
         self.assertIsNotNone(audio_response)
         self.assertGreater(len(audio_response), 0)
-
         return audio_response.lower()
+
+    def get_audio_response(self, url: str, prompt, category):
+        audio_file_path = self.get_or_download_file(url)
+        messages = self.prepare_audio_messages(prompt, audio_file_path)
+        return self._run_audio_chat(messages, category=category)
 
     def test_audio_speech_completion(self):
         # a fragment of Trump's speech
         audio_response = self.get_audio_response(
             AUDIO_TRUMP_SPEECH_URL,
-            "Listen to this audio and write down the audio transcription in English.",
+            self._SPEECH_PROMPT,
             category="speech",
         )
         self.verify_speech_recognition_response(audio_response)
@@ -164,10 +216,55 @@ class AudioOpenAITestMixin(TestOpenAIMLLMServerBase):
         # bird song
         audio_response = self.get_audio_response(
             AUDIO_BIRD_SONG_URL,
-            "Please listen to the audio snippet carefully and transcribe the content in English.",
+            self._AMBIENT_PROMPT,
             "ambient",
         )
         assert "bird" in audio_response
+
+    def test_audio_input_audio_completion(self):
+        """E2E path for OpenAI `input_audio` (base64) through a live audio MLLM."""
+        audio_b64, audio_format = self._audio_file_to_base64(AUDIO_TRUMP_SPEECH_URL)
+        messages = self.prepare_input_audio_messages(
+            self._SPEECH_PROMPT, audio_b64, audio_format
+        )
+        audio_response = self._run_audio_chat(messages, category="input_audio")
+        self.verify_speech_recognition_response(audio_response)
+
+    def test_audio_speech_streaming(self):
+        audio_file_path = self.get_or_download_file(AUDIO_TRUMP_SPEECH_URL)
+        messages = self.prepare_audio_messages(self._SPEECH_PROMPT, audio_file_path)
+        audio_response = self._run_audio_chat(
+            messages, category="speech_streaming", stream=True
+        )
+        self.verify_speech_recognition_response(audio_response)
+
+    def test_audio_mixed_batch(self):
+        """Concurrent speech + ambient audio requests, mirroring image mixed_batch."""
+
+        def _one(job):
+            url, prompt, category, check = job
+            text = self.get_audio_response(url, prompt, category)
+            if check == "speech":
+                self.verify_speech_recognition_response(text)
+            else:
+                assert "bird" in text
+
+        jobs = [
+            (
+                AUDIO_TRUMP_SPEECH_URL,
+                self._SPEECH_PROMPT,
+                "speech_batch",
+                "speech",
+            ),
+            (
+                AUDIO_BIRD_SONG_URL,
+                self._AMBIENT_PROMPT,
+                "ambient_batch",
+                "ambient",
+            ),
+        ] * 2
+        with ThreadPoolExecutor(4) as executor:
+            list(executor.map(_one, jobs))
 
 
 class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):

@@ -29,7 +29,8 @@ from sglang.test.vlm_utils import (
     VideoOpenAITestMixin,
 )
 
-register_cuda_ci(est_time=641, stage="extra-a", runner_config="1-gpu-large")
+# Qwen2-Audio moved to test_audio_openai_server.py (~180s); keep the rest here.
+register_cuda_ci(est_time=461, stage="extra-a", runner_config="1-gpu-large")
 
 
 # --- Qwen3-VL grounding regression (deepstack fusion) --------------------------
@@ -243,10 +244,6 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     extra_args = [
         "--reasoning-parser=glm45",
     ]
-
-
-class TestQwen2AudioServer(AudioOpenAITestMixin):
-    model = "Qwen/Qwen2-Audio-7B-Instruct"
 
 
 class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
