@@ -11,10 +11,10 @@ import torch
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.moss_vl import MossVLForConditionalGeneration
 from sglang.srt.multimodal.media_io import (
-    check_local_media_file,
     download_remote_media,
     get_video_bytes,
     is_local_media_path,
+    local_media_decoder_source,
     media_url_timeout,
 )
 from sglang.srt.multimodal.modality import Modality
@@ -428,11 +428,17 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             raise
 
     def _normalize_video_string(self, value: str) -> Tuple[str, Optional[str]]:
-        if value.startswith("file://"):
-            return check_local_media_file(self._resolve_file_url(value)), None
-
-        if is_local_media_path(value):
-            return check_local_media_file(value), None
+        if value.startswith("file://") or is_local_media_path(value):
+            path = (
+                self._resolve_file_url(value) if value.startswith("file://") else value
+            )
+            source = local_media_decoder_source(path)
+            if isinstance(source, bytes):
+                temp_path = self._write_video_bytes_to_tempfile(
+                    source, suffix=os.path.splitext(path)[1] or ".mp4"
+                )
+                return temp_path, temp_path
+            return source, None
 
         if value.startswith(("http://", "https://")):
             timeout = media_url_timeout(10)

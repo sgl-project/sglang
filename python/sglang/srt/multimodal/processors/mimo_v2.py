@@ -27,8 +27,8 @@ from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
 from sglang.srt.multimodal.media_io import (
     ImageData,
     VideoData,
-    check_local_media_file,
     download_remote_media,
+    local_media_decoder_source,
     media_url_timeout,
     read_local_media_file,
 )
@@ -493,7 +493,7 @@ class MiMoProcessor:
             if isinstance(source, str):
                 if source.startswith("file://"):
                     source = unquote(urlparse(source).path)
-                source = check_local_media_file(source)
+                source = local_media_decoder_source(source)
             AudioDecoder(source)
             return True
         except Exception:

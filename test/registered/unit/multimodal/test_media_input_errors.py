@@ -3,12 +3,14 @@ import os
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pybase64
 import requests
 from PIL import Image
 
+from sglang.srt.arg_groups.fields.mm import Mm
 from sglang.srt.multimodal.cache.identity import snapshot_media
 from sglang.srt.multimodal.media_artifacts.base import MediaArtifactCacheMixin
 from sglang.srt.multimodal.media_io import (
@@ -18,6 +20,7 @@ from sglang.srt.multimodal.media_io import (
     load_audio,
     load_image,
     load_video,
+    local_media_decoder_source,
     media_url_timeout,
 )
 from sglang.srt.multimodal.modality import Modality
@@ -197,6 +200,41 @@ class TestLocalMediaFiles(_PolicyTestCase):
                     self.assertRaisesRegex(ValueError, "not allowed"),
                 ):
                     fn(value)
+
+    def test_decoder_uses_authorized_file_contents(self):
+        self.assertEqual(local_media_decoder_source(self.path), self.path)
+        configure_media_url_security([], allowed_local_media_paths=[self.dir])
+        source = local_media_decoder_source(self.path)
+        with open(self.path, "wb") as f:
+            f.write(b"replacement fixture")
+        self.assertEqual(source, _image_bytes("PNG"))
+
+    def test_processor_initialization_preserves_local_path_allowlist(self):
+        blocked_path = os.path.join(self.dir, "blocked.png")
+        with open(blocked_path, "wb") as f:
+            f.write(_image_bytes("PNG"))
+        mm = Mm(
+            mm_feature_transport="cpu",
+            mm_process_config={},
+            mm_preprocess_cache_size_mb=0,
+            allowed_media_domains=["example.com"],
+            allowed_local_media_paths=[self.path],
+        )
+        serving = SimpleNamespace(skip_tokenizer_init=True, tokenizer_worker_num=1)
+        target = "sglang.srt.multimodal.processors.base_processor"
+        with (
+            patch(f"{target}.get_mm", return_value=mm),
+            patch(f"{target}.get_serving", return_value=serving),
+            patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()),
+        ):
+            processor = BaseMultimodalProcessor(
+                None, SimpleNamespace(base_gpu_id=0), None, "cpu", skip_mm_pool=True
+            )
+        self.addCleanup(processor.shutdown)
+
+        self.assertEqual(get_image_bytes(self.path), _image_bytes("PNG"))
+        with self.assertRaisesRegex(ValueError, "not within allowed paths"):
+            get_image_bytes(blocked_path)
 
     def test_raw_base64_starting_with_slash_is_not_a_path(self):
         jpeg = _image_bytes("JPEG")

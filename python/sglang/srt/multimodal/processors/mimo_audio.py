@@ -207,11 +207,11 @@ class MiMoAudioPipeline:
                         )
                         raise
                 elif audio.startswith("file://"):
-                    file = media_io.check_local_media_file(
+                    file = media_io.local_media_decoder_source(
                         unquote(urlparse(audio).path)
                     )
                 else:
-                    file = media_io.check_local_media_file(audio)
+                    file = media_io.local_media_decoder_source(audio)
             if AudioDecoder is None:
                 raise RuntimeError(
                     "torchcodec is required for audio decoding; install with `pip install torchcodec`."

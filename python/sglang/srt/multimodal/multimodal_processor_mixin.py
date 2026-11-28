@@ -59,6 +59,7 @@ class MultimodalProcessorMixin:
             processor_config.media_url_max_file_size_mb,
             processor_config.media_url_timeout,
             processor_config.allow_local_media_files,
+            allowed_local_media_paths=processor_config.allowed_local_media_paths,
         )
 
         self.image_processor_backend = processor_config.image_processor_backend

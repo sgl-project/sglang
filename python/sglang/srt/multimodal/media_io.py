@@ -71,6 +71,7 @@ _media_url_timeout: Optional[float] = None
 
 
 _allow_local_media_files = True
+_allowed_local_media_paths: Optional[frozenset[str]] = None
 
 
 def _normalize_media_domain(domain: str) -> str:
@@ -110,6 +111,7 @@ def configure_media_url_security(
     max_file_size_mb: int = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB,
     timeout: Optional[float] = None,
     allow_local_files: bool = True,
+    allowed_local_media_paths: Optional[Sequence[str]] = None,
 ) -> list[str]:
     """Configure process-wide safeguards for client-supplied media URLs.
 
@@ -123,26 +125,43 @@ def configure_media_url_security(
     if timeout is not None and timeout <= 0:
         raise ValueError("media_url_timeout must be positive")
 
+    if allowed_local_media_paths is not None and any(
+        not isinstance(path, str) or not path.strip()
+        for path in allowed_local_media_paths
+    ):
+        raise ValueError("allowed_local_media_paths entries must be non-empty paths")
+
     normalized_domains = sorted(
         {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
     )
     global _allowed_media_domains, _media_url_max_file_size_bytes
-    global _media_url_timeout, _allow_local_media_files
+    global _media_url_timeout, _allow_local_media_files, _allowed_local_media_paths
     _allowed_media_domains = frozenset(normalized_domains)
     _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
     _media_url_timeout = timeout
     _allow_local_media_files = allow_local_files
+    _allowed_local_media_paths = (
+        None
+        if allowed_local_media_paths is None
+        else frozenset(
+            os.path.realpath(os.path.expanduser(path))
+            for path in allowed_local_media_paths
+        )
+    )
     return normalized_domains
 
 
 def media_url_security_config() -> tuple:
     """The configured policy, as ``configure_media_url_security`` arguments."""
-    return (
+    config = (
         sorted(_allowed_media_domains),
         _media_url_max_file_size_bytes // (1024 * 1024),
         _media_url_timeout,
         _allow_local_media_files,
     )
+    if _allowed_local_media_paths is None:
+        return config
+    return (*config, sorted(_allowed_local_media_paths))
 
 
 def _assert_media_url_allowed(url: str) -> None:
@@ -285,12 +304,47 @@ def shorten_media_source(value: str) -> str:
     return value if len(value) <= 100 else value[:100] + "..."
 
 
+def _open_allowlisted_path(path: str, flags: int) -> int:
+    # Walk the already-authorized canonical path relative to open directories.
+    # A replaced component must never redirect the read to a different tree.
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parts = path.split(os.sep)[1:]
+    parent = os.open(os.sep, directory_flags)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, directory_flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        return os.open(
+            parts[-1] or ".", flags | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent
+        )
+    finally:
+        os.close(parent)
+
+
 def _open_local_media_file(path: str) -> BinaryIO:
     if not _allow_local_media_files:
         raise ValueError("Local media files are not allowed")
+    if _allowed_local_media_paths is not None:
+        real_path = os.path.realpath(os.path.expanduser(path))
+        if not any(
+            real_path == allowed or os.path.commonpath([real_path, allowed]) == allowed
+            for allowed in _allowed_local_media_paths
+        ):
+            raise ValueError(f"Local media path is not within allowed paths: {path!r}")
+        path = real_path
+    elif _allowed_media_domains:
+        raise ValueError(
+            "Local media access is disabled when allowed_media_domains is configured"
+        )
     try:
         # A FIFO opens at once instead of waiting for a writer; fstat rejects it.
-        f = open(path, "rb", opener=lambda p, flags: os.open(p, flags | os.O_NONBLOCK))
+        if _allowed_local_media_paths is not None:
+            f = open(path, "rb", opener=_open_allowlisted_path)
+        else:
+            f = open(
+                path, "rb", opener=lambda p, flags: os.open(p, flags | os.O_NONBLOCK)
+            )
     except OSError as e:
         if e.errno not in _CLIENT_PATH_ERRNOS:
             raise
@@ -314,9 +368,16 @@ def _open_local_media_file(path: str) -> BinaryIO:
 
 
 def check_local_media_file(path: str) -> str:
-    """Raise ValueError unless ``path`` is an allowed, in-cap regular file."""
+    """Check the current file against the local media policy."""
     _open_local_media_file(path).close()
     return path
+
+
+def local_media_decoder_source(path: str) -> Union[str, bytes]:
+    """Give codecs a snapshot of an allowlisted file, or a vetted ordinary path."""
+    if _allowed_local_media_paths is not None:
+        return read_local_media_file(path)
+    return check_local_media_file(path)
 
 
 def read_local_media_file(path: str) -> bytes:
@@ -371,9 +432,9 @@ def load_audio(
         timeout = media_url_timeout(5)
         source = download_remote_media(audio_file, timeout=timeout)
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
-        source = check_local_media_file(unquote(urlparse(audio_file).path))
+        source = local_media_decoder_source(unquote(urlparse(audio_file).path))
     elif isinstance(audio_file, str):
-        source = check_local_media_file(audio_file)
+        source = local_media_decoder_source(audio_file)
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
@@ -694,9 +755,9 @@ def _normalize_video_input(
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
         elif video_file.startswith("file://"):
-            return check_local_media_file(unquote(urlparse(video_file).path))
+            return local_media_decoder_source(unquote(urlparse(video_file).path))
         elif is_local_media_path(video_file):
-            return check_local_media_file(video_file)
+            return local_media_decoder_source(video_file)
         else:
             return _decode_bare_base64(video_file)
     else:
