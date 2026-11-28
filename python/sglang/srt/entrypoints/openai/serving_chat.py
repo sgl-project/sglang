@@ -756,12 +756,13 @@ class OpenAIServingChat(OpenAIServingBase):
         if len(run) < 2:
             return run
         call_ids = [tc.get("id") for tc in tool_calls]
-        if any(call_id is None for call_id in call_ids) or len(set(call_ids)) != len(
+        call_id_set = set(call_ids)
+        if any(call_id is None for call_id in call_ids) or len(call_id_set) != len(
             call_ids
         ):
             return run
         result_ids = [message.get("tool_call_id") for message in run]
-        if any(result_id not in call_ids for result_id in result_ids) or len(
+        if any(result_id not in call_id_set for result_id in result_ids) or len(
             set(result_ids)
         ) != len(result_ids):
             return run
