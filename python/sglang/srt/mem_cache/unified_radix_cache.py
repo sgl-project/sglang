@@ -244,6 +244,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if is_cp_sharded_padded():
             self.logical_page_size *= get_cp_strategy().cp_size
         self.disable = params.disable
+        # See BasePrefixCache._priority_sort_key for how the sign is used.
+        self.priority_sign = -1 if params.schedule_low_priority_values_first else 1
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -1696,7 +1698,7 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             inserted_len=req.kv.cache_inserted_len,
-            priority=req.priority or 0,
+            priority=self._priority_sort_key(req.priority),
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
@@ -1897,7 +1899,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.checkpoint(req, up_to=branch_end)
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
-            priority=req.priority or 0,
+            priority=self._priority_sort_key(req.priority),
             rotation_base=req.kv_rotation_base,
         )
         effective_cache_len = len(token_ids)

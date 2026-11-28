@@ -319,6 +319,10 @@ class _ExternalCachePrefetch:
     discard: bool = False
     # Outcome label when it ends unpublished for a known reason; "failed" otherwise.
     stop_reason: str = ""
+    # The prefetching request's eviction sort key, stamped on the published
+    # nodes: a default 0 would over-protect the restored prefix when lower
+    # values mean higher priority and the max() propagation would keep it.
+    priority: int = 0
 
 
 class _PendingOffload(NamedTuple):
@@ -509,6 +513,7 @@ class UnifiedCacheLinkerWrapper:
             [],
             timeout_s=self.cache.prefetch_timeout_base
             + len(hashes) * self.cache.prefetch_timeout_per_page,
+            priority=self.cache._priority_sort_key(req.priority),
         )
         self.prefetches[request] = state
         try:
@@ -651,6 +656,7 @@ class UnifiedCacheLinkerWrapper:
                     mamba_value=mamba.device_indices if mamba is not None else None,
                     prev_prefix_len=start,
                     inserted_len=end,
+                    priority=state.priority,
                     component_evicted_seqlens=evicted,
                 )
             )

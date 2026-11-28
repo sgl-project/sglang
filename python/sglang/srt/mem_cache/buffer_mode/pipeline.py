@@ -2144,6 +2144,11 @@ class BufferModePipeline:
                 key=plan.key,
                 value=torch.cat([prefix_indices, state.device_indices]),
                 prev_prefix_len=plan.device_prefix_len,
+                # Stamp the restoring request's eviction sort key: a default 0
+                # would over-protect the restored prefix when lower values
+                # mean higher priority (0 sorts above every negative key) and
+                # the max() propagation would keep that wrong key forever.
+                priority=cache._priority_sort_key(req.priority),
                 component_evicted_seqlens={
                     ct: window.start for ct, window in plan.windows.items()
                 },

@@ -317,6 +317,8 @@ class RadixCache(BasePrefixCache):
             "lru" if self.disable else self.eviction_policy,
             None if self.disable else params.eviction_policy_config,
         )
+        # See BasePrefixCache._priority_sort_key for how the sign is used.
+        self.priority_sign = -1 if params.schedule_low_priority_values_first else 1
 
         self.evictable_leaves = set()
         self.reset()
@@ -476,8 +478,8 @@ class RadixCache(BasePrefixCache):
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
-        # Radix Cache takes one ref in memory pool
-        priority = req.priority or 0
+        # Radix Cache takes one ref in memory pool.
+        priority = self._priority_sort_key(req.priority)
         result = self.insert(
             InsertParams(
                 key=radix_key,
