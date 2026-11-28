@@ -16,7 +16,7 @@ async function check({
   snapshot = [], live = [], lint = 'success', event = 'pull_request',
   failedJobNames = ['model-test'], jobs, independentTestJobPrefix = '',
   lintErrors = [], jobErrors = [], quotaWait = () => assert.fail('unexpected quota wait'),
-  maxQuotaWaitMinutes = '2', pageSizes = [],
+  maxQuotaWaitMinutes = '2', pageSizes = [], warnings = [],
 } = {}) {
   const failures = [];
   let labelReads = 0;
@@ -57,7 +57,8 @@ async function check({
     payload: event === 'pull_request'
       ? { pull_request: { number: 42, head: { sha: 'head' }, labels: labels(snapshot) } }
       : {},
-  }, { info: () => {}, setFailed: message => failures.push(message) },
+  }, { info: () => {}, warning: message => warnings.push(message),
+    setFailed: message => failures.push(message) },
      { env: { GITHUB_WORKSPACE: WORKSPACE, INDEPENDENT_TEST_JOB_PREFIX: independentTestJobPrefix,
        MAX_QUOTA_WAIT_MINUTES: maxQuotaWaitMinutes } }, name => name === 'node:timers/promises' ? { setTimeout: quotaWait } : require(name));
   return { failures, labelReads, jobReads };
@@ -247,15 +248,63 @@ test('diffusion can wait for a ten-minute reset and still enforces lint', async 
   assert.ok(waits[0] >= 602_000 && waits[0] <= 604_000);
   assert.deepEqual(result.failures, ['Fail-fast: lint check failed']);
   const tooLate = quotaError(730);
-  await assert.rejects(check({ lintErrors: [tooLate], maxQuotaWaitMinutes: '12' }),
-    err => err === tooLate);
+  const warnings = [];
+  assert.deepEqual(await check({ lintErrors: [tooLate], maxQuotaWaitMinutes: '12', warnings }),
+    { failures: [], labelReads: 0, jobReads: 0 });
+  assert.equal(warnings.length, 1);
 });
 
-test('another quota failure, a long reset or a permission error still fails the check', async () => {
-  const repeated = quotaError();
-  await assert.rejects(check({ lintErrors: [quotaError()], jobErrors: [repeated],
-    quotaWait: () => {} }), err => err === repeated);
-  for (const error of [quotaError(600), quotaError(100, '24'), quotaError(NaN)]) {
-    await assert.rejects(check({ lintErrors: [error] }), err => err === error);
+for (const status of [403, 429]) {
+  for (const stage of ['lint', 'jobs']) {
+    test(`primary quota exhaustion skips the advisory ${stage} read (${status})`, async () => {
+      const warnings = [];
+      const error = Object.assign(quotaError(1200), { status });
+      const result = await check({ warnings,
+        [stage === 'lint' ? 'lintErrors' : 'jobErrors']: [error] });
+      assert.deepEqual(result, { failures: [], labelReads: stage === 'lint' ? 0 : 1,
+        jobReads: stage === 'lint' ? 0 : 1 });
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /primary quota exhausted.*required lint\/test checks/);
+    });
   }
+}
+
+test('quota recovery is attempted only once across lint and job reads', async () => {
+  for (const errors of [
+    { lintErrors: [quotaError(), quotaError()] },
+    { lintErrors: [quotaError()], jobErrors: [quotaError()] },
+    { jobErrors: [quotaError(), quotaError()] },
+  ]) {
+    const warnings = [];
+    const waits = [];
+    const result = await check({ ...errors, warnings, quotaWait: ms => waits.push(ms) });
+    assert.deepEqual(result.failures, []);
+    assert.equal(waits.length, 1);
+    assert.equal(warnings.length, 1);
+  }
+});
+
+test('an exhausted quota with an invalid reset skips without waiting', async () => {
+  for (const reset of [undefined, 'not-a-time', '0', '1.5']) {
+    const error = quotaError();
+    error.response.headers['x-ratelimit-reset'] = reset;
+    const warnings = [];
+    const result = await check({ lintErrors: [error], warnings });
+    assert.deepEqual(result, { failures: [], labelReads: 0, jobReads: 0 });
+    assert.equal(warnings.length, 1);
+  }
+});
+
+test('permission, secondary-limit, server and network errors still fail the check', async () => {
+  for (const error of [quotaError(100, '24'), { status: 403 }, { status: 429 },
+    Object.assign(quotaError(), { status: 500 }), new Error('Connection reset')]) {
+    await assert.rejects(check({ lintErrors: [error] }), err => err === error);
+    await assert.rejects(check({ jobErrors: [error] }), err => err === error);
+  }
+});
+
+test('an unrelated retry failure is not hidden by the earlier quota error', async () => {
+  const error = Object.assign(new Error('Forbidden'), { status: 403 });
+  await assert.rejects(check({ lintErrors: [quotaError(), error], quotaWait: () => {} }),
+    err => err === error);
 });
