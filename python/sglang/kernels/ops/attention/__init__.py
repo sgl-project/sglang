@@ -657,6 +657,18 @@ for _fn in ("fp8_indexer_topk", "fp4_indexer_topk"):
             ),
         )
     )
+# DSA & KPool prefill indexer top-k via FlashTopK (CuTe DSL + Triton), SM90 and SM100.
+for _fn in ("flashtopk_fp8_indexer_topk", "flashtopk_kpool_indexer_topk"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.CUTE_DSL,
+            target=f"sglang.kernels.ops.attention.dsa.flashtopk.prefill:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(10, 9))}
+            ),
+        )
+    )
 del _fn
 
 # Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
