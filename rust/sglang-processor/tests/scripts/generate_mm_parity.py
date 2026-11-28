@@ -30,6 +30,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.hf_transformers.processor import get_processor  # noqa: E402
 from sglang.srt.managers.multimodal_processor import import_processors  # noqa: E402
 from sglang.srt.multimodal.processors.qwen_vl import (  # noqa: E402
     QwenVLImageProcessor,
@@ -37,7 +38,6 @@ from sglang.srt.multimodal.processors.qwen_vl import (  # noqa: E402
 from sglang.srt.runtime_context import publish, reset_context  # noqa: E402
 from sglang.srt.rust_server.multimodal import RustMmProcessor  # noqa: E402
 from sglang.srt.server_args import ServerArgs  # noqa: E402
-from sglang.srt.utils.hf_transformers.processor import get_processor  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "mm_parity"
 IMAGES = FIXTURES / "images"
@@ -183,8 +183,10 @@ def cases(formats):
 class PythonPath:
     """SGLang's Qwen-VL processor over one checkpoint, one backend and one config."""
 
-    def __init__(self, model_dir, backend, image_overrides):
+    def __init__(self, model_dir, backend, image_overrides, video_config=None):
         mm_process_config = {"image": image_overrides} if image_overrides else {}
+        if video_config:
+            mm_process_config["video"] = video_config
         server_args = SimpleNamespace(
             model_impl="sglang",
             mm_feature_transport="cpu",
@@ -219,8 +221,10 @@ class PythonPath:
         self.processor = QwenVLImageProcessor(
             self.hf_config, server_args, processor, None, skip_mm_pool=True
         )
-        # The CPU path: PIL decode (read by a classmethod), and CPU image kernels.
+        # The CPU path: PIL decode (read by a classmethod), CPU video decode,
+        # and CPU image kernels.
         QwenVLImageProcessor.gpu_image_decode = False
+        QwenVLImageProcessor.video_preprocessing_device = "cpu"
         self.processor._fast_image_processor_device = lambda _processor: "cpu"
         self.spec = self.rust_spec(server_args, processor)
 

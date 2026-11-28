@@ -23,7 +23,7 @@ import time
 from array import array
 from itertools import chain
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import msgspec
 import orjson
@@ -65,8 +65,10 @@ from sglang.srt.rust_server.config import (
 from sglang.srt.rust_server.multimodal import (
     MM_TRANSPORT_STATS,
     RUST_MM_FAMILIES,
+    RustMmModelDirSpec,
     RustMmProcessor,
     RustMmSpec,
+    RustMmVideoSpec,
     settle_shm_buffers,
 )
 from sglang.srt.rust_server.warmups import (
@@ -210,7 +212,7 @@ class RustServer:
         self,
         server: Server,
         http_port: int,
-        mm_spec: Optional[RustMmSpec] = None,
+        mm_spec: Optional[Union[RustMmSpec, RustMmModelDirSpec]] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
@@ -305,7 +307,9 @@ class RustServer:
         return load_rust_extension("sglang.srt.rust_extensions._server")
 
     @classmethod
-    def _resolve_multimodal(cls, scheduler: Scheduler) -> Optional[RustMmSpec]:
+    def _resolve_multimodal(
+        cls, scheduler: Scheduler
+    ) -> Optional[Union[RustMmSpec, RustMmModelDirSpec]]:
         """Resolve the built-in Rust MM pipeline for a multimodal model, and
         refuse a model it cannot serve. ``launch`` calls this before the
         listener binds, so a refused model never accepts a connection. A
@@ -317,6 +321,14 @@ class RustServer:
             model_config=scheduler.model_config,
             processor=scheduler.processor,
         ).resolve_spec()
+        if isinstance(mm_spec, RustMmModelDirSpec):
+            # The checkpoint's own files are read here, so a refusal fails the launch.
+            if not cls._build_mm_spec(mm_spec).takes_video:
+                logger.warning(
+                    "rust server: video input disabled: dynamo-multimodal resolves "
+                    "no video spec SGLang can mirror for this %s checkpoint",
+                    mm_spec.family,
+                )
         if mm_spec is None:
             supported = sorted(
                 set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
@@ -1278,17 +1290,41 @@ class RustServer:
             return b""
 
     @classmethod
-    def _build_mm_spec(cls, spec: RustMmSpec) -> MmSpec:
+    def _build_mm_spec(cls, spec: Union[RustMmSpec, RustMmModelDirSpec]) -> MmSpec:
         """The typed MM configuration for ``Server.start_mm_workers``: the
         :class:`RustMmSpec` fields the Rust pipeline consumes, as the Rust
         extension's own ``MmSpec`` class (same required-keyword contract as
         :func:`_build_server_args`; ``family`` / ``resample`` become the
         extension's ``MmFamily`` / ``MmResample`` enums)."""
         ext = cls._load_extension()
-        family = {"qwen_vl": ext.MmFamily.QwenVl}[spec.family]
+        family = {
+            "qwen_vl": ext.MmFamily.QwenVl,
+            "glm5_next": ext.MmFamily.Glm5Next,
+            "nemotron_vl": ext.MmFamily.NemotronVl,
+        }[spec.family]
         resample = {"aten_u8": ext.MmResample.AtenU8, "pil": ext.MmResample.Pil}[
             spec.resample
         ]
+        if isinstance(spec, RustMmModelDirSpec):
+            nemotron = spec.nemotron
+            family_args = (
+                {}
+                if nemotron is None
+                else dict(
+                    max_model_len=nemotron.max_model_len,
+                    video_target_num_patches=nemotron.video_target_num_patches,
+                    video_maintain_aspect_ratio=nemotron.video_maintain_aspect_ratio,
+                    video_pruning_rate=nemotron.video_pruning_rate,
+                )
+            )
+            return ext.MmSpec.from_model_dir(
+                family=family,
+                model_path=spec.model_path,
+                revision=spec.revision,
+                resample=resample,
+                feature_shm=spec.feature_shm,
+                **family_args,
+            )
         return ext.MmSpec(
             family=family,
             feature_shm=spec.feature_shm,
@@ -1301,6 +1337,35 @@ class RustServer:
             image_mean=spec.image_mean,
             image_std=spec.image_std,
             resample=resample,
+            video=cls._build_mm_video_spec(ext, spec.video),
+        )
+
+    @staticmethod
+    def _build_mm_video_spec(ext, video: Optional[RustMmVideoSpec]):
+        """The extension's ``MmVideoSpec`` for ``RustMmVideoSpec``, or ``None``."""
+        if video is None:
+            return None
+        sampling = video.sampling
+        return ext.MmVideoSpec(
+            video_token_id=video.video_token_id,
+            vision_start_token_id=video.vision_start_token_id,
+            vision_end_token_id=video.vision_end_token_id,
+            patch_size=video.patch_size,
+            merge_size=video.merge_size,
+            temporal_patch_size=video.temporal_patch_size,
+            min_pixels=video.min_pixels,
+            max_pixels=video.max_pixels,
+            image_mean=video.image_mean,
+            image_std=video.image_std,
+            config=sampling.config,
+            fps=sampling.fps,
+            min_frames=sampling.min_frames,
+            max_frames=sampling.max_frames,
+            frame_factor=sampling.frame_factor,
+            factor=sampling.factor,
+            sampling_min_pixels=sampling.min_pixels,
+            sampling_max_pixels=sampling.max_pixels,
+            sampling_total_pixels=sampling.total_pixels,
         )
 
 
