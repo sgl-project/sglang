@@ -39,6 +39,7 @@ import torch
 from PIL import Image
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.multimodal.image_dp_consensus import image_dp_local_stage
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import flatten_nested_list
 
@@ -564,6 +565,7 @@ def run_dp_sharded_mrope_vision_model(
     pixel_values_device: Optional[torch.device] = None,
     pixel_values_dtype: Optional[torch.dtype] = None,
     pass_grid_thw_list: bool = False,
+    parallel_group=None,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -585,6 +587,7 @@ def run_dp_sharded_mrope_vision_model(
                    the spatial merge area instead of t * h * w divided by it.
         pass_grid_thw_list: Forward the existing host grid list to the vision
             model so graph-aware towers do not materialize it from a CUDA tensor.
+        parallel_group: Image-DP group; defaults to the attention-TP group.
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -611,7 +614,11 @@ def run_dp_sharded_mrope_vision_model(
             "pixel_values_device and pixel_values_dtype are required with a local loader"
         )
 
-    tp_size = get_parallel().attn_tp_size
+    tp_size = (
+        get_parallel().attn_tp_size
+        if parallel_group is None
+        else parallel_group.world_size
+    )
     if tp_size == 1:
         if pixel_values is None:
             pixel_values = load_local_pixel_values(list(range(len(grid_thw_list))))
@@ -643,156 +650,198 @@ def run_dp_sharded_mrope_vision_model(
             return image_embeds
         return vision_model(pixel_values, grid_thw=grid_thw)
 
-    # GPU_0 tp_rank_local = 0
-    # GPU_1 tp_rank_local = 1
-    tp_rank_local = get_parallel().attn_tp_rank
-
-    # patches_per_image = [1000, 100, 200, 50]
-    patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
-    # print(f"{patches_per_image = }")
-    # patches_per_image = [0, 1000, 1100, 1300, 1350]
-    cum_patches_per_image = [0, *itertools.accumulate(patches_per_image)]
-
-    # Get load balancing assignment with all metadata
-    # image_to_tp_rank = [0, 2, 1, 3]
-    # gpu_sample_counts = [1, 3]
-    # grouped_pixel_values_len = [1000, 350]
-    image_to_tp_rank, gpu_sample_counts, _ = get_dp_encoder_lb_assignment(
-        patches_per_image, tp_size
-    )
-
-    # cu_gpu_sample_counts = [0, 1, 4]
-    cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
-
-    # GPU_0 image_idxs_local = [0]
-    # GPU_1 image_idxs_local = [2, 1, 3]
-    image_idxs_local = image_to_tp_rank[
-        cum_gpu_sample_counts[tp_rank_local] : cum_gpu_sample_counts[tp_rank_local + 1]
-    ]
-
-    # Get the pixel values for the local images based on the image_idxs_local
-    if len(image_idxs_local) > 0:
-        if load_local_pixel_values is not None:
-            pixel_values_local = load_local_pixel_values(image_idxs_local)
-        else:
-            assert pixel_values is not None
-            pixel_values_local = torch.cat(
-                [
-                    pixel_values[
-                        cum_patches_per_image[i] : cum_patches_per_image[i + 1]
-                    ]
-                    for i in image_idxs_local
-                ]
-            )
-    else:
-        pixel_values_local = None
-    # embed_dim_reduction_factor = 2 * 2
-    packed_2d_rope = rope_type in ("rope_2d", "rope_2d_packed")
-    if packed_2d_rope:
-        embed_dim_reduction_factor = (
-            vision_model.merge_kernel_size[0] * vision_model.merge_kernel_size[1]
+    preallocate_gather = parallel_group is not None
+    gathered_embeds = None
+    with image_dp_local_stage(
+        parallel_group,
+        lambda: (grid_thw_list, tuple(payload.shape), str(payload.dtype)),
+    ):
+        # GPU_0 tp_rank_local = 0
+        # GPU_1 tp_rank_local = 1
+        tp_rank_local = (
+            get_parallel().attn_tp_rank
+            if parallel_group is None
+            else parallel_group.rank_in_group
         )
-    else:
-        embed_dim_reduction_factor = (
-            vision_model.spatial_merge_size * vision_model.spatial_merge_size
+        if parallel_group is None:
+            parallel_group = get_parallel().attn_tp_group
+
+        # patches_per_image = [1000, 100, 200, 50]
+        patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
+        # print(f"{patches_per_image = }")
+        # patches_per_image = [0, 1000, 1100, 1300, 1350]
+        cum_patches_per_image = [0, *itertools.accumulate(patches_per_image)]
+
+        # Get load balancing assignment with all metadata
+        # image_to_tp_rank = [0, 2, 1, 3]
+        # gpu_sample_counts = [1, 3]
+        # grouped_pixel_values_len = [1000, 350]
+        image_to_tp_rank, gpu_sample_counts, _ = get_dp_encoder_lb_assignment(
+            patches_per_image, tp_size
         )
 
-    output_tokens_per_image = [
-        math.prod(grid[1:] if pool_temporal_dimension else grid)
-        // embed_dim_reduction_factor
-        for grid in grid_thw_list
-    ]
-    grouped_output_lengths = []
-    assignment_offset = 0
-    for sample_count in gpu_sample_counts:
-        rank_images = image_to_tp_rank[
-            assignment_offset : assignment_offset + sample_count
+        # cu_gpu_sample_counts = [0, 1, 4]
+        cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
+
+        # GPU_0 image_idxs_local = [0]
+        # GPU_1 image_idxs_local = [2, 1, 3]
+        image_idxs_local = image_to_tp_rank[
+            cum_gpu_sample_counts[tp_rank_local] : cum_gpu_sample_counts[
+                tp_rank_local + 1
+            ]
         ]
-        grouped_output_lengths.append(
-            sum(output_tokens_per_image[i] for i in rank_images)
-        )
-        assignment_offset += sample_count
 
-    # Find the max length across all ranks
-    # The output embedding of every DP rank has to be
-    # padded to this length for tensor_model_parallel_all_gather
-    # to work
-    max_len_per_rank = max(grouped_output_lengths)
-    local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
-
-    # Run the vision model on the local pixel_values_local
-    if packed_2d_rope:
-        if pixel_values_local is not None and pixel_values_local.shape[0] > 0:
-            # Packed MoonViT reads grid_thw as CPU shape metadata. Placing it
-            # on CUDA would make each .tolist() call synchronize with the host.
-            local_grid_thw = torch.tensor(
-                local_grid_thw_list,
-                device=(pixel_values_local.device if rope_type == "rope_2d" else None),
-            )
-            if rope_type == "rope_2d":
-                kwargs = {
-                    "grid_hw": local_grid_thw,
-                    "max_seqlen": max(math.prod(grid) for grid in local_grid_thw_list),
-                }
-                if pass_grid_thw_list:
-                    kwargs["grid_thw_list"] = local_grid_thw_list
-                image_embeds_local = vision_model(pixel_values_local, **kwargs)
+        # Get the pixel values for the local images based on the image_idxs_local
+        if len(image_idxs_local) > 0:
+            if load_local_pixel_values is not None:
+                pixel_values_local = load_local_pixel_values(image_idxs_local)
             else:
-                image_embeds_local = vision_model(pixel_values_local, local_grid_thw)
-            if isinstance(image_embeds_local, list):
-                image_embeds_local = concat_or_single(image_embeds_local, dim=0)
+                assert pixel_values is not None
+                pixel_values_local = torch.cat(
+                    [
+                        pixel_values[
+                            cum_patches_per_image[i] : cum_patches_per_image[i + 1]
+                        ]
+                        for i in image_idxs_local
+                    ]
+                )
         else:
-            out_dim = getattr(vision_model.config, "hidden_size", None)
-            image_embeds_local = torch.empty(
-                (0, embed_dim_reduction_factor, out_dim),
-                device=vision_model.device,
-                dtype=input_dtype,
+            pixel_values_local = None
+        # embed_dim_reduction_factor = 2 * 2
+        packed_2d_rope = rope_type in ("rope_2d", "rope_2d_packed")
+        if packed_2d_rope:
+            embed_dim_reduction_factor = (
+                vision_model.merge_kernel_size[0] * vision_model.merge_kernel_size[1]
             )
-    else:
-        if pixel_values_local is not None and pixel_values_local.shape[0] > 0:
-            # print(f"{local_grid_thw_list = }", flush=True)
-            image_embeds_local = vision_model(
-                pixel_values_local, torch.tensor(local_grid_thw_list)
-            )
-            if isinstance(image_embeds_local, list):
-                image_embeds_local = concat_or_single(image_embeds_local, dim=0)
         else:
-            # Handle empty case
-            out_dim = getattr(vision_model, "out_hidden_size", None)
-            if out_dim is None:
-                out_dim = vision_model.config.hidden_size
-            image_embeds_local = torch.empty(
-                (0, out_dim),
-                device=vision_model.device,
-                dtype=input_dtype,
+            embed_dim_reduction_factor = (
+                vision_model.spatial_merge_size * vision_model.spatial_merge_size
             )
 
-    # Single-image fast path. Bit-identical to the all-gather below, which for
-    # one image just pads the owner's rows and slices them back out.
-    if len(grid_thw_list) == 1:
-        owner_local = image_to_tp_rank[0]
-        n_tok = output_tokens_per_image[0]
-        if tp_rank_local == owner_local:
-            out_embeddings = image_embeds_local.contiguous()
-        else:
-            out_embeddings = torch.empty(
-                (n_tok, *image_embeds_local.shape[1:]),
-                dtype=input_dtype,
-                device=input_device,
+        output_tokens_per_image = [
+            math.prod(grid[1:] if pool_temporal_dimension else grid)
+            // embed_dim_reduction_factor
+            for grid in grid_thw_list
+        ]
+        grouped_output_lengths = []
+        assignment_offset = 0
+        for sample_count in gpu_sample_counts:
+            rank_images = image_to_tp_rank[
+                assignment_offset : assignment_offset + sample_count
+            ]
+            grouped_output_lengths.append(
+                sum(output_tokens_per_image[i] for i in rank_images)
             )
-        get_parallel().attn_tp_group.broadcast(out_embeddings, src=owner_local)
+            assignment_offset += sample_count
+
+        # Find the max length across all ranks
+        # The output embedding of every DP rank has to be
+        # padded to this length for tensor_model_parallel_all_gather
+        # to work
+        max_len_per_rank = max(grouped_output_lengths)
+        local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
+
+        # Run the vision model on the local pixel_values_local
+        if packed_2d_rope:
+            if pixel_values_local is not None and pixel_values_local.shape[0] > 0:
+                # Packed MoonViT reads grid_thw as CPU shape metadata. Placing it
+                # on CUDA would make each .tolist() call synchronize with the host.
+                local_grid_thw = torch.tensor(
+                    local_grid_thw_list,
+                    device=(
+                        pixel_values_local.device if rope_type == "rope_2d" else None
+                    ),
+                )
+                if rope_type == "rope_2d":
+                    kwargs = {
+                        "grid_hw": local_grid_thw,
+                        "max_seqlen": max(
+                            math.prod(grid) for grid in local_grid_thw_list
+                        ),
+                    }
+                    if pass_grid_thw_list:
+                        kwargs["grid_thw_list"] = local_grid_thw_list
+                    image_embeds_local = vision_model(pixel_values_local, **kwargs)
+                else:
+                    image_embeds_local = vision_model(
+                        pixel_values_local, local_grid_thw
+                    )
+                if isinstance(image_embeds_local, list):
+                    image_embeds_local = concat_or_single(image_embeds_local, dim=0)
+            else:
+                out_dim = getattr(vision_model.config, "hidden_size", None)
+                image_embeds_local = torch.empty(
+                    (0, embed_dim_reduction_factor, out_dim),
+                    device=vision_model.device,
+                    dtype=input_dtype,
+                )
+        else:
+            if pixel_values_local is not None and pixel_values_local.shape[0] > 0:
+                # print(f"{local_grid_thw_list = }", flush=True)
+                image_embeds_local = vision_model(
+                    pixel_values_local, torch.tensor(local_grid_thw_list)
+                )
+                if isinstance(image_embeds_local, list):
+                    image_embeds_local = concat_or_single(image_embeds_local, dim=0)
+            else:
+                # Handle empty case
+                out_dim = getattr(vision_model, "out_hidden_size", None)
+                if out_dim is None:
+                    out_dim = vision_model.config.hidden_size
+                image_embeds_local = torch.empty(
+                    (0, out_dim),
+                    device=vision_model.device,
+                    dtype=input_dtype,
+                )
+
+        # Single-image fast path. Bit-identical to the all-gather below, which for
+        # one image just pads the owner's rows and slices them back out.
+        if len(grid_thw_list) == 1:
+            owner_local = image_to_tp_rank[0]
+            n_tok = output_tokens_per_image[0]
+            if tp_rank_local == owner_local:
+                out_embeddings = image_embeds_local.contiguous()
+            else:
+                out_embeddings = torch.empty(
+                    (n_tok, *image_embeds_local.shape[1:]),
+                    dtype=input_dtype,
+                    device=input_device,
+                )
+        else:
+            # The TP all-gather needs a common first dimension. Allocate that final
+            # shape directly instead of materializing a padding fragment and catting it.
+            image_embeds_local_padded = _pad_mrope_vision_embeddings_for_tp_gather(
+                image_embeds_local, max_len_per_rank
+            )
+            if preallocate_gather:
+                # Allocate the receive buffer before peers enter the payload collective.
+                with parallel_group.use_symmetric_memory(
+                    parallel_group,
+                    disabled=not parallel_group.is_allocation_symmetric(),
+                ):
+                    gathered_embeds = torch.empty(
+                        (
+                            tp_size * max_len_per_rank,
+                            *image_embeds_local_padded.shape[1:],
+                        ),
+                        dtype=image_embeds_local_padded.dtype,
+                        device=image_embeds_local_padded.device,
+                    )
+        payload = (
+            out_embeddings if len(grid_thw_list) == 1 else image_embeds_local_padded
+        )
+
+    if len(grid_thw_list) == 1:
+        parallel_group.broadcast(out_embeddings, src=owner_local)
         return out_embeddings
 
-    # The TP all-gather needs a common first dimension. Allocate that final
-    # shape directly instead of materializing a padding fragment and catting it.
-    image_embeds_local_padded = _pad_mrope_vision_embeddings_for_tp_gather(
-        image_embeds_local, max_len_per_rank
-    )
-
     # Do all_gather to collect embeddings from all ranks
-    gathered_embeds = get_parallel().attn_tp_group.all_gather(
-        image_embeds_local_padded, dim=0
-    )
+    if gathered_embeds is None:
+        gathered_embeds = parallel_group.all_gather(image_embeds_local_padded, dim=0)
+    else:
+        parallel_group.all_gather_into_tensor(
+            gathered_embeds, image_embeds_local_padded
+        )
 
     # Remove padding and reconstruct per-rank embeddings
     rank_embeddings = list[torch.Tensor]()
