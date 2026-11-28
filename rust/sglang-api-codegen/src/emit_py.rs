@@ -730,6 +730,12 @@ fn emit_tuple_codec(out: &mut String, m: &MessageModel, fields: &[FieldModel]) {
 fn emit_bare_list_codec(out: &mut String, m: &MessageModel, item: &FieldModel) {
     let name = &m.rust_name;
     let elem = match &item.kind {
+        // JSON token IDs are plain ints. An exact type check keeps bools and
+        // other int subclasses on the normal scalar validation path.
+        FieldKind::RepeatedScalar { ty: ScalarTy::I64 } => {
+            let fallback = expect_call(&ScalarTy::I64, "e", None);
+            format!("e if type(e) is int else {fallback}")
+        }
         FieldKind::RepeatedScalar { ty } => expect_call(ty, "e", None),
         FieldKind::RepeatedMessage { rust_path } => format!("decode_{rust_path}(e)"),
         other => panic!("{name}: bare_list item must be repeated, got {other:?}"),

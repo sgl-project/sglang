@@ -4563,7 +4563,7 @@ KvHintsEnvelopeOrList = Union[KvHintsEnvelope, KvHintsEnvelopeList]
 
 
 def decode_TokenIds(value: Any) -> TokenIds:
-    return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
+    return [e if type(e) is int else _expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
 
 
 def encode_TokenIds(v: TokenIds) -> List[Any]:
@@ -4646,7 +4646,7 @@ def encode_Int64OrList(v: Int64OrList) -> Any:
 
 
 def decode_Int64List(value: Any) -> Int64List:
-    return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
+    return [e if type(e) is int else _expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
 
 
 def encode_Int64List(v: Int64List) -> List[Any]:
@@ -6726,7 +6726,7 @@ def encode_Matched(v: Matched) -> Any:
 
 
 def decode_MatchedTokens(value: Any) -> MatchedTokens:
-    return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
+    return [e if type(e) is int else _expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
 
 
 def encode_MatchedTokens(v: MatchedTokens) -> List[Any]:
