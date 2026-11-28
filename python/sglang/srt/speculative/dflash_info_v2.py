@@ -1,6 +1,8 @@
 """DFLASH spec-v2 overlap scheduling data structures."""
 
 import contextlib
+import functools
+import logging
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -10,11 +12,14 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
-    add_spec_decode_headroom_pages,
-    spec_decode_alloc_lens,
+    decode_alloc_targets,
+    get_decode_ahead,
 )
+from sglang.srt.mem_cache.capacity import tokens_fit
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.device import is_pin_memory_available
+
+logger = logging.getLogger(__name__)
 
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
 
@@ -32,6 +37,57 @@ def _get_overlap_plan_stream(
         stream = torch.get_device_module(device_str).Stream()
         _OVERLAP_PLAN_STREAMS[device_str] = stream
     return stream, torch.get_device_module(device_str).stream(stream)
+
+
+@functools.cache
+def _prealloc_pages(hisparse: bool) -> int:
+    pages = envs.SGLANG_OPT_SPEC_DECODE_HEADROOM_PAGES.get()
+    if pages <= 0:
+        return 0
+    if hisparse:
+        if envs.SGLANG_OPT_SPEC_DECODE_HEADROOM_PAGES.is_set():
+            logger.warning(
+                "SGLANG_OPT_SPEC_DECODE_HEADROOM_PAGES is ignored under HiSparse."
+            )
+        return 0
+    return min(pages, 8)
+
+
+def _add_prealloc_pages(
+    batch: ScheduleBatch,
+    nxt_kv_lens: List[int],
+    num_needed_tokens: int,
+) -> tuple[List[int], int]:
+    """On a step that allocates anyway, extend every request to the configured
+    pages beyond its page-aligned need in the same allocation."""
+    page_size = batch.token_to_kv_pool_allocator.page_size
+    if num_needed_tokens == 0 or page_size == 1:
+        return nxt_kv_lens, num_needed_tokens
+    pages = _prealloc_pages(batch.hisparse_coordinator is not None)
+    if pages == 0:
+        return nxt_kv_lens, num_needed_tokens
+    row_cap = batch.req_to_token_pool.row_width // page_size * page_size
+    ahead = get_decode_ahead()
+    lens = list(nxt_kv_lens)
+    extra = 0
+    for i, req in enumerate(batch.reqs):
+        need = req.kv.kv_committed_len + ahead
+        target = min(
+            row_cap,
+            (need + page_size - 1) // page_size * page_size + pages * page_size,
+        )
+        if target > lens[i]:
+            extra += target - lens[i]
+            lens[i] = target
+    if extra == 0:
+        return nxt_kv_lens, num_needed_tokens
+    # Paged extend evicts up to needed + bs pages; stay clear of that demand.
+    if not tokens_fit(
+        batch.token_to_kv_pool_allocator,
+        num_needed_tokens + len(lens) * page_size + 4 * extra,
+    ):
+        return nxt_kv_lens, num_needed_tokens
+    return lens, num_needed_tokens + extra
 
 
 @dataclass
@@ -140,26 +196,26 @@ class DFlashDraftInputV2(SpecInput):
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
 
-        cur_kv_lens, nxt_kv_lens, num_needed_tokens = spec_decode_alloc_lens(
+        allocated_lens, target_lens, num_new_tokens = decode_alloc_targets(
             batch.reqs, page_size=batch.token_to_kv_pool_allocator.page_size
         )
-        nxt_kv_lens, num_needed_tokens = add_spec_decode_headroom_pages(
-            batch, nxt_kv_lens, num_needed_tokens
+        target_lens, num_new_tokens = _add_prealloc_pages(
+            batch, target_lens, num_new_tokens
         )
 
         committed_lens = [int(req.kv.kv_committed_len) for req in batch.reqs]
         top_ks = [int(req.sampling_params.top_k) for req in batch.reqs]
         batch_seq_lens_cpu_t.numpy()[:] = committed_lens
-        cur_kv_lens_cpu_t.numpy()[:] = cur_kv_lens
-        nxt_kv_lens_cpu_t.numpy()[:] = nxt_kv_lens
+        cur_kv_lens_cpu_t.numpy()[:] = allocated_lens
+        nxt_kv_lens_cpu_t.numpy()[:] = target_lens
         # Host upper bound of the over-allocated KV lengths (>= committed +
-        # alloc reserve): bounds the NPU backend's mirrorless replay
+        # decode-ahead): bounds the NPU backend's mirrorless replay
         # page-table copies without a D2H sync, mirroring
         # eagle_utils.eagle_prepare_for_decode. Backend consumers gate on
         # seq_lens_cpu, so leaving this set in mirror mode is a no-op.
         batch.max_seq_len_host = int(cur_kv_lens_cpu_t.max())
         committed_seq_lens_sum = sum(committed_lens)
-        nxt_kv_lens_sum = sum(nxt_kv_lens)
+        nxt_kv_lens_sum = sum(target_lens)
         max_top_k = max(top_ks)
         uniform_top_k = top_ks.count(top_ks[0]) == bs
         uniform_top_k_value = top_ks[0]
@@ -192,7 +248,7 @@ class DFlashDraftInputV2(SpecInput):
                 cur_kv_lens_cpu=cur_kv_lens_cpu_t,
                 nxt_kv_lens=nxt_kv_lens,
                 nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
-                num_needed_tokens=num_needed_tokens,
+                num_needed_tokens=num_new_tokens,
                 batch=batch,
             )
         if caller_stream is not None:

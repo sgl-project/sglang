@@ -1046,6 +1046,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                 ):
                     return CompressedTensorsMxInt4MoE(self, weight_quant=weight_quant)
                 elif _is_hip:
+                    # The Triton runner gets no zero points (get_triton_quant_info), so an
+                    # asymmetric checkpoint would be dequantized with an implicit -8.
+                    if not weight_quant.symmetric:
+                        raise ValueError(
+                            "The ROCm Triton WNA16 MoE path only supports symmetric INT4 "
+                            "group quantization; this checkpoint has zero points."
+                        )
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
                     return CompressedTensorsWNA16TritonMoE(
                         self, weight_quant=weight_quant
