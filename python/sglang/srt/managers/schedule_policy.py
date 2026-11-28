@@ -2508,14 +2508,19 @@ class PrefillAdder:
         self._account_prefill_cache_admission(req, admission.prefix_len)
 
     def preempt_to_schedule(self, req: Req) -> bool:
-        """
-        Preempt running requests to serve the new request if the priority threshold is met and token count sum is verified.
-        Returns True if preemption was committed, and the new request can be scheduled.
-        """
+        """Free running requests when their priority and token budget allow it."""
+        victims = self.select_preemption_victims(req)
+        if not victims:
+            return False
+        self.commit_preemption(victims)
+        return True
+
+    def select_preemption_victims(self, req: Req) -> List[Req]:
+        """Choose running requests that would make room without releasing them."""
         if self.chunked_req_waits:
             # The pass admits no one while the unfinished chunked request
             # waits, so a preempted request would gain the new one nothing.
-            return False
+            return []
         # Iterate running requests to find preemptible requests
         priority_sign = 1 if get_schedule().schedule_low_priority_values_first else -1
 
@@ -2562,11 +2567,13 @@ class PrefillAdder:
                 break
 
         # Check max token count limit can be met
-        if len(preemptible_reqs) == 0 or min_tokens_to_remove > 0:
-            return False
+        if min_tokens_to_remove > 0:
+            return []
+        return preemptible_reqs
 
+    def commit_preemption(self, victims: List[Req]) -> None:
         # Preempt running requests. Release allocated resources for immediate usage.
-        preemptible_reqs = set(preemptible_reqs)
+        preemptible_reqs = set(victims)
         keep_indices = []
         release_counter = 0
         for i, running_req in enumerate(self.running_batch.reqs):
@@ -2584,4 +2591,3 @@ class PrefillAdder:
                 keep_indices.append(i)
         self.running_batch.filter_batch(keep_indices=keep_indices)
         self.preempt_list.extend(preemptible_reqs)
-        return True

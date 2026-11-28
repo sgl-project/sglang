@@ -4881,6 +4881,8 @@ class Scheduler(
             self.prefill_admission_no_token = True
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
+        # LMCache's readiness poll records the local prefix after any eviction.
+        defer_preemption = self.enable_hicache_storage and not self.enable_lmcache
         # Get requests from the waiting queue to a new prefill batch
         bounded_active = self.policy._bounded_active
         candidates = (
@@ -4932,10 +4934,14 @@ class Scheduler(
             ):
                 running_batch.batch_is_full = True
 
+            preemption_deferred = running_batch.batch_is_full and defer_preemption
             if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
-                ):
+                if not self.enable_priority_preemption:
+                    break
+                if preemption_deferred:
+                    if not adder.select_preemption_victims(req):
+                        break
+                elif not adder.preempt_to_schedule(req):
                     break
 
             if (
@@ -4952,6 +4958,10 @@ class Scheduler(
                     if bounded_active:
                         self.policy.mark_admission_skipped(req)
                     continue
+                # Completing the prefetch can pin device KV. Recheck the budget
+                # before preempting, leaving the loaded span for a later pass.
+                if preemption_deferred and not adder.preempt_to_schedule(req):
+                    break
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
                 loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
