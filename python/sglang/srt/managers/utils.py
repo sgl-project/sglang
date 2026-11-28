@@ -30,7 +30,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.device import async_d2h as _async_d2h
-from sglang.srt.utils.device import is_cuda, is_pin_memory_available
+from sglang.srt.utils.device import is_cuda, is_hip, is_pin_memory_available
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
@@ -79,10 +79,14 @@ def allocate_distinct_stream(device_module, avoid_streams):
 
 
 def is_war_barrier_enabled() -> bool:
-    # On by default on CUDA. Unified memory frees ids and rewrites request rows on the
-    # schedule stream at once, so it needs the barrier on every device.
+    # On by default on CUDA and ROCm: without it the schedule stream can free KV slots and
+    # rewrite request rows that a forward still reads (e.g. after a radix-cache insert),
+    # which on ROCm shows up as memory faults or silently corrupted prefixes. Unified
+    # memory frees ids and rewrites request rows on the schedule stream at once, so it
+    # needs the barrier on every device.
     return (
         is_cuda()
+        or is_hip()
         or get_memory().enable_unified_memory
         or envs.SGLANG_ENABLE_WAR_BARRIER.get()
     )
