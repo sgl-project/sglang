@@ -286,7 +286,7 @@ Each component implements these hooks. See `base.py` for the ABC and docstrings.
 
 | Hook | Purpose | Called By | Default |
 |------|---------|-----------|----------|
-| `redistribute_on_node_split()` | Redistribute component data between new parent (prefix) and child (suffix) when a node is split. Full: copies `lock_ref` to parent. SWA: slices SWA value, copies `lock_ref` and `component_uuid`. Mamba: parent gets `None`/`lock_ref=0` (mamba stays on leaf). | `_split_node` | *abstract* |
+| `redistribute_on_node_split()` | Redistribute component data between new parent (prefix) and child (suffix) when a node is split. Path data (Full, SWA): parent inherits the lock and session refs, takes the head of each value, and receives the `split_boundary_keys` uuids. SWA also re-parks tombstoned halves in the host LRU. State (Mamba): the parent keeps its empty records. | `_split_node` | path split; skipped for state |
 
 ### Eviction Phase
 

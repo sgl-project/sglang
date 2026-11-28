@@ -653,13 +653,8 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
     ) {
         let (new_parent, child) = tree_core.arena.node_pair_mut(new_parent_id, child_id);
         let split_len = new_parent.key.atom_len() as i64;
-        new_parent.copy_device_lock_ref(SWA, child);
-        new_parent.copy_host_lock_ref(SWA, child);
-        if child.has_device_value(SWA) {
-            Node::redistribute_child_device_value(new_parent, child, SWA, split_len);
-        }
+        Node::split_path_slots(new_parent, child, SWA, split_len);
         if child.has_host_value(SWA) {
-            Node::redistribute_child_host_value(new_parent, child, SWA, split_len);
             // Device-tombstoned sides park in the host LRU. Host-locked
             // halves stay out of it: in-flight IO holds them, and host
             // acquire removed the node at 0->1.
@@ -681,10 +676,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
 
         // The window-boundary uuids mark the node's older edge, which the
         // split moves to the parent — both tiers migrate with it.
-        let swa_uuid = tree_core.arena.node_mut(child_id).swa_uuid.take();
-        tree_core.arena.node_mut(new_parent_id).swa_uuid = swa_uuid;
-        let swa_host_uuid = tree_core.arena.node_mut(child_id).swa_host_uuid.take();
-        tree_core.arena.node_mut(new_parent_id).swa_host_uuid = swa_host_uuid;
+        let (new_parent, child) = tree_core.arena.node_pair_mut(new_parent_id, child_id);
+        new_parent.swa_uuid = child.swa_uuid.take();
+        new_parent.swa_host_uuid = child.swa_host_uuid.take();
     }
 
     fn evict_component(

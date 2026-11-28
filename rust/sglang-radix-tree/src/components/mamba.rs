@@ -563,24 +563,6 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         }
     }
 
-    fn redistribute_on_node_split(
-        &self,
-        tree_core: &mut UnifiedTreeCore<K>,
-        new_parent_id: NodeIdx_,
-        _child_id: NodeIdx_,
-    ) {
-        let new_parent = tree_core.arena.node_mut(new_parent_id);
-        if new_parent.has_device_value(MAMBA) {
-            let _ = new_parent.take_device_value(MAMBA);
-        }
-        new_parent.set_lock_ref_(ValueSlotIdx::device(MAMBA), 0);
-        // HiCache: mamba host_value stays on child (mamba = leaf-only data).
-        if new_parent.has_host_value(MAMBA) {
-            let _ = new_parent.take_host_value(MAMBA);
-        }
-        new_parent.set_lock_ref_(ValueSlotIdx::host(MAMBA), 0);
-    }
-
     /// Free the node's mamba slot on the targeted layer(s).
     fn evict_component(
         &self,

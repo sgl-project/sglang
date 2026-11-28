@@ -47,6 +47,8 @@ if TYPE_CHECKING:
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
     family = TREE_TOKEN
+    # A Full host lock is a segment; its boundary moves with the inserted prefix.
+    split_boundary_keys = ("host_uuid",)
 
     def __init__(self, cache, params, slot):
         super().__init__(cache, params, slot)
@@ -145,31 +147,6 @@ class FullComponent(TreeComponent):
                 host_hit_length=max(result.host_hit_length, kv_host_hit)
             )
         return result
-
-    def redistribute_on_node_split(
-        self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
-    ):
-        ct = self.component_type
-        new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
-        new_parent.component_data[ct].session_ref = child.component_data[ct].session_ref
-        child_cd = child.component_data[ct]
-        new_parent.component_data[ct].host_lock_ref = child_cd.host_lock_ref
-        # A Full host lock starts as a one-node segment. Splitting that node
-        # extends the segment through the inserted prefix, so its boundary
-        # moves to the prefix's older edge just like the SWA segment boundary.
-        host_uuid = child_cd.metadata.pop("host_uuid", None)
-        if host_uuid is not None:
-            new_parent.component_data[ct].metadata["host_uuid"] = host_uuid
-        assert new_parent.component_data[ct].session_ids is None
-        split_len = len(new_parent.key)
-        if child_cd.value is not None:
-            new_parent.component_data[ct].value = child_cd.value[:split_len].clone()
-            child_cd.value = child_cd.value[split_len:].clone()
-        if child_cd.host_value is not None:
-            new_parent.component_data[ct].host_value = child_cd.host_value[
-                :split_len
-            ].clone()
-            child_cd.host_value = child_cd.host_value[split_len:].clone()
 
     def evict_component(
         self,

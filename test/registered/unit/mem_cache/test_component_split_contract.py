@@ -35,8 +35,7 @@ _REGISTERED_COMPONENTS = tuple(
 class TestComponentSplitFieldCoverage(unittest.TestCase):
     """`redistribute_on_node_split` must decide every ComponentData field.
 
-    Each component hand-writes this hook, and the recurring bug is a field
-    nobody remembered: SWA dropped `host_lock_ref` (#38138) and FULL dropped it
+    The recurring bug is a field the hook forgot: SWA dropped `host_lock_ref` (#38138) and FULL dropped it
     again (#38480), in both cases letting an eviction reclaim a host slice an
     in-flight L3 write was still reading. The table below is the decision
     record; adding a field to ComponentData without classifying it here fails.
