@@ -68,6 +68,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
@@ -431,7 +432,7 @@ class TestMambaInfoRouting(CustomTestCase):
                                 spec_state_size=0,
                                 cache_params=InklingConvCacheParams(
                                     shape=InklingConvStateShape(
-                                        conv=[(2,)], temporal=(2,)
+                                        conv=[(2, 2)], temporal=(2,)
                                     ),
                                     layers=list(ids),
                                     dtype=InklingStateDType(
@@ -841,11 +842,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
                         "_build_sidecar_host_pool",
                         return_value=SimpleNamespace(layer_num=2),
                     ) as build_indexer,
-                    patch.object(
-                        hybrid_pool_assembler,
-                        "get_memory",
-                        return_value=SimpleNamespace(hicache_mem_layout="page_first"),
-                    ),
+                    get_context().override_server_args(hicache_mem_layout="page_first"),
                     patch.object(
                         hybrid_pool_assembler,
                         "get_parallel",
