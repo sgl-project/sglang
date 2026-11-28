@@ -476,6 +476,9 @@ class Envs:
     # ===================================================================
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
+    # llguidance structural tags: longest string length bound that is enforced
+    # by a regex; larger bounds are relaxed to free text. Negative = no limit.
+    SGLANG_LLGUIDANCE_MAX_ENFORCED_STRING_LENGTH = EnvInt(4096)
 
     # ===================================================================
     # Fault injection and regression tests
