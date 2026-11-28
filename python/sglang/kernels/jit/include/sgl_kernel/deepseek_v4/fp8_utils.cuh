@@ -8,10 +8,9 @@
 #ifndef USE_ROCM
 #include <cuda_fp8.h>
 #elif defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__)
-// Only on the arches that take the hardware branch below. hip_fp8.h is what defines
-// HIP_FP8_TYPE_FNUZ, and nothing else in this include tree pulls it in, so gating on
-// those macros instead would also flip the software cast's arch constants on gfx942 --
-// it picks fn today because the macro is not visible there.
+// Only on the arches that take the hardware branch below. The software cast's flavour
+// comes from the JIT build flags instead: get_default_target_flags passes
+// -DHIP_FP8_TYPE_FNUZ=1 on gfx942 and -DHIP_FP8_TYPE_E4M3=1 elsewhere.
 #include <hip/hip_fp8.h>
 #define SGL_ROCM_FP8_HW_CVT 1
 #endif
@@ -57,78 +56,57 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
 // is the OCP one kFP8E4M3Max already assumes there. Clip first rather than passing
 // __HIP_SATFINITE -- the x2 fast path converts the value it was handed, not the clamped
 // one (ROCm 7.2).
-//
-// gfx942 keeps the software cast below, top-segment bug and all -- this instruction does
-// not produce the fnuz flavour that arch needs, so it takes a separate fix.
 SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
   const fp32x2_t v{fp8_e4m3_clip(x), fp8_e4m3_clip(y)};
   return __hip_cvt_float2_to_fp8x2(v, __HIP_NOSAT, __HIP_E4M3);
 }
 #else
 // Software float -> FP8 E4M3 conversion for the archs the branch above skips: gfx942,
-// plus any target with no native fp8 convert.
+// plus any target with no native fp8 convert. Rounds to nearest even like torch's cast:
+// the rescale by a power of two is exact, so rintf does the rounding.
 SGL_DEVICE uint8_t cvt_float_to_fp8_e4m3(float val) {
   val = fp8_e4m3_clip(val);
-  if (val == 0.0f) return 0;
-
-  uint32_t f32 = __float_as_uint(val);
-  uint8_t sign = static_cast<uint8_t>((f32 >> 31) << 7);
-  int32_t exp32 = static_cast<int32_t>((f32 >> 23) & 0xFF) - 127;
-  uint32_t mant23 = f32 & 0x7FFFFF;
+  const uint8_t sign = static_cast<uint8_t>((__float_as_uint(val) >> 31) << 7);
+  const float a = fabsf(val);
 
 #if HIP_FP8_TYPE_FNUZ
-  // E4M3FNUZ: bias=8, max=240, no negative zero, NaN=0x80
+  // E4M3FNUZ: bias=8, max=240 (exponent 15 is a normal binade), no negative zero, NaN=0x80
   constexpr int32_t kBias = 8;
-  constexpr int32_t kMaxExp = 15;
-  constexpr int32_t kMinSubnormExp = -10;  // min subnormal exponent
-  constexpr int32_t kMinNormExp = -7;      // min normal exponent
-  constexpr uint8_t kSaturate = 0x7Fu;     // max normal = 0_1111_111 = 240.0
+  constexpr int32_t kMinNormExp = -7;
+  constexpr int32_t kMinSubnormExp = -10;
+  constexpr int32_t kMaxTopMant = 7;    // 0_1111_111 = 240.0
+  constexpr uint8_t kSaturate = 0x7Fu;  // max normal = 240.0
+  // An underflowing negative must flush to +0: byte 0x80 is NaN here, not -0.0.
+  constexpr bool kHasNegZero = false;
 #else
   // E4M3FN: bias=7, max=448, NaN=0x7F
   constexpr int32_t kBias = 7;
-  constexpr int32_t kMaxExp = 15;
-  constexpr int32_t kMinSubnormExp = -9;
   constexpr int32_t kMinNormExp = -6;
-  constexpr uint8_t kSaturate = 0x7Eu;  // max normal = 0_1111_110 = 448.0
+  constexpr int32_t kMinSubnormExp = -9;
+  constexpr int32_t kMaxTopMant = 6;    // 0_1111_110 = 448.0; 0_1111_111 is NaN
+  constexpr uint8_t kSaturate = 0x7Eu;  // max normal = 448.0
+  constexpr bool kHasNegZero = true;
 #endif
 
-  int32_t exp8;
-  uint8_t mant3;
-
-  if (exp32 < kMinSubnormExp) {
-#if HIP_FP8_TYPE_FNUZ
-    // E4M3FNUZ (gfx942) has no negative zero: byte 0x80 is NaN, not -0.0.
-    // Returning `sign` (0x80) for an underflowing negative injects NaN into the
-    // fp8 KV cache -> NaN attention/logits. Flush underflow to +0 instead.
-    return 0;
-#else
-    // E4M3FN (gfx950): 0x80 == -0.0, harmless.
-    return sign;
-#endif
-  } else if (exp32 < kMinNormExp) {
-    // Subnormal range
-    int32_t shift = -(kBias - 1) - exp32;  // 1..3
-    uint32_t subnorm_mant = (0x800000 | mant23) >> (shift + 20);
-    uint32_t round_bit = ((0x800000 | mant23) >> (shift + 19)) & 1;
-    subnorm_mant += round_bit;
-    mant3 = static_cast<uint8_t>(subnorm_mant & 0x07);
-    exp8 = 0;
-    if (subnorm_mant > 7) {
-      exp8 = 1;
-      mant3 = 0;
-    }
-  } else {
-    exp8 = exp32 + kBias;
-    mant3 = static_cast<uint8_t>(mant23 >> 20);
-    uint32_t round_bit = (mant23 >> 19) & 1;
-    mant3 += round_bit;
-    if (mant3 > 7) {
-      mant3 = 0;
-      exp8++;
-    }
-    if (exp8 >= kMaxExp) return sign | kSaturate;
+  if (a < ldexpf(1.0f, kMinNormExp)) {
+    // Subnormal (or zero): count min subnormals, ties to even. The binade under the min
+    // subnormal rounds up to it past its midpoint; 8 of them are the min normal.
+    const int32_t n = static_cast<int32_t>(rintf(ldexpf(a, -kMinSubnormExp)));
+    if (n == 0) return kHasNegZero ? sign : 0;
+    return sign | static_cast<uint8_t>(n);  // n == 8 is exponent 1, mantissa 0
   }
-  return sign | (static_cast<uint8_t>(exp8) << 3) | mant3;
+  int32_t exp32 = ilogbf(a);
+  // 1.mmm in eighths, 8..16 after rounding to nearest even
+  int32_t eighths = static_cast<int32_t>(rintf(ldexpf(a, 3 - exp32)));
+  if (eighths == 16) {
+    eighths = 8;
+    ++exp32;
+  }
+  const int32_t exp8 = exp32 + kBias;
+  const int32_t mant3 = eighths - 8;
+  // Exponent 15 is a full normal binade; only past its last finite code does it saturate.
+  if (exp8 > 15 || (exp8 == 15 && mant3 > kMaxTopMant)) return sign | kSaturate;
+  return sign | static_cast<uint8_t>((exp8 << 3) | mant3);
 }
 
 // Pack two fp32 values into a single fp8x2_e4m3 (uint16_t on HIP).

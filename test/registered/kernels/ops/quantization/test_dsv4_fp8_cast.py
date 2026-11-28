@@ -3,14 +3,13 @@
 Every fp8 store in the DSv4 tree quantizes through ``pack_fp8``, and none of the
 callers can see when it is wrong: the value has already been divided by a
 quantization scale, so a bad rounding or saturation boundary comes back as fp8 being
-lossier than it should be, not as a failure. ``pack_fp8`` on ROCm used to be a
-hand-written bit twiddle, and it had two: the whole top exponent segment saturated
-to the max normal, and the binade under the min subnormal flushed to zero instead of
-rounding up to it. Both are pinned below.
+lossier than it should be, not as a failure. The ROCm software cast used to have
+three: the whole top exponent segment saturated to the max normal, the binade under
+the min subnormal flushed to zero instead of rounding up to it, and ties rounded up
+instead of to even. All are pinned below.
 
-gfx950 only. gfx942 still runs the software cast, bugs and all, because the
-instruction cannot produce the fnuz bytes that arch writes; that one needs its own fix.
-The reference is torch's own cast.
+gfx950 runs the hardware convert, gfx942 the software cast. The reference is torch's
+own cast.
 """
 
 import math
@@ -19,14 +18,13 @@ import unittest
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, fp8_max
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.deepseek_v4.fp8_cvt import cvt_fp8_e4m3
 from sglang.test.test_utils import CustomTestCase
 
-# the default amd runner is mi300, where pack_fp8 still takes the software path this
-# does not cover
 register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd")
 
 DEVICE = torch.device("cuda")
 
@@ -69,8 +67,10 @@ def _as_bytes(x):
 
 
 @unittest.skipUnless(
-    torch.cuda.is_available() and is_hip() and is_gfx95_supported(),
-    "the gfx95 path of pack_fp8 is what this pins",
+    torch.cuda.is_available()
+    and is_hip()
+    and (is_gfx95_supported() or is_gfx942_supported()),
+    "pins pack_fp8 on gfx950 (hardware convert) and gfx942 (software cast)",
 )
 class TestDsv4Fp8Cast(CustomTestCase):
     def test_matches_torch_over_the_whole_range(self):
