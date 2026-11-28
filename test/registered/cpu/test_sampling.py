@@ -4,6 +4,7 @@ import pytest
 import sgl_kernel  # noqa: F401
 import torch
 
+from sglang.kernels.ops.sampling import argmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -50,6 +51,22 @@ def test_murmur_hash32_cpu_shape_and_dtype(positions_dtype):
     assert actual.device.type == "cpu"
     assert actual.dtype == torch.uint32
     assert actual.shape == (3, 128)
+
+
+@pytest.mark.parametrize("rows,cols", [(1, 7), (5, 200064), (3, 4097), (2, 12345)])
+def test_argmax_cpu_matches_torch(rows, cols):
+    torch.manual_seed(0)
+    x = torch.randn(rows, cols)
+    torch.testing.assert_close(argmax(x), torch.argmax(x, dim=-1))
+
+
+def test_argmax_cpu_ties_and_nan():
+    x = torch.zeros(3, 20000)
+    x[:, [5000, 9000, 19999]] = 1.0
+    x[1, 3] = float("nan")
+    x[2, 15000] = float("nan")
+    x[2, 9000] = float("nan")
+    torch.testing.assert_close(argmax(x), torch.argmax(x, dim=-1))
 
 
 if __name__ == "__main__":

@@ -152,6 +152,17 @@ def softmax_sample(
     return softmax_jit.softmax_sample(logits, temperatures, top_ks=top_ks, out=out)
 
 
+@functools.cache
+def _has_cpu_argmax() -> bool:
+    import torch
+
+    try:
+        import sgl_kernel  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch.ops.sgl_kernel, "argmax_cpu")
+
+
 def argmax(logits: torch.Tensor) -> torch.Tensor:
     """Row-wise int64 argmax of ``[rows, vocab]``; a value tie takes the lowest index.
 
@@ -159,6 +170,15 @@ def argmax(logits: torch.Tensor) -> torch.Tensor:
     preserve torch.argmax's NaN selection.
     """
     import torch
+
+    if (
+        logits.device.type == "cpu"
+        and logits.dtype == torch.float32
+        and logits.dim() == 2
+        and logits.stride(1) == 1
+        and _has_cpu_argmax()
+    ):
+        return torch.ops.sgl_kernel.argmax_cpu(logits)
 
     if logits.is_cuda and PlatformInfo.detect().device_type == "npu":
         if (
