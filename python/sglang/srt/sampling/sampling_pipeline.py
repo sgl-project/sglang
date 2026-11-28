@@ -291,7 +291,6 @@ def detect_nan_logits(logits: Optional[torch.Tensor], entry: str) -> None:
 def edits_verify_logits(
     info: SamplingBatchInfo, *, has_grammar: bool, has_watermark: bool
 ) -> bool:
-    """Whether some stage before the sanitize edits a verify's logits."""
     return (
         has_grammar
         or has_watermark
