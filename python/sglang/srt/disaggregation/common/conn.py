@@ -6,6 +6,7 @@ import dataclasses
 import logging
 import threading
 import time
+import uuid
 from collections import defaultdict
 from contextlib import nullcontext
 from typing import (
@@ -77,6 +78,11 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+_BOOTSTRAP_EPOCH = "X-SGLang-Bootstrap-Epoch"
+_TOPOLOGY_PATH = (
+    "/route?prefill_dp_rank=-1&prefill_cp_rank=-1&target_tp_rank=-1&target_pp_rank=-1"
+)
 
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
@@ -230,6 +236,7 @@ class PrefillServerInfo:
     target_pp_ranks: Optional[List[int]] = None
     required_dst_info_num: Optional[int] = None
     required_prefill_response_num: Optional[int] = None
+    bootstrap_epoch: Optional[str] = None
 
     def __post_init__(self):
         self.attn_tp_size = int(self.attn_tp_size)
@@ -252,6 +259,7 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    manager_id: Optional[str] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -1585,11 +1593,7 @@ class CommonKVManager(BaseKVManager):
 
         info: PrefillServerInfo = None
         try:
-            url = (
-                f"http://{bootstrap_addr}/route?"
-                f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
-                f"target_tp_rank={-1}&target_pp_rank={-1}"
-            )
+            url = f"http://{bootstrap_addr}{_TOPOLOGY_PATH}"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -1598,6 +1602,7 @@ class CommonKVManager(BaseKVManager):
                 info = PrefillServerInfo(
                     **{key: value for key, value in data.items() if key in known}
                 )
+                info.bootstrap_epoch = response.headers.get(_BOOTSTRAP_EPOCH)
             else:
                 logger.error(
                     f"Failed to get prefill server info: {response.status_code}, {response.text}"
@@ -1920,6 +1925,9 @@ class CommonKVManager(BaseKVManager):
             "prefill_http_port": get_serving().port,
         }
 
+        if get_disagg().enable_pd_role_switch:
+            # A retried PUT reuses this ID; a rebuilt manager gets a new one.
+            payload["manager_id"] = uuid.uuid4().hex
         payload["decode_allocation_policy"] = (
             get_disagg().disaggregation_decode_allocation_policy
         )
@@ -2326,15 +2334,16 @@ class CommonKVManager(BaseKVManager):
                 if self._heartbeat_shutdown.wait(self.heartbeat_interval):
                     break
                 with self.connection_lock:
-                    addresses = list(self.prefill_info_table.keys())
+                    peers = list(self.prefill_info_table.items())
 
-                for bootstrap_addr in addresses:
+                for bootstrap_addr, info in peers:
+                    epoch = getattr(info, "bootstrap_epoch", None)
                     session = None
                     try:
                         with self.session_pool_lock:
                             session = self.session_pool[bootstrap_addr]
                         response = session.get(
-                            f"http://{bootstrap_addr}/health",
+                            f"http://{bootstrap_addr}{_TOPOLOGY_PATH if epoch else '/health'}",
                             timeout=(2, 3),
                             # The Rust server's /health skips its generation probe for this.
                             headers={
@@ -2343,6 +2352,14 @@ class CommonKVManager(BaseKVManager):
                             },
                         )
                         if response.status_code == 200:
+                            if (
+                                epoch
+                                and response.headers.get(_BOOTSTRAP_EPOCH) != epoch
+                            ):
+                                self._handle_node_failure(
+                                    bootstrap_addr, expected_info=info
+                                )
+                                continue
                             self.heartbeat_failures[bootstrap_addr] = 0
                             self._on_heartbeat_success(bootstrap_addr)
                         else:
@@ -2379,9 +2396,15 @@ class CommonKVManager(BaseKVManager):
         """Hook called on successful heartbeat. Override for backend-specific cleanup."""
         pass
 
-    def _handle_node_failure(self, failed_bootstrap_addr: str):
-        """Handle failure of a prefill node."""
+    def _handle_node_failure(self, failed_bootstrap_addr: str, *, expected_info=None):
+        """Retire cached endpoints and unfinished rooms bound to this prefill."""
         with self.connection_lock:
+            if (
+                expected_info is not None
+                and self.prefill_info_table.get(failed_bootstrap_addr)
+                is not expected_info
+            ):
+                return
             keys_to_remove = [
                 k
                 for k in self.connection_pool
@@ -2411,6 +2434,11 @@ class CommonKVManager(BaseKVManager):
         for endpoint in stale_endpoints:
             CommonKVReceiver.disconnect_endpoint(endpoint)
 
+        reason = (
+            "Prefill manager changed"
+            if expected_info is not None
+            else "Lost connection with prefill instance"
+        )
         affected_rooms = []
         for room in possible_affected_rooms:
             if (
@@ -2419,13 +2447,13 @@ class CommonKVManager(BaseKVManager):
             ):
                 self.record_failure(
                     room,
-                    f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
+                    f"{reason} (bootstrap_addr: {failed_bootstrap_addr})",
                 )
                 self.update_status(room, KVPoll.Failed)
                 affected_rooms.append(room)
 
         logger.error(
-            f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
+            f"{reason} (bootstrap_addr: {failed_bootstrap_addr}), "
             f"{len(affected_rooms)} requests affected"
         )
 
@@ -2869,7 +2897,8 @@ class CommonKVReceiver(BaseKVReceiver):
     def init(self, prefill_dp_rank: int):
         if self.conclude_state == KVPoll.Failed:
             return
-        if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
+        self.prefill_info = self.kv_mgr.prefill_info_table.get(self.bootstrap_addr)
+        if self.prefill_info is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
                 f"Prefill server with bootstrap_addr: {self.bootstrap_addr} is healthy before, but now it is down. Request (bootstrap_room: {self.bootstrap_room}) has been marked as failed.",
@@ -2879,7 +2908,6 @@ class CommonKVReceiver(BaseKVReceiver):
             return
 
         # Read pre-computed rank mapping from prefill_info (computed in try_ensure_parallel_info)
-        self.prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
         info = self.prefill_info
         policy = get_disagg().disaggregation_decode_allocation_policy
         reason = None
@@ -3026,6 +3054,16 @@ class CommonKVReceiver(BaseKVReceiver):
                     return
 
                 with self.kv_mgr.connection_lock:
+                    if (
+                        self.kv_mgr.prefill_info_table.get(self.bootstrap_addr)
+                        is not self.prefill_info
+                    ):
+                        self.kv_mgr.record_failure(
+                            self.bootstrap_room, "Prefill changed during bootstrap"
+                        )
+                        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                        self.conclude_state = KVPoll.Failed
+                        return
                     cached_bootstrap_infos = self.kv_mgr.connection_pool.setdefault(
                         bootstrap_key, self.bootstrap_infos
                     )
@@ -3402,6 +3440,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         ] = {}
         self.room_to_dp_rank: Dict[int, Dict[str, Union[int, float]]] = {}
         self._registered_count = 0
+        self._bootstrap_epoch = None
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
         )
@@ -3574,11 +3613,16 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
             tp_group_table = cp_group_table.setdefault(attn_tp_rank, {})
 
-            if pp_rank not in tp_group_table:
+            previous = tp_group_table.get(pp_rank)
+            if previous is None:
                 self._registered_count += 1
+            manager_id = data.get("manager_id")
+            if manager_id != (previous.manager_id if previous else None):
+                self._bootstrap_epoch = uuid.uuid4().hex
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                manager_id=manager_id,
             )
 
         expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
@@ -3638,6 +3682,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 decode_allocation_policy=self.decode_allocation_policy,
             )
             payload = dataclasses.asdict(info)
+            # The epoch travels in a header so older decodes can parse the body.
+            payload.pop("bootstrap_epoch")
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
             if info.spec_kv_layout is None:
@@ -3650,7 +3696,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 payload.pop("state_wire")
             if not info.state_wires:
                 payload.pop("state_wires")
-            return web.json_response(payload, status=200)
+            headers = (
+                {_BOOTSTRAP_EPOCH: self._bootstrap_epoch}
+                if self._bootstrap_epoch
+                else {}
+            )
+            return web.json_response(payload, status=200, headers=headers)
 
         if not self._is_ready():
             return web.Response(
@@ -3672,7 +3723,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 status=404,
             )
 
-        return web.json_response(dataclasses.asdict(bootstrap_info), status=200)
+        return web.json_response(
+            {"rank_ip": bootstrap_info.rank_ip, "rank_port": bootstrap_info.rank_port}
+        )
 
     async def _handle_register_dp_rank(self, request: web.Request):
         data = await request.json()

@@ -5,13 +5,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
+import asyncio
 import struct
 import threading
 import unittest
 from collections import defaultdict
 from itertools import product
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import msgspec
 import numpy as np
@@ -88,10 +89,12 @@ class _FetchingReceiver(_ConcreteReceiver):
 
 def _fetching_receiver(connection_pool):
     receiver = object.__new__(_FetchingReceiver)
+    receiver.prefill_info = object()
     receiver.kv_mgr = SimpleNamespace(
         connection_pool=connection_pool,
         connection_lock=threading.Lock(),
         is_mla_backend=False,
+        prefill_info_table={"prefill:8998": receiver.prefill_info},
     )
     receiver.bootstrap_addr = "prefill:8998"
     receiver.bootstrap_room = 1
@@ -106,6 +109,86 @@ def _fetching_receiver(connection_pool):
 
 
 class TestReceiverConnectionPool(CustomTestCase):
+    def test_heartbeat_rediscovers_rebuilt_prefill(self):
+        addr = "prefill:8998"
+        with patch.object(CommonKVBootstrapServer, "run"):
+            server = CommonKVBootstrapServer("127.0.0.1", 8998)
+        row = dict(
+            attn_tp_size=1,
+            attn_cp_size=1,
+            attn_dp_size=1,
+            pp_size=1,
+            system_dp_size=1,
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+            attn_dp_rank=0,
+            pp_rank=0,
+            system_dp_rank=0,
+            rank_ip="127.0.0.1",
+            rank_port=17000,
+            page_size=1,
+            kv_cache_dtype="auto",
+            manager_id="old",
+        )
+
+        def register():
+            asyncio.run(
+                server._handle_route_put(
+                    SimpleNamespace(json=AsyncMock(return_value=row))
+                )
+            )
+
+        def route(url, **kwargs):
+            from urllib.parse import parse_qsl, urlsplit
+
+            target = urlsplit(url)
+            self.assertEqual((target.netloc, target.path), (addr, "/route"))
+            return asyncio.run(
+                server._handle_route_get(
+                    SimpleNamespace(query=dict(parse_qsl(target.query)))
+                )
+            )
+
+        register()
+        query = f"http://{addr}/route?prefill_dp_rank=-1&prefill_cp_rank=-1&target_tp_rank=-1&target_pp_rank=-1"
+        info = SimpleNamespace(
+            bootstrap_epoch=route(query).headers["X-SGLang-Bootstrap-Epoch"]
+        )
+        register()  # A retried PUT must not invalidate a live peer.
+        self.assertEqual(
+            route(query).headers["X-SGLang-Bootstrap-Epoch"], info.bootstrap_epoch
+        )
+        key = f"{addr}_0_0_0"
+        stale = [{"rank_ip": row["rank_ip"], "rank_port": row["rank_port"]}]
+        manager = _manager()
+        manager.connection_lock = threading.Lock()
+        manager.session_pool_lock = threading.Lock()
+        manager.connection_pool = {key: stale, "other:8998_0_0_0": []}
+        manager.prefill_info_table = {addr: info}
+        session = Mock()
+        session.get.side_effect = lambda url, **kw: SimpleNamespace(
+            status_code=200, headers=route(url).headers
+        )
+        manager.session_pool = {addr: session}
+        manager.heartbeat_failures = {}
+        manager.max_failures = 3
+        manager.heartbeat_interval = 0
+        # The bootstrap service survives P->D->P, even if the new rank reuses its port.
+        row["manager_id"] = "new"
+        register()
+        manager._heartbeat_shutdown = Mock()
+        manager._heartbeat_shutdown.is_set.return_value = False
+        manager._heartbeat_shutdown.wait.side_effect = [False, True]
+        with patch.object(CommonKVReceiver, "disconnect_endpoint") as disconnect:
+            manager._start_heartbeat_checker_thread().join(5)
+            disconnect.assert_called_once_with("tcp://127.0.0.1:17000")
+        self.assertNotIn(addr, manager.prefill_info_table)
+        self.assertEqual(manager.connection_pool, {"other:8998_0_0_0": []})
+        receiver = _fetching_receiver(manager.connection_pool)
+        receiver._register_kv_args = Mock(return_value=True)
+        receiver._setup_bootstrap_infos()
+        receiver._register_kv_args.assert_called_once()
+
     def test_next_receiver_refetches_after_invalidation(self):
         stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
         connection_pool = {"prefill:8998_0_0_0": stale}
