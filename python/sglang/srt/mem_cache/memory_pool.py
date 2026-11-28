@@ -5743,9 +5743,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
         tail_dtype = torch.bfloat16
         tail_width = index_kpool + tail_extra_slots
         with (
-            torch.cuda.use_mem_pool(self.custom_mem_pool)
-            if self.custom_mem_pool
-            else nullcontext()
+            self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
+            (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ),
         ):
             self._compress_tail_k: Optional[List[torch.Tensor]] = [
                 torch.zeros(
