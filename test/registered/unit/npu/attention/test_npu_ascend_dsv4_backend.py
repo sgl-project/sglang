@@ -89,6 +89,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     _sparse_attn_kv_quant_kwargs,
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
+    prewarm_dsv4_aicpu,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     dsv4_state_payloads,
@@ -737,6 +738,66 @@ class TestSparseAttentionMetadata(unittest.TestCase):
     _ARCH35_PATCH_TARGET = (
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35"
     )
+
+    def test_prewarm_initializes_all_metadata_and_preserves_live_state(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        previous_metadata = object()
+        backend.forward_metadata = previous_metadata
+        backend._dsv4_sliding_window_size = 128
+        backend._dsv4_q_head_num = 64
+        backend._dsv4_kv_head_num = 1
+        backend._dsv4_head_dim = 512
+        backend._dsv4_has_c4 = True
+        backend._dsv4_has_c128 = True
+        backend._dsv4_index_topk = 512
+        backend._build_li_quant_metadata = MagicMock()
+
+        def check_synchronized_metadata(device):
+            self.assertEqual(device, "cpu")
+            self.assertEqual(
+                set(backend.forward_metadata.kernel_metadata),
+                {"c1a_metadata", "c4a_metadata", "c128a_metadata", "li_quant_metadata"},
+            )
+
+        synchronize = MagicMock(side_effect=check_synchronized_metadata)
+        with (
+            patch(self._ARCH35_PATCH_TARGET, return_value=False),
+            patch(_BACKEND_NPU_OPS) as ops,
+            patch.object(
+                torch, "npu", SimpleNamespace(synchronize=synchronize), create=True
+            ),
+        ):
+            prewarm_dsv4_aicpu(backend, "cpu")
+
+        calls = ops.sparse_flash_mla_metadata.call_args_list
+        self.assertEqual([call.kwargs["cmp_ratio"] for call in calls], [1, 4, 128])
+        for call in calls:
+            self.assertEqual(call.kwargs["batch_size"], 1)
+            self.assertEqual(call.kwargs["cu_seqlens_q_cpu"].tolist(), [0, 1])
+            self.assertEqual(call.kwargs["seqused_ori_kv_cpu"].tolist(), [1])
+        backend._build_li_quant_metadata.assert_called_once()
+        synchronize.assert_called_once_with("cpu")
+        self.assertIs(backend.forward_metadata, previous_metadata)
+
+    def test_prewarm_restores_live_state_on_failure(self):
+        for fail_during in ("build", "synchronize"):
+            with self.subTest(fail_during=fail_during):
+                previous_metadata = object()
+                build = MagicMock(return_value={})
+                synchronize = MagicMock()
+                failing_call = build if fail_during == "build" else synchronize
+                failing_call.side_effect = RuntimeError("prewarm failed")
+                backend = SimpleNamespace(
+                    forward_metadata=previous_metadata,
+                    _dsv4_sliding_window_size=128,
+                    _kernel_metadata_from_parts=build,
+                )
+                with patch.object(
+                    torch, "npu", SimpleNamespace(synchronize=synchronize), create=True
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "prewarm failed"):
+                        prewarm_dsv4_aicpu(backend, "cpu")
+                self.assertIs(backend.forward_metadata, previous_metadata)
 
     def test_device_metadata_receives_sequence_lengths(self):
         cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32)
