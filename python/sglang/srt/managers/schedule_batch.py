@@ -2414,7 +2414,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.get_fill_ids()[r.prefix_len :] for r in reqs]
+        input_ids = [
+            r.full_untruncated_fill_ids[r.prefix_len : r.extend_end] for r in reqs
+        ]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [r.extend_end for r in reqs]
         orig_seq_lens = [max(r.extend_end, len(r.origin_input_ids)) for r in reqs]
