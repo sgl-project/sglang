@@ -640,6 +640,72 @@ def test_masked_post_quant_writes_exactly_the_real_rows(transposed, counts_kind)
             assert (scale[expert, count:] == sentinel).all()
 
 
+@pytest.mark.parametrize("num_tokens", [0, 1, 3, 4, 7, 32])
+@pytest.mark.parametrize("hidden", [512, 768, 1024, 2048])
+def test_silu_and_mul_contig_post_quant_fp32_transposed(num_tokens, hidden):
+    """Column-major TMA-aligned fp32 scales match row-major fp32 scales bit-for-bit."""
+    from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+        silu_and_mul_contig_post_quant,
+    )
+
+    torch.manual_seed(num_tokens * 1000 + hidden)
+    x = torch.randn(num_tokens, hidden * 2, device="cuda", dtype=torch.bfloat16)
+
+    q_rm = torch.empty(num_tokens, hidden, device="cuda", dtype=fp8_dtype)
+    s_rm = create_per_token_group_quant_fp8_output_scale(
+        x_shape=q_rm.shape,
+        device="cuda",
+        group_size=128,
+        column_major_scales=False,
+        scale_tma_aligned=False,
+        scale_ue8m0=False,
+    )
+    silu_and_mul_contig_post_quant(
+        x, q_rm, s_rm, 128, scale_ue8m0=False, transposed=False, round_bf16=True
+    )
+
+    q_cm = torch.empty(num_tokens, hidden, device="cuda", dtype=fp8_dtype)
+    s_cm = create_per_token_group_quant_fp8_output_scale(
+        x_shape=q_cm.shape,
+        device="cuda",
+        group_size=128,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=False,
+    )
+    silu_and_mul_contig_post_quant(
+        x, q_cm, s_cm, 128, scale_ue8m0=False, transposed=True, round_bf16=True
+    )
+
+    assert torch.equal(q_rm.view(torch.uint8), q_cm.view(torch.uint8))
+    assert torch.equal(s_rm, s_cm)
+    if num_tokens > 0:
+        from sgl_kernel import silu_and_mul
+
+        ref_act = silu_and_mul(x)
+        ref_q, ref_s = sglang_per_token_group_quant_fp8(
+            ref_act, 128, column_major_scales=True, scale_tma_aligned=True
+        )
+        # With round_bf16=True, the fused kernel matches the two-kernel path
+        # (silu_and_mul -> per_token_group_quant_fp8) tightly (exact scales and
+        # near-100% byte equality, differing only on rare fast-math expf ULP ties).
+        torch.testing.assert_close(s_cm, ref_s, rtol=1e-4, atol=1e-6)
+        byte_match = (q_cm.view(torch.uint8) == ref_q.view(torch.uint8)).float().mean()
+        assert byte_match >= 0.999, (
+            f"Expected >=99.9% FP8 byte match, got {byte_match:.5f}"
+        )
+        deq_cm = (
+            q_cm.float().view(num_tokens, hidden // 128, 128) * s_cm.unsqueeze(-1)
+        ).view(num_tokens, hidden)
+        deq_ref = (
+            ref_q.float().view(num_tokens, hidden // 128, 128) * ref_s.unsqueeze(-1)
+        ).view(num_tokens, hidden)
+        cos = torch.nn.functional.cosine_similarity(
+            deq_cm.reshape(1, -1), deq_ref.reshape(1, -1)
+        ).item()
+        assert cos > 0.9995
+
+
 @pytest.mark.parametrize("column_major", [True, False])
 @pytest.mark.parametrize("scale_ue8m0", [True, False])
 def test_fused_silu(scale_ue8m0, column_major):
