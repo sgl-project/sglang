@@ -11,6 +11,11 @@ Design for DP-attention:
     broadcast is needed.  Empty-token ranks contribute zeros in the
     all-reduce so the collective never deadlocks.
 
+    On Ascend NPU, DeepEP exclusively owns the moe_ep group's HCCL
+    communication domain.  Running the count all-reduce on that group
+    contends with DeepEP and can hang, so callers pass ``allreduce_group``
+    (a dedicated process group spanning the same EP ranks) instead.
+
 Usage:
     solver = LPLBSolver(phy2log, log2phy, num_gpus, ep_group)
     log2phy_prob = solver.solve(topk_ids)  # per batch
@@ -90,6 +95,7 @@ class LPLBSolver:
         num_gpus: int,
         ep_group=None,
         logical_to_all_physical_map_num_valid=None,
+        allreduce_group=None,
     ):
         """
         Args:
@@ -98,10 +104,16 @@ class LPLBSolver:
             num_gpus: Number of GPUs in the EP group.
             ep_group: GroupCoordinator for EP communication (all-reduce).
             logical_to_all_physical_map_num_valid: (num_logical_experts,) number of valid physical copies.
+            allreduce_group: Optional raw ``torch.distributed.ProcessGroup``
+                spanning the EP ranks. When set, the per-batch count
+                all-reduce uses this group instead of ``ep_group``. Ascend NPU
+                passes a dedicated group here because DeepEP owns the moe_ep
+                group's HCCL communication domain.
         """
         device = phy2log.device
         self.num_gpus = num_gpus
         self.ep_group = ep_group
+        self.allreduce_group = allreduce_group
         self._has_redundancy = False
         if logical_to_all_physical_map_num_valid is not None:
             self._has_redundancy = bool(
@@ -179,23 +191,23 @@ class LPLBSolver:
         # without per-call .long() casts (Tier 1 optimization).
         self.log2phy = log2phy.to(torch.int64).contiguous()
 
-        # Pre-JIT-compile the fused IPM kernel for this (NC, NV) shape so the
+        # Pre-JIT-compile the IPM kernel for this (NC, NV) shape so the
         # 20-40s compile cost happens once at startup rather than on the first
         # real request. No-op when the fused backend is unavailable.
         nc = self.A_base.shape[0]
         nv = self.A_base.shape[1] + 1  # +1 for Big-M column added in solve()
-        from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
+        from sglang.srt.eplb.lplb_backend import get_lplb_warmup
 
+        _ipm_warmup = get_lplb_warmup()
         _ipm_warmup(nc, nv, num_iters=5, device=device)
 
         # Pre-compute A_base row sum (used in every prep call).
         self._A_base_row_sum = self.A_base.sum(dim=1).contiguous()  # (NC,)
 
-        # Pre-allocate the buffers the JIT CUDA prep / IPM / post kernels write
+        # Pre-allocate the buffers the fused prep / IPM / post kernels write
         # into. All writes are contiguous full-tensor stores (no strided
         # ``out=`` semantics), so the reuse is safe under high concurrency.
-        # Constructed lazily on the first solve() call (we don't know the
-        # device-side log2phy_prob shape until then) — see _solve.
+        # Both backends write ``_x`` through the ``result`` argument.
         self._A_full = torch.empty(nc, nv, dtype=torch.float32, device=device)
         self._A_full[:, : nv - 1].copy_(self.A_base)
         self._b = torch.empty(nc, dtype=torch.float32, device=device)
@@ -213,6 +225,8 @@ class LPLBSolver:
         including empty-token ranks (which pass an empty topk_ids tensor).
         This ensures the all-reduce collective does not deadlock under
         DP-attention where different ranks may have different token counts.
+        The count all-reduce runs on ``allreduce_group`` when one was supplied,
+        otherwise on ``ep_group``.
 
         Args:
             topk_ids: (num_tokens, topk) int32 tensor of logical expert IDs.
@@ -242,27 +256,36 @@ class LPLBSolver:
         # All EP ranks must participate — empty-token ranks contribute zeros.
         # After all-reduce, every rank has identical global_counts and solves
         # the same LP independently, so no broadcast is needed.
+        # On Ascend NPU the dedicated ``allreduce_group`` is preferred: DeepEP
+        # owns the moe_ep group's HCCL communication domain and an all-reduce
+        # there would contend with it (and hang the DeepEP path).
         # GroupCoordinator.all_reduce may be in-place (pynccl) or out-of-place
         # (ca_comm / pymscclpp / ...) depending on tensor size; small tensors
         # like ours (~num_logical * 4 B) typically take the out-of-place path,
         # so we must capture the return value.
         global_counts = local_counts.float()
-        if self.ep_group is not None:
+        if self.allreduce_group is not None:
+            # Dedicated raw process group; the collective is in-place.
+            torch.distributed.all_reduce(global_counts, group=self.allreduce_group)
+        elif self.ep_group is not None:
             global_counts = self.ep_group.all_reduce(global_counts)
 
         # Step 3: Run LP solver
         return self._solve(global_counts)
 
     def _solve(self, global_counts: torch.Tensor) -> torch.Tensor:
-        """Three CUDA kernel launches replace ~14 torch ops.
+        """Three fused kernel launches replace ~14 torch ops.
 
-        Pipeline (all writes go into pre-allocated buffers from __init__):
-            prep_lp_inputs → solve_ipm → extract_log2phy_prob
-        Raises if the JIT CUDA backend is unavailable.
+        Pipeline: prep_lp_inputs → solve_ipm → extract_log2phy_prob.
+        The kernels are selected per platform (CUDA JIT or Ascend NPU Triton).
+        The prep/post kernels write into pre-allocated buffers; the IPM kernel
+        writes the pre-allocated ``_x`` and returns it.
+        Raises if no backend is available.
         """
-        from sglang.kernels.ops.lplb import cuda_solver
+        from sglang.srt.eplb.lplb_backend import get_lplb_backend
 
-        cuda_solver.prep_lp_inputs(
+        backend = get_lplb_backend()
+        backend.prep_lp_inputs(
             self._A_full,
             self._b,
             self._t1,
@@ -272,10 +295,12 @@ class LPLBSolver:
             self.B1,
             self._A_base_row_sum,
         )
-        cuda_solver.solve_ipm(self._A_full, self._b, self.c_vec, result=self._x)
-        cuda_solver.extract_log2phy_prob(
+        # Both backends write into the pre-allocated ``self._x``; use the
+        # returned tensor so the call site stays backend-agnostic.
+        x = backend.solve_ipm(self._A_full, self._b, self.c_vec, result=self._x)
+        backend.extract_log2phy_prob(
             self._log2phy_prob,
-            self._x,
+            x,
             self._t1,
             self.phy_single,
             self.phy_replicated,

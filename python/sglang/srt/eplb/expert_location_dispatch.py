@@ -98,6 +98,28 @@ def transform_select_experts_inputs(
     return router_logits, correction_bias
 
 
+def solve_lplb_prob(
+    topk_ids: torch.Tensor,
+    info: Optional[ExpertLocationDispatchInfo],
+    layer_id: Optional[int],
+) -> Optional[torch.Tensor]:
+    """Run this layer's LPLB solver for ``topk_ids``, if LP dispatch is active.
+
+    The solver contains an EP all-reduce, so it must run outside any compiled
+    region and every EP rank must call it on every forward (including ranks with
+    an empty ``topk_ids``).  Callers pass the routed ids, without fused shared
+    expert columns.
+    """
+    if info is None or info.ep_dispatch_algorithm != "lp":
+        return None
+    from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+    lplb_solver = get_global_lplb_solver(layer_id)
+    if lplb_solver is None:
+        return None
+    return lplb_solver.solve(topk_ids)
+
+
 def topk_ids_logical_to_physical(
     topk_ids: torch.Tensor,
     info: Optional[ExpertLocationDispatchInfo],
@@ -190,17 +212,13 @@ def _topk_ids_logical_to_physical_probability(
     info: ExpertLocationDispatchInfo,
     log2phy_prob: torch.Tensor,
 ) -> torch.Tensor:
-    """Select physical experts via the JIT-compiled CUDA dispatch kernel.
+    """Select physical experts via the platform's fused dispatch kernel.
 
-    Raises if ``topk_ids`` isn't on CUDA — the LP path requires the fused
-    kernel and there is no torch reference fallback at runtime.
+    CUDA runs the JIT kernel; Ascend NPU runs the Triton-Ascend port. There is
+    no torch-reference fallback at runtime on either platform.
     """
-    if not topk_ids.is_cuda:
-        raise RuntimeError(
-            f"LP dispatch requires CUDA tensors; got topk_ids on {topk_ids.device}."
-        )
-    from sglang.kernels.ops.lplb import cuda_solver
+    from sglang.srt.eplb.lplb_backend import get_lplb_backend
 
-    return cuda_solver.dispatch_probability(
+    return get_lplb_backend().dispatch_probability(
         topk_ids, log2phy_prob, info.partial_logical_to_all_physical_map
     )
