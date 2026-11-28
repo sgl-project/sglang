@@ -321,8 +321,25 @@ def _gdn_prefill_graph_extend_captures(model_runner: ModelRunner) -> bool:
         from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
             get_prefill_num_tokens_to_capture,
         )
-        return buckets_keep_chunk_o_block_size(
-            get_prefill_num_tokens_to_capture(capture_tokens)
+
+        buckets = get_prefill_num_tokens_to_capture(capture_tokens)
+        if not buckets_keep_chunk_o_block_size(buckets):
+            return False
+        # PrefillCudaGraphRunner.capture_prepare splits a token bucket into
+        # ceil(bucket / context) synthetic requests, while the GDN metadata
+        # only holds prefill_graph_max_seqs rows: a bucket needing more rows
+        # than that asserts in GDNPrefillGraphMetadata.fill() during capture.
+        context_len = model_runner.model_config.context_len
+        if prefill.max_context_size:
+            context_len = min(prefill.max_context_size, context_len)
+        if not context_len or context_len <= 0:
+            return False
+        max_seqs_cap = min(
+            model_runner.req_to_token_pool.size,
+            envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get(),
+        )
+        return all(
+            -(-n // context_len) <= max(1, min(n, max_seqs_cap)) for n in buckets
         )
     except Exception as e:
         rank0_log(
