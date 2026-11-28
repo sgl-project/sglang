@@ -1263,6 +1263,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 video, audio, features = model(**call_kwargs, return_dwd_features=True)
                 batch.extra[MINIMAX_H3_DWD_FEATURES_EXTRA_KEY] = features
                 return video, audio
+            if getattr(batch, "enable_spectrum", False) or getattr(
+                getattr(batch, "sampling_params", None), "enable_spectrum", False
+            ):
+                # Spectrum switches on forward_batch.enable_spectrum inside
+                # MiniMaxH3DiTModel.forward() and skips the block stack on
+                # forecast steps; replaying a graph warmed with Spectrum off
+                # would skip begin_spectrum_step() and run the full blocks.
+                return model(**call_kwargs)
             runner = self._maybe_get_bcg_runner(model)
             if runner is None:
                 return model(**call_kwargs)

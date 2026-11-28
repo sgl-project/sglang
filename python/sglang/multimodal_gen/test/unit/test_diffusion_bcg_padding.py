@@ -741,6 +741,58 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         )
         self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
 
+    def test_minimax_h3_hybrid_window_backend_keeps_host_bounds(self):
+        from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+            H3PackedPrompt,
+            live_packed_prompt,
+        )
+        from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+        resolved_model = MiniMaxH3DiTModel()
+        resolved_model._resolved_attention_backend = (
+            AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
+        )
+
+        lazy_model = MiniMaxH3DiTModel()
+        lazy_model._resolved_attention_backend = None
+        lazy_model.arch = SimpleNamespace(hybrid_attention=object())
+        resolve_calls = 0
+
+        def _resolve():
+            nonlocal resolve_calls
+            resolve_calls += 1
+            lazy_model._resolved_attention_backend = (
+                AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
+            )
+
+        lazy_model._resolve_attention_backend_once = _resolve
+
+        def pad(model, n: int):
+            kw = self._minimax_h3_kwargs(n)
+            token = live_packed_prompt.set(
+                H3PackedPrompt(tuple(kw["packed_seq_params"]["cu_seqlens_q_host"]), n)
+            )
+            try:
+                out = self.stage._bcg_pad_prompt_kwargs(kw, current_model=model)
+            finally:
+                live_packed_prompt.reset(token)
+            return kw, out
+
+        with self._patch_buckets(64, 128):
+            short_in, short_out = pad(resolved_model, 19)
+            long_in, long_out = pad(resolved_model, 47)
+            lazy_in, lazy_out = pad(lazy_model, 19)
+
+        self.assertIs(short_out, short_in)
+        self.assertIs(long_out, long_in)
+        self.assertIs(lazy_out, lazy_in)
+        self.assertEqual(resolve_calls, 1)
+        self.assertEqual(
+            short_out["packed_seq_params"]["cu_seqlens_q_host"], (0, 25, 64)
+        )
+        self.assertNotIn("bcg_live_bounds", short_out["packed_seq_params"])
+        self.assertNotEqual(_signature_kwargs(short_out), _signature_kwargs(long_out))
+
     def _ideogram_kwargs(self, text_seq: int, *, image_seq: int = 4):
         total_seq = text_seq + image_seq
         indicator = torch.zeros(1, total_seq, dtype=torch.long)

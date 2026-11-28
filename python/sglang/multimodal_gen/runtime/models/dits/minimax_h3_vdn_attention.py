@@ -363,6 +363,13 @@ def _minimax_h3_hybrid_attention_core_impl(
     max_seqlen: int,
     ulysses_active: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if cu_seqlens_host == ():
+        from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+            _live_attention_bounds,
+        )
+
+        cu_seqlens_host, max_seqlen = _live_attention_bounds()
+        cu_seqlens = cu_seqlens[: len(cu_seqlens_host)]
     meta = _hybrid_attention_metadata()
     layout = meta.layout
     softmax = functools.partial(
