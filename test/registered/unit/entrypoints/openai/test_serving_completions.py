@@ -23,6 +23,7 @@ from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.streaming_abort_test_utils import abort_stream_chunks
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -500,6 +501,53 @@ class ServingCompletionTestCase(unittest.TestCase):
                 self.assertEqual(choices[0]["prompt_token_ids"], [1, 2])
                 for choice in choices[1:]:
                     self.assertNotIn("prompt_token_ids", choice)
+
+    def test_streaming_graceful_abort_sends_the_text_once(self):
+        """A graceful abort ends the stream with the text generated so far.
+
+        Under incremental streaming the abort chunk carried the whole text
+        while every earlier chunk carried a delta, so the client received the
+        generation twice.
+        """
+        req = CompletionRequest(model="x", prompt="Hi", max_tokens=10, stream=True)
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+        deltas = ["Hello", ", wor", "ld!"]
+        for incremental in (True, False):
+            with (
+                self.subTest(incremental_streaming_output=incremental),
+                get_context().override_server_args(
+                    stream_response_default_include_usage=False,
+                    incremental_streaming_output=incremental,
+                ),
+            ):
+                # The last two deltas are still queued when the abort arrives.
+                chunks = abort_stream_chunks(
+                    deltas, incremental=incremental, read_after=(0,)
+                )
+
+                async def _mock_generate(*args, _chunks=chunks, **kwargs):
+                    for chunk in _chunks:
+                        yield chunk
+
+                self.sc.tokenizer_manager.generate_request = _mock_generate
+
+                async def run_stream():
+                    return [
+                        chunk
+                        async for chunk in self.sc._generate_completion_stream(
+                            adapted_request, req, self.fastapi_request
+                        )
+                    ]
+
+                raw_chunks = get_or_create_event_loop().run_until_complete(run_stream())
+                choices = [
+                    choice
+                    for raw in raw_chunks
+                    if raw.startswith("data: ") and raw.strip() != "data: [DONE]"
+                    for choice in json.loads(raw[len("data: ") :]).get("choices", [])
+                ]
+                self.assertEqual("".join(c["text"] for c in choices), "Hello, world!")
+                self.assertEqual(choices[-1]["finish_reason"], "abort")
 
     def test_non_streaming_cached_tokens_details_emits_sglext(self):
         """Test that non-streaming completion responses emit cached token details in sglext."""

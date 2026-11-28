@@ -3,6 +3,7 @@ contract that replaced the raw_json passthrough, checked without a server, and
 where the route applies it. Also how `serve_generate_request` writes a stream."""
 
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 
@@ -12,8 +13,15 @@ from fastapi.testclient import TestClient
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.api_contract import generate_contract_error
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.json_response import dumps_json
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.streaming_abort_test_utils import (
+    make_stream_manager,
+    make_stream_state,
+    stream_until_abort,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -281,6 +289,53 @@ class TestGenerateStreamWrites(CustomTestCase):
                     self.assertEqual(asyncio.run(writes(obj, outs, **kwargs)), expected)
         finally:
             http_server._global_state = prior_state
+
+    def test_incremental_abort_stream_sends_each_delta_once(self):
+        """/generate writes the manager's chunks as they are, so under
+        incremental streaming an abort must end the stream with only the
+        output not yet sent."""
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        tm = make_stream_manager(incremental=True)
+        state = make_stream_state(tm, "generate-abort")
+        deltas = ("Hello", ", wor", "ld!")
+
+        async def generate_request(obj, request):
+            # The last two deltas are still queued when the abort arrives.
+            for chunk in await stream_until_abort(tm, state, deltas, read_after=(0,)):
+                yield chunk
+
+        class Request:
+            headers = {}
+
+            async def is_disconnected(self):
+                return False
+
+        async def run():
+            http_server.set_global_state(
+                SimpleNamespace(
+                    tokenizer_manager=SimpleNamespace(
+                        generate_request=generate_request,
+                        create_abort_task=lambda obj: None,
+                    )
+                )
+            )
+            response = await http_server.serve_generate_request(state.obj, Request())
+            return [body async for body in response.body_iterator]
+
+        prior_state = http_server.get_global_state()
+        try:
+            events = b"".join(asyncio.run(run())).decode().split("\n\n")
+        finally:
+            http_server._global_state = prior_state
+        outs = [
+            json.loads(event[len("data: ") :])
+            for event in events
+            if event.startswith("data: {")
+        ]
+        self.assertEqual("".join(out["text"] for out in outs), "".join(deltas))
+        self.assertEqual(outs[-1]["meta_info"]["finish_reason"]["type"], "abort")
 
 
 if __name__ == "__main__":

@@ -30,6 +30,12 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.streaming_abort_test_utils import (
+    abort_stream_chunks,
+    make_stream_manager,
+    make_stream_state,
+    stream_until_abort,
+)
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
@@ -496,6 +502,69 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
         self.tm.abort_request.assert_called_once_with(self.state.obj.rid)
 
 
+class TestIncrementalStreamAbort(CustomTestCase):
+    """An abort ends an incremental stream with only what was not yet sent.
+
+    The abort chunk carried the whole text and every logprob so far, while
+    each earlier chunk carried a delta, so the client received them again;
+    chunks still queued at the abort are coalesced with it.
+    """
+
+    DELTAS = ("Hello", ", wor", "ld!")
+
+    def setUp(self):
+        override = get_context().override_server_args(speculative_algorithm=None)
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _received(self, chunks):
+        text = "".join(chunk["text"] for chunk in chunks)
+        logprobs = [
+            entry
+            for chunk in chunks
+            for entry in chunk["meta_info"].get("output_token_logprobs", [])
+        ]
+        return text, logprobs
+
+    def test_each_delta_and_logprob_reaches_the_client_once(self):
+        # The client reads after the first delta; the other two stay queued.
+        chunks = abort_stream_chunks(
+            self.DELTAS, incremental=True, read_after=(0,), return_logprob=True
+        )
+        text, logprobs = self._received(chunks)
+        self.assertEqual(text, "".join(self.DELTAS))
+        self.assertEqual([token_id for _, token_id, _ in logprobs], [100, 101, 102])
+        final = chunks[-1]["meta_info"]
+        self.assertEqual(final["finish_reason"]["type"], "abort")
+        self.assertEqual(final["completion_tokens"], 3)
+        self.assertEqual(final["output_token_logprobs_length"], 3)
+
+    def test_error_abort_also_ends_with_only_the_unsent_output(self):
+        """An abort with a status code ends a stream through the same chunk."""
+        tm = make_stream_manager(incremental=True)
+        state = make_stream_state(tm, "abort-error", return_logprob=True)
+        abort = AbortReq(
+            rid="abort-error",
+            finished_reason={"type": "abort", "status_code": 503, "message": "x"},
+        )
+        chunks = asyncio.run(
+            stream_until_abort(tm, state, self.DELTAS, read_after=(0,), abort=abort)
+        )
+        text, logprobs = self._received(chunks)
+        self.assertEqual(text, "".join(self.DELTAS))
+        self.assertEqual(len(logprobs), 3)
+        self.assertEqual(chunks[-1]["meta_info"]["finish_reason"]["status_code"], 503)
+
+    def test_cumulative_stream_ends_with_the_whole_output(self):
+        """Cumulative chunks supersede each other, so the last one is complete."""
+        chunks = abort_stream_chunks(
+            self.DELTAS, incremental=False, read_after=(0,), return_logprob=True
+        )
+        final = chunks[-1]
+        self.assertEqual(final["text"], "".join(self.DELTAS))
+        self.assertEqual(len(final["meta_info"]["output_token_logprobs"]), 3)
+
+
 class TestRidToStateCleanupOnAbort(CustomTestCase):
     """Test that _handle_abort_req removes rid from rid_to_state."""
 
@@ -612,16 +681,17 @@ class TestAbortOutputPayload(CustomTestCase):
         self.assertEqual(with_ids.out_list[0]["prompt_token_ids"], [1, 2, 3])
         self.assertNotIn("prompt_token_ids", without_ids.out_list[0])
 
-    def test_abort_output_ids_match_the_streaming_mode(self):
+    def test_abort_output_matches_the_streaming_mode(self):
         """Only incremental streaming collapses the abort chunk to the last
-        token; cumulative chunks supersede, so they carry the whole generation.
+        token and no text, as every delta was already queued; cumulative chunks
+        supersede, so they carry the whole generation.
         """
         cases = [
-            ("incremental stream", True, True, [7]),
-            ("cumulative stream", True, False, [5, 6, 7]),
-            ("non-stream", False, False, [5, 6, 7]),
+            ("incremental stream", True, True, [7], ""),
+            ("cumulative stream", True, False, [5, 6, 7], "abc"),
+            ("non-stream", False, False, [5, 6, 7], "abc"),
         ]
-        for name, is_stream, incremental, expected in cases:
+        for name, is_stream, incremental, expected_ids, expected_text in cases:
             with self.subTest(name):
                 tm = _make_tokenizer_manager(self)
                 tm.incremental_streaming_output = incremental
@@ -629,12 +699,14 @@ class TestAbortOutputPayload(CustomTestCase):
                 state = _make_req_state(rid)
                 state.obj.stream = is_stream
                 state.output_ids = [5, 6, 7]
+                state.append_text("abc")
                 tm.rid_to_state[rid] = state
 
                 tm._handle_abort_req(_make_abort_req(rid))
 
                 out = state.out_list[0]
-                self.assertEqual(out["output_ids"], expected)
+                self.assertEqual(out["output_ids"], expected_ids)
+                self.assertEqual(out["text"], expected_text)
                 self.assertEqual(out["meta_info"]["completion_tokens"], 3)
 
     def test_abort_with_routed_experts_returns_no_output(self):
