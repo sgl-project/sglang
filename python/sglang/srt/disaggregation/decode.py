@@ -4236,6 +4236,7 @@ class SchedulerDisaggregationDecodeMixin:
             )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
+                self._pp_spec_normalize_relay_input(new_prebuilt_batch)
                 if running_batch.is_empty():
                     running_batch = new_prebuilt_batch
                     if self.enable_hisparse:

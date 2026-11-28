@@ -247,25 +247,29 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
         )
         if envs.SGLANG_ENABLE_PP_SPEC.get():
             # The aggregate relay carries an EAGLE-shaped tree and only
-            # EAGLEWorkerV2 tail-drafts. PD prefill relays topk_p /
-            # topk_index / hidden states through RelayPayload; the gated
-            # flow replaces that relay with its own and does not carry
-            # those fields.
-            assert cfg.disaggregation_mode == "null", (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
+            # EAGLEWorkerV2 tail-drafts. PD decode can normalize the received
+            # draft root into this relay; PD prefill still needs the original
+            # topk probabilities, indices and hidden states in RelayPayload.
+            assert cfg.disaggregation_mode in ("null", "decode"), (
+                "SGLANG_ENABLE_PP_SPEC is only compatible with "
+                "--disaggregation-mode null or decode"
             )
             # The PP relay slices spec results with the configured
             # num_draft_tokens; adaptive spec changes it at runtime.
             assert not cfg.speculative_adaptive, (
                 "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
             )
-            # Every stage rebuilds the same verify input from the relayed
-            # per-request state, so all stages must see the same batch.
-            # DP attention partitions it per DP rank.
-            assert not attn_dp_enabled_of(cfg), (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with attention DP "
-                "(--attn-dp-size)"
-            )
+            if attn_dp_enabled_of(cfg):
+                # Requests use lane-local PP rank offsets. Tensor relays shard
+                # and gather within the lane's attention-TP group.
+                assert (
+                    cfg.attn_cp_size == 1
+                    and 0 < cfg.attn_dp_size <= cfg.tp_size
+                    and cfg.tp_size % cfg.attn_dp_size == 0
+                ), (
+                    "SGLANG_ENABLE_PP_SPEC with attention DP requires "
+                    "--attn-cp-size 1 and --attn-dp-size dividing --tp-size"
+                )
             assert not cfg.enable_return_routed_experts, (
                 "SGLANG_ENABLE_PP_SPEC is not compatible with "
                 "--enable-return-routed-experts"

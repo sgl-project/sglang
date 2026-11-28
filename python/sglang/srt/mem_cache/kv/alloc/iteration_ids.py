@@ -209,6 +209,8 @@ class IterationIds:
         if isinstance(cols, torch.Tensor):
             return torch.where(cols >= 0, ids[cols.clamp(min=0)], 0)
         bs = int(self.req_pool_indices.numel())
+        if bs == 0:
+            return ids
         if bs == 1:
             return ids[cols]
         return ids.view(bs, -1)[:, cols].reshape(-1)
