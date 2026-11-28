@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-import asyncio
 import dataclasses
 import pickle
 import threading
@@ -16,11 +15,6 @@ from typing import Any, Callable, Iterator, List
 import msgspec
 import zmq
 
-from sglang.multimodal_gen.runtime.disaggregation.deployment.worker import (
-    DeploymentWorker,
-    broadcast_request,
-    run_partition,
-)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
@@ -1566,6 +1560,14 @@ class Scheduler(
         Handles abortion
         """
         if self.server_args.stage_role:
+            import asyncio
+
+            from sglang.multimodal_gen.runtime.disaggregation.deployment.worker import (
+                DeploymentWorker,
+                broadcast_request,
+                run_partition,
+            )
+
             if self.gpu_id == 0:
                 asyncio.run(DeploymentWorker(self).run())
             else:

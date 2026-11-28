@@ -58,7 +58,7 @@ from sglang.multimodal_gen.runtime.pipelines.flux3_image_package import (
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     normalize_output_seeds,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding import (
     ConditionEncodingStage,
@@ -951,10 +951,11 @@ class Flux3ImageDenoiseStage(DenoisingStage):
 
 
 class Flux3ImageDecodeStage(PipelineStage):
-    def __init__(self, vae, package_config) -> None:
+    def __init__(self, vae, package_config, separate_postprocess=False) -> None:
         super().__init__()
         self.vae = vae
         self.package_config = package_config
+        self.separate_postprocess = separate_postprocess
 
     @property
     def role_affinity(self) -> RoleType:
@@ -978,7 +979,7 @@ class Flux3ImageDecodeStage(PipelineStage):
         ]
 
     @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req | OutputBatch:
         with (
             self.use_declared_component(
                 component_name="vae",
@@ -989,10 +990,14 @@ class Flux3ImageDecodeStage(PipelineStage):
             exact_vae_convolutions(batch.quality == "exact"),
         ):
             with torch.inference_mode():
-                batch.output = vae_decode(
+                image = vae_decode(
                     self.vae, batch.latents, batch.latent_ids, batched=True
                 )
-        return batch
+                if self.separate_postprocess:
+                    batch.output = image
+                    return batch
+                image = crop_output(image, batch.extra["flux3_crop"])
+        return OutputBatch(output=self._to_display(image), metrics=batch.metrics)
 
     @torch.no_grad()
     def run_grouped_requests(self, batches, server_args):
@@ -1018,15 +1023,27 @@ class Flux3ImageDecodeStage(PipelineStage):
                     [req.num_outputs_per_prompt for _, req in group]
                 )
                 for (index, req), images in zip(group, decoded_groups):
-                    req.output = images
-                    outputs[index] = req
+                    if self.separate_postprocess:
+                        req.output = images
+                        outputs[index] = req
+                        continue
+                    outputs[index] = OutputBatch(
+                        output=list(
+                            self._to_display(
+                                crop_output(images, req.extra["flux3_crop"])
+                            )
+                        ),
+                        metrics=req.metrics,
+                    )
         return outputs
-
-
-class Flux3ImagePostprocessStage(PostprocessStage):
-    def process(self, batch, server_args):
-        return self._to_display(crop_output(batch.output, batch.extra["flux3_crop"]))
 
     @staticmethod
     def _to_display(image: Tensor) -> Tensor:
         return ((image.clamp(-1, 1) + 1) * 0.5).reshape(-1, *image.shape[-3:])
+
+
+class Flux3ImagePostprocessStage(PostprocessStage):
+    def process(self, batch, server_args):
+        return Flux3ImageDecodeStage._to_display(
+            crop_output(batch.output, batch.extra["flux3_crop"])
+        )

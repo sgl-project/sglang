@@ -12,7 +12,9 @@ class PostprocessStage(PipelineStage):
         return RoleType.DECODER
 
     def process(self, batch, server_args):
-        return server_args.pipeline_config.post_decoding(batch.output, server_args)
+        config = server_args.pipeline_config
+        frames = config.post_decoding(batch.output, server_args)
+        return config.postprocess_decoded_batch(frames, batch, server_args)
 
     def forward(self, batch, server_args):
         paths = batch.extra.get("decoded_output_paths")
@@ -21,6 +23,8 @@ class PostprocessStage(PipelineStage):
             if paths is None and batch.output is not None
             else None,
             output_file_paths=paths,
+            audio=batch.audio,
+            audio_sample_rate=batch.audio_sample_rate,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             rollout_trajectory_data=batch.rollout_trajectory_data,

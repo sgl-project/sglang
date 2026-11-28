@@ -103,7 +103,7 @@ def _field_size(value):
 
 
 class DeploymentWorker:
-    """serialize compute separately from transfers so downstream reads cannot block on it"""
+    """serialize compute separately from transfers so next-stage reads cannot block on it"""
 
     def __init__(self, scheduler):
         self.scheduler = scheduler

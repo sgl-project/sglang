@@ -223,17 +223,20 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
             ),
             "flux3_denoise",
         )
+        separate = self.deployment_plan is not None
         self.add_stage_factory(
             RoleType.DECODER,
             lambda: Flux3ImageDecodeStage(
                 vae=self.get_module("vae"),
                 package_config=package_config,
+                separate_postprocess=separate,
             ),
             "flux3_decode",
         )
-        self.add_stage_factory(
-            RoleType.DECODER, Flux3ImagePostprocessStage, "flux3_postprocess"
-        )
+        if separate:
+            self.add_stage_factory(
+                RoleType.DECODER, Flux3ImagePostprocessStage, "flux3_postprocess"
+            )
 
 
 EntryClass = Flux3ImagePipeline

@@ -9,14 +9,6 @@ from multiprocessing.connection import wait
 
 import uvicorn
 
-from sglang.multimodal_gen.registry import get_model_info, get_pipeline_class
-from sglang.multimodal_gen.runtime.disaggregation.deployment.coordinator import (
-    DeploymentServer,
-)
-from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
-    Deployment,
-    ExecutionPlan,
-)
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     DiffusionServer,
 )
@@ -727,6 +719,15 @@ def dispatch_launch(server_args: ServerArgs):
 
 
 def launch_stage_deployment(server_args: ServerArgs):
+    from sglang.multimodal_gen.registry import get_model_info, get_pipeline_class
+    from sglang.multimodal_gen.runtime.disaggregation.deployment.coordinator import (
+        DeploymentServer,
+    )
+    from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
+        Deployment,
+        ExecutionPlan,
+    )
+
     if server_args.disagg_timeout <= 0 or server_args.disagg_max_slots_per_instance < 1:
         raise ValueError("Deployment timeout and capacity must be positive")
     if server_args.batching_max_size != 1:

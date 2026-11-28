@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Async encoding client returning named tensors on the trainer's GPU."""
+"""Async encoding client returning named tensors on the caller's GPU."""
 
 import asyncio
 import logging

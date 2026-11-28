@@ -36,15 +36,13 @@ class _RecordingExecutor:
 
     def execute_with_profiling(self, stages, batch, server_args):
         self.seen_at_execute = self.component_residency_manager
-        return batch
 
     def execute_group_with_profiling(self, stages, batches, server_args):
         self.seen_at_execute = self.component_residency_manager
-        return batches
 
     def execute_group_sequentially_with_profiling(self, stages, batches, server_args):
         self.seen_at_execute = self.component_residency_manager
-        yield from batches
+        yield None
 
 
 def _make_req():

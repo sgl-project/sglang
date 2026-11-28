@@ -41,13 +41,13 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     SlotHandle,
     TransferTensorBuffer,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
-    ComposedPipelineBase,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
     SyncExecutor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.postprocess import (
+    PostprocessStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
@@ -97,8 +97,7 @@ def test_stage_launch_uses_real_server_args_capacity(monkeypatch, argv, expected
     )
     monkeypatch.setattr(Deployment, "load", lambda _: deployment)
     monkeypatch.setattr(
-        launch_module,
-        "get_model_info",
+        "sglang.multimodal_gen.registry.get_model_info",
         lambda *args, **kwargs: SimpleNamespace(
             pipeline_cls=SimpleNamespace(stage_specs=specs())
         ),
@@ -314,8 +313,16 @@ def test_worker_retains_reusable_model_outputs(monkeypatch):
     assert peak == 1
 
 
-@pytest.mark.parametrize("deployed", [False, True])
-def test_postprocess_can_precede_another_stage(deployed):
+def test_stage_runner_leaves_monolithic_runs_untouched():
+    def execute(stage, current):
+        return OutputBatch(output=torch.ones(1))
+
+    executor = object.__new__(SyncExecutor)
+    runner = executor.stage_runner(SimpleNamespace(stage_deployment=None), execute)
+    assert runner is execute
+
+
+def test_deployed_postprocess_can_precede_another_stage():
     stages = [object(), object()]
     req = Req(prompt="test")
 
@@ -326,19 +333,35 @@ def test_postprocess_can_precede_another_stage(deployed):
         return current
 
     executor = object.__new__(SyncExecutor)
-    run = executor.stage_runner(
-        stages, SimpleNamespace(stage_deployment="plan" if deployed else None), execute
-    )
+    run = executor.stage_runner(SimpleNamespace(stage_deployment="plan"), execute)
     current = run(stages[0], req)
     assert current is req
     current = run(stages[1], current)
-    pipeline = SimpleNamespace(deployment_plan=object() if deployed else None)
-    result = ComposedPipelineBase._finalize_stage_result(pipeline, current)
-    if deployed:
-        assert result is req
-    else:
-        assert isinstance(result, OutputBatch)
-    torch.testing.assert_close(result.output, torch.full((3, 2, 2), 2.0))
+    assert current is req
+    torch.testing.assert_close(current.output, torch.full((3, 2, 2), 2.0))
+
+
+def test_postprocess_stage_matches_monolithic_decode_output():
+    calls = []
+
+    class Config:
+        def post_decoding(self, frames, server_args):
+            calls.append("post_decoding")
+            return frames * 2
+
+        def postprocess_decoded_batch(self, frames, batch, server_args):
+            calls.append("postprocess_decoded_batch")
+            return frames[:, :, 1:]
+
+    req = Req(prompt="test")
+    req.output = torch.ones(1, 3, 4, 2, 2)
+    req.audio = torch.zeros(1, 2, 8)
+    req.audio_sample_rate = 16000
+    result = PostprocessStage().forward(req, SimpleNamespace(pipeline_config=Config()))
+    assert calls == ["post_decoding", "postprocess_decoded_batch"]
+    torch.testing.assert_close(result.output, torch.full((1, 3, 3, 2, 2), 2.0))
+    assert result.audio is req.audio
+    assert result.audio_sample_rate == 16000
 
 
 @pytest.mark.parametrize(

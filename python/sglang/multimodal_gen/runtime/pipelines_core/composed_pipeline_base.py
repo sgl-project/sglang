@@ -995,12 +995,15 @@ class ComposedPipelineBase(ABC):
         stage_name: str = "decoding_stage",
     ) -> "ComposedPipelineBase":
 
+        # a deployment may place postprocessing apart from the decoder
+        separate = self.deployment_plan is not None
+
         def create_stage() -> PipelineStage:
             return DecodingStage(
                 vae=self.get_module(vae_key),
                 pipeline=self,
                 component_name=vae_key,
-                separate_postprocess=True,
+                separate_postprocess=separate,
             )
 
         self.add_stage_factory(
@@ -1008,9 +1011,11 @@ class ComposedPipelineBase(ABC):
             create_stage,
             stage_name,
         )
-        return self.add_stage_factory(
-            RoleType.DECODER, PostprocessStage, stage_name + "_postprocess"
-        )
+        if separate:
+            self.add_stage_factory(
+                RoleType.DECODER, PostprocessStage, stage_name + "_postprocess"
+            )
+        return self
 
     def add_standard_t2i_stages(
         self,
@@ -1180,17 +1185,6 @@ class ComposedPipelineBase(ABC):
         self.add_standard_decoding_stage()
         return self
 
-    def _finalize_stage_result(self, result):
-        if self.deployment_plan is None and isinstance(result, Req):
-            output = result.extra.pop("_deployment_result", None)
-            if output is not None:
-                output.output = result.output
-                output.audio = result.audio
-                output.audio_sample_rate = result.audio_sample_rate
-                output.fps = result.fps
-                return output
-        return result
-
     # TODO(will): don't hardcode no_grad
     @torch.no_grad()
     def forward(
@@ -1228,9 +1222,7 @@ class ComposedPipelineBase(ABC):
 
         self._install_component_residency_manager(server_args)
 
-        return self._finalize_stage_result(
-            self.executor.execute_with_profiling(self.stages, batch, server_args)
-        )
+        return self.executor.execute_with_profiling(self.stages, batch, server_args)
 
     @torch.no_grad()
     def forward_batch(
@@ -1259,10 +1251,9 @@ class ComposedPipelineBase(ABC):
             )
 
         self._install_component_residency_manager(server_args)
-        results = self.executor.execute_group_with_profiling(
+        return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
         )
-        return [self._finalize_stage_result(result) for result in results]
 
     @torch.no_grad()
     def forward_batch_sequentially(
@@ -1279,12 +1270,11 @@ class ComposedPipelineBase(ABC):
             return
 
         self._install_component_residency_manager(server_args)
-        for result in self.executor.execute_group_sequentially_with_profiling(
+        yield from self.executor.execute_group_sequentially_with_profiling(
             self.stages,
             batches,
             server_args,
-        ):
-            yield self._finalize_stage_result(result)
+        )
 
     def _install_component_residency_manager(self, server_args: ServerArgs) -> None:
         """Publish the residency manager the executor dereferences unguarded.

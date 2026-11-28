@@ -211,13 +211,13 @@ class PipelineExecutor(ABC):
             current.fps = result.fps
         return current
 
-    def stage_runner(self, stages, server_args, run_stage):
-        deployment = vars(server_args).get("stage_deployment") is not None
+    def stage_runner(self, server_args, run_stage):
+        """keep the request context across stage outputs; monolithic runs are untouched"""
+        if getattr(server_args, "stage_deployment", None) is None:
+            return run_stage
 
         def run(stage, current):
             result = run_stage(stage, current)
-            if stage is stages[-1] and not deployment:
-                return result
             if isinstance(result, list):
                 if any(isinstance(item, OutputBatch) for item in result):
                     return [
