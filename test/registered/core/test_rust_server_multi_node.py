@@ -37,7 +37,7 @@ from sglang.test.test_utils import (
     wait_for_gpu_release,
 )
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=116, stage="base-b", runner_config="2-gpu-large")
 
 # Maximum time this test allows a node to exit after its peer is killed.
 PEER_EXIT_TIMEOUT_SECS = 120

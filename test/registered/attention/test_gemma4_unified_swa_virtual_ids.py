@@ -48,7 +48,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=77, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=99, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=120, stage="extra-a", runner_config="1-gpu-small-amd")
 
 # Healthy 0.865-0.880 (static pool 0.870); a died-mid-run server scores

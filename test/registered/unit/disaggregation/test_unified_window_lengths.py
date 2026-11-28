@@ -28,7 +28,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import setup_allocator_context
 
-register_cuda_ci(est_time=20, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=18, stage="extra-a", runner_config="1-gpu-large")
 
 _MHA = MHAGeometry(head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16)
 _PAGE = 4

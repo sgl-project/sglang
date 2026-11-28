@@ -19,7 +19,7 @@ from sglang.test.kits.unified_radix_cache.hicache import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "mamba pool fixtures need CUDA")

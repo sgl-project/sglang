@@ -23,7 +23,7 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import target_kv_pool_view
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 _DEV = "cuda"

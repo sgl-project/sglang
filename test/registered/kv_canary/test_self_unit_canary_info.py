@@ -63,7 +63,7 @@ from sglang.test.kernels.kv_canary._canary_helpers import (
 from sglang.test.kv_canary.canary_info_utils import reference_canary_infos
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 _CPU = torch.device("cpu")

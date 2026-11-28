@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 # CUDA-only: this self-bench asserts a 1.0% kv_canary overhead budget tuned on
 # the CUDA (H100) runner. On ROCm the measured overhead is ~1.26%, so the
 # benchmark is not portable as-is; keep it off AMD CI rather than register-and-skip.
-register_cuda_ci(est_time=480, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=743, stage="extra-a", runner_config="1-gpu-large")
 
 
 _QWEN3_MODEL = "Qwen/Qwen3-30B-A3B"

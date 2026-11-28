@@ -20,7 +20,7 @@ import sglang.kernels.ops.layernorm.mhc as kernels_mhc
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=24, stage="base-b", runner_config="1-gpu-small")
 
 HIDDEN = 5120
 HC_MULT = 4

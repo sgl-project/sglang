@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_NGRAM,
 )
 
-register_cuda_ci(est_time=740, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=827, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):

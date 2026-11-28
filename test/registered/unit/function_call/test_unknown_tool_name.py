@@ -10,7 +10,7 @@ from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(5, "base-a-test-cpu")
+register_cpu_ci(2, "base-a-test-cpu")
 register_cpu_ci(est_time=5, suite="extra-test-cpu-intel")
 
 

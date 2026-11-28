@@ -15,7 +15,7 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=9, suite="extra-a-test-npu")
+register_npu_ci(est_time=2, suite="extra-a-test-npu")
 
 
 def _make_glm51_model_config():

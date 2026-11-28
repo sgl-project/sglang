@@ -21,7 +21,7 @@ from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=5, suite="extra-a-test-npu")
+register_npu_ci(est_time=2, suite="extra-a-test-npu")
 
 
 class TestOnlineMXFP4Loading(unittest.TestCase):
