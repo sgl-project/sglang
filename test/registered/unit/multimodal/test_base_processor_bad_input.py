@@ -11,7 +11,9 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import asyncio
 import base64
 import binascii
+import errno
 import io
+import traceback
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
@@ -19,7 +21,7 @@ from unittest.mock import MagicMock, patch
 import requests
 from PIL import Image
 
-from sglang.srt.multimodal.media_io import CLIENT_MEDIA_EXCEPTIONS
+from sglang.srt.multimodal.media_io import CLIENT_MEDIA_EXCEPTIONS, ImageData
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -83,11 +85,12 @@ class TestBadInputIsClientError(CustomTestCase):
                 self.assertIsInstance(ctx.exception.__cause__.__cause__, OSError)
 
     def test_decompression_bomb_image(self):
-        # 15000 x 15000 is above twice Image.MAX_IMAGE_PIXELS, so Pillow refuses it
-        # in Image.open, before decoding; a 1-bit PNG of that size is about 27 KB.
         buf = io.BytesIO()
-        Image.new("1", (15000, 15000)).save(buf, format="PNG")
-        with self.assertRaisesRegex(ValueError, "decompression bomb") as ctx:
+        Image.new("RGB", (8, 8)).save(buf, format="PNG")
+        with (
+            patch.object(Image, "MAX_IMAGE_PIXELS", 16),
+            self.assertRaisesRegex(ValueError, "decompression bomb") as ctx,
+        ):
             _StubProcessor._load_single_item(buf.getvalue(), Modality.IMAGE)
         self.assertIsInstance(ctx.exception.__cause__, Image.DecompressionBombError)
 
@@ -124,10 +127,90 @@ class TestServerFaultStaysServerError(CustomTestCase):
     def test_image_source_os_error(self):
         with patch(
             "sglang.srt.multimodal.media_io.get_image_bytes",
-            side_effect=OSError("too many open files"),
+            side_effect=OSError(errno.EMFILE, "too many open files"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "too many open files"):
+            with self.assertRaisesRegex(RuntimeError, "(?i)too many open files"):
                 _StubProcessor._load_single_item("file:///image.png", Modality.IMAGE)
+
+
+class TestBadInputDoesNotLeakMedia(CustomTestCase):
+    """Loader failures must not expose request media in formatted exceptions."""
+
+    def test_malformed_url_preserves_sanitized_client_error(self):
+        url = "https://[invalid"
+
+        with self.assertRaises(ValueError) as ctx:
+            _StubProcessor._load_single_item(url, Modality.IMAGE)
+
+        formatted = "".join(traceback.format_exception(ctx.exception))
+        self.assertNotIn(url, formatted)
+        self.assertIn("Error while loading image data <url scheme=https>", formatted)
+        self.assertIsInstance(ctx.exception.__cause__, ValueError)
+        self.assertIsNone(ctx.exception.__context__)
+
+    def test_authenticated_url_is_redacted_from_client_error(self):
+        url = (
+            "https://media-user:media-password@example.com/private.jpg"
+            "?token=MOCK_PRIVATE_TOKEN"
+        )
+        response = requests.Response()
+        response.status_code = 404
+        loader_error = requests.HTTPError("fixture detail", response=response)
+
+        with patch(
+            "sglang.srt.multimodal.multimodal_processor_mixin.load_image",
+            side_effect=loader_error,
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                _StubProcessor._load_single_item(ImageData(url=url), Modality.IMAGE)
+
+        formatted = "".join(traceback.format_exception(ctx.exception))
+        self.assertNotIn(url, formatted)
+        self.assertNotIn("media-password", formatted)
+        self.assertNotIn("MOCK_PRIVATE_TOKEN", formatted)
+        self.assertIn("<url scheme=https>", formatted)
+        self.assertIn("HTTP 404", formatted)
+        self.assertIsInstance(ctx.exception.__cause__, requests.HTTPError)
+        self.assertIsNone(ctx.exception.__context__)
+
+    def test_encoder_redacts_decoder_details(self):
+        from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessor
+        from sglang.srt.disaggregation.encoder.server import BadRequestError
+
+        processor = object.__new__(EncoderPreprocessor)
+        processor.use_image_processor_gpu = False
+        with (
+            patch(
+                "sglang.srt.disaggregation.encoder.preprocessor.load_image",
+                side_effect=ValueError("fixture-private-caption"),
+            ),
+            self.assertRaises(BadRequestError) as ctx,
+        ):
+            processor._load_single_item(b"fixture", Modality.IMAGE)
+        formatted = "".join(traceback.format_exception(ctx.exception))
+        self.assertNotIn("fixture-private-caption", formatted)
+        self.assertIn("<bytes length=7>", formatted)
+
+    def test_data_uri_is_redacted_from_client_error(self):
+        encoded = base64.b64encode(b"MOCK_PRIVATE_MEDIA").decode()
+        data_uri = f"data:image/jpeg;base64,{encoded}"
+        loader_error = binascii.Error(f"Non-base64 digit found in {data_uri}")
+
+        with patch(
+            "sglang.srt.multimodal.multimodal_processor_mixin.load_image",
+            side_effect=loader_error,
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                _StubProcessor._load_single_item(data_uri, Modality.IMAGE)
+
+        formatted = "".join(traceback.format_exception(ctx.exception))
+        self.assertNotIn(data_uri, formatted)
+        self.assertNotIn(encoded, formatted)
+        self.assertNotIn("data:image/jpeg;base64", formatted)
+        self.assertIn(f"<data-uri length={len(encoded)}>", formatted)
+        self.assertIn("Invalid base64 media", formatted)
+        self.assertIsInstance(ctx.exception.__cause__, binascii.Error)
+        self.assertIsNone(ctx.exception.__context__)
 
 
 class TestClientMediaExceptions(CustomTestCase):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 import torch
@@ -10,7 +10,7 @@ from sglang.kernels.ops.sampling.synthid import MAX_CHAIN_WIDTH
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.async_probe import sanitize_nan_logits
-from sglang.srt.utils.device import async_h2d, is_cuda
+from sglang.srt.utils.device import is_cuda, rows_where
 
 from ..batch_layout import num_prefill_rows
 from ..config import SYNTHID_CONFIG_FIELDS, WatermarkRequestConfig
@@ -32,18 +32,6 @@ class SynthIDRows(msgspec.Struct, frozen=True):
     # Batch indices of the watermarked rows, int64 on the batch device.
     indices: torch.Tensor
     candidates_host: list[bool]
-
-    @classmethod
-    def from_candidates(
-        cls, candidates_host: list[bool], device: torch.device | str
-    ) -> Optional[SynthIDRows]:
-        indices = [index for index, on in enumerate(candidates_host) if on]
-        if not indices:
-            return None
-        return cls(
-            indices=async_h2d(indices, dtype=torch.int64, device=device),
-            candidates_host=candidates_host,
-        )
 
     def __repr__(self) -> str:
         return f"SynthIDRows(rows={len(self.candidates_host)!r})"
@@ -90,24 +78,26 @@ def _resolve_enabled(
     return enabled
 
 
-def build_rows(
-    requests: Sequence[Req],
-    *,
-    features: ExecFeatures,
-    device: torch.device | str,
-) -> Optional[SynthIDRows]:
-    return SynthIDRows.from_candidates(
-        [
-            _resolve_enabled(
-                request.sampling_params.watermark,
-                server_enabled=True,
-                default_enabled=features.watermark_default_enabled,
-                enforce_all=features.watermark_enforce_all,
-            )
-            and request.sampling_params.top_k > 1
-            for request in requests
-        ],
-        device,
+NUM_POOL_FIELDS = 1
+
+
+def pool_values(request: Req, *, features: ExecFeatures) -> tuple[bool, tuple[int]]:
+    candidate = (
+        _resolve_enabled(
+            request.sampling_params.watermark,
+            server_enabled=True,
+            default_enabled=features.watermark_default_enabled,
+            enforce_all=features.watermark_enforce_all,
+        )
+        and request.sampling_params.top_k > 1
+    )
+    return candidate, (int(candidate),)
+
+
+def build_rows(values: torch.Tensor, candidates_host: list[bool]) -> SynthIDRows:
+    return SynthIDRows(
+        indices=rows_where(values[0] != 0, sum(candidates_host)),
+        candidates_host=candidates_host,
     )
 
 

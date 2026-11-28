@@ -913,8 +913,12 @@ def _load_image(
     try:
         image = Image.open(BytesIO(image_bytes))
     except (OSError, SyntaxError) as e:
-        raise ValueError(f"Could not decode image: {e}") from e
+        raise ImageDecodeError(f"Could not decode image: {e}") from e
     return _fully_load_pil_image(image)
+
+
+class ImageDecodeError(ValueError):
+    """Pillow could not decode the supplied image."""
 
 
 def _fully_load_pil_image(image: Image.Image) -> Image.Image:
@@ -922,7 +926,7 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     try:
         image.load()
     except (OSError, SyntaxError) as e:
-        raise ValueError(f"Could not decode image: {e}") from e
+        raise ImageDecodeError(f"Could not decode image: {e}") from e
     return image
 
 

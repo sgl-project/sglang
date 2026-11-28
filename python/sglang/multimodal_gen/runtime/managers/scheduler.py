@@ -1568,6 +1568,13 @@ class Scheduler(
         The main event loop that listens for ZMQ requests.
         Handles abortion
         """
+        if self.server_args.stage_role:
+            from sglang.multimodal_gen.runtime.disaggregation.deployment.worker import (
+                run_stage_worker,
+            )
+
+            return run_stage_worker(self)
+
         # Pool mode: all roles use the pool event loop
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_event_loop()

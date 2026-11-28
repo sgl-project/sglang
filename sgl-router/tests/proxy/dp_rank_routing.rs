@@ -80,6 +80,7 @@ fn router_with_load(
             openai: None,
             grpc_port: None,
             supports_inline_system: false,
+            prefill_answers_alone: false,
         };
         registry.add_with_cb(spec, None, profile).unwrap();
     }

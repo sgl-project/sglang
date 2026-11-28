@@ -81,6 +81,7 @@ except ImportError:
     initialize_mamba_selective_state_update_backend = None
 import traceback
 
+from sglang.srt.beam_search.batch_tail import is_beam_only_batch
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
@@ -403,11 +404,10 @@ from sglang.srt.rust_server.server import (
     claim_sigterm_before_compiles,
     drain_notify_name,
 )
-from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
-from sglang.srt.sampling.sampler_params import SamplerParamsPool
+from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params_pool import SamplingParamsPool
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
-from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -712,7 +712,7 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
         self.init_penalty_status_pool()
-        self.init_sampler_params_pool()
+        self.init_sampling_params_pool()
 
         # Prefill read-done lets the schedule stream run ahead of the forward that
         # writes a stashed chunk. The cache controller's fence streams above order
@@ -744,6 +744,9 @@ class Scheduler(
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
+        self.metrics_reporter.shortest_prefill_load_scaling = (
+            self.policy.shortest_prefill_load_scaling
+        )
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -1407,10 +1410,11 @@ class Scheduler(
             device=self.req_to_token_pool.device,
         )
 
-    def init_sampler_params_pool(self) -> None:
-        self.sampler_params_pool = SamplerParamsPool(
+    def init_sampling_params_pool(self) -> None:
+        self.sampling_params_pool = SamplingParamsPool(
             num_rows=self.req_to_token_pool.req_to_token.shape[0],
             device=self.req_to_token_pool.device,
+            penalty_status_pool=self.penalty_status_pool,
         )
 
     def init_running_status(self):
@@ -1971,8 +1975,9 @@ class Scheduler(
         Without DCP the prefix-relative rule already donates, so leave the
         existing alignment alone, except where unified memory retires window
         rows behind the checkpoints (`mamba_prefill_chunk_grid`): there every
-        cut lands on the checkpoint grid. Use the LCM to preserve any alignment
-        that is already set."""
+        cut lands on the checkpoint grid. Under deterministic inference with a
+        mamba cache every cut also lands on the kernel chunk grid. Use the LCM
+        to preserve any alignment that is already set."""
         chunk_size = mamba_prefill_chunk_grid(getattr(self, "tree_cache", None))
         if chunk_size <= 1:
             return
@@ -2005,11 +2010,12 @@ class Scheduler(
             f"chunked prefill size is {chunk}{dp_note}; a prompt longer than "
             f"{chunk} tokens could never be scheduled. Raise --chunked-prefill-size "
             f"to at least {align * attn_dp_size}. The alignment includes the Mamba "
-            f"state checkpoint grid under DCP, and under --enable-unified-memory "
+            f"state checkpoint grid (under DCP, or under --enable-unified-memory "
             f"when sliding-window layers retire their rows behind the cached "
-            f"checkpoints; with the flashinfer backend under deterministic "
-            f"inference, lowering SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE also "
-            f"helps."
+            f"checkpoints) and the Mamba kernel chunk grid (under "
+            f"--enable-deterministic-inference); with the flashinfer backend "
+            f"under deterministic inference, lowering "
+            f"SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE also helps."
         )
 
     def init_request_dispatcher(self):
@@ -2146,13 +2152,6 @@ class Scheduler(
             # The main process waits for this process's crash dump.
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
-
-        if get_serving().grpc_port is not None:
-            result_dict["kv_event_sources"] = (
-                self.kv_events_publisher.local_kv_event_sources(
-                    self.page_size * get_parallel().dcp_size
-                )
-            )
         return result_dict
 
     def release_host_resources(self) -> None:
@@ -5103,9 +5102,9 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
-        self.sampler_params_pool.write(new_batch.reqs)
         self.penalty_status_pool.alloc(new_batch.reqs)
         self.penalty_status_pool.reset_history(new_batch.reqs)
+        self.sampling_params_pool.write(new_batch.reqs)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -5550,17 +5549,11 @@ class Scheduler(
         if self.is_generation:
             # A beam tail's member rows follow the requests' rows; they take no params.
             num_reqs = len(batch.reqs)
-            batch.sampling_info.set_sampler_params(
-                self.sampler_params_pool.gather(
+            batch.sampling_info.set_rows(
+                self.sampling_params_pool.gather(
                     batch.req_pool_indices[:num_reqs],
                     batch.req_pool_indices_cpu[:num_reqs],
                 )
-            )
-            batch.sampling_info.step_penalties = StepPenalties.build(
-                batch.reqs, self.penalty_status_pool
-            )
-            batch.sampling_info.watermark = build_watermark_rows(
-                batch.reqs, batch.device
             )
             batch.sampling_info.set_step_state(batch.reqs)
             if self.enable_overlap:
@@ -5923,6 +5916,12 @@ class Scheduler(
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(batch_result.next_draft_input)
                 self.future_map.stash(future_indices, payload)
+            return
+        if is_beam_only_batch(batch):
+            # Nothing was sampled; the coordinator relays every row.
+            self.beam_coordinator.maybe_select_and_relay(
+                batch, batch_result, chunked_req=self.chunked_req
+            )
             return
         if batch_result.next_draft_input is not None:
             payload = RelayPayload.from_draft_input(batch_result.next_draft_input)

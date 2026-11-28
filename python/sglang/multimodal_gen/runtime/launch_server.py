@@ -224,7 +224,13 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     server_args_payload = ServerArgsPayload.capture(server_args)
     processes = _start_scheduler_processes(
         server_args_payload,
-        [(i, rank_offset + i) for i in range(local_num_gpus)],
+        [
+            (
+                server_args.base_gpu_id + i if server_args.stage_role else i,
+                rank_offset + i,
+            )
+            for i in range(local_num_gpus)
+        ],
         "sglang-diffusionWorker-",
     )
 
@@ -694,6 +700,14 @@ def dispatch_launch(server_args: ServerArgs):
 
     if "NCCL_NVLS_ENABLE" not in os.environ or server_args.enable_nccl_nvls:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+
+    if server_args.stage_deployment:
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.launch import (
+            launch_stage_deployment,
+        )
+
+        launch_stage_deployment(server_args)
+        return
 
     role = server_args.disagg_role
     if role == RoleType.MONOLITHIC:
