@@ -1,0 +1,36 @@
+## Motivation
+
+While deploying Qwen3.8-27B on four Ascend 910B3 NPUs with TP4, I found two setup failures that the deployment guide could help users avoid. The BF16 server opened its HTTP port, but generation failed with `FP32 initial_state is only supported on Ascend950 (arch35)`. EvalScope also failed when it tried to create `./outputs` under the read-only shared model directory.
+
+In the long-context benchmark, the BF16 baseline reported 114.25 ms mean TPOT at client concurrency 4. The scheduler log showed about 33 seconds of consecutive prefill batch messages while three requests were active. This motivated documenting TPOT, TTFT, and output throughput together.
+
+## Modifications
+
+- Document `--mamba-ssm-dtype bfloat16` for the 910B3 deployment and add a generation smoke test.
+- Add an EvalScope example with a writable `--work-dir`, an explicit API endpoint, and the served model ID.
+- Document a shared-prefix benchmark with fixed request lengths, client concurrency, and warmup. Report mean and P95 TPOT, TTFT, output throughput, and measured cache hit rate.
+
+## Accuracy Tests
+
+Qwen3.8-27B-W8A8 achieved **97.5% GSM8K accuracy (195/200)** on the `main` subset. The BF16 GSM8K result is pending.
+
+![W8A8 GSM8K result on 200 samples](https://github.com/user-attachments/assets/3e672f40-dc96-49e5-a2fb-f2cd4cc85cd6)
+
+## Speed Tests and Profiling
+
+Both BF16 runs used 20 requests at client concurrency 4, with 128,000 input tokens, 1,000 output tokens, and a 115,200-token shared prefix.
+
+| Metric | Baseline | Run meeting the 50 ms TPOT target |
+| --- | ---: | ---: |
+| Successful requests | 20/20 | 20/20 |
+| Mean TPOT | 114.25 ms | **32.69 ms** |
+| P95 TPOT | 230.34 ms | **41.93 ms** |
+| Mean TTFT | 72.38 s | 159.96 s |
+| Output throughput | 21.40 tok/s | 19.65 tok/s |
+| Measured cache hit rate | 90.44% | 90.44% |
+
+The measured trade-off was lower TPOT, higher TTFT, and lower output throughput. A separate BF16 run at client concurrency 1 achieved **21.74 ms mean TPOT** and **28.72 tok/s**, the highest output throughput among the BF16 runs that met the target so far.
+
+The resolved server arguments for the concurrency-4 run still need to be checked before attributing the change to `--prefill-decode-interval 64`. W8A8 long-context performance is pending.
+
+![BF16 long-context benchmark showing TPOT, TTFT, and cache hit rate](https://github.com/user-attachments/assets/43a065f4-e226-4616-85e9-9022818deb9d)
