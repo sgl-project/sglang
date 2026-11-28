@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import inspect
 import logging
 from types import SimpleNamespace
@@ -59,6 +60,7 @@ from sglang.srt.layers.attention.graph_variants import (
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_capacity_for,
     require_attn_tp_gather,
     require_mlp_tp_gather,
     set_dp_buffer_len,
@@ -98,8 +100,10 @@ from sglang.srt.model_executor.runner.early_verify_metadata import (
     VerifyInputSources,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    capture_with_flashinfer_replay,
     flashinfer_tactics_cache_for_persistence,
     maybe_flashinfer_autotune_speculative_draft,
+    uses_flashinfer_capture_replay,
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
@@ -1002,8 +1006,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
-        # Compact-trie logits and shared-context attention run eagerly.
-        if forward_batch.beam is not None:
+        # Compact-trie logits and shared-context attention run eagerly, unless a
+        # subclass captured a beam graph that fits the batch.
+        if forward_batch.beam is not None and not self._can_run_beam_graph(
+            forward_batch
+        ):
             return False
 
         if self.require_mlp_tp_gather:
@@ -1063,6 +1070,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and is_tbo_supported
             and is_ngram_supported
         )
+
+    def _can_run_beam_graph(self, forward_batch: ForwardBatch) -> bool:
+        return False
 
     def _can_run_ragged_verify_graph(self, forward_batch: ForwardBatch, ragged_layout):
         if not self.attn_backend.supports_ragged_verify_graph:
@@ -1211,6 +1221,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         global_num_tokens_cpu = self._global_num_tokens_for_graph(num_tokens)
+        # Captured at the buffer ceiling; replay fills only the live num_dp_ranks.
+        if self.require_mlp_tp_gather:
+            global_num_tokens_cpu = [num_tokens] * dp_capacity_for(self.num_dp_ranks)
 
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
@@ -1384,6 +1397,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # and write KV -- through the previous batch's live values. Replay is
         # already covered by the registry's padding policy.
         self.buffers.reset_index_buffers()
+        if uses_flashinfer_capture_replay(self):
+            logger.info(
+                "FlashInfer autotune: decode graphs capture only stored tactics."
+            )
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -1594,11 +1611,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                     run_lm_head=True,
                 )
-                self.backend.capture_one(
-                    shape_key,
+                capture_with_flashinfer_replay(
+                    self,
+                    functools.partial(
+                        self.backend.capture_one,
+                        shape_key,
+                        run_once,
+                        capture_inputs=None,
+                        post_warmup_hook=post_warmup_hook,
+                    ),
                     run_once,
-                    capture_inputs=None,
-                    post_warmup_hook=post_warmup_hook,
+                    post_warmup_hook,
                 )
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:

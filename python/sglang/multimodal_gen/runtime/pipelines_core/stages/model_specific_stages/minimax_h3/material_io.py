@@ -20,7 +20,6 @@ import subprocess
 import tempfile
 import threading
 import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -756,18 +755,12 @@ def _stream_http_material(
     condition_index: int,
     timeout_s: float,
 ) -> str:
-    with open_remote_media(uri, media_url_timeout(timeout_s)) as (headers, chunks):
-        media_type = headers.get("Content-Type", "").partition(";")[0].strip().lower()
-        suffix = (
-            _safe_suffix(uri)
-            or _SUFFIX_BY_MEDIA_TYPE.get(str(media_type or "").lower())
-            or _DEFAULT_SUFFIX_BY_TYPE.get(condition_type, ".bin")
+    with open_remote_media(uri, media_url_timeout(timeout_s)) as (_, chunks):
+        # The suffix follows the condition type, never the URL or Content-Type:
+        # a ".m3u8" name would steer FFmpeg's probe toward the HLS demuxer.
+        output_path, partial_path = _material_output_paths(
+            batch, condition_type=condition_type, condition_index=condition_index
         )
-        output_path = (
-            Path(_material_workdir(batch))
-            / f"condition_{int(condition_index):04d}{suffix}"
-        )
-        partial_path = output_path.with_name(output_path.name + ".partial")
         total = 0
         try:
             with partial_path.open("wb") as output:

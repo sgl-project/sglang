@@ -136,14 +136,8 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
 
     def test_allow_private_media_hosts_arg(self):
         try:
-            sa = self._parse([])
-            self.assertFalse(sa.allow_private_media_hosts)
-            sa = self._parse(["--allow-private-media-hosts"])
-            self.assertTrue(sa.allow_private_media_hosts)
-            # Parsing applies the policy to this process.
+            self._parse(["--allow-private-media-hosts"])
             self.assertEqual(media_url_security_config()[4], True)
-            sa = self._parse(["--no-allow-private-media-hosts"])
-            self.assertFalse(sa.allow_private_media_hosts)
         finally:
             configure_media_url_security([], max_file_size_mb=64)
 

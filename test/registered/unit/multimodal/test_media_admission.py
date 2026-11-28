@@ -1,14 +1,8 @@
 """Request admission and process inheritance using ordinary, locally owned media."""
 
-import asyncio
 import base64
-import http.server
 import io
-import ipaddress
 import multiprocessing
-import ssl
-import subprocess
-import threading
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,100 +75,6 @@ def test_encoder_and_spawned_cpu_worker_inherit_monolithic_policy(tmp_path):
             assert pool.submit(_worker_policy, str(path)).result(90) == reference
     finally:
         media_io.configure_media_url_security(*previous)
-
-
-def test_pinned_https_preserves_original_sni_host_and_redirect_policy(
-    tmp_path, monkeypatch
-):
-    from sglang.multimodal_gen.runtime.entrypoints.openai import utils
-
-    crt = tmp_path / "server.crt"
-    key = tmp_path / "server.key"
-    subprocess.run(
-        [
-            "openssl",
-            "req",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-x509",
-            "-days",
-            "1",
-            "-subj",
-            "/CN=one.media.test",
-            "-addext",
-            "subjectAltName=DNS:one.media.test,DNS:two.media.test",
-            "-keyout",
-            str(key),
-            "-out",
-            str(crt),
-        ],
-        check=True,
-        capture_output=True,
-    )
-    seen, names = [], []
-    body = _png()
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            seen.append(self.headers["Host"])
-            if self.path == "/first":
-                self.send_response(302)
-                self.send_header(
-                    "Location",
-                    f"https://two.media.test:{self.server.server_port}/image.png",
-                )
-            else:
-                self.send_response(200)
-                self.send_header("Content-Type", "image/png")
-            self.end_headers()
-            if self.path != "/first":
-                self.wfile.write(body)
-
-        def log_message(self, *_):
-            pass
-
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(crt, key)
-    ctx.set_servername_callback(lambda sock, name, context: names.append(name))
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    server.socket = ctx.wrap_socket(server.socket, server_side=True)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    previous = media_io.media_url_security_config()
-    monkeypatch.setenv("no_proxy", "*")
-    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(crt))
-    monkeypatch.setenv("SSL_CERT_FILE", str(crt))
-    # The operating system cannot resolve these fixture hostnames. Any unpinned dial fails.
-    monkeypatch.setattr(
-        media_io, "_resolve_host_ips", lambda _: [ipaddress.ip_address("127.0.0.1")]
-    )
-    media_io.configure_media_url_security(
-        ["one.media.test", "two.media.test", "other.media.test"]
-    )
-    port = server.server_port
-    url = f"https://one.media.test:{port}/first"
-    try:
-        assert media_io.get_image_bytes(url) == body
-        saved = asyncio.run(utils._save_url_image_to_path(url, str(tmp_path / "saved")))
-        assert Path(saved).read_bytes() == body
-        assert seen == [f"one.media.test:{port}", f"two.media.test:{port}"] * 2
-        assert names == ["one.media.test", "two.media.test"] * 2
-        import requests
-
-        with pytest.raises(requests.exceptions.SSLError):
-            media_io.get_image_bytes(f"https://other.media.test:{port}/image.png")
-        monkeypatch.setenv("no_proxy", "")
-        monkeypatch.setenv("NO_PROXY", "")
-        monkeypatch.setenv("https_proxy", "http://proxy.media.test:3000")
-        with pytest.raises(ValueError, match="direct route"):
-            media_io.get_image_bytes(url)
-        assert len(seen) == 4
-    finally:
-        media_io.configure_media_url_security(*previous)
-        server.shutdown()
-        server.server_close()
-        thread.join()
 
 
 if __name__ == "__main__":

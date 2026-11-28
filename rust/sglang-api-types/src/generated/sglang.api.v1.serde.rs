@@ -18052,13 +18052,98 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiClassifyRequest {
     }
 }
 
+impl ::serde::Serialize for OpenAiClassifyProbabilityRows {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.rows.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiClassifyProbabilityRows {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(OpenAiClassifyProbabilityRows {
+            rows: <::prost::alloc::vec::Vec<DoubleList> as ::serde::Deserialize>::deserialize(
+                deserializer,
+            )?,
+        })
+    }
+}
+
+impl ::serde::Serialize for OpenAiClassifyProbabilities {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(open_ai_classify_probabilities::Value::Sequence(v)) => v.serialize(serializer),
+            Some(open_ai_classify_probabilities::Value::PerToken(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiClassifyProbabilities {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiClassifyProbabilities;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the OpenAiClassifyProbabilities shapes")
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items: Vec<::serde_json::Value> = Vec::new();
+                while let Some(v) = seq.next_element::<::serde_json::Value>()? {
+                    items.push(v);
+                }
+                let shape = match items.first() {
+                    None => "empty",
+                    Some(::serde_json::Value::Array(inner))
+                        if inner.first().is_some_and(|x| x.is_array()) =>
+                    {
+                        "seq2"
+                    }
+                    Some(::serde_json::Value::Array(_)) => "seq",
+                    Some(::serde_json::Value::String(_)) => "str",
+                    Some(::serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => "int",
+                    Some(::serde_json::Value::Number(_)) => "float",
+                    Some(::serde_json::Value::Object(_)) => "map",
+                    Some(::serde_json::Value::Bool(_)) => "bool",
+                    Some(::serde_json::Value::Null) => "null",
+                };
+                let reparse = ::serde_json::Value::Array(items);
+                match shape {
+                    "int" | "float" | "empty" => {
+                        let v: DoubleList = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(OpenAiClassifyProbabilities {
+                            value: Some(open_ai_classify_probabilities::Value::Sequence(v)),
+                        })
+                    }
+                    "seq" => {
+                        let v: OpenAiClassifyProbabilityRows = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(OpenAiClassifyProbabilities {
+                            value: Some(open_ai_classify_probabilities::Value::PerToken(v)),
+                        })
+                    }
+                    other => Err(::serde::de::Error::custom(format!(
+                        "no OpenAiClassifyProbabilities array form takes {other} elements"
+                    ))),
+                }
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
 impl ::serde::Serialize for OpenAiClassifyData {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "index", &self.index)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "label", &self.label)?;
-        if !self.probs.is_empty() {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "probs", &self.probs)?;
+        if let Some(v) = &self.label {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "label", v)?;
+        }
+        if let Some(v) = &self.probs {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "probs", v)?;
         }
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "num_classes", &self.num_classes)?;
         ::serde::ser::SerializeMap::end(map)
@@ -18093,14 +18178,14 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiClassifyData {
                             if f_label.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("label"));
                             }
-                            f_label = Some(map.next_value::<::prost::alloc::string::String>()?);
+                            f_label = Some(map.next_value::<Option<StringOrList>>()?);
                         }
                         "probs" => {
                             if f_probs.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("probs"));
                             }
                             f_probs =
-                                Some(map.next_value::<Option<Vec<f64>>>()?.unwrap_or_default());
+                                Some(map.next_value::<Option<OpenAiClassifyProbabilities>>()?);
                         }
                         "num_classes" => {
                             if f_num_classes.is_some() {
@@ -18115,8 +18200,8 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiClassifyData {
                 }
                 Ok(OpenAiClassifyData {
                     index: f_index.unwrap_or_default(),
-                    label: f_label.unwrap_or_default(),
-                    probs: f_probs.unwrap_or_default(),
+                    label: f_label.flatten(),
+                    probs: f_probs.flatten(),
                     num_classes: f_num_classes.unwrap_or_default(),
                 })
             }

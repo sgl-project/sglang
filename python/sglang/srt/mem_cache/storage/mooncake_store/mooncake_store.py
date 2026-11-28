@@ -896,7 +896,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
             self.registered_pools = {}
 
-            self.gb_per_page = None
             self.prefetch_pgs = []
             self.backup_pgs = []
             self.prefetch_bandwidth = []
@@ -1043,12 +1042,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
-
-        bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
-        if self.unified_chunk_spans is not None:
-            # A unified page is every chunk this rank owns, K and V together.
-            bytes_per_page = sum(length for _, length in self.unified_chunk_spans)
-        self.gb_per_page = bytes_per_page / (1 << 30)
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         # KV anchor memory is already registered via register_mem_pool_host().
@@ -1647,6 +1640,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return key_list, ptr_list, element_size_list
 
     @staticmethod
+    def _transfer_gb(sizes: List[Any]) -> float:
+        return sum(
+            sum(size) if isinstance(size, Sequence) else size for size in sizes
+        ) / (1 << 30)
+
+    @staticmethod
     def _uses_multi_buffer(buffer_ptrs: List[Any]) -> bool:
         return bool(buffer_ptrs) and isinstance(buffer_ptrs[0], Sequence)
 
@@ -1788,7 +1787,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
             self.prefetch_bandwidth.append(
-                len(keys) / (end_time - start_time) * self.gb_per_page
+                self._transfer_gb(buffer_sizes) / (end_time - start_time)
             )
 
         if self.unified_suffixes is not None:
@@ -1859,12 +1858,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         # Chunks differ in size (a short final layer range), so count
                         # the pages touched and the bytes actually put.
                         backup_pages = len({i // key_multiplier for i in set_indices})
-                        backup_gb = sum(set_buffer_sizes) / (1 << 30)
                     else:
                         backup_pages = len(set_keys)
-                        backup_gb = backup_pages * self.gb_per_page
                     self.backup_pgs.append(backup_pages)
-                    self.backup_bandwidth.append(backup_gb / (end_time - start_time))
+                    self.backup_bandwidth.append(
+                        self._transfer_gb(set_buffer_sizes) / (end_time - start_time)
+                    )
 
                 for i in range(len(set_indices)):
                     set_results[set_indices[i]] = put_results[i]
@@ -1931,7 +1930,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.enable_storage_metrics:
             self.backup_pgs.append(len(set_keys))
             self.backup_bandwidth.append(
-                len(set_keys) / (end_time - start_time) * self.gb_per_page
+                self._transfer_gb(set_target_sizes) / (end_time - start_time)
             )
 
         for i in range(len(set_indices)):
@@ -1982,7 +1981,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
             self.prefetch_bandwidth.append(
-                len(keys) / (end_time - start_time) * self.gb_per_page
+                self._transfer_gb(target_sizes) / (end_time - start_time)
             )
 
         for i in range(len(keys)):

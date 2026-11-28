@@ -171,6 +171,21 @@ def storage_prefetch_end(
     return len(_req_radix_key(tree_cache, req, token_ids, max_prefix_len))
 
 
+def prefill_load_tokens(
+    seqlen: int, matched: int, storage_span: Optional[tuple[int, int]]
+) -> int:
+    """Prefill tokens a waiting request adds to the load: its sequence less the
+    matched prefix and the storage hit its prefetch has confirmed, in flight or
+    staged. Ranking counts a storage hit only once it is staged; the load counts
+    it from confirmation, and a revoked or failed prefetch drops its span, so
+    the next reading charges the full work."""
+    uncached = max(0, seqlen - matched)
+    if storage_span is not None:
+        start, end = storage_span
+        uncached -= max(0, min(end, seqlen) - max(start, matched))
+    return uncached
+
+
 def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     tree_cache.touch_prefix(
         _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)

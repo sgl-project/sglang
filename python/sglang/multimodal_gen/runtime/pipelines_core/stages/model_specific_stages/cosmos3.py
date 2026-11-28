@@ -12,16 +12,12 @@ per-request from ``batch.data_type`` and the presence of
 import copy
 import json
 import math
-import os
-import tempfile
 from collections import deque
 from collections.abc import Iterator
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import closing, contextmanager
 from fractions import Fraction
 from itertools import islice
 from typing import Any
-from urllib.parse import urlparse
-from urllib.request import DataHandler, Request
 
 import numpy as np
 import PIL.Image
@@ -104,9 +100,9 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.vision import (
-    download_video_to_stream,
     load_image,
     load_video,
+    open_video_source,
     preprocess_image,
 )
 from sglang.srt.environ import envs
@@ -245,40 +241,6 @@ def _pad_transfer_frames(video: torch.Tensor, target_frames: int) -> torch.Tenso
     return video.contiguous()
 
 
-@contextmanager
-def _open_video_stream(video_path: str):
-    """Give PyAV a seekable stream; remote clips are fully staged under the download cap."""
-    with ExitStack() as files:
-        try:
-            scheme = urlparse(video_path).scheme.lower()
-            if scheme in ("http", "https"):
-                # An explicitly configured scratch volume must not fall back to another disk.
-                root = os.environ.get("TMPDIR") or None
-                if root is not None and not os.path.isabs(root):
-                    raise ValueError("TMPDIR must be absolute")
-                stream = files.enter_context(tempfile.TemporaryFile(dir=root))
-                download_video_to_stream(video_path, stream)
-                stream.seek(0)
-            elif scheme == "data":
-                # DataHandler only reads inline bytes; it does not dispatch URLs.
-                stream = files.enter_context(
-                    DataHandler().data_open(Request(video_path))
-                )
-            elif not scheme or len(scheme) == 1:
-                stream = files.enter_context(open(video_path, "rb"))
-            else:
-                stream = None
-        except (ValueError, OSError) as exc:
-            # Both HTTP and filesystem exceptions may retain the original source.
-            category = type(exc).__name__
-        else:
-            if stream is None:
-                raise ValueError("Unsupported video path scheme")
-            yield stream
-            return
-        raise ValueError(f"Could not open video source ({category}).")
-
-
 def _iter_video_frames_pyav(
     video_path: str, num_frames: int, keep: str = "first"
 ) -> Iterator[np.ndarray]:
@@ -296,7 +258,7 @@ def _iter_video_frames_pyav(
         raise ValueError("keep must be 'first' or 'last'")
 
     with (
-        _open_video_stream(video_path) as source,
+        open_video_source(video_path) as source,
         av.open(source, options={"protocol_whitelist": "data"}) as container,
     ):
         if not container.streams.video:
@@ -1344,6 +1306,9 @@ class Cosmos3DenoisingStage(PipelineStage):
         # ``batch.extra["transformer_extra_kwargs"]`` (e.g. the Cosmos3
         # multiview attention layout and temporal wrap period).
         self._extra_transformer_kwargs: dict[str, Any] = {}
+        # The request being denoised; bound only for one denoising loop so the
+        # stage never keeps a finished request (and its tensors) alive.
+        self._request_batch: Req | None = None
 
         # Apply torch.compile if enabled
         if server_args is not None:
@@ -1457,7 +1422,11 @@ class Cosmos3DenoisingStage(PipelineStage):
         """
         if current_timestep is None:
             current_timestep = int(timestep.flatten()[0].item())
-        with set_forward_context(current_timestep=current_timestep, attn_metadata=None):
+        with set_forward_context(
+            current_timestep=current_timestep,
+            attn_metadata=None,
+            forward_batch=self._request_batch,
+        ):
             return self.transformer(
                 hidden_states=latents,
                 encoder_hidden_states=None,  # Not used by Cosmos3
@@ -1658,10 +1627,13 @@ class Cosmos3DenoisingStage(PipelineStage):
                 batch.num_inference_steps, device=batch.latents.device
             )
             batch.timesteps = self.scheduler.timesteps
-            with self.use_declared_component(
-                component_name="transformer",
-                module=self.transformer,
-                phase="denoise",
+            with (
+                self.use_declared_component(
+                    component_name="transformer",
+                    module=self.transformer,
+                    phase="denoise",
+                ),
+                self._bind_request(batch),
             ):
                 self._denoise_once(batch, server_args, generator=generator)
             with self.use_declared_component(
@@ -2133,12 +2105,23 @@ class Cosmos3DenoisingStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if batch.extra.get("transfer_plan") is not None:
             return self._forward_transfer(batch, server_args)
-        with self.use_declared_component(
-            component_name="transformer",
-            module=self.transformer,
-            phase="denoise",
+        with (
+            self.use_declared_component(
+                component_name="transformer",
+                module=self.transformer,
+                phase="denoise",
+            ),
+            self._bind_request(batch),
         ):
             return self._denoise_once(batch, server_args)
+
+    @contextmanager
+    def _bind_request(self, batch: Req):
+        self._request_batch = batch
+        try:
+            yield
+        finally:
+            self._request_batch = None
 
     def _predict_noise_cfg(
         self,

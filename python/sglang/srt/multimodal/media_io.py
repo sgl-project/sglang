@@ -25,6 +25,7 @@ import socket
 import stat
 import threading
 import time
+import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -37,6 +38,7 @@ import numpy as np
 import pybase64
 import requests
 import torch
+import urllib3
 from PIL import Image, ImageOps, UnidentifiedImageError
 from typing_extensions import Literal
 from urllib3.connection import HTTPConnection, HTTPSConnection
@@ -259,6 +261,14 @@ class _MediaConnection:
         finally:
             self.host = origin
 
+    def getresponse(self, *args, **kwargs):
+        # http.client drops self.sock once the response owns the socket; keep it
+        # so the body read can bound each socket read by the download deadline.
+        sock = self.sock
+        response = super().getresponse(*args, **kwargs)
+        response.media_sock = sock
+        return response
+
 
 class _MediaHTTPConnection(_MediaConnection, HTTPConnection):
     pass
@@ -280,8 +290,8 @@ class _MediaPool:
             except OSError:
                 connection.close()
             except BaseException:
+                # urlopen returns the pool slot when _get_conn raises.
                 connection.close()
-                self._put_conn(None)
                 raise
         return connection
 
@@ -308,14 +318,16 @@ class _MediaAdapter(requests.adapters.HTTPAdapter):
         )
 
 
-def validate_remote_media_url(url: str) -> str:
-    """Validate a client-supplied media URL; return its normalized form.
+def check_remote_media_url(url: str) -> str:
+    """Check a client-supplied media URL without DNS; return its normalized form.
 
     Raises ValueError when the URL is not an http(s) URL, its host is not in
-    the configured domain allowlist, or it resolves to a non-public IP
-    address (unless private hosts are explicitly allowed). The returned URL
-    is the same normalized representation ``requests`` sends, so callers that
-    fetch it validate exactly what is fetched.
+    the configured domain allowlist, or it is a non-public IP literal (unless
+    private hosts are explicitly allowed). Safe to call on an event loop; the
+    addresses a hostname resolves to are checked by ``validate_remote_media_url``
+    and again when the fetch connects. The returned URL is the same normalized
+    representation ``requests`` sends, so callers that fetch it validate
+    exactly what is fetched.
     """
     try:
         prepared_url = requests.Request("GET", url).prepare().url
@@ -326,7 +338,24 @@ def validate_remote_media_url(url: str) -> str:
     parsed = urlparse(prepared_url)
     if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
         raise ValueError("Expected an HTTP(S) media URL")
-    approved_media_addresses(parsed.hostname)
+    host = _normalize_media_domain(parsed.hostname)
+    if _allowed_media_domains and host not in _allowed_media_domains:
+        raise ValueError(f"Media URL domain is not allowed: {host}")
+    if _allow_private_media_hosts or host in _allowed_media_domains:
+        return prepared_url
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return prepared_url
+    if not _ip_is_public(ip):
+        raise ValueError("Media URL host resolves to a non-public IP address")
+    return prepared_url
+
+
+def validate_remote_media_url(url: str) -> str:
+    """``check_remote_media_url`` plus a DNS check of every address the host resolves to."""
+    prepared_url = check_remote_media_url(url)
+    approved_media_addresses(urlparse(prepared_url).hostname)
     return prepared_url
 
 
@@ -334,6 +363,11 @@ def media_url_timeout(default: float) -> float:
     if _media_url_timeout is not None:
         return _media_url_timeout
     return float(os.getenv("REQUEST_TIMEOUT", default))
+
+
+def media_url_max_file_size_bytes() -> int:
+    """The configured per-download size cap in bytes; 0 means no cap."""
+    return _media_url_max_file_size_bytes
 
 
 @contextmanager
@@ -363,6 +397,7 @@ def open_remote_media(url: str, timeout: float):
             allow_redirects=False,
             stream=True,
             timeout=remaining,
+            headers={"Accept-Encoding": "identity"},
         ) as response:
             location = response.headers.get("Location")
             if response.status_code in _MEDIA_URL_REDIRECT_STATUS_CODES and location:
@@ -388,11 +423,7 @@ def open_remote_media(url: str, timeout: float):
 
             def chunks():
                 total = 0
-                for chunk in response.iter_content(chunk_size=64 * 1024):
-                    if not chunk:
-                        continue
-                    if time.monotonic() > deadline:
-                        raise requests.exceptions.Timeout("Media download timed out")
+                for chunk in _read_body_until(response, deadline):
                     total += len(chunk)
                     if max_bytes and total > max_bytes:
                         raise ValueError(
@@ -402,6 +433,117 @@ def open_remote_media(url: str, timeout: float):
 
             yield response.headers, chunks()
             return
+
+
+_MEDIA_READ_CHUNK_BYTES = 64 * 1024
+
+
+def _body_decoder(content_encoding: Optional[str]):
+    """Return a ``decode(data) -> iterator of bytes`` for a Content-Encoding.
+
+    Media requests send ``Accept-Encoding: identity``; this only handles a server
+    that compresses anyway. Output is produced in bounded pieces, so a
+    compression bomb cannot be expanded in one step.
+    """
+    encoding = (content_encoding or "identity").strip().lower()
+    if encoding in ("", "identity"):
+
+        def decode_identity(data):
+            return iter((data,)) if data else iter(())
+
+        decode_identity.finish = lambda: iter(())
+        return decode_identity
+    if encoding not in ("gzip", "x-gzip", "deflate"):
+        raise requests.exceptions.ContentDecodingError(
+            f"Unsupported Content-Encoding for media: {content_encoding}"
+        )
+
+    if encoding == "deflate":
+        # servers send either zlib-wrapped or raw deflate; decide on the first bytes
+        decompressors = [zlib.decompressobj(), zlib.decompressobj(-zlib.MAX_WBITS)]
+    else:
+        decompressors = [zlib.decompressobj(16 + zlib.MAX_WBITS)]
+    state = {"first": True, "held": b""}
+
+    def decode(data, final=False):
+        if state["first"] and data:
+            data = state["held"] + data
+            if len(decompressors) == 2 and len(data) < 2 and not final:
+                # too short to tell zlib from raw deflate; wait for more bytes
+                state["held"] = data
+                return
+            state["held"] = b""
+            state["first"] = False
+            if len(decompressors) == 2:
+                # a zlib header is (CMF * 256 + FLG) % 31 == 0 with CM == 8
+                zlib_wrapped = len(data) >= 2 and (
+                    data[0] & 0x0F == 8 and (data[0] * 256 + data[1]) % 31 == 0
+                )
+                decompressors[:] = (
+                    decompressors[:1] if zlib_wrapped else decompressors[1:]
+                )
+        decompressor = decompressors[0]
+        try:
+            while data:
+                piece = decompressor.decompress(data, _MEDIA_READ_CHUNK_BYTES)
+                if piece:
+                    yield piece
+                data = decompressor.unconsumed_tail
+                # output held back by max_length is drained with empty input
+                while not data and len(piece) == _MEDIA_READ_CHUNK_BYTES:
+                    piece = decompressor.decompress(b"", _MEDIA_READ_CHUNK_BYTES)
+                    if piece:
+                        yield piece
+        except zlib.error as e:
+            raise requests.exceptions.ContentDecodingError(e) from e
+
+    def finish():
+        """Called once the raw stream ends; a truncated body is an error."""
+        if state["held"]:
+            held, state["held"] = state["held"], b""
+            yield from decode(held, final=True)
+        if not decompressors[0].eof:
+            raise requests.exceptions.ContentDecodingError(
+                "Truncated compressed media body"
+            )
+
+    decode.finish = finish
+    return decode
+
+
+def _read_body_until(response: requests.Response, deadline: float):
+    """Yield the decoded body, failing once the total deadline passes.
+
+    Each raw socket read is preceded by re-arming the socket timeout to the time
+    left, and ``read1`` returns what one read brings, so a server that trickles
+    bytes cannot outlast the deadline. The body is read undecoded and decoded
+    here, since urllib3 may loop on several raw reads inside one decoded read.
+    urllib3 errors are raised as the requests errors ``iter_content`` raises.
+    """
+    raw = response.raw
+    sock = getattr(raw, "media_sock", None)
+    decode = _body_decoder(response.headers.get("Content-Encoding"))
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise requests.exceptions.Timeout("Media download timed out")
+            if sock is not None and not raw.isclosed():
+                # http.client closes the socket once the whole body is read
+                sock.settimeout(remaining)
+            data = raw.read1(_MEDIA_READ_CHUNK_BYTES, decode_content=False)
+            if not data:
+                yield from decode.finish()
+                return
+            yield from decode(data)
+    except urllib3.exceptions.ReadTimeoutError as e:
+        raise requests.exceptions.Timeout("Media download timed out") from e
+    except urllib3.exceptions.SSLError as e:
+        raise requests.exceptions.SSLError(e) from e
+    except urllib3.exceptions.DecodeError as e:
+        raise requests.exceptions.ContentDecodingError(e) from e
+    except urllib3.exceptions.ProtocolError as e:
+        raise requests.exceptions.ChunkedEncodingError(e) from e
 
 
 def download_remote_media(url: str, timeout: float) -> bytes:
@@ -744,10 +886,12 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
-            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
+            from torchvision.io import ImageReadMode, decode_jpeg  # lazy: torch._dynamo
 
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            image_tensor = decode_jpeg(
+                encoded_image, mode=ImageReadMode.RGB, device="cuda"
+            )
             return image_tensor
         except Exception as e:
             if gpu_image_decode == "nvjpeg_fancy":

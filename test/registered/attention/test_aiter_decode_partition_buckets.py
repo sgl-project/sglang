@@ -42,7 +42,7 @@ def _make_backend(context_len=131072, **flags):
     backend.use_mla = flags.get("use_mla", False)
     backend.use_triton_unified_attention = flags.get("unified", False)
     backend.kv_cache_is_vectorized_5d = flags.get("vec5d", False)
-    backend.max_context_len = context_len
+    backend.max_kv_len = context_len
     backend.max_num_partitions = -(-context_len // _AITER_PARTITION_SIZE_ROCM)
     backend._decode_partition_buckets = backend._build_decode_partition_buckets()
     return backend
