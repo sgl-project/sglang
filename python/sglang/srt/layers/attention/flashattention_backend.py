@@ -484,6 +484,27 @@ class FlashAttentionBackend(AttentionBackend):
             return 4
         return self.fa_impl_ver
 
+    def fp8_query_dtype(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> Optional[torch.dtype]:
+        # Mirrors prepare_paged_mha_query's quantize_q for an FA3 layer. Decode
+        # only: a prefill CUDA graph captured on text is also replayed for image
+        # batches, which send every layer to FA4, and FA4 takes an unquantized
+        # 16-bit q there.
+        if (
+            not forward_batch.forward_mode.is_decode()
+            or self.kv_cache_dtype_str == "auto"
+            or self.kv_cache_is_mxfp8
+            # the RoPE q_out path writes e4m3 only; e5m2 keeps the cast here
+            or self.kv_cache_dtype != torch.float8_e4m3fn
+            or self._ver_for(layer) != 3
+            or layer.head_dim > 256
+            or layer.is_cross_attention
+            or get_spec().speculative_algorithm is not None
+        ):
+            return None
+        return self.kv_cache_dtype
+
     def _maybe_init_local_attn_builder(
         self, model_runner: ModelRunner
     ) -> Optional[LocalAttentionMetadataBuilder]:

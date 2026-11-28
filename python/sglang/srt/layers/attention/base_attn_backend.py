@@ -458,6 +458,14 @@ class AttentionBackend(ABC):
         """Run a forward for decode."""
         raise NotImplementedError()
 
+    def fp8_query_dtype(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> Optional[torch.dtype]:
+        """The fp8 dtype this backend casts ``layer``'s query to for this batch,
+        or None. A model may then hand attention a query already in that dtype
+        (e.g. written by the RoPE kernel) and skip the cast."""
+        return None
+
     def forward_extend(
         self,
         q: torch.Tensor,

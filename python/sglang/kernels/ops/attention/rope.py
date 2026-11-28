@@ -58,11 +58,23 @@ def bf16_rope_scale_store(
 
 @cache_once
 def _jit_fused_rope_module(
-    is_neox: bool, rope_dim: int, dtype: torch.dtype, q_dtype: torch.dtype
+    is_neox: bool,
+    rope_dim: int,
+    dtype: torch.dtype,
+    q_dtype: torch.dtype,
+    q_out_dtype: Optional[torch.dtype] = None,
 ) -> Module:
     # q_dtype supports a same-size mixed-dtype q, e.g. fp16 q with bf16 k;
-    # k/v/caches use dtype.
-    args = make_cpp_args(is_neox, rope_dim, is_arch_support_pdl(), dtype, q_dtype)
+    # k/v/caches use dtype. q_out_dtype (any size, e.g. fp8) is what run_rope_qout
+    # writes the rotated q as.
+    args = make_cpp_args(
+        is_neox,
+        rope_dim,
+        is_arch_support_pdl(),
+        dtype,
+        q_dtype,
+        *([q_out_dtype] if q_out_dtype is not None else []),
+    )
     return load_jit(
         "fused_rope",
         *args,
@@ -70,6 +82,7 @@ def _jit_fused_rope_module(
         cuda_wrappers=[
             ("run_rope", f"FusedRopeKernel<{args}>::run"),
             ("run_rope_store", f"FusedRopeKernel<{args}>::run_fused"),
+            ("run_rope_qout", f"FusedRopeKernel<{args}>::run_qout"),
         ],
     )
 
@@ -152,6 +165,7 @@ def apply_rope_inplace(
     *,
     is_neox: bool,
     rope_dim: int = 0,
+    q_out: Optional[torch.Tensor] = None,
 ) -> None:
     """
     Fused inplace rotary position embedding for query and key tensors.
@@ -165,8 +179,20 @@ def apply_rope_inplace(
         positions: Position indices of shape [num_tokens], int32 or int64.
         is_neox: Whether to use GPT-NeoX style (True) or GPT-J interleaved style (False).
         rope_dim: Rotary embedding dimension. Defaults to cos_sin_cache.size(-1).
+        q_out: Optional [num_tokens, num_qo_heads, rope_dim] buffer of another
+            dtype (fp8 e4m3, for an FP8-KV attention kernel that quantizes q
+            anyway): the rotated q is written there, rounded to q's dtype
+            first, and q itself is left as it was.
     """
     rope_dim = rope_dim or cos_sin_cache.size(-1)
+    if q_out is not None:
+        # The JIT fp8 casts cover e4m3 only (sgl_kernel/type.cuh).
+        assert q_out.dtype in (torch.float8_e4m3fn, q.dtype, k.dtype), q_out.dtype
+        module = _jit_fused_rope_module(
+            is_neox, rope_dim, k.dtype, q.dtype, q_out.dtype
+        )
+        module.run_rope_qout(q, k, q_out, cos_sin_cache, positions)
+        return
     module = _jit_fused_rope_module(is_neox, rope_dim, k.dtype, q.dtype)
     module.run_rope(q, k, cos_sin_cache, positions)
 
@@ -219,6 +245,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     is_neox: bool,
     rope_dim: int = 0,
     fused_args: Optional[FusedSetKVBufferArg] = None,
+    q_out: Optional[torch.Tensor] = None,
 ) -> None:
     """
     Apply RoPE to q and k inplace, with optional fused kv cache store.
@@ -235,8 +262,11 @@ def apply_rope_with_cos_sin_cache_inplace(
         rope_dim: Rotary embedding dimension. Defaults to cos_sin_cache.size(-1).
         fused_args: Optional arguments for fused RoPE + KV cache store. If None,
             only RoPE will be applied inplace without touching kv cache.
+        q_out: Optional buffer the rotated q is written to instead of q (see
+            apply_rope_inplace); not combined with fused_args.
     """
     if fused_args is not None:
+        assert q_out is None, "q_out is not supported with the fused KV store"
         apply_rope_inplace_with_kvcache(
             q,
             k,
@@ -251,5 +281,11 @@ def apply_rope_with_cos_sin_cache_inplace(
         )
     else:
         apply_rope_inplace(
-            q, k, cos_sin_cache, positions, is_neox=is_neox, rope_dim=rope_dim
+            q,
+            k,
+            cos_sin_cache,
+            positions,
+            is_neox=is_neox,
+            rope_dim=rope_dim,
+            q_out=q_out,
         )
