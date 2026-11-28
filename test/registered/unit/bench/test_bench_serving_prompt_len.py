@@ -6,10 +6,14 @@ import threading
 import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import Mock
 
+from sglang.benchmark.datasets.common import DatasetRow
 from sglang.benchmark.serving import (
     RequestFuncInput,
+    RequestFuncOutput,
     async_request_openai_chat_completions,
+    calculate_metrics,
     set_global_args,
     wrap_multi_turn_request_func,
 )
@@ -133,6 +137,64 @@ class TestBenchServingPromptLen(CustomTestCase):
                 self.assertEqual(
                     [b["stream_options"] for b in self.server.bodies], [sent] * 3
                 )
+
+
+class TestBenchServingInputMetrics(CustomTestCase):
+    @staticmethod
+    def _output(prompt_len, success=True):
+        return RequestFuncOutput(
+            success=success,
+            prompt_len=prompt_len,
+            output_len=2,
+            generated_text="hi",
+            latency=1.0,
+            ttft=0.1,
+            itl=[0.9],
+            start_time=1.0,
+        )
+
+    def _metrics(self, outputs, input_requests=None):
+        return calculate_metrics(
+            input_requests=input_requests,
+            outputs=outputs,
+            dur_s=2.0,
+            tokenizer=Mock(encode=Mock(return_value=[1, 2])),
+            backend="sglang-oai-chat",
+        )[0]
+
+    def test_multi_turn_input_tokens_and_throughput(self):
+        metrics = self._metrics([self._output(100), self._output(200)])
+        self.assertEqual(metrics.total_input, 300)
+        self.assertEqual(metrics.input_throughput, 150.0)
+        self.assertEqual(metrics.total_output, 4)
+        self.assertEqual(metrics.output_throughput, 2.0)
+        self.assertEqual(metrics.total_throughput, 152.0)
+
+    def test_multi_turn_failed_round_is_excluded(self):
+        metrics = self._metrics(
+            [self._output(100), self._output(9999, success=False), self._output(200)]
+        )
+        self.assertEqual(metrics.completed, 2)
+        self.assertEqual(metrics.total_input, 300)
+        self.assertEqual(metrics.input_throughput, 150.0)
+        self.assertEqual(metrics.total_throughput, 152.0)
+
+    def test_single_turn_keeps_dataset_lengths_and_modality_breakdown(self):
+        rows = [
+            DatasetRow(
+                prompt="hello",
+                prompt_len=100,
+                output_len=2,
+                text_prompt_len=40,
+                vision_prompt_len=60,
+            )
+        ]
+        metrics = self._metrics([self._output(9999)], input_requests=rows)
+        self.assertEqual(metrics.total_input, 100)
+        self.assertEqual(metrics.total_input_text, 40)
+        self.assertEqual(metrics.total_input_vision, 60)
+        self.assertEqual(metrics.input_throughput, 50.0)
+        self.assertEqual(metrics.total_throughput, 51.0)
 
 
 if __name__ == "__main__":
