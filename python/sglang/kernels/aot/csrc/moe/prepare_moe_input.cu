@@ -276,7 +276,9 @@ __global__ void apply_shuffle_mul_sum_kernel(
   int thread_idx = threadIdx.x;
   int stride = blockDim.x;
 
-  for (int d_vec_idx = thread_idx; d_vec_idx < row_stride / vec_size; d_vec_idx += stride) {
+  // 16-byte vector loads need every row to start 16-byte aligned.
+  int num_vecs = row_stride % vec_size == 0 ? row_stride / vec_size : 0;
+  for (int d_vec_idx = thread_idx; d_vec_idx < num_vecs; d_vec_idx += stride) {
     int d = d_vec_idx * vec_size;
     vec_t sum_vec;
     sum_vec.fill(0.0f);
@@ -302,7 +304,7 @@ __global__ void apply_shuffle_mul_sum_kernel(
   }
 
   //  remainder part
-  int remainder_start = (row_stride / vec_size) * vec_size;
+  int remainder_start = num_vecs * vec_size;
   for (int d = remainder_start + thread_idx; d < row_stride; d += stride) {
     t sum_val = 0.0;
     for (int j = 0; j < topk; ++j) {
@@ -331,14 +333,19 @@ void get_apply_shuffle_mul_sum_caller(
   TORCH_CHECK(permutation.dim() == 1, "permutation must be 1D [m * topk]");
 
   int m = output_tensor.size(0);
+  if (m == 0) {
+    TORCH_CHECK(
+        input_tensor.size(0) == 0 && permutation.numel() == 0, "Empty output requires empty input and permutation");
+    TORCH_CHECK(!factors_opt.has_value() || factors_opt->numel() == 0, "Empty output requires empty factors");
+    return;
+  }
   int topk = int(permutation.size(0) / m);
   int row_stride = output_tensor.size(1);
 
   TORCH_CHECK(permutation.size(0) == m * topk, "permutation size must match m * topk");
 
-  auto scalar_type = output_tensor.scalar_type();
-  uint32_t vec_size = 16 / sizeof(scalar_type);
-  auto blockDim = std::min(row_stride / vec_size, 1024U);
+  uint32_t vec_size = 16 / output_tensor.element_size();
+  auto blockDim = std::max(1U, std::min(row_stride / vec_size, 1024U));
   dim3 block(blockDim);
 
   dim3 grid(m);  // blockIdx.x = j, blockIdx.y = i
