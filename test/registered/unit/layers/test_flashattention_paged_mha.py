@@ -141,6 +141,32 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
                         torch.equal(key_cache[page, token, head], k[page, head, token])
                     )
 
+    def test_dense_kv_slots_follow_each_request_through_its_pages(self):
+        # Both requests end mid-page; request 1 starts on a page below request 0's.
+        slots = flashattention_backend._dense_kv_slots(
+            page_table=torch.tensor([[5, 2, 0], [1, 6, 3]]),
+            seq_lens=torch.tensor([6, 9]),
+            cu_seqlens_k=torch.tensor([0, 6, 15]),
+            num_keys=15,
+            page_size=4,
+        )
+
+        self.assertEqual(
+            slots.tolist(),
+            [20, 21, 22, 23, 8, 9, 4, 5, 6, 7, 24, 25, 26, 27, 12],
+        )
+
+    def test_dense_extend_wins_only_while_the_attention_pays_for_the_copy(self):
+        # Qwen3-30B-A3B heads on one of four TP ranks.
+        heads = dict(num_q_heads=8, num_kv_heads=1, head_dim=128)
+        wins = flashattention_backend._dense_extend_wins
+
+        self.assertTrue(wins(extend_lens=[4096], prefix_lens=[8192], **heads))
+        # The work is too little for the copy's launch.
+        self.assertFalse(wins(extend_lens=[1536], prefix_lens=[2048], **heads))
+        # The copy would pass 256 MiB.
+        self.assertFalse(wins(extend_lens=[8192], prefix_lens=[600_000], **heads))
+
     def test_prepare_paged_mha_query_reuses_fa_scaling_policy(self):
         backend = _backend()
         layer = SimpleNamespace(
