@@ -9,6 +9,7 @@ completed real work.
 """
 
 import asyncio
+import io
 import json
 import socket
 import threading
@@ -17,9 +18,13 @@ import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from aiohttp import web
+from tqdm import tqdm
+
 from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
+    async_request_openai_completions,
     calculate_metrics,
     set_global_args,
 )
@@ -348,6 +353,292 @@ class TestBenchServingReasoningNonStream(CustomTestCase):
         self.assertEqual(out.generated_text, "answer")
         self.assertGreater(out.ttft, 0.0)
         self.assertEqual(out.output_len, 1)
+
+
+class TestBenchServingIncompleteStream(CustomTestCase):
+    """HTTP 200 with a clean HTTP EOF must not hide an unfinished SSE response."""
+
+    @staticmethod
+    def _chunk(kind, text="", index=0, **choice_fields):
+        choice = {"delta": {"content": text}} if kind == "chat" else {"text": text}
+        return {"choices": [{"index": index, **choice, **choice_fields}]}
+
+    @staticmethod
+    def _sse(chunks, done=False):
+        body = b"".join(
+            b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n"
+            for chunk in chunks
+        )
+        return body + (b"data: [DONE]\n\n" if done else b"")
+
+    async def _request(
+        self, kind, body, *, stream=True, extra=None, width=None, truncated=False
+    ):
+        # Exercise the real aiohttp client, including split UTF-8/SSE lines and
+        # the distinction between clean application EOF and broken HTTP framing.
+        received = []
+
+        async def handler(request):
+            received.append(await request.json())
+            response = web.StreamResponse(
+                headers={
+                    "Content-Type": (
+                        "text/event-stream"
+                        if received[-1]["stream"]
+                        else "application/json"
+                    ),
+                    "Content-Length": str(len(body) + int(truncated)),
+                }
+            )
+            await response.prepare(request)
+            step = width or max(len(body), 1)
+            for offset in range(0, len(body), step):
+                await response.write(body[offset : offset + step])
+                await asyncio.sleep(0)
+            if truncated:
+                request.transport.close()
+            else:
+                await response.write_eof()
+            return response
+
+        app = web.Application()
+        endpoint = "/v1/chat/completions" if kind == "chat" else "/v1/completions"
+        app.router.add_post(endpoint, handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        try:
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            port = runner.addresses[0][1]
+            set_global_args(
+                Namespace(
+                    disable_stream=not stream,
+                    disable_ignore_eos=True,
+                    return_logprob=False,
+                    print_requests=False,
+                    tokenizer="",
+                    header=None,
+                )
+            )
+            request = RequestFuncInput(
+                prompt="hello",
+                api_url=f"http://127.0.0.1:{port}{endpoint}",
+                prompt_len=1,
+                output_len=64,
+                model="dummy-model",
+                lora_name="",
+                image_data=None,
+                extra_request_body=extra or {},
+            )
+            request_func = (
+                async_request_openai_chat_completions
+                if kind == "chat"
+                else async_request_openai_completions
+            )
+            with tqdm(total=1, file=io.StringIO()) as progress:
+                output = await request_func(request, progress)
+                self.assertEqual(progress.n, 1)
+            self.assertEqual(received[0]["stream"], (extra or {}).get("stream", stream))
+            return output
+        finally:
+            await runner.cleanup()
+
+    def test_clean_eof_is_not_success(self):
+        async def run():
+            for kind in ("chat", "completions"):
+                partial = self._chunk(kind, "你")
+                empty = self._chunk(kind)
+                if kind == "chat":
+                    empty["choices"][0]["delta"] = {"role": "assistant"}
+                cases = {
+                    "empty body": b"",
+                    "blank lines": b"\n\n",
+                    "partial content": self._sse([partial]),
+                    "role or empty delta": self._sse([empty]),
+                    "null finish": self._sse([self._chunk(kind, finish_reason=None)]),
+                    "empty finish": self._sse([self._chunk(kind, finish_reason="")]),
+                    "provisional usage": self._sse(
+                        [{**partial, "usage": {"completion_tokens": 1}}]
+                    ),
+                    "usage only": self._sse(
+                        [{"choices": [], "usage": {"completion_tokens": 0}}]
+                    ),
+                }
+                for name, body in cases.items():
+                    for width in (1, None):
+                        with self.subTest(kind=kind, case=name, width=width):
+                            output = await self._request(kind, body, width=width)
+                            self.assertFalse(output.success)
+                            self.assertIn("Incomplete streaming response", output.error)
+
+        asyncio.run(run())
+
+    def test_terminal_markers_and_usage_tail(self):
+        async def run():
+            for kind in ("chat", "completions"):
+                partial = self._chunk(kind, "你")
+                finish = self._chunk(kind, finish_reason="stop")
+                usage = {"choices": [], "usage": {"completion_tokens": 1}}
+                cases = [
+                    ([partial], True, "你", 64),
+                    ([partial, finish, usage], False, "你", 1),
+                    ([partial, finish, self._chunk(kind), usage], True, "你", 1),
+                    ([{**finish, "usage": {"completion_tokens": 0}}], False, "", 0),
+                ]
+                if kind == "chat":
+                    tool = self._chunk(kind, finish_reason="tool_calls")
+                    tool["choices"][0]["delta"] = {
+                        "tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]
+                    }
+                    cases.append(([tool, usage], False, "", 1))
+                for chunks, done, text, tokens in cases:
+                    with self.subTest(kind=kind, chunks=chunks, done=done):
+                        output = await self._request(
+                            kind, self._sse(chunks, done), width=1
+                        )
+                        self.assertTrue(output.success, output.error)
+                        self.assertEqual(output.generated_text, text)
+                        self.assertEqual(output.output_len, tokens)
+
+        asyncio.run(run())
+
+    def test_all_requested_and_observed_choices_must_finish(self):
+        async def run():
+            for kind in ("chat", "completions"):
+                finished = self._chunk(kind, finish_reason="length")
+                second = self._chunk(kind, "partial", index=1)
+                second_finished = self._chunk(kind, index=1, finish_reason="stop")
+                cases = [
+                    ([finished], {"n": 2}, False),
+                    ([finished, second], {"n": 2}, False),
+                    ([finished, second], {}, False),
+                    ([second_finished], {"n": 2}, False),
+                    ([finished, second_finished], {"n": 2}, True),
+                    # A trailing metadata delta must not clear earlier finish state.
+                    ([finished, self._chunk(kind, finish_reason=None)], {}, True),
+                    (
+                        [{"choices": finished["choices"] + second["choices"]}],
+                        {"n": 2},
+                        False,
+                    ),
+                    (
+                        [{"choices": finished["choices"] + second_finished["choices"]}],
+                        {"n": 2},
+                        True,
+                    ),
+                ]
+                if kind == "completions":
+                    cases.extend(
+                        [
+                            ([finished], {"prompt": ["one", "two"]}, False),
+                            ([finished], {"prompt": [[1], [2]]}, False),
+                            ([finished], {"prompt": [1, 2]}, True),
+                            (
+                                [finished, second_finished],
+                                {"prompt": ["one", "two"]},
+                                True,
+                            ),
+                        ]
+                    )
+                for chunks, extra, expected in cases:
+                    with self.subTest(kind=kind, chunks=chunks, extra=extra):
+                        output = await self._request(
+                            kind, self._sse(chunks), extra=extra
+                        )
+                        self.assertEqual(output.success, expected, output.error)
+
+        asyncio.run(run())
+
+    def test_effective_stream_flag_and_non_stream_json(self):
+        async def run():
+            for kind in ("chat", "completions"):
+                choice = (
+                    {"message": {"content": "answer"}}
+                    if kind == "chat"
+                    else {"text": "answer"}
+                )
+                # A JSON response does not need an SSE marker or finish_reason.
+                body = json.dumps(
+                    {"choices": [choice], "usage": {"completion_tokens": 1}}
+                ).encode()
+                for stream, extra in ((False, {}), (True, {"stream": False})):
+                    with self.subTest(kind=kind, stream=stream, extra=extra):
+                        output = await self._request(
+                            kind, body, stream=stream, extra=extra
+                        )
+                        self.assertTrue(output.success, output.error)
+                        self.assertEqual(output.generated_text, "answer")
+                        self.assertEqual(output.output_len, 1)
+                with self.subTest(kind=kind, empty_non_stream_choices=True):
+                    output = await self._request(
+                        kind,
+                        b'{"choices": [], "usage": {"completion_tokens": 0}}',
+                        stream=False,
+                    )
+                    self.assertFalse(output.success)
+                for done in (False, True):
+                    with self.subTest(kind=kind, override_stream=True, done=done):
+                        output = await self._request(
+                            kind,
+                            self._sse([self._chunk(kind, "partial")], done),
+                            stream=False,
+                            extra={"stream": True},
+                        )
+                        self.assertEqual(output.success, done, output.error)
+                        if not done:
+                            self.assertIn("Incomplete streaming response", output.error)
+
+        asyncio.run(run())
+
+    def test_broken_http_framing_stays_a_transport_error(self):
+        async def run():
+            for kind in ("chat", "completions"):
+                for done in (False, True):
+                    with self.subTest(kind=kind, done=done):
+                        output = await self._request(
+                            kind,
+                            self._sse(
+                                [self._chunk(kind, "partial", finish_reason="stop")],
+                                done,
+                            ),
+                            truncated=True,
+                        )
+                        self.assertFalse(output.success)
+                        self.assertIn("ClientPayloadError", output.error)
+                        self.assertIn("ContentLengthError", output.error)
+
+        asyncio.run(run())
+
+    def test_incomplete_requests_are_excluded_from_metrics(self):
+        async def run():
+            for kind in ("chat", "completions"):
+                partial = await self._request(
+                    kind, self._sse([self._chunk(kind, "partial")])
+                )
+                complete = await self._request(
+                    kind,
+                    self._sse(
+                        [
+                            {
+                                **self._chunk(kind, "answer", finish_reason="stop"),
+                                "usage": {"completion_tokens": 1},
+                            }
+                        ]
+                    ),
+                )
+                metrics, lengths = calculate_metrics(
+                    input_requests=None,
+                    outputs=[partial, complete],
+                    dur_s=1.0,
+                    tokenizer=_StrictStringTokenizer(),
+                    backend="sglang-oai-chat" if kind == "chat" else "sglang-oai",
+                )
+                with self.subTest(kind=kind):
+                    self.assertEqual(metrics.completed, 1)
+                    self.assertEqual(metrics.total_output, 1)
+                    self.assertEqual(lengths, [0, 1])
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":
