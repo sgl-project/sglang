@@ -45,6 +45,8 @@ class SessionSlot:
     # Until the first turn finishes or is retracted, its checkpoints publish
     # the prompt into the tree and move the lock onto the deepest published node.
     publishes_prompt: bool = False
+    # LoRA adapter bound to this slot's KV cache (None for base model).
+    lora_id: Optional[str] = None
 
 
 def is_virtual_node(node: Any) -> bool:
@@ -90,6 +92,17 @@ class StreamingSession:
             req.session.abort_req()
             req.session = None
             return None
+        req_lora_id = getattr(req, "lora_id", None)
+        if slot.lora_id != req_lora_id:
+            logger.warning(
+                "Streaming session %s lora_id mismatch (%r != %r); "
+                "releasing cached KV slot.",
+                req.session.session_id,
+                slot.lora_id,
+                req_lora_id,
+            )
+            self.release_session(req.session.session_id)
+            return None
         return slot
 
     def will_lend_record(self, req: Optional[Req]) -> bool:
@@ -98,7 +111,11 @@ class StreamingSession:
         if not _is_streaming(req) or req.to_finish is not None:
             return False
         slot = self.slots.get(req.session.session_id)
-        return slot is not None and slot.kv.holds_kv
+        return (
+            slot is not None
+            and slot.kv.holds_kv
+            and slot.lora_id == getattr(req, "lora_id", None)
+        )
 
     def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
         """Returns a MatchResult iff the request hits an active session slot;
@@ -241,7 +258,11 @@ class StreamingSession:
             return
         session_id = req.session.session_id
         assert session_id not in self.slots, f"{session_id=} already has a slot"
-        slot = SessionSlot(kv=req.kv, publishes_prompt=True)
+        slot = SessionSlot(
+            kv=req.kv,
+            publishes_prompt=True,
+            lora_id=getattr(req, "lora_id", None),
+        )
         self._lock_to_slot(req, slot)
         self.slots[session_id] = slot
 

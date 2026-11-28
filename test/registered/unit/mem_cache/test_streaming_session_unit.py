@@ -280,6 +280,59 @@ def test_session_rewind_keeps_component_cursors_page_aligned(operation, componen
     )
 
 
+def test_streaming_session_slot_rejects_mismatched_lora_id():
+    """A cached session slot must never lend KV rows to a request with a
+    different lora_id; on mismatch the stale slot is released and matching
+    falls back to the radix tree."""
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator(page_size=1)
+    fallback_result = MatchResult(
+        device_prefix_len=0,
+        last_device_node=None,
+        last_host_node=None,
+        best_match_node=None,
+    )
+    tree_cache = _FakeInnerCache(
+        req_to_token_pool,
+        allocator,
+        page_size=1,
+        match_results=[fallback_result],
+    )
+
+    turn1 = _FakeReq("session-lora", req_pool_idx=0, committed=4, allocated=4)
+    turn1.lora_id = "adapter-a"
+    slot = _finished_turn(tree_cache, turn1)
+    assert slot.lora_id == "adapter-a"
+
+    same_adapter = _FakeReq("session-lora", req_pool_idx=1, committed=0, allocated=0)
+    same_adapter.lora_id = "adapter-a"
+    assert tree_cache.session.will_lend_record(same_adapter)
+
+    # A pre-aborted mismatched request (e.g. rejected by Session.create_req)
+    # detaches without disturbing the healthy slot.
+    aborted_other = _FakeReq("session-lora", req_pool_idx=1, committed=0, allocated=0)
+    aborted_other.lora_id = "adapter-b"
+    aborted_other.to_finish = FINISH_ABORT("lora mismatch")
+    assert not tree_cache.session.will_lend_record(aborted_other)
+    assert tree_cache.session.find_active_slot(aborted_other) is None
+    assert aborted_other.session is None
+    assert "session-lora" in tree_cache.session.slots
+
+    other_adapter = _FakeReq("session-lora", req_pool_idx=1, committed=0, allocated=0)
+    other_adapter.lora_id = "adapter-b"
+    assert not tree_cache.session.will_lend_record(other_adapter)
+
+    result = tree_cache.match_prefix(
+        SimpleNamespace(req=other_adapter, key=list(range(6)))
+    )
+    assert result is fallback_result
+    assert "session-lora" not in tree_cache.session.slots
+    assert other_adapter.kv.req_pool_idx == 1
+    assert req_to_token_pool.free_slots == [0]
+    assert [t.tolist() for t in allocator.freed] == [[0, 1, 2, 3]]
+
+
 if __name__ == "__main__":
     import sys
 
