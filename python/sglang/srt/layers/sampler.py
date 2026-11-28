@@ -11,6 +11,7 @@ from sglang.kernels.ops.sampling import argmax as sampler_argmax
 from sglang.kernels.ops.sampling import softmax as sampler_softmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
+from sglang.srt.distributed.parallel_state import pynccl_comm_for_device_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -114,6 +115,14 @@ def _select_sampling_mask_rows(
     if batch_indices.numel() == tensor.shape[0]:
         return tensor
     return tensor.index_select(0, batch_indices)
+
+
+def _all_reduce_sync(tensor: torch.Tensor, op: dist.ReduceOp, group) -> None:
+    pynccl_comm = pynccl_comm_for_device_group(group, tensor)
+    if pynccl_comm is not None:
+        pynccl_comm.all_reduce(tensor, op=op)
+    else:
+        dist.all_reduce(tensor, op=op, group=group)
 
 
 class Sampler(nn.Module):
@@ -583,16 +592,12 @@ class Sampler(nn.Module):
         # All replicas must make the same request-abort decision.
         if dist.is_initialized():
             if dist.get_world_size(self.tp_sync_group) > 1:
-                dist.all_reduce(
-                    statuses, op=dist.ReduceOp.MAX, group=self.tp_sync_group
-                )
+                _all_reduce_sync(statuses, dist.ReduceOp.MAX, self.tp_sync_group)
             if (
                 self.cp_sync_group is not None
                 and dist.get_world_size(self.cp_sync_group) > 1
             ):
-                dist.all_reduce(
-                    statuses, op=dist.ReduceOp.MAX, group=self.cp_sync_group
-                )
+                _all_reduce_sync(statuses, dist.ReduceOp.MAX, self.cp_sync_group)
 
         packed_size = min(self.sampling_mask_max_tokens, weights.shape[-1])
         if token_ids is None:
@@ -747,10 +752,8 @@ class Sampler(nn.Module):
             # A 1-rank all-reduce is the identity, but its first call lazily creates
             # the communicator, which stalls the first grammar batch after startup.
             if dist.get_world_size(self.tp_sync_group) > 1:
-                torch.distributed.all_reduce(
-                    batch_next_token_ids,
-                    op=dist.ReduceOp.MIN,
-                    group=self.tp_sync_group,
+                _all_reduce_sync(
+                    batch_next_token_ids, dist.ReduceOp.MIN, self.tp_sync_group
                 )
 
     def compute_logprobs_only(

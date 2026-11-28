@@ -37,7 +37,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from unittest.mock import patch
 
 import torch
@@ -200,6 +200,78 @@ _groups: Dict[str, Callable[[], Optional["GroupCoordinator"]]] = {}
 
 def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
+
+
+# Must match ncclDataTypeEnum.from_torch.
+_PYNCCL_DTYPES = frozenset(
+    {
+        torch.int8,
+        torch.uint8,
+        torch.int32,
+        torch.int64,
+        torch.float16,
+        torch.float32,
+        torch.float64,
+        torch.bfloat16,
+    }
+)
+
+
+def pynccl_comm_for_device_group(
+    device_group: ProcessGroup, tensor: torch.Tensor
+) -> Optional[Any]:
+    """With SGLANG_PYNCCL_OUTSIDE_GRAPHS, the PyNccl communicator to call
+    instead of torch.distributed on `device_group` for `tensor`, so the device
+    group never builds a second NCCL communicator. None otherwise."""
+    if not envs.SGLANG_PYNCCL_OUTSIDE_GRAPHS.get():
+        return None
+    for ref in _groups.values():
+        group = ref()
+        if group is not None and group.device_group is device_group:
+            return group.enabled_pynccl_comm(tensor)
+    return None
+
+
+_device_group_nccl_reported: Set[str] = set()
+_device_group_nccl_checked_step: Optional[int] = None
+
+
+def warn_on_device_group_nccl_comms(stage: str, step: Optional[int] = None) -> None:
+    """With SGLANG_PYNCCL_OUTSIDE_GRAPHS, name the groups whose device group
+    built its own NCCL communicator anyway: some caller used
+    torch.distributed on it directly, so the group holds two sets of NCCL
+    buffers on the same ranks. Each group is reported once; with `step`, the
+    check is skipped when `step` has not changed since the last one. Groups
+    without PyNccl (e.g. the world group) are not checked."""
+    global _device_group_nccl_checked_step
+    if not envs.SGLANG_PYNCCL_OUTSIDE_GRAPHS.get():
+        return
+    if step is not None:
+        if step == _device_group_nccl_checked_step:
+            return
+        _device_group_nccl_checked_step = step
+    names = []
+    for name, ref in _groups.items():
+        if name in _device_group_nccl_reported:
+            continue
+        group = ref()
+        if group is None or group.get_available_pynccl_comm() is None:
+            continue
+        try:
+            backend = group.device_group._get_backend(group.device)
+        except (RuntimeError, AttributeError):
+            continue
+        if getattr(backend, "_is_initialized", lambda: False)():
+            names.append(name)
+    if names:
+        _device_group_nccl_reported.update(names)
+        logger.warning(
+            "SGLANG_PYNCCL_OUTSIDE_GRAPHS: %s already has a device-group NCCL "
+            "communicator %s; a direct torch.distributed call on device_group "
+            "allocated it next to PyNccl's.",
+            ", ".join(names),
+            stage,
+        )
 
 
 def _aiter_capture_registered(ca_comm) -> bool:
@@ -497,6 +569,8 @@ class GroupCoordinator:
                 device=self.device,
                 is_symmetric_memory_enabled=self.is_symmetric_memory_enabled(),
             )
+            if envs.SGLANG_PYNCCL_OUTSIDE_GRAPHS.get() and self.pynccl_comm.available:
+                self.pynccl_comm.disabled = False
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
         if use_mscclpp and self.world_size > 1:
@@ -645,6 +719,25 @@ class GroupCoordinator:
             return None
         return pynccl_comm
 
+    def enabled_pynccl_comm(self, tensor: torch.Tensor) -> Optional[Any]:
+        """Return the PyNccl communicator when it is enabled for `tensor`.
+
+        With SGLANG_PYNCCL_OUTSIDE_GRAPHS, tensors PyNccl cannot carry keep
+        using the device group, as they do without the flag: dtypes outside
+        NCCL's (bool, fp8), non-contiguous tensors (PyNccl passes the raw
+        pointer and numel) and tensors on another device.
+        """
+        pynccl_comm = self.get_available_pynccl_comm()
+        if pynccl_comm is None or pynccl_comm.disabled:
+            return None
+        if envs.SGLANG_PYNCCL_OUTSIDE_GRAPHS.get() and not (
+            tensor.dtype in _PYNCCL_DTYPES
+            and tensor.is_contiguous()
+            and tensor.device == pynccl_comm.device
+        ):
+            return None
+        return pynccl_comm
+
     def require_pynccl_comm(self, operation: str) -> Any:
         """Return an available PyNccl communicator or fail with context."""
         pynccl_comm = self.get_available_pynccl_comm()
@@ -684,10 +777,11 @@ class GroupCoordinator:
             # --------------------------------------------
             # quick allreduce        | enabled | enabled |
             # custom allreduce       | enabled | enabled |
-            # PyNccl                 | disabled| enabled |
+            # PyNccl                 | disabled*| enabled |
             # PyMscclpp              | disabled| enabled |
             # TorchSymmMem           | disabled| enabled |
             # torch.distributed      | enabled | disabled|
+            # * enabled with SGLANG_PYNCCL_OUTSIDE_GRAPHS
             #
             # Note: When custom quick allreduce is enabled, a runtime check
             #  will be performed. If the tensor size is too small, it will
@@ -1113,9 +1207,9 @@ class GroupCoordinator:
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
-        pynccl_comm = self.get_available_pynccl_comm()
+        pynccl_comm = self.enabled_pynccl_comm(input_)
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        if pynccl_comm is not None:
             pynccl_comm.all_reduce(input_)
         elif (
             torch_symm_mem_comm is not None
@@ -1170,7 +1264,8 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         pynccl_comm = self.get_available_pynccl_comm()
         if pynccl_comm is not None and (
-            not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
+            self.enabled_pynccl_comm(input) is not None
+            or self.is_symmetric_memory_enabled()
         ):
             self.debug_check_symmetric_mempool(
                 self, {"output": output, "input": input}, "reduce_scatter_tensor"
@@ -1254,8 +1349,8 @@ class GroupCoordinator:
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
         # pynccl path keeps the a2a exchange CUDA-graph-capturable (DCP a2a backend).
-        pynccl_comm = self.get_available_pynccl_comm()
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        pynccl_comm = self.enabled_pynccl_comm(input)
+        if pynccl_comm is not None:
             pynccl_comm.all_to_all_single(output, input)
         else:
             torch.distributed.all_to_all_single(output, input, group=self.device_group)
@@ -1377,7 +1472,8 @@ class GroupCoordinator:
 
         pynccl_comm = self.get_available_pynccl_comm()
         if pynccl_comm is not None and (
-            not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
+            self.enabled_pynccl_comm(input) is not None
+            or self.is_symmetric_memory_enabled()
         ):
             self.debug_check_symmetric_mempool(
                 self, {"output": output}, "all_gather_into_tensor"
@@ -1564,8 +1660,8 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        pynccl_comm = self.get_available_pynccl_comm()
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        pynccl_comm = self.enabled_pynccl_comm(input_)
+        if pynccl_comm is not None:
             pynccl_comm.broadcast(input_, src=src)
         else:
             # Broadcast.
@@ -2076,8 +2172,8 @@ class GroupCoordinator:
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
-        pynccl_comm = self.get_available_pynccl_comm()
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        pynccl_comm = self.enabled_pynccl_comm(tensor)
+        if pynccl_comm is not None:
             pynccl_comm.send(tensor, dst)
         else:
             torch.distributed.send(tensor, self.ranks[dst], self.device_group)
@@ -2091,8 +2187,8 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        pynccl_comm = self.get_available_pynccl_comm()
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        pynccl_comm = self.enabled_pynccl_comm(tensor)
+        if pynccl_comm is not None:
             pynccl_comm.recv(tensor, src)
         else:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)

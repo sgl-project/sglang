@@ -123,6 +123,7 @@ from sglang.srt.distributed.communication_op import control_request_all_gather_o
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
     close_custom_all_reduce,
+    warn_on_device_group_nccl_comms,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, freeze_env_reads
@@ -1208,6 +1209,7 @@ class Scheduler(
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
+        warn_on_device_group_nccl_comms("after CUDA graph capture")
 
     def init_model_worker(self):
         # Load model weights.
@@ -6324,6 +6326,7 @@ class Scheduler(
 
         self.invariant_checker.run(CheckPhase.IDLE)
         self.gc_freezer.on_idle(self.forward_ct)
+        warn_on_device_group_nccl_comms("while serving", step=self.forward_ct)
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()

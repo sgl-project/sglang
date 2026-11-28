@@ -929,6 +929,10 @@ class Envs:
     # Set to "env://" to use an externally-created TCPStore via MASTER_ADDR/MASTER_PORT.
     SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE = EnvStr(None)
     SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
+    # Keep PyNccl enabled outside CUDA graphs, so eager collectives run on its
+    # communicator and the device group never builds a second one (~7-9 GB of
+    # NCCL buffers per GPU on MI455X). Must be set the same on every rank.
+    SGLANG_PYNCCL_OUTSIDE_GRAPHS = EnvBool(False)
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)

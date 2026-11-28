@@ -615,5 +615,136 @@ def test_fused_allreduce_rmsnorm_quant_per_group_runs_on_gfx942_and_gfx95(
     assert len(calls) == int(expect_fused)
 
 
+def _register_fake_group(monkeypatch, *, nccl_built=False):
+    device_group = Mock()
+    device_group._get_backend.return_value = Mock(
+        _is_initialized=Mock(return_value=nccl_built)
+    )
+    pynccl_comm = Mock(disabled=False)
+    group = Mock(device_group=device_group)
+    group.get_available_pynccl_comm.return_value = pynccl_comm
+    group.enabled_pynccl_comm.return_value = pynccl_comm
+    monkeypatch.setattr(parallel_state, "_groups", {"tp": lambda: group})
+    monkeypatch.setattr(parallel_state, "_device_group_nccl_reported", set())
+    monkeypatch.setattr(parallel_state, "_device_group_nccl_checked_step", None)
+    return device_group, pynccl_comm
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_pynccl_comm_for_device_group_only_with_flag(monkeypatch, flag):
+    monkeypatch.setenv("SGLANG_PYNCCL_OUTSIDE_GRAPHS", "1" if flag else "0")
+    device_group, pynccl_comm = _register_fake_group(monkeypatch)
+    tensor = torch.zeros(2, dtype=torch.int32)
+
+    found = parallel_state.pynccl_comm_for_device_group(device_group, tensor)
+    assert found is (pynccl_comm if flag else None)
+    assert parallel_state.pynccl_comm_for_device_group(Mock(), tensor) is None
+
+
+def test_pynccl_dtypes_match_wrapper():
+    from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
+        ncclDataTypeEnum,
+    )
+
+    for dtype in (
+        torch.bool,
+        torch.int8,
+        torch.uint8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        try:
+            ncclDataTypeEnum.from_torch(dtype)
+            supported = True
+        except ValueError:
+            supported = False
+        assert (dtype in parallel_state._PYNCCL_DTYPES) is supported, dtype
+
+
+_CPU = torch.device("cpu")
+
+
+@pytest.mark.parametrize(
+    "flag, disabled, tensor, expect_comm",
+    [
+        (False, False, torch.zeros(2, dtype=torch.bfloat16), True),
+        (False, True, torch.zeros(2, dtype=torch.bfloat16), False),
+        # Without the flag PyNccl is only enabled in graph capture; keep its
+        # behavior unchanged there.
+        (False, False, torch.zeros(2, dtype=torch.bool), True),
+        (False, False, torch.zeros(4, 4)[:, 0], True),
+        (True, False, torch.zeros(2, dtype=torch.bfloat16), True),
+        (True, False, torch.zeros(2, dtype=torch.int32), True),
+        (True, False, torch.zeros(2, dtype=torch.bool), False),
+        (True, False, torch.zeros(2, dtype=torch.float8_e4m3fn), False),
+        (True, False, torch.zeros(4, 4)[:, 0], False),
+        (True, False, torch.zeros(4, 4).t(), False),
+        (True, False, torch.zeros(2, device="meta"), False),
+    ],
+)
+def test_enabled_pynccl_comm(monkeypatch, flag, disabled, tensor, expect_comm):
+    monkeypatch.setenv("SGLANG_PYNCCL_OUTSIDE_GRAPHS", "1" if flag else "0")
+    pynccl_comm = Mock(disabled=disabled, device=_CPU)
+    group = Mock(spec=parallel_state.GroupCoordinator)
+    group.get_available_pynccl_comm.return_value = pynccl_comm
+
+    found = parallel_state.GroupCoordinator.enabled_pynccl_comm(group, tensor)
+    assert found is (pynccl_comm if expect_comm else None)
+
+
+def test_broadcast_falls_back_to_device_group_for_bool(monkeypatch):
+    monkeypatch.setenv("SGLANG_PYNCCL_OUTSIDE_GRAPHS", "1")
+    pynccl_comm = Mock(disabled=False, device=_CPU)
+    group = Mock(spec=parallel_state.GroupCoordinator)
+    group.world_size = 2
+    group.ranks = [0, 1]
+    group.device_group = Mock()
+    group.get_available_pynccl_comm.return_value = pynccl_comm
+    group.enabled_pynccl_comm = lambda t: (
+        parallel_state.GroupCoordinator.enabled_pynccl_comm(group, t)
+    )
+    flags = torch.zeros(4, dtype=torch.bool)
+
+    with patch.object(torch.distributed, "broadcast") as broadcast:
+        parallel_state.GroupCoordinator.broadcast(group, flags, src=0)
+    pynccl_comm.broadcast.assert_not_called()
+    broadcast.assert_called_once_with(flags, src=0, group=group.device_group)
+
+
+@pytest.mark.parametrize("nccl_built", [False, True])
+def test_warn_on_device_group_nccl_comms(monkeypatch, nccl_built):
+    monkeypatch.setenv("SGLANG_PYNCCL_OUTSIDE_GRAPHS", "1")
+    _register_fake_group(monkeypatch, nccl_built=nccl_built)
+    with patch.object(parallel_state.logger, "warning") as warning:
+        parallel_state.warn_on_device_group_nccl_comms("at test")
+    assert warning.called is nccl_built
+    if nccl_built:
+        assert "tp" in warning.call_args.args
+
+
+def test_warn_on_device_group_nccl_comms_reports_each_group_once(monkeypatch):
+    monkeypatch.setenv("SGLANG_PYNCCL_OUTSIDE_GRAPHS", "1")
+    _register_fake_group(monkeypatch, nccl_built=True)
+    with patch.object(parallel_state.logger, "warning") as warning:
+        parallel_state.warn_on_device_group_nccl_comms("after CUDA graph capture")
+        parallel_state.warn_on_device_group_nccl_comms("while serving")
+    warning.assert_called_once()
+
+
+def test_warn_on_device_group_nccl_comms_skips_unchanged_step(monkeypatch):
+    monkeypatch.setenv("SGLANG_PYNCCL_OUTSIDE_GRAPHS", "1")
+    device_group, _ = _register_fake_group(monkeypatch)
+    for step in (1, 1, 1, 2):
+        parallel_state.warn_on_device_group_nccl_comms("while serving", step=step)
+    assert device_group._get_backend.call_count == 2
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
