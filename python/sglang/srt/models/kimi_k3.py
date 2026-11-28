@@ -32,6 +32,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import layernorm_sp, zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
+from sglang.srt.layers.attention.dsa import dsa_prologue_hip
 from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -2972,6 +2973,19 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self.o_proj.forward = _gated_o_proj_forward
         if sp_moe:
             _route_sp_o_proj_output(self.o_proj)
+        # gfx950 fused DSA prologue (dsa_prologue_hip): the merged front GEMM, set
+        # post-load, and the output gate it hands to the gated o_proj this forward
+        self.dsa_front = None
+        self.front_output_gate: Optional[torch.Tensor] = None
+
+    def prepare_qkv_latent(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        if self.dsa_front is not None and dsa_prologue_hip.front_applies(
+            self, hidden_states, forward_batch
+        ):
+            return dsa_prologue_hip.run_front(self, hidden_states)
+        return super().prepare_qkv_latent(hidden_states, forward_batch)
 
     @staticmethod
     def _split_kv_b_weight_loader(param, loaded_weight) -> None:
@@ -3008,6 +3022,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     def _compute_output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
         alt = self._gate_pending_stream
         self._gate_pending_stream = None
+        if self.front_output_gate is not None:
+            gate, self.front_output_gate = self.front_output_gate, None
+            # join the gate branch forked before the merged GEMM ran
+            return mono_output_gate_hip({"gate": gate}, alt)
         pre = self.__dict__.get("_mono_pre") if _is_gfx95 else None
         if pre is not None and "gate" in pre:
             return mono_output_gate_hip(pre, alt)
@@ -3029,9 +3047,16 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
             self._fork_output_gate(hidden_states)
-        return super().forward(
-            positions, hidden_states, forward_batch, zero_allocator, **kwargs
-        )
+        if self.dsa_front is None:
+            return super().forward(
+                positions, hidden_states, forward_batch, zero_allocator, **kwargs
+            )
+        try:
+            return super().forward(
+                positions, hidden_states, forward_batch, zero_allocator, **kwargs
+            )
+        finally:
+            dsa_prologue_hip.clear_front(self)
 
     def forward_pre_o_proj(
         self,
@@ -4321,6 +4346,9 @@ class KimiK3LinearForCausalLM(nn.Module):
                 and layer.self_attn.indexer is not None
             ):
                 layer.self_attn.indexer.prepare_merged_k_gate()
+                layer.self_attn.dsa_front = dsa_prologue_hip.merge_front_weights(
+                    layer.self_attn
+                )
                 # MI355X, 140k keys: ~0.6 ms/layer unsplit at 512 rows vs ~0.16 ms at 64
                 layer.self_attn.indexer.tp_split_min_rows = 64 if _is_gfx95 else 1024
 

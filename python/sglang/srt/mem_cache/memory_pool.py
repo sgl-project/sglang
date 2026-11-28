@@ -66,6 +66,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa import dsa_prologue_hip
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k, maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -5159,6 +5160,16 @@ class MLATokenToKVPool(KVCache, MLAKVView):
                 dcp_world_size=self._write_loc_dcp_span,
                 dcp_rank=get_parallel().attn_dcp_rank,
             )
+        elif (
+            _is_hip
+            and self.dsa_kv_cache_store_fp8
+            and self.use_dsa
+            and dsa_prologue_hip.fp8_ds_mla_store(
+                self, dst_buffer, loc, cache_k_nope, cache_k_rope
+            )
+        ):
+            # gfx950 fused DSA prologue: tile quant + DCP-owner scatter in one launch
+            pass
         elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path

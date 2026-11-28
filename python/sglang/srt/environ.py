@@ -1160,6 +1160,12 @@ class Envs:
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
     # Kimi-K3 gfx950 prefill: leave the stream on each rank's rows after the row-sharded tail
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
+    # Kimi-K3.1 gfx950 DSA decode/verify prologue fusion (vLLM #67847): one BF16 GEMM for
+    # [fused_qkv_a | wk | weights_proj | g_proj], one launch for the index key LayerNorm +
+    # index-K store + query quant + head gate, one launch for the fp8_ds_mla KV store
+    SGLANG_ENABLE_ROCM_K3_DSA_FUSED_PROLOGUE = EnvBool(False)
+    # Which parts the switch above turns on: any of "gemm", "index", "kv" (comma list)
+    SGLANG_ROCM_K3_DSA_FUSED_PROLOGUE_PARTS = EnvStr("gemm,index,kv")
     # GiB of gfx950 memory kept out of torch's allocator for HSA queue scratch (0: none)
     SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of

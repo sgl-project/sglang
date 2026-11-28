@@ -9,7 +9,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsa.fp4_index_hip import indexer_q_fp4_head_gate
 from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
-from sglang.srt.layers.attention.dsa import dsa_indexer_hip
+from sglang.srt.layers.attention.dsa import dsa_indexer_hip, dsa_prologue_hip
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.runtime_context import get_exec
@@ -35,6 +35,10 @@ class RocmNoPEPrologue:
         self.k_gate_weight: Optional[torch.Tensor] = None
         # the monokernel's index-K store may apply k_norm itself (fuse_index_k_norm)
         self.mono_k_norm = mono_k_norm
+        # (key, head gate) of this layer forward's merged front GEMM (dsa_prologue_hip)
+        self.front_key_gate: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        # one launch for k_norm + index-K store + query quant + head gate
+        self.fused_index_prep = dsa_prologue_hip.part_enabled("index")
 
     def merge_k_gate(self, indexer) -> None:
         if not (
@@ -73,8 +77,12 @@ class RocmNoPEPrologue:
         # a monokernel plugin that already ran wk, weights_proj and wq_b hands
         # their outputs in (_mono_pre)
         pre = indexer.__dict__.get("_mono_pre")
+        front, self.front_key_gate = self.front_key_gate, None
         if pre is not None:
             key, gate, query = pre["k"], pre["w"], pre["q"]
+        elif front is not None:
+            key, gate = front
+            query = indexer.wq_b(q_lora)[0]
         else:
             # AITER's fused RMSNorm hands (fp8, scale, bf16); wk and the gate read the bf16
             if isinstance(x, tuple):
@@ -88,6 +96,12 @@ class RocmNoPEPrologue:
                     [indexer.head_dim, indexer.n_heads], dim=-1
                 )
             query = indexer.wq_b(q_lora)[0]
+        if self.fused_index_prep:
+            fused = dsa_prologue_hip.index_qk_prep(
+                indexer, forward_batch, layer_id, query, gate, key
+            )
+            if fused is not None:
+                return fused
         if fuse_k_norm:
             # key is k_norm's input; the fused store applies k_norm
             dsa_indexer_hip.store_index_k_prenorm(indexer, forward_batch, layer_id, key)
