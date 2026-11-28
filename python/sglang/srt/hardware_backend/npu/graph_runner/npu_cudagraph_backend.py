@@ -62,8 +62,16 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         enable_memory_saver: bool = False,
     ) -> None:
         self._decode_runner = cuda_graph_runner
+        self._pingpong_enabled = envs.SGLANG_NPU_GRAPH_PINGPONG.get()
+        # Async update deferral is only valid with 2+ ping-pong slots; a single
+        # slot must finish its host update before returning to keep replay safe.
+        self._async_update_enabled = (
+            self._pingpong_enabled and envs.SGLANG_NPU_GRAPH_ASYNC_UPDATE.get()
+        )
+        self._num_slots = 2 if self._pingpong_enabled else 1
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._slot_cursor: Dict[Any, int] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
@@ -82,16 +90,22 @@ class NPUCudaGraphBackend(BaseGraphBackend):
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
-        # Reuse one device-bound worker for graph input updates.
+        # Keep max_workers=1: torch_npu.NPUGraph.update() dispatches host tiling
+        # on a shared update_stream, so >1 concurrent update worker triggers ACL
+        # error 107033 (update stream busy).
         self._update_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="npu-graph-update",
             initializer=self._device_module.set_device,
             initargs=(self._device_id,),
         )
-        # Event of the last replay; the next rebind waits on it so the device is
-        # done reading the host-side seq_lens array before we rewrite it.
+        # Default single-slot completion fence (unchanged when ping-pong is off).
         self._rebind_fence = None
+        # Per-(shape_key, slot) completion fences and deferred update futures
+        # used in 2-slot ping-pong mode: slot s's fence belongs to step t-2, so
+        # host NPUGraph.update(slot s) overlaps with NPU execution of slot s^1.
+        self._rebind_fences: Dict[Any, Any] = {}
+        self._pending_update_futures: Dict[Any, Any] = {}
 
     @property
     def supports_shared_read_events(self) -> bool:
@@ -451,8 +465,6 @@ class NPUCudaGraphBackend(BaseGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        graph = torch.npu.NPUGraph()
-
         graph_ctx: Callable[..., AbstractContextManager]
         if (
             self._memory_saver_adapter is not None
@@ -465,16 +477,44 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         else:
             graph_ctx = torch.npu.graph
 
-        with graph_ctx(
-            graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-            auto_dispatch_capture=True,
-        ):
-            out = forward_fn()
+        if self._num_slots == 1:
+            graph = torch.npu.NPUGraph()
+            with graph_ctx(
+                graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                auto_dispatch_capture=True,
+            ):
+                out = forward_fn()
+            self._graphs[shape_key] = graph
+            self._outputs[shape_key] = out
+            return
 
-        self._graphs[shape_key] = graph
-        self._outputs[shape_key] = out
+        # Ping-pong mode: capture two graph slots sharing self._pool. Both slots
+        # replay sequentially on the same NPU stream so intermediate activations
+        # reuse the shared pool with zero extra activation HBM while each slot's
+        # live output tensor remains distinct.
+        graphs = []
+        outputs = []
+        for slot in range(self._num_slots):
+            graph = torch.npu.NPUGraph()
+            with graph_ctx(
+                graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                auto_dispatch_capture=True,
+            ):
+                out = forward_fn()
+            graphs.append(graph)
+            outputs.append(out)
+            if slot + 1 < self._num_slots:
+                self._device_module.synchronize()
+                if post_warmup_hook is not None:
+                    post_warmup_hook()
+
+        self._graphs[shape_key] = graphs
+        self._outputs[shape_key] = outputs
+        self._slot_cursor[shape_key] = 0
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -551,8 +591,13 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                     attr_name=self.get_update_attr_name(),
                     attr_type=[],
                 )
-        self._graphs[shape_key].replay()
-        return self._outputs[shape_key]
+        graph_entry = self._graphs[shape_key]
+        output_entry = self._outputs[shape_key]
+        if isinstance(graph_entry, list):
+            graph_entry[0].replay()
+            return output_entry[0]
+        graph_entry.replay()
+        return output_entry
 
     def _eagle_draft_extend_update_lengths(self, runner, forward_batch):
         seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
@@ -598,27 +643,64 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                 seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
             cpu_update_input = [{attr_name: seq_lens}]
 
-        graph = self._graphs[shape_key]
+        graph_entry = self._graphs[shape_key]
+        if not isinstance(graph_entry, list):
+            if self._rebind_fence is not None:
+                self._rebind_fence.synchronize()
 
-        if self._rebind_fence is not None:
-            self._rebind_fence.synchronize()
+            update_future = self._update_executor.submit(
+                graph_entry.update, cpu_update_input=cpu_update_input
+            )
+            graph_entry.replay()
+            update_future.result()
+
+            fence = self._device_module.Event()
+            fence.record()
+            self._rebind_fence = fence
+            return self._outputs[shape_key]
+
+        slot = self._slot_cursor.get(shape_key, 0) % len(graph_entry)
+        self._slot_cursor[shape_key] = (slot + 1) % len(graph_entry)
+        graph = graph_entry[slot]
+        slot_key = (shape_key, slot)
+
+        # Drain slot s's previous async update and wait on its completion fence
+        # (from step t-2), avoiding a stall on step t-1 running in slot s^1.
+        prev_future = self._pending_update_futures.pop(slot_key, None)
+        if prev_future is not None:
+            prev_future.result()
+        prev_fence = self._rebind_fences.get(slot_key)
+        if prev_fence is not None:
+            prev_fence.synchronize()
 
         update_future = self._update_executor.submit(
             graph.update, cpu_update_input=cpu_update_input
         )
         graph.replay()
-        update_future.result()
+        if self._async_update_enabled:
+            self._pending_update_futures[slot_key] = update_future
+        else:
+            update_future.result()
 
         fence = self._device_module.Event()
         fence.record()
-        self._rebind_fence = fence
-        return self._outputs[shape_key]
+        self._rebind_fences[slot_key] = fence
+        return self._outputs[shape_key][slot]
 
     def cleanup(self) -> None:
+        for fut in self._pending_update_futures.values():
+            if fut is not None:
+                fut.result()
+        self._pending_update_futures.clear()
         self._update_executor.shutdown(wait=True, cancel_futures=True)
         if self._rebind_fence is not None:
             self._rebind_fence.synchronize()
             self._rebind_fence = None
+        for fence in self._rebind_fences.values():
+            if fence is not None:
+                fence.synchronize()
+        self._rebind_fences.clear()
+        self._slot_cursor.clear()
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None

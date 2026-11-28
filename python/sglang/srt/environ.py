@@ -1403,6 +1403,13 @@ class Envs:
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
     # Set to 0 to allow AscendAttnBackend to set needs_cpu_seq_lens to False for dsa models.
     SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS = EnvBool(True)
+    # Capture two alternating NPUGraph slots per shape sharing the same graph
+    # memory pool so host NPUGraph.update() overlaps with the prior slot's NPU
+    # execution instead of stalling on its completion fence.
+    SGLANG_NPU_GRAPH_PINGPONG = EnvBool(False)
+    # When SGLANG_NPU_GRAPH_PINGPONG=1, defer awaiting NPUGraph.update() until
+    # the same slot is reused two steps later to avoid blocking the main thread.
+    SGLANG_NPU_GRAPH_ASYNC_UPDATE = EnvBool(False)
 
     # ===================================================================
     # MUSA

@@ -193,6 +193,170 @@ class TestNPUCudaGraphBackend(unittest.TestCase):
         self.assertEqual(update_input, [{"actual_seq_lengths_kv": [5, 3]}])
         graph.replay.assert_called_once_with()
 
+    def test_pingpong_disabled_by_default_and_async_requires_pingpong(self):
+        with (
+            mock.patch.object(
+                mod.envs.SGLANG_NPU_GRAPH_PINGPONG, "get", return_value=False
+            ),
+            mock.patch.object(
+                mod.envs.SGLANG_NPU_GRAPH_ASYNC_UPDATE, "get", return_value=True
+            ),
+        ):
+            backend, _ = _make_backend()
+        self.assertFalse(backend._pingpong_enabled)
+        self.assertFalse(backend._async_update_enabled)
+        self.assertEqual(backend._num_slots, 1)
+        backend.cleanup()
+
+    def test_pingpong_captures_two_slots_sharing_same_pool(self):
+        import sys
+
+        captured_pools = []
+        created_graphs = []
+
+        class _FakeGraph:
+            pass
+
+        def _fake_graph_ctx(
+            graph, *, pool=None, stream=None, auto_dispatch_capture=False
+        ):
+            captured_pools.append(pool)
+            return mod.empty_context()
+
+        def _make_fake_graph():
+            g = _FakeGraph()
+            created_graphs.append(g)
+            return g
+
+        fake_npu = SimpleNamespace(NPUGraph=_make_fake_graph, graph=_fake_graph_ctx)
+        with (
+            mock.patch.object(
+                mod.envs.SGLANG_NPU_GRAPH_PINGPONG, "get", return_value=True
+            ),
+            mock.patch.object(
+                mod.envs.SGLANG_NPU_GRAPH_ASYNC_UPDATE, "get", return_value=False
+            ),
+        ):
+            backend, _ = _make_backend()
+
+        backend._pool = ("shared-pool", 0)
+        shape_key = ShapeKey(size=4)
+        call_idx = 0
+
+        def forward_fn():
+            nonlocal call_idx
+            call_idx += 1
+            return f"out-{call_idx}"
+
+        post_warmup = mock.Mock()
+        with (
+            mock.patch.dict(sys.modules, {"torch_npu": SimpleNamespace()}),
+            mock.patch.object(torch, "npu", fake_npu, create=True),
+        ):
+            backend._capture_one(shape_key, forward_fn, post_warmup_hook=post_warmup)
+
+        self.assertEqual(len(created_graphs), 2)
+        self.assertEqual(captured_pools, [("shared-pool", 0), ("shared-pool", 0)])
+        self.assertEqual(backend._graphs[shape_key], created_graphs)
+        # 2 warmup calls + 2 capture slot calls -> outputs are out-3, out-4.
+        self.assertEqual(backend._outputs[shape_key], ["out-3", "out-4"])
+        # post_warmup_hook called after each warmup (2) and between slot 0 & 1 (1).
+        self.assertEqual(post_warmup.call_count, 3)
+        backend.cleanup()
+
+    def test_pingpong_alternates_slots_and_waits_per_slot_fence(self):
+        with (
+            mock.patch.object(
+                mod.envs.SGLANG_NPU_GRAPH_PINGPONG, "get", return_value=True
+            ),
+            mock.patch.object(
+                mod.envs.SGLANG_NPU_GRAPH_ASYNC_UPDATE, "get", return_value=False
+            ),
+        ):
+            backend, runner = _make_backend()
+
+        events = [mock.Mock(), mock.Mock(), mock.Mock()]
+        runner.device_module.Event.side_effect = events
+        g0, g1 = mock.Mock(), mock.Mock()
+        shape_key = ShapeKey(size=4)
+        backend._graphs[shape_key] = [g0, g1]
+        backend._outputs[shape_key] = ["out0", "out1"]
+
+        # Step 0 -> slot 0: no prior fence synchronized.
+        self.assertEqual(
+            backend.replay_with_input_update(
+                shape_key, [10], attr_name="k", attr_type=[]
+            ),
+            "out0",
+        )
+        g0.replay.assert_called_once()
+        g1.replay.assert_not_called()
+        events[0].record.assert_called_once()
+        events[0].synchronize.assert_not_called()
+
+        # Step 1 -> slot 1: must NOT wait on slot 0's fence (events[0]).
+        self.assertEqual(
+            backend.replay_with_input_update(
+                shape_key, [11], attr_name="k", attr_type=[]
+            ),
+            "out1",
+        )
+        g1.replay.assert_called_once()
+        events[0].synchronize.assert_not_called()
+        events[1].record.assert_called_once()
+
+        # Step 2 -> slot 0 again: now waits on slot 0's fence (events[0]), not events[1].
+        self.assertEqual(
+            backend.replay_with_input_update(
+                shape_key, [12], attr_name="k", attr_type=[]
+            ),
+            "out0",
+        )
+        events[0].synchronize.assert_called_once()
+        events[1].synchronize.assert_not_called()
+        self.assertEqual(g0.replay.call_count, 2)
+        backend.cleanup()
+
+    def test_pingpong_async_update_defers_future_until_slot_reuse_and_cleanup(self):
+        import threading
+
+        with (
+            mock.patch.object(
+                mod.envs.SGLANG_NPU_GRAPH_PINGPONG, "get", return_value=True
+            ),
+            mock.patch.object(
+                mod.envs.SGLANG_NPU_GRAPH_ASYNC_UPDATE, "get", return_value=True
+            ),
+        ):
+            backend, _ = _make_backend()
+
+        gate = threading.Event()
+        completed = []
+
+        def slow_update(cpu_update_input):
+            gate.wait(timeout=2.0)
+            completed.append(cpu_update_input)
+
+        g0 = SimpleNamespace(update=slow_update, replay=mock.Mock())
+        g1 = SimpleNamespace(update=mock.Mock(), replay=mock.Mock())
+        shape_key = ShapeKey(size=2)
+        backend._graphs[shape_key] = [g0, g1]
+        backend._outputs[shape_key] = ["out0", "out1"]
+
+        # Step 0 must return immediately without waiting for gate to be set.
+        out0 = backend.replay_with_input_update(
+            shape_key, [1], attr_name="k", attr_type=[]
+        )
+        self.assertEqual(out0, "out0")
+        self.assertIn((shape_key, 0), backend._pending_update_futures)
+        self.assertEqual(completed, [])
+
+        # Release gate; cleanup must drain pending futures cleanly.
+        gate.set()
+        backend.cleanup()
+        self.assertEqual(completed, [[{"k": [1]}]])
+        self.assertEqual(backend._pending_update_futures, {})
+
 
 if __name__ == "__main__":
     unittest.main()
