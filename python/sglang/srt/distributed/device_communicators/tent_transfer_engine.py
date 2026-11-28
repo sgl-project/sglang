@@ -80,7 +80,9 @@ def _build_tent_config(
         # Same-host GPU peers use NVLink; TENT skips it across machines and
         # uses RDMA. SHM stays off. TCP mode disables both device transports.
         "transports": {
-            "rdma": {"enable": not force_tcp},
+            # Use only the NICs closest to the GPU on both ends; slices sprayed
+            # across PCIe tiers cut incast bandwidth and trigger PFC pauses.
+            "rdma": {"enable": not force_tcp, "closest_tier_only": True},
             "tcp": {"enable": force_tcp},
             "hp_tcp": {"enable": False},
             "shm": {"enable": False},

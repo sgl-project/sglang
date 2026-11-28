@@ -277,7 +277,11 @@ class TestTentTransferEngine(CustomTestCase):
         self.assertEqual(config["topology"]["rdma_whitelist"], ["mlx5_0", "mlx5_1"])
         self.assertEqual(
             config["transports"]["rdma"],
-            {"enable": True, "numa_penalties": [1.0, 2.0, 10.0]},
+            {
+                "enable": True,
+                "closest_tier_only": True,
+                "numa_penalties": [1.0, 2.0, 10.0],
+            },
         )
         self.assertTrue(config["transports"]["nvlink"]["enable"])
 
