@@ -23,7 +23,7 @@ from sglang.test.quant_ref_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=24, stage="base-b", runner_config="4-gpu-b200")
 
 E, H, I, TOPK, M = 8, 1024, 1024, 2, 32
 
@@ -40,6 +40,9 @@ class TestNvFp4MoeBackends(CustomTestCase):
         backend: str,
         intermediate_size: int = I,
         swiglu_limit: float | None = None,
+        *,
+        w3_magnitude: float = 1.0,
+        check_magnitude: bool = False,
     ):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopKConfig, select_experts
@@ -93,9 +96,10 @@ class TestNvFp4MoeBackends(CustomTestCase):
                         if shard_id in ("w1", "w3")
                         else (H, intermediate_size)
                     )
-                    w = (
-                        torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
-                        / 10
+                    # A w3 of another magnitude gets its own global scale.
+                    magnitude = w3_magnitude if shard_id == "w3" else 1.0
+                    w = torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda") * (
+                        magnitude / 10
                     )
                     w_q, sf_linear, gs, w_dequant = quantize_nvfp4_shard(w)
                     prefix = "w13" if shard_id in ("w1", "w3") else "w2"
@@ -168,6 +172,11 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 swiglu_limit,
             )
             assert_output_close(self, out, ref)
+            if check_magnitude:
+                # The cosine check cannot see a scale error, such as a w3
+                # dequantized with w1's global scale.
+                norm_ratio = (out.float().norm() / ref.norm()).item()
+                self.assertLess(abs(norm_ratio - 1), 0.1)
 
     @staticmethod
     def _torch_moe_reference(
@@ -204,6 +213,17 @@ class TestNvFp4MoeBackends(CustomTestCase):
     def test_flashinfer_cutlass(self):
         self._run_backend("flashinfer_cutlass")
 
+    def test_flashinfer_cutlass_w3_global_scale(self):
+        """CUTLASS takes one GEMM1 scale for w1 and w3: where the two global
+        scales differ, either way, w3 must still dequantize with its own."""
+        for w3_magnitude in (3.0, 1 / 3):
+            with self.subTest(w3_magnitude=w3_magnitude):
+                self._run_backend(
+                    "flashinfer_cutlass",
+                    w3_magnitude=w3_magnitude,
+                    check_magnitude=True,
+                )
+
     def test_flashinfer_trtllm(self):
         self._run_backend("flashinfer_trtllm")
 
@@ -219,6 +239,17 @@ class TestNvFp4MoeBackends(CustomTestCase):
     def test_flashinfer_cutedsl_swiglu_limit(self):
         """The limit sits inside the GEMM1 outputs' spread (std ~0.3), so the clamp binds."""
         self._run_backend("flashinfer_cutedsl", swiglu_limit=0.1)
+
+    def test_flashinfer_cutedsl_w3_global_scale(self):
+        """CuTe DSL takes one GEMM1 scale for w1 and w3: where the two global
+        scales differ, either way, w3 must still dequantize with its own."""
+        for w3_magnitude in (3.0, 1 / 3):
+            with self.subTest(w3_magnitude=w3_magnitude):
+                self._run_backend(
+                    "flashinfer_cutedsl",
+                    w3_magnitude=w3_magnitude,
+                    check_magnitude=True,
+                )
 
 
 if __name__ == "__main__":
