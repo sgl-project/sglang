@@ -47,6 +47,20 @@ class TestResolveMinFreeSlots(unittest.TestCase):
     def test_explicit_one_disables_dflash_default(self):
         self.assertIsNone(resolve_min_free_slots(1, 512, is_dflash_family=True))
 
+    def test_admission_cap_lowers_the_dflash_default(self):
+        for cap in (2, 3, 4, 7):
+            self.assertIsNone(
+                resolve_min_free_slots(
+                    None, 36, is_dflash_family=True, admission_cap=cap
+                )
+            )
+        self.assertEqual(
+            resolve_min_free_slots(None, 36, is_dflash_family=True, admission_cap=8), 2
+        )
+
+    def test_admission_cap_caps_explicit_value(self):
+        self.assertEqual(resolve_min_free_slots(16, 512, admission_cap=8), 8)
+
 
 class TestMinFreeSlotsDelayer(unittest.TestCase):
     def test_delays_below_threshold(self):

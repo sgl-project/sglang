@@ -5,6 +5,7 @@ def resolve_min_free_slots(
     user_value: Optional[int],
     max_running_requests: int,
     is_dflash_family: bool = False,
+    admission_cap: Optional[int] = None,
 ) -> Optional[int]:
     """Resolve the min-free-slots threshold (None = disabled).
 
@@ -14,6 +15,10 @@ def resolve_min_free_slots(
     max_running_requests < 8); other workloads stay disabled.
     """
     max_running_requests = max(0, int(max_running_requests))
+    if admission_cap is not None:
+        # A threshold above the admission cap is never met while a request
+        # runs, so every admission would wait for the batch to drain.
+        max_running_requests = min(max_running_requests, max(0, int(admission_cap)))
     if user_value is not None:
         threshold = min(user_value, max_running_requests)
         return threshold if threshold > 1 else None
