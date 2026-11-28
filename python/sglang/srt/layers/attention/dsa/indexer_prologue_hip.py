@@ -71,10 +71,11 @@ class RocmNoPEPrologue:
             indexer, forward_batch
         )
         # a monokernel plugin that already ran wk, weights_proj and wq_b hands
-        # their outputs in (_mono_pre)
+        # their outputs in (_mono_pre); Kimi-K3's projection front hands in no q
         pre = indexer.__dict__.get("_mono_pre")
         if pre is not None:
-            key, gate, query = pre["k"], pre["w"], pre["q"]
+            key, gate = pre["k"], pre["w"]
+            query = pre["q"] if "q" in pre else indexer.wq_b(q_lora)[0]
         else:
             # AITER's fused RMSNorm hands (fp8, scale, bf16); wk and the gate read the bf16
             if isinstance(x, tuple):

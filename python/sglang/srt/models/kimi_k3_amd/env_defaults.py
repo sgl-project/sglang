@@ -5,9 +5,13 @@ import os
 K31_BF16_TUNED_GEMM = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "kimi_k31_bf16_tuned_gemm.csv"
 )
+# MI355X TP8 decode / DFLASH-verify GEMMs at M = 5 x graph bs
+K31_BF16_DECODE_GEMM = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "kimi_k31_bf16_decode_gemm.csv"
+)
 
 
-def apply_kimi_k31_rocm_env_defaults() -> None:
+def apply_kimi_k31_rocm_env_defaults(*, verifies_drafts: bool) -> None:
     """AITER and SGLang env defaults Kimi-K3.1 is served with on gfx950, unless the user set them."""
     # AITER's opus MoE stage 2 otherwise stores per-slot down outputs in fp8 before the
     # top-k sum: 11x the error of the bf16 partials the reference keeps.
@@ -19,3 +23,6 @@ def apply_kimi_k31_rocm_env_defaults() -> None:
 
         # the K3.1 rows add shapes aiter does not tune; a shape it tunes keeps aiter's row
         install_intree_table(GEMM_BF16, (K31_BF16_TUNED_GEMM,))
+    if verifies_drafts:
+        # the table's M are verify batches; other servers would only pay its preload
+        os.environ.setdefault("SGLANG_ROCM_DECODE_GEMM_TABLE", K31_BF16_DECODE_GEMM)
