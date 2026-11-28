@@ -1,10 +1,17 @@
 """TP4 tiny-row all-reduce/post using AITER's registered peer buffers."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
-from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 from aiter.jit.core import AITER_CSRC_DIR
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+
+if TYPE_CHECKING:
+    # Annotation only: importing this aiter module JIT-builds its extension.
+    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
 
 @cache_once
