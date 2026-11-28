@@ -61,6 +61,26 @@ class TestMambaStaleCowSource(UnifiedRadixCacheHiCacheFixtures, CustomTestCase):
                 f"slot back in free list={src_freed}",
             )
 
+    def test_rematch_without_a_source_clears_the_kept_slot(self):
+        cache, req_to_token_pool, seq_a = self._build_internal_mamba_fixture(
+            "write_through"
+        )
+        token_ids = array("q", seq_a)
+
+        req = self._make_req(req_to_token_pool)
+        match_kv_cache(req, cache, token_ids, cow_mamba=True)
+        self.assertIsNotNone(req.kv.mamba_cow_src_index)
+        self.assertTrue(req.kv.holds_mamba)
+        self.assertFalse(req.kv.mamba_needs_clear)
+
+        cache.evict(EvictParams(num_tokens=0, mamba_num=10))
+
+        second = match_kv_cache(req, cache, token_ids, cow_mamba=True)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertEqual(second.mamba_host_hit_length, 0)
+        self.assertTrue(req.kv.holds_mamba)
+        self.assertTrue(req.kv.mamba_needs_clear)
+
 
 if __name__ == "__main__":
     unittest.main()
