@@ -1,10 +1,5 @@
 """Page format and resolved logical KV dtype namespace storage keys.
 
-The unified pool's host mirror stores whole page envelopes, whose bytes are
-token-major entries. A page persisted under another format has the same size,
-so only the key can keep it from being read back as a unified page: the
-storage model name carries the pool's format tag, and an untagged page misses.
-
 CPU-only.
 
     python -m pytest test/registered/unit/mem_cache/test_hicache_storage_format_tag.py -v
@@ -25,13 +20,16 @@ import torch
 from sglang.srt.managers import cache_controller
 from sglang.srt.managers.cache_controller import storage_model_name
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.test.test_utils import CustomTestCase
 
 
-def _config(model_name):
+def _config(model_name, *, mla=False):
     return HiCacheStorageConfig(
         tp_rank=0,
         tp_size=1,
@@ -39,7 +37,7 @@ def _config(model_name):
         pp_size=1,
         attn_cp_rank=0,
         attn_cp_size=1,
-        is_mla_model=False,
+        is_mla_model=mla,
         enable_storage_metrics=False,
         is_page_first_layout=True,
         model_name=model_name,
@@ -189,6 +187,126 @@ class TestStorageModelName(CustomTestCase):
                                 config.model_name,
                                 storage_model_name("org/model", HostKVCache, dtype),
                             )
+
+
+class TestDenseStoragePageFormats(CustomTestCase):
+    def _host_pool(self, mla, layout, dtype=torch.float16):
+        device_type = MLATokenToKVPool if mla else MHATokenToKVPool
+        host_type = MLATokenToKVPoolHost if mla else MHATokenToKVPoolHost
+        geometry = (
+            dict(kv_lora_rank=2, qk_rope_head_dim=2)
+            if mla
+            else dict(head_num=2, head_dim=4)
+        )
+        device = device_type(
+            size=4,
+            page_size=2,
+            dtype=dtype,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+            **geometry,
+        )
+        host_kwargs = dict(
+            device_capacity_tokens=device.size,
+            start_layer=device.start_layer,
+            end_layer=device.end_layer,
+        )
+        if mla:
+            host_kwargs["target_layer_num"] = device.layer_num
+        host = host_type(
+            device.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=2,
+            layout=layout,
+            pin_memory=False,
+            **host_kwargs,
+        )
+        self.addCleanup(host.destroy)
+        return host
+
+    def test_file_restore_requires_compatible_page_format(self):
+        for mla in (False, True):
+            layouts = ["layer_first", "page_first_direct", "page_first"]
+            if not mla:
+                layouts.append("page_head")
+            hosts = {
+                (layout, dtype): self._host_pool(mla, layout, dtype)
+                for layout in layouts
+                for dtype in (torch.float16, torch.bfloat16)
+            }
+            for (source_layout, source_dtype), source in hosts.items():
+                with tempfile.TemporaryDirectory() as directory:
+                    writer = HiCacheFile(
+                        _config(
+                            storage_model_name("org/model", source, source_dtype),
+                            mla=mla,
+                        ),
+                        file_path=directory,
+                    )
+                    payload = source.get_dummy_flat_data_page()
+                    payload.copy_(torch.arange(payload.numel()).reshape(payload.shape))
+                    source.set_from_flat_data_page(0, payload)
+                    self.assertTrue(writer.set("page-0", source.get_data_page(0)))
+                    for (target_layout, target_dtype), target in hosts.items():
+                        with self.subTest(
+                            mla=mla,
+                            source=(source_layout, source_dtype),
+                            target=(target_layout, target_dtype),
+                        ):
+                            reader = HiCacheFile(
+                                _config(
+                                    storage_model_name(
+                                        "org/model", target, target_dtype
+                                    ),
+                                    mla=mla,
+                                ),
+                                file_path=directory,
+                            )
+                            compatible = source_dtype == target_dtype and (
+                                source_layout == target_layout
+                                or {source_layout, target_layout}
+                                == {"layer_first", "page_first_direct"}
+                            )
+                            self.assertEqual(reader.exists("page-0"), compatible)
+                            restored = reader.get(
+                                "page-0", target.get_dummy_flat_data_page()
+                            )
+                            if compatible:
+                                self.assertIsNotNone(restored)
+                                target.set_from_flat_data_page(0, restored)
+                                torch.testing.assert_close(
+                                    target.get_data_page(0), payload, rtol=0, atol=0
+                                )
+                            else:
+                                self.assertIsNone(restored)
+
+    def test_untagged_files_are_not_restored(self):
+        for mla in (False, True):
+            host = self._host_pool(mla, "layer_first")
+            for legacy_name in (
+                "org/model",
+                storage_model_name("org/model", HostKVCache, torch.float16),
+            ):
+                with (
+                    self.subTest(mla=mla, legacy_name=legacy_name),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    legacy = HiCacheFile(
+                        _config(legacy_name, mla=mla), file_path=directory
+                    )
+                    self.assertTrue(
+                        legacy.set("page-0", host.get_dummy_flat_data_page())
+                    )
+                    tagged = HiCacheFile(
+                        _config(
+                            storage_model_name("org/model", host, torch.float16),
+                            mla=mla,
+                        ),
+                        file_path=directory,
+                    )
+                    self.assertFalse(tagged.exists("page-0"))
 
 
 if __name__ == "__main__":
