@@ -180,7 +180,19 @@ def _diffusers_h3_checkpoint(
     iterator: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Map Diffusers H3 names/layout to the fused native checkpoint layout."""
-    mapping = get_param_names_mapping(_ARCH_DEFAULTS.param_names_mapping)
+    # Quant companion keys keep their checkpoint name here: int8 convrot
+    # checkpoints store `weight_scale`, while `*_inv` is an FP8-only alias whose
+    # resolution needs the model state dict. Applying it here rewrites
+    # `weight_scale` -> `weight_scale_inv` for native checkpoints, and the later
+    # hf_to_custom_state_dict fallback (which requires target != source) can no
+    # longer restore it, so the required scale params get dropped.
+    mapping = get_param_names_mapping(
+        {
+            pattern: replacement
+            for pattern, replacement in _ARCH_DEFAULTS.param_names_mapping.items()
+            if "weight_scale_inv" not in str(replacement)
+        }
+    )
     pending: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
     has_rope_inv_freq = False
 
