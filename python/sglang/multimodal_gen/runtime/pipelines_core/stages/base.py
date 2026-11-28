@@ -83,8 +83,8 @@ class PipelineStage(StageDedupMixin, ABC):
     _registered_stage_name: str | None = None
     _profile_stage_name: str | None = None
     _progress_range: tuple[float, float] = (0.0, 1.0)
-    # MAIN_RANK_ONLY_AND_SEND_TO_OTHERS: move the received batch's device tensors,
-    # unpickled on the sender's device index, to the receiving rank's device.
+    # MAIN_RANK_ONLY_AND_SEND_TO_OTHERS: receivers unpickle the batch's device tensors
+    # onto their own device; else they land on the sender's device index (its card).
     relocate_broadcast_batch: bool = False
 
     def __init__(self):
