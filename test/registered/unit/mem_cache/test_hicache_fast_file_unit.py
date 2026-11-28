@@ -1013,6 +1013,58 @@ class TestMinFreeSpace(FastFileTestBase):
         self.assertTrue(b.exists("newk"))
 
 
+    def test_pending_reservation_does_not_reuse_free_space_budget(self):
+        """Issue #50535: reserve() must charge pending writes against the floor.
+
+        Two concurrent 40-byte writes with free=100 and floor=30 must not both
+        be admitted: completing them would leave 20 bytes, below the floor.
+        """
+        b = self.make_backend(min_free="30")
+        b._evictor._fs_stats = lambda: (1000, 100)
+        first = b._evictor.reserve(b._get_suffixed_key("first"), 40)
+        self.assertTrue(first)
+        second = b._evictor.reserve(b._get_suffixed_key("second"), 40)
+        self.assertFalse(second, "second pending write must be refused")
+        # After the first pending write commits, a new write that fits is
+        # admitted (100 - 40 - 40 = 20 < 30 still refuses, but 100 - 40 - 20
+        # = 40 >= 30 admits).
+        b._evictor.commit(b._get_suffixed_key("first"))
+        self.assertTrue(b._evictor.reserve(b._get_suffixed_key("third"), 20))
+
+    def test_pending_reservation_blocks_eviction_to_restore_floor(self):
+        """Eviction loop must also charge pending writes against the floor."""
+        b = self.make_backend(min_free="40")
+        suffixed_victim = b._get_suffixed_key("victim")
+        path = b._page_path(b._get_suffixed_key("victim"))
+        with open(path, "wb") as f:
+            f.write(b"v" * 50)
+        b._evictor._lru[suffixed_victim] = 50
+        b._evictor._total_bytes = 50
+        free = [100]
+        original_remove = os.remove
+
+        def tracked_remove(p):
+            if os.path.exists(p):
+                free[0] += os.path.getsize(p)
+            return original_remove(p)
+
+        # Reserve 30 bytes pending (simulating an in-flight write).
+        b._evictor._pending_writes.add(b._get_suffixed_key("inflight"))
+        b._evictor._lru[b._get_suffixed_key("inflight")] = 30
+        b._evictor._total_bytes += 30
+
+        with (
+            mock.patch.object(
+                b._evictor, "_fs_stats", side_effect=lambda: (1024, free[0])
+            ),
+            mock.patch("os.remove", side_effect=tracked_remove),
+        ):
+            # free=100, pending=30, new=40 → 100 - 30 - 40 = 30 < 40 → must
+            # evict the 50-byte victim first, then admit.
+            self.assertTrue(b._evictor.reserve(b._get_suffixed_key("newk"), 40))
+        self.assertNotIn(suffixed_victim, b._evictor._lru)
+
+
 class TestMLAOwnerGating(FastFileTestBase):
     def test_only_rank_zero_evicts_and_creates_files_for_replicated_kv(self):
         owner = self.make_backend(max_size="200", is_mla=True, tp_rank=0, tp_size=2)
