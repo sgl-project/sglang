@@ -155,6 +155,60 @@ def validate_n(n: Any) -> int:
     return n
 
 
+def _is_json_scalar(value: Any) -> bool:
+    """Whether value is a JSON scalar that survives the msgpack IPC round-trip."""
+    if value is None or isinstance(value, (bool, str, int)):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def _validate_custom_param_value(key: str, value: Any) -> None:
+    """Check one custom_params entry against its declared CustomParamValue type."""
+    if _is_json_scalar(value):
+        return
+    if isinstance(value, list):
+        if all(_is_json_scalar(item) for item in value):
+            return
+    elif isinstance(value, dict):
+        if all(
+            isinstance(sub_key, str) and _is_json_scalar(item)
+            for sub_key, item in value.items()
+        ):
+            return
+    raise ValueError(
+        "custom_params values must be JSON scalars, lists of JSON scalars, "
+        f"or objects of JSON scalars, got {value!r} for key {key!r}."
+    )
+
+
+def _validate_custom_params(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+) -> None:
+    """Reject custom_params that cannot reach the scheduler intact.
+
+    The msgspec Struct constructor does not type-check custom_params, so a
+    list, string, number, or too-deeply-nested value is accepted here and
+    only crashes later: the scheduler's msgpack decode raises
+    ValidationError, and the uocr page-guard logit processor calls .get()
+    on the non-dict value. verify() runs in the tokenizer manager before
+    any IPC, so rejecting here turns those crashes into a 400, matching
+    the Rust server.
+    """
+    if custom_params is None:
+        return
+    if not isinstance(custom_params, dict):
+        raise ValueError(
+            "custom_params must be an object mapping string keys to JSON "
+            f"values, got {type(custom_params).__name__}."
+        )
+    for key, value in custom_params.items():
+        if not isinstance(key, str):
+            raise ValueError(
+                f"custom_params keys must be strings, got {type(key).__name__}."
+            )
+        _validate_custom_param_value(key, value)
+
+
 class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     """
     The sampling parameters.
@@ -341,6 +395,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     "sampling_seed must be in [-2**63, 2**63 - 1], got "
                     f"{self.sampling_seed}."
                 )
+
+        _validate_custom_params(self.custom_params)
 
         get_request_reasoning_end_token_ids(
             self.custom_params,
