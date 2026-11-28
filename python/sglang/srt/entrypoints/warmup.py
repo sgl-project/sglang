@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import fcntl
+import itertools
 import logging
-from typing import TYPE_CHECKING, List
+import os
+import random
+import tempfile
+import time
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import msgspec
 import numpy as np
 import tqdm
 
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -166,3 +175,305 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+# Prompt tokens per round: more than one prefill chunk at common chunk sizes,
+# so every round also splits a prompt across a chunk boundary.
+_CONCURRENT_PREFILL_TOKENS = 40000
+_CONCURRENT_PREFILL_NEW_TOKENS = 8
+# Input-logprob probes over an unaligned and a 16-aligned row count.
+_CONCURRENT_PREFILL_LOGPROB_SIZES = (513, 512)
+
+
+class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
+    """The scheduler's effective limits that the warmup plan must stay inside."""
+
+    # Effective running-request slots of one DP rank (the smallest).
+    max_running_requests: int
+    # Rounds are sized per DP rank and rely on an even dispatch.
+    dp_ranks: int = 1
+    even_dp_dispatch: bool = True
+    # Per scheduler; None is unlimited or not applied.
+    max_queued_requests: Optional[int]
+    # Tokenizer workers of the server; with a queue limit only one of them
+    # sends this warmup (`_claim_tokenizer_worker_warmup`).
+    tokenizer_workers: int = 1
+    # The scheduler's own chunk size; None when chunked prefill is off.
+    chunked_prefill_size: Optional[int]
+    # Prefill tokens the scheduler packs into one forward. Without chunking it
+    # still admits one longer prompt alone, past what the forward is sized for.
+    max_prefill_tokens: int
+    context_len: int
+    max_req_input_len: int
+    # Speculative slots the tokenizer adds to each prompt's length.
+    num_reserved_tokens: int
+    # Smallest full-attention KV pool over DP ranks, in tokens.
+    kv_pool_tokens: int
+    # Any sliding-window or per-request ring pool besides the full one.
+    has_window_pool: bool = False
+    page_size: int
+    serves_input_logprobs: bool
+
+
+class ConcurrentPrefillPlan(msgspec.Struct, frozen=True, kw_only=True):
+    rounds: List[List[int]]
+    logprob_sizes: List[int]
+    # Set when the warmup cannot be shown to be safe; nothing is sent then.
+    skip_reason: Optional[str] = None
+
+
+def concurrent_prefill_limits(
+    internal_states: List[Dict[str, Any]],
+    *,
+    context_len: int,
+    max_req_input_len: int,
+    num_reserved_tokens: int,
+) -> ConcurrentPrefillLimits:
+    """Collect the limits from the schedulers' `get_internal_state` readback
+    (one dict per DP rank)."""
+    state = internal_states[0]
+    spec_algorithm = SpeculativeAlgorithm.from_string(state["speculative_algorithm"])
+    pd_prefill = state.get("disaggregation_mode") == "prefill"
+    load_balance = state["load_balance_method"]
+    return ConcurrentPrefillLimits(
+        max_running_requests=min(
+            s["effective_max_running_requests_per_dp"] for s in internal_states
+        ),
+        dp_ranks=len(internal_states),
+        # Round robin gives each rank an equal share of a round, and so do the
+        # consecutive bootstrap rooms this warmup sends to a PD prefill server.
+        even_dp_dispatch=len(internal_states) == 1
+        or load_balance == "round_robin"
+        or (pd_prefill and load_balance == "follow_bootstrap_room"),
+        # Only the regular scheduler applies the queue limit; a PD prefill
+        # server queues requests for bootstrap instead.
+        max_queued_requests=None if pd_prefill else state["max_queued_requests"],
+        tokenizer_workers=state["tokenizer_worker_num"],
+        chunked_prefill_size=state["effective_chunked_prefill_size"],
+        max_prefill_tokens=state["max_prefill_tokens"],
+        context_len=context_len,
+        max_req_input_len=max_req_input_len,
+        num_reserved_tokens=num_reserved_tokens,
+        kv_pool_tokens=min(
+            s["memory_usage"]["token_capacity"] for s in internal_states
+        ),
+        has_window_pool=any(
+            s["memory_usage"]["token_capacity_swa"] is not None
+            or bool(s["memory_usage"]["token_capacity_window"])
+            for s in internal_states
+        ),
+        page_size=state["page_size"] or 1,
+        # UNO refuses logprob requests; the MLX sampling path refuses prompt logprobs.
+        serves_input_logprobs=not (
+            spec_algorithm.is_uno() or state["mlx_enable_sampling"]
+        ),
+    )
+
+
+def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefillPlan:
+    """Prompt lengths of each concurrent round (1, about 1/8 and all of the
+    running slots of every DP rank) and of the input-logprob probes.
+
+    The plan only covers configs where it can show that every request is
+    admitted; for any other config it sends nothing and says why.
+    Without chunking only the probes run.
+
+    Each DP rank gets at least one round budget (two prefill chunks, at least
+    `_CONCURRENT_PREFILL_TOKENS`) per round and less than two: each prompt gets
+    an equal share plus an offset below that share, stepped by 37 so extends do
+    not align.
+    """
+    page = limits.page_size
+    new_tokens = _CONCURRENT_PREFILL_NEW_TOKENS
+    chunk = limits.chunked_prefill_size
+    queue = limits.max_queued_requests
+    max_prompt = min(
+        # The scheduler aborts a prompt of max_req_input_len tokens or more.
+        limits.max_req_input_len - 1,
+        # The tokenizer counts the reserved slots and the new tokens in the context.
+        limits.context_len - limits.num_reserved_tokens - new_tokens - 1,
+        # Admission rounds the prompt up to whole pages and reserves one more page.
+        (limits.kv_pool_tokens - limits.num_reserved_tokens - new_tokens) // page * page
+        - 2 * page,
+    )
+    if chunk is None:
+        # Never rely on the lone-long-prompt exception: backends size their
+        # per-forward buffers to this budget (the Ascend fused MoE prefill
+        # takes at most min(max_prefill_tokens, 4096) rows).
+        max_prompt = min(max_prompt, limits.max_prefill_tokens)
+    skip_reason = None
+    if chunk is None and limits.has_window_pool:
+        # Without chunking a prompt must fit every pool in one piece; a
+        # full-attention-only model is covered by max_prompt.
+        skip_reason = "chunked prefill is off and the model has sliding-window pools"
+    elif not limits.even_dp_dispatch and queue is not None:
+        # Without a queue limit an uneven share only waits in the queue.
+        skip_reason = "DP dispatch is load based, so a rank's queue share is unknown"
+    elif queue is not None and queue < 1:
+        skip_reason = "the request queue limit is 0"
+    elif max_prompt < 1:
+        skip_reason = "the context or the KV pool is too small"
+    if skip_reason is not None:
+        return ConcurrentPrefillPlan(
+            rounds=[], logprob_sizes=[], skip_reason=skip_reason
+        )
+
+    logprob_sizes = []
+    if limits.serves_input_logprobs:
+        logprob_sizes = [min(max_prompt, s) for s in _CONCURRENT_PREFILL_LOGPROB_SIZES]
+    if chunk is None:
+        # The rounds warm prefills that cross chunk boundaries; without
+        # chunking a round would pack up to max_prefill_tokens into one forward,
+        # past a backend's own per-forward limit, so only the probes run.
+        return ConcurrentPrefillPlan(rounds=[], logprob_sizes=logprob_sizes)
+
+    slots = limits.max_running_requests
+    if queue is not None:
+        # A rank's share of a round can arrive in one scheduler poll.
+        slots = min(slots, queue)
+    budget = max(_CONCURRENT_PREFILL_TOKENS, 2 * chunk)
+    rounds = []
+    for n in sorted({1, slots // 8 or 1, slots}):
+        share = max(1, budget // n)
+        rounds.append(
+            [
+                min(max_prompt, share + 37 * i % share + 1)
+                for i in range(n * limits.dp_ranks)
+            ]
+        )
+    return ConcurrentPrefillPlan(rounds=rounds, logprob_sizes=logprob_sizes)
+
+
+# Held until the worker exits, so no other tokenizer worker of this server runs
+# the warmup after this one finishes.
+_tokenizer_worker_warmup_lock: Optional[int] = None
+# How long a worker waits for the elected worker's warmup before it warns (it
+# keeps waiting: going on would let its default warmup compete for the queue).
+_TOKENIZER_WORKER_WAIT_S = 1800.0
+_TOKENIZER_WORKER_POLL_S = 0.1
+
+
+def _tokenizer_worker_lock_path(suffix: str = "") -> str:
+    """A lock file shared by the tokenizer workers of this server only: named
+    after its main process, the same id the workers use for their shared args."""
+    from sglang.srt.managers.multi_tokenizer_mixin import get_main_process_id
+
+    return os.path.join(
+        tempfile.gettempdir(),
+        f"sglang_concurrent_prefill_{get_main_process_id()}{suffix}.lock",
+    )
+
+
+def _try_lock(path: str) -> Optional[int]:
+    """A file descriptor holding an exclusive lock on `path`, or None when
+    another process holds it."""
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+async def _wait_for_lock(path: str, warn_after: float) -> int:
+    """`_try_lock` retried without blocking the event loop, with one warning
+    once `warn_after` seconds pass."""
+    deadline = time.monotonic() + warn_after
+    while (fd := _try_lock(path)) is None:
+        if deadline is not None and time.monotonic() >= deadline:
+            logger.warning(
+                "concurrent_prefill: another tokenizer worker's warmup is still "
+                f"running after {warn_after:.0f}s; still waiting for it"
+            )
+            deadline = None
+        await asyncio.sleep(_TOKENIZER_WORKER_POLL_S)
+    return fd
+
+
+def _claim_tokenizer_worker_warmup() -> bool:
+    """True in exactly one tokenizer worker of this server: the first to lock
+    the server's lock file. The lock goes away with the worker, so a later
+    server reusing the process id can claim it again."""
+    global _tokenizer_worker_warmup_lock
+    if _tokenizer_worker_warmup_lock is None:
+        _tokenizer_worker_warmup_lock = _try_lock(_tokenizer_worker_lock_path())
+    return _tokenizer_worker_warmup_lock is not None
+
+
+@warmup("concurrent_prefill")
+async def concurrent_prefill(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Warm up multi-sequence prefill, mixed steps and input logprobs, so their
+    first JIT compiles happen before serving."""
+    if disaggregation_mode == "decode" or not tokenizer_manager.is_generation:
+        logger.info(
+            "Skipping concurrent_prefill: this server runs no generation prefill"
+        )
+        return
+    vocab = min(2**16, tokenizer_manager.model_config.vocab_size)
+    # PD prefill servers need a bootstrap room; concurrent requests need
+    # distinct ones, also across tokenizer workers. Consecutive rooms keep
+    # follow_bootstrap_room DP dispatch even.
+    bootstrap_rooms = itertools.count(random.randrange(1 << 62))
+
+    async def one(size, **kwargs):
+        req = GenerateReqInput(
+            input_ids=np.random.randint(vocab, size=size).tolist(),
+            sampling_params={
+                "max_new_tokens": _CONCURRENT_PREFILL_NEW_TOKENS,
+                "temperature": 0,
+            },
+            **kwargs,
+        )
+        if disaggregation_mode != "null":
+            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+            req.bootstrap_room = next(bootstrap_rooms)
+        await tokenizer_manager.generate_request(req, None).__anext__()
+
+    # An opt-in warmup must not stop the server from starting; the default
+    # warmup that follows still checks that the server serves.
+    try:
+        limits = concurrent_prefill_limits(
+            await tokenizer_manager.get_internal_state(),
+            context_len=tokenizer_manager.context_len,
+            max_req_input_len=tokenizer_manager.max_req_input_len,
+            num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
+        )
+        plan = concurrent_prefill_plan(limits)
+        if plan.skip_reason is not None:
+            logger.info(f"Skipping concurrent_prefill: {plan.skip_reason}")
+            return
+        turn = None
+        try:
+            if limits.tokenizer_workers > 1 and (
+                limits.max_queued_requests is not None
+                or limits.chunked_prefill_size is None
+            ):
+                # The plan bounds one sender's requests per rank queue, and
+                # without chunking one sender's probes per forward (several
+                # workers' probes would batch into one), so one worker sends it.
+                # The workers take this lock in turn and the elected one keeps
+                # it until its warmup ends (or it exits), so no worker serves or
+                # sends its default warmup before then.
+                turn = await _wait_for_lock(
+                    _tokenizer_worker_lock_path(".turn"), _TOKENIZER_WORKER_WAIT_S
+                )
+                if not _claim_tokenizer_worker_warmup():
+                    logger.info(
+                        "Skipping concurrent_prefill: another tokenizer worker runs it"
+                    )
+                    return
+            logger.info(
+                f"concurrent_prefill: {limits=}, round sizes {[len(r) for r in plan.rounds]}"
+            )
+            for sizes in plan.rounds:
+                await asyncio.gather(*(one(size) for size in sizes))
+            for size in plan.logprob_sizes:
+                await one(size, return_logprob=True, logprob_start_len=0)
+        finally:
+            if turn is not None:
+                os.close(turn)
+    except Exception as e:
+        logger.warning(f"concurrent_prefill warmup stopped early: {e!r}")

@@ -72,6 +72,9 @@ class SchedulerInternalStateController:
         )
         state["startup_time"] = scheduler.startup_time
         state["effective_max_running_requests_per_dp"] = scheduler.max_running_requests
+        # None when the scheduler runs without chunked prefill, also when it
+        # turned chunking off itself (multimodal Transformers models).
+        state["effective_chunked_prefill_size"] = scheduler.chunked_prefill_size
         state["last_gen_throughput"] = scheduler.metrics_reporter.last_gen_throughput
 
     def _add_memory_usage(self, state: Dict[str, Any]) -> None:
