@@ -1,5 +1,6 @@
 """Unit tests for hybrid HiCache pool assembly."""
 
+import random
 import threading
 import unittest
 from functools import partial
@@ -62,6 +63,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
+from sglang.srt.mem_cache.pool_host import unified as unified_host
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
@@ -1693,7 +1695,9 @@ class TestTransferLayerSpan(CustomTestCase):
         )
 
 
-def _build_unified_swa_pool(page_size: int = 4, *, fused_draft=None):
+def _build_unified_swa_pool(
+    page_size: int = 4, *, fused_draft=None, total_bytes: int = 4096
+):
     from sglang.test.unified_allocator_fixtures import setup_allocator_context
 
     setup_allocator_context()
@@ -1711,7 +1715,7 @@ def _build_unified_swa_pool(page_size: int = 4, *, fused_draft=None):
         end_layer=4,
         swa_attention_layer_ids=[3],
         full_attention_layer_ids=[0, 1, 2],
-        total_bytes=4096,
+        total_bytes=total_bytes,
         enable_memory_saver=False,
         need_sort=False,
         lazy_compaction=True,
@@ -2008,6 +2012,208 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
 
         full_pool.free(full_indices[page_size:])
         self.assertIsNotNone(swa_pool.alloc(page_size))
+
+    def test_envelope_copy_dispatch_per_platform(self):
+        """Only CUDA kernel copies of multi-token pages use token-row indices."""
+        for page_size in (1, 4):
+            full_host, swa_host = _build_unified_host_pair(
+                _build_unified_swa_pool(page_size, total_bytes=4096 * page_size)
+            )
+            self.addCleanup(full_host.destroy)
+            self.addCleanup(swa_host.destroy)
+            for host in (full_host, swa_host):
+                with self.subTest(page_size=page_size, pool=host.pool_label):
+                    self._check_envelope_copy_dispatch(host)
+
+    def _check_envelope_copy_dispatch(self, host):
+        page_size = host.page_size
+        src_pages, dst_pages = torch.tensor([5, 2, 7]), torch.tensor([0, 6, 3])
+
+        def tokens(pages):
+            return (pages[:, None] * page_size + torch.arange(page_size)).reshape(-1)
+
+        for cuda, device, backend in (
+            (True, "cuda", "kernel"),
+            (True, "cuda", "direct"),
+            (True, "cpu", "kernel"),
+            (False, "cuda", "kernel"),
+        ):
+            with (
+                patch.object(unified_host, "_is_cuda", cuda),
+                patch.object(
+                    host,
+                    "_device_page_buffer",
+                    SimpleNamespace(device=torch.device(device)),
+                ),
+            ):
+                self.assertEqual(
+                    host._copies_token_rows(backend),
+                    cuda and device == "cuda" and backend == "kernel" and page_size > 1,
+                )
+
+        host_tokens, device_tokens = tokens(dst_pages), tokens(src_pages)
+        for rows in (True, False):
+            with (
+                patch.object(host, "_copies_token_rows", return_value=rows),
+                patch.object(host, "_transfer_token_rows") as row_copy,
+                patch.object(host, "_transfer_pages") as page_copy,
+            ):
+                host.backup_from_device_all_layer_physical(
+                    None, host_tokens, device_tokens, "kernel"
+                )
+                host.load_to_device_per_layer_physical(
+                    None, host_tokens, device_tokens, 0, "kernel"
+                )
+            if rows:
+                self.assertEqual(page_copy.call_count, 0)
+                backup, load = row_copy.call_args_list
+                self.assertIs(backup.kwargs["src_indices"], device_tokens)
+                self.assertIs(load.kwargs["src_indices"], host_tokens)
+            else:
+                self.assertEqual(row_copy.call_count, 0)
+                backup, load = page_copy.call_args_list
+                self.assertTrue(torch.equal(backup.args[2], src_pages))
+                self.assertTrue(torch.equal(load.args[3], src_pages))
+
+        src = torch.randint(0, 256, (8, host.item_bytes), dtype=torch.uint8)
+        calls = []
+
+        def kernel_copy(**kwargs):
+            calls.append(("mla", kwargs))
+            item = kwargs["item_size"]
+            dst_rows = kwargs["dst"].view(-1, item)
+            dst_rows[kwargs["dst_indices"]] = kwargs["src"].view(-1, item)[
+                kwargs["src_indices"]
+            ]
+
+        def direct_copy(**kwargs):
+            calls.append(("direct", kwargs))
+
+        for copy in ("rows", "rocm", "direct"):
+            dst = torch.zeros_like(src)
+            calls.clear()
+            with (
+                patch.object(unified_host, "_is_cuda", copy == "rows"),
+                patch.object(unified_host, "_is_hip", copy != "rows"),
+                patch.object(
+                    unified_host, "transfer_kv_per_layer_mla", kernel_copy, create=True
+                ),
+                patch.object(
+                    unified_host, "transfer_kv_direct", direct_copy, create=True
+                ),
+                patch.object(
+                    host,
+                    "_device_page_buffer",
+                    SimpleNamespace(device=torch.device("meta")),
+                ),
+            ):
+                if copy == "rows":
+                    host._transfer_token_rows(
+                        src=src,
+                        dst=dst,
+                        src_indices=tokens(src_pages),
+                        dst_indices=tokens(dst_pages),
+                    )
+                else:
+                    backend = "kernel" if copy == "rocm" else "direct"
+                    host._transfer_pages(src, dst, src_pages, dst_pages, backend)
+            ((kind, kwargs),) = calls
+            if copy == "direct":
+                self.assertEqual(kind, "direct")
+                self.assertEqual(kwargs["page_size"], 1)
+                self.assertIs(kwargs["src_indices"], src_pages)
+                continue
+            self.assertEqual(kind, "mla")
+            self.assertTrue(torch.equal(dst[dst_pages], src[src_pages]))
+            untouched = torch.ones(len(dst), dtype=torch.bool)
+            untouched[dst_pages] = False
+            self.assertFalse(dst[untouched].any())
+            if copy == "rows":
+                self.assertEqual(kwargs["item_size"], host.size_per_token)
+                self.assertTrue(torch.equal(kwargs["src_indices"], tokens(src_pages)))
+                self.assertIn("block_quota", kwargs)
+            else:
+                self.assertEqual(
+                    set(kwargs),
+                    {"src", "dst", "src_indices", "dst_indices", "item_size"},
+                )
+                self.assertIs(kwargs["src_indices"], src_pages)
+                self.assertEqual(kwargs["item_size"], host.item_bytes)
+
+    def test_compaction_keeps_every_live_page_and_packs_the_side(self):
+        for page_size in (1, 4, 64):
+            for seed in range(4):
+                with self.subTest(page_size=page_size, seed=seed):
+                    self._check_random_compaction(page_size, random.Random(seed))
+
+    def _check_random_compaction(self, page_size, rng):
+        hosts = dict(
+            zip(
+                ("full", "swa"),
+                _build_unified_host_pair(
+                    _build_unified_swa_pool(page_size, total_bytes=4096 * page_size)
+                ),
+            )
+        )
+        for host in hosts.values():
+            self.addCleanup(host.destroy)
+        backing = hosts["full"].shared_allocation_domain
+        compact_side = backing._compact_side
+        compacted_with_holes = {
+            side.grow_direction: 0 for side in backing.sides.values()
+        }
+        moves_per_page = {}
+
+        def checked_compact(side):
+            before = dict(side.logical_to_physical)
+            if side.free_physical_pages:
+                compacted_with_holes[side.grow_direction] += 1
+            compact_side(side)
+            for logical, page in side.logical_to_physical.items():
+                if page != before[logical]:
+                    key = (side.grow_direction, logical)
+                    moves_per_page[key] = moves_per_page.get(key, 0) + 1
+            live = sorted(side.physical_to_logical)
+            start = 0 if side.grow_direction == "up" else side.page_num - len(live)
+            self.assertEqual(live, list(range(start, start + len(live))))
+            self.assertEqual(
+                {page: logical for logical, page in side.logical_to_physical.items()},
+                side.physical_to_logical,
+            )
+
+        def page_bytes(name, logical):
+            side = backing.sides[name]
+            page = side.logical_to_physical[logical]
+            return backing.raw[page * side.page_bytes : (page + 1) * side.page_bytes]
+
+        held = {name: [] for name in hosts}
+        expected = {}
+        with patch.object(backing, "_compact_side", side_effect=checked_compact):
+            for _ in range(400):
+                name = rng.choice(tuple(hosts))
+                host = hosts[name]
+                if rng.random() < 0.7:
+                    indices = host.alloc(host.page_size * rng.randint(1, 3))
+                    if indices is not None:
+                        held[name].append(indices)
+                        for logical in {int(i) // host.page_size for i in indices}:
+                            data = torch.randint(
+                                0,
+                                256,
+                                (backing.sides[name].page_bytes,),
+                                dtype=torch.uint8,
+                            )
+                            page_bytes(name, logical).copy_(data)
+                            expected[(name, logical)] = data
+                elif held[name]:
+                    indices = held[name].pop(rng.randrange(len(held[name])))
+                    host.free(indices)
+                    for logical in {int(i) // host.page_size for i in indices}:
+                        del expected[(name, logical)]
+                for (kept, logical), data in expected.items():
+                    self.assertTrue(torch.equal(page_bytes(kept, logical), data))
+        self.assertTrue(all(compacted_with_holes.values()), compacted_with_holes)
+        self.assertGreater(max(moves_per_page.values(), default=0), 1)
 
 
 class TestUnifiedPageEnvelopeSelection(CustomTestCase):

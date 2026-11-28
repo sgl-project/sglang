@@ -423,31 +423,42 @@ class _SharedPageEnvelopeHostBacking:
             self.release_layout()
 
     def _compact_side(self, side: _Side) -> None:
-        reverse = side.grow_direction == "down"
-        live = sorted(side.physical_to_logical.items(), reverse=reverse)
-        if reverse:
-            targets = range(side.page_num - 1, side.page_num - 1 - len(live), -1)
-        else:
-            targets = range(len(live))
+        # Fill holes nearest the side's end; each hole needs at most one page copy.
+        up = side.grow_direction == "up"
+        holes = sorted(side.free_physical_pages, reverse=not up)
+        step = -1 if up else 1
+        cursor = side.watermark + step
+        sources, targets = [], []
+        for hole in holes:
+            while (cursor > hole if up else cursor < hole) and (
+                cursor not in side.physical_to_logical
+            ):
+                cursor += step
+            if cursor <= hole if up else cursor >= hole:
+                break
+            sources.append(cursor)
+            targets.append(hole)
+            cursor += step
 
-        new_logical_to_physical = {}
-        new_physical_to_logical = {}
-        for (source, logical), target in zip(live, targets, strict=True):
-            if source != target:
-                source_offset = source * side.page_bytes
-                target_offset = target * side.page_bytes
-                self.raw[target_offset : target_offset + side.page_bytes].copy_(
-                    self.raw[source_offset : source_offset + side.page_bytes].clone()
-                )
-            new_logical_to_physical[logical] = target
-            new_physical_to_logical[target] = logical
+        self._move_pages(side, sources=sources, targets=targets)
+        for source, target in zip(sources, targets, strict=True):
+            logical = side.physical_to_logical.pop(source)
+            side.physical_to_logical[target] = logical
+            side.logical_to_physical[logical] = target
 
-        side.logical_to_physical = new_logical_to_physical
-        side.physical_to_logical = new_physical_to_logical
         side.free_physical_pages.clear()
-        side.watermark = (
-            len(live) if side.grow_direction == "up" else side.page_num - 1 - len(live)
+        live_count = side.live_page_count
+        side.watermark = live_count if up else side.page_num - 1 - live_count
+
+    def _move_pages(
+        self, side: _Side, *, sources: list[int], targets: list[int]
+    ) -> None:
+        # Targets are free and disjoint from sources, so copies need no staging.
+        pages = self.raw[: side.page_num * side.page_bytes].view(
+            side.page_num, side.page_bytes
         )
+        for source, target in zip(sources, targets, strict=True):
+            pages[target].copy_(pages[source])
 
     def _compact(self) -> None:
         events = self._begin_compaction()
