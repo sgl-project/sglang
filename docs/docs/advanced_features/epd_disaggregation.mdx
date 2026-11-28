@@ -19,6 +19,43 @@ When launching a language-only model, you must additionally specify the encoder 
 
 We support multiple encoder transfer backends, including zmq_to_scheduler, zmq_to_tokenizer, and mooncake (the default is zmq_to_scheduler). The backend can be selected using `--encoder-transfer-backend`.
 
+### External encoder selection
+
+By default the language worker chooses the encoder. An external router, such as
+Dynamo, can choose it instead when the language worker runs the Rust server.
+Start the encoder as usual. Start the language worker with
+`SGLANG_RUST_SERVER=1`, `SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF=1`,
+`--language-only` and `--encoder-transfer-backend zmq_to_scheduler`. It needs
+PP=1 and one DP rank.
+
+For each request with media, the router does two things:
+
+1. It sends the encoder its native `/encode` request, one per modality, with
+   `req_id` set to `{rid}_local_part_{index}` and `num_parts` set to the number
+   of modalities. `/encode` returns after the embedding has been delivered, so
+   the router keeps the call open.
+2. It sends the language worker a tokenized `/generate` request that carries
+   the same `rid`, one placeholder token per media item, no raw media, and an
+   `encoder_handoff` field naming the encoder:
+
+```json
+{
+  "encoder_url": "http://encoder:30000",
+  "parts": [{"modality": "image", "items": 2}]
+}
+```
+
+`parts` lists the modalities in the order of their part indices. The language
+worker registers its receive address with that encoder and receives the
+embeddings over the existing ZMQ path. The router must use a unique `rid` per
+request, because the encoder keys its work by it.
+
+If `--encoder-urls` is set on the language worker, `encoder_handoff` may only
+name an encoder from that list. Without it, any address is accepted, so expose
+this listener to the router only. Requests with raw media are rejected with
+400. A request whose prompt holds media placeholders but no `encoder_handoff`
+is treated as text.
+
 ### Encoder transfer with Mooncake
 
 `--encoder-transfer-backend mooncake` controls **how encoder outputs are transferred** between encoder and language/prefill services. It is an encoder transfer option and can be used independently of the global multimodal embedding cache.

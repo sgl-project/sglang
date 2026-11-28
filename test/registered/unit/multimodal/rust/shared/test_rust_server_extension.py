@@ -633,10 +633,11 @@ def build_rust_customized_info_fixture() -> dict:
 
 
 @contextmanager
-def launch_context(server_cls, cores=(None, None)):
+def launch_context(server_cls, cores=(None, None), disagg=None):
     """Patch what `launch` reads so it runs as DP rank 1 of a two-rank node,
     with `cores` as the `(launch_cores, server_cores)` partition (unpinned by
-    default); yields the `_build_server_args` mock."""
+    default) and `disagg` as `get_disagg()` (no disaggregation by default);
+    yields the `_build_server_args` mock."""
     with (
         patch.object(
             server_module,
@@ -677,7 +678,7 @@ def launch_context(server_cls, cores=(None, None)):
         patch.object(
             server_module,
             "get_disagg",
-            return_value=SimpleNamespace(disaggregation_mode="null"),
+            return_value=disagg or SimpleNamespace(disaggregation_mode="null"),
         ),
         patch.object(server_module, "vlm_warmup_image_base64", return_value=None),
         patch.object(
@@ -1275,6 +1276,97 @@ class TestRustServerExtension(CustomTestCase):
             self.assertEqual(json.load(f), build_rust_frame_metadata_fixture())
         with open(RUST_CUSTOMIZED_INFO_FIXTURE) as f:
             self.assertEqual(json.load(f), build_rust_customized_info_fixture())
+
+    def test_external_encoder_starts_a_language_worker_without_an_mm_pool(self):
+        extension = ModuleType("server")
+        extension.Server = Mock()
+        scheduler = SimpleNamespace(
+            server_args=sentinel.server_args,
+            processor=sentinel.processor,
+            model_config=SimpleNamespace(
+                is_multimodal=True,
+                is_generation=True,
+                hf_config=SimpleNamespace(model_type="qwen3_vl"),
+                model_path="test/model",
+            ),
+        )
+        disagg = SimpleNamespace(
+            disaggregation_mode="null",
+            encoder_transfer_backend="zmq_to_tokenizer",
+            encoder_urls=["http://e1:30000/"],
+        )
+        with (
+            server_module.envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(True),
+            launch_context(RustServer, disagg=disagg),
+            patch.object(RustServer, "_load_extension", return_value=extension),
+            patch.object(RustServer, "_resolve_multimodal") as resolve_mm,
+        ):
+            # The scheduler only starts its receiver for this backend.
+            with self.assertRaisesRegex(RuntimeError, "zmq_to_scheduler"):
+                RustServer.launch(scheduler)
+            extension.Server.assert_not_called()
+
+            disagg.encoder_transfer_backend = "zmq_to_scheduler"
+            instance = RustServer.launch(scheduler)
+            self.assertFalse(instance._multimodal_enabled)
+            self.assertEqual(instance._allowed_encoder_urls, {"http://e1:30000"})
+            instance.server.start_mm_workers.assert_not_called()
+            resolve_mm.assert_not_called()
+
+    def test_encoder_handoff_selects_the_receivers_encoder(self):
+        from sglang.srt.multimodal.modality import Modality
+
+        server = RustServer.__new__(RustServer)
+        server._external_encoder = True
+        server._allowed_encoder_urls = frozenset()
+
+        def attach(handoff, limits=None):
+            obj = SimpleNamespace()
+            with patch.object(
+                server_module,
+                "get_mm",
+                return_value=SimpleNamespace(limit_mm_data_per_request=limits),
+            ):
+                server._attach_encoder_handoff(obj, json.dumps(handoff).encode())
+            return obj
+
+        handoff = {
+            "encoder_url": "http://e1:30000/",
+            "parts": [
+                {"modality": "video", "items": 1},
+                {"modality": "IMAGE", "items": 2},
+            ],
+        }
+        obj = attach(handoff)
+        self.assertIs(obj.need_wait_for_mm_inputs, True)
+        self.assertEqual(obj.encoder_urls, ["http://e1:30000"])
+        # Part indices follow this order, so it must survive as given.
+        self.assertEqual(
+            list(obj.num_items_assigned.items()),
+            [(Modality.VIDEO, [1]), (Modality.IMAGE, [2])],
+        )
+
+        server._allowed_encoder_urls = frozenset({"http://e1:30000"})
+        attach(handoff)
+        for change, limits, error in (
+            ({"encoder_url": "http://other:1"}, None, "outside --encoder-urls"),
+            ({"parts": []}, None, "names no media"),
+            ({"parts": [{"modality": "image", "items": 0}]}, None, "nonempty"),
+            ({"parts": handoff["parts"][1:] * 2}, None, "distinct"),
+            ({"parts": [{"modality": "text", "items": 1}]}, None, "Invalid modality"),
+            ({}, {"image": 1}, "limit-mm-data-per-request"),
+        ):
+            with (
+                self.subTest(change=change, limits=limits),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                attach({**handoff, **change}, limits)
+        with self.assertRaises(server_module.msgspec.ValidationError):
+            attach({**handoff, "extra": 1})
+
+        server._external_encoder = False
+        with self.assertRaisesRegex(ValueError, "EXTERNAL_ENCODER_HANDOFF"):
+            attach(handoff)
 
     def test_launch_resolves_the_mm_pipeline_before_the_server_starts(self):
         """The listener answers once the server is constructed, so a model

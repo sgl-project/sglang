@@ -400,6 +400,9 @@ class GenerateReqInput:
     # Snapshot of encoder URLs at the time tokenizer-side computed
     # ``num_items_assigned``.
     encoder_urls: Optional[List[str]] = None
+    # The encoder an external router selected. Only the Rust server's private
+    # listener consumes it; this ingress dispatches to encoders itself.
+    encoder_handoff: Optional[dict] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -502,6 +505,10 @@ class GenerateReqInput:
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
+        if self.encoder_handoff is not None:
+            raise ValueError(
+                "encoder_handoff requires the private SGLANG_RUST_SERVER listener"
+            )
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None
         ) or (

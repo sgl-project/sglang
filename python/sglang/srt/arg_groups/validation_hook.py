@@ -146,7 +146,8 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     # Python's changes the pad values of the items it serves. A model package
     # whose Rust server caches honors it (`rust_server_unsupported_args`).
     "mm_preprocess_cache_size_mb",
-    # The Rust server has no encoder dispatch.
+    # The Rust server has no encoder dispatch; an external router can supply
+    # one (SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF).
     "language_only",
     # The Rust listener reports ready without waiting for weight updates.
     "checkpoint_engine_wait_weights_before_ready",
@@ -170,6 +171,8 @@ def rust_server_unsupported_args(
     defaults = {
         field.name: _field_default(field) for field in record_fields(type(server_args))
     }
+    if envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get():
+        honored = (*honored, "language_only")
     offending = []
     for name in RUST_SERVER_UNSUPPORTED_ARGS:
         if name in honored:
@@ -199,9 +202,31 @@ def rust_server_refusal(offending: List[str], separator: str = ", ") -> ValueErr
     )
 
 
+def _validate_external_encoder_handoff(cfg: Any) -> None:
+    if not cfg.language_only or not envs.SGLANG_RUST_SERVER.get():
+        raise ValueError(
+            "SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF requires --language-only and "
+            "SGLANG_RUST_SERVER=1."
+        )
+    if cfg.pp_size != 1 or num_dp_ranks_of(cfg) != 1:
+        raise ValueError("External encoder handoff requires PP=1 and one DP rank.")
+    if cfg.encoder_transfer_backend not in ("auto", "zmq_to_scheduler"):
+        raise ValueError(
+            "External encoder handoff requires --encoder-transfer-backend "
+            f"zmq_to_scheduler, got {cfg.encoder_transfer_backend}."
+        )
+    if cfg.enable_adaptive_dispatch_to_encoder:
+        raise ValueError(
+            "--enable-adaptive-dispatch-to-encoder is incompatible with external "
+            "encoder handoff."
+        )
+
+
 def validate_rust_server_unsupported_args(server_args: Any) -> None:
     """Refuse, in Rust-server mode, every argument the Rust server would ignore
     (``rust_server_unsupported_args``)."""
+    if envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get():
+        _validate_external_encoder_handoff(resolving_view(server_args))
     if not envs.SGLANG_RUST_SERVER.get():
         return
     offending = rust_server_unsupported_args(server_args)

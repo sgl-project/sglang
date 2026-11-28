@@ -1543,6 +1543,7 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     routed_experts_start_len: int = 0
     return_sampling_mask: Optional[BoolOrList] = None
     modalities: Optional[OptionalStringList] = None
+    encoder_handoff: Optional[Any] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -7092,6 +7093,8 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["return_sampling_mask"] = None if x is None else decode_BoolOrList(x)
         elif key == "modalities":
             kw["modalities"] = None if x is None else decode_OptionalStringList(x)
+        elif key == "encoder_handoff":
+            kw["encoder_handoff"] = x
     return GenerateRequest(**kw)
 
 
@@ -7173,6 +7176,8 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["return_sampling_mask"] = encode_BoolOrList(v.return_sampling_mask)
     if v.modalities is not None:
         d["modalities"] = encode_OptionalStringList(v.modalities)
+    if v.encoder_handoff is not None:
+        d["encoder_handoff"] = v.encoder_handoff
     return d
 
 

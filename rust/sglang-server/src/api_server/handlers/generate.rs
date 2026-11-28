@@ -396,6 +396,16 @@ impl CoreHandle {
     }
 
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
+        // This worker has no local MM pool: the router's encoder owns the media.
+        // Reject raw media before fetching any URL or admitting the request.
+        if self.inner.metadata.external_encoder_handoff {
+            if requests.iter().any(GenerateRequest::has_multimodal) {
+                return Err(CoreError::InvalidArgument(
+                    "external encoder mode requires encoder_handoff for multimodal requests".into(),
+                ));
+            }
+            return Ok(());
+        }
         // A multimodal model's requests wait here until the MM pool starts, so
         // none is admitted without the processor's media hooks. The wait has
         // no deadline: the pool starts during launch, and runtime shutdown
@@ -943,6 +953,35 @@ mod tests {
     use crate::tokenizer_manager::wiring::TmEvent;
     use bytes::Bytes;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn external_encoder_rejects_raw_media_before_prefetch() {
+        let mut harness = Harness::unbounded(8);
+        Arc::get_mut(&mut harness.handle.inner)
+            .unwrap()
+            .metadata
+            .external_encoder_handoff = true;
+        let raw_media = GenerateRequest {
+            mm: Some(Box::new(MmData {
+                image_data: vec![MmItem::Source("https://unused.invalid/image".into())],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let error = harness
+            .handle
+            .prepare_generations(&mut [raw_media])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CoreError::InvalidArgument(message) if message.contains("encoder_handoff"))
+        );
+        harness
+            .handle
+            .prepare_generations(&mut [GenerateRequest::default()])
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn scheduler_status_is_classified_once_for_non_http_adapters() {

@@ -1283,6 +1283,11 @@ pub struct GenerateRequest {
     pub return_sampling_mask: ::core::option::Option<BoolOrList>,
     #[prost(message, optional, tag = "40")]
     pub modalities: ::core::option::Option<OptionalStringList>,
+    /// Private language-only ingress. Names the encoder an external router has
+    /// already asked to encode this request's media, so the worker only registers
+    /// its receive address there. Requires unexpanded input_ids and a rid.
+    #[prost(string, optional, tag = "41")]
+    pub encoder_handoff: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Per-request Unlimited-OCR options. The processor owns mode validation and
 /// defaults: an absent image_mode uses "gundam", an empty prefix adds no tokens.

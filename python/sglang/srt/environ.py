@@ -2128,6 +2128,8 @@ class Envs:
     # Encoder pipeline and disaggregation
     # ===================================================================
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
+    # A Rust language worker accepts the encoder an external router selected.
+    SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF = EnvBool(False)
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
