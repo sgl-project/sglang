@@ -116,5 +116,46 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         self.assertIs(attention.input, projected_hidden)
 
 
+class _ExternalTarget(torch.nn.Module):
+    """An external-package target whose `lm_head` forward is target-only."""
+
+    def __init__(self, shared_modules) -> None:
+        super().__init__()
+        self.lm_head = torch.nn.Linear(2, 3)
+        self.embed = torch.nn.Embedding(3, 2)
+        self.shared_modules = shared_modules
+
+    def get_input_embeddings(self):
+        return self.embed
+
+    def get_dspark_shared_modules(self):
+        return self.shared_modules
+
+
+class DSparkSharedModulesTest(CustomTestCase):
+    def test_the_provider_hook_wins_over_lm_head_and_input_embeddings(self) -> None:
+        """An external target's raw vocab modules must reach the draft, not its
+        `lm_head` / `get_input_embeddings`, which may postprocess."""
+        raw_embed, raw_head = torch.nn.Embedding(3, 2), torch.nn.Linear(2, 3)
+        target = _ExternalTarget((raw_embed, raw_head))
+        worker = object.__new__(DSparkWorkerV2)
+
+        embed_tokens, lm_head = worker._resolve_target_dspark_modules(target)
+
+        self.assertIs(embed_tokens, raw_embed)
+        self.assertIs(lm_head, raw_head)
+
+    def test_a_malformed_provider_result_is_rejected(self) -> None:
+        worker = object.__new__(DSparkWorkerV2)
+        for bad in ([torch.nn.Embedding(3, 2), torch.nn.Linear(2, 3)], (None,)):
+            with (
+                self.subTest(result=bad),
+                self.assertRaisesRegex(
+                    RuntimeError, r"_ExternalTarget\.get_dspark_shared_modules\(\)"
+                ),
+            ):
+                worker._resolve_target_dspark_modules(_ExternalTarget(bad))
+
+
 if __name__ == "__main__":
     unittest.main()
