@@ -150,6 +150,20 @@ class MooncakeTransferEngine(KVTransferEngine):
             self.hostname, self.engine.get_rpc_port()
         ).to_host_port_str()
 
+    def enable_memory_registration_reuse(self) -> bool:
+        """Let several users register identical or contained regions; False if unsupported."""
+        if not hasattr(self.engine, "enable_memory_registration_reuse"):
+            logger.warning(
+                "Mooncake lacks enable_memory_registration_reuse; "
+                "upgrade it to share one engine between the store and PD."
+            )
+            return False
+        ret = self.engine.enable_memory_registration_reuse()
+        if ret != 0:
+            logger.warning(f"Mooncake refused memory registration reuse (ret={ret})")
+            return False
+        return True
+
     def register(self, ptr, length) -> None:
         try:
             ret_value = self.engine.register_memory(ptr, length)

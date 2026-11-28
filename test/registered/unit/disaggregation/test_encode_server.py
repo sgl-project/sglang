@@ -726,6 +726,27 @@ class TestMooncakeRegistration(CustomTestCase):
         with self.assertLogs(level="ERROR"):
             self.engine.batch_register([0x10000], [0x1000])
 
+    def test_registration_reuse_falls_back_without_native_api(self):
+        self.engine.engine = unittest.mock.Mock(spec=["register_memory"])
+
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertFalse(self.engine.enable_memory_registration_reuse())
+
+        self.assertIn("lacks enable_memory_registration_reuse", logs.output[0])
+
+    def test_registration_reuse_falls_back_on_nonzero_status(self):
+        self.engine.engine.enable_memory_registration_reuse.return_value = -6
+
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertFalse(self.engine.enable_memory_registration_reuse())
+
+        self.assertIn("refused memory registration reuse (ret=-6)", logs.output[0])
+
+    def test_registration_reuse_enabled(self):
+        self.engine.engine.enable_memory_registration_reuse.return_value = 0
+
+        self.assertTrue(self.engine.enable_memory_registration_reuse())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -454,13 +454,15 @@ class MooncakeBaseStore:
         )
 
     def register_buffer(self, tensor: torch.Tensor):
-        if self.store is None:
-            raise RuntimeError("Mooncake store is not initialized.")
-        ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
         if size == 0:
             # conv-only models have a 0-element ssm state; nothing to register
             return
+        self.register_memory(tensor.data_ptr(), size)
+
+    def register_memory(self, ptr: int, size: int) -> None:
+        if self.store is None:
+            raise RuntimeError("Mooncake store is not initialized.")
         ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
             logger.error(f"Failed to register buffer, error code: {ret_code}")
@@ -721,11 +723,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         get_mooncake_transfer_engine,
                     )
 
-                    self._shared_mooncake_transfer_engine = (
-                        get_mooncake_transfer_engine()
-                    )
+                    shared_engine = get_mooncake_transfer_engine()
                 except Exception:
-                    self._shared_mooncake_transfer_engine = None
+                    shared_engine = None
                     logger.debug("Failed to reuse initialized mooncake transfer engine")
 
                 # Only reuse the shared MooncakeTransferEngine when its
@@ -733,22 +733,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 # PD may already have created an NVLink engine even when
                 # storage opted out of sharing in order to use RDMA.
                 # A TENT engine has no classic engine object for the store to drive.
+                # Without registration reuse the store and PD would register the
+                # same buffers twice on one engine, so the store builds its own.
                 if (
                     envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
-                    and isinstance(
-                        self._shared_mooncake_transfer_engine, MooncakeTransferEngine
-                    )
-                    and device_name
-                    == self._shared_mooncake_transfer_engine.get_ib_device()
+                    and isinstance(shared_engine, MooncakeTransferEngine)
+                    and device_name == shared_engine.get_ib_device()
                     and self.config.metadata_server == "P2PHANDSHAKE"
                     and self.config.protocol == "rdma"
+                    and shared_engine.enable_memory_registration_reuse()
                 ):
-                    client_hostname = (
-                        self._shared_mooncake_transfer_engine.get_session_id()
-                    )
-                    transfer_engine = self._shared_mooncake_transfer_engine.get_engine()
+                    client_hostname = shared_engine.get_session_id()
+                    transfer_engine = shared_engine.get_engine()
                     logger.info(
-                        f"Reuse initialized mooncake transfer engine: {self._shared_mooncake_transfer_engine}"
+                        f"Reuse initialized mooncake transfer engine: {shared_engine}"
                     )
                 else:
                     client_hostname = self.config.local_hostname
