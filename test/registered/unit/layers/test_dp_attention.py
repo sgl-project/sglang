@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -9,6 +10,7 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     _DpGatheredBufferWrapper,
     get_dp_global_num_tokens,
+    get_dp_local_slice_cpu,
     get_global_dp_buffer_len,
     get_local_dp_buffer_len,
     is_dp_max_padding,
@@ -98,6 +100,24 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
         ):
             set_dp_buffer_len_from_batch(batch)
         self.assertEqual(get_local_dp_buffer_len(), 0)
+
+
+class TestGetDpLocalSliceCpu(unittest.TestCase):
+    def test_graph_stride_uses_the_decoded_batch_size(self):
+        batch = SimpleNamespace(global_num_tokens_cpu=[7, 7])
+        with patch("sglang.srt.layers.dp_attention.dp_slot_in", return_value=1):
+            self.assertEqual(
+                get_dp_local_slice_cpu(
+                    batch, can_run_graph=True, cuda_graph_batch=4
+                ),
+                (4, 7),
+            )
+            self.assertEqual(
+                get_dp_local_slice_cpu(
+                    batch, can_run_graph=True, cuda_graph_batch=None
+                ),
+                (7, 7),
+            )
 
 
 if __name__ == "__main__":
