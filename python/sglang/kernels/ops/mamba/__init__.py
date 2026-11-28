@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -40,6 +45,19 @@ register_kernel(
             "sglang.kernels.ops.mamba.causal_conv1d_triton:"
             "_CAUSAL_CONV1D_OP.forward_triton"
         ),
+    )
+)
+# AITER FlyDSL on gfx950 under SGLANG_USE_AITER; CausalConv1dOp falls back to
+# Triton where it is unavailable or declines the batch.
+register_kernel(
+    KernelSpec(
+        op="mamba.causal_conv1d_fn",
+        backend=KernelBackend.FLYDSL,
+        target=(
+            "sglang.kernels.ops.mamba.causal_conv1d_triton:"
+            "_CAUSAL_CONV1D_OP.forward_flydsl"
+        ),
+        capabilities=frozenset({CapabilityRequirement.HIP}),
     )
 )
 
