@@ -91,6 +91,7 @@ from sglang.srt.arg_groups.parallel_hook import (
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.arg_groups.serving_hook import (
     handle_admin_api_key_env,
+    handle_api_key_env,
     handle_crash_dump_env,
     handle_grpc_args,
     handle_load_balance_method,
@@ -1154,6 +1155,46 @@ class TestAdminApiKeyEnv(CustomTestCase):
             handle_admin_api_key_env(server_args)
 
         self.assertEqual(resolution_result(server_args, "admin_api_key"), "sk-flag")
+
+
+class TestApiKeyEnvFallback(CustomTestCase):
+    """--api-key falls back to SGLANG_API_KEY when the flag is absent, so
+    the secret never has to appear in the process command line
+    (world-readable via /proc/<pid>/cmdline). The CLI flag keeps
+    precedence. (The --admin-api-key fallback is covered by
+    TestAdminApiKeyEnv.)
+    """
+
+    @staticmethod
+    def _args(**kwargs):
+        return ServerArgs(model_path="dummy", **kwargs)
+
+    def test_env_api_key_used_when_flag_absent(self):
+        sa = self._args()
+        with envs.SGLANG_API_KEY.override("env-secret"):
+            handle_api_key_env(sa)
+        self.assertEqual(resolution_result(sa, "api_key"), "env-secret")
+
+    def test_cli_api_key_takes_precedence_over_env(self):
+        sa = self._args(api_key="cli-secret")
+        with envs.SGLANG_API_KEY.override("env-secret"):
+            handle_api_key_env(sa)
+        self.assertEqual(resolution_result(sa, "api_key"), "cli-secret")
+
+    def test_empty_env_value_counts_as_unset(self):
+        sa = self._args()
+        with envs.SGLANG_API_KEY.override(""):
+            handle_api_key_env(sa)
+        self.assertIsNone(resolution_result(sa, "api_key"))
+
+    def test_env_api_key_conflicts_with_grpc_port(self):
+        # The env-provided key must hit the same --grpc-port incompatibility
+        # check as a CLI-provided one.
+        sa = self._args(grpc_port=50051)
+        with envs.SGLANG_API_KEY.override("env-secret"):
+            handle_api_key_env(sa)
+            with self.assertRaisesRegex(ValueError, "incompatible"):
+                handle_grpc_args(sa)
 
 
 class TestTokenSpaceProcessorArgs(CustomTestCase):
