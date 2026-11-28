@@ -1556,6 +1556,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>300</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_DECODE_PREALLOC_BACKFILL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Allow a smaller request to reserve KV space when an earlier request is blocked in the standard PD decode preallocation queue. A scan can skip up to eight blocked requests. Each blocked request can be overtaken by at most four successful reservations. Priority scheduling, pipeline parallelism and specialized cache modes retain their existing ordering.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Interval (seconds) between disaggregation heartbeats.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>5.0</code></td>
