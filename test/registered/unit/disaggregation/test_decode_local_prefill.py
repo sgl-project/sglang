@@ -113,7 +113,7 @@ class TestDecodeLocalPrefillScheduler(CustomTestCase):
         scheduler.hisparse_coordinator = None
         scheduler.dllm_config = None
         scheduler.request_retirer = MagicMock()
-        scheduler.sampler_params_pool = MagicMock()
+        scheduler.sampling_params_pool = MagicMock()
         scheduler.penalty_status_pool = MagicMock()
         return scheduler
 
