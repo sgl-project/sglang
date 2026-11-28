@@ -161,6 +161,7 @@ def test_scheduler_isolates_invalid_messages_and_replies(invalid, reply_blocked)
         sp_degree=1,
         enable_cfg_parallel=False,
         tp_size=1,
+        pp_size=1,
     )
     try:
         before = Req(sampling_params=SamplingParams(prompt="before"))
