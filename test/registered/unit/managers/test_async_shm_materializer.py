@@ -6,7 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
 from sglang.srt.managers.mm_utils import ShmPointerMMData
+from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
     AsyncShmMaterializer,
     create_async_shm_materializer,
@@ -14,6 +16,9 @@ from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
 )
 from sglang.srt.models.unlimited_ocr_v2_support.request_receiver import (
     UocrRequestReceiver,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
+    UocrSchedulerRuntime,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -26,6 +31,81 @@ class FakePointer:
         self.shm_name = name
         self.shape = shape
         self.dtype = SimpleNamespace(itemsize=itemsize)
+
+
+class UocrRequestReceiverFactoryTest(CustomTestCase):
+    def _create_receiver(self, *, input_blocker):
+        runtime = object.__new__(UocrSchedulerRuntime)
+        runtime._crop_transfer = SimpleNamespace(prefetch_requests=Mock())
+        receiver = runtime.create_request_receiver(
+            # Single-rank, single-node UOCR is supported by the async factory.
+            parallel=SimpleNamespace(
+                tp_size=1, pp_size=1, num_dp_ranks=1, attn_cp_size=1, nnodes=1
+            ),
+            attn_dp_enabled=False,
+            # CPU feature transport and non-scripted/non-Rust input are also
+            # required for the supported async configuration.
+            mm_feature_transport="cpu",
+            scripted_scheduler_hook=None,
+            rust_server_mode=False,
+            # This is the receive bound implicated in blocker batch release.
+            max_recv_per_poll=2,
+            input_blocker=input_blocker,
+            # The following receiver collaborators are not exercised: raw input
+            # is patched below, no skipper/MM receiver is active, and finalization
+            # is disabled by the non-multimodal model configuration.
+            recv_from_tokenizer=None,
+            recv_skipper=None,
+            mm_receiver=None,
+            model_config=SimpleNamespace(is_multimodal=False),
+            request_retirer=Mock(),
+            get_last_batch=lambda: None,
+        )
+        self.addCleanup(receiver.close)
+        return receiver
+
+    def test_default_supported_configuration_remains_async(self):
+        receiver = self._create_receiver(input_blocker=None)
+
+        self.assertIsInstance(receiver.async_shm_materializer, AsyncShmMaterializer)
+
+    def test_input_blocker_releases_full_batches_synchronously(self):
+        blocker = SchedulerInputBlocker(noop=False)
+        receiver = self._create_receiver(input_blocker=blocker)
+        self.assertIsNone(receiver.async_shm_materializer)
+
+        a, b, c = object(), object(), object()
+        raw_batches = [
+            [BlockReqInput(req_type=BlockReqType.BLOCK), a, b],
+            [c, BlockReqInput(req_type=BlockReqType.UNBLOCK)],
+        ]
+        receiver_module = "sglang.srt.managers.scheduler_components.request_receiver"
+        with (
+            # Replace only raw transport pulling. The factory, public receiver,
+            # blocker state machine, and synchronous fallback remain real.
+            patch.object(
+                UocrRequestReceiver, "_pull_raw_reqs", side_effect=raw_batches
+            ),
+            # A single rank needs no broadcast, and a local unblock completes
+            # when its barrier observes the collective arrival.
+            patch(
+                receiver_module + ".get_parallel",
+                return_value=SimpleNamespace(
+                    pp_rank=0, tp_size=1, attn_dp_enabled=False
+                ),
+            ),
+            patch(
+                receiver_module + ".get_disagg",
+                return_value=SimpleNamespace(language_only=False),
+            ),
+            patch.object(
+                blocker._global_unblock_barrier,
+                "_compute_global_arrived",
+                return_value=True,
+            ),
+        ):
+            self.assertEqual(receiver.recv_requests(), [])
+            self.assertEqual(receiver.recv_requests(), [a, b, c])
 
 
 class AsyncShmMaterializerTest(CustomTestCase):
