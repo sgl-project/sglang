@@ -41,10 +41,17 @@ _ROUTED_EXPERT_PATTERN = re.compile(r"\.experts\.")
 logger = logging.getLogger(__name__)
 
 
-def _inkling2_qkvr_member_rows(text_config) -> tuple[int, ...]:
+def _inkling2_qkvr_member_rows(text_config, *, is_local: bool) -> tuple[int, ...]:
     """Unsharded output rows of each qkvr member, in INKLING2_QKVR_PROJECTIONS order."""
-    heads, kv_heads = text_config.num_attention_heads, text_config.num_key_value_heads
-    head_dim = text_config.head_dim
+    # Local layers take the swa_* geometry, as Inkling2Attention does.
+    if is_local:
+        heads = text_config.swa_num_attention_heads
+        kv_heads = text_config.swa_num_key_value_heads
+        head_dim = text_config.swa_head_dim
+    else:
+        heads = text_config.num_attention_heads
+        kv_heads = text_config.num_key_value_heads
+        head_dim = text_config.head_dim
     return (
         heads * head_dim,
         kv_heads * head_dim,
@@ -338,7 +345,7 @@ class LoRAAdapter(nn.Module):
         An untrained member (Tinker adapters skip attn_sink_proj) loads as zeros, so
         its qkvr slice gets no delta.
         """
-        member_rows = _inkling2_qkvr_member_rows(self.base_hf_config.get_text_config())
+        text_config = self.base_hf_config.get_text_config()
         prefixes = {
             name[: name.index(f".{member}.lora_A.")]
             for name in weights
@@ -346,6 +353,10 @@ class LoRAAdapter(nn.Module):
             if f".{member}.lora_A." in name
         }
         for prefix in prefixes:
+            member_rows = _inkling2_qkvr_member_rows(
+                text_config,
+                is_local=get_layer_id(prefix) in text_config.local_layer_ids,
+            )
             a_parts, b_parts = _inkling2_qkvr_member_parts(
                 weights, prefix=prefix, member_rows=member_rows
             )

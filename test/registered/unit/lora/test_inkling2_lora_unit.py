@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.utils import get_normalized_target_modules
@@ -35,17 +36,23 @@ _TARGETS = [f"attn.{m}" for m in (*_TRAINED, "wo_ud")] + [
 _LAYER = "model.llm.layers.{}.attn"
 
 
-def _text_config():
+def _text_config(swa_heads=_HEADS, local_layer_ids=(0,)):
     return SimpleNamespace(
         num_attention_heads=_HEADS,
         num_key_value_heads=_KV_HEADS,
         head_dim=_HEAD_DIM,
+        swa_num_attention_heads=swa_heads,
+        swa_num_key_value_heads=_KV_HEADS,
+        swa_head_dim=_HEAD_DIM,
         d_rel=_D_REL,
+        local_layer_ids=list(local_layer_ids),
     )
 
 
-def _adapter(architecture="Inkling2LoopForConditionalGeneration", num_layers=2):
-    text = _text_config()
+def _adapter(
+    architecture="Inkling2LoopForConditionalGeneration", num_layers=2, text=None
+):
+    text = text or _text_config()
     return LoRAAdapter(
         uid="inkling2",
         config=LoRAConfig.from_dict(
@@ -113,6 +120,20 @@ def test_qkvr_stacks_six_slices_with_zero_sink():
                 assert not a_slices[slot].any() and not b_slices[slot].any()
 
 
+def test_local_layers_use_swa_geometry():
+    """A local layer's members are sized by swa_* heads, not the full-attention ones."""
+    swa_heads = 16
+    tensors = _member_tensors(0)
+    for member in ("wq_du", "wr_du", "gate_attn"):
+        rows = _MEMBER_ROWS[member] // _HEADS * swa_heads
+        tensors[f"{_LAYER.format(0)}.{member}.lora_B.weight"] = torch.zeros(rows, _RANK)
+    adapter = _adapter(num_layers=1, text=_text_config(swa_heads=swa_heads))
+    adapter.initialize_weights_from_tensors(tensors)
+    lora_b = adapter.layers[0].weights[f"{_LAYER.format(0)}.qkvr.lora_B.weight"]
+    q, kv, r = swa_heads * _HEAD_DIM, _KV_HEADS * _HEAD_DIM, swa_heads * _D_REL
+    assert lora_b.shape == (q + 2 * kv + r + q + swa_heads, _RANK)
+
+
 def test_qkvr_rejects_a_member_with_wrong_rows():
     tensors = _member_tensors(0)
     bad = f"{_LAYER.format(0)}.wk_dv.lora_B.weight"
@@ -162,7 +183,8 @@ def test_hidden_dims_match_mini():
     from sglang.srt.models.inkling2 import Inkling2ForConditionalGeneration
 
     attn = SimpleNamespace(
-        qkvr=_FakeLinear(_D, list(_MEMBER_ROWS.values())),
+        # A trailing pad slice carries no adapter.
+        qkvr=_FakeLinear(_D, [*_MEMBER_ROWS.values(), 8]),
         wo_ud=_FakeLinear(_HEADS * _HEAD_DIM, [_D]),
     )
     model = Inkling2ForConditionalGeneration.__new__(Inkling2ForConditionalGeneration)
@@ -186,38 +208,30 @@ def test_hidden_dims_match_mini():
     assert model.get_stacked_multiply("wo_ud") == 1
 
 
-def test_stacked_rows_give_each_slice_its_own_source():
-    """Full-attention layers project three stacked sources and keep q, r, gate from
-    the first block, k from the second, v from the third. A LoRA delta added to every
-    row of the fused output must equal projecting each source separately."""
-    torch.manual_seed(0)
-    tokens, rank = 5, 4
-    sizes = [12, 4, 4, 6, 12, 3]  # q, k, v, r, gate, sink
-    weight = torch.randn(sum(sizes), 8)
-    lora_a = [torch.randn(rank, 8) for _ in sizes]
-    lora_b = [torch.randn(n, rank) for n in sizes]
-    lora_b[-1].zero_()
-    q_src, k_src, v_src = (torch.randn(tokens, 8) for _ in range(3))
+class _RecordingLoRAQKVR(BaseLayerWithLoRA):
+    def __init__(self, width):
+        nn.Module.__init__(self)
+        self.width, self.rows = width, []
 
-    def fused(x):
-        delta = torch.cat([x @ a.T @ b.T for a, b in zip(lora_a, lora_b)], dim=-1)
-        return x @ weight.T + 2 * delta
+    def forward(self, x):
+        self.rows.append(x.shape[0])
+        return torch.zeros(x.shape[0], self.width), None
 
-    q_out, k_out, v_out = fused(torch.cat((q_src, k_src, v_src))).chunk(3)
-    q, _, _, r, gate, sink = q_out.split(sizes, dim=-1)
-    k = k_out.split(sizes, dim=-1)[1]
-    v = v_out.split(sizes, dim=-1)[2]
 
-    def reference(x, slot):
-        w = weight.split(sizes)[slot]
-        return x @ w.T + 2 * x @ lora_a[slot].T @ lora_b[slot].T
+def test_lora_qkvr_projects_each_source_separately():
+    """LoRA kernels walk the batch's T token segments, so stacking three sources into
+    [3T, D] would leave the k and v rows without their adapter delta."""
+    from sglang.srt.models.inkling_common.inkling2_attn import (
+        AttentionSources,
+        Inkling2Attention,
+    )
 
-    for got, src, slot in (
-        (q, q_src, 0),
-        (k, k_src, 1),
-        (v, v_src, 2),
-        (r, q_src, 3),
-        (gate, q_src, 4),
-        (sink, q_src, 5),
-    ):
-        torch.testing.assert_close(got, reference(src, slot))
+    sizes = list(_MEMBER_ROWS.values())
+    attn = Inkling2Attention.__new__(Inkling2Attention)
+    nn.Module.__init__(attn)
+    attn.split_sizes = sizes
+    attn.qkvr = _RecordingLoRAQKVR(sum(sizes))
+    tokens = 5
+    sources = AttentionSources(*(torch.randn(tokens, _D) for _ in range(3)))
+    attn._project_sources(sources)
+    assert attn.qkvr.rows == [tokens, tokens, tokens]
