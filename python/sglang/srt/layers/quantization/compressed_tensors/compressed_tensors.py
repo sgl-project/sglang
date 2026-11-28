@@ -68,6 +68,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
     find_matched_target,
+    find_matched_targets,
     is_activation_quantization_format,
     should_ignore_layer,
 )
@@ -1296,20 +1297,6 @@ class CompressedTensorsConfig(QuantizationConfig):
         layer_name: str | None = None,
         matched_target: str | None = None,
     ) -> dict[str, QuantizationArgs | str | None] | None:
-        """
-        Extract the QuantizationArgs for a given layer.
-
-        A caller that already resolved the layer's target (e.g. via
-        suffix-aware matching) passes it as ``matched_target`` to skip
-        ``find_matched_target``'s stricter exact/regex lookup.
-
-        Returns:
-            dict with {
-                "weights": QuantizationArgs,
-                "input_activations": QuantizationArgs | None,
-                "format": str | None
-            } | None
-        """
         if should_ignore_layer(
             layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
@@ -1318,12 +1305,34 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
             if matched_target is None:
-                matched_target = find_matched_target(
+                matched_targets = find_matched_targets(
                     layer_name=layer_name,
                     module=layer,
                     targets=self.target_scheme_map.keys(),
                     fused_mapping=self.packed_modules_mapping,
                 )
+                first_scheme = self.target_scheme_map[matched_targets[0]]
+
+                def _effective_scheme(scheme):
+                    fmt = scheme.get("format")
+                    return {
+                        **scheme,
+                        "format": self.quant_format if fmt is None else fmt,
+                    }
+
+                first_effective = _effective_scheme(first_scheme)
+                for other_target in matched_targets[1:]:
+                    if (
+                        _effective_scheme(self.target_scheme_map[other_target])
+                        != first_effective
+                    ):
+                        raise ValueError(
+                            f"Found incompatible quantization schemes for fused layer "
+                            f"{layer_name}: matched targets {matched_targets} resolve "
+                            "to different schemes. SGLang requires all fused components "
+                            "to use the same quantization scheme."
+                        )
+                return first_scheme
 
             return self.target_scheme_map[matched_target]
 

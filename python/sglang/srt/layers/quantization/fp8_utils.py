@@ -4,7 +4,7 @@ import logging
 import re
 from enum import Enum
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -36,6 +36,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers import deep_gemm_wrapper, offloader
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
@@ -1127,8 +1128,167 @@ def pack_mxfp8_weight_scale_for_deepgemm(
     )
 
 
-def dispatch_w8a8_mxfp8_linear() -> Callable:
-    backend = resolve_mxfp8_dense_gemm_backend()
+def _prepare_mxfp8_trtllm_weights(
+    layer: torch.nn.Module,
+    scale_u8: torch.Tensor,
+    *,
+    scale_attr: str,
+) -> None:
+    from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+
+    weight = layer.weight.data
+    n, k = weight.shape
+    epilogue_tile_m = 128
+    sf_cols = k // 32
+
+    scale_u8 = scale_u8.contiguous().view(torch.uint8).reshape(n, sf_cols)
+    padded_n = ((n + epilogue_tile_m - 1) // epilogue_tile_m) * epilogue_tile_m
+    pad_rows = padded_n - n
+    if pad_rows:
+        scale_u8 = torch.nn.functional.pad(
+            scale_u8,
+            (0, 0, 0, pad_rows),
+            mode="constant",
+            value=0,
+        )
+
+    copy_or_rebind_param(
+        layer,
+        "weight_shuffled",
+        shuffle_matrix_a(weight.contiguous().view(torch.uint8), epilogue_tile_m).view(
+            weight.dtype
+        ),
+    )
+    copy_or_rebind_param(
+        layer,
+        f"{scale_attr}_shuffled",
+        shuffle_matrix_sf_a(
+            scale_u8,
+            epilogue_tile_m,
+            num_elts_per_sf=32,
+        )
+        .reshape_as(scale_u8)
+        .contiguous(),
+    )
+
+
+def prepare_mxfp8_linear_weight_scale(
+    layer: torch.nn.Module,
+    backend: Mxfp8DenseGemmBackend,
+    scale_u8: torch.Tensor,
+    *,
+    scale_attr: str = "weight_scale_inv",
+    params_dtype: Optional[torch.dtype] = None,
+) -> None:
+    if backend.is_flashinfer_trtllm():
+        _prepare_mxfp8_trtllm_weights(layer, scale_u8, scale_attr=scale_attr)
+    elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
+        from flashinfer import block_scale_interleave
+
+        # block_scale_interleave may pad and/or reshape scales,
+        # so store swizzled scales separately to keep weight update working
+        copy_or_rebind_param(
+            layer,
+            f"{scale_attr}_swizzled",
+            block_scale_interleave(scale_u8.contiguous()).contiguous(),
+        )
+    elif backend.is_deep_gemm():
+        from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+            DEEPGEMM_SCALE_UE8M0,
+        )
+
+        n, k = layer.weight.shape
+        swizzled_attr = f"{scale_attr}_swizzled"
+        shape_supported = n % 64 == 0 and k % 128 == 0
+        dtype_supported = params_dtype is None or params_dtype == torch.bfloat16
+        if not (shape_supported and dtype_supported):
+            if not (get_platform().is_blackwell and is_flashinfer_available()):
+                raise RuntimeError(
+                    f"--fp8-gemm-backend=deep_gemm cannot serve MXFP8 weight shape "
+                    f"({n}, {k}) with dtype {params_dtype} "
+                    "(needs N % 64 == 0, K % 128 == 0, and bfloat16), and this "
+                    "device has no FlashInfer MXFP8 fallback kernel."
+                )
+            from flashinfer import block_scale_interleave
+
+            copy_or_rebind_param(
+                layer,
+                swizzled_attr,
+                block_scale_interleave(scale_u8.contiguous()).contiguous(),
+            )
+        else:
+            setattr(layer, swizzled_attr, None)
+        if DEEPGEMM_SCALE_UE8M0:
+            # Pre-packed; GEMM must be called with disable_ue8m0_cast=True.
+            scale_packed = pack_mxfp8_weight_scale_for_deepgemm(scale_u8, n, k)
+        else:
+            scale_packed = (
+                (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
+                .view(torch.float32)
+                .view(n, k // 32)
+            )
+        copy_or_rebind_param(layer, f"{scale_attr}_deepgemm", scale_packed)
+    elif backend.is_halops():
+        from sglang.srt.layers.quantization.halops_mxfp8 import (
+            swizzle_scale_to_sfatom,
+            weight_supported,
+        )
+
+        n, k = layer.weight.shape
+        halops_attr = f"{scale_attr}_halops"
+        if not weight_supported(n=n, k=k):
+            setattr(layer, halops_attr, None)
+        else:
+            copy_or_rebind_param(
+                layer,
+                halops_attr,
+                swizzle_scale_to_sfatom(scale_u8.contiguous().view(torch.uint8)),
+            )
+    elif backend.is_xpu_scaled_mm() or backend.is_unsupported():
+        return
+    else:
+        raise NotImplementedError(
+            f"Unsupported MXFP8 dense GEMM backend: {backend.value}."
+        )
+
+
+def resolve_mxfp8_linear_weight(
+    layer: torch.nn.Module,
+    backend: Mxfp8DenseGemmBackend,
+) -> torch.Tensor:
+    if backend.is_flashinfer_trtllm():
+        return layer.weight_shuffled
+    return layer.weight
+
+
+def resolve_mxfp8_linear_weight_scale(
+    layer: torch.nn.Module,
+    backend: Mxfp8DenseGemmBackend,
+    *,
+    scale_attr: str = "weight_scale_inv",
+) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+    if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
+        return getattr(layer, f"{scale_attr}_swizzled"), {}
+    if backend.is_flashinfer_trtllm():
+        return getattr(layer, f"{scale_attr}_shuffled"), {}
+    if backend.is_deep_gemm():
+        return (
+            getattr(layer, f"{scale_attr}_deepgemm"),
+            {"weight_scale_swizzled": getattr(layer, f"{scale_attr}_swizzled")},
+        )
+    if backend.is_halops():
+        return (
+            getattr(layer, f"{scale_attr}_halops"),
+            {"weight_scale_fallback": getattr(layer, scale_attr)},
+        )
+    return getattr(layer, scale_attr), {}
+
+
+def dispatch_w8a8_mxfp8_linear(
+    backend: Optional[Mxfp8DenseGemmBackend] = None,
+) -> Callable:
+    if backend is None:
+        backend = resolve_mxfp8_dense_gemm_backend()
     if backend.is_deep_gemm():
         return deepgemm_w8a8_mxfp8_linear_with_fallback
     elif backend.is_flashinfer_trtllm():
@@ -1282,9 +1442,6 @@ def deepgemm_w8a8_mxfp8_linear_with_fallback(
             scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
-
-    # weight_scale format is set per-backend by _process_mxfp8_linear_weight_scale
-    # (int32 packed TMA-aligned on Blackwell, float32 on Hopper); NOT uint8 — Triton form is routed to the fallback above.
 
     output = w8a8_mxfp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, output_dtype=output_dtype
