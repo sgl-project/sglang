@@ -644,8 +644,7 @@ class CommonKVManager(BaseKVManager):
         every CP rank holds the same state. When all CP ranks transfer their KV
         shards, only rank 0 needs to send that state. Cache layer split is the
         exception because each CP rank owns different state layers. Page-sharded
-        DSA indexer state likewise needs every owner; Mooncake filters its page
-        lists before transfer instead of suppressing whole ranks.
+        DSA indexer state likewise needs every owner to send its own pages.
         """
         return (
             self.attn_cp_size > 1
@@ -654,6 +653,21 @@ class CommonKVManager(BaseKVManager):
             and not get_parallel().enable_cp_tp_group_sharing
             and getattr(self, "kv_shard_size", 1) <= 1
         )
+
+    def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
+        """Pair target/draft indexer pages before narrowing to this owner."""
+        if len(src_indices) != len(dst_indices):
+            raise RuntimeError(
+                "Sharded DSA state page count mismatch: "
+                f"prefill={len(src_indices)}, dst={len(dst_indices)}"
+            )
+        local_indices, positions = filter_kv_indices_for_shard_rank(
+            kv_indices=np.asarray(src_indices, dtype=np.int32),
+            index_slice=slice(0, len(src_indices)),
+            shard_rank=self.kv_shard_rank,
+            shard_size=self.kv_shard_size,
+        )
+        return local_indices, np.asarray(dst_indices, dtype=np.int32)[positions]
 
     # The three helpers below hold under ``kv_shard_state_peer_only`` only;
     # callers check that flag first, so unsharded transfers read nothing new.
@@ -2576,9 +2590,21 @@ class CommonKVSender(BaseKVSender):
     ):
         self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
-            for component_indices in state_indices:
-                if component_indices is not None:
-                    self._transfer_num_state_indices += len(component_indices)
+            for i, indices in enumerate(state_indices):
+                if indices is None:
+                    continue
+                if (
+                    self.kv_mgr.kv_shard_size > 1
+                    and self.kv_mgr.kv_args.state_types[i] == StateType.DSA
+                ):
+                    # Both workers receive logical indexer pages but only send
+                    # pages owned by this rank.
+                    self._transfer_num_state_indices += np.count_nonzero(
+                        np.asarray(indices) % self.kv_mgr.kv_shard_size
+                        == self.kv_mgr.kv_shard_rank
+                    )
+                else:
+                    self._transfer_num_state_indices += len(indices)
 
     def _prepare_send_indices(
         self,

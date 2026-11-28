@@ -2,8 +2,9 @@
 
 torch pin_memory buffers are only reachable by the SDMA engine; AIV kernels
 (e.g. kv_exchange) can only de-reference host VAs that were mapped into the
-device VA space first.  SGLANG_HICACHE_HOST_MEM_BACKEND selects the backend
-(a NpuHostMemoryBackend subclass resolved by get_host_memory_backend()):
+device VA space first. SGLANG_HICACHE_HOST_MEM_BACKEND selects the backend
+(a NpuHostMemoryBackend subclass resolved by get_host_memory_backend()); ACL
+is used when the variable is unset:
 
 - ``memfabric`` (MemfabricHostMemoryBackend): a MemFabric ``Offload``
   instance owns the host pool; ``pool.initialize`` reserves and
@@ -46,9 +47,9 @@ logger = logging.getLogger(__name__)
 _MEMFABRIC_GB = 1024**3
 
 
-def host_memory_backend() -> str | None:
-    """Return 'memfabric' | 'acl' | None from SGLANG_HICACHE_HOST_MEM_BACKEND."""
-    return os.environ.get("SGLANG_HICACHE_HOST_MEM_BACKEND", "").lower() or None
+def host_memory_backend() -> str:
+    """Use ACL by default; honor an explicitly selected host-memory backend."""
+    return (os.environ.get("SGLANG_HICACHE_HOST_MEM_BACKEND") or "acl").lower()
 
 
 def memfabric_host_memory_enabled() -> bool:
@@ -167,7 +168,7 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
 
         total_bytes is the combined byte size of all buffers the calling
         host pool is about to allocate (ultimately derived from
-        --hicache-size / --hicache-ratio).  The entity is sized by the first
+        --hicache-size / --hicache-ratio). The entity is sized by the first
         declaration; later host pools in the same process must fit into
         what is left.
         """
@@ -306,10 +307,8 @@ _backend: NpuHostMemoryBackend | None = None
 def get_host_memory_backend() -> NpuHostMemoryBackend | None:
     """Return the backend selected by SGLANG_HICACHE_HOST_MEM_BACKEND.
 
-    Returns None when no registered-host-memory backend is configured;
-    callers then fall back to plain pinned memory.  The instance is cached,
-    so the selection and the MemFabric entity state are process-wide
-    singletons.
+    ACL is the default. The instance is cached, so the selection and the
+    MemFabric entity state are process-wide singletons.
     """
     global _backend
     if _backend is None:
@@ -332,6 +331,8 @@ def reserve_mla_split_host_memory(
     buffers: MLASplitBuffers,
 ) -> None:
     """Reserve the split MLA host buffers before allocating them."""
+    if not is_npu():
+        return
     backend = get_host_memory_backend()
     if backend is None:
         return

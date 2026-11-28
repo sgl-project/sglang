@@ -1195,7 +1195,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
             reqs=[],
-            sampling_info=SimpleNamespace(set_plugin_state=lambda reqs: None),
+            sampling_info=SimpleNamespace(set_step_state=lambda reqs: None),
         )
         scheduler.get_next_batch_to_run = lambda running_batch, last_batch: (
             SimpleNamespace(batch_to_run=batch, running_batch=running_batch)

@@ -517,7 +517,6 @@ async def create_video(
                         video_reference,
                         request_id,
                         uploads_dir,
-                        prefer_remote_source=server_args.input_save_path is None,
                     )
                 elif video_path or video_url:
                     video_input_path = video_path or video_url
@@ -528,7 +527,6 @@ async def create_video(
                         input_reference,
                         request_id,
                         uploads_dir,
-                        prefer_remote_source=server_args.input_save_path is None,
                     )
                     image_sources = merge_image_input_list(reference_url)
                 elif reference_url and _is_probably_video_source(reference_url):
@@ -542,7 +540,6 @@ async def create_video(
                             image_sources,
                             request_id,
                             uploads_dir,
-                            prefer_remote_source=server_args.input_save_path is None,
                         )
                     except Exception as e:
                         raise HTTPException(
@@ -677,8 +674,6 @@ async def create_video(
                                 payload.get("reference_url"),
                                 request_id,
                                 uploads_dir,
-                                prefer_remote_source=server_args.input_save_path
-                                is None,
                             )
                         except Exception as e:
                             raise HTTPException(

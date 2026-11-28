@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
+import json
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -18,6 +20,7 @@ from sglang.multimodal_gen.configs.sample.magi2 import (
 )
 from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import SpShard
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
@@ -40,8 +43,12 @@ from sglang.multimodal_gen.runtime.models.dits.magi2_layers import (
     Magi2FourierRope,
     Magi2ModalityLinear,
     Magi2ModalityRMSNorm,
+    Magi2PostAdapter,
+    Magi2PreAdapter,
     apply_partial_rope,
+    local_row_range,
     modality_runs,
+    pad_local_rows,
     pad_rows_to_multiple,
     sharded_cu_seqlens,
 )
@@ -84,6 +91,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     skimming_mask,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2.packed_sequence import (
+    build_coords,
     build_layout,
     build_timesteps,
 )
@@ -423,6 +431,99 @@ class TestShardedCuSeqlens(unittest.TestCase):
         )
         self.assertEqual(cu.tolist(), [0, 62, 64])
         self.assertEqual(max_seqlen, 62)
+
+
+class TestAdaptersOnLocalRows(unittest.TestCase):
+    """Each rank embeds and projects only its own rows; stitched together they must
+    equal the adapters run on the whole sequence, pad rows included."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        config = SimpleNamespace(
+            residual_stream_dim=16,
+            time_channel_dim=4,
+            video_in_channels=6,
+            audio_in_channels=5,
+            text_in_channels=7,
+            rope_bands=2,
+        )
+        self.pre = Magi2PreAdapter(config)
+        self.post = Magi2PostAdapter(config)
+        ref = dict(ref_latent_hw=[(2, 2)], ref_patch_counts=[4])
+        self.layout = build_layout(
+            video_latent_thw=(2, 3, 4),
+            audio_tokens=5,
+            text_tokens=6,
+            device=torch.device("cpu"),
+            ref_patch_counts=ref["ref_patch_counts"],
+        )
+        total = self.layout.total_tokens  # 40 rows: 4 ranks of 11, 4 pad rows
+        self.inputs = dict(
+            video=torch.randn(24, 6),
+            audio=torch.randn(5, 5),
+            text=torch.randn(6, 7),
+            layout=self.layout,
+            coords=build_coords(
+                video_latent_shape=(2, 3, 4),
+                audio_tokens=5,
+                text_tokens=6,
+                device=torch.device("cpu"),
+                **ref,
+            ),
+            timestep=torch.rand(total) * 1000,
+            ref_patches=torch.randn(4, 6),
+            ref_special=torch.randn(1, 7),
+        )
+        self.sp = 4
+        local = -(-total // self.sp)
+        self.plans = [
+            SpShard(total, local, local * self.sp - total, self.sp, rank)
+            for rank in range(self.sp)
+        ]
+
+    def _per_rank(self, fn):
+        out = []
+        for plan in self.plans:
+            with mock.patch(
+                "sglang.multimodal_gen.runtime.models.dits.magi2_layers.build_shard_plan",
+                return_value=plan,
+            ):
+                _, row_range = local_row_range(plan.orig_len)
+            out.append(fn(plan, row_range))
+        return out
+
+    def test_pre_adapter_rows_match_the_sharded_full_rows(self):
+        rows, rope = self.pre(**self.inputs)
+        num_pad = self.plans[0].num_pad
+        full = [
+            torch.cat([t, t[-1:].expand(num_pad, *t.shape[1:])]) for t in (rows, rope)
+        ]
+        local = self._per_rank(
+            lambda plan, row_range: pad_local_rows(
+                plan, *self.pre(**self.inputs, row_range=row_range)
+            )
+        )
+        for i, name in enumerate(("rows", "rope")):
+            with self.subTest(name=name):
+                torch.testing.assert_close(torch.cat([r[i] for r in local]), full[i])
+
+    def test_post_adapter_gathers_only_projections(self):
+        rows = torch.randn(self.layout.total_tokens, 16)
+        rows_f = rows.float()
+        ref_video = self.post.final_linear_video(
+            self.post.final_norm_video(rows_f.index_select(0, self.layout.video_index))
+        )
+        ref_audio = self.post.final_linear_audio(
+            self.post.final_norm_audio(rows_f.index_select(0, self.layout.audio_index))
+        )
+        padded = torch.cat([rows, rows[-1:].expand(self.plans[0].num_pad, -1)])
+        local = padded.view(self.sp, -1, 16)
+        gathered = torch.cat([self.post.project(chunk) for chunk in local])
+        video, audio = self.post(
+            gathered[: self.layout.total_tokens], layout=self.layout
+        )
+        torch.testing.assert_close(video, ref_video)
+        torch.testing.assert_close(audio, ref_audio)
 
 
 # 1080p refiner grid: 32 latent frames of 68x120.
@@ -969,6 +1070,8 @@ def _validate_args(**overrides):
         tp_size=1,
         ring_degree=1,
         num_gpus=4,
+        layerwise_offload_components=None,
+        explicit_residency_mode=lambda component: None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -1110,6 +1213,15 @@ class TestServerArgsValidation(unittest.TestCase):
                         _validate_args(attention_backend=backend)
                     )
 
+    def test_text_encoder_streams_unless_placed_explicitly(self):
+        args = _validate_args(layerwise_offload_components=["vae"])
+        Magi2PipelineConfig().validate_server_args(args)
+        self.assertEqual(args.layerwise_offload_components, ["vae", "text_encoder"])
+
+        explicit = _validate_args(explicit_residency_mode=lambda component: "resident")
+        Magi2PipelineConfig().validate_server_args(explicit)
+        self.assertIsNone(explicit.layerwise_offload_components)
+
     def test_data_parallel_is_rejected(self):
         """EP groups span the global world, so dp replicas would share experts."""
         with self.assertRaisesRegex(ValueError, "--dp-size"):
@@ -1147,6 +1259,59 @@ class TestSinkAttentionBackend(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "FlashAttention"):
                 attention._ensure_impl(torch.bfloat16)
+
+
+class TestTextEncoderSourceRank(unittest.TestCase):
+    def test_non_source_ranks_load_no_weights(self):
+        """Only the source rank encodes, so the others must not hold a host copy."""
+        with mock.patch.object(
+            magi2_loader, "get_sp_group", return_value=SimpleNamespace(rank_in_group=1)
+        ):
+            model = magi2_loader.load_magi2_text_encoder(
+                component_path="/nonexistent",
+                server_args=None,
+                component_name="text_encoder",
+                param_dtype=torch.bfloat16,
+            )
+        self.assertLessEqual(sum(p.numel() for p in model.parameters()), 1)
+        with self.assertRaises(RuntimeError):
+            model(input_ids=None)
+
+    def test_source_rank_encoder_joins_no_fold_group(self):
+        """A fold group spanning ranks that never encode deadlocks the cache all-reduce."""
+        from sglang.multimodal_gen.runtime.loader.component_loaders import (
+            text_encoder_loader,
+        )
+
+        pipeline_config = Magi2PipelineConfig()
+        pipeline_config.text_encoder_configs[0].parallel_folding_mode = "world"
+        seen = {}
+
+        def load_model(_self, path, config, server_args, **kwargs):
+            seen["mode"] = config.parallel_folding_mode
+            seen["dtype"] = kwargs["dtype"]
+            return _M()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(f"{tmp}/config.json", "w") as f:
+                json.dump({"text_config": {"num_hidden_layers": 2}}, f)
+            with (
+                mock.patch.object(
+                    magi2_loader,
+                    "get_sp_group",
+                    return_value=SimpleNamespace(rank_in_group=0),
+                ),
+                mock.patch.object(
+                    text_encoder_loader.TextEncoderLoader, "load_model", load_model
+                ),
+            ):
+                magi2_loader.load_magi2_text_encoder(
+                    component_path=tmp,
+                    server_args=SimpleNamespace(pipeline_config=pipeline_config),
+                    component_name="text_encoder",
+                    param_dtype=torch.bfloat16,
+                )
+        self.assertEqual(seen, {"mode": None, "dtype": "bfloat16"})
 
 
 class TestLoaderPrecision(unittest.TestCase):

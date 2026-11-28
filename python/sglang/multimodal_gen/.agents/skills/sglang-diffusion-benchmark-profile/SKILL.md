@@ -56,7 +56,7 @@ If any benchmark, perf-dump, or `torch.profiler` command prints one of those sig
 - [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses checked-in nightly-aligned presets plus current-source extras such as LongCat image/edit, Qwen base edit/layered, SD3.5, SANA-Video/SANA-WM, LingBot Video/World, Cosmos3 Edge/Super I2V/distilled and the explicit Super TP2 x CFG2 comparator, LTX-2.5 and its diffusion decoder, MiniMax-H3, FLUX.2 Klein, Ideogram4, ERNIE/GLM/SANA image models, FastWan2.1/2.2, the Blackwell-only Wan2.2 NVFP4 comparator, `LTX-2.3`, HunyuanVideo, MOVA, Helios, image edit, Hunyuan3D shape, and a separate Pi0.5 action-policy lane
 - [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, MoE routing, packed QKV paths, fused `QK norm + RoPE`, distributed overlap patterns, and open optimization PRs before proposing new code
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery from the skill's owning checkout before falling back to `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
-- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; defaults to eager/lossless, supports explicit quality and BCG comparators plus a same-GPU applicability matrix, rejects invalid BCG capture/fallback logs and late high-quality DiT fusion mounts, forces H3 to its eager consistency mode, enables synchronized stage attribution, validates nightly preset drift, and can clean one isolated model cache after the full matrix in a `finally` block with a JSONL ledger
+- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; defaults to eager/lossless, supports explicit quality and BCG comparators plus a same-GPU applicability matrix, warms up each BCG run at its own quality, rejects invalid BCG capture/fallback logs and requests whose quality has no captured graph, forces H3 to its eager consistency mode, enables synchronized stage attribution, validates nightly preset drift, and can clean one isolated model cache after the full matrix in a `finally` block with a JSONL ledger
 
 ## Opportunity Discovery Rule
 
@@ -103,10 +103,11 @@ A-B-B-A at `exact`, then repeats the pair at `lossless` and `high`, on
 one locked GPU set and one isolated checkpoint cache. The lossless/high+BCG
 rows are applicability checks, not presumed-valid performance cells. A BCG row is invalid unless the log
 contains `[Diffusion BCG] captured` and contains no support-disable,
-capture-failure, serving-signature-miss, or late quality-fusion marker. In
-particular, a request-scoped DiT fusion mounted after exact warmup capture
-would be bypassed by replay; reject that row even when capture and signature
-checks pass. For video presets, the helper declares both the request resolution
+capture-failure, serving-signature-miss, or `has no captured breakable CUDA
+graphs` marker. Warmup captures graphs only at its own quality level, so the
+helper passes each BCG row's quality in `--warmup-sampling-params`. A request
+at any other level runs eager with its own fusion set; reject that row even
+when a capture line is present. For video presets, the helper declares both the request resolution
 and `--warmup-num-frames` so the synthetic BCG warmup captures the requested
 temporal shape. Treat any remaining temporal or conditioning signature miss as
 Eager fallback, not as a valid BCG measurement.

@@ -922,6 +922,7 @@ async fn register_one(
         openai: info.openai.map(Arc::new),
         grpc_port: info.grpc_port,
         supports_inline_system: info.supports_inline_system,
+        prefill_answers_alone: info.prefill_answers_alone,
     };
     if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration

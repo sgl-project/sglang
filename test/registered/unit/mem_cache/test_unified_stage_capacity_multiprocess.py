@@ -313,6 +313,7 @@ def _loop_worker(rank, path, level, drift_round):
                 may_launch=lambda: True,
             )
             self.request_receiver = NS(recv_requests=self._recv_requests)
+            self.flush_wrapper = NS(prepare_pp_probe=lambda vote: False)
             self.metrics_reporter = NS(record_scheduler_active=lambda start: None)
             self.invariant_checker = NS(run=lambda *args: None)
             self.new_token_ratio_tracker = NS(current=0.5)
