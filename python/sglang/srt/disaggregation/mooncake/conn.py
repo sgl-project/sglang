@@ -1452,9 +1452,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 [make_layer_copy(*params) for params in layers_params],
             )
 
-        if (
-            self.enable_custom_mem_pool
-            and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
+        # AMD_GEM only moves the KV pool into GEM BOs; its buffers take the
+        # default RDMA path.
+        if self.enable_custom_mem_pool and self.custom_mem_pool_type not in (
+            "INTRA_NODE_NVLINK",
+            "AMD_GEM",
         ):
             futures = [
                 executor.submit(process_layer, *params) for params in layers_params
@@ -1988,7 +1990,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     return ret
             return 0
 
-        if self.enable_custom_mem_pool:
+        if self.enable_custom_mem_pool and self.custom_mem_pool_type != "AMD_GEM":
             futures = [
                 executor.submit(
                     self._transfer_copies, mooncake_session_id, [c.to_copy()]
