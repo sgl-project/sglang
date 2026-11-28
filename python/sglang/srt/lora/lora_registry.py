@@ -338,6 +338,9 @@ class LoRARegistry:
         """
         return len(self._registry)
 
+    def has_adapter(self, lora_name: str) -> bool:
+        return lora_name in self._registry
+
     def get_all_adapters(self) -> Dict[str, LoRARef]:
         """
         Returns a dictionary of all registered LoRA adapters.
