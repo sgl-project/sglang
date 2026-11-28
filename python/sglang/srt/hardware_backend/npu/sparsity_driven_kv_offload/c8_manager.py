@@ -46,11 +46,16 @@ class PackedMemFabricKVPool(HostKVPool):
 class C8DecodeAdapter(LIMDecodeAdapter):
     @staticmethod
     def _load_operator():
-        operator = getattr(
-            torch.ops.npu, "fused_quant_lightning_indexer_manage_full_visible", None
-        )
-        if operator is None:
-            raise RuntimeError("A5 C8 requires the paired fully visible LIM wheel.")
+        try:
+            from sgl_kernel_npu.operators.indexer.fused_quant_lightning_indexer_manage_full_visible import (
+                fused_quant_lightning_indexer_manage_full_visible as operator,
+            )
+
+            torch.ops.npu.fused_quant_lightning_indexer_manage_full_visible.default
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "A5 C8 requires the paired fully visible LIM wheel."
+            ) from error
         return operator
 
     def _run_operator(
@@ -98,7 +103,17 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
             raise RuntimeError(
                 "A5 C8 requires the paired native-LIM source-gather CopySFA wheel."
             )
-        return torch.ops.npu.fused_quant_scatter_copy_sparse_flash_attention_v2
+        try:
+            from sgl_kernel_npu.operators.attention.fused_quant_scatter_copy_sparse_flash_attention_v2 import (
+                fused_quant_scatter_copy_sparse_flash_attention_v2 as operator,
+            )
+
+            torch.ops.npu.fused_quant_scatter_copy_sparse_flash_attention_v2.default
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "A5 C8 requires the paired native-LIM source-gather CopySFA wheel."
+            ) from error
+        return operator
 
     def _make_decode_adapter(self):
         return C8DecodeAdapter(

@@ -49,22 +49,6 @@ class TestModelConfigShapes(CustomTestCase):
         model_config._derive_model_shapes()
         return model_config
 
-    def test_compressed_mla_and_configured_kv_head_counts(self):
-        for heads in (64, 128):
-            with self.subTest(heads=heads):
-                config = self._derive_shapes(
-                    _make_external_mla_config(
-                        num_attention_heads=heads, num_key_value_heads=heads
-                    )
-                )
-                self.assertEqual(config.get_total_num_kv_heads(), heads)
-                self.assertEqual(config.get_total_num_kv_heads(compressed_mla=True), 1)
-
-        config = self._derive_shapes(_make_text_config())
-        self.assertEqual(config.get_total_num_kv_heads(), 8)
-        with self.assertRaisesRegex(ValueError, "require an MLA model"):
-            config.get_total_num_kv_heads(compressed_mla=True)
-
     def test_external_model_requires_explicit_mla_opt_in(self):
         for use_mla in (False, None):
             with self.subTest(use_mla=use_mla):

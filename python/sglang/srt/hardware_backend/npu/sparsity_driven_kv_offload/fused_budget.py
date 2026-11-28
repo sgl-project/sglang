@@ -19,6 +19,9 @@ MISS_CAPACITY = 32768
 MAX_QUERY_WIDTH = 14
 C8_ROW_BYTES = 656
 
+# Compressed MLA stores one shared KV head per token.
+MLA_KV_HEAD_NUM = 1
+
 _SLOT_MAP_DTYPE = torch.int32
 _SLOT_MAP_EXTRA_ROWS = 1
 
@@ -292,7 +295,6 @@ def resolve_sparse_kv_budget(
     resident_rows: int | None = None,
 ) -> BudgetPlan:
     """Resolve and validate native persistent allocations before pool sizing."""
-    kv_head_num = model_config.get_total_num_kv_heads(compressed_mla=True)
     kv_lora_rank = model_config.kv_lora_rank
     qk_rope_head_dim = model_config.qk_rope_head_dim
     index_head_dim = model_config.index_head_dim
@@ -303,8 +305,7 @@ def resolve_sparse_kv_budget(
         raise ValueError("Invalid native LIM query geometry.")
     if packed_c8:
         if (
-            kv_head_num != 1
-            or (kv_lora_rank, qk_rope_head_dim, index_head_dim, page_size, top_k)
+            (kv_lora_rank, qk_rope_head_dim, index_head_dim, page_size, top_k)
             != (512, 64, 128, 128, 2048)
             or kv_bytes_per_token != C8_ROW_BYTES
             or context_len > 262144
@@ -315,7 +316,7 @@ def resolve_sparse_kv_budget(
     elif (
         kv_dtype != torch.bfloat16
         or kv_bytes_per_token
-        != kv_head_num * (kv_lora_rank + qk_rope_head_dim) * kv_dtype.itemsize
+        != MLA_KV_HEAD_NUM * (kv_lora_rank + qk_rope_head_dim) * kv_dtype.itemsize
     ):
         raise ValueError("Native LIM requires BF16 MLA KV storage.")
     cache_tokens = get_sparse_kv_cache_tokens(cache_tokens, max_query_width, top_k)
@@ -338,7 +339,7 @@ def resolve_sparse_kv_budget(
         max_query_width=max_query_width,
         cache_tokens=cache_tokens,
         page_size=page_size,
-        kv_head_num=kv_head_num,
+        kv_head_num=MLA_KV_HEAD_NUM,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         index_head_dim=index_head_dim,
