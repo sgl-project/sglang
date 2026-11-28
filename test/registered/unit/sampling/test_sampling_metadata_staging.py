@@ -4,17 +4,24 @@ import random
 import unittest
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.sampling.logit_bias import LogitBiasEntries, build_logit_bias
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
+from sglang.test.sampling_test_utils import build_step_penalties
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 VOCAB_SIZE = 32
 
@@ -62,7 +69,7 @@ def _admitted_pool(reqs, device):
 
 
 def _step_penalties(reqs, device):
-    return StepPenalties.build(reqs, _admitted_pool(reqs, device))
+    return build_step_penalties(reqs, _admitted_pool(reqs, device))
 
 
 class _SamplingMetadataTestBase(CustomTestCase):
@@ -88,14 +95,14 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
         reqs[0].tokenizer.additional_stop_token_ids = {4, None}
         reqs[0].tokenizer.eos_token_id = 1
         pool = _admitted_pool(reqs, self.device)
-        penalty_indices = StepPenalties.build(reqs, pool).penalty_indices
+        penalty_indices = build_step_penalties(reqs, pool).penalty_indices
         self.assert_device_tensor(
             pool.live_tables().min_new_tokens[penalty_indices],
             torch.tensor([2, 1], dtype=torch.int32),
             torch.int32,
         )
         for step in range(3):
-            penalties = StepPenalties.build(reqs, pool)
+            penalties = build_step_penalties(reqs, pool)
             additive, scaling = penalties.logit_penalties()
             self.assertIsNone(scaling)
             expected = torch.zeros(3, VOCAB_SIZE)
@@ -182,7 +189,8 @@ class TestSamplingMetadataCUDA(_SamplingMetadataTestBase):
             self.assertTrue(torch.isneginf(additive[:, 2:4]).all().item())
         self.assertEqual(copy_counts[16], copy_counts[1])
 
-    def test_step_build_copies_only_the_indices(self):
+    def test_step_build_copies_nothing(self):
+        """The step reads its penalty indices from the pool's gathered field."""
         reqs = [
             _req(min_new_tokens=2, stop_token_ids=[2, 3], frequency_penalty=0.5),
             _req(),
@@ -190,10 +198,13 @@ class TestSamplingMetadataCUDA(_SamplingMetadataTestBase):
         ]
         pool = _admitted_pool(reqs, self.device)
         pool.live_tables()
+        host = np.array([0, -1, 1], dtype=np.int64)
+        indices = torch.tensor(host, dtype=torch.int32, device=self.device)
         with _H2DCopies() as copies:
-            StepPenalties.build(reqs, pool)
+            step = StepPenalties.build(pool, indices, host)
         torch.cuda.synchronize()
-        self.assertEqual(copies.numels, [4])
+        self.assertEqual(copies.numels, [])
+        self.assertEqual(step.batch_indices.tolist(), [0, 2])
 
     def test_logit_bias_never_copies_a_dense_row(self):
         reqs = [_req(logit_bias={"1": 2, "31": -1}), _req(), _req(logit_bias={})]

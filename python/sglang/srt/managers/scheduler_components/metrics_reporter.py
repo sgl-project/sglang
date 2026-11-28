@@ -15,7 +15,11 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.prefill_busy_clock import (
+    PrefillBusyClock,
+)
 from sglang.srt.managers.scheduler_components.request_list import ListKind
+from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -234,6 +238,12 @@ class SchedulerMetricsReporter:
     metrics_collector: Optional[SchedulerMetricsCollector]
     num_retracted_reqs: int = 0
     num_paused_reqs: int = 0
+    # Runs whether or not metrics are enabled.
+    prefill_busy_clock: PrefillBusyClock = dataclasses.field(
+        default_factory=PrefillBusyClock
+    )
+    # Set by the scheduler once its policy exists; None when load scaling is off.
+    shortest_prefill_load_scaling: Optional[ShortestPrefillLoadScaling] = None
 
     def __post_init__(self) -> None:
         self.enable_metrics = self.metrics_collector_context.enable_metrics
@@ -1346,15 +1356,17 @@ class SchedulerMetricsReporter:
 
     def record_scheduler_active(self, event_ns: int) -> None:
         """End CPU-side idle at event_ns (monotonic nanoseconds)."""
+        self.prefill_busy_clock.mark_busy(event_ns)
         if self.scheduler.enable_fpm:
             self.scheduler._fpm_publisher.set_idle(False)
         self._record_scheduler_time(is_idle=False, event_ns=event_ns)
 
     def record_scheduler_idle(self) -> None:
         """Start CPU-side idle at the current monotonic time."""
+        now_ns = self.prefill_busy_clock.mark_idle()
         if self.scheduler.enable_fpm:
             self.scheduler._fpm_publisher.set_idle(True)
-        self._record_scheduler_time(is_idle=True, event_ns=time.monotonic_ns())
+        self._record_scheduler_time(is_idle=True, event_ns=now_ns)
 
     def _record_scheduler_time(self, is_idle: bool, event_ns: int) -> None:
         if not (self.enable_metrics or ENABLE_METRICS_DEVICE_TIMER):
@@ -1435,12 +1447,36 @@ class SchedulerMetricsReporter:
             self.fwd_occupancy = float("nan")
             self.stats.fwd_occupancy = float("nan")
 
+    def _update_shortest_prefill_load_stats(self, has_waiting: bool) -> None:
+        load = self.shortest_prefill_load_scaling
+        if load is None:
+            return
+        policy = self.scheduler.policy
+        # The policy refreshes the backlog only on passes that have prefill work,
+        # so it holds its last value once the queue drains.
+        backlog = (
+            policy.shortest_prefill_backlog
+            if has_waiting or self.scheduler.chunked_req is not None
+            else 0
+        )
+        budget = load.token_budget(
+            backlog,
+            page_size=self.scheduler.page_size,
+            align=self.scheduler.truncation_align_size,
+        )
+        self.stats.shortest_prefill_backlog_tokens = backlog
+        self.stats.shortest_prefill_class_boundary_tokens = load.class_boundary(backlog)
+        self.stats.shortest_prefill_token_budget = (
+            load.chunk_tokens if budget is None else budget
+        )
+
     def _update_queue_stats(self, priority_enabled: bool) -> None:
         lists = self.scheduler.request_lists()
         self.stats.num_queue_reqs = QueueCount.from_reqs(
             lists[ListKind.WAITING], priority_enabled
         )
         self.stats.num_grammar_queue_reqs = len(lists[ListKind.GRAMMAR])
+        self._update_shortest_prefill_load_stats(bool(lists[ListKind.WAITING]))
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                 lists[ListKind.PD_BOOTSTRAP], priority_enabled
@@ -1508,6 +1544,10 @@ class SchedulerMetricsReporter:
         self._reset_device_timer_window()
         if not self.current_scheduler_metrics_enabled:
             return
+        if self.scheduler_status_logger is not None:
+            self.scheduler_status_logger.maybe_dump(
+                self.scheduler.running_batch, self.scheduler.waiting_queue
+            )
         # The running-reqs gauge holds the last batch report until the next
         # one (on PD prefill that is the last forward-batch snapshot, which
         # no later report zeroes). If it disagrees with running_batch -- the

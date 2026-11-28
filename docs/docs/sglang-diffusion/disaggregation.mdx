@@ -6,6 +6,8 @@ metatags:
 
 Split a monolithic text-to-video/image pipeline into independent **Encoder**, **Denoiser**, and **Decoder** roles, each running on its own GPU(s). A central **DiffusionServer** routes requests through the pipeline.
 
+To place arbitrary consecutive stage groups from a deployment file instead of these preset roles, see the experimental [stage deployments](/docs/sglang-diffusion/disaggregation/stage-deployments).
+
 ## Quick Start
 
 Disaggregation is controlled by a single flag: `--disagg-role`. Each component is launched independently, just like LLM PD disaggregation.
@@ -62,21 +64,21 @@ The following commands have been tested end-to-end on an 8×H200 machine with
 sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --disagg-role encoder \
     --disagg-server-addr tcp://127.0.0.1:19655 \
-    --scheduler-port 19000 \
+    --scheduler-port 19000 --master-port 19100 \
     --num-gpus 1 --base-gpu-id 0
 
 # Terminal 2: Denoiser (GPU 1)
 sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --disagg-role denoiser \
     --disagg-server-addr tcp://127.0.0.1:19655 \
-    --scheduler-port 19001 \
+    --scheduler-port 19001 --master-port 19101 \
     --num-gpus 1 --base-gpu-id 1
 
 # Terminal 3: Decoder (GPU 2)
 sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --disagg-role decoder \
     --disagg-server-addr tcp://127.0.0.1:19655 \
-    --scheduler-port 19002 \
+    --scheduler-port 19002 --master-port 19102 \
     --num-gpus 1 --base-gpu-id 2
 
 # Terminal 4: DiffusionServer head (no GPU, receives HTTP requests)

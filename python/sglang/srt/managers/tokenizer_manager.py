@@ -66,6 +66,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.utils import TransferBackend, lacks_decode_peer
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
@@ -103,6 +104,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ElasticDrainClearReq,
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     EncoderDispatchErrorReq,
@@ -130,6 +132,7 @@ from sglang.srt.managers.io_struct import (
     row_output_ids,
     sock_send,
     unwrap_from_pickle,
+    unwrap_object_fields_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
@@ -143,6 +146,8 @@ from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
+    get_context_length_sentence,
+    get_input_length_error,
     get_preserve_last_token_id,
     is_health_check_generate_req,
     truncate_input_ids,
@@ -158,6 +163,7 @@ from sglang.srt.multimodal.token_space_mm_process.registry import (
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
+from sglang.srt.multimodal.transport.memory_pool import InactivePoolLeaseError
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -229,7 +235,7 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
-from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.network import await_zmq_send, get_zmq_socket
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.srt.utils.weight_versions import (
     add_weight_versions_to_meta_info,
@@ -241,6 +247,20 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+# Poll interval while a staged grow waits out the previous stage's warmup window.
+_ELASTIC_STAGE_RETRY_S = 2.0
+# Budget for a grow below launch width to learn its joiner's width (joiner cold start).
+_JOINER_ANNOUNCE_WAIT_S = 120.0
+_JOINER_ANNOUNCE_POLL_S = 0.5
+
+
+def elastic_stage_plan(current: int, launch_ep: int, target: int) -> List[int]:
+    """Split a grow past the launch width in two: recover and scale slots cannot mix.
+
+    A partial regrow is split later, off a scheduler reject, so its stage 2 can shrink.
+    """
+    return [launch_ep, target] if current < launch_ep < target else [target]
 
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
@@ -686,6 +706,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
+        # Orchestrator view: id of the in-flight scale and the slots it freed.
+        self.elastic_operation_id = None
+        self.elastic_retired_ranks: List[int] = []
+        # Staged grow: targets still owed, caller's start width (stage 2 can shrink).
+        self.elastic_pending_stages: List[int] = []
+        self.elastic_staged_from: Optional[int] = None
         self.enable_metrics = get_observability().enable_metrics
         self.incremental_streaming_output = get_serving().incremental_streaming_output
         self.enable_lora = get_lora().enable_lora
@@ -750,8 +776,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.served_model_name = get_serving().served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
-        self.context_len = self.model_config.context_len
-        self.max_req_input_len = None  # Will be set later in engine.py
+        self.max_req_len = None
+        self.max_req_input_len = None
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.default_priority_value = get_schedule().default_priority_value
         self.num_reserved_tokens = compute_num_reserved_tokens()
@@ -852,10 +878,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             caller="TokenizerManager",
         )
 
-    def _dispatch_to_scheduler(self, obj: Any) -> None:
+    def _dispatch_to_scheduler(self, obj: Any) -> Optional[asyncio.Future]:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
-        sock_send(self.send_to_scheduler, obj)
+        return sock_send(self.send_to_scheduler, obj)
 
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
@@ -936,6 +962,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.is_pause_cond = asyncio.Condition()
         # Future for awaiting pause/continue broadcast confirmation
         self._pause_continue_future: Optional[asyncio.Future] = None
+
+        # Shrink admission gate, scoped to the slots that are leaving.
+        self._elastic_shrink_pause_event = asyncio.Event()
+        self._elastic_shrink_pause_event.set()
+        self._elastic_shrink_retiring: set[int] = set()
+        self._elastic_scale_lock = asyncio.Lock()
+        # Strong refs to in-flight staged-grow tasks; asyncio only holds weak ones.
+        self._elastic_stage_tasks: Set[asyncio.Task] = set()
 
     def init_lora(self):
         # LoRA
@@ -1082,16 +1116,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "--enable-strict-thinking"
             )
 
-        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            num_dp_ranks = self.elastic_worker_count
-            if num_dp_ranks <= 1 and obj.routed_dp_rank == 0:
-                logger.debug(
-                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
-                )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= num_dp_ranks:
-                raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
-                )
+        self._validate_routed_dp_rank(obj)
 
         self._init_req_state(obj, request)
         request_states = {
@@ -1112,6 +1137,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for state in request_states.values():
                     state.waiting_at_pause_gate = False
 
+            await self._await_elastic_shrink_gate(obj)
+            # Again: a shrink may have narrowed the width while this request waited.
+            self._validate_routed_dp_rank(obj)
+
             async with self.model_update_lock.reader_lock:
                 await self._validate_and_resolve_lora(obj)
 
@@ -1121,11 +1150,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
-                    await self._send_one_request(tokenized_obj)
+                    await self._send_with_disconnect_monitor(
+                        self._send_one_request(tokenized_obj), obj, request
+                    )
                     if obj.input_ids is not None and not self._reads_input_ids_late():
                         obj.input_ids = None
                         state.prompt_released = True
-                    async for response in self._wait_one_response(obj, request):
+                    async for response in self._wait_one_response(
+                        obj, request, state=state
+                    ):
                         yield response
                 else:
                     async for response in self._handle_batch_request(
@@ -1402,7 +1435,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         audio_data=obj.audio_data,
                         input_text=mm_processor_input,
                         request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
                     )
             elif (
                 get_disagg().language_only
@@ -1417,7 +1449,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     audio_data=obj.audio_data,
                     input_text=mm_processor_input,
                     request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
                 )
 
             if mm_inputs and mm_inputs.input_ids is not None:
@@ -1448,7 +1479,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
-        self._validate_one_request(obj, input_ids)
+        is_multimodal = mm_inputs is not None or (
+            isinstance(obj, GenerateReqInput) and bool(obj.need_wait_for_mm_inputs)
+        )
+        self._validate_one_request(obj, input_ids, is_multimodal=is_multimodal)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -1485,10 +1519,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj.mm_content_hashes = normalized
 
     def _validate_one_request(
-        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        input_ids: List[int],
+        *,
+        is_multimodal: bool = False,
     ) -> None:
-        """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
-        # FIXME: unify the length validation logic with the one in the scheduler.
+        """Validates the input and requested token counts against the request length limits."""
         if get_exec().features.enable_encoder_swa_bounded_replay:
             if obj.image_data is not None and not get_platform().is_cuda:
                 raise ValueError(
@@ -1510,51 +1547,46 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
         self._validate_joint_schema_request(obj, input_ids)
-        _max_req_len = self.context_len
+        input_len = len(input_ids) if input_ids is not None else 0
+        error_msg = get_input_length_error(
+            input_len, self.max_req_input_len, is_multimodal=is_multimodal
+        )
+        if error_msg is not None:
+            if is_multimodal or not self.allow_auto_truncate:
+                raise ValueError(error_msg)
+            logger.warning(
+                f"The input ({input_len} tokens) is longer than the maximum "
+                f"allowed length ({self.max_req_input_len} tokens on this "
+                "server). Truncating the input."
+            )
+            input_ids[:] = truncate_input_ids(
+                input_ids,
+                max_len=self.max_req_input_len,
+                preserve_last_token_id=self._embedding_preserve_last_token_id,
+            )
+
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
-
-        # Validate input length
-        if input_token_num >= self.context_len:
-            if self.allow_auto_truncate:
-                logger.warning(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens). "
-                    "Truncating the input."
-                )
-                input_ids[:] = truncate_input_ids(
-                    input_ids,
-                    max_len=_max_req_len,
-                    preserve_last_token_id=self._embedding_preserve_last_token_id,
-                )
-                input_token_num = len(input_ids)
-            else:
-                raise ValueError(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens)."
-                )
-
-        # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        context_max_new_tokens = self.max_req_len - input_token_num
         if (
             self.validate_total_tokens
             and max_new_tokens is not None
-            and (max_new_tokens + input_token_num) > _max_req_len
+            and max_new_tokens > context_max_new_tokens
         ):
             if self.allow_auto_truncate:
                 logger.warning(
                     f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
-                    f"exceeds the model's context length ({self.context_len} tokens). "
-                    "Truncating max_new_tokens."
+                    f"exceeds the model's context length ({self.max_req_len} tokens "
+                    "on this server). Truncating max_new_tokens."
                 )
-                obj.sampling_params["max_new_tokens"] = max(
-                    0, _max_req_len - input_token_num
-                )
+                obj.sampling_params["max_new_tokens"] = max(0, context_max_new_tokens)
             else:
                 total_tokens = max_new_tokens + input_token_num
                 error_msg = (
-                    f"Requested token count exceeds the model's maximum context length "
-                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
+                    "Requested token count exceeds the model's maximum context length. "
+                    f"{get_context_length_sentence(self.max_req_len)} "
+                    f"You requested a total of {total_tokens} "
                     f"tokens: {input_token_num} tokens from the input messages and "
                     f"{max_new_tokens} tokens for the completion. Please reduce the number "
                     f"of tokens in the input messages or the completion to fit within the limit."
@@ -1650,8 +1682,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "This checkpoint answers schema decisions, send them to /v1/systemone"
             )
         limit = max_joint_prompt_tokens(
-            context_len=self.context_len,
-            num_reserved_tokens=self.num_reserved_tokens,
             max_req_input_len=self.max_req_input_len,
             max_prefill_tokens=get_schedule().max_prefill_tokens,
         )
@@ -1862,9 +1892,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             bootstrap_room = obj.bootstrap_room
-            if (
-                bootstrap_room is None
-                and get_disagg().disaggregation_transfer_backend == "fake"
+            # Neither has a decode that would look the room up.
+            transfer_backend = TransferBackend(
+                get_disagg().disaggregation_transfer_backend
+            )
+            if bootstrap_room is None and (
+                transfer_backend == TransferBackend.FAKE
+                or lacks_decode_peer(
+                    obj,
+                    disaggregation_mode=DisaggregationMode(
+                        get_disagg().disaggregation_mode
+                    ),
+                    transfer_backend=transfer_backend,
+                )
             ):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
@@ -2070,6 +2110,56 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
+    async def _send_with_disconnect_monitor(
+        self,
+        send: Awaitable[None],
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request],
+    ):
+        if request is None or obj.background:
+            return await send
+
+        owner = asyncio.current_task()
+        loop = asyncio.get_running_loop()
+        if (
+            sys.version_info >= (3, 12)
+            and asyncio.iscoroutine(send)
+            and loop.get_task_factory() is None
+        ):
+            send_task = asyncio.Task(send, loop=loop, eager_start=True)
+        else:
+            send_task = asyncio.ensure_future(send)
+        if send_task.done():
+            # Eager enqueue does not yield. Scheduled cancellation arrives at
+            # the next suspension; queued samples use dispatched-request cleanup.
+            return send_task.result()
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    (send_task,), timeout=_REQUEST_STATE_WAIT_TIMEOUT
+                )
+                if done:
+                    return await send_task
+                cancellations = owner.cancelling()
+                disconnected = await request.is_disconnected()
+                # Starlette's self-cancelling AnyIO scope can also suppress an
+                # external Task.cancel() delivered during the disconnect probe.
+                if owner.cancelling() > cancellations:
+                    raise asyncio.CancelledError
+                if disconnected:
+                    raise ValueError(
+                        f"Request is disconnected from the client side during dispatch. {obj.rid=}"
+                    )
+        finally:
+            # Drain the sender so its enqueue callback and resource cleanup run
+            # before generate_request releases request state and the reader lock.
+            if send_task.done():
+                if not send_task.cancelled():
+                    send_task.exception()
+            else:
+                send_task.cancel()
+                await asyncio.gather(send_task, return_exceptions=True)
+
     def _reads_input_ids_late(self) -> bool:
         return (
             self.request_logger.logs_field_on_finish("input_ids")
@@ -2084,7 +2174,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         prepared_mm_items = []
         prepared_embeds = []
+        pending_handles = []
         dispatched = False
+        state = self.rid_to_state.get(tokenized_obj.rid)
+        dispatch_ready = self.encoder_dispatch_ready.get(tokenized_obj.rid)
+
+        def mark_dispatched():
+            nonlocal dispatched
+            dispatched = True
+            self._mark_request_dispatched(tokenized_obj.rid, state, dispatch_ready)
+
         try:
             prepared_mm_items = (
                 await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
@@ -2092,7 +2191,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             )
             if self._skip_dispatch_if_aborted(tokenized_obj.rid):
-                self._cancel_cuda_ipc_features((tokenized_obj,))
                 return
             prepared_embeds = self.positional_embeds_transport.prepare_for_dispatch(
                 (tokenized_obj,)
@@ -2102,21 +2200,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 hook.on_request_dispatched(
                     rid_to_state=self.rid_to_state, tokenized_obj=tokenized_obj
                 )
-            tokenized_obj = wrap_shm_features(tokenized_obj)
+            tokenized_obj = wrap_shm_features(
+                tokenized_obj, pending_handles=pending_handles
+            )
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
-            self._dispatch_to_scheduler(tokenized_obj)
-            self._mark_state_dispatched(tokenized_obj.rid)
-            dispatched = True
-            dispatch_ready = self.encoder_dispatch_ready.pop(tokenized_obj.rid, None)
-            if dispatch_ready is not None:
-                dispatch_ready.set()
-            tokenized_obj.time_stats = time_stats
-            tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+            send_future = self._dispatch_to_scheduler(tokenized_obj)
+            try:
+                tokenized_obj.time_stats = time_stats
+                tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+            finally:
+                await await_zmq_send(
+                    send_future,
+                    mark_dispatched,
+                    require_future=isinstance(
+                        getattr(self, "send_to_scheduler", None), zmq.asyncio.Socket
+                    ),
+                )
         finally:
             if not dispatched:
+                for pointer in pending_handles:
+                    pointer.close_and_unlink()
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
                 self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
+                self._cancel_cuda_ipc_features((tokenized_obj,))
 
     def _drop_aborted_before_dispatch(self, tokenized_objs):
         """Return *tokenized_objs* without the requests aborted before dispatch.
@@ -2174,13 +2281,70 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         pool = getattr(self.mm_processor, "cudaipc_mmfeature_pool", None)
         if pool is None:
             return
+        seen = set()
         for tokenized_obj in tokenized_objs:
             if tokenized_obj.mm_inputs is None:
                 continue
-            for item in tokenized_obj.mm_inputs.mm_items:
+            mm_inputs = unwrap_object_fields_from_pickle(tokenized_obj.mm_inputs)
+            for item in mm_inputs.mm_items:
                 for tensor in (item.feature, item.precomputed_embeddings):
                     if isinstance(tensor, CudaIpcTensorTransportProxy):
-                        pool.cancel_proxy(tensor)
+                        lease_key = (
+                            tuple(tensor.proxy_state["ipc_extra"]["pool_handle"]),
+                            tensor.ready_byte_offset,
+                            tensor.ack_byte_offset,
+                            tensor.generation,
+                        )
+                        if lease_key in seen:
+                            continue
+                        seen.add(lease_key)
+                        try:
+                            pool.cancel_proxy(tensor)
+                        except InactivePoolLeaseError:
+                            continue
+
+    def _validate_routed_dp_rank(self, obj) -> None:
+        """Check an explicit DP pin against the width that is live right now."""
+        if not isinstance(obj, GenerateReqInput) or obj.routed_dp_rank is None:
+            return
+        num_dp_ranks = self.elastic_worker_count
+        if num_dp_ranks <= 1 and obj.routed_dp_rank == 0:
+            logger.debug(
+                f"routed_dp_rank={obj.routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
+            )
+        elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= num_dp_ranks:
+            raise ValueError(
+                f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
+            )
+
+    async def _await_elastic_shrink_gate(self, obj) -> None:
+        """Hold only requests pinned to a leaving slot; the DPC skips draining slots."""
+        if self._elastic_shrink_pause_event.is_set():
+            return
+        if getattr(obj, "routed_dp_rank", None) in self._elastic_shrink_retiring:
+            await self._elastic_shrink_pause_event.wait()
+
+    def _close_elastic_shrink_gate(self, retiring: Iterable[int]) -> None:
+        """Required ``retiring``: an empty set makes the pinned-only gate a no-op."""
+        self._elastic_shrink_retiring = set(retiring)
+        self._elastic_shrink_pause_event.clear()
+        if self._elastic_shrink_retiring:
+            # A retiree can exit long before the shrink commits, so stop waiting on
+            # its control replies now; the reopen restores whatever width stands.
+            self.update_control_communicator_fan_out(
+                min(self._elastic_shrink_retiring), keep_scale_fan_out=True
+            )
+
+    def _open_elastic_shrink_gate(self) -> None:
+        narrowed = bool(self._elastic_shrink_retiring)
+        self._elastic_shrink_retiring = set()
+        self._elastic_shrink_pause_event.set()
+        if narrowed:
+            self.update_control_communicator_fan_out(self.elastic_worker_count)
+
+    def _clear_elastic_draining(self) -> None:
+        """Tell the DPC the retiring slots are staying, so it routes to them again."""
+        self._dispatch_to_scheduler(ElasticDrainClearReq())
 
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
@@ -2192,6 +2356,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if state is not None:
             state.dispatched = True
 
+    def _mark_request_dispatched(
+        self,
+        rid: str,
+        state: Optional[ReqState],
+        dispatch_ready: Optional[threading.Event] = None,
+    ):
+        """Complete enqueue bookkeeping without affecting a newer request."""
+        if self.rid_to_state.get(rid) is state:
+            self._mark_state_dispatched(rid)
+        if dispatch_ready is not None:
+            if self.encoder_dispatch_ready.get(rid) is dispatch_ready:
+                del self.encoder_dispatch_ready[rid]
+            dispatch_ready.set()
+
     async def _send_batch_request(
         self,
         tokenized_objs: List[
@@ -2202,6 +2380,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         prepared_mm_items = []
         prepared_embeds = []
         dispatched = False
+        states = {
+            tokenized_obj.rid: self.rid_to_state.get(tokenized_obj.rid)
+            for tokenized_obj in tokenized_objs
+        }
+
+        def mark_dispatched():
+            nonlocal dispatched
+            dispatched = True
+            for tokenized_obj in tokenized_objs:
+                self._mark_request_dispatched(
+                    tokenized_obj.rid, states[tokenized_obj.rid]
+                )
+
         try:
             prepared_mm_items = (
                 await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
@@ -2230,17 +2421,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
-            self._dispatch_to_scheduler(batch_req)
-            for tokenized_obj in tokenized_objs:
-                self._mark_state_dispatched(tokenized_obj.rid)
-            dispatched = True
-            for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
-                tokenized_obj.time_stats = time_stat
-            set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
+            send_future = self._dispatch_to_scheduler(batch_req)
+            try:
+                for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
+                    tokenized_obj.time_stats = time_stat
+                set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
+            finally:
+                await await_zmq_send(
+                    send_future,
+                    mark_dispatched,
+                    require_future=isinstance(
+                        getattr(self, "send_to_scheduler", None), zmq.asyncio.Socket
+                    ),
+                )
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
                 self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
+                self._cancel_cuda_ipc_features(tokenized_objs)
 
     def _coalesce_streaming_chunks(
         self,
@@ -2328,11 +2526,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        *,
+        state: Optional[ReqState] = None,
     ):
-        # Batch dispatch builds every waiter before advancing any.
-        # Both removers append the output after the del, so the ReqState stays valid.
-        state = self.rid_to_state[obj.rid]
-        if state.abort_sent and not state.dispatched:
+        # Dispatch can yield until after a terminal response removes this RID.
+        # Callers retain the original state so completion or RID reuse is safe.
+        if state is None:
+            state = self.rid_to_state[obj.rid]
+        if (
+            state.abort_sent
+            and not state.dispatched
+            and self.rid_to_state.get(obj.rid) is state
+        ):
             # Skipped by _skip_dispatch_if_aborted. Finish it here, once the
             # waiter holds its state, as the scheduler finishes a queued abort.
             self._handle_abort_req(AbortReq(rid=obj.rid))
@@ -2486,15 +2691,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
-                await self._send_batch_request(tokenized_objs)
 
-                # Set up generators for each request in the batch
                 for i in range(batch_size):
                     tmp_obj = obj[i]
-                    state = self.rid_to_state[tmp_obj.rid]
+                    state = request_states[tmp_obj.rid]
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+
+                await self._send_with_disconnect_monitor(
+                    self._send_batch_request(tokenized_objs), obj, request
+                )
+                # Build waiters after dispatch so requests aborted during
+                # preparation are finalized by _wait_one_response.
+                for i in range(batch_size):
+                    tmp_obj = obj[i]
+                    generators.append(
+                        self._wait_one_response(
+                            tmp_obj, request, state=request_states[tmp_obj.rid]
+                        )
+                    )
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
@@ -2511,8 +2726,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state = self.rid_to_state[tmp_obj.rid]
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
-                        await self._send_one_request(tokenized_obj)
-                        generators.append(self._wait_one_response(tmp_obj, request))
+                        await self._send_with_disconnect_monitor(
+                            self._send_one_request(tokenized_obj), tmp_obj, request
+                        )
+                        generators.append(
+                            self._wait_one_response(tmp_obj, request, state=state)
+                        )
                         rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
@@ -2548,22 +2767,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
-                request_states[tmp_obj.rid] = self.rid_to_state[tmp_obj.rid]
-                await self._send_one_request(tokenized_obj)
-                await self._wait_one_response(tmp_obj, request).__anext__()
+                state = self.rid_to_state[tmp_obj.rid]
+                request_states[tmp_obj.rid] = state
+                await self._send_with_disconnect_monitor(
+                    self._send_one_request(tokenized_obj), tmp_obj, request
+                )
+                await self._wait_one_response(tmp_obj, request, state=state).__anext__()
 
-            # Retain initial states until all warmups succeed so errors can
-            # release their LoRA references. Sampling requests take ownership below.
             initial_req_states = {}
             for initial_rid in obj.rid if isinstance(obj.rid, list) else [obj.rid]:
                 initial_state = request_states[initial_rid]
                 if self.rid_to_state.get(initial_rid) is initial_state:
-                    del self.rid_to_state[initial_rid]
-                    initial_state.lora_released = True
                     initial_req_states[initial_rid] = initial_state
 
-            # Expand requests, assign new rids for them, and send them
+            sample_requests = []
             for i in range(batch_size):
+                samples = []
                 for sample_index in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
@@ -2579,12 +2798,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]
+                    # Initial states own the references until every sample exists.
+                    state.lora_released = True
                     request_states[tmp_obj.rid] = state
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
-                    await self._send_one_request(tokenized_obj)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    samples.append((tmp_obj, tokenized_obj, state))
+                sample_requests.append(samples)
+
+            for initial_rid, initial_state in initial_req_states.items():
+                if self.rid_to_state.get(initial_rid) is initial_state:
+                    del self.rid_to_state[initial_rid]
+                initial_state.lora_released = True
+            for samples in sample_requests:
+                for _, _, state in samples:
+                    state.lora_released = False
+
+            for i, samples in enumerate(sample_requests):
+                for tmp_obj, tokenized_obj, state in samples:
+                    await self._send_with_disconnect_monitor(
+                        self._send_one_request(tokenized_obj), tmp_obj, request
+                    )
+                    generators.append(
+                        self._wait_one_response(tmp_obj, request, state=state)
+                    )
                     rids.append(tmp_obj.rid)
 
                 if objs[i].rid in initial_req_states:
@@ -4095,32 +4333,171 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
         if not msg.success:
             self.elastic_pending_ep_size = None
+            self._clear_staged_scale()
             self.elastic_scale_phase = "failed"
             self.elastic_last_error = msg.error
+            self.elastic_retired_ranks = []
+            old_worker_count = self.elastic_worker_count
+            # Retirees may exit before a shrink fails; never fan out to departed ranks.
+            if msg.effective_ep_size and msg.effective_ep_size != self._elastic_ep_size:
+                logger.warning(
+                    "[Elastic EP] scale failed after ranks departed; narrowing "
+                    "control fan-out %d -> %d",
+                    self._elastic_ep_size,
+                    msg.effective_ep_size,
+                )
+                self.elastic_worker_count = physical_ep_size_to_dp_size(
+                    msg.effective_ep_size, self.attn_replica_size
+                )
+                self.update_control_communicator_fan_out(self.elastic_worker_count)
+            # The DPC still holds the retiring slots out of routing; release them.
+            if self.elastic_worker_count < old_worker_count:
+                # Ranks left before the failure: retire their slots instead.
+                self._dispatch_to_scheduler(
+                    ElasticScaleUpdateReq(
+                        success=False,
+                        effective_ep_size=msg.effective_ep_size,
+                        slot_offset=self.elastic_worker_count,
+                        slot_count=old_worker_count - self.elastic_worker_count,
+                        direction="shrink",
+                        error=msg.error,
+                    )
+                )
+            else:
+                self._clear_elastic_draining()
+            self._open_elastic_shrink_gate()
             return
 
         self._dispatch_to_scheduler(msg)
         self.elastic_worker_count = physical_ep_size_to_dp_size(
             msg.effective_ep_size, self.attn_replica_size
         )
+        if self.elastic_pending_stages:
+            # Intermediate stage: keep pending_ep_size and the shrink gate as they are.
+            self.update_control_communicator_fan_out(self.elastic_worker_count)
+            self.elastic_scale_phase = "staged_grow"
+            task = asyncio.create_task(
+                self._drive_next_elastic_stage(self.elastic_pending_stages.pop(0))
+            )
+            self._elastic_stage_tasks.add(task)
+            task.add_done_callback(self._elastic_stage_tasks.discard)
+            return
         self.elastic_pending_ep_size = None
-        self.elastic_scale_phase = "serving_expanded"
+        # Direction from the caller's request: a partial regrow's last stage shrinks.
+        shrank = (
+            msg.effective_ep_size < self.elastic_staged_from
+            if self.elastic_staged_from is not None
+            else msg.direction == "shrink"
+        )
+        self._clear_staged_scale()
+        self.elastic_scale_phase = "serving_shrunk" if shrank else "serving_expanded"
         self.elastic_last_error = None
+        # Published only post-commit: until then these ranks are load-bearing.
+        self.elastic_retired_ranks = (
+            list(range(msg.slot_offset, msg.slot_offset + msg.slot_count))
+            if msg.direction == "shrink"
+            else []
+        )
         self.update_control_communicator_fan_out(self.elastic_worker_count)
+        self._open_elastic_shrink_gate()
+
+    @property
+    def _elastic_ep_size(self) -> int:
+        """Physical EP width; elastic_worker_count counts attention replicas."""
+        return self.elastic_worker_count * self.attn_replica_size
 
     def get_elastic_ep_state(self):
+        # A grow clears pending_ep_size at commit but stays warming_up until served.
+        settled = (
+            self.elastic_pending_ep_size is None
+            and self.elastic_scale_phase != "warming_up"
+        )
         return {
-            "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
-            "effective_ep_size": self.elastic_worker_count * self.attn_replica_size,
+            "is_scaling_elastic_ep": not settled,
+            "effective_ep_size": self._elastic_ep_size,
             "pending_ep_size": self.elastic_pending_ep_size,
             "scale_phase": self.elastic_scale_phase,
             "last_error": self.elastic_last_error,
+            "operation_id": self.elastic_operation_id,
+            "retired_ranks": list(self.elastic_retired_ranks),
+            # Safe only once the survivors committed; empty mid-scale.
+            "safe_to_terminate_ranks": (
+                list(self.elastic_retired_ranks)
+                if settled and self.elastic_scale_phase == "serving_shrunk"
+                else []
+            ),
         }
+
+    def _elastic_launch_ep(self) -> int:
+        return get_parallel().elastic_ep_initial_size or get_parallel().tp_size
+
+    def _stage_through(self, obj: ScaleElasticEPReqInput, width: int):
+        """Redirect this request through ``width``, leaving the target for stage two."""
+        self.elastic_staged_from = self._elastic_ep_size
+        self.elastic_pending_stages = [self.elastic_pending_ep_size]
+        return ScaleElasticEPReqInput(new_ep_size=width, operation_id=obj.operation_id)
+
+    def _clear_staged_scale(self) -> None:
+        """Drop staging state as one unit -- a stale origin width mislabels a phase."""
+        self.elastic_pending_stages = []
+        self.elastic_staged_from = None
 
     async def scale_elastic_ep(
         self, obj: ScaleElasticEPReqInput
     ) -> ScaleElasticEPReqOutput:
         """Send a scale request to every DP scheduler."""
+        async with self._elastic_scale_lock:
+            return await self._scale_elastic_ep_locked(obj)
+
+    async def _drive_next_elastic_stage(self, target: int) -> None:
+        """Send the next stage of a staged grow, retrying while schedulers warm up.
+
+        Failure must clear the pending size, or the duplicate guard blocks later scales.
+        """
+        obj = ScaleElasticEPReqInput(
+            new_ep_size=target, operation_id=self.elastic_operation_id
+        )
+        deadline = time.monotonic() + get_exec().moe.elastic_ep_scale_timeout
+        # By target, not intent: a partial regrow's stage 2 shrinks and needs the gate.
+        is_shrink = target < self._elastic_ep_size
+        try:
+            if is_shrink:
+                self._close_elastic_shrink_gate(
+                    range(target // self.attn_replica_size, self.elastic_worker_count)
+                )
+            while True:
+                # A landed stage answers "noop": arrival, not failure, and it can
+                # land mid-send. Equality, not >=: stage 2 can sit below stage 1.
+                if self._elastic_ep_size == target:
+                    return
+                responses = await self.scale_elastic_ep_communicator(obj)
+                if all(r.success for r in responses):
+                    return  # under way; the completion message reports the outcome
+                stale = next(r for r in responses if not r.success)
+                if stale.old_ep_size == target:
+                    return
+                if (
+                    stale.scale_phase != "warming_up" and stale.pending_ep_size is None
+                ) or time.monotonic() >= deadline:
+                    raise RuntimeError(stale.message)
+                await asyncio.sleep(_ELASTIC_STAGE_RETRY_S)
+        except BaseException as exc:
+            self._clear_staged_scale()
+            self.elastic_pending_ep_size = None
+            self.elastic_scale_phase = "failed"
+            self.elastic_last_error = (
+                f"staged grow to {target} did not start: {type(exc).__name__}: {exc}"
+            )
+            logger.error("[Elastic EP] %s", self.elastic_last_error)
+            self._open_elastic_shrink_gate()
+            if is_shrink:
+                self._clear_elastic_draining()
+            if not isinstance(exc, Exception):
+                raise
+
+    async def _scale_elastic_ep_locked(
+        self, obj: ScaleElasticEPReqInput
+    ) -> ScaleElasticEPReqOutput:
         if self.elastic_pending_ep_size is not None:
             return ScaleElasticEPReqOutput(
                 success=False,
@@ -4128,25 +4505,103 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "A previous scale operation has not completed yet. Wait until "
                     "all pending ranks have joined before issuing another scale."
                 ),
-                old_ep_size=self.elastic_worker_count * self.attn_replica_size,
+                old_ep_size=self._elastic_ep_size,
                 new_ep_size=obj.new_ep_size,
                 pending_ep_size=self.elastic_pending_ep_size,
                 scale_phase=self.elastic_scale_phase,
             )
         self.auto_create_handle_loop()
-        responses: List[
-            ScaleElasticEPReqOutput
-        ] = await self.scale_elastic_ep_communicator(obj)
+
+        # Close the shrink gate and publish pending; reopened on completion/failure.
+        target = obj.new_ep_size
+        is_shrink = target < self._elastic_ep_size
+        # A refusal restores all three: safe_to_terminate_ranks is read off them.
+        prev_operation_id = self.elastic_operation_id
+        prev_retired_ranks = list(self.elastic_retired_ranks)
+        prev_scale_phase = self.elastic_scale_phase
+
+        def restore_previous(phase: str, pending_ep_size: Optional[int]) -> None:
+            self.elastic_scale_phase = phase
+            self.elastic_pending_ep_size = pending_ep_size
+            self._clear_staged_scale()
+            self.elastic_operation_id = prev_operation_id
+            self.elastic_retired_ranks = prev_retired_ranks
+            if is_shrink:
+                self._open_elastic_shrink_gate()
+                self._clear_elastic_draining()
+
+        self.elastic_pending_ep_size = target
+        self.elastic_scale_phase = "waiting_for_cohort"
+        self.elastic_operation_id = obj.operation_id
+        self.elastic_retired_ranks = []
+        if is_shrink:
+            self._close_elastic_shrink_gate(
+                range(target // self.attn_replica_size, self.elastic_worker_count)
+            )
+
+        # pending_ep_size stays on the caller's target; only the wire request narrows.
+        stages = elastic_stage_plan(
+            self._elastic_ep_size, self._elastic_launch_ep(), target
+        )
+        if len(stages) > 1:
+            obj = self._stage_through(obj, stages[0])
+
+        try:
+            responses = await self.scale_elastic_ep_communicator(obj)
+            # Wait here, not in scheduler loops, for the joiner to announce its width;
+            # resends are clean because schedulers validate first.
+            deadline = time.monotonic() + _JOINER_ANNOUNCE_WAIT_S
+            requested = obj.new_ep_size
+            while (rejects := [r for r in responses if not r.success]) and all(
+                r.retry_when_joiner_announces for r in rejects
+            ):
+                if time.monotonic() >= deadline:
+                    # Nothing announced in time; the rejects below carry the reason.
+                    break
+                await asyncio.sleep(_JOINER_ANNOUNCE_POLL_S)
+                responses = await self.scale_elastic_ep_communicator(obj)
+            else:
+                # A wider joiner needs the grow to land at its width first.
+                required = max((r.required_ep_size or 0 for r in rejects), default=0)
+                if required > obj.new_ep_size:
+                    obj = self._stage_through(obj, required)
+            if obj.new_ep_size != requested:
+                logger.info(
+                    "[Elastic EP][scale] grow to %d staged through %d to serve the "
+                    "joiner waiting below the launch width",
+                    requested,
+                    obj.new_ep_size,
+                )
+                responses = await self.scale_elastic_ep_communicator(obj)
+        # BaseException: a client disconnect cancels us, and the gate must still reopen.
+        except BaseException:
+            restore_previous("failed", None)
+            raise
+
         for res in responses:
             if not res.success:
-                self.elastic_scale_phase = res.scale_phase
-                self.elastic_pending_ep_size = res.pending_ep_size
+                restore_previous(prev_scale_phase, res.pending_ep_size)
                 self.elastic_last_error = res.message
                 return res
-        self.elastic_pending_ep_size = responses[0].pending_ep_size
         self.elastic_scale_phase = responses[0].scale_phase
         self.elastic_last_error = None
-        return responses[0]
+        if not self.elastic_pending_stages:
+            self.elastic_pending_ep_size = responses[0].pending_ep_size
+            return responses[0]
+        # Keep pending_ep_size at the caller's target: a stage width would read as done.
+        final = self.elastic_pending_ep_size
+        return ScaleElasticEPReqOutput(
+            success=True,
+            message=(
+                f"Scaling initiated from {responses[0].old_ep_size} to {final} via "
+                f"{[responses[0].new_ep_size] + self.elastic_pending_stages}; "
+                "poll /is_scaling_elastic_ep for completion"
+            ),
+            old_ep_size=responses[0].old_ep_size,
+            new_ep_size=final,
+            pending_ep_size=final,
+            scale_phase=responses[0].scale_phase,
+        )
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)

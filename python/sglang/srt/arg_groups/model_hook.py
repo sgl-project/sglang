@@ -290,6 +290,8 @@ def handle_model_specific_adjustments(server_args: Any):
         "Dots3NoteForCausalLM",
         "Xing4_0ForCausalLM",
         "KimiK31ForConditionalGeneration",
+        "GigaChat4ForCausalLM",
+        "GigaChat4ForCausalLMNextN",
     ]:
         # Set attention backend for DeepSeek
         if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -387,19 +389,19 @@ def handle_model_specific_adjustments(server_args: Any):
                     "--enable-prefill-cp and --cp-strategy interleave."
                 )
             # Layer split relies on an all-CP-rank KV/indexer transfer path:
-            # mooncake on GPU, the ascend engine (memfabric_hybrid) on NPU.
-            # mori/nixl support is a temporary limitation and will be added
-            # later by the community.
-            allowed_transfer_backend = "ascend" if get_platform().is_npu else "mooncake"
+            # mooncake on GPU/NPU, nixl on GPU.
+            allowed_transfer_backends = (
+                ("mooncake",) if get_platform().is_npu else ("mooncake", "nixl")
+            )
             if (
                 cfg.enable_dsa_cache_layer_split
-                and cfg.disaggregation_transfer_backend != allowed_transfer_backend
+                and cfg.disaggregation_transfer_backend not in allowed_transfer_backends
             ):
                 raise ValueError(
                     "--enable-dsa-cache-layer-split currently only supports "
-                    "the mooncake transfer backend on GPU, or ascend on NPU. Got "
+                    "the mooncake transfer backend, or nixl on GPU. Got "
                     f"--disaggregation-transfer-backend "
-                    f"{cfg.disaggregation_transfer_backend!r}. mori/nixl "
+                    f"{cfg.disaggregation_transfer_backend!r}. mori "
                     "support will be added later by the community."
                 )
             if cfg.enable_dsa_cache_layer_split and cfg.pp_size > 1:

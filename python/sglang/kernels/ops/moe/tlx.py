@@ -1,4 +1,4 @@
-"""gfx950 BF16 routed MoE from fbtriton ``tlx.ops.moe``, vendored as ``sglang.kernels.tlx_ops.kernels.moe.gfx950``.
+"""gfx950 BF16 routed MoE from upstream ``tlx.ops.moe``, vendored as ``tlx_moe``.
 
 Coverage: ``moe`` there aligns tokens to local experts, runs the gate/up GEMM with
 fused SiLU, the down GEMM, the optional per-expert post-norm (a None weight means no

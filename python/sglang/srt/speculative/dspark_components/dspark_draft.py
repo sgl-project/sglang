@@ -407,6 +407,8 @@ class DraftBlockProposer:
             if enable_num_token_non_padded()
             else None
         )
+        # The count last written into _num_token_non_padded (written only here).
+        self._num_token_non_padded_value: Optional[int] = None
         self._dp_meta_host: Optional[torch.Tensor] = None
         self._dp_meta_device: Optional[torch.Tensor] = None
         self._dp_meta_copied: list = []
@@ -464,7 +466,11 @@ class DraftBlockProposer:
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
-            if not self.sample_from_anchor
+            if (
+                not self.sample_from_anchor
+                or getattr(self.draft_model, "_glm_dspark_quarot_config", None)
+                is not None
+            )
             else target_model.get_input_embeddings()
         )
         draft_sampler = self._draft_sampler
@@ -727,7 +733,9 @@ class DraftBlockProposer:
         device = self.draft_model_runner.device
         num_tokens = forward_batch.input_ids.numel()
         if self._num_token_non_padded is not None:
-            self._num_token_non_padded.fill_(num_tokens)
+            if self._num_token_non_padded_value != num_tokens:
+                self._num_token_non_padded.fill_(num_tokens)
+                self._num_token_non_padded_value = num_tokens
             forward_batch.num_token_non_padded = self._num_token_non_padded
         forward_batch.num_token_non_padded_cpu = num_tokens
         if not self._dp_moe_sync or batch.global_num_tokens is None:
