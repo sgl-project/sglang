@@ -76,6 +76,11 @@ def chunk_fwd_kernel_o(
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
 
+    # A captured prefill graph pads the chunk table past the sequence; the
+    # masked body would write nothing, so skip it as kkt_solve already does.
+    if i_t * BT >= T:
+        return
+
     # offset calculation
     q += (bos * Hg + i_h // (H // Hg)) * K
     k += (bos * Hg + i_h // (H // Hg)) * K

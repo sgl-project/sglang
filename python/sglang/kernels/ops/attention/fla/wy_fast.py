@@ -61,6 +61,11 @@ def recompute_w_u_fwd_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
+    # A captured prefill graph pads the chunk table past the sequence; the
+    # masked body would write nothing, so skip it as kkt_solve already does.
+    if i_t * BT >= T:
+        return
+
     o_t = i_t * BT + tl.arange(0, BT)
     o_A = tl.arange(0, BT)
     m_t = o_t < T
