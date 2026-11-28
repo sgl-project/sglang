@@ -1302,7 +1302,21 @@ class TestLlama32Detector(unittest.TestCase):
         text = '{"name": "get_weather", "parameters": {}} Some follow-up text'
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
-        self.assertIn("follow-up", result.normal_text)
+        self.assertEqual(result.normal_text, "Some follow-up text")
+
+    def test_json_with_adjacent_trailing_text_and_spaced_separator(self):
+        """Trailing text without a leading separator must keep its first character,
+        and whitespace after <|python_tag|> or ';' must not drop valid JSON calls."""
+        text = (
+            '<|python_tag|> {"parameters": {"city": "Paris"}, "name": "get_weather"}; '
+            '{"parameters": {"city": "London"}, "name": "get_tourist_attractions"}'
+            "Follow-up text"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[1].name, "get_tourist_attractions")
+        self.assertEqual(result.normal_text, "Follow-up text")
 
     def test_invalid_then_valid_json(self):
         text = (
