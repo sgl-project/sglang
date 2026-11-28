@@ -100,11 +100,125 @@ def causal_conv1d_update_ref(
 class TestCausalConv1d(CustomTestCase):
     activation = "silu"
 
+    @parametrize(width=[3, 4])
+    def test_prefix_and_pad_slots(self, width):
+        """Short continuations retain old state and padded requests never access a cache slot."""
+        dim = 64
+        dtype = torch.bfloat16
+        weight = torch.randn(dim, width, dtype=dtype)
+        bias = torch.randn(dim, dtype=dtype)
+        inputs = torch.randn(40, dim, dtype=dtype)
+        states = torch.randn(4, width - 1, dim, dtype=dtype).transpose(1, 2)
+        previous = states.clone()
+        slots = torch.tensor([2, -1, 0], dtype=torch.int32)
+        starts = torch.tensor([0, 1, 4, 40], dtype=torch.int32)
+        output = causal_conv1d_fwd(
+            inputs.t(),
+            causal_conv1d_weight_pack(weight),
+            bias,
+            states,
+            starts,
+            slots,
+            torch.tensor([True, True, False]),
+            False,
+            -1,
+            True,
+        )
+        for start, end, slot, initial in [(0, 1, 2, True), (4, 40, 0, False)]:
+            reference, final_state = causal_conv1d_ref(
+                inputs[start:end].t().unsqueeze(0),
+                weight,
+                bias,
+                initial_states=previous[slot].unsqueeze(0) if initial else None,
+                return_final_states=True,
+                activation=None,
+            )
+            torch.testing.assert_close(
+                output[:, start:end],
+                reference[0],
+                atol=precision[dtype],
+                rtol=precision[dtype],
+            )
+            torch.testing.assert_close(states[slot], final_state[0])
+        torch.testing.assert_close(states[1], previous[1])
+        torch.testing.assert_close(states[3], previous[3])
+        previous = states.clone()
+        decoded = causal_conv1d_update(
+            inputs[:3].contiguous(),
+            states,
+            causal_conv1d_weight_pack(weight),
+            bias,
+            False,
+            None,
+            slots,
+            -1,
+            True,
+        )
+        for batch_index, slot in [(0, 2), (2, 0)]:
+            state_reference = previous[slot].clone().unsqueeze(0)
+            reference = causal_conv1d_update_ref(
+                inputs[batch_index : batch_index + 1],
+                state_reference,
+                weight,
+                bias,
+            )
+            torch.testing.assert_close(
+                decoded[batch_index],
+                reference[0],
+                atol=precision[dtype],
+                rtol=precision[dtype],
+            )
+            torch.testing.assert_close(states[slot], state_reference[0])
+        self.assertEqual(decoded[1].abs().max().item(), 0)
+
+    def test_width3_prefill_decode(self):
+        """Width-three convolution must preserve its two-token state across decode."""
+        dim, width = 64, 3
+        weight = torch.randn(dim, width, dtype=torch.bfloat16)
+        inputs = torch.randn(6, dim, dtype=torch.bfloat16)
+        states = torch.zeros(1, width - 1, dim, dtype=torch.bfloat16).transpose(1, 2)
+        indices = torch.tensor([0], dtype=torch.int32)
+        prefill = causal_conv1d_fwd(
+            inputs[:5].t(),
+            weight,
+            None,
+            states,
+            torch.tensor([0, 5], dtype=torch.int32),
+            indices,
+            torch.tensor([False]),
+            False,
+            PAD_SLOT_ID,
+            False,
+        )
+        decode = causal_conv1d_update(
+            inputs[5:],
+            states,
+            weight,
+            None,
+            False,
+            None,
+            indices,
+            PAD_SLOT_ID,
+            False,
+        )
+        reference, _ = causal_conv1d_ref(
+            inputs.t().unsqueeze(0),
+            weight,
+            activation=None,
+        )
+        torch.testing.assert_close(
+            torch.cat([prefill.t(), decode]),
+            reference.squeeze(0).t(),
+            atol=precision[torch.bfloat16],
+            rtol=precision[torch.bfloat16],
+        )
+        torch.testing.assert_close(states[0], inputs[-2:].t())
+
     @parametrize(
         batch=[1, 1024],
         dim=[96, 512],
         seqlen=[2, 36],
-        width=[4],
+        width=[3, 4],
         has_bias=[True, False],
         has_initial_state=[True, False],
     )
@@ -164,7 +278,8 @@ class TestCausalConv1d(CustomTestCase):
         batch=[11],
         dim=[96],
         max_seqlen=[66],
-        width=[4],
+        width=[3, 4],
+        prepack=[False, True],
     )
     def test_causal_conv1d_varlen(
         self,
@@ -193,9 +308,7 @@ class TestCausalConv1d(CustomTestCase):
         final_states = torch.randn(total_entries, dim, width - 1, dtype=dtype)
         final_states_ref = final_states.clone()
 
-        has_initial_states = torch.randint(0, 2, (batch,), dtype=torch.bool).fill_(
-            False
-        )
+        has_initial_states = torch.arange(batch) % 2 == 0
         state_indices = torch.randperm(total_entries, dtype=torch.int32)[:batch]
 
         out_ref = []
@@ -228,7 +341,7 @@ class TestCausalConv1d(CustomTestCase):
 
         out = causal_conv1d_fwd(
             x,
-            weight,
+            causal_conv1d_weight_pack(weight) if prepack else weight,
             bias,
             final_states,
             query_start_loc,
@@ -246,7 +359,7 @@ class TestCausalConv1d(CustomTestCase):
     @parametrize(
         batch=[11],
         dim=[32, 64, 96],
-        width=[4],
+        width=[3, 4],
     )
     def test_causal_conv1d_update(
         self, batch, dim, width, has_bias=False, dtype=torch.bfloat16, prepack=True
@@ -284,7 +397,7 @@ class TestCausalConv1d(CustomTestCase):
     @parametrize(
         batch=[7],
         dim=[96],
-        width=[4],
+        width=[3, 4],
     )
     def test_causal_conv1d_update_with_batch_gather(
         self, batch, dim, width, has_bias=False, dtype=torch.bfloat16, prepack=True
