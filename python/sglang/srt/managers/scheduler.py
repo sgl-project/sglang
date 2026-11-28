@@ -5946,6 +5946,16 @@ class Scheduler(
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
         )
+        if (
+            self.enable_overlap
+            and batch_result.logits_output is not None
+            and batch_result.logits_output.beam is not None
+        ):
+            # Beam relay writes request rows after the runner's read-done event.
+            # Finish those writes before teardown or next-iteration scheduling.
+            mapping_done = self.device_module.Event()
+            mapping_done.record(self.forward_stream)
+            self.schedule_stream.wait_event(mapping_done)
 
     def _copy_auxiliary_output_to_cpu(
         self,
