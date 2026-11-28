@@ -22,6 +22,10 @@ from sglang.srt.layers.quantization.fp8 import (
     Fp8MoEMethod,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.quark.online_block_fp8 import (
+    QuarkOnlineBlockFp8LinearMethod,
+    online_block_fp8_applies,
+)
 from sglang.srt.layers.quantization.quark.schemes import (
     QuarkLinearScheme,
     QuarkMoEScheme,
@@ -488,9 +492,12 @@ class QuarkConfig(QuantizationConfig):
                 # "exclude" means keep the layer in its original precision.
                 # Mixed-precision sources may keep excluded layers in FP8
                 # (block or per-tensor, selected by excluded_fp8_config's
-                # weight_block_size); pure-NVFP4/BF16 sources keep them bf16.
+                # weight_block_size); pure-NVFP4/BF16 sources keep them bf16
+                # unless SGLANG_QUARK_DENSE_FP8 opts them into block FP8.
                 if self.excluded_fp8_config is not None:
                     return Fp8LinearMethod(quant_config=self.excluded_fp8_config)
+                if online_block_fp8_applies(prefix):
+                    return QuarkOnlineBlockFp8LinearMethod()
                 return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
