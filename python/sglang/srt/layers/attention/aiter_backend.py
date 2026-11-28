@@ -48,6 +48,7 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import (
     is_gfx95_supported,
+    is_gfx942_supported,
     is_gfx1250_supported,
     print_info_once,
 )
@@ -750,6 +751,46 @@ def _unified_extend_q(q: torch.Tensor, num_heads: int, head_dim: int) -> torch.T
     return q.contiguous().view(-1, num_heads, head_dim)
 
 
+# Smallest KV page that unified_attention target_verify is measured to beat the
+# legacy extend kernel at (MI300X, 16 query heads per KV head, head_dim 256).
+_UNIFIED_VERIFY_MIN_PAGE_SIZE = 16
+
+
+def _unified_verify_enabled(
+    use_mla: bool,
+    eagle_topk: Optional[int],
+    page_size: int,
+    *,
+    speculative: bool = True,
+    use_triton_unified_attention: bool = False,
+    kv_cache_is_vectorized_5d: bool = False,
+) -> bool:
+    """Whether EAGLE target_verify runs on unified_attention.
+
+    With topk == 1 the draft chain is linear, so the verify mask is pure causal
+    and unified_attention's split-K kernel reads the long paged KV in parallel,
+    where the legacy extend_attention_fwd walks each request's KV serially.
+    MLA has its own verify path, a topk > 1 tree mask is not causal, and the
+    vectorized_5d KV pool cannot be viewed as the 4D paged cache it reads.
+
+    With SGLANG_USE_AITER_UNIFIED_ATTN=1 verify follows the other phases onto
+    unified_attention, as before. Without it, verify alone moves on gfx942,
+    where it is measured, and only with KV pages of at least
+    _UNIFIED_VERIFY_MIN_PAGE_SIZE tokens: unified_attention tiles the KV by
+    page and is slower than the legacy kernel with one-token pages.
+    SGLANG_AITER_UNIFIED_VERIFY=0 keeps the legacy path.
+    """
+    if not speculative or use_mla or kv_cache_is_vectorized_5d:
+        return False
+    if eagle_topk is not None and int(eagle_topk) != 1:
+        return False
+    if not get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1"):
+        return False
+    if use_triton_unified_attention:
+        return True
+    return is_gfx942_supported() and page_size >= _UNIFIED_VERIFY_MIN_PAGE_SIZE
+
+
 class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -991,15 +1032,15 @@ class AiterAttnBackend(AttentionBackend):
             self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
         )
 
-        # When topk == 1 the EAGLE draft chain is linear, so target_verify's
-        # mask reduces to pure causal and can go through unified_attention
-        # instead of the legacy triton extend_attention_fwd. Gated on non-MLA
-        # (MLA has its own verify path) and env var for opt-out.
-        self._use_unified_verify = (
-            self.use_triton_unified_attention
-            and not self.use_mla
-            and self.topk == 1
-            and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
+        # The registry builds this backend without the EAGLE topk (self.topk
+        # stays at its default), so read it from the speculative config.
+        self._use_unified_verify = _unified_verify_enabled(
+            self.use_mla,
+            get_spec().speculative_eagle_topk,
+            self.page_size,
+            speculative=get_spec().speculative_algorithm is not None,
+            use_triton_unified_attention=self.use_triton_unified_attention,
+            kv_cache_is_vectorized_5d=self.kv_cache_is_vectorized_5d,
         )
         # Draft-extend only (prefill/target verify keep their kernels). Read the
         # eagle topk from the spec config: the registry builds this backend with the
@@ -3839,10 +3880,11 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if self.decode_uses_page_table:
-            # Keep a distinct page-table buffer for page-table decode.  Sharing
-            # cuda_graph_kv_indices with flat per-token indices makes
-            # page-table width ambiguous after the token buffer is expanded.
+        if self.decode_uses_page_table or self._use_unified_verify:
+            # Keep a distinct page-table buffer for page-table decode and for
+            # unified target_verify.  Sharing cuda_graph_kv_indices with flat
+            # per-token indices makes page-table width ambiguous after the
+            # token buffer is expanded.
             self.cuda_graph_page_table = torch.zeros(
                 (max_bs, self.max_num_pages),
                 dtype=torch.int32,
