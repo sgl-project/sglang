@@ -535,6 +535,8 @@ class Scheduler(
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
+    # The reason the abort recorded in `_pending_chunked_abort_req` came with, if any.
+    _pending_chunked_abort_reason: Optional[FINISH_ABORT] = None
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
@@ -4345,6 +4347,8 @@ class Scheduler(
         req = self._pending_chunked_abort_req
         if req is None:
             return
+        abort_reason = self._pending_chunked_abort_reason
+        self._pending_chunked_abort_reason = None
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
@@ -4354,10 +4358,17 @@ class Scheduler(
             # The request moved to another scheduler queue after abort_request
             # deferred it, so retry against its current location.
             self._pending_chunked_abort_req = None
-            self.abort_request(AbortReq(rid=req.rid))
+            self.abort_request(
+                AbortReq(
+                    rid=req.rid,
+                    finished_reason=abort_reason and abort_reason.to_json(),
+                    abort_message=abort_reason and abort_reason.message,
+                )
+            )
             return
 
-        reason = req.discard_output_reason or FINISH_ABORT("Aborted")
+        sent_reason = req.discard_output_reason or abort_reason
+        reason = sent_reason or FINISH_ABORT("Aborted")
         prepare_abort(req, reason.message, reason.status_code)
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.clear_requested_finish()
@@ -4365,7 +4376,7 @@ class Scheduler(
             self.release_prefill_sender(req, abort_sender=True)
         # A client abort leaves the message to the tokenizer.
         self.request_retirer.abort(
-            req, finished_reason=req.discard_output_reason and reason.to_json()
+            req, finished_reason=sent_reason and reason.to_json()
         )
 
         self._pending_chunked_abort_req = None
@@ -6819,6 +6830,15 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+                if recv_req.rid != chunked_req.rid:
+                    # Matched by prefix only: the reason belongs to another
+                    # request, so keep whatever this one already recorded.
+                    return
+                reason = recv_req.finished_reason
+                self._pending_chunked_abort_reason = reason and FINISH_ABORT(
+                    message=reason.get("message"),
+                    status_code=reason.get("status_code"),
+                )
 
     def abort_request(self, recv_req: AbortReq):
         # Encoder waiters were already aborted in arrival order by

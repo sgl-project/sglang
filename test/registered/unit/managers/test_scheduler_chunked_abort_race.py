@@ -97,6 +97,22 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     return sched
 
 
+_TIMEOUT_MESSAGE = "Request running timeout reached."
+
+
+def _timeout_abort(rid: str) -> AbortReq:
+    """The abort `Scheduler._poll_timeout_aborts` emits for a request."""
+    return AbortReq(
+        rid=rid,
+        abort_message=_TIMEOUT_MESSAGE,
+        finished_reason={
+            "type": "abort",
+            "status_code": 503,
+            "message": _TIMEOUT_MESSAGE,
+        },
+    )
+
+
 class TestPendingChunkedAbortRace(CustomTestCase):
     def setUp(self):
         enter_scope(self, published_topology())
@@ -104,10 +120,15 @@ class TestPendingChunkedAbortRace(CustomTestCase):
     def test_req_left_chunked_slot_is_aborted(self):
         req = _FakeReq("zombie_rid")
         sched = _make_scheduler(req, chunked_req=None, running_reqs=[req])
+        sched._pending_chunked_abort_reason = FINISH_ABORT(
+            message=_TIMEOUT_MESSAGE, status_code=503
+        )
 
         sched.process_pending_chunked_abort()
 
         self.assertIsNotNone(req.to_finish, "recorded abort was never applied")
+        self.assertEqual(req.to_finish.status_code, 503)
+        self.assertEqual(req.to_finish.message, _TIMEOUT_MESSAGE)
         self.assertIsNone(sched._pending_chunked_abort_req)
 
     def test_discarded_chunk_keeps_its_abort_reason(self):
@@ -124,6 +145,79 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         self.assertEqual(req.finished_reason.status_code, 503)
         (abort_req, _), _ = sched.ipc_channels.send_to_tokenizer.send_output.call_args
         self.assertEqual(abort_req.finished_reason, req.discard_output_reason.to_json())
+
+    def test_timeout_abort_of_chunked_req_keeps_its_reason(self):
+        """REGRESSION: a timeout abort of a request in the chunked slot reaches
+        the tokenizer with its 503, as it does for a waiting or a running one."""
+        req = _FakeReq("long_prompt")
+        sched = _make_scheduler(None, chunked_req=req, running_reqs=[])
+
+        sched.abort_request(_timeout_abort(req.rid))
+        with (
+            patch.object(sched.request_retirer, "_detach"),
+            patch.object(retirer_mod, "release_kv_cache"),
+        ):
+            sched.process_pending_chunked_abort()
+
+        self.assertEqual(req.finished_reason.status_code, 503)
+        (abort_req, _), _ = sched.ipc_channels.send_to_tokenizer.send_output.call_args
+        self.assertEqual(abort_req.finished_reason, req.finished_reason.to_json())
+        self.assertEqual(abort_req.finished_reason["message"], _TIMEOUT_MESSAGE)
+
+    def test_timeout_abort_of_a_prefix_rid_sends_no_reason(self):
+        """A timeout of `job_1` also matches `job_10` by prefix; `job_10` must not
+        be told it timed out."""
+        req = _FakeReq("job_10")
+        sched = _make_scheduler(None, chunked_req=req, running_reqs=[])
+
+        sched.abort_request(_timeout_abort("job_1"))
+        with (
+            patch.object(sched.request_retirer, "_detach"),
+            patch.object(retirer_mod, "release_kv_cache"),
+        ):
+            sched.process_pending_chunked_abort()
+
+        (abort_req, _), _ = sched.ipc_channels.send_to_tokenizer.send_output.call_args
+        self.assertIsNone(abort_req.finished_reason)
+
+    def test_prefix_match_keeps_the_chunked_reqs_own_timeout(self):
+        """`job_10` and `job_1` time out together: `job_10` keeps its own 503
+        whichever abort is handled first."""
+        for order in (("job_10", "job_1"), ("job_1", "job_10")):
+            with self.subTest(order=order):
+                req = _FakeReq("job_10")
+                sched = _make_scheduler(None, chunked_req=req, running_reqs=[])
+
+                for rid in order:
+                    sched.abort_request(_timeout_abort(rid))
+                with (
+                    patch.object(sched.request_retirer, "_detach"),
+                    patch.object(retirer_mod, "release_kv_cache"),
+                ):
+                    sched.process_pending_chunked_abort()
+
+                self.assertEqual(req.finished_reason.status_code, 503)
+                (abort_req, _), _ = (
+                    sched.ipc_channels.send_to_tokenizer.send_output.call_args
+                )
+                self.assertEqual(
+                    abort_req.finished_reason, req.finished_reason.to_json()
+                )
+
+    def test_client_abort_of_chunked_req_sends_no_reason(self):
+        """A client abort has no reason; the tokenizer writes its own message."""
+        req = _FakeReq("client_gone")
+        sched = _make_scheduler(None, chunked_req=req, running_reqs=[])
+
+        sched.abort_request(AbortReq(rid=req.rid))
+        with (
+            patch.object(sched.request_retirer, "_detach"),
+            patch.object(retirer_mod, "release_kv_cache"),
+        ):
+            sched.process_pending_chunked_abort()
+
+        (abort_req, _), _ = sched.ipc_channels.send_to_tokenizer.send_output.call_args
+        self.assertIsNone(abort_req.finished_reason)
 
     def test_aborted_chunked_beam_leader_retires_its_group(self):
         req = _FakeReq("beam_leader")
