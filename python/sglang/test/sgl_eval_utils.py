@@ -13,6 +13,8 @@ from itertools import islice
 from pathlib import Path
 from types import SimpleNamespace
 
+from sglang.test.ci.metrics import record
+
 THINKING_MODE_CHOICES = ["deepseek-v3", "qwen-3", "glm-45", "kimi-k2"]
 
 # Benchmarks scored only by sgl-eval; run_eval does not serve them.
@@ -219,6 +221,11 @@ def run_sgl_eval(args):
             value,
             labels={"model": sampler.model, "eval": spec.name},
         )
+    labels = {"model": sampler.model, "eval": spec.name}
+    record("eval_score", metrics["score"], **labels)
+    record("eval_invalid_rate", metrics["invalid"], **labels)
+    record("eval_latency", metrics["latency"], **labels)
+    record("eval_output_throughput", metrics["output_throughput"], **labels)
     print(f"sgl-eval {spec.name}: {metrics}")
     return (
         (metrics, result.latency) if getattr(args, "return_latency", False) else metrics

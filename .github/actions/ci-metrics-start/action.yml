@@ -1,0 +1,17 @@
+name: Start CI metrics
+description: |
+  Gives the job an empty directory for sglang.test.ci.metrics.record and
+  exports it as SGLANG_CI_METRICS_DIR. Under RUNNER_TEMP, so nothing from an
+  earlier job on a self-hosted runner is uploaded as this job's. Pair with
+  ./.github/actions/ci-metrics-upload at the end of the job.
+
+runs:
+  using: composite
+  steps:
+    - name: Make the metrics directory
+      shell: bash
+      run: |
+        dir="${RUNNER_TEMP:-/tmp}/sglang-ci-metrics"
+        rm -rf "$dir"
+        mkdir -p "$dir"
+        echo "SGLANG_CI_METRICS_DIR=$dir" >> "$GITHUB_ENV"

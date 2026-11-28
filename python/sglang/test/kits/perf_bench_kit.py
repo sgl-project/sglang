@@ -6,6 +6,7 @@ Bounds are tuned per CI runner, so a local run prints them without asserting.
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
+from sglang.test.ci.metrics import record
 from sglang.test.test_utils import is_in_amd_ci, is_in_ci, write_github_step_summary
 
 
@@ -22,13 +23,16 @@ class Metric:
     def line(self) -> str:
         return f"{self.name}: {self.value:.2f}" + (f" {self.unit}" if self.unit else "")
 
+    def limit(self) -> Optional[float]:
+        """The bound this run is held to."""
+        if is_in_amd_ci() and self.amd_bound is not None:
+            return self.amd_bound
+        return self.bound
+
     def check(self, test_case) -> None:
         if self.bound is None:
             return
-        limit = self.bound
-        if is_in_amd_ci() and self.amd_bound is not None:
-            limit = self.amd_bound
-        getattr(test_case, self.assertion)(self.value, limit)
+        getattr(test_case, self.assertion)(self.value, self.limit())
 
 
 def at_least(name, value, bound, *, amd=None, unit="") -> Metric:
@@ -51,6 +55,8 @@ def check_perf(test_case, *metrics: Metric, suffix: str = "") -> None:
     label = test_case._testMethodName + suffix
     report = f"### {label}\n" + "".join(m.line() + "\n" for m in metrics)
     print(report, end="")
+    for m in metrics:
+        record(m.name, m.value, bound=m.limit(), label=label)
     if not is_in_ci():
         return
     write_github_step_summary(report)

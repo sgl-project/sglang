@@ -19,6 +19,7 @@ import numpy as np
 
 from sglang.lang.api import set_default_backend
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.test.ci.metrics import record
 from sglang.utils import (
     download_and_cache_file,
     dump_state_text,
@@ -157,6 +158,11 @@ def run_eval(args):
     print(f"Invalid: {invalid:.3f}")
     print(f"Latency: {latency:.3f} s")
     print(f"Output throughput: {output_throughput:.3f} token/s")
+    labels = {"eval": "few_shot_gsm8k", "num_shots": args.num_shots}
+    record("eval_score", acc, **labels)
+    record("eval_invalid_rate", invalid, **labels)
+    record("eval_latency", latency, **labels)
+    record("eval_output_throughput", output_throughput, **labels)
 
     # Dump results
     dump_state_text("tmp_output_gsm8k.txt", states)

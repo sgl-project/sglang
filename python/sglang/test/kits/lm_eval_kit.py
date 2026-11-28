@@ -12,6 +12,7 @@ import numpy as np
 import requests
 import yaml
 
+from sglang.test.ci.metrics import record
 from sglang.test.test_utils import dump_metric
 
 
@@ -79,6 +80,13 @@ class LMEvalMixin:
                         "eval": "lm-eval",
                         "task": task["name"],
                     },
+                )
+                record(
+                    "eval_score",
+                    measured_value,
+                    model=eval_config.get("model_name", ""),
+                    eval=task["name"],
+                    variant=metric["name"],
                 )
                 success = success and np.isclose(
                     ground_truth, measured_value, rtol=rtol
