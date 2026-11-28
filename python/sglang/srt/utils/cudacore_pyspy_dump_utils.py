@@ -98,18 +98,41 @@ def pyspy_dump_schedulers(scheduler_only=False):
     else:
         pids = [psutil.Process().pid]
     for pid in pids:
-        for attempt, native_flag in enumerate(["--native", ""]):
-            try:
-                cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
-                result = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, check=True
-                )
-                logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
-                break
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
-                if attempt == 1:
-                    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
+        _pyspy_dump_pid(pid)
+
+
+# Arbitrary; a healthy dump of a large process takes a few seconds, and three
+# attempts must fit in the watchdog's diagnostics budget.
+_PYSPY_TIMEOUT_S = 15.0
+
+
+def _pyspy_dump_pid(pid: int) -> None:
+    # --native stats every mapped file and can block on a stalled network mount;
+    # the first two modes also suspend the target, which waits on a thread in
+    # uninterruptible sleep. --nonblocking only reads memory, so it goes last.
+    for extra_flags in (["--native"], [], ["--nonblocking"]):
+        cmd = ["py-spy", "dump", *extra_flags, "--pid", str(pid)]
+        cmd_str = subprocess.list2cmdline(cmd)
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=_PYSPY_TIMEOUT_S,
+            )
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Pyspy failed ({cmd_str}). Error: {e.stderr}")
+            continue
+        except subprocess.TimeoutExpired:
+            logger.error(f"Pyspy timed out after {_PYSPY_TIMEOUT_S}s ({cmd_str}).")
+            continue
+        except OSError as e:
+            logger.error(f"Pyspy could not start ({cmd_str}): {e}")
+            return
+        logger.error(f"Pyspy dump for PID {pid} ({cmd_str}):\n{result.stdout}")
+        return
+    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
 
 
 def trigger_cuda_user_coredump(scheduler_only=False):

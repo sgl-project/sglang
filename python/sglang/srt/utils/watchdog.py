@@ -20,6 +20,11 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Diagnostics (dump_info, py-spy) can block forever, e.g. on a CUDA sync or a
+# stalled network filesystem; SIGQUIT is sent once this bound expires.
+_DIAGNOSTICS_TIMEOUT_S = 60.0
+_SIGQUIT_DELAY_S = 5.0
+
 
 class Watchdog:
     @staticmethod
@@ -125,6 +130,7 @@ class WatchdogRaw:
         # process tree; this thread runs even while the stuck main thread is
         # blocked in C with the GIL released.
         self.before_crash = before_crash
+        self._diagnostics_thread: Optional[threading.Thread] = None
 
         self.parent_process = psutil.Process().parent()
         # CI containers lack CAP_SYS_PTRACE, so py-spy cannot attach without this.
@@ -158,14 +164,11 @@ class WatchdogRaw:
                     watchdog_last_time = current
             time.sleep(self.watchdog_timeout / 2)
 
-        if self.dump_info is not None and (info_msg := self.dump_info()):
-            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
-
-        pyspy_dump_schedulers()
         logger.error(
             f"{self.debug_name} watchdog timeout "
             f"({self.watchdog_timeout=}, {self.soft=})"
         )
+        self._run_diagnostics()
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
 
@@ -176,8 +179,38 @@ class WatchdogRaw:
                 except BaseException:  # e.g. a Rust panic; SIGQUIT must still go
                     logger.exception(f"{self.debug_name} watchdog: before_crash failed")
             # Wait for some time so that the parent process can print the error.
-            time.sleep(5)
+            time.sleep(_SIGQUIT_DELAY_S)
             self.parent_process.send_signal(signal.SIGQUIT)
+
+    def _run_diagnostics(self):
+        # A wedged diagnostic must not pile up a new thread on every soft timeout.
+        previous = self._diagnostics_thread
+        if previous is not None and previous.is_alive():
+            logger.error(
+                f"{self.debug_name} watchdog diagnostics from the previous timeout "
+                f"are still running, skipping"
+            )
+            return
+        self._diagnostics_thread = threading.Thread(
+            target=self._dump_diagnostics, daemon=True
+        )
+        self._diagnostics_thread.start()
+        self._diagnostics_thread.join(timeout=_DIAGNOSTICS_TIMEOUT_S)
+        if self._diagnostics_thread.is_alive():
+            logger.error(
+                f"{self.debug_name} watchdog diagnostics did not finish within "
+                f"{_DIAGNOSTICS_TIMEOUT_S}s, skipping"
+            )
+
+    def _dump_diagnostics(self):
+        try:
+            if self.dump_info is not None and (info_msg := self.dump_info()):
+                logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+            pyspy_dump_schedulers()
+        except BaseException as e:
+            logger.error(
+                f"{self.debug_name} watchdog diagnostics failed: {e}", exc_info=True
+            )
 
 
 class SubprocessWatchdog:
