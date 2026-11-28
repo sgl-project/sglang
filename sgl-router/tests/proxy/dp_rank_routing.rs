@@ -12,7 +12,6 @@ use serde_json::json;
 use sgl_router::config::{Config, DpRankPolicy, PolicyKind, StickyConfig, StickyFallbackKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
-use sgl_router::policies::request_tokens_for;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -23,6 +22,7 @@ use sgl_router::state::load_monitor::engine_reported_load::{EngineReportedLoadTa
 use sgl_router::state::load_monitor::router_inflight_load::{
     RouterInflightLoadRegistry, SystemTimeClock,
 };
+use sgl_router::tokenizer::prompt::request_tokens_for;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
 use tower::ServiceExt;

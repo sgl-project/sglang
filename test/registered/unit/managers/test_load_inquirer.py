@@ -58,10 +58,11 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             num_matched_prefix_tokens=20,
             cache_request_handle=CacheRequestHandle("waiting", 0),
         )
-        chunked_req = SimpleNamespace(seqlen=50, prefix_len=10)
+        chunked_req = SimpleNamespace(
+            seqlen=50, prefix_len=10, kv=SimpleNamespace(kv_allocated_len=10)
+        )
         return SchedulerLoadInquirer(
             disaggregation_mode=disaggregation_mode,
-            server_args=None,
             max_total_num_tokens=1000,
             max_running_requests=10,
             pool_stats_observer=None,
@@ -83,6 +84,50 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             get_decode_moment_totals=None,
             get_waiting_storage_span=Mock(return_value=storage_span),
         )
+
+    def test_load_report_carries_the_storage_prefetch_counters(self):
+        collector = SimpleNamespace(
+            total_storage_prefetch_hit_tokens=500,
+            total_storage_prefetch_unfulfilled_tokens={"storage_transfer": 20},
+        )
+        for storage, expected in [
+            (collector, (500, {"storage_transfer": 20})),
+            (None, (None, None)),
+        ]:
+            inquirer = replace(
+                self.make_inquirer(),
+                spec_algorithm=SimpleNamespace(is_none=lambda: True),
+                pool_stats_observer=SimpleNamespace(
+                    get_pool_stats=lambda: SimpleNamespace(
+                        get_kv_token_stats=lambda: (0, 0.0)
+                    )
+                ),
+                get_running_batch=lambda: SimpleNamespace(reqs=[]),
+                get_stats=lambda: SchedulerStats(),
+                get_request_lists=lambda: {},
+                get_total_prefill_uncached_tokens=lambda: 0,
+                get_total_prefill_busy_us=lambda: 0,
+                get_decode_moment_totals=lambda: [0.0] * 6,
+                get_storage_metrics_collector=lambda storage=storage: storage,
+            )
+            with (
+                patch(
+                    "sglang.srt.managers.scheduler_components.load_inquirer.get_lora",
+                    return_value=SimpleNamespace(enable_lora=False),
+                ),
+                patch(
+                    "sglang.srt.managers.scheduler_components.load_inquirer.get_parallel",
+                    return_value=SimpleNamespace(dp_rank=0),
+                ),
+            ):
+                load = inquirer.get_loads()
+            self.assertEqual(
+                (
+                    load.total_storage_prefetch_hit_tokens,
+                    load.total_storage_prefetch_unfulfilled_tokens,
+                ),
+                expected,
+            )
 
     def test_waiting_tokens_are_estimated_when_prefix_matching_is_skipped(self):
         inquirer = self.make_inquirer(waiting_queue_prefix_matched=False)
@@ -182,6 +227,60 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
         self.assertEqual(loads.queues.prealloc_ready, 0)
         self.assertEqual(loads.disaggregation.decode_host_pool_blocked, 0)
 
+    def get_loads_with_used_tokens(self, inquirer, num_used_tokens):
+        inquirer = replace(
+            inquirer,
+            pool_stats_observer=SimpleNamespace(
+                get_pool_stats=lambda: SimpleNamespace(
+                    get_kv_token_stats=lambda: (num_used_tokens, 0.0)
+                )
+            ),
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            get_running_batch=lambda: SimpleNamespace(reqs=[]),
+            get_stats=SchedulerStats,
+            get_request_lists=lambda: {},
+            get_total_prefill_uncached_tokens=lambda: 0,
+            get_total_prefill_busy_us=lambda: 0,
+            get_decode_moment_totals=lambda: (0,),
+        )
+        module = "sglang.srt.managers.scheduler_components.load_inquirer"
+        with (
+            patch(
+                f"{module}.get_lora", return_value=SimpleNamespace(enable_lora=False)
+            ),
+            patch(f"{module}.get_parallel", return_value=SimpleNamespace(dp_rank=0)),
+        ):
+            return inquirer.get_loads()
+
+    def test_total_tokens_count_the_rest_of_a_chunked_prefill(self):
+        """The unprefilled part of the chunked request counts toward the DP load."""
+        loads = self.get_loads_with_used_tokens(self.make_inquirer(), 200)
+
+        # 200 KV tokens in use + 100 waiting + (50 - 10) still to prefill.
+        self.assertEqual(loads.num_total_tokens, 340)
+        self.assertEqual(loads.num_active_tokens, 340)
+
+    def test_total_tokens_count_a_just_run_chunk_once(self):
+        """A chunk already allocated in the KV pool is not counted again as unprefilled,
+        though prefix_len only reaches it on the next scheduling pass."""
+        chunked_req = SimpleNamespace(
+            seqlen=16384, prefix_len=0, kv=SimpleNamespace(kv_allocated_len=4096)
+        )
+        inquirer = replace(
+            self.make_inquirer(),
+            get_waiting_queue=lambda: [],
+            get_chunked_req=lambda: chunked_req,
+        )
+        loads = self.get_loads_with_used_tokens(inquirer, 4096)
+
+        self.assertEqual(loads.num_total_tokens, 16384)
+
+    def test_total_tokens_without_a_chunked_prefill(self):
+        inquirer = replace(self.make_inquirer(), get_chunked_req=lambda: None)
+        loads = self.get_loads_with_used_tokens(inquirer, 200)
+
+        self.assertEqual(loads.num_total_tokens, 300)
+
     def test_storage_exclusion_requires_per_request_matching(self):
         for prefix_matched, expected in ((True, 60), (False, 65)):
             with self.subTest(prefix_matched=prefix_matched):
@@ -248,7 +347,6 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
         get_storage_span = Mock(return_value=(20, 80))
         scheduler = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.PREFILL,
-            server_args=None,
             max_total_num_tokens=1000,
             kv_shard_widening=1,
             max_running_requests=10,

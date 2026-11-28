@@ -9,10 +9,11 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.mem_cache_utils import routed
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=40, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 @pytest.mark.parametrize("requests", [1, 3, 8, 128])
@@ -473,7 +474,7 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
         token_to_kv_pool=routed(pool),
         device="cuda",
         is_draft_worker=False,
-        req_to_token_pool=SimpleNamespace(req_to_token=table),
+        req_to_token_pool=SimpleNamespace(req_to_token=table, row_width=64),
         model_config=SimpleNamespace(hf_config=config, context_len=64),
     )
     backend = QwenSparseAttnBackend(runner)
@@ -494,6 +495,7 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
         spec_info=SimpleNamespace(draft_token_num=width, topk=1),
         input_ids=torch.zeros(width, device="cuda", dtype=torch.int32),
         extend_seq_lens=torch.tensor([width], device="cuda", dtype=torch.int32),
+        extend_seq_lens_cpu=[width],
         _original_forward_mode=None,
         mrope_positions=None,
     )

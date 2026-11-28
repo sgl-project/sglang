@@ -12,11 +12,13 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
+from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -28,6 +30,7 @@ def _handle_pd_request(mode, req):
         hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=120
     )
     scheduler.disaggregation_mode = mode
+    scheduler.transfer_backend = TransferBackend.MOONCAKE
     scheduler.disagg_metadata_buffers = SimpleNamespace(enable_sampling_mask=False)
     scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
     scheduler.tokenizer = None
@@ -45,6 +48,7 @@ def _handle_pd_request(mode, req):
     scheduler.hisparse_coordinator = None
     scheduler.uocr_runtime = None
     scheduler.send_abort_output = MagicMock()
+    scheduler.penalty_status_pool = idle_penalty_status_pool()
     scheduler.init_request_retirer()
     recv_req = MagicMock(
         session_params=None,
@@ -140,6 +144,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.beam_coordinator = MagicMock()
                 scheduler.hisparse_coordinator = None
                 scheduler.uocr_runtime = None
+                scheduler.penalty_status_pool = idle_penalty_status_pool()
                 scheduler.init_request_retirer()
                 scheduler.server_args = SimpleNamespace(sampling_mask_max_tokens=64)
                 scheduler._create_generation_req = lambda recv_req, **kw: Req(**kw)

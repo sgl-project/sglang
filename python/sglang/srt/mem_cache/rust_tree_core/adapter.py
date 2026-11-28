@@ -610,7 +610,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 is_write_back=False,
                 enable_hicache=False,
                 write_through_threshold=256,
-                device=str(self.device),
+                empty_device_indices=torch.empty(
+                    0, dtype=torch.int64, device=self.device
+                ),
                 # The window slot's history, as SWAComponent keeps it, the
                 # fused draft's front rows included.
                 swa_sliding_window_size=window,
@@ -1033,6 +1035,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_host_memory_buffer_only(self) -> None:
         self._binding.set_host_memory_buffer_only()
 
+    def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
+        self._binding.set_mamba_path_cap_counts_host(enabled)
+
     @property
     def is_host_memory_buffer_only(self) -> bool:
         return self._binding.is_host_memory_buffer_only()
@@ -1232,6 +1237,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self._binding.node_backuped(node_id)
+
+    def needs_incremental_component_backup(self, node_id: NodeId) -> bool:
+        return self._binding.needs_incremental_component_backup(node_id)
 
     def is_root(self, node_id: NodeId) -> bool:
         return self._binding.is_root(node_id)

@@ -20,44 +20,21 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_params import SamplingParams
+    from sglang.srt.sampling.verify_accept import VerifyAccept
 
 
 class WatermarkRows(Protocol):
-    """One batch's per-row watermark policy.
+    """One step's per-row watermark policy, built by the scheduler at each
+    launch from the step's requests.
 
     Exists only if at least one row is a candidate (enabled and top_k > 1); the
-    batch carries None otherwise. Immutable: an overlapped forward may still read
-    the old object, so filter and concat return new objects.
+    batch carries None otherwise. Only the algorithm's own engine reads its
+    fields; other code only checks it for None.
     """
-
-    def filter(
-        self, keep_indices: list[int], keep_indices_device: Tensor
-    ) -> Optional[WatermarkRows]:
-        """The kept rows, or None when no candidate row is kept."""
-        ...
-
-    def concat(
-        self, other: Optional[WatermarkRows], self_len: int, other_len: int
-    ) -> WatermarkRows:
-        """These rows followed by ``other``'s, or by ``other_len`` off rows."""
-        ...
-
-    def prepend_off(self, num_rows: int) -> WatermarkRows: ...
-
-
-def merge_watermark_rows(
-    a: Optional[WatermarkRows],
-    b: Optional[WatermarkRows],
-    a_len: int,
-    b_len: int,
-) -> Optional[WatermarkRows]:
-    if a is None:
-        return None if b is None else b.prepend_off(a_len)
-    return a.concat(b, a_len, b_len)
 
 
 @dataclass(frozen=True)
-class SampleStep:
+class SampleWatermarkOutput:
     # What the stock sampler must sample with.
     sampling_info: SamplingBatchInfo
     # The pre-watermark logits, iff the caller asked to keep them for logprobs.
@@ -72,7 +49,7 @@ class SampleStep:
 class SampleWatermark(Protocol):
     """One ordinary sampling step's watermark, bound to its forward batch."""
 
-    def apply(self, logits: Tensor, *, keep_logits: bool) -> SampleStep: ...
+    def apply(self, logits: Tensor, *, keep_logits: bool) -> SampleWatermarkOutput: ...
 
     def commit(self, token_ids: Tensor) -> None: ...
 
@@ -107,9 +84,8 @@ class VerifyWatermark(Protocol):
         """
         ...
 
-    def record(self, accept_index: Optional[Tensor], accept_lens: Tensor) -> None:
-        """Record the accepted positions; ``accept_index`` None after a chain
-        apply, where each row accepts a prefix of its draft positions."""
+    def commit(self, accept: VerifyAccept) -> None:
+        """Commit the applied verify's accepted tokens to the watermark state."""
         ...
 
 
@@ -129,14 +105,6 @@ class WatermarkEngine(Protocol):
     ) -> Optional[VerifyWatermark]:
         """The verify's watermark, or None when the batch has no watermark rows."""
         ...
-
-    def append_accept_tokens(
-        self,
-        rows: WatermarkRows,
-        req_pool_indices: Tensor,
-        accept_tokens: Tensor,
-        accept_lens: Tensor,
-    ) -> None: ...
 
 
 # Provider ABI v2 (``VerifySamplingView.watermark_*``) fields of a batch without
