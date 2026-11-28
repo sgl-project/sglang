@@ -77,6 +77,8 @@ def build_attention(
         gating_type=variant,
         use_qk_norm=True,
         qk_norm_type="per_head",
+        # GigaChat35Config's default; build_norm reads it.
+        norm_type="ZeroCenteredGatedNorm",
         use_gemma_norm=variant == "index_sharded",
         dtype=torch.get_default_dtype(),
         num_values=4,
