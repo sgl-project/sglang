@@ -368,6 +368,32 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
     )
 
 
+def _warmup_direct_page_runs(mem_pool_host: Any) -> None:
+    """Build the batched page-run copy before serving if a host pool will issue it.
+
+    Only the layer_first MLA KV and DSA indexer host pools copy through
+    `transfer_kv_direct_runs` on the direct io backend; others never build it.
+    """
+    from sglang.srt.mem_cache.pool_host.direct_copy import (
+        warmup_transfer_kv_direct_runs,
+    )
+    from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+    from sglang.srt.mem_cache.pool_host.group import HostPoolGroup
+    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+    pools = (
+        [entry.host_pool for entry in mem_pool_host.entries]
+        if isinstance(mem_pool_host, HostPoolGroup)
+        else [mem_pool_host]
+    )
+    if any(
+        isinstance(pool, (MLATokenToKVPoolHost, DSAIndexerPoolHost))
+        and pool.layout == "layer_first"
+        for pool in pools
+    ):
+        warmup_transfer_kv_direct_runs()
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -466,6 +492,8 @@ class HiCacheController:
         self.forward_on_fence_stream = False
         self.ack_write_queue: List[HiCacheAck] = []
 
+        if io_backend == "direct":
+            _warmup_direct_page_runs(mem_pool_host)
         self.l2_transfer_engine = L2TransferEngine(io_backend)
 
         # If a storage backend is provided at startup, treat it as an implicit attach,

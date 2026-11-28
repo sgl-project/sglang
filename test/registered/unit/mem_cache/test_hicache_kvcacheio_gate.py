@@ -9,8 +9,9 @@ from unittest import mock
 
 from sglang.srt import runtime_context
 from sglang.srt import utils as srt_utils
-from sglang.srt.mem_cache.pool_host import _kvcacheio
+from sglang.srt.mem_cache.pool_host import _kvcacheio, direct_copy
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -55,12 +56,20 @@ def _is_xpu_guard(test: ast.expr) -> bool:
 class _PoolClass:
     def __init__(self, node: ast.ClassDef):
         self.bases = [b.id for b in node.bases if isinstance(b, ast.Name)]
-        self.calls = {
-            n.func.id
+        named_calls = [
+            n
             for n in ast.walk(node)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id in ALL_OPS
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        ]
+        # Called directly, or passed as the fallback of transfer_kv_direct_runs.
+        self.calls = {n.func.id for n in named_calls if n.func.id in ALL_OPS} | {
+            kw.value.id
+            for n in named_calls
+            if n.func.id == "transfer_kv_direct_runs"
+            for kw in n.keywords
+            if kw.arg == "fallback"
+            and isinstance(kw.value, ast.Name)
+            and kw.value.id in ALL_OPS
         }
         self.own_table = None
         for stmt in self._class_level(node.body):
@@ -239,6 +248,22 @@ class TestKvcacheioGate(unittest.TestCase):
                 self.assertIsNone(_kvcacheio.unavailable_reason)
                 self.assertFalse(hasattr(_kvcacheio, "transfer_kv_per_layer"))
                 self._assert_never_reads_server_args()
+
+
+class TestDirectPageRunsBuildFailure(CustomTestCase):
+    def test_build_failure_only_disables_the_batched_copy(self):
+        """A failed JIT build of the batched page-run copy must not fail startup."""
+        direct_copy._op_available.cache_clear()
+        self.addCleanup(direct_copy._op_available.cache_clear)
+        with (
+            mock.patch.object(direct_copy, "_is_cuda", True),
+            mock.patch(
+                "sglang.kernels.ops.kvcache.page_runs.warmup_page_runs",
+                side_effect=RuntimeError("no compiler"),
+            ),
+        ):
+            direct_copy.warmup_transfer_kv_direct_runs()
+            self.assertFalse(direct_copy._op_available())
 
 
 if __name__ == "__main__":

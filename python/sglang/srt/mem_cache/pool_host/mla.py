@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_storage_page_align,
     make_kernel_ptr_table,
 )
+from sglang.srt.mem_cache.pool_host.direct_copy import transfer_kv_direct_runs
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.npu_host_memory import reserve_mla_split_host_memory
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
@@ -719,12 +720,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
             if self.layout == "layer_first":
-                transfer_kv_direct(
+                transfer_kv_direct_runs(
                     src_layers=[self.kv_buffer[host_layer_id]],
                     dst_layers=[device_buffer],
                     src_indices=host_indices,
                     dst_indices=device_indices,
                     page_size=self.page_size,
+                    fallback=transfer_kv_direct,
                 )
             elif self.layout == "page_first_direct":
                 self._require_packed_device_rows("transfer_kv_per_layer_direct_pf_lf")
@@ -830,12 +832,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
         elif io_backend == "direct":
             if self.layout == "layer_first":
-                transfer_kv_direct(
+                transfer_kv_direct_runs(
                     src_layers=[device_buffer],
                     dst_layers=[self.kv_buffer[host_layer_id]],
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     page_size=self.page_size,
+                    fallback=transfer_kv_direct,
                 )
             else:
                 raise ValueError(
@@ -1153,12 +1156,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
             if self.layout == "layer_first":
-                transfer_kv_direct(
+                transfer_kv_direct_runs(
                     src_layers=device_kv_buffers,
                     dst_layers=self.data_refs,
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     page_size=self.page_size,
+                    fallback=transfer_kv_direct,
                 )
             elif self.layout == "page_first_direct":
                 self._require_packed_device_rows("transfer_kv_all_layer_direct_lf_pf")
