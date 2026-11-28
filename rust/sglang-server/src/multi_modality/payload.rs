@@ -107,9 +107,10 @@ fn collect_media(
 
 /// True for sources the API layer must resolve before MM dispatch: I/O — network
 /// *or* disk, since a network mount can hang past any HTTP timeout — never runs
-/// on the fixed MM worker pool (see `core::prefetch`). That is every absolute
-/// path and every `scheme://` URI, so a scheme no fetcher serves is rejected
-/// there instead of being decoded as base64. `data:` and bare base64 are pure
+/// on the fixed MM worker pool (see `core::prefetch`). That is every source
+/// that starts with '/' (a path, or bare base64 when no such file exists) and
+/// every `scheme://` URI, so a scheme no fetcher serves is rejected there
+/// instead of being decoded as base64. `data:` and other bare base64 are pure
 /// CPU and stay on the worker. Lives next to [`collect_media`] so the prefetch
 /// walk and the resolve walk cannot drift.
 pub fn is_io_source(src: &str) -> bool {
