@@ -40,6 +40,16 @@ class OpenAIServingClassify(OpenAIServingBase):
             getattr(self.tokenizer_manager.model_config.hf_config, "problem_type", None)
             == "multi_label_classification"
         )
+        self.is_regression = (
+            getattr(self.tokenizer_manager.model_config.hf_config, "problem_type", None)
+            == "regression"
+        )
+        # Head semantics for turning raw logits into probs, aligned with
+        # transformers' TextClassificationPipeline and vLLM's pooler:
+        # - regression heads return raw scores (identity)
+        # - single-label heads use sigmoid (softmax over one logit is always 1.0)
+        # - multi-class / multi-label heads use softmax / sigmoid
+        self.num_labels = len(self.id2label)
         self.is_token_classifier = (
             self.tokenizer_manager.model_config.embedding_model_spec.task
             == EmbeddingTask.TOKEN_CLASSIFY
@@ -197,9 +207,16 @@ class OpenAIServingClassify(OpenAIServingBase):
 
     def _classify_scores(self, *, scores: Any, num_tokens: int) -> Dict[str, Any]:
         rows = self._score_rows(scores=scores, num_tokens=num_tokens)
-        probs = (
-            torch.sigmoid(rows) if self.is_multi_label else torch.softmax(rows, dim=-1)
-        ).tolist()
+        if self.is_regression:
+            # Regression heads return raw scores; softmax would turn them into a
+            # distribution that loses their values and signs.
+            probs = rows.tolist()
+        elif self.is_multi_label or self.num_labels < 2:
+            # A softmax over a single logit is always 1.0, which discards the
+            # score entirely; use sigmoid instead.
+            probs = torch.sigmoid(rows).tolist()
+        else:
+            probs = torch.softmax(rows, dim=-1).tolist()
         labels = [self._label(class_id) for class_id in rows.argmax(dim=-1).tolist()]
         if not self.is_token_classifier:
             probs, labels = probs[0], labels[0]
