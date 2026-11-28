@@ -404,6 +404,9 @@ class Envs:
     SGLANG_USAGE_HEADER_PREFIX = EnvStr("")
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    # Bound /server_info's internal-state fan-out. The underlying query keeps
+    # running after a timeout and is reused by the next caller.
+    SGLANG_SERVER_INFO_TIMEOUT = EnvFloat(2.0)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
