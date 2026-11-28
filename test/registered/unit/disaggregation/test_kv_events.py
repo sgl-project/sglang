@@ -419,5 +419,155 @@ class TestZmqReplayBackpressure(CustomTestCase):
         self.assertFalse(self.publisher._pending_replays)
 
 
+class TestTokenIdSuppression(unittest.TestCase):
+    TOKENS = [104729, 130363, 155921, 196613, 221021, 260003, 300007, 340019]
+    SPANS = [[(0, 2, "image-a")], []]
+
+    def _batch(self, **overrides):
+        stored = BlockStored(
+            block_hashes=[-9007199254740001, 424242],
+            parent_block_hash=-8000000000000000,
+            token_ids=list(self.TOKENS),
+            block_size=4,
+            lora_id=None,
+            medium=StorageMedium.CPU,
+            cache_salt="synthetic-salt",
+            session_id="synthetic-session",
+            lora_name=None,
+            mm_routing_spans=self.SPANS,
+        )
+        if overrides:
+            stored = msgspec.structs.replace(stored, **overrides)
+        return KVEventBatch(ts=1.25, events=[stored])
+
+    def _track(self, publisher):
+        # Upstream registers shutdown with atexit in __init__; unregister it so
+        # shutdown runs once, from addCleanup, as the existing publisher tests do.
+        atexit.unregister(publisher.shutdown)
+        self.addCleanup(publisher.shutdown)
+        return publisher
+
+    def _publisher(self, **config):
+        return self._track(ZmqEventPublisher(
+            attn_dp_rank=0,
+            endpoint=f"tcp://127.0.0.1:{get_free_port()}",
+            bind=True,
+            **config,
+        ))
+
+    def _wait_for_seq(self, publisher, seq, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while not publisher._buffer or publisher._buffer[-1][0] < seq:
+            if time.monotonic() >= deadline:
+                self.fail(f"sequence {seq} not buffered within {timeout}s")
+            time.sleep(0.01)
+
+    def _published_bytes(self, batch, **config):
+        publisher = self._publisher(**config)
+        publisher.publish(batch)
+        self._wait_for_seq(publisher, 0)
+        return publisher._buffer[-1][1]
+
+    @staticmethod
+    def _decode(payload):
+        return msgspec.msgpack.decode(payload, type=KVEventBatch)
+
+    def test_default_control_and_suppressed_golden(self):
+        control = self._decode(self._published_bytes(self._batch())).events[0]
+        suppressed = self._decode(
+            self._published_bytes(self._batch(), include_token_ids=False)
+        ).events[0]
+        self.assertEqual(control.token_ids, self.TOKENS)
+        self.assertEqual(suppressed.token_ids, [])
+        for field in (
+            "block_hashes", "parent_block_hash", "block_size", "lora_id",
+            "medium", "cache_salt", "session_id", "lora_name", "mm_routing_spans",
+        ):
+            self.assertEqual(getattr(suppressed, field), getattr(control, field), field)
+        self.assertEqual(suppressed.mm_routing_spans, [[(0, 2, "image-a")], []])
+
+    def test_suppressed_bytes_equal_control_encoding_with_empty_ids(self):
+        suppressed = self._published_bytes(self._batch(), include_token_ids=False)
+        expected = self._batch(token_ids=[])
+        expected.attn_dp_rank = 0  # what publish() assigns
+        self.assertEqual(suppressed, msgspec.msgpack.encode(expected))
+
+    def test_suppression_preserves_metadata_and_bigram_shape(self):
+        batch = self._batch(token_ids=[(104729, 104730), (104730, 104731)])
+        stored = self._decode(
+            self._published_bytes(batch, include_token_ids=False)
+        ).events[0]
+        self.assertEqual(stored.token_ids, [])
+        self.assertEqual(stored.block_hashes, [-9007199254740001, 424242])
+        self.assertEqual(stored.parent_block_hash, -8000000000000000)
+        self.assertEqual(stored.block_size, 4)
+        self.assertEqual(stored.cache_salt, "synthetic-salt")
+        self.assertEqual(stored.session_id, "synthetic-session")
+        self.assertEqual(stored.medium, StorageMedium.CPU)
+
+    def test_empty_lora_name_is_base(self):
+        stored = self._decode(
+            self._published_bytes(self._batch(lora_name=""), include_token_ids=False)
+        ).events[0]
+        self.assertEqual(stored.token_ids, [])
+        self.assertEqual(stored.lora_name, "")
+
+    def test_named_lora_rejects_whole_batch_before_queue(self):
+        publisher = self._publisher(include_token_ids=False)
+        base = self._batch().events[0]
+        named = msgspec.structs.replace(base, lora_name="adapter-a")
+        with self.assertRaisesRegex(ValueError, "named LoRA"):
+            publisher.publish(KVEventBatch(ts=2.0, events=[base, named]))
+        self.assertTrue(publisher._event_queue.empty())
+        self.assertEqual(base.token_ids, self.TOKENS)
+        # The rejected batch must not have consumed a sequence number: the next
+        # accepted batch is sequence 0 and it is the only one buffered.
+        publisher.publish(self._batch())
+        self._wait_for_seq(publisher, 0)
+        self.assertEqual([seq for seq, _ in publisher._buffer], [0])
+
+    def test_replay_matches_buffer_and_is_sanitized(self):
+        # The live frame and the _buffer entry come from one encode call, so
+        # this proves replay == buffer, not live == replay. Live-vs-replay
+        # parity is asserted by the E2E attacker, which captures both.
+        replay = f"tcp://127.0.0.1:{get_free_port()}"
+        publisher = self._publisher(
+            replay_endpoint=replay, buffer_steps=1, include_token_ids=False
+        )
+        dealer = zmq.Context.instance().socket(zmq.DEALER)
+        dealer.setsockopt(zmq.RCVTIMEO, 5000)
+        dealer.connect(replay)
+        self.addCleanup(dealer.close, linger=0)
+        for ts in (1.0, 2.0):
+            publisher.publish(KVEventBatch(ts=ts, events=self._batch().events))
+        self._wait_for_seq(publisher, 1)
+        buffered = publisher._buffer[-1][1]
+
+        def replay_once():
+            dealer.send_multipart([b"", (0).to_bytes(8, "big")])
+            data = dealer.recv_multipart()
+            end = dealer.recv_multipart()
+            self.assertEqual(int.from_bytes(end[2], "big", signed=True), -1)
+            return data
+
+        first = replay_once()
+        second = replay_once()
+        self.assertEqual(first[3], buffered)
+        self.assertEqual(second[3], buffered)
+        self.assertEqual(int.from_bytes(first[2], "big"), 1)  # buffer_steps=1 rotated seq 0 out
+        self.assertEqual(self._decode(first[3]).events[0].token_ids, [])
+
+    def test_factory_passes_include_token_ids(self):
+        config = json.dumps({
+            "publisher": "zmq",
+            "endpoint": f"tcp://127.0.0.1:{get_free_port()}",
+            "include_token_ids": False,
+        })
+        publisher = self._track(EventPublisherFactory.create(config, attn_dp_rank=0))
+        publisher.publish(self._batch())
+        self._wait_for_seq(publisher, 0)
+        self.assertEqual(self._decode(publisher._buffer[-1][1]).events[0].token_ids, [])
+
+
 if __name__ == "__main__":
     unittest.main()
