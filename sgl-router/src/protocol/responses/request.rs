@@ -220,6 +220,16 @@ fn reject_unsupported(req: &Map<String, Value>) -> Result<(), String> {
     if req.get("background").and_then(Value::as_bool) == Some(true) {
         return Err("`background: true` is not supported".into());
     }
+    // Accepting it would echo `store: true` on a response that can never be
+    // retrieved or continued, so a client could drop its own history.
+    if req.get("store").and_then(Value::as_bool) == Some(true) {
+        return Err(
+            "`store: true` is not supported: this endpoint does not store responses, so they \
+             cannot be retrieved or continued. Omit `store` or send `false`, and keep the \
+             conversation in `input`."
+                .into(),
+        );
+    }
     if set("prompt") {
         return Err("`prompt` (stored prompt templates) is not supported".into());
     }

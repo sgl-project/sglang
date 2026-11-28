@@ -170,6 +170,20 @@ async fn streaming_event_sequence() {
 }
 
 #[tokio::test]
+async fn store_false_is_accepted_and_echoed() {
+    let mock = MockWorker::start(vec![]).await;
+    let (status, _, body) = post(
+        build_ctx(mock.url.clone()),
+        "/v1/responses",
+        json!({"model": MODEL, "input": "x", "store": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["store"], false);
+}
+
+#[tokio::test]
 async fn engine_error_is_rewrapped() {
     let mock = MockWorker::start_returning_error(
         StatusCode::BAD_REQUEST,
@@ -204,6 +218,10 @@ async fn router_side_rejections_are_structured() {
         ),
         (
             json!({"model": MODEL, "input": "x", "include": ["message.output_text.logprobs"]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"model": MODEL, "input": "x", "store": true}),
             StatusCode::BAD_REQUEST,
         ),
     ] {
