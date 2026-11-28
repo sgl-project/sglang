@@ -108,6 +108,8 @@ class ComposedPipelineBase(ABC):
     # the name of the pipeline it associated with, in diffusers
     pipeline_name: str
     default_model_subfolder: str | None = None
+    # Hub files this pipeline never loads; skipped when it downloads a whole repository
+    hub_ignore_patterns: tuple[str, ...] = ()
 
     def is_lora_effective(self):
         return False
@@ -220,6 +222,7 @@ class ComposedPipelineBase(ABC):
                 self.model_path,
                 force_diffusers_model=True,
                 revision=self.server_args.revision,
+                extra_ignore_patterns=self.hub_ignore_patterns,
             )
         else:
             model_subfolder = os.path.normpath(model_subfolder)
