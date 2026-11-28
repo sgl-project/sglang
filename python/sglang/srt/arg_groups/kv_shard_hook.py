@@ -96,13 +96,13 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
                 "KV and page size 64."
             )
         if (
-            cfg.disaggregation_transfer_backend != "mooncake"
+            cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
             or cfg.enable_dsa_cache_layer_split
             or get_dsa_index_kpool(hf_config) != 1
             or get_dsa_index_kpool_compress(hf_config)
         ):
             raise ValueError(
-                "DSA KV sharding requires Mooncake, uncompressed index_kpool=1 "
+                "DSA KV sharding requires Mooncake or NIXL, uncompressed index_kpool=1 "
                 "and no DSA cache layer splitting."
             )
         return

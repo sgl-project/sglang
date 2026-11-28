@@ -133,7 +133,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.runtime_context import (
     describe_kv_events_publisher,
     get_context,
-    get_serving,
     override_platform,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
@@ -4602,9 +4601,8 @@ class TestHandleCrashDumpEnv(CustomTestCase):
 
 
 class TestGrpcServerArgs(CustomTestCase):
-    """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT) and runs
-    alongside HTTP; --grpc-mode serves the encoder over gRPC. Worker-threads /
-    max-prefill-tokens are env-only knobs.
+    """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT), which only
+    the Rust server serves; --grpc-mode serves the encoder over gRPC.
 
     The gRPC setup lives in `serving_hook.handle_grpc_args`, which
     __post_init__ skips for dummy models, so these tests build a dummy
@@ -4621,16 +4619,20 @@ class TestGrpcServerArgs(CustomTestCase):
         handle_grpc_args(sa)
         self.assertIsNone(resolution_result(sa, "grpc_port"))
 
-    def test_grpc_port_enables_native_and_env_knobs(self):
+    def test_grpc_port_requires_the_rust_server(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER=1"):
+            handle_grpc_args(self._args(grpc_port=50051))
         sa = self._args(grpc_port=50051)
-        with envs.SGLANG_GRPC_WORKER_THREADS.override(8):
+        with envs.SGLANG_RUST_SERVER.override(True):
             handle_grpc_args(sa)
         self.assertEqual(resolution_result(sa, "grpc_port"), 50051)
-        self.assertEqual(resolution_result(sa, "grpc_worker_threads"), 8)
 
     def test_env_grpc_port_enables_native(self):
         sa = self._args(port=30000)
-        with envs.SGLANG_GRPC_PORT.override(45000):
+        with (
+            envs.SGLANG_GRPC_PORT.override(45000),
+            envs.SGLANG_RUST_SERVER.override(True),
+        ):
             handle_grpc_args(sa)
         self.assertEqual(resolution_result(sa, "grpc_port"), 45000)
 
@@ -4828,11 +4830,6 @@ class TestGrpcServerArgs(CustomTestCase):
         proc.join.assert_called_once_with(timeout=42.0)
         kill_tree.assert_called_once_with(1234, wait_timeout=42.0)
 
-    def test_native_grpc_rejects_multi_tokenizer(self):
-        sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
-        with self.assertRaises(ValueError):
-            handle_grpc_args(sa)
-
     def test_rust_server_grpc_accepts_multi_tokenizer(self):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=4)
         with envs.SGLANG_RUST_SERVER.override(True):
@@ -4859,12 +4856,6 @@ class TestGrpcServerArgs(CustomTestCase):
             source.index("run_hook(handle_grpc_args"),
         )
 
-    def test_invalid_grpc_worker_threads_rejected(self):
-        sa = self._args(grpc_port=40000)
-        with envs.SGLANG_GRPC_WORKER_THREADS.override(0):
-            with self.assertRaises(ValueError):
-                handle_grpc_args(sa)
-
     def test_grpc_response_timeout(self):
         parser = self._sidecar_parser()
         for value in (300, 1800, 0, -1):
@@ -4879,62 +4870,11 @@ class TestGrpcServerArgs(CustomTestCase):
                     ):
                         handle_grpc_args(sa)
                 else:
-                    handle_grpc_args(sa)
+                    with envs.SGLANG_RUST_SERVER.override(True):
+                        handle_grpc_args(sa)
                     self.assertEqual(
                         resolution_result(sa, "grpc_response_timeout_secs"), value
                     )
-
-    def test_start_server_call_site_matches_native_signature(self):
-        """Regression for the startup blocker: the native start_server binding
-        only accepts (host, port, runtime_handle, worker_threads, ...). The
-        arg-parsing tests above never call start_server, so a stray kwarg (e.g.
-        the removed max_prefill_tokens) would only surface as a TypeError at
-        launch. This mocks the native extension and locks the kwarg set."""
-        from sglang.srt.entrypoints import http_server
-
-        fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
-        fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
-        override = get_context().override_server_args(
-            host="127.0.0.1",
-            grpc_port=50051,
-            grpc_worker_threads=4,
-            grpc_response_timeout_secs=1800,
-        )
-        server_args = override.install()
-        self.addCleanup(override.restore)
-        with (
-            patch(
-                "sglang.srt.rust_extensions.load_rust_extension",
-                return_value=fake_core,
-            ) as load_rust_extension,
-            patch.dict(
-                "sys.modules", {"sglang.srt.entrypoints.grpc_bridge": fake_bridge}
-            ),
-        ):
-            handle = http_server._start_native_grpc_server_for_runtime(
-                server_args=server_args,
-                tokenizer_manager=MagicMock(),
-                template_manager=MagicMock(),
-                scheduler_info={},
-                grpc_port=get_serving().grpc_port,
-            )
-
-        self.assertEqual(handle, "handle")
-        load_rust_extension.assert_called_once_with("sglang.srt.rust_extensions._grpc")
-        _, kwargs = fake_core.start_server.call_args
-        self.assertEqual(
-            set(kwargs),
-            {
-                "host",
-                "port",
-                "runtime_handle",
-                "worker_threads",
-                "response_timeout_secs",
-            },
-        )
-        self.assertEqual(kwargs["worker_threads"], 4)
-        self.assertEqual(kwargs["response_timeout_secs"], 1800)
-        self.assertNotIn("max_prefill_tokens", kwargs)
 
 
 class TestTwoBatchOverlapBackend(CustomTestCase):
@@ -5960,6 +5900,7 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "ssl_keyfile_password": ["--ssl-keyfile-password", "pw"],
         "enable_ssl_refresh": ["--enable-ssl-refresh"],
         "allowed_media_domains": ["--allowed-media-domains", "example.com"],
+        "allow_private_media_hosts": ["--allow-private-media-hosts"],
         "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
         "enable_trace": ["--enable-trace"],
         "completion_template": ["--completion-template", "deepseek_coder"],

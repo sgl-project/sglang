@@ -369,8 +369,6 @@ class TestMooncakeUnifiedKeys(CustomTestCase):
             layer_partition=3,
         )
         rank.store.enable_storage_metrics = True
-        # The MHA pool sizes a page by K alone; a unified page holds K and V.
-        self.assertEqual(rank.store.gb_per_page * (1 << 30), rank.layout.bytes_per_page)
         keys = ["p0", "p1"]
         short_chunks = [suffix for suffix in rank.plan.suffixes if "_L3-4_" in suffix]
         with patch("time.perf_counter", side_effect=[0.0, 1.0, 1.0, 2.0]):

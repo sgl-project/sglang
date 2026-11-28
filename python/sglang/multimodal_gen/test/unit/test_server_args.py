@@ -105,6 +105,10 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.server_args import server_args as server_args_module
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 from sglang.multimodal_gen.test.unit.conftest import mock_cuda_platform
+from sglang.srt.multimodal.media_io import (
+    configure_media_url_security,
+    media_url_security_config,
+)
 
 
 def _from_dict_without_model_resolution(
@@ -324,6 +328,37 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
         self.assertEqual(server_args.numa_node, [0, 1])
+
+    def test_media_url_flags_configure_the_process_policy_at_parse(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--allowed-media-domains",
+            "Media.Example",
+            "--allow-private-media-hosts",
+            "--media-url-max-file-size-mb",
+            "7",
+            "--media-url-timeout",
+            "3",
+        ]
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            mock_cuda_platform(),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            try:
+                ServerArgs.from_cli_args(args, unknown_args)
+                self.assertEqual(
+                    media_url_security_config(),
+                    (["media.example"], 7, 3.0, True, True),
+                )
+            finally:
+                configure_media_url_security()
 
     def test_component_paths_are_expanded_before_pipeline_resolution(self):
         args = self._from_dict_without_model_resolution(

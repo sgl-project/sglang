@@ -796,8 +796,16 @@ class Envs:
     # ===================================================================
     # Shared-prompt decode attention for wide beam batches (FlashInfer MHA only).
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
+    # Run shared-context attention with the split-KV kernel (prompt split across CTAs).
+    SGLANG_USE_BEAM_SHARED_CONTEXT_SPLIT_KV = EnvBool(False)
     # Replay the trie beam selection step as a CUDA graph.
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
+    # Replay decode batches made only of beam requests as CUDA graphs.
+    SGLANG_ENABLE_BEAM_DECODE_GRAPH = EnvBool(False)
+    # Beam width of the shared-context beam graphs.
+    SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH = EnvInt(None)
+    # Tokens per request the beam graphs hold; needed when the model has no trie.
+    SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY = EnvInt(None)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
@@ -1145,6 +1153,9 @@ class Envs:
     SGLANG_AITER_INTREE_GEMM_TUNE = EnvBool(True)
     # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
     SGLANG_AITER_INTREE_MHC_TILE_M16 = EnvBool(True)
+    # Qwen4-Exp HC sites with <= 128 rows on gfx950: fold the per-branch norm and the
+    # inject GEMV into a FlyDSL mix. Off by default: not bit-exact (~1 bf16 ulp).
+    SGLANG_ROCM_OPT_QWEN4_FUSED_HC = EnvBool(False)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
@@ -1790,6 +1801,9 @@ class Envs:
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
+    # SM120: fuse SiLU-and-mul into unquantized bf16 gate_up GEMMs (quack) through
+    # DualGemm, for MLPs built on LlamaMLP or Qwen2MLP.
+    SGLANG_USE_QUACK_SWIGLU_GEMM = EnvBool(False)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
 
@@ -2142,11 +2156,9 @@ class Envs:
     # Native gRPC server
     # ===================================================================
     # Native gRPC server. SGLANG_GRPC_PORT is the env fallback for the
-    # --grpc-port CLI flag; setting either enables the native server alongside
-    # HTTP. The worker-threads knob stays env-only (internal tuning, no CLI
-    # surface).
+    # --grpc-port CLI flag; setting either enables the Rust server's native
+    # gRPC listener (requires SGLANG_RUST_SERVER).
     SGLANG_GRPC_PORT = EnvInt(None)
-    SGLANG_GRPC_WORKER_THREADS = EnvInt(4)
 
     # ===================================================================
     # NUMA and CPU affinity
@@ -2864,7 +2876,12 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_GRPC_WORKER_THREADS": _DeprecatedEnv(
+        note="The Python gRPC bridge was removed; the Rust server sizes its own "
+        "thread pools."
+    ),
+}
 
 
 def _handle_deprecated_envs():
