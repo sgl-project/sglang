@@ -9,6 +9,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.layernorm import mhc
+from sglang.srt.batch_invariant_ops import set_batch_invariant_mode
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -30,14 +31,15 @@ class TestAiterMHCGLM53Flash(CustomTestCase):
     def setUp(self):
         mhc._AITER_MHC_RUNTIME_DISABLED = False
 
-    def _inputs(self, tokens: int, seed: int = 0):
+    def _inputs(self, tokens: int, seed: int = 0, hc_mult: int | None = None):
         torch.manual_seed(seed)
         device = torch.device("cuda")
-        mix_size = 2 * self.hc_mult + self.hc_mult**2
+        hc_mult = hc_mult or self.hc_mult
+        mix_size = 2 * hc_mult + hc_mult**2
         residual = (
             torch.randn(
                 tokens,
-                self.hc_mult,
+                hc_mult,
                 self.hidden_size,
                 device=device,
                 dtype=torch.bfloat16,
@@ -47,7 +49,7 @@ class TestAiterMHCGLM53Flash(CustomTestCase):
         fn = (
             torch.randn(
                 mix_size,
-                self.hc_mult * self.hidden_size,
+                hc_mult * self.hidden_size,
                 device=device,
                 dtype=torch.float32,
             )
@@ -96,6 +98,83 @@ class TestAiterMHCGLM53Flash(CustomTestCase):
         self.assertFalse(norm_fused)
         torch.testing.assert_close(layer_input, layer_ref)
         self.assertTrue(torch.isfinite(out).all())
+
+    def _pre_kwargs(self, fn, scale, base):
+        return dict(
+            fn=fn,
+            hc_scale=scale,
+            hc_base=base,
+            rms_eps=self.rms_eps,
+            hc_pre_eps=self.hc_eps,
+            hc_sinkhorn_eps=self.hc_eps,
+            hc_post_mult_value=2.0,
+            sinkhorn_repeat=20,
+        )
+
+    def test_batch_invariant_mode_rows_do_not_depend_on_the_batch(self):
+        """In batch-invariant mode a token's mHC pre outputs must not change with its batchmates."""
+        residual, fn, scale, base = self._inputs(1024)
+        kwargs = self._pre_kwargs(fn, scale, base)
+        with (
+            envs.SGLANG_USE_AITER.override(True),
+            set_batch_invariant_mode(True),
+            patch.object(
+                mhc,
+                "_try_aiter_mhc_pre",
+                side_effect=AssertionError("AITER mhc_pre called"),
+            ),
+        ):
+            *full, norm_fused = mhc._mhc_pre_dispatch(residual=residual, **kwargs)
+            # 256 / 257 rows straddle the switch to taller row tiles.
+            for start, rows in (
+                (0, 1),
+                (5, 1),
+                (3, 7),
+                (100, 256),
+                (100, 257),
+                (700, 324),
+            ):
+                with self.subTest(start=start, rows=rows):
+                    *part, _ = mhc._mhc_pre_dispatch(
+                        residual=residual[start : start + rows].contiguous(), **kwargs
+                    )
+                    for got, ref in zip(part, full):
+                        self.assertTrue(torch.equal(got, ref[start : start + rows]))
+        self.assertFalse(norm_fused)
+
+    def test_batch_invariant_mode_matches_torch(self):
+        """The batch-invariant kernel computes the Torch fallback's math."""
+        residual, fn, scale, base = self._inputs(300, seed=1)
+        kwargs = self._pre_kwargs(fn, scale, base)
+        post_ref, comb_ref, layer_ref = mhc._mhc_pre_torch(residual=residual, **kwargs)
+        with set_batch_invariant_mode(True):
+            post, comb, layer_input, _ = mhc._mhc_pre_dispatch(
+                residual=residual, **kwargs
+            )
+        torch.testing.assert_close(
+            post.view_as(post_ref), post_ref, atol=1e-4, rtol=1e-4
+        )
+        torch.testing.assert_close(
+            comb.view_as(comb_ref), comb_ref, atol=1e-4, rtol=1e-4
+        )
+        torch.testing.assert_close(layer_input, layer_ref)
+
+    def test_batch_invariant_mode_odd_stream_count_uses_torch(self):
+        """A stream count the Triton kernel cannot compile (hc_mult=3) must take the Torch path."""
+        residual, fn, scale, base = self._inputs(5, hc_mult=3)
+        kwargs = self._pre_kwargs(fn, scale, base)
+        with (
+            set_batch_invariant_mode(True),
+            patch.object(
+                mhc,
+                "mhc_pre_batch_invariant",
+                side_effect=AssertionError("Triton mhc_pre called"),
+            ),
+        ):
+            ref = mhc._mhc_pre_torch(residual=residual, **kwargs)
+            *got, _ = mhc._mhc_pre_dispatch(residual=residual, **kwargs)
+        for g, r in zip(got, ref):
+            self.assertTrue(torch.equal(g, r))
 
     def test_aiter_import_and_runtime_failures_latch_to_torch(self):
         """A missing symbol or a raising kernel must disable the route once, not fail the request."""
