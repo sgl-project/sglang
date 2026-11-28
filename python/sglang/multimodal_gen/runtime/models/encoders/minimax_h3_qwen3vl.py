@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.weights.source import (
     materialize_weight,
     resolve_weight,
 )
+from sglang.srt.runtime_context import get_parallel
 
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 _LAYER_WEIGHT_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.")
@@ -283,7 +284,11 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             quant_config=config.quant_config,
             use_tensor_parallel=True,
             prefix="model",
+            vision_replicated=config.vision_replicated,
         )
+        if config.vision_replicated and get_parallel().tp_size > 1:
+            # stream the three full-width mergers along with the replicated blocks
+            self.layer_names = [*self.layer_names, "model.visual.deepstack_merger_list"]
         # H3 and ClipProj consume an unnormalized intermediate residual stream.
         self.model.language_model.norm = nn.Identity()
         self.image_token_id = int(arch.image_token_id)
