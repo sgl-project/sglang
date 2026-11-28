@@ -96,3 +96,21 @@ def store_fp4_index_k_cache_split(
         BLOCK=64,
         PAGE8=page8,
     )
+
+
+def store_fp4_index_k_cache_natural(
+    input: torch.Tensor,
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    rne: bool = False,
+) -> None:
+    """Quantize input [n, 128] to fp4 (per-32 ue8m0) into slot loc[i] of the natural
+    layout (payload [pages, page_size, 64], scale [pages, page_size, 4])."""
+    assert input.shape[-1] == _HEAD_DIM
+    k_fp4, k_sf = quantize_fp4_indexer_tensor(input.contiguous(), rne=rne)
+    loc = loc.to(torch.int64)
+    payload.view(torch.uint8).view(-1, _HEAD_DIM // 2)[loc] = k_fp4.view(torch.uint8)
+    # chunk c's e8m0 byte sits at bits 8c of the packed int32 = byte c little-endian
+    scale.view(-1, 4)[loc] = k_sf.view(torch.uint8).view(-1, 4)
