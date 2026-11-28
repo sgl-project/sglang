@@ -209,6 +209,7 @@ def _req(rid, prompt, max_new_tokens=4):
         max_new_tokens=max_new_tokens, ignore_eos=False
     )
     req.retracted_stain = False
+    req.swa_branching_seqlen = None
     req.host_hit_length = 0
     req.window_host_hit_lengths = {}
     req.mamba_host_hit_length = 0

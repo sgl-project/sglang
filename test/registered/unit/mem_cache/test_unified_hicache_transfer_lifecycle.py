@@ -625,6 +625,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         req.window_host_hit_lengths = dict(match.window_host_hit_lengths)
         req.retracted_stain = False
         req.beam_group = None
+        req.swa_branching_seqlen = None
         req.needs_host_load_back.return_value = True
         req.finished.return_value = False
         req.materialized_host_hit_len.return_value = match.host_hit_length
