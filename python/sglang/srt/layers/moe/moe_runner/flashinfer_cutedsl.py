@@ -301,12 +301,8 @@ def refresh_cutedsl_standard_scales_for_weight_update(
             )
 
     with torch.no_grad():
-        dsts, srcs = zip(*scale_pairs)
-        if all(t.is_cuda for t in dsts):
-            torch._foreach_copy_(dsts, srcs)
-        else:
-            for current, new in scale_pairs:
-                current.copy_(new)
+        for current, new in scale_pairs:
+            current.copy_(new)
 
 
 def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
