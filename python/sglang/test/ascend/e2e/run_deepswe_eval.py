@@ -308,11 +308,13 @@ def start_docker_heartbeat(interval=60):
 # a trial that dies before writing reward.txt surfaces only as
 # RewardFileNotFoundError, so print those files (they also land in the saved
 # eval log artifact) to make the failure diagnosable.
+# evalscope nests each run under <work_dir>/<timestamp>/deep_swe_jobs/..., so
+# the timestamp level needs its own wildcard.
 TRIAL_LOG_PATTERNS = (
-    "deep_swe_jobs/**/agent/mini-swe-agent.txt",
-    "deep_swe_jobs/**/verifier/test-stdout.txt",
-    "deep_swe_jobs/**/verifier/run.log",
-    "deep_swe_jobs/**/exception.txt",
+    "**/deep_swe_jobs/**/agent/mini-swe-agent.txt",
+    "**/deep_swe_jobs/**/verifier/test-stdout.txt",
+    "**/deep_swe_jobs/**/verifier/run.log",
+    "**/deep_swe_jobs/**/exception.txt",
 )
 
 
