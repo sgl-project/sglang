@@ -134,9 +134,10 @@ class Magi2RefinerDiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         for block in self.blocks:
             rows = block(rows, rope=rope, layout=local_layout, grid=grid)
 
-        rows = gather_packed_rows(rows, plan=plan)
+        projected = gather_packed_rows(self.post_adapter.project(rows), plan=plan)
         return self.post_adapter(
-            rows.narrow(0, 0, restore.numel()).index_select(0, restore), layout=layout
+            projected.narrow(0, 0, restore.numel()).index_select(0, restore),
+            layout=layout,
         )
 
 

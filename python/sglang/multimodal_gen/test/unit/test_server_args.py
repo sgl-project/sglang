@@ -105,6 +105,10 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.server_args import server_args as server_args_module
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 from sglang.multimodal_gen.test.unit.conftest import mock_cuda_platform
+from sglang.srt.multimodal.media_io import (
+    configure_media_url_security,
+    media_url_security_config,
+)
 
 
 def _from_dict_without_model_resolution(
@@ -324,6 +328,37 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
         self.assertEqual(server_args.numa_node, [0, 1])
+
+    def test_media_url_flags_configure_the_process_policy_at_parse(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--allowed-media-domains",
+            "Media.Example",
+            "--allow-private-media-hosts",
+            "--media-url-max-file-size-mb",
+            "7",
+            "--media-url-timeout",
+            "3",
+        ]
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            mock_cuda_platform(),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            try:
+                ServerArgs.from_cli_args(args, unknown_args)
+                self.assertEqual(
+                    media_url_security_config(),
+                    (["media.example"], 7, 3.0, True, True),
+                )
+            finally:
+                configure_media_url_security()
 
     def test_component_paths_are_expanded_before_pipeline_resolution(self):
         args = self._from_dict_without_model_resolution(
@@ -4084,6 +4119,48 @@ class TestPerRoleParallelism(unittest.TestCase):
 
     def _from_dict(self, kwargs):
         return _from_dict_without_model_resolution(kwargs)
+
+    def test_stage_role_rebuilds_defaults_and_isolates_model_config(self):
+        def config(kwargs):
+            if "pipeline_config" in kwargs:
+                return kwargs["pipeline_config"]
+            return (
+                ZImagePipelineConfig()
+                if kwargs["model_path"] == "/image"
+                else WanT2V480PConfig()
+            )
+
+        with (
+            patch.object(PipelineConfig, "from_kwargs", side_effect=config),
+            patch.object(ServerArgs, "_model_default_uses_cfg", return_value=True),
+            mock_cuda_platform(),
+        ):
+            source = ServerArgs.from_kwargs(
+                model_path="/video",
+                stage_deployment="pools.json",
+                num_gpus=2,
+                attention_backend="TORCH_SDPA",
+                disagg_timeout=17,
+            )
+            worker = source.for_stage_role("text", num_gpus=1)
+            self.assertEqual(worker.num_gpus, 1)
+            self.assertEqual(
+                worker.tp_size * worker.sp_degree * worker.cfg_parallel_degree, 1
+            )
+            self.assertEqual(worker.attention_backend, "TORCH_SDPA")
+            self.assertIsNot(worker.pipeline_config, source.pipeline_config)
+            image = source.for_stage_role("image", model_path="/image", num_gpus=1)
+            self.assertIsInstance(image.pipeline_config, ZImagePipelineConfig)
+            self.assertIsInstance(source.pipeline_config, WanT2V480PConfig)
+            self.assertFalse(image.is_arg_explicitly_set("attention_backend"))
+            self.assertEqual(image.disagg_timeout, 17)
+            self.assertEqual(image.stage_deployment, "pools.json")
+            overridden = source.for_stage_role(
+                "image", model_path="/image", pipeline_config=image.pipeline_config
+            )
+            self.assertIsNot(overridden.pipeline_config, image.pipeline_config)
+            self.assertEqual(source.num_gpus, 2)
+            self.assertIsNone(source.stage_role)
 
     def test_role_derivation_recalculates_automatic_topology(self):
         with (

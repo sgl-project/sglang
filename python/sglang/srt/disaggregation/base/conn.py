@@ -35,6 +35,8 @@ class StateType(str, enum.Enum):
     DRAFT_RING = "draft_ring"
     # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
     DSV4_REQUEST_STATE = "c128_state"
+    # DeepSeek-V4 compressed KV pages on NPU.
+    DSV4_C128 = "dsv4_c128"
     # One item per request row (req_pool_idx), sent row to row: the DeepSeek-V4
     # DSpark draft's SWA valid-from, and the DFLASH draft KV ring's floor.
     REQUEST_ROW = "request_row"

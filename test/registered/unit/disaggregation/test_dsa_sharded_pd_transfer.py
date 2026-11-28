@@ -1,6 +1,6 @@
 """CPU byte-exact tests of page-sharded target/draft DSA PD transfer.
 
-Exercise the production owner filter and Mooncake descriptor builder with a
+Exercise the production owner filter and Mooncake and NIXL descriptor builders with a
 memory-copy transport. No GPU, RDMA engine or model weights are required.
 """
 
@@ -13,6 +13,8 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric, StateType
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
+from sglang.srt.disaggregation.nixl.buffers import BufferKeys
+from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
@@ -21,6 +23,20 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _ROOM = 7
 _INDEX_PAGE_BYTES = 64 * (128 + 4)
+
+
+def _fragmented_indexer_pages():
+    logical_pages = np.array(
+        [15, 3, 24, 9, 18, 7, 28, 12, 22, 1, 8, 30, 4],
+        dtype=np.int32,
+    )
+    dst_pages = np.array(
+        [29, 5, 16, 8, 1, 27, 3, 20, 7, 15, 10, 31, 0],
+        dtype=np.int32,
+    )
+    rng = np.random.default_rng(92)
+    canonical = rng.integers(0, 256, (4, 32, _INDEX_PAGE_BYTES), dtype=np.uint8)
+    return logical_pages, dst_pages, canonical
 
 
 def _manager(rank, size, sources, destinations):
@@ -87,7 +103,26 @@ def _send_state(mgr, peer, src_pages, dst_pages):
         )
 
 
-class TestDSAShardedPDTransfer(CustomTestCase):
+class _FragmentedPagesTestMixin:
+    def test_fragmented_pages_preserve_every_target_and_draft_byte(self):
+        # Three target layers and one draft layer, including packed keys and scales.
+        logical, dst_pages, canonical = _fragmented_indexer_pages()
+        for size in (4, 8):  # At CP size 8, rank 5 owns no requested pages.
+            dst = np.full_like(canonical, 0xA5)
+            expected = dst.copy()
+            for rank in range(size):
+                with self.subTest(cp_size=size, rank=rank):
+                    src = np.ascontiguousarray(canonical[:, rank::size])
+                    written = self._send_pages(rank, size, src, dst, logical, dst_pages)
+                    owned = logical % size == rank
+                    expected[:, dst_pages[owned]] = canonical[:, logical[owned]]
+                    np.testing.assert_array_equal(dst, expected)
+                    self.assertEqual(
+                        written, owned.sum() * len(src) * _INDEX_PAGE_BYTES
+                    )
+
+
+class TestDSAShardedPDTransfer(_FragmentedPagesTestMixin, CustomTestCase):
     def setUp(self):
         super().setUp()
         override = patch(
@@ -97,50 +132,20 @@ class TestDSAShardedPDTransfer(CustomTestCase):
         override.start()
         self.addCleanup(override.stop)
 
-    def test_fragmented_pages_preserve_every_target_and_draft_byte(self):
-        # A full indexer page includes its packed K region AND scale region.
-        # Random bytes encode layer, logical page and byte offset independently.
-        # The fourth layer represents draft, preventing target/draft aliasing
-        # from passing as an apparently correct copy.
-        for size in (4, 8):
-            with self.subTest(cp_size=size):
-                logical_pages = np.array(
-                    [15, 3, 24, 9, 18, 7, 28, 12, 22, 1, 8, 30, 4],
-                    dtype=np.int32,
-                )
-                dst_pages = np.array(
-                    [29, 5, 16, 8, 1, 27, 3, 20, 7, 15, 10, 31, 0],
-                    dtype=np.int32,
-                )
-                rng = np.random.default_rng(92)
-                canonical = rng.integers(
-                    0, 256, (4, 32, _INDEX_PAGE_BYTES), dtype=np.uint8
-                )
-                destinations = [np.full_like(x, 0xA5) for x in canonical]
-                expected = [x.copy() for x in destinations]
-                for layer in range(4):
-                    expected[layer][dst_pages] = canonical[layer][logical_pages]
-                byte_count = 0
-                for rank in range(size):
-                    sources = [np.ascontiguousarray(x[rank::size]) for x in canonical]
-                    mgr, peer = _manager(rank, size, sources, destinations)
-                    with patch(
-                        "sglang.srt.disaggregation.common.conn.get_parallel",
-                        return_value=SimpleNamespace(
-                            enable_dsa_cache_layer_split=False,
-                            enable_cp_tp_group_sharing=False,
-                        ),
-                    ):
-                        self.assertEqual(
-                            mgr._get_dsa_cache_transfer_skip_flags(peer), (False, False)
-                        )
-                    self.assertEqual(
-                        _send_state(mgr, peer, logical_pages, dst_pages), 0
-                    )
-                    byte_count += sum(length for _, _, length in mgr.blocks)
-                for actual, oracle in zip(destinations, expected):
-                    np.testing.assert_array_equal(actual, oracle)
-                self.assertEqual(byte_count, len(logical_pages) * 4 * _INDEX_PAGE_BYTES)
+    def _send_pages(self, rank, size, src, dst, logical, dst_pages):
+        mgr, peer = _manager(rank, size, src, dst)
+        with patch(
+            "sglang.srt.disaggregation.common.conn.get_parallel",
+            return_value=SimpleNamespace(
+                enable_dsa_cache_layer_split=False,
+                enable_cp_tp_group_sharing=False,
+            ),
+        ):
+            self.assertEqual(
+                mgr._get_dsa_cache_transfer_skip_flags(peer), (False, False)
+            )
+        self.assertEqual(_send_state(mgr, peer, logical, dst_pages), 0)
+        return sum(length for _, _, length in mgr.blocks)
 
     def test_mismatch_is_rejected_before_any_write(self):
         src = [np.zeros((8, _INDEX_PAGE_BYTES), dtype=np.uint8)]
@@ -208,6 +213,57 @@ class TestDSAShardedPDTransfer(CustomTestCase):
         expected = np.full_like(dst[0], 0xA5)
         expected[7] = src[0][0]  # logical page 3 on rank 3 is local page 0
         np.testing.assert_array_equal(dst[0], expected)
+
+
+class TestDSANIXLShardedPDTransfer(_FragmentedPagesTestMixin, CustomTestCase):
+    def _send_pages(self, rank, size, src, dst, logical, dst_pages):
+        mgr = NixlKVManager.__new__(NixlKVManager)
+        mgr.kv_shard_rank, mgr.kv_shard_size = rank, size
+        mgr.is_mla_backend = True
+        mgr._state_layout_rejections = {}
+        mgr._prepared_state_plans = {}
+        mgr.kv_args = SimpleNamespace(
+            gpu_id=0,
+            kv_data_ptrs=[],
+            state_types=[StateType.DSA],
+            state_layer_ids=[[]],
+            state_data_ptrs=[[x.ctypes.data for x in src]],
+            state_item_lens=[[_INDEX_PAGE_BYTES] * len(src)],
+        )
+        mgr._local_keys = BufferKeys.for_buffers([], [], [list(range(len(src)))])
+        peer_keys = BufferKeys.for_buffers([], [], [list(range(len(dst)))])
+        mgr._peers = {"decode": SimpleNamespace(keys=peer_keys)}
+        src_by_key = dict(zip(mgr._local_keys.state[0], src))
+        dst_by_key = dict(zip(peer_keys.state[0], dst))
+        byte_count = 0
+
+        # Apply exactly the byte ranges submitted to the transport.
+        def transfer_copies(peer, copies):
+            nonlocal byte_count
+            self.assertEqual(peer, "decode")
+            for copy in copies:
+                s_buf = src_by_key[copy.src].reshape(-1)
+                d_buf = dst_by_key[copy.dst].reshape(-1)
+                for s, d, n in copy.ranges.tolist():
+                    self.assertTrue(0 <= s <= s_buf.size - n)
+                    self.assertTrue(0 <= d <= d_buf.size - n)
+                    d_buf[d : d + n] = s_buf[s : s + n]
+                    byte_count += n
+            return [SimpleNamespace(xfer=object(), result=None, error=None)]
+
+        mgr._transfer_copies = transfer_copies
+        handles = list(
+            mgr.maybe_send_extra(
+                "decode",
+                [logical],
+                [[x.ctypes.data for x in dst]],
+                [dst_pages],
+                decode_tp_size=1,
+                dst_state_item_lens=[[_INDEX_PAGE_BYTES] * len(dst)],
+            )
+        )
+        self.assertEqual(len(handles), int(np.any(logical % size == rank)))
+        return byte_count
 
 
 if __name__ == "__main__":

@@ -33,6 +33,22 @@ sgl-router --model-id qwen3 --service-discovery \
   --pd-version-group-label sglang.ai/version-group
 ```
 
+### Single-token requests on prefill
+
+A PD prefill engine samples the first output token itself, so a request whose
+whole output is that token (prompt scoring, classification, a yes/no judge)
+does not need decode. With `--pd-one-token-on-prefill-only`, the router sends
+a chat, completions or `/generate` request for at most one token, one sample and
+one prompt to the chosen prefill worker alone, with no bootstrap fields. Decode
+reserves no KV for it and no KV is transferred; the prompt still enters that
+prefill's prefix cache. Routing and the DP rank are chosen as for any request.
+
+The router does this only for prefill workers whose `/server_info` reports
+`prefill_answers_alone: true`. A worker running an SGLang that predates the
+field, or one on the `fake` transfer backend, keeps the normal prefill and
+decode path, so the flag is safe to set during a rolling upgrade. A request
+without an explicit `max_tokens` (or `max_new_tokens`) always uses decode.
+
 ### External KV indexer
 
 ```bash
@@ -490,8 +506,18 @@ flags make it cheaper:
 
 On a ~69K-token DeepSeek-V4 chat, `hf` encodes in ~40 ms, `fast` in ~4 ms, and
 a new turn on a cached history in ~0.2 ms. The DeepSeek fixtures check every
-case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
-backend and cache state. `/metrics` exposes only
+case under `hf`, `fast`, and `fast` with L1.
+
+DeepSeek-V4 and V4.1 chats render in `sglang_processor`, whose own HF checkpoint
+tokenizer would encode them past both flags. With the L1 cache or `fast`, the
+router's tokenizer encodes the rendered segments instead (control tokens with
+the added vocabulary, message text without it), so each segment of at least 128
+bytes is cached and a new turn encodes only its new segments. At startup the
+router encodes a set of probe chats both ways and keeps the processor's encode
+if any id differs, logging the first difference. Chats with images always take
+the processor's multimodal path.
+
+Startup logs report the resolved backend and cache state. `/metrics` exposes only
 `sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
 how much tokenization work the cache reuses.
 
@@ -783,12 +809,13 @@ is re-registered; its circuit breaker will open in the meantime.
 `--grpc-port` serves `sglang.api.v1.SglangService/Generate`
 (`proto/sglang/api/v1/service.proto`). A single text prompt or token sequence is
 routed like HTTP `/generate` and forwarded to the selected engine's native
-`api.v1` gRPC server. Engines must run with `--grpc-port`; the router reads that
-port from each worker's `/server_info`. HTTP requests still reach engines over
+`api.v1` gRPC server. Engines must run the native Rust server
+(`SGLANG_RUST_SERVER=1`) with `--grpc-port`, which is the only engine that
+serves `api.v1`; the router reads that port from each worker's `/server_info`. HTTP requests still reach engines over
 HTTP.
 
-This replaces the legacy runtime service. Clients and workers must use `api.v1`;
-there is no legacy fallback. OpenAI, embedding, classify, and rerank gRPC methods
+This replaces the legacy `runtime.v1` service, which engines no longer serve.
+Clients and workers must use `api.v1`; there is no legacy fallback. OpenAI, embedding, classify, and rerank gRPC methods
 are no longer served. Their HTTP endpoints remain available. The other `api.v1`
 RPCs, including health, metadata, detokenization, and administrative calls, answer
 `UNIMPLEMENTED` at the router.

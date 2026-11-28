@@ -3,6 +3,7 @@ title: MAGI-2-preview
 description: Run native MAGI-2-preview joint audio-video generation with SGLang Diffusion.
 metatags:
     description: "Serve MAGI-2-preview with SGLang Diffusion for text-to-video-and-audio and image+text-to-video-and-audio, with expert parallelism over its multi-head MoE DiT and a two-stage 1080p refiner."
+tag: NEW
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
@@ -446,11 +447,10 @@ offload has nothing to move. `--performance-mode memory` likewise lands within a
 couple of percent of `speed` on both time and peak. Neither is a substitute for
 the layerwise flag here.
 
-The Qwen3.5 text encoder is 52 GiB and stays on the host regardless of these
-flags, and its forward runs there too. Staging it onto a card costs 42-84 s for a
-3 s GPU forward against 24 s on the CPU, and the transfer spikes 52 GiB on top of
-the resident DiTs, which is enough to fail the second request of a run. Only one
-rank encodes; the embedding is broadcast to the others.
+The Qwen3.5 text encoder (48 GiB in BF16) runs on one rank, which broadcasts the
+embedding to the others; only that rank loads it. Its layers stream from
+pinned host memory onto that rank's GPU, adding under 1 GiB of device memory; on
+4x B200 the text stage takes 0.9 s.
 
 <Warning>
 Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` when running the
@@ -494,8 +494,9 @@ error.
   configuration-only change.
 - Audio is delivered as stereo at 44100 Hz. The audio VAE decodes at 51200 Hz
   and is resampled for the container.
-- The text encoder is a Qwen3.5 hybrid backbone loaded through transformers.
-  Prompts are padded to the longest in the batch and truncated at 7000 tokens.
+- The text encoder is a Qwen3.5 hybrid backbone, run as SGLang's native Qwen3.5
+  encoder. Prompts are padded to the longest in the batch and truncated at 7000
+  tokens.
 
 ## 8. Performance
 
