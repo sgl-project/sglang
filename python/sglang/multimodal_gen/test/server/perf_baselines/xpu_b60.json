@@ -2,8 +2,8 @@
     "metadata": {
         "model": "Diffusion Server",
         "hardware": "CI Intel Arc Pro B60 (24 GiB) pool: bmg-multigen-models",
-        "description": "Core scenarios were re-seeded from XPU multimodal_gen CI run 35563559050 job 106220948594 (PR #39956), with SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 so step timings record device time rather than host enqueue. Each core value is the max over the 7 attempts of that job. Denoise numbers are stable across attempts (<=2% spread); expected_load_ms is host I/O bound and ranged 21.4-48.0s across attempts, so it is guarded only by the wide e2e tolerance. The fsdp-inference scenario comes from the dedicated 2x B60 validation in PR #35267.",
-        "last_updated": "2026-09-21"
+        "description": "Core scenarios were re-seeded from XPU multimodal_gen CI run 35563559050 job 106220948594 (PR #39956), with SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 so step timings record device time rather than host enqueue. Each core value is the max over the 7 attempts of that job. Denoise numbers are stable across attempts (<=2% spread); expected_load_ms is host I/O bound and ranged 21.4-48.0s across attempts, so it is guarded only by the wide e2e tolerance. The fsdp-inference scenario comes from the dedicated 2x B60 validation in PR #35267. flux_2_klein_image_t2i was re-seeded on 2026-11-22 from 5 warm runs on a B60 CI runner (max over runs; e2e spread ~1%, denoise ~0.2%) after DecodingStage rose from ~292 ms to ~700 ms.",
+        "last_updated": "2026-11-22"
     },
     "tolerances": {
         "long_term": {
@@ -65,24 +65,24 @@
         "flux_2_klein_image_t2i": {
             "estimated_full_test_time_s": 106.8,
             "stages_ms": {
-                "InputValidationStage": 0.11,
-                "TextEncodingStage": 88.26,
-                "ImageVAEEncodingStage": 0.06,
-                "LatentPreparationStage": 0.47,
-                "TimestepPreparationStage": 2.37,
-                "DenoisingStage": 2803.24,
-                "DecodingStage": 292.44
+                "InputValidationStage": 0.05,
+                "TextEncodingStage": 88.94,
+                "ImageVAEEncodingStage": 0.04,
+                "LatentPreparationStage": 0.32,
+                "TimestepPreparationStage": 3.35,
+                "DenoisingStage": 2552.69,
+                "DecodingStage": 715.35
             },
             "denoise_step_ms": {
-                "0": 591.79,
-                "1": 536.64,
-                "2": 537.71,
-                "3": 537.7
+                "0": 611.04,
+                "1": 547.63,
+                "2": 549.03,
+                "3": 549.14
             },
-            "expected_e2e_ms": 3754.98,
-            "expected_load_ms": 26566.83,
-            "expected_avg_denoise_ms": 550.96,
-            "expected_median_denoise_ms": 537.7
+            "expected_e2e_ms": 3919.82,
+            "expected_load_ms": 24001.51,
+            "expected_avg_denoise_ms": 563.72,
+            "expected_median_denoise_ms": 548.92
         },
         "flux_2_klein_base_image_t2i": {
             "stages_ms": {

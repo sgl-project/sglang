@@ -57,6 +57,9 @@ struct VsaBlockSparseSm100Kernel {
     CHECK_HOST(num_blocks % 2 == 0) << "num_blocks must be even, got " << num_blocks;
     CHECK_HOST(S.unwrap() == num_blocks * BLOCK) << "seq_pad " << S.unwrap() << " != num_blocks * " << BLOCK;
     CHECK_HOST(R.unwrap() == B.unwrap() * H.unwrap() * num_blocks) << "q2k rows must be batch * heads * num_blocks";
+    // The vendored kernel indexes q2k_idx as `row * max_kv + i` in int32; the largest index is R * MAXKV - 1.
+    CHECK_HOST(R.unwrap() * MAXKV.unwrap() <= int64_t{INT32_MAX} + 1)
+        << "q2k_idx has " << R.unwrap() << " x " << MAXKV.unwrap() << " entries, int32 indexing overflows";
 
     BlockSparseVsaArgs a{};
     a.q = static_cast<const __nv_bfloat16*>(q.data_ptr());

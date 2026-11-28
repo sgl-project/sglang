@@ -22,6 +22,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     IDEOGRAM4_CI_sampling_params,
     JOY_ECHO_T2V_CI_sampling_params,
     LINGBOT_VIDEO_T2V_CI_sampling_params,
+    LINGBOT_VIDEO_TI2V_CI_sampling_params,
     LONGLIVE2_I2V_CI_sampling_params,
     LONGLIVE2_T2V_CI_sampling_params,
     MINIMAX_H3_IMAGE_EDIT_sampling_params,
@@ -34,8 +35,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
     PI05_ACTION_CI_sampling_params,
-    PRAXIS_DROID_CI_sampling_params,
-    PRAXIS_YAM_CI_sampling_params,
     REALTIME_MODEL_sampling_params,
     SANA_VIDEO_T2V_CI_sampling_params,
     SANA_WM_TI2V_CI_sampling_params,
@@ -135,25 +134,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_perf_check=False,
         perf_warmup_requests=1,
         # No Diffusers counterpart to compare components against.
-        run_component_accuracy_check=False,
-        run_t2v_input_reference_check=False,
-    ),
-    # Action GT (consistency) files live in sgl-project/ci-data-diffusion and are not added yet.
-    DiffusionTestCase(
-        "praxis_droid_http",
-        DiffusionServerArgs(model_path="runwayml/praxis-1-droid-lerobot"),
-        PRAXIS_DROID_CI_sampling_params,
-        perf_warmup_requests=1,
-        run_consistency_check=False,
-        run_component_accuracy_check=False,
-        run_t2v_input_reference_check=False,
-    ),
-    DiffusionTestCase(
-        "praxis_yam_http",
-        DiffusionServerArgs(model_path="runwayml/praxis-1-yam-lerobot"),
-        PRAXIS_YAM_CI_sampling_params,
-        perf_warmup_requests=1,
-        run_consistency_check=False,
         run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),
@@ -570,6 +550,25 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
+        "lingbot_video_moe_ti2v",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-video-moe-30b-a3b",
+            modality="video",
+            num_gpus=1,
+            text_encoder_cpu_offload=True,
+            extras=[
+                f"--warmup-resolutions {LINGBOT_VIDEO_TI2V_CI_sampling_params.output_size}"
+            ],
+        ),
+        LINGBOT_VIDEO_TI2V_CI_sampling_params,
+        min_input_first_frame_psnr=18.0,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
         "lingbot_world_realtime_plastic_beach",
         DiffusionServerArgs(
             model_path="robbyant/lingbot-world-fast-diffusers",
@@ -964,6 +963,111 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
         run_t2v_input_reference_check=False,
     ),
 ]
+
+
+MAGI2_FOUR_GPU_H100_CASES = [
+    DiffusionTestCase(
+        "magi2_preview_t2va_ep4_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="sand-ai/MAGI-2-preview",
+            modality="video",
+            num_gpus=4,
+            ulysses_degree=4,
+            extras=[
+                # ep_size has no CLI flag; the file also skips loading the refiner.
+                "--pipeline-config-path",
+                str(_CACHE_DIT_CONFIG_DIR / "magi2_ep4_preview_only.json"),
+                "--warmup-resolutions",
+                "896x512",
+                "--enable-torch-compile",
+                "false",
+            ],
+            env_vars={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A street musician plays an acoustic guitar under a stone archway "
+                "at dusk, strumming a slow folk melody while pigeons settle nearby."
+            ),
+            output_size="896x512",
+            seconds=10,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={"num_inference_steps": 2, "seed": 42},
+        ),
+        # Consistency: no golden file in sgl-project/ci-data-diffusion yet.
+        run_consistency_check=False,
+        # Component accuracy: FOUR_GPU_H100_CASES is not wired to any CI lane
+        # (test_server_4_gpu_h100.py has no registered bridge), so this case
+        # never runs component-accuracy in CI — a future lane addition can
+        # enable it once the golden artifacts exist.
+        run_component_accuracy_check=False,
+        # Perf: run_perf_check=False keeps perf noise off until a stable
+        # baseline on matching hardware is added to h100.json. The e2e and load
+        # guards in _validate_and_record still run unconditionally.
+        run_perf_check=False,
+        # models-api: not disabled by design — left False until the two-stage
+        # tier is covered by a separate case so this smoke run stays fast.
+        run_models_api_check=False,
+        # t2v_input_reference: TI2V task type, so the base check is a no-op.
+        run_t2v_input_reference_check=False,
+    ),
+]
+
+MAGI2_TWO_STAGE_FOUR_GPU_H100_CASES = [
+    DiffusionTestCase(
+        "magi2_two_stage_t2va_ep4_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="sand-ai/MAGI-2-preview",
+            modality="video",
+            num_gpus=4,
+            ulysses_degree=4,
+            extras=[
+                "--pipeline-config-path",
+                str(_CACHE_DIT_CONFIG_DIR / "magi2_ep4_two_stage.json"),
+                "--warmup-resolutions",
+                "1920x1088",
+                "--dit-layerwise-offload",
+                "true",
+                "--enable-torch-compile",
+                "false",
+            ],
+            env_vars={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A street musician plays an acoustic guitar under a stone archway "
+                "at dusk, strumming a slow folk melody while pigeons settle nearby."
+            ),
+            output_size="1920x1088",
+            seconds=10,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "num_inference_steps": 2,
+                "refiner_num_inference_steps": 1,
+                "seed": 42,
+            },
+        ),
+        # Consistency: no golden file in sgl-project/ci-data-diffusion yet.
+        run_consistency_check=False,
+        # Component accuracy: same lane constraint as the preview-only case.
+        run_component_accuracy_check=False,
+        # Perf: baseline measured on H100 × 4 with layerwise offload (117.5 s,
+        # peak VRAM 61.7 GiB). run_perf_check=False until the lane is wired.
+        run_perf_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+]
+
+FOUR_GPU_H100_CASES = (
+    MINIMAX_H3_FOUR_GPU_H100_CASES
+    + MAGI2_FOUR_GPU_H100_CASES
+    + MAGI2_TWO_STAGE_FOUR_GPU_H100_CASES
+)
 
 TWO_GPU_CASES = [
     DiffusionTestCase(
@@ -1416,6 +1520,23 @@ TWO_GPU_CASES = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
+        "flux3_image_t2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/flux-3-image-klein",
+            tp_size=2,
+            extras=["--component-residency all=resident --attention-backend fa"],
+        ),
+        DiffusionSamplingParams(
+            prompt="A red fox in snow",
+            output_size="512x512",
+            output_format="png",
+            extras={"seed": 42},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
@@ -1615,6 +1736,7 @@ def _discover_unit_tests() -> list[str]:
 
 FILE_SUITES = {
     "unit": _discover_unit_tests(),
+    "bcg-diffusion": ["../single_test_file/test_diffusion_bcg_zimage_turbo.py"],
     "component-accuracy": [
         "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
         "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
@@ -1646,19 +1768,18 @@ PARAMETRIZED_CASE_GROUPS = {
     "2-gpu": [
         ("test_server_2_gpu.py", TWO_GPU_CASES),
     ],
-    "bcg-diffusion": [],
 }
 
 STANDALONE_FILES = {
-    "bcg-diffusion": [
-        "../single_test_file/test_diffusion_bcg_zimage_turbo.py",
-    ],
     "1-gpu": [
+        "../single_test_file/test_diffusion_bcg_zimage_turbo.py",
+        "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
         "../single_test_file/test_generate_zimage_turbo_cli.py",
         "../single_test_file/test_nomas_offline.py",
         "../single_test_file/test_update_weights_from_disk.py",
     ],
     "2-gpu": [
+        "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
@@ -1677,10 +1798,42 @@ STANDALONE_FILES = {
         "../unit/test_kandinsky6_sr_decode_parallel.py",
         "../unit/test_kandinsky6_sr_sequence_parallel.py",
         "../unit/test_nomas_parallel.py",
+        "../unit/test_qwen3_encoder_graph_cuda.py",
         "../unit/test_qwen_image21_distributed.py",
         "../unit/test_text_encoding_cache.py",
     ],
 }
+
+# the CI planner reads the CUDA registry before platform-specific list replacements
+CUDA_STANDALONE_FILES = STANDALONE_FILES.copy()
+
+# BCG and the component reference suites previously ran in dedicated CUDA jobs.
+if not current_platform.is_cuda():
+    cuda_only_files = set(
+        FILE_SUITES["bcg-diffusion"] + FILE_SUITES["component-accuracy"]
+    )
+    for suite in ("1-gpu", "2-gpu"):
+        STANDALONE_FILES[suite] = [
+            path for path in STANDALONE_FILES[suite] if path not in cuda_only_files
+        ]
+
+
+# These files also contain single-rank tests covered by the unit suite.
+# Keep each file as one partition item and one pytest process.
+TWO_GPU_UNIT_NODES = {
+    "../unit/test_async_output_save.py": [
+        "test_finalize_materializes_pixels_on_nonzero_worker_device"
+    ],
+    "../unit/test_text_encoding_cache.py": [
+        "test_fsdp_group_reuse_agrees_across_shards_and_expires"
+    ],
+    "../unit/test_kandinsky6_sr_decode_parallel.py": [
+        f"test_sr_parallel_decode[{mode}-2-{tp}-1]"
+        for mode in ("tiles", "spatial")
+        for tp in (2, 1)
+    ],
+}
+
 
 # test_update_weights_from_disk fails deterministically on ROCm: the diffusion
 # weight-update-from-disk reload path does not reconcile the diffusers
@@ -1704,10 +1857,9 @@ if current_platform.is_hip():
 # measured value that must be copied into STANDALONE_FILE_EST_TIMES.
 # scheduling estimates use full-process H100 CI medians, rounded up to 10s
 STANDALONE_FILE_EST_TIMES = {
-    "bcg-diffusion": {
-        "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 420.0,
-    },
     "1-gpu": {
+        "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 210.0,
+        "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py": 360.0,
         "../single_test_file/test_generate_zimage_turbo_cli.py": 180.0,
         # Initial H200 full-process observation: 97 s; refresh on H100 CI.
         # This is a partitioning estimate, not a performance gate.
@@ -1715,6 +1867,7 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_update_weights_from_disk.py": 200.0,
     },
     "2-gpu": {
+        "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py": 450.0,
         "../single_test_file/test_disagg_server.py": 780.0,
         "../single_test_file/test_ar_models.py": 120.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
@@ -1745,6 +1898,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../unit/test_kandinsky6_sr_sequence_parallel.py": 90.0,
         # H200: TP/SP parity for SDPA and FA3 (55 s each), window decode (22 s)
         "../unit/test_nomas_parallel.py": 140.0,
+        # 2x B300: 63 s, two spawned TP2 cases
+        "../unit/test_qwen3_encoder_graph_cuda.py": 70.0,
         "../unit/test_qwen_image21_distributed.py": 40.0,
         # 2x GB300: 101 s, mostly the spawned DP/FSDP cases
         "../unit/test_text_encoding_cache.py": 120.0,

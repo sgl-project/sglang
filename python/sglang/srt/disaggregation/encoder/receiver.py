@@ -29,6 +29,7 @@ from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import get_processor
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     EncoderDispatchErrorReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
@@ -906,9 +907,6 @@ class WaitingMMRequestBase(ABC):
     ):
         self.rid = rid
         self.recv_req = recv_req
-        self.mm_inputs = None
-        self.error = None
-        self.thread = None
         self.mm_processor = mm_processor
         self.encoder_urls = encoder_urls
         self.model_type = model_type
@@ -1914,11 +1912,9 @@ class MMReceiverBase(ABC):
         # A scheduler-side receiver works across its TP group; the tokenizer
         # side has no placement.
         parallel = get_parallel()
-        self.pp_rank = parallel.pp_rank if scheduler is not None else None
         self.tp_rank = parallel.tp_rank if scheduler is not None else None
         self.tp_size = parallel.tp_size
         self.tp_group = parallel.tp_group if scheduler is not None else None
-        self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
         self.waiting_by_rid: Dict[str, WaitingMMRequestBase] = {}
@@ -1946,7 +1942,6 @@ class MMReceiverBase(ABC):
         self.scheduler = scheduler
         self.device_type = torch.device(get_device().device).type
         self.gpu_id = get_device().gpu_id if scheduler is not None else 0
-        self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.embedding_pool = None
 
         self.model_type = (
@@ -2214,15 +2209,6 @@ class MMReceiverBase(ABC):
     def send_encode_request(
         self, obj, time_stats_json=None, on_dispatch_error=None
     ) -> Optional[threading.Event]:
-        return self._send_encode_request(
-            obj,
-            time_stats_json=time_stats_json,
-            on_dispatch_error=on_dispatch_error,
-        )
-
-    def _send_encode_request(
-        self, obj, time_stats_json=None, on_dispatch_error=None
-    ) -> Optional[threading.Event]:
         mm_data = self._extract_url_data(obj)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
@@ -2352,6 +2338,11 @@ class MMReceiverBase(ABC):
                     )
                 continue
 
+            if isinstance(recv_req, AbortReq):
+                self.abort_waiting_requests(recv_req)
+                new_recv_reqs.append(recv_req)
+                continue
+
             if (
                 isinstance(recv_req, TokenizedGenerateReqInput)
                 and recv_req.need_wait_for_mm_inputs is True
@@ -2448,7 +2439,7 @@ class MMReceiverBase(ABC):
             waiting_req._try_recv_mm_data()
             if (
                 waiting_req.status == WaitingMMRequestStatus.PENDING
-                and current_time - waiting_req.start_time > self.wait_timeout
+                and current_time - waiting_req.start_time > self.recv_timeout
             ):
                 waiting_req.status = WaitingMMRequestStatus.TIMEOUT
                 waiting_req.release_resources()
@@ -2491,7 +2482,7 @@ class MMReceiverBase(ABC):
                 abort_reqs.append(
                     (
                         self.create_req(waiting_req.recv_req),
-                        f"Timeout waiting for image embedding after {self.wait_timeout}s",
+                        f"Timeout waiting for image embedding after {self.recv_timeout}s",
                         HTTPStatus.REQUEST_TIMEOUT,
                     )
                 )
@@ -2701,22 +2692,6 @@ class MMReceiverBase(ABC):
 
 
 class MMReceiverHTTP(MMReceiverBase):
-    def __init__(
-        self,
-        server_args: ServerArgs,
-        dtype: Optional[torch.dtype] = None,
-        hf_config: Optional[PretrainedConfig] = None,
-        scheduler: Optional["Scheduler"] = None,
-        encode_urls: Optional[List[str]] = None,
-    ):
-        super().__init__(
-            server_args,
-            dtype=dtype,
-            hf_config=hf_config,
-            scheduler=scheduler,
-            encode_urls=encode_urls,
-        )
-
     # For zmq_to_scheduler and mooncake
     def process_waiting_requests(self, recv_reqs):
         if self.encoder_transfer_backend == "mooncake":
@@ -2874,7 +2849,9 @@ class MMReceiverGrpc(MMReceiverBase):
         endpoint_encode,
         num_items_assigned=None,
         encode_urls=None,
+        time_stats_json=None,
     ):
+        # time_stats_json is not sent: the gRPC EncodeRequest has no field for it.
         if not mm_data:
             return
 

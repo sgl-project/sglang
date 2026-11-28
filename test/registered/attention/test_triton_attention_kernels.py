@@ -953,6 +953,91 @@ class TestTritonAttention(CustomTestCase):
             for B, H_Q, H_KV, D, D_V in configs:
                 self._test_grouped_decode_attention_once(B, S, H_Q, H_KV, D, D_V)
 
+    def test_grouped_decode_attention_split_programs_bitwise(self):
+        """Above _MAX_SPLIT_PROGRAMS splits (deterministic mode sizes the split budget
+        by the context length) stage 1 can run fewer blocks that loop over the
+        splits. With and without stage 2 stopping at each request's own count
+        (deterministic mode's stop_at_request_splits), the output must be bitwise
+        the same as with one block per split."""
+        from sglang.kernels.ops.attention import decode_attention as da
+
+        device = get_device()
+        dtype = torch.bfloat16
+        H_Q, H_KV, D, tile, max_kv_splits = 64, 8, 64, 256, 128
+        seq_lens = [1, 255, 1500, 2049, 8000, 20000]
+        B = len(seq_lens)
+        torch.manual_seed(0)
+        lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        total = int(lens.sum())
+        q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
+        k_buffer = torch.randn(total, H_KV, D, dtype=dtype, device=device)
+        v_buffer = torch.randn(total, H_KV, D, dtype=dtype, device=device)
+        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        kv_indptr[1:] = torch.cumsum(lens, dim=0)
+        kv_indices = torch.randperm(total, device=device)
+        num_kv_splits = ((lens + tile - 1) // tile).to(torch.int32)
+        sinks = torch.randn(H_Q, dtype=torch.float32, device=device)
+
+        def run(max_split_programs, stop_at_request_splits):
+            old = da._MAX_SPLIT_PROGRAMS, da._device_core_count
+            # One core: the block count is _MAX_SPLIT_PROGRAMS, whatever the device.
+            da._MAX_SPLIT_PROGRAMS = max_split_programs
+            da._device_core_count = lambda device_index: 1
+            try:
+                o = torch.zeros(B, H_Q, D, dtype=dtype, device=device)
+                attn_logits = torch.empty(
+                    (B, H_Q, max_kv_splits, D), dtype=torch.float32, device=device
+                )
+                attn_lse = torch.empty(
+                    (B, H_Q, max_kv_splits), dtype=torch.float32, device=device
+                )
+                decode_attention_fwd_grouped(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    o,
+                    kv_indptr,
+                    kv_indices,
+                    attn_logits,
+                    attn_lse,
+                    num_kv_splits,
+                    max_kv_splits,
+                    D**-0.5,
+                    1.0,
+                    sinks=sinks,
+                    stop_at_request_splits=stop_at_request_splits,
+                )
+                return o
+            finally:
+                da._MAX_SPLIT_PROGRAMS, da._device_core_count = old
+
+        for stop in (False, True):
+            one_block_per_split = run(max_kv_splits, stop)
+            for programs in (1, 8, 32):
+                self.assertTrue(
+                    torch.equal(run(programs, stop), one_block_per_split),
+                    f"{programs} blocks per request and head tile differ "
+                    f"(stop_at_request_splits={stop})",
+                )
+
+    def test_grouped_decode_split_programs_cover_the_device(self):
+        """Stage 1 loops over splits only while the blocks still cover the device: a
+        budget sized by the core count (normal-mode MLA) keeps one block per split at
+        small batch, and a large batch still gets _MAX_SPLIT_PROGRAMS blocks."""
+        from sglang.kernels.ops.attention.decode_attention import _split_programs
+
+        # (batch, head_tiles, max_kv_splits, core_count, expected)
+        for batch, tiles, budget, cores, expected in [
+            (1, 1, 256, 256, 0),  # MLA, 16 heads per rank, batch 1: one per split
+            (2, 1, 256, 256, 128),
+            (8, 1, 256, 256, 32),
+            (64, 4, 512, 256, 32),  # deterministic budget at a large batch
+            (1, 4, 512, 256, 64),
+            (1, 1, 32, 256, 0),
+        ]:
+            with self.subTest(batch=batch, tiles=tiles, budget=budget, cores=cores):
+                self.assertEqual(_split_programs(batch, tiles, budget, cores), expected)
+
     def test_decode_attention_uneven_batch_graph_replay(self):
         """One captured decode graph replayed over uniform, padded and ragged batches.
 
@@ -1411,6 +1496,217 @@ class TestTritonAttention(CustomTestCase):
             return o
 
         self.assertTrue(torch.equal(run(prefix), run(0)[prefix:]))
+
+    def test_unified_sliding_window_tree_mask_matches_reference(self):
+        """A speculative tree mask has full-length rows. On a sliding-window layer
+        the rail holds only the last `window` prefix keys, so the kernel must read
+        the mask with the full row stride, starting at the window's first column."""
+        torch.manual_seed(0)
+        device = get_device()
+        window, num_draft, heads, head_dim = 64, 4, 8, 64
+        parents = [-1, 0, 0, 1]
+        i32 = lambda *x: torch.tensor(x, dtype=torch.int32, device=device)
+        arange = lambda lo, hi: torch.arange(lo, hi, device=device)
+
+        for prefix_len in (window - 8, window, window + 1, 3 * window + 7):
+            with self.subTest(prefix_len=prefix_len):
+                total = prefix_len + num_draft
+                q = torch.randn(
+                    num_draft, heads, head_dim, dtype=torch.bfloat16, device=device
+                )
+                k = torch.randn(
+                    total, heads, head_dim, dtype=torch.bfloat16, device=device
+                )
+                v = torch.randn_like(k)
+
+                mask = torch.zeros(num_draft, total, dtype=torch.bool)
+                mask[:, :prefix_len] = True
+                for row in range(num_draft):
+                    node = row
+                    while node != -1:
+                        mask[row, prefix_len + node] = True
+                        node = parents[node]
+                mask = mask.to(device)
+
+                sm_scale = head_dim**-0.5
+                scores = torch.einsum("qhd,khd->qhk", q.float(), k.float()) * sm_scale
+                q_pos = prefix_len + arange(0, num_draft)
+                k_pos = arange(0, total)
+                allowed = mask & (q_pos[:, None] <= k_pos[None, :] + window)
+                scores = scores.masked_fill(~allowed[:, None, :], float("-inf"))
+                expected = torch.einsum(
+                    "qhk,khd->qhd", torch.softmax(scores, dim=-1), v.float()
+                )
+
+                rail_len = min(prefix_len, window)
+                kv_indptr, kv_indices, kv_prefix_lens = build_unified_kv_indices(
+                    i32(0, rail_len),
+                    arange(prefix_len - rail_len, prefix_len),
+                    i32(0),
+                    i32(num_draft),
+                    arange(prefix_len, total),
+                    1,
+                )
+                o = torch.empty_like(q)
+                extend_attention_fwd_unified(
+                    q,
+                    o,
+                    k,
+                    v,
+                    1.0,
+                    1.0,
+                    i32(0, num_draft),
+                    kv_indptr,
+                    kv_indices,
+                    kv_prefix_lens.to(torch.int32),
+                    num_draft,
+                    custom_mask=mask.flatten(),
+                    mask_indptr=torch.tensor(
+                        [0, num_draft * total], dtype=torch.int64, device=device
+                    ),
+                    sm_scale=sm_scale,
+                    sliding_window_size=window,
+                    window_start_pos=i32(prefix_len - rail_len),
+                )
+                torch.testing.assert_close(o.float(), expected, atol=3e-2, rtol=3e-2)
+
+    def test_unified_sliding_window_tree_mask_batched_and_aligned(self):
+        """Batches of requests with different prefix lengths, with the window rail
+        either exact or padded to the tile boundary by align_window_kv_to_tiles,
+        with more draft nodes than one query block, and with grouped-query heads
+        in fp16 as well as the default multi-head bf16."""
+        device = get_device()
+        window, head_dim, tile = 64, 64, 128
+        i32 = lambda x: torch.tensor(x, dtype=torch.int32, device=device)
+        arange = lambda lo, hi: torch.arange(lo, hi, device=device)
+        mha = (8, 8, torch.bfloat16)  # query heads, kv heads, dtype
+        gqa = (16, 4, torch.float16)
+        cases = [
+            ([56, 65, 199], 4, False, mha),
+            ([56, 65, 199], 4, True, mha),
+            ([300, 135, 64], 4, True, mha),
+            ([199, 300], 80, False, mha),
+            ([199, 300], 80, True, mha),
+            ([56, 65, 199], 4, False, gqa),
+            ([199, 300], 80, True, gqa),
+        ]
+        for prefixes, num_draft, aligned, (heads, kv_heads, dtype) in cases:
+            with self.subTest(
+                prefixes=prefixes,
+                num_draft=num_draft,
+                aligned=aligned,
+                heads=heads,
+                kv_heads=kv_heads,
+                dtype=dtype,
+            ):
+                torch.manual_seed(1)
+                rng = random.Random(1)
+                bs = len(prefixes)
+                totals = [p + num_draft for p in prefixes]
+                bases = [sum(totals[:i]) for i in range(bs)]
+                k = torch.randn(
+                    sum(totals), kv_heads, head_dim, dtype=dtype, device=device
+                )
+                v = torch.randn_like(k)
+                q = torch.randn(
+                    bs * num_draft, heads, head_dim, dtype=dtype, device=device
+                )
+                sm_scale = head_dim**-0.5
+
+                masks, expected = [], []
+                for i, prefix_len in enumerate(prefixes):
+                    parents = [-1] + [rng.randrange(-1, n) for n in range(1, num_draft)]
+                    mask = torch.zeros(num_draft, totals[i], dtype=torch.bool)
+                    mask[:, :prefix_len] = True
+                    for row in range(num_draft):
+                        node = row
+                        while node != -1:
+                            mask[row, prefix_len + node] = True
+                            node = parents[node]
+                    masks.append(mask)
+                    qi = q[i * num_draft : (i + 1) * num_draft]
+                    group = heads // kv_heads
+                    ki = k[bases[i] : bases[i] + totals[i]].repeat_interleave(
+                        group, dim=1
+                    )
+                    vi = v[bases[i] : bases[i] + totals[i]].repeat_interleave(
+                        group, dim=1
+                    )
+                    scores = (
+                        torch.einsum("qhd,khd->qhk", qi.float(), ki.float()) * sm_scale
+                    )
+                    q_pos = prefix_len + arange(0, num_draft)
+                    k_pos = arange(0, totals[i])
+                    allowed = mask.to(device) & (
+                        q_pos[:, None] <= k_pos[None, :] + window
+                    )
+                    scores = scores.masked_fill(~allowed[:, None, :], float("-inf"))
+                    expected.append(
+                        torch.einsum(
+                            "qhk,khd->qhd", torch.softmax(scores, dim=-1), vi.float()
+                        )
+                    )
+                expected = torch.cat(expected)
+
+                rail_lens = [min(p, window) for p in prefixes]
+                rail_indptr = i32([0, *torch.tensor(rail_lens).cumsum(0).tolist()])
+                rail_indices = torch.cat(
+                    [
+                        bases[i] + arange(prefixes[i] - rail_lens[i], prefixes[i])
+                        for i in range(bs)
+                    ]
+                )
+                window_start = i32([p - r for p, r in zip(prefixes, rail_lens)])
+                if aligned:
+                    rail_indptr, rail_indices = align_window_kv_to_tiles(
+                        rail_indptr, rail_indices, window_start, bs, tile
+                    )
+                    window_start = i32(prefixes) - (rail_indptr[1:] - rail_indptr[:-1])
+                kv_indptr, kv_indices, kv_prefix_lens = build_unified_kv_indices(
+                    rail_indptr,
+                    rail_indices,
+                    i32([i * num_draft for i in range(bs)]),
+                    i32([num_draft] * bs),
+                    torch.cat(
+                        [
+                            bases[i] + prefixes[i] + arange(0, num_draft)
+                            for i in range(bs)
+                        ]
+                    ),
+                    bs,
+                )
+                mask_flat = torch.cat([m.flatten() for m in masks]).to(device)
+                mask_indptr = torch.tensor(
+                    [
+                        0,
+                        *torch.tensor([num_draft * t for t in totals])
+                        .cumsum(0)
+                        .tolist(),
+                    ],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                o = torch.empty_like(q)
+                extend_attention_fwd_unified(
+                    q,
+                    o,
+                    k,
+                    v,
+                    1.0,
+                    1.0,
+                    i32([i * num_draft for i in range(bs + 1)]),
+                    kv_indptr,
+                    kv_indices,
+                    kv_prefix_lens.to(torch.int32),
+                    num_draft,
+                    custom_mask=mask_flat,
+                    mask_indptr=mask_indptr,
+                    sm_scale=sm_scale,
+                    sliding_window_size=window,
+                    window_start_pos=window_start,
+                )
+                tol = 3e-2 if dtype == torch.bfloat16 else 4e-3
+                torch.testing.assert_close(o.float(), expected, atol=tol, rtol=tol)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen.configs.pipeline_configs.nomas import NomasPipelineConfig
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     has_realtime_model_adapter,
 )
@@ -90,10 +91,19 @@ def is_realtime_serving(server_args: ServerArgs) -> bool:
 
 
 def should_run_synthetic_server_warmup(server_args: ServerArgs) -> bool:
-    return (
-        should_run_server_warmup(server_args)
-        and supports_synthetic_warmup(server_args)
-        and not is_realtime_serving(server_args)
+    if not (
+        should_run_server_warmup(server_args) and supports_synthetic_warmup(server_args)
+    ):
+        return False
+    if not is_realtime_serving(server_args):
+        return True
+    # The same Nomas server accepts independent offline event requests.
+    return bool(
+        isinstance(server_args.pipeline_config, NomasPipelineConfig)
+        and server_args.enable_breakable_cuda_graph
+        and server_args.warmup_resolutions
+        and server_args.warmup_num_frames
+        and server_args.warmup_sampling_params
     )
 
 
@@ -248,11 +258,14 @@ async def run_async_client_warmup(
     fail_open: bool = False,
     rewarm: bool = False,
     step_limit: int | None = None,
+    check_backend: Callable[[], None] | None = None,
 ) -> None:
     """Warm every replica with the full request list.
 
     `forward(req, replica=i)` must deliver to replica i: each replica compiles
     and allocates on its own GPUs, and each counts the same `warmup_total`.
+    `check_backend` must raise if serving is no longer possible; backend death
+    must not be suppressed by the synthetic probe's `fail_open` fallback.
     """
     try:
         warmup_input_path = None
@@ -282,6 +295,8 @@ async def run_async_client_warmup(
             if isinstance(result, BaseException):
                 raise result
     except Exception:
+        if check_backend is not None:
+            check_backend()
         if fail_open:
             logger.warning(
                 "Synthetic server warmup failed; continuing startup", exc_info=True

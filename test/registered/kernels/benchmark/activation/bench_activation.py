@@ -17,6 +17,9 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(
     est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
+register_cuda_ci(
+    est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-b200"
+)
 register_amd_ci(est_time=30, stage="base-a-jit-kernel-benchmark", runner_config="amd")
 
 
@@ -48,7 +51,7 @@ OPS = {
 @marker.parametrize("op_name", ["silu", "gelu", "gelu_tanh"])
 @marker.parametrize("dim", [1024, 4096, 6144, 8192], [4096])
 @marker.parametrize("batch_size", [2**x for x in range(0, 15)], [8, 512])
-@marker.benchmark("impl", ["aot", "jit", "torch"])
+@marker.benchmark("impl", ["aot", "jit", "torch"], gate=["jit"])
 def benchmark(op_name: str, dim: int, batch_size: int, impl: str):
     x = create_random(batch_size, dim * 2)
     aot_op, jit_op, torch_op = OPS[op_name]
@@ -100,7 +103,7 @@ def relu2_torch(input: torch.Tensor) -> torch.Tensor:
 
 @marker.parametrize("dim", [1024, 4096, 6144, 8192], [4096])
 @marker.parametrize("batch_size", [2**x for x in range(0, 15)], [8, 512])
-@marker.benchmark("impl", ["jit", "torch"])
+@marker.benchmark("impl", ["jit", "torch"], gate=["jit"])
 def benchmark_unary(dim: int, batch_size: int, impl: str):
     x = create_random(batch_size, dim)
     fn = {"jit": relu2_jit, "torch": relu2_torch}[impl]

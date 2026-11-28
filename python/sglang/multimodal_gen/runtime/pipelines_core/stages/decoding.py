@@ -55,6 +55,21 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 logger = init_logger(__name__)
 
 
+def decode_parallelism_type(vae) -> StageParallelismType:
+    """Every rank decodes unless CFG parallel duplicates the latents on ranks
+    whose output is dropped: then only the main CFG rank does, or all of them
+    when the VAE shards the decode over the ranks."""
+    if not get_global_server_args().enable_cfg_parallel:
+        return StageParallelismType.REPLICATED
+    if (
+        model_parallel_is_initialized()
+        and get_decode_parallel_world_size() > 1
+        and vae.use_parallel_decode
+    ):
+        return StageParallelismType.REPLICATED
+    return StageParallelismType.MAIN_RANK_ONLY
+
+
 def scale_and_shift_latents(latents: torch.Tensor, server_args, vae) -> torch.Tensor:
     """De-normalize latents before VAE decode (single shared implementation).
 
@@ -116,17 +131,26 @@ class DecodingStage(PipelineStage):
     output format (e.g., pixel values).
     """
 
+    separate_postprocess: bool = False
+
     @property
     def role_affinity(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
         return RoleType.DECODER
 
-    def __init__(self, vae, pipeline=None, component_name: str = "vae") -> None:
+    def __init__(
+        self,
+        vae,
+        pipeline=None,
+        component_name: str = "vae",
+        separate_postprocess: bool = False,
+    ) -> None:
         super().__init__()
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
         self.component_name = component_name
+        self.separate_postprocess = separate_postprocess
         self._compiled_vae_decode = ActiveTargetCompiledCallable()
 
     def component_uses(
@@ -145,19 +169,7 @@ class DecodingStage(PipelineStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        server_args = get_global_server_args()
-        if server_args.enable_cfg_parallel:
-            if self._can_use_parallel_decode():
-                return StageParallelismType.REPLICATED
-            return StageParallelismType.MAIN_RANK_ONLY
-        return StageParallelismType.REPLICATED
-
-    def _can_use_parallel_decode(self) -> bool:
-        return (
-            model_parallel_is_initialized()
-            and get_decode_parallel_world_size() > 1
-            and self.vae.use_parallel_decode
-        )
+        return decode_parallelism_type(self.vae)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify decoding stage inputs."""
@@ -393,7 +405,7 @@ class DecodingStage(PipelineStage):
         self,
         batch: Req,
         server_args: ServerArgs,
-    ) -> OutputBatch:
+    ) -> Req | OutputBatch:
         """
         Decode latent representations into pixel space.
 
@@ -473,6 +485,12 @@ class DecodingStage(PipelineStage):
                     trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
                 else:
                     trajectory_decoded = None
+
+        if self.separate_postprocess:
+            batch.output = frames if output_file_paths is None else None
+            batch.extra["decoded_output_paths"] = output_file_paths
+            batch.extra["trajectory_decoded"] = trajectory_decoded
+            return batch
 
         if output_file_paths is None:
             frames = server_args.pipeline_config.post_decoding(frames, server_args)

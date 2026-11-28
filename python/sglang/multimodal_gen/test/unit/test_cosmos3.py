@@ -59,6 +59,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader imp
     SchedulerLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     Cosmos3OmniTransformer,
     DomainAwareLinear,
@@ -70,6 +71,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     shard_sequence,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
     Cosmos3DenoisingStage,
@@ -1438,6 +1442,33 @@ class TestCosmos3EncodeWhileDecoding(unittest.TestCase):
                     )
 
 
+class TestCosmos3DecodeRanks(unittest.TestCase):
+    def test_cfg_parallel_decodes_on_the_main_rank_unless_the_vae_shards(self):
+        """The other CFG rank holds the same latents and its decode is dropped."""
+        decoding = "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding"
+        stage = Cosmos3DecodingStage.__new__(Cosmos3DecodingStage)
+        cases = (
+            (False, False, StageParallelismType.REPLICATED),
+            (True, False, StageParallelismType.MAIN_RANK_ONLY),
+            (True, True, StageParallelismType.REPLICATED),
+        )
+        for cfg_parallel, sharded_decode, expected in cases:
+            stage.vae = types.SimpleNamespace(use_parallel_decode=sharded_decode)
+            server_args = types.SimpleNamespace(enable_cfg_parallel=cfg_parallel)
+            with (
+                mock.patch(
+                    f"{decoding}.get_global_server_args", return_value=server_args
+                ),
+                mock.patch(
+                    f"{decoding}.model_parallel_is_initialized", return_value=True
+                ),
+                mock.patch(
+                    f"{decoding}.get_decode_parallel_world_size", return_value=2
+                ),
+            ):
+                self.assertEqual(stage.parallelism_type, expected)
+
+
 class TestCosmos3DecodeFastPath(unittest.TestCase):
     """The VAE decode runs on the fast path exactly when the quality allows it."""
 
@@ -2400,6 +2431,35 @@ class TestCosmos3BatchedActionStages(unittest.TestCase):
         self.assertEqual(tuple(input_ids.shape), (2, 16))
         self.assertEqual(tuple(attention_mask.shape), (2, 16))
         self.assertEqual(seq_len, 4)
+
+    def test_transformer_context_carries_the_request(self):
+        """Quality-gated paths read the request from the transformer's forward
+        context; the stage must not keep the request once its loop ends."""
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        stage._request_batch = None
+        stage._extra_transformer_kwargs = {}
+        stage._share_vision_temporal_positions = True
+        seen = []
+
+        def fake_transformer(**kwargs):
+            seen.append(get_forward_context().forward_batch)
+            return kwargs["hidden_states"]
+
+        stage.transformer = fake_transformer
+        batch = types.SimpleNamespace(
+            sampling_params=types.SimpleNamespace(quality="lossless")
+        )
+        with stage._bind_request(batch):
+            stage._run_transformer(
+                latents=torch.zeros(1),
+                timestep=torch.ones(1),
+                text_ids=torch.ones(1, 4, dtype=torch.long),
+                text_mask=torch.ones(1, 4, dtype=torch.long),
+                video_shape=(1, 1, 1),
+                fps=20.0,
+            )
+        self.assertEqual(seen, [batch])
+        self.assertIsNone(stage._request_batch)
 
     def test_cfg_duplicates_batched_timesteps(self):
         stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
