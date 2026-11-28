@@ -32,6 +32,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     move,
 )
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -415,9 +416,13 @@ class TestRunningReqsHooks(CustomTestCase):
         s.get_prefill_adder_class = lambda: _Adder
         s.request_retirer = None
         s.page_size = 1
-        s.tree_cache = SimpleNamespace(buffer_pipeline=None)
-        s.token_to_kv_pool_allocator = SimpleNamespace(
-            state_slots=None, pools_share_memory=False
+        s.tree_cache = SimpleNamespace(
+            buffer_pipeline=None,
+            supports_mamba=lambda: False,
+            evictable_size=lambda: 0,
+        )
+        s.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+            size=1024, dtype=torch.float32, device="cpu", kvcache=None, need_sort=False
         )
         s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
         s.max_prefill_tokens = 1 << 20
