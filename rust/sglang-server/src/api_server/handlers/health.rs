@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use crate::message::ids::Rid;
-use crate::message::request::GenerateRequest;
+use crate::message::multimodal::MmItem;
+use crate::message::request::{GenerateRequest, MmData, RenderedChat};
 use crate::message::sampling::SamplingParams;
 
 use super::handle::CoreHandle;
@@ -12,6 +13,21 @@ use crate::api_server::core::{CoreError, CoreEvent, HealthStatus, ReceivedAs};
 /// Sentinel host that makes the KV connector no-op. Parity with
 /// `sglang.srt.disaggregation.utils.FAKE_BOOTSTRAP_HOST`.
 const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
+
+/// A VLM's startup warmup (Python `_execute_server_warmup`): its image, and
+/// the prompt of a user message with that image and "Describe the image.",
+/// rendered with the model's chat template.
+pub(crate) struct VlmWarmup {
+    pub(crate) prompt: VlmWarmupPrompt,
+    pub(crate) image: MmItem,
+}
+
+pub(crate) enum VlmWarmupPrompt {
+    /// Rendered by the launcher, for a template this server cannot render.
+    Text(String),
+    /// Rendered with the served chat template.
+    Rendered(Box<RenderedChat>),
+}
 
 impl CoreHandle {
     /// Confirm that scheduler output is moving. The response heartbeat is the
@@ -103,13 +119,32 @@ impl CoreHandle {
         }
     }
 
-    /// One generation mirroring the Python `_execute_server_warmup` text request;
-    /// VLMs warm only the text path. The caller decides readiness.
-    pub(crate) async fn warm_up(&self, skip_tokenizer_init: bool) -> Result<(), CoreError> {
-        let (text, input_ids) = if skip_tokenizer_init {
-            (None, Some(vec![10, 11, 12]))
-        } else {
-            (Some("The capital city of France is".to_string()), None)
+    /// One generation mirroring the Python `_execute_server_warmup` request:
+    /// a VLM's image and prompt, else its text request. The caller decides
+    /// readiness.
+    pub(crate) async fn warm_up(
+        &self,
+        skip_tokenizer_init: bool,
+        vlm: Option<VlmWarmup>,
+    ) -> Result<(), CoreError> {
+        let (text, input_ids, chat_prompt, mm) = match vlm {
+            Some(VlmWarmup { prompt, image }) => {
+                let mm = Some(Box::new(MmData {
+                    image_data: vec![image],
+                    ..Default::default()
+                }));
+                match prompt {
+                    VlmWarmupPrompt::Text(text) => (Some(text), None, None, mm),
+                    VlmWarmupPrompt::Rendered(rendered) => (None, None, Some(rendered), mm),
+                }
+            }
+            None if skip_tokenizer_init => (None, Some(vec![10, 11, 12]), None, None),
+            None => (
+                Some("The capital city of France is".to_string()),
+                None,
+                None,
+                None,
+            ),
         };
         let mut call = self
             .generate_internal(
@@ -117,6 +152,10 @@ impl CoreHandle {
                     rid: Rid::new(),
                     text,
                     input_ids,
+                    chat_prompt,
+                    mm,
+                    // Python's `/generate` default.
+                    logprob_start_len: -1,
                     sampling_params: SamplingParams {
                         max_new_tokens: Some(8),
                         temperature: 0.0,
@@ -443,7 +482,7 @@ mod tests {
     async fn warm_up_succeeds_on_finished_generation() {
         let harness = Harness::unbounded(8);
         let handle = harness.handle.clone();
-        let warm_up = tokio::spawn(async move { handle.warm_up(false).await });
+        let warm_up = tokio::spawn(async move { handle.warm_up(false, None).await });
 
         let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
         let RequestKind::Generate(warmup) = &request.kind else {
@@ -482,7 +521,7 @@ mod tests {
             true,
             Vec::new(),
         );
-        let warm_up = tokio::spawn(async move { handle.warm_up(true).await });
+        let warm_up = tokio::spawn(async move { handle.warm_up(true, None).await });
 
         let request = accept_intake(intake_rx.recv_async().await.unwrap());
         let RequestKind::Generate(warmup) = &request.kind else {
