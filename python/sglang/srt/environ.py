@@ -2508,6 +2508,10 @@ class Envs:
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
 
+    # Opt-in: an all-sliding DFlash draft keeps its KV in the target's SWA sub-pool,
+    # one row per target SWA slot, instead of one row per full-pool token.
+    SGLANG_DFLASH_DRAFT_KV_IN_TARGET_SWA = EnvBool(False)
+
     # ===================================================================
     # Muse Spark
     # ===================================================================

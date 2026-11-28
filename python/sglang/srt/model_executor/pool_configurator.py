@@ -96,6 +96,10 @@ class MemoryPoolConfig:
     # The target priced a compact DFLASH draft pool per sliding-window token: the
     # draft pool holds swa_max_total_num_tokens rows indexed by the target's SWA ids.
     dflash_draft_follows_swa: bool = False
+    # The target priced a non-compact DFLASH draft per sliding-window token: the
+    # draft builds an SWA pool (all layers in the SWA sub-pool) on the target's
+    # full->SWA mapping.
+    draft_kv_in_swa: bool = False
     # Live owner-token ceiling (user or PP), distinct from the arena's share.
     # None allows token KV to borrow unused state/window capacity.
     unified_full_cap_tokens: Optional[int] = None
@@ -211,6 +215,47 @@ def dflash_draft_kv_follows_target_swa(kvc: KVCacheConfigurator) -> bool:
         )
         return False
     return True
+
+
+def _dflash_draft_kv_in_target_swa(
+    kvc: KVCacheConfigurator, target_window: Optional[int]
+) -> bool:
+    """Whether the target prices a non-compact DFLASH draft per sliding-window
+    token (SGLANG_DFLASH_DRAFT_KV_IN_TARGET_SWA): every draft layer slides within
+    the target's window, so the draft reads only what SWA eviction retains."""
+    if not envs.SGLANG_DFLASH_DRAFT_KV_IN_TARGET_SWA.get():
+        return False
+    draft_model_config = kvc.spec_aux_config.draft_model_config
+    if (
+        kvc.is_draft_worker
+        or not kvc.is_hybrid_swa
+        or not kvc.layer_info.full_attention_layer_ids
+        or draft_model_config is None
+        or get_memory().enable_unified_memory
+        # DCP widens the draft id space past the target's SWA ids.
+        or kvc.dflash_draft_loc_space_scale != 1
+    ):
+        return False
+    from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+    from sglang.srt.speculative.dflash_utils import dflash_draft_kv_fits_swa
+
+    # The label the draft runner will resolve for its own pool.
+    draft_kv_cache_dtype, _ = configure_kv_cache_dtype(
+        server_args_kv_cache_dtype=get_model().kv_cache_dtype,
+        speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
+        quant_config=None,
+        model_dtype=draft_model_config.dtype,
+        is_draft_worker=True,
+        is_dflash=True,
+        speculative_draft_attention_backend=(
+            get_spec().speculative_draft_attention_backend
+        ),
+    )
+    return dflash_draft_kv_fits_swa(
+        draft_hf_config=draft_model_config.hf_config,
+        target_window=target_window,
+        draft_kv_cache_dtype=draft_kv_cache_dtype,
+    )
 
 
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
@@ -995,8 +1040,15 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._draft_follows_swa = (
             self._draft_cell_size > 0 and dflash_draft_kv_follows_target_swa(kvc)
         )
+        # A non-compact draft that only reads the target's window keeps its KV
+        # per target SWA slot instead of per full-pool token.
+        self._draft_kv_in_swa = (
+            not self._draft_follows_swa
+            and self._draft_cell_size > 0
+            and _dflash_draft_kv_in_target_swa(kvc, self._sliding_window_size)
+        )
         self._draft_swa_cell_size = 0
-        if self._draft_follows_swa:
+        if self._draft_follows_swa or self._draft_kv_in_swa:
             self._draft_swa_cell_size = self._draft_cell_size
             self._draft_cell_size = 0
 
@@ -1142,6 +1194,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 else None
             ),
             dflash_draft_follows_swa=self._draft_follows_swa,
+            draft_kv_in_swa=self._draft_kv_in_swa,
         )
 
     def calculate_pool_sizes(

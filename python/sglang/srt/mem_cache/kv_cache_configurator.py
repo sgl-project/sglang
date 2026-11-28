@@ -700,7 +700,7 @@ class KVCacheConfigurator:
         max_running_requests = config.max_running_requests
         full_max_total_num_tokens = None
         swa_max_total_num_tokens = None
-        if self.is_hybrid_swa:
+        if self.is_hybrid_swa or self._draft_kv_in_target_swa():
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
@@ -1939,7 +1939,7 @@ class KVCacheConfigurator:
                     mla_pool_class=mla_pool_class,
                 )
         else:
-            if self.is_hybrid_swa:
+            if self.is_hybrid_swa or self._draft_kv_in_target_swa():
                 token_to_kv_pool = self._build_hybrid_swa_kv_pool(
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
@@ -1997,6 +1997,14 @@ class KVCacheConfigurator:
                         sizes.max_total_num_tokens,
                     )
         return token_to_kv_pool
+
+    def _draft_kv_in_target_swa(self) -> bool:
+        """Draft worker whose KV lives in the target's SWA sub-pool (one row per SWA slot)."""
+        return (
+            self.is_draft_worker
+            and self.memory_pool_config is not None
+            and self.memory_pool_config.draft_kv_in_swa
+        )
 
     def _draft_follows_target_swa(self) -> bool:
         """Whether this draft pool takes the target's sliding-window ids, as the
@@ -2756,6 +2764,14 @@ class KVCacheConfigurator:
         )
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
+        if not self.is_hybrid_swa and self._draft_kv_in_target_swa():
+            # Every draft layer in the SWA sub-pool, one row per target SWA slot.
+            swa_attention_layer_ids = list(
+                range(self.layer_info.start_layer, self.layer_info.end_layer)
+            )
+            full_attention_layer_ids = []
+            kwargs["v_head_dim"] = self.model_config.v_head_dim
+            swa_pool_class = mha_pool_class
         # The draft SWA ring must cover the target allocator's full token capacity.
         size_swa = (
             full_max_total_num_tokens
@@ -3356,6 +3372,10 @@ class KVCacheConfigurator:
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
                     )
+            elif self._draft_kv_in_target_swa():
+                token_to_kv_pool.register_mapping(
+                    token_to_kv_pool_allocator.full_to_swa_index_mapping
+                )
         return token_to_kv_pool_allocator
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:

@@ -478,6 +478,7 @@ def _make_mtp_configurator(use_mla=True):
     )
     kvc.device = "cpu"
     kvc.is_draft_worker = True
+    kvc.memory_pool_config = None
     kvc.page_size = target.page_size
     kvc.use_mla_backend = use_mla
     kvc.kv_cache_dtype = target.dtype

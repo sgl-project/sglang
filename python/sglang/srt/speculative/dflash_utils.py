@@ -355,6 +355,52 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     return int(sliding_window) - 1
 
 
+# Draft backends on the CUDA platform validated with the draft's sliding layers
+# read through the SWAKVPool full -> SWA mapping. Other platforms build their own
+# pools (Ascend: an NPU pool without register_mapping) or read rows differently.
+_SWA_SUB_POOL_DRAFT_BACKENDS = frozenset({"fa3", "fa4"})
+# Draft KV dtypes the plain MHA SWA sub-pool stores. mxfp8 needs the block-scaled
+# pool class and FP4 a quant method, which the draft's SWA sub-pool builds neither of.
+_SWA_SUB_POOL_DRAFT_KV_DTYPES = frozenset(
+    {"auto", "bf16", "bfloat16", "fp8_e4m3", "fp8_e5m2"}
+)
+
+
+def dflash_draft_kv_fits_swa(
+    *,
+    draft_hf_config: Any,
+    target_window: Optional[int],
+    draft_kv_cache_dtype: str,
+) -> bool:
+    """Every draft layer slides within the target's SWA window."""
+    from sglang.srt.platforms import current_platform
+    from sglang.srt.runtime_context import get_disagg
+
+    spec = get_spec()
+    # PD transfer registers only a pool's full sub-pool
+    if (
+        target_window is None
+        or spec.speculative_draft_window_size is not None
+        or get_disagg().disaggregation_mode != "null"
+        or not current_platform.is_cuda()
+        or spec.speculative_draft_attention_backend not in _SWA_SUB_POOL_DRAFT_BACKENDS
+        or draft_kv_cache_dtype not in _SWA_SUB_POOL_DRAFT_KV_DTYPES
+    ):
+        return False
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    window = get_dflash_attention_sliding_window_size(draft_hf_config)
+    return (
+        bool(layer_types)
+        and all(t == "sliding_attention" for t in layer_types)
+        and window is not None
+        # RadixAttention reads window 0 (HF sliding_window=1) as full attention,
+        # which would read this SWA sub-pool through full-pool ids.
+        and 0 < window <= target_window
+        # The draft then lives in an MHA SWA sub-pool, which an MLA draft cannot use.
+        and not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
+    )
+
+
 def dflash_draft_window_pages(draft_hf_config: Any, *, page_size: int) -> int:
     """Trailing pages of draft KV a sliding-window-only DFLASH/DSPARK draft
     reads; 0 when any draft layer attends to the whole prompt, so a PD sender
