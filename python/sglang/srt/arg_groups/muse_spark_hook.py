@@ -30,13 +30,18 @@ MUSE_SPARK_ENV_DEFAULTS = (
 # Hopper (SM90) serving path, applied with SGLANG_MUSE_SPARK_HOPPER_KERNELS on;
 # see docs/docs/advanced_features/muse_spark_hopper.mdx.
 MUSE_SPARK_SM90_ENV_DEFAULTS = (
-    (envs.SGLANG_HOPPER_SMALL_M_GEMV, True),
-    (envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY, True),
-    (envs.SGLANG_OPT_DFLASH_DRAFT_FAST_PATH, True),
     (envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH, True),
     # Input-logprob chunks run the logits tail eagerly with fp32 full-vocab
     # logits per row; the stock chunk length bounds that memory.
     (envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS, 16384),
+)
+
+# The Hopper serving path's resolved switches; they have no CLI, so the kill switch
+# above is their only control.
+MUSE_SPARK_SM90_RESOLVED = dict(
+    speculative_dflash_mixed_verify=True,
+    speculative_dflash_draft_fast_path=True,
+    hopper_bf16_small_m_gemv=True,
 )
 
 
@@ -79,6 +84,11 @@ def apply_muse_spark_env_defaults(server_args: Any) -> None:
         if not field.is_set():
             field.set(value)
             applied.append(f"{field.name}={value}")
+    if sm90:
+        declare_resolution(
+            server_args, "muse_spark_hopper_path", **MUSE_SPARK_SM90_RESOLVED
+        )
+        applied += [f"{k}={v}" for k, v in MUSE_SPARK_SM90_RESOLVED.items()]
     if (
         sm90
         and cfg.nnodes == 1

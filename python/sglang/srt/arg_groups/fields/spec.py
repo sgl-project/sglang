@@ -194,6 +194,29 @@ class Spec(msgspec.Struct):
             resolvable=True,
         ),
     ] = False
+    speculative_dflash_mixed_verify: A[
+        bool,
+        Arg(
+            help="(Resolved) DFLASH verifies the running requests' draft blocks "
+            "inside the mixed extend forward (--enable-mixed-chunk) instead of a "
+            "separate decode round. Set by Muse Spark on SM90 with its Hopper "
+            "kernels (SGLANG_MUSE_SPARK_HOPPER_KERNELS); off otherwise.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
+    speculative_dflash_draft_fast_path: A[
+        bool,
+        Arg(
+            help="(Resolved) DFLASH draft fast path for TP > 1: TP-split context "
+            "projection, packed top-k gather, the target projecting its own "
+            "context rows, startup cuBLAS shape sweep. Set by Muse Spark on SM90 "
+            "with its Hopper kernels (SGLANG_MUSE_SPARK_HOPPER_KERNELS); off "
+            "otherwise.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     speculative_draft_sink_size: A[
         Optional[int],
         "Number of leading 'attention sink' tokens the draft always attends to, in addition to the --speculative-draft-window-size recent window (StreamingLLM-style). Honored only by the built-in EAGLE/MTP draft-decode path on the Triton and FlashInfer draft backends; the Llama EAGLE-3 and DFLASH windows ignore it. 0/unset => pure recent window. Requires --speculative-draft-window-size.",

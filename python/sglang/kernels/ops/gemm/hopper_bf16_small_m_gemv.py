@@ -1,5 +1,5 @@
 """SM90 small-M BF16 ``x @ w.T`` (fp32 acc) in TileLang, for unquant's BF16 dispatch
-(SGLANG_HOPPER_SMALL_M_GEMV) and the Muse Spark fp32 router."""
+(`hopper_bf16_small_m_gemv`) and the Muse Spark fp32 router."""
 
 import contextlib
 import logging

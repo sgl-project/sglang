@@ -349,6 +349,17 @@ class ExecKernel(msgspec.Struct):
             choices=["auto", "cutedsl", "gemv", "torch"],
         ),
     ] = "auto"
+    hopper_bf16_small_m_gemv: A[
+        bool,
+        Arg(
+            help="(Resolved) With --bf16-gemm-backend auto on SM90, the unquantized "
+            "linear method runs the small-M BF16 GEMV (TileLang) on the (N, K) "
+            "shapes in its tables. Set by Muse Spark with its Hopper kernels "
+            "(SGLANG_MUSE_SPARK_HOPPER_KERNELS); off otherwise.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     dsa_prefill_backend: A[
         Optional[str],
         Arg(

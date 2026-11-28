@@ -335,6 +335,29 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
                     ).speculative_draft_attention_backend
                 )
 
+    def test_hopper_path_switches_follow_the_kill_switch(self):
+        """Mixed verify, the DFLASH draft fast path and the small-M GEMV are resolved
+        only for Muse Spark on SM90 with its Hopper kernels on."""
+        switches = (
+            "speculative_dflash_mixed_verify",
+            "speculative_dflash_draft_fast_path",
+            "hopper_bf16_small_m_gemv",
+        )
+        for options, kernels, expected in (
+            ({"platform": "hopper"}, True, True),
+            ({"platform": "hopper"}, False, False),
+            ({"platform": "blackwell"}, True, False),
+            ({"platform": "hopper", "arch": "LlamaForCausalLM"}, True, False),
+        ):
+            with (
+                self.subTest(options=options, kernels=kernels),
+                envs.SGLANG_MUSE_SPARK_HOPPER_KERNELS.override(kernels),
+            ):
+                cfg = self.resolve(**options)
+                self.assertEqual(
+                    [getattr(cfg, name) for name in switches], [expected] * 3
+                )
+
     def test_minimal_local_recipe_resolves_through_the_full_pipeline(self):
         """Omitted flags must reach later validators for both ModelOpt formats."""
         from sglang.srt.configs.muse_spark import MuseSparkConfig

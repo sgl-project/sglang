@@ -95,7 +95,7 @@ _FC_ROW_SPLIT_MIN_TOKENS = 512
 
 
 def _fast_path() -> bool:
-    return envs.SGLANG_OPT_DFLASH_DRAFT_FAST_PATH.get()
+    return get_spec().speculative_dflash_draft_fast_path
 
 
 def _gemm_ag(x, w):
@@ -947,15 +947,28 @@ class DFlashMLP(nn.Module):
         return x
 
 
-@torch.compile(
-    dynamic=True,
-    backend=get_compiler_backend(),
-    disable=_is_npu,
-    options={"triton.enable_pdl": True}
-    if get_compiler_backend() == "inductor" and _fast_path()
-    else None,
-)
-def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size, taps):
+@cache
+def _compiled_grouped_conv():
+    # Compiled on first use: the PDL option reads the resolved draft fast path,
+    # which is published after this module is imported.
+    return torch.compile(
+        _grouped_conv_eager,
+        dynamic=True,
+        backend=get_compiler_backend(),
+        disable=_is_npu,
+        options={"triton.enable_pdl": True}
+        if get_compiler_backend() == "inductor" and _fast_path()
+        else None,
+    )
+
+
+def _grouped_conv(*args):
+    return _compiled_grouped_conv()(*args)
+
+
+def _grouped_conv_eager(
+    hidden_states, delta, base, block_size, num_groups, group_size, taps
+):
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
     out = coefficients[:, 0] * blocks

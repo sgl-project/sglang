@@ -678,7 +678,7 @@ class FutureMap:
                 )
             if (
                 self.spec_algo.is_dflash()
-                and envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY.get()
+                and get_spec().speculative_dflash_mixed_verify
             ):
                 self.deferred_tails = batch.mix_running_indices_cpu
                 return

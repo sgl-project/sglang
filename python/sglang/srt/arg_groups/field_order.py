@@ -596,5 +596,8 @@ POSITIONAL_FIELD_ORDER = (
     "inkling2_loop_share_cache",
     "inkling2_tool_call_author_name_mode",
     "disaggregation_decode_first_token_stream",
+    "speculative_dflash_mixed_verify",
+    "speculative_dflash_draft_fast_path",
+    "hopper_bf16_small_m_gemv",
 )
 # fmt: on

@@ -66,7 +66,7 @@ def mixed_verify_configured() -> bool:
     running requests inside the extend forward. `DFlashWorkerV2._runs_mixed_verify`
     adds the per-batch conditions; the scheduler budgets the verify rows on this."""
     return (
-        envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY.get()
+        get_spec().speculative_dflash_mixed_verify
         and not get_parallel().attn_dp_enabled
         and get_parallel().pp_group.world_size == 1
         # a context-parallel forward splits the rows across ranks and runs the

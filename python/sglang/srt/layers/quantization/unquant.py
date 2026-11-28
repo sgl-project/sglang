@@ -528,7 +528,7 @@ def initialize_bf16_gemm_config() -> None:
             _use_hopper_bf16_tiny_gemv = use_hopper_bf16_tiny_gemv
     elif (
         backend_str == "auto"
-        and envs.SGLANG_HOPPER_SMALL_M_GEMV.get()
+        and get_exec().kernel.hopper_bf16_small_m_gemv
         and _is_cuda
         and torch.cuda.get_device_capability() == (9, 0)
         and not get_exec().deterministic.enable_deterministic_inference
