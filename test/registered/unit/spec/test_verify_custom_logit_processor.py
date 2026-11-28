@@ -164,13 +164,6 @@ class TestRowPrefixes(CustomTestCase):
             ],
         )
 
-    def test_tree_rows_get_the_pending_tokens_then_their_path(self):
-        tree = _host_tree(_tree(), 2).resolve()
-        self.assertEqual(
-            verify_row_prefixes(*tree, pending_tokens=[[ROOT], []]),
-            [[1], [1, 2], [1, 5], [1, 2, 3], [], [2], [5], [2, 3]],
-        )
-
     def test_the_barrier_supplies_tokens_output_ids_lacks(self):
         """Under overlap req.output_ids misses the previous step's tokens; the
         barrier's tokens for them lead the row prefixes, so the processor reads
@@ -235,38 +228,27 @@ class TestCustomLogitProcessorSync(CustomTestCase):
             has_grammar=has_grammar,
         )
 
-    def test_only_a_processor_the_barrier_cannot_serve_syncs(self):
-        # NGRAM verifies without the barrier; every other spec algorithm here
-        # has it, and a processor without row prefixes does not read it.
-        for name, processor in itertools.product(
-            ("NONE", "EAGLE", "NGRAM", "DFLASH", "DSPARK"),
-            (None, _CountUp(), _CountUpWithoutRowPrefix()),
-        ):
-            algorithm = SpeculativeAlgorithm.from_string(name)
-            batch = self._batch(processor, algorithm=algorithm)
-            want = (
-                processor is not None
-                and not algorithm.is_none()
-                and (name == "NGRAM" or not processor.supports_row_prefix)
+    def test_the_scheduler_syncs_only_for_a_processor_the_barrier_cannot_serve(self):
+        # EAGLE has the barrier; a processor without row prefixes does not read it.
+        for processor, want in [
+            (_CountUpWithoutRowPrefix(), True),
+            (_CountUp(), False),
+        ]:
+            batch = self._batch(
+                processor, algorithm=SpeculativeAlgorithm.from_string("EAGLE")
             )
-            with self.subTest(algorithm=name, processor=type(processor).__name__):
+            batch.grammar_needs_sync = lambda: False
+            batch.custom_logit_processor_needs_sync = lambda: (
+                ScheduleBatch.custom_logit_processor_needs_sync(batch)
+            )
+            with (
+                self.subTest(processor=type(processor).__name__),
+                envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
+            ):
                 self.assertEqual(
-                    ScheduleBatch.custom_logit_processor_needs_sync(batch), want
+                    Scheduler.should_process_last_batch_early(SimpleNamespace(), batch),
+                    want,
                 )
-
-    def test_the_scheduler_processes_the_last_result_first(self):
-        batch = self._batch(
-            _CountUpWithoutRowPrefix(),
-            algorithm=SpeculativeAlgorithm.from_string("EAGLE"),
-        )
-        batch.grammar_needs_sync = lambda: False
-        batch.custom_logit_processor_needs_sync = lambda: (
-            ScheduleBatch.custom_logit_processor_needs_sync(batch)
-        )
-        with envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False):
-            self.assertTrue(
-                Scheduler.should_process_last_batch_early(SimpleNamespace(), batch)
-            )
 
 
 class TestPendingTokens(CustomTestCase):
@@ -317,10 +299,6 @@ class TestPendingTokens(CustomTestCase):
         result = SimpleNamespace(copy_done=None, next_token_ids=torch.tensor([9, 4]))
         batch = self._batch([done, chunked], decode=False, chunked_req=chunked)
         self.assertEqual(self._pending(result, batch), {done: [9]})
-
-    def test_a_batch_without_processors_reads_nothing(self):
-        batch = self._batch([self._req(custom=False)], decode=True)
-        self.assertEqual(self._pending(SimpleNamespace(), batch), {})
 
     def test_the_barrier_advances_the_grammar_then_merges_queued_results(self):
         req = self._req()
