@@ -220,7 +220,7 @@ class MinimaxM2Detector(BaseFormatDetector):
         calls: List[ToolCallItem] = []
 
         # Build tool indices for validation
-        if not hasattr(self, "_tool_indices"):
+        if self._tool_indices is None:
             self._tool_indices = self._get_tool_indices(tools)
 
         while True:

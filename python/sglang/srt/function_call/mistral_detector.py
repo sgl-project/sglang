@@ -147,7 +147,7 @@ class MistralDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text)
 
         # Build tool indices if not already built.
-        if not hasattr(self, "_tool_indices"):
+        if self._tool_indices is None:
             self._tool_indices = self._get_tool_indices(tools)
 
         # Try compact first; JSON-array requires `] [` and often arrives later in streaming.

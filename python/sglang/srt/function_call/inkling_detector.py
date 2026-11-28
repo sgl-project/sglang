@@ -303,7 +303,7 @@ class InklingDetector(BaseFormatDetector):
             logger.warning("Invalid Inkling tool call payload: %s", payload)
             return None
 
-        if not hasattr(self, "_tool_indices"):
+        if self._tool_indices is None:
             self._tool_indices = self._get_tool_indices(tools)
         if name not in self._tool_indices:
             # Surface the call anyway (OpenAI behavior for hallucinated tools):

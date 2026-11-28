@@ -108,7 +108,7 @@ class GigaChat35Detector(BaseFormatDetector):
             if leading:
                 return StreamingParseResult(normal_text=leading)
 
-        if not hasattr(self, "_tool_indices"):
+        if self._tool_indices is None:
             self._tool_indices = self._get_tool_indices(tools)
 
         _, _, after_open = current_text.partition(self.bot_token)

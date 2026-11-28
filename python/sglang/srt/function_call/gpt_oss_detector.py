@@ -139,7 +139,7 @@ class GptOssDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text="", calls=[])
 
         # Initialize state if needed
-        if not hasattr(self, "_tool_indices"):
+        if self._tool_indices is None:
             self._tool_indices = self._get_tool_indices(tools)
 
         calls = []
