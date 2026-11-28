@@ -238,20 +238,22 @@ def sample_generated_shared_prefix_requests(
         range_ratio=range_ratio,
         num=num_groups,
     )
+    total_slots = num_groups * prompts_per_group
+    # Decoding zero IDs gives the same question in every slot.
+    share_empty_questions = question_len == 0 and not input_ids and total_slots > 0
+    num_question_rows = 1 if share_empty_questions else total_slots
     question_lens = np.array(
         compute_random_lens(
             full_len=question_len,
             range_ratio=range_ratio,
-            num=num_groups * prompts_per_group * num_turns,
+            num=num_question_rows * num_turns,
         )
-    ).reshape(num_groups, prompts_per_group, num_turns)
-    output_lens = np.array(
-        compute_random_lens(
-            full_len=output_len,
-            range_ratio=range_ratio,
-            num=num_groups * prompts_per_group,
-        )
-    ).reshape(num_groups, prompts_per_group)
+    ).reshape(num_question_rows, num_turns)
+    output_lens = compute_random_lens(
+        full_len=output_len,
+        range_ratio=range_ratio,
+        num=total_slots,
+    )
     del system_prompt_len, question_len, output_len
 
     generate_prompt = gen_prompt_ids if input_ids else gen_prompt
@@ -260,16 +262,9 @@ def sample_generated_shared_prefix_requests(
         for i in range(num_groups)
     ]
 
-    # shape: (num_groups, prompts_per_group, num_turns)
     questions = [
-        [
-            [
-                generate_prompt(tokenizer, int(question_lens[g, p, t]))
-                for t in range(num_turns)
-            ]
-            for p in range(prompts_per_group)
-        ]
-        for g in range(num_groups)
+        [generate_prompt(tokenizer, int(length)) for length in turn_lens]
+        for turn_lens in question_lens
     ]
 
     # Per-slot group assignment. Uniform mode is the identity assignment
@@ -278,7 +273,6 @@ def sample_generated_shared_prefix_requests(
     # that compute_random_lens / gen_prompt rely on is never perturbed -- this
     # keeps the system-prompt and question pool byte-identical to uniform mode
     # for the same seed and other args.
-    total_slots = num_groups * prompts_per_group
     if group_distribution == "uniform":
         assignment = np.repeat(np.arange(num_groups), prompts_per_group)
     else:  # "zipf"
@@ -293,9 +287,6 @@ def sample_generated_shared_prefix_requests(
     for slot_idx, sampled_g in enumerate(
         tqdm(assignment, desc="Generating shared-prefix prompts")
     ):
-        # src_(g,p) walks the question pool in uniform-enumeration order, so
-        # per-slot question text is reproducibly identical across modes.
-        src_g, src_p = divmod(slot_idx, prompts_per_group)
         sampled_g = int(sampled_g)
 
         system_prompt = system_prompts[sampled_g]
@@ -304,7 +295,7 @@ def sample_generated_shared_prefix_requests(
             if send_routing_key
             else None
         )
-        turn_questions = questions[src_g][src_p]
+        turn_questions = questions[0 if share_empty_questions else slot_idx]
         first_question = turn_questions[0]
         if input_ids:
             first_turn = system_prompt + first_question
@@ -323,7 +314,7 @@ def sample_generated_shared_prefix_requests(
             # The statistics below still need the questions without the system prefix.
             full_prompt = turn_questions.copy()
             full_prompt[0] = first_turn
-        output_len_val = int(output_lens[src_g, src_p])
+        output_len_val = int(output_lens[slot_idx])
 
         input_requests.append(
             DatasetRow(
@@ -351,18 +342,18 @@ def sample_generated_shared_prefix_requests(
         system_token_lens = [
             len(sp) if input_ids else len(tokenizer.encode(sp)) for sp in system_prompts
         ]
-        all_questions = [q for group in questions for conv in group for q in conv]
-        question_token_lens = [
-            len(q) if input_ids else len(tokenizer.encode(q)) for q in all_questions
-        ]
+        question_tokens = sum(
+            len(q) if input_ids else len(tokenizer.encode(q))
+            for turns in questions
+            for q in turns
+        )
+        avg_question_len = question_tokens / (len(questions) * num_turns)
         print(f"Total input tokens: {total_input_tokens}")
         print(f"Total output tokens: {total_output_tokens}")
         print(
             f"Average system prompt length: {sum(system_token_lens) / len(system_prompts):.1f} tokens"
         )
-        print(
-            f"Average question length: {sum(question_token_lens) / len(all_questions):.1f} tokens\n"
-        )
+        print(f"Average question length: {avg_question_len:.1f} tokens\n")
 
     if should_cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)

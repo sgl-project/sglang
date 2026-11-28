@@ -1187,9 +1187,14 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         options = dict(question_len=0, num_turns=2, send_routing_key=True)
         uniform = self._run_gsp(**options)
         expected = {group(row): row.prompt[0] for row in uniform}
-        with patch.object(
-            self.tokenizer, "encode", wraps=self.tokenizer.encode
-        ) as encode:
+        with (
+            patch.object(
+                self.tokenizer, "encode", wraps=self.tokenizer.encode
+            ) as encode,
+            patch.object(
+                self.tokenizer, "decode", wraps=self.tokenizer.decode
+            ) as decode,
+        ):
             rows = self._run_gsp(mode="zipf", alpha=1.0, fast_prepare=False, **options)
 
         first_turn_by_group = {group(row): row.prompt[0] for row in rows}
@@ -1208,6 +1213,9 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             c.args[0] for c in encode.call_args_list if c.args[0].endswith("\n\n")
         ]
         self.assertCountEqual(encoded_turns, first_turn_by_group.values())
+        # One representative two-turn conversation suffices for all empty questions.
+        self.assertLessEqual(sum(not c.args[0] for c in decode.call_args_list), 2)
+        self.assertLessEqual(sum(c.args[0] == "" for c in encode.call_args_list), 2)
 
     def test_gsp_default_ignores_legacy_fast_cache(self):
         common = dict(num_groups=3, prompts_per_group=4, seed=7)
