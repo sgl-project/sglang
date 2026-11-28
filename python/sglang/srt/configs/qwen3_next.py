@@ -294,9 +294,12 @@ class Qwen3NextConfig(PretrainedConfig):
         # GDN conv_state == cat([query, key, value]); each sub-block is
         # head-sharded independently across attn-TP, so record the full
         # (unsharded) sub-block dims for correct PD transfer between prefill and
-        # decode with different attn_tp_size (see _send_mamba_state_slice).
-        key_dim = self.linear_key_head_dim * self.linear_num_key_heads
-        value_dim = self.linear_value_head_dim * self.linear_num_value_heads
+        # decode with different attn_tp_size (see _send_mamba_state_slice). The
+        # head counts let PD slice key heads replicated when TP > num key heads.
+        num_k_heads = self.linear_num_key_heads
+        num_v_heads = self.linear_num_value_heads
+        key_dim = self.linear_key_head_dim * num_k_heads
+        value_dim = self.linear_value_head_dim * num_v_heads
         shape = Mamba2StateShape.create(
             tp_world_size=linear_attn_tp_size(),
             intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
@@ -305,7 +308,11 @@ class Qwen3NextConfig(PretrainedConfig):
             head_dim=self.linear_value_head_dim,
             state_size=self.linear_key_head_dim,
             conv_kernel=self.linear_conv_kernel_dim,
-            conv_shard_groups=[key_dim, key_dim, value_dim],
+            conv_shard_groups=[
+                (key_dim, num_k_heads),
+                (key_dim, num_k_heads),
+                (value_dim, num_v_heads),
+            ],
         )
 
         return Mamba2CacheParams(
