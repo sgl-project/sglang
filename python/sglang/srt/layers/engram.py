@@ -1767,6 +1767,34 @@ def engram_gate(
         return fused_engram_gate(
             x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
         )
+    if x.device.type == "npu" and x.shape[0] > 512:
+        # The FP32 workspace scales with rows * hc_mult * dim; token rows
+        # are independent, including the image-token mask.
+        out = torch.empty_like(x)
+        for start in range(0, x.shape[0], 512):
+            rows = slice(start, start + 512)
+            ids = None if input_ids is None else input_ids[rows]
+            out[rows].copy_(
+                _engram_gate_torch(
+                    x[rows],
+                    kv[rows],
+                    q_weight,
+                    k_weight,
+                    eps,
+                    clamp_value,
+                    ids,
+                    image_token_id,
+                )
+            )
+        return out
+    return _engram_gate_torch(
+        x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
+    )
+
+
+def _engram_gate_torch(
+    x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
+):
     hc_mult, dim = x.shape[-2:]
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
