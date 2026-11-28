@@ -47,7 +47,7 @@ from sglang.srt.multimodal.processors.unlimited_ocr_v2 import (  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 
-register_cpu_ci(est_time=55, suite="base-a-test-cpu")
+register_cpu_ci(est_time=75, suite="base-a-test-cpu")
 
 
 class _CloneFailure:
@@ -96,7 +96,7 @@ def _request(feature, rid: str = "vlm-request") -> TokenizedEmbeddingReqInput:
     )
 
 
-def _receiver() -> SchedulerRequestReceiver:
+def _receiver(mm_input_validator=None) -> SchedulerRequestReceiver:
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
         recv_skipper=None,
@@ -107,6 +107,7 @@ def _receiver() -> SchedulerRequestReceiver:
         request_retirer=None,
         get_last_batch=lambda: None,
         rust_server_mode=False,
+        mm_input_validator=mm_input_validator,
     )
 
 
@@ -201,6 +202,206 @@ def _run_image_receiver(rank, init_file, pipe):
     finally:
         pipe.close()
         torch.distributed.destroy_process_group()
+
+
+def _gemma4_receiver(*, unified=False):
+    from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+    from sglang.srt.models.gemma4_unified import Gemma4UnifiedForConditionalGeneration
+
+    model_cls = (
+        Gemma4UnifiedForConditionalGeneration
+        if unified
+        else Gemma4ForConditionalGeneration
+    )
+    hf_config = SimpleNamespace(
+        vision_config=SimpleNamespace(
+            patch_size=16, model_patch_size=48, pooling_kernel_size=2
+        ),
+        text_config=SimpleNamespace(hidden_size=4096),
+    )
+    return _receiver(model_cls.build_mm_input_validator(hf_config))
+
+
+def _vision_request(width=768, rid="image", *, video=False):
+    req = _request(torch.full((1, 4, width), 0.5), rid=rid)
+    item = req.mm_inputs.mm_items[0]
+    item.modality = Modality.VIDEO if video else Modality.IMAGE
+    item.set(
+        "video_position_ids" if video else "image_position_ids",
+        torch.zeros((1, 4, 2), dtype=torch.int64),
+    )
+    return req
+
+
+class TestGemma4InputFailureConsensus(CustomTestCase):
+    def _finalize(self, requests):
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+            return_value=SimpleNamespace(attn_dp_enabled=False, tp_size=1),
+        ):
+            _gemma4_receiver()._finalize_shm_features(requests)
+
+    def test_mixed_requests_reject_bad_pixels_before_vision(self):
+        """#26751: grayscale/RGBA patch width must not kill a healthy encoder."""
+        from sglang.srt.models.gemma4_vision import Gemma4VisionPatchEmbedder
+
+        projection = Gemma4VisionPatchEmbedder(
+            SimpleNamespace(
+                patch_size=16,
+                hidden_size=8,
+                position_embedding_size=16,
+            )
+        )
+        for width in (256, 1024):
+            with self.subTest(width=width):
+                bad = _vision_request(width, rid="bad")
+                good = _vision_request(rid="good")
+                with self.assertRaises(RuntimeError):
+                    projection._patch_projection(bad.mm_inputs.mm_items[0].feature)
+                self._finalize([BatchTokenizedEmbeddingReqInput(batch=[bad, good])])
+                self.assertIsInstance(bad.mm_inputs, MMInputsProcessError)
+                with self.assertRaises(_MultimodalInputProcessingError):
+                    Scheduler._get_multimodal_inputs(
+                        object.__new__(Scheduler), bad.mm_inputs
+                    )
+                pixels = good.mm_inputs.mm_items[0].feature
+                torch.testing.assert_close(
+                    projection._patch_projection(pixels),
+                    torch.zeros(1, 4, 8),
+                )
+
+    def test_malformed_positions_and_video_are_request_local(self):
+        for positions in (None, torch.zeros(1, 3, 2), torch.zeros(1, 4, 3)):
+            for video in (False, True):
+                with self.subTest(positions=positions, video=video):
+                    bad = _vision_request(video=video)
+                    key = "video_position_ids" if video else "image_position_ids"
+                    bad.mm_inputs.mm_items[0].set(key, positions)
+                    self._finalize([bad])
+                    self.assertIsInstance(bad.mm_inputs, MMInputsProcessError)
+
+    def test_positions_must_cover_every_image_in_the_batch(self):
+        """Both encoders index positions per image; batch-1 positions crash them."""
+        for positions in (torch.zeros(1, 4, 2), torch.zeros(4, 2)):
+            for unified in (False, True):
+                with self.subTest(positions=tuple(positions.shape), unified=unified):
+                    width = 6912 if unified else 768
+                    bad = _vision_request(width)
+                    bad.mm_inputs.mm_items[0].feature = torch.zeros(2, 4, width)
+                    bad.mm_inputs.mm_items[0].set("image_position_ids", positions)
+                    with patch(
+                        "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+                        return_value=SimpleNamespace(attn_dp_enabled=False, tp_size=1),
+                    ):
+                        _gemma4_receiver(unified=unified)._finalize_shm_features([bad])
+                    self.assertIsInstance(bad.mm_inputs, MMInputsProcessError)
+
+    def test_patch_count_must_fill_the_pooling_kernel(self):
+        """The Gemma 4 pooler raises unless patches are a multiple of k**2."""
+        from sglang.srt.models.gemma4_vision import Gemma4VisionPooler
+
+        pooler = Gemma4VisionPooler(SimpleNamespace(hidden_size=8))
+        for patches in (2, 6):
+            with self.assertRaises((ValueError, ZeroDivisionError)):
+                pooler._avg_pool_by_positions(
+                    torch.zeros(1, patches, 8),
+                    torch.zeros(1, patches, 2),
+                    length=patches // 4,
+                )
+            for video in (False, True):
+                with self.subTest(patches=patches, video=video):
+                    bad = _vision_request(video=video)
+                    key = "video_position_ids" if video else "image_position_ids"
+                    bad.mm_inputs.mm_items[0].feature = torch.zeros(1, patches, 768)
+                    bad.mm_inputs.mm_items[0].set(key, torch.zeros(1, patches, 2))
+                    self._finalize([bad])
+                    self.assertIsInstance(bad.mm_inputs, MMInputsProcessError)
+
+    def test_precomputed_and_featureless_inputs_keep_their_paths(self):
+        embedded = _vision_request(4096)
+        embedded.mm_inputs.mm_items[0].set("image_position_ids", None)
+        featureless = _request(None)
+        self._finalize([embedded, featureless])
+        self.assertIsInstance(embedded.mm_inputs, MultimodalProcessorOutput)
+        self.assertIsInstance(featureless.mm_inputs, MultimodalProcessorOutput)
+
+    def test_video_frames_and_nested_images_are_valid(self):
+        video = _vision_request(video=True)
+        video.mm_inputs.mm_items[0].feature = torch.zeros(1, 2, 4, 768)
+        video.mm_inputs.mm_items[0].set("video_position_ids", torch.zeros(1, 2, 4, 2))
+        image = _vision_request()
+        item = image.mm_inputs.mm_items[0]
+        item.feature = [torch.zeros(4, 768), torch.zeros(1, 4, 768)]
+        item.set("image_position_ids", [torch.zeros(4, 2), torch.zeros(1, 4, 2)])
+        self._finalize([video, image])
+        self.assertIsInstance(video.mm_inputs, MultimodalProcessorOutput)
+        self.assertIsInstance(image.mm_inputs, MultimodalProcessorOutput)
+
+    def test_rejected_ipc_features_release_each_consumer_without_reconstruction(self):
+        from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmTensorTransportProxy
+
+        for proxy_type in (CudaIpcTensorTransportProxy, CudaVmmTensorTransportProxy):
+            with self.subTest(transport=proxy_type.__name__):
+                released = []
+                proxy = object.__new__(proxy_type)
+                proxy.total_consumer_count = 2
+                if proxy_type is CudaVmmTensorTransportProxy:
+                    proxy.shape = (1, 4, 256)
+                else:
+                    proxy.proxy_state = {"ipc_extra": {"recons_shape": (1, 4, 256)}}
+                # The physical GPU acknowledgement is the dependency boundary.
+                proxy.release_without_reconstruction = lambda count: released.append(
+                    count
+                )
+                req = _vision_request()
+                req.mm_inputs.mm_items[0].feature = proxy
+                self._finalize([req])
+                self.assertIsInstance(req.mm_inputs, MMInputsProcessError)
+                self.assertEqual(released, [1])
+
+    def test_unified_checks_merged_patch_width(self):
+        """gemma4_unified merges patches: 3 * model_patch_size**2 = 6912."""
+        for width, rejected in ((768, True), (6912, False)):
+            for video in (False, True):
+                with self.subTest(width=width, video=video):
+                    req = _vision_request(width, video=video)
+                    with patch(
+                        "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+                        return_value=SimpleNamespace(attn_dp_enabled=False, tp_size=1),
+                    ):
+                        _gemma4_receiver(unified=True)._finalize_shm_features([req])
+                    self.assertEqual(
+                        isinstance(req.mm_inputs, MMInputsProcessError), rejected
+                    )
+
+    def test_validation_without_shm_skips_rank_collectives(self):
+        """Every TP rank validates the same broadcast metadata on its own."""
+        module = "sglang.srt.managers.scheduler_components.request_receiver"
+        parallel = SimpleNamespace(
+            attn_dp_enabled=False, tp_size=2, tp_group=SimpleNamespace(cpu_group=None)
+        )
+        bad, good = _vision_request(256, rid="bad"), _vision_request(rid="good")
+        with (
+            patch(f"{module}.get_parallel", return_value=parallel),
+            patch(f"{module}.barrier") as barrier,
+            patch(f"{module}.all_reduce") as all_reduce,
+        ):
+            _gemma4_receiver()._finalize_shm_features([bad, good])
+        barrier.assert_not_called()
+        all_reduce.assert_not_called()
+        self.assertIsInstance(bad.mm_inputs, MMInputsProcessError)
+        self.assertIsInstance(good.mm_inputs, MultimodalProcessorOutput)
+
+    def test_pipeline_relay_preserves_rejection(self):
+        bad, good = _vision_request(256), _vision_request()
+        good.mm_inputs.mm_items[0].hash = 7
+        self._finalize([bad, good])
+        relayed = strip_mm_features_for_pp_relay([bad, good])
+        self._finalize(relayed)
+        self.assertIsInstance(relayed[0].mm_inputs, MMInputsProcessError)
+        self.assertIsInstance(relayed[1].mm_inputs, MultimodalProcessorOutput)
+        self.assertIsNone(relayed[1].mm_inputs.mm_items[0].feature)
 
 
 class TestShmStorageOwnership(unittest.TestCase):

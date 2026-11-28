@@ -34,6 +34,7 @@ only construction, per-modality feature extraction and weight loading.
 
 import logging
 import re
+from functools import partial
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -50,6 +51,10 @@ from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+from sglang.srt.multimodal.mm_input_validation import MultimodalInputValidator
+from sglang.srt.multimodal.processors.gemma4_validation import (
+    validate_gemma4_vision_inputs,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import flatten_nested_list
 
@@ -132,6 +137,18 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
     plumbing from :class:`Gemma4ForConditionalGeneration`, swapping the SigLIP
     vision tower and conformer audio tower for the encoder-free embedders.
     """
+
+    @classmethod
+    def build_mm_input_validator(cls, hf_config) -> Optional[MultimodalInputValidator]:
+        if hf_config.vision_config is None:
+            return None
+        return partial(
+            validate_gemma4_vision_inputs,
+            patch_width=3 * hf_config.vision_config.model_patch_size**2,
+            hidden_size=hf_config.text_config.hidden_size,
+            image_dims=(2, 3, 4),
+            video_dims=(2, 3, 4),
+        )
 
     def __init__(
         self,

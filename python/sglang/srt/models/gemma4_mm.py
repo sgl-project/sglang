@@ -16,6 +16,7 @@
 import logging
 import re
 from array import array
+from functools import partial
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -57,7 +58,11 @@ from sglang.srt.models.gemma4_causal import (
     pp_filter_load_weight,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
+from sglang.srt.multimodal.mm_input_validation import MultimodalInputValidator
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.processors.gemma4_validation import (
+    validate_gemma4_vision_inputs,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import cpu_has_amx_support, flatten_nested_list, is_cpu, is_xpu
 
@@ -154,6 +159,21 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         "gate_up_proj",
         "down_proj",
     ]
+
+    @classmethod
+    def build_mm_input_validator(
+        cls, hf_config: Gemma4Config
+    ) -> Optional[MultimodalInputValidator]:
+        if hf_config.vision_config is None:
+            return None
+        return partial(
+            validate_gemma4_vision_inputs,
+            patch_width=3 * hf_config.vision_config.patch_size**2,
+            hidden_size=hf_config.text_config.hidden_size,
+            image_dims=(2, 3),
+            video_dims=(3, 4),
+            pooling_kernel_size=hf_config.vision_config.pooling_kernel_size,
+        )
 
     def __init__(
         self,
