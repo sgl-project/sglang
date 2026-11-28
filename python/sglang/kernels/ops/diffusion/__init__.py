@@ -36,6 +36,7 @@ _CUDA = frozenset({CapabilityRequirement.CUDA})
 _CUDA_SM90_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))})
 _CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
+_CUDA_OR_HIP = frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP})
 _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 
 # ---------------------------------------------------------------------------
@@ -628,6 +629,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.pack_qkv_norm_rope_destination_major",
+        KernelBackend.TRITON,
+        "layout.ulysses_qkv_triton:pack_qkv_norm_rope_destination_major",
+        _CUDA_OR_HIP,
+    ),
+    (
         "diffusion.copy_head_groups",
         KernelBackend.TRITON,
         "layout.head_group_copy_triton:copy_head_groups",
@@ -913,6 +920,8 @@ _EXPORTS: dict[str, str] = {
     "fused_causal_conv3d_cat_pad_cuda": "sglang.kernels.kda_kernels.causal_conv3d_cat_pad_jit",
     "fused_causal_conv3d_cat_pad": "layout.causal_conv3d_cat_pad_triton",
     "pack_qkv_destination_major": "layout.ulysses_qkv_triton",
+    "pack_qkv_norm_rope_destination_major": "layout.ulysses_qkv_triton",
+    "can_use_pack_qkv_norm_rope": "layout.ulysses_qkv_triton",
     "copy_head_groups": "layout.head_group_copy_triton",
     "prebuild_copy_head_groups": "layout.head_group_copy_triton",
     "fused_qknorm_rope_out_of_place": "rope.qknorm_rope_jit",
