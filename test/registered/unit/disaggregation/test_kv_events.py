@@ -53,8 +53,7 @@ class TestLocalKvEventSource(CustomTestCase):
     def test_advertised_source_delivers_events(self):
         for host, bind, topic in (("*", None, "kv"), ("127.0.0.1", True, "")):
             with self.subTest(host=host):
-                with zmq.Context.instance().socket(zmq.PUB) as probe:
-                    port = probe.bind_to_random_port("tcp://127.0.0.1")
+                port = get_free_port()
                 publisher = self._publisher(
                     attn_dp_rank=4,
                     endpoint=f"tcp://{host}:{port - 4}",
