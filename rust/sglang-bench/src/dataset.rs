@@ -5,8 +5,11 @@
 //! itself, but it does not reproduce the Python script's selection: the two
 //! use different random number generators, so the same `--seed` draws
 //! different prompts. Totals and distributions match; individual prompts do
-//! not.
+//! not. `token-ids` reads prompts that were tokenized ahead of time; it has no
+//! Python-client counterpart, so `serving.py` admits it only with
+//! `--rust-client`.
 
+use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -72,6 +75,7 @@ pub fn load(
             let corpus = corpus.context("the sharegpt dataset needs a corpus path")?;
             sample_sharegpt(args, required(tokenizer)?, corpus, &mut rng)?
         }
+        DatasetName::TokenIds => load_token_ids(args, Path::new(&args.dataset_path))?,
     };
     anyhow::ensure!(
         !rows.is_empty(),
@@ -207,6 +211,54 @@ fn sample_sharegpt(
         }
         rows.push(DatasetRow::new(
             Prompt::Text(prompt.clone()),
+            prompt_len,
+            output_len,
+        ));
+    }
+    Ok(rows)
+}
+
+/// One line of a `token-ids` file.
+#[derive(Deserialize)]
+struct TokenIdsLine {
+    input_ids: Vec<u32>,
+    #[serde(default)]
+    output_len: Option<usize>,
+}
+
+/// The `token-ids` dataset: prompts tokenized ahead of time, one JSON object
+/// per line, read in file order up to `--num-prompts`. The ids go on the wire
+/// unchanged, so the server's tokenizer and chat template play no part.
+/// `--sharegpt-output-len` overrides each line's `output_len`, as it does for
+/// the Python `custom` dataset.
+fn load_token_ids(args: &Args, path: &Path) -> Result<Vec<DatasetRow>> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut rows = Vec::new();
+    for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+        if rows.len() == args.num_prompts {
+            break;
+        }
+        let line = line.with_context(|| format!("cannot read {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let at = || format!("{}:{}", path.display(), index + 1);
+        let parsed: TokenIdsLine = serde_json::from_str(&line)
+            .with_context(|| format!("{} is not a {{\"input_ids\": [...]}} object", at()))?;
+        anyhow::ensure!(!parsed.input_ids.is_empty(), "{} has no input_ids", at());
+        let output_len = args
+            .sharegpt_output_len
+            .or(parsed.output_len)
+            .with_context(|| {
+                format!(
+                    "{} has no output_len; set it or pass --sharegpt-output-len",
+                    at()
+                )
+            })?;
+        let prompt_len = parsed.input_ids.len();
+        rows.push(DatasetRow::new(
+            Prompt::TokenIds(parsed.input_ids),
             prompt_len,
             output_len,
         ));
@@ -363,6 +415,69 @@ mod tests {
             std::env::temp_dir().join(format!("sgl-bench-empty-{}.json", std::process::id()));
         std::fs::write(&path, b"[]").unwrap();
         assert!(load_sharegpt_pairs(&path, &mut StdRng::seed_from_u64(1)).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `token-ids` sends each line's ids unchanged, in file order, stops at
+    /// `--num-prompts`, and lets `--sharegpt-output-len` override the line's
+    /// `output_len`. A line it cannot use is an error that names the line.
+    #[test]
+    fn token_ids_lines_become_id_prompts() {
+        let path =
+            std::env::temp_dir().join(format!("sgl-bench-token-ids-{}.jsonl", std::process::id()));
+        let write = |text: &str| std::fs::write(&path, text).unwrap();
+        let ids = |row: &DatasetRow| match &row.prompt {
+            Prompt::TokenIds(ids) => ids.clone(),
+            Prompt::Text(_) => panic!("expected token ids"),
+        };
+
+        write(concat!(
+            "{\"input_ids\": [5, 6, 7], \"output_len\": 4}\n",
+            "\n",
+            "{\"input_ids\": [9], \"output_len\": 8}\n",
+            "{\"input_ids\": [1]}\n",
+        ));
+        let two = Args {
+            num_prompts: 2,
+            ..Args::default()
+        };
+        let rows = load_token_ids(&two, &path).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (ids(&rows[0]), rows[0].prompt_len, rows[0].output_len),
+            (vec![5, 6, 7], 3, 4)
+        );
+        assert_eq!(
+            (ids(&rows[1]), rows[1].prompt_len, rows[1].output_len),
+            (vec![9], 1, 8)
+        );
+
+        // The fourth line has no output_len: an error naming it, unless the
+        // flag supplies one for every line.
+        let three = Args {
+            num_prompts: 3,
+            ..Args::default()
+        };
+        let error = load_token_ids(&three, &path).unwrap_err().to_string();
+        assert!(error.contains(":4"), "{error}");
+        let fixed = Args {
+            num_prompts: 3,
+            sharegpt_output_len: Some(16),
+            ..Args::default()
+        };
+        let rows = load_token_ids(&fixed, &path).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.output_len == 16));
+
+        for bad in [
+            "{\"input_ids\": []}\n",
+            "{\"error\": \"x\"}\n",
+            "not json\n",
+        ] {
+            write(bad);
+            let error = load_token_ids(&fixed, &path).unwrap_err().to_string();
+            assert!(error.contains(":1"), "{bad}: {error}");
+        }
         std::fs::remove_file(&path).unwrap();
     }
 }

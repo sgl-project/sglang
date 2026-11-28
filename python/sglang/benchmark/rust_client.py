@@ -47,7 +47,7 @@ SUPPORTED_BACKENDS = frozenset(
 )
 
 #: Datasets the Rust client implements.
-SUPPORTED_DATASETS = frozenset({"random", "random-ids", "sharegpt"})
+SUPPORTED_DATASETS = frozenset({"random", "random-ids", "sharegpt", "token-ids"})
 
 #: Namespace attributes that map onto a Rust flag of the same name. Anything
 #: needing conversion is handled in :func:`build_config`.

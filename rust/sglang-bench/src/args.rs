@@ -51,6 +51,9 @@ pub enum DatasetName {
     /// The first turn of each ShareGPT conversation, with its reply's length
     /// as the output length.
     Sharegpt,
+    /// Pre-tokenized prompts read from `--dataset-path`, a JSONL file with one
+    /// `{"input_ids": [...], "output_len": N}` object per line, sent as ids.
+    TokenIds,
 }
 
 #[derive(Debug, Deserialize, Parser)]
@@ -93,7 +96,8 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "sharegpt")]
     pub dataset_name: DatasetName,
 
-    /// Path to a local ShareGPT JSON. Empty downloads and caches it.
+    /// Path to a local ShareGPT JSON. Empty downloads and caches it. With
+    /// `--dataset-name token-ids`, the pre-tokenized JSONL file to read.
     #[arg(long, default_value = "")]
     pub dataset_path: String,
 
@@ -306,6 +310,7 @@ impl DatasetName {
             Self::Random => "random",
             Self::RandomIds => "random-ids",
             Self::Sharegpt => "sharegpt",
+            Self::TokenIds => "token-ids",
         }
     }
 
@@ -382,13 +387,30 @@ impl Args {
             !self.tokenize_prompt || self.backend.api() != Api::OpenaiChat,
             "--tokenize-prompt cannot be used with a chat backend, which sends messages"
         );
+        if self.dataset_name == DatasetName::TokenIds {
+            anyhow::ensure!(
+                !self.dataset_path.is_empty(),
+                "--dataset-name token-ids reads its prompts from --dataset-path"
+            );
+            anyhow::ensure!(
+                self.backend.api() != Api::OpenaiChat,
+                "--dataset-name token-ids sends token ids, which a chat backend cannot carry"
+            );
+        }
         anyhow::ensure!(
             self.protocol == Protocol::Http || self.backend.api() == Api::SglangGenerate,
             "--protocol grpc carries the native /generate contract only; use --backend sglang \
              (the OpenAI routes have no gRPC service)"
         );
+        // ShareGPT keeps Python's floor of four; prebuilt prompts may ask for
+        // a single token, which measures prefill alone.
         if let Some(len) = self.sharegpt_output_len {
-            anyhow::ensure!(len >= 4, "--sharegpt-output-len is too small, got {len}");
+            let min = if self.dataset_name == DatasetName::Sharegpt {
+                4
+            } else {
+                1
+            };
+            anyhow::ensure!(len >= min, "--sharegpt-output-len is too small, got {len}");
         }
         if let Some(limit) = self.max_concurrency {
             anyhow::ensure!(limit > 0, "--max-concurrency must be at least 1");
@@ -530,6 +552,17 @@ mod tests {
         );
         assert!(args(&["--sharegpt-output-len", "2"]).validate().is_err());
         assert!(args(&["--max-concurrency", "0"]).validate().is_err());
+        // token-ids needs its file, and a chat backend cannot carry ids.
+        let token_ids = ["--dataset-name", "token-ids", "--dataset-path", "ids.jsonl"];
+        assert!(args(&token_ids).validate().is_ok());
+        assert!(args(&["--dataset-name", "token-ids"]).validate().is_err());
+        let mut chat = token_ids.to_vec();
+        chat.extend(["--backend", "sglang-oai-chat"]);
+        assert!(args(&chat).validate().is_err());
+        // Only sharegpt needs four output tokens; prebuilt prompts take 1.
+        let mut prefill_only = token_ids.to_vec();
+        prefill_only.extend(["--sharegpt-output-len", "1"]);
+        assert!(args(&prefill_only).validate().is_ok());
     }
 
     /// `--vocab-size` replaces the tokenizer, so it is only coherent where the

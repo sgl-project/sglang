@@ -2350,6 +2350,7 @@ def cli_main():
             "openai",
             "random",
             "random-ids",
+            "token-ids",
             "generated-shared-prefix",
             "mmmu",
             "image",
@@ -2894,6 +2895,11 @@ def cli_main():
     args = parser.parse_args()
     if args.rust_worker_threads is not None and not args.rust_client:
         parser.error("--rust-worker-threads requires --rust-client")
+    if args.dataset_name == "token-ids" and not args.rust_client:
+        parser.error(
+            "--dataset-name token-ids requires --rust-client; the Python client "
+            "has no token-ids dataset"
+        )
     if args.rust_client:
         # Checked here so an unsupported combination is a usage error rather
         # than a traceback; `run_benchmark` still raises for a programmatic
