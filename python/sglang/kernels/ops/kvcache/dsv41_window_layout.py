@@ -5,7 +5,9 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# Runtime row bounds and layout offsets vary with each prefill batch. They do
+# not change the tile or strides, so avoid recompiling on a new alignment class.
+@triton.jit(do_not_specialize=["N", "PAD", "HISTORY", "GROUPS"])
 def _window_layout_queries(
     Req,
     Pos,
