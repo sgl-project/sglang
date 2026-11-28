@@ -3780,11 +3780,11 @@ class Scheduler(
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
-        if self._abort_if_invalid_mis_swa(req=req):
-            return
-
         # initialize before returning
         self.init_req_max_new_tokens(req)
+
+        if req.is_prefill_only and self._abort_if_invalid_mis_swa(req=req):
+            return
 
         # Validate prompt length
         error_msg = validate_input_length(

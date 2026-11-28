@@ -316,13 +316,17 @@ class TestSWAMultiItemScoringIngressGuard(CustomTestCase):
         return scheduler
 
     def _make_tokenized_intake_req(
-        self, *, input_ids: list[int], delimiters: list[int]
+        self,
+        *,
+        input_ids: list[int],
+        delimiters: list[int],
+        max_new_tokens: int = 0,
     ) -> SimpleNamespace:
         return SimpleNamespace(
             rid="swa-intake-req",
             input_text="",
             input_ids=array("q", input_ids),
-            sampling_params=SamplingParams(max_new_tokens=0),
+            sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
             mm_inputs=None,
             session_params=None,
             session_id=None,
@@ -486,6 +490,20 @@ class TestSWAMultiItemScoringIngressGuard(CustomTestCase):
                 getattr(scheduler, method_name)(ignored_req)
                 scheduler._add_request_to_queue.assert_called_once()
                 scheduler.output_streamer.stream_output.assert_not_called()
+
+        with self.subTest(
+            entrypoint="handle_generate_request", case="non_prefill_only_ignored"
+        ):
+            publish(ServerArgs(model_path="dummy", enable_mis=True), role="test")
+            scheduler = self._make_intake_scheduler(min_positive_swa_window=31)
+            gen_req = self._make_tokenized_intake_req(
+                input_ids=list(range(35)),
+                delimiters=[32, 34],
+                max_new_tokens=1,
+            )
+            scheduler.handle_generate_request(gen_req)
+            scheduler._add_request_to_queue.assert_called_once()
+            scheduler.output_streamer.stream_output.assert_not_called()
 
         infos = [
             {"min_positive_swa_window": None},
