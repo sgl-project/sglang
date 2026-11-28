@@ -469,7 +469,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._use_draft_input_embeds = (
             is_breakable_eagle_draft and model_runner.spec_algorithm.is_eagle3()
         )
-        if is_breakable_eagle_draft:
+        if is_breakable_eagle_draft or model_runner.spec_algorithm.is_dfly():
             self.capture_hidden_mode = CaptureHiddenMode.LAST
         elif (is_eagle and not model_runner.is_draft_worker) or (
             model_runner.spec_algorithm.is_dflash_family()

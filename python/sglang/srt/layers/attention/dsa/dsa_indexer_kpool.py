@@ -171,6 +171,7 @@ class IndexerKPool(MultiPlatformOp):
         self.index_kpool = config.index_kpool
         self.index_kpool_always_select_tail = config.index_kpool_always_select_tail
         self.index_kpool_compress = config.index_kpool_compress
+        self.dfly_topk_capture = None
 
         assert (
             self.index_kpool > 1
@@ -1641,6 +1642,8 @@ class IndexerKPool(MultiPlatformOp):
         return_indices: bool = True,
         use_cuda_graph: bool = True,
     ) -> Optional[torch.Tensor]:
+        capture = self.dfly_topk_capture
+        need_indices = return_indices or capture is not None
         if (
             use_cuda_graph
             and is_in_breakable_cuda_graph()
@@ -1655,7 +1658,7 @@ class IndexerKPool(MultiPlatformOp):
             # bridge the result into a stable buffer for captured attention.
             output = torch.empty(
                 (
-                    x.shape[0] if return_indices else 0,
+                    x.shape[0] if need_indices else 0,
                     self.index_topk + self.index_kpool - 1,
                 ),
                 dtype=torch.int32,
@@ -1664,15 +1667,26 @@ class IndexerKPool(MultiPlatformOp):
             bcg_kpool_indexer_prefill_with_output(
                 self, x, q_lora, positions, output, layer_id
             )
-            return output if return_indices else None
-        return self._forward_cuda_impl(
-            x,
-            q_lora,
-            positions,
-            forward_batch,
-            layer_id,
-            return_indices,
-        )
+        else:
+            output = self._forward_cuda_impl(
+                x,
+                q_lora,
+                positions,
+                forward_batch,
+                layer_id,
+                need_indices,
+            )
+        if capture is not None and output is not None and output.shape[0]:
+            if forward_batch.forward_mode.is_extend_without_speculative():
+                lengths = forward_batch.extend_seq_lens
+                last_rows = lengths.cumsum(0, dtype=torch.long) - 1
+                selected = output.index_select(0, last_rows.clamp_min(0))
+                capture[: last_rows.numel()].copy_(
+                    selected.masked_fill(lengths[:, None] == 0, -1)
+                )
+            elif forward_batch.forward_mode.is_target_verify():
+                capture[: output.shape[0]].copy_(output)
+        return output if return_indices else None
 
     @property
     def topk_output_width(self):

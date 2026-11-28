@@ -1821,6 +1821,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        dfly = getattr(self, "dfly", None)
+        if dfly is not None and forward_batch.forward_mode.is_target_verify():
+            dfly.draft_into_verify(input_ids, positions, forward_batch)
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
