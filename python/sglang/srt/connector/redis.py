@@ -2,7 +2,7 @@
 
 import logging
 from typing import Generator, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import torch
 
@@ -19,7 +19,16 @@ class RedisConnector(BaseKVConnector):
 
         super().__init__(url)
         parsed_url = urlparse(url)
-        self.connection = redis.Redis(host=parsed_url.hostname, port=parsed_url.port)
+        # urlparse does not percent-decode credentials; redis-py's from_url
+        # does, so match that convention (e.g. "p%40ss" -> "p@ss").
+        username = unquote(parsed_url.username) if parsed_url.username else None
+        password = unquote(parsed_url.password) if parsed_url.password else None
+        self.connection = redis.Redis(
+            host=parsed_url.hostname,
+            port=parsed_url.port,
+            username=username,
+            password=password,
+        )
         self.model_name = parsed_url.path.lstrip("/")
         # TODO: more serde options
         self.s, self.d = create_serde("safe")
