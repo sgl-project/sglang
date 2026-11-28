@@ -339,6 +339,13 @@ if _is_npu:
     )
 
 
+def _resolved_prefill_is_intel_xpu(backend) -> bool:
+    # The runner's resolved prefill backend, not the base
+    # --linear-attn-backend leaf: --linear-attn-prefill-backend overrides
+    # win either way. Only intel_xpu was validated on XPU against the views.
+    return backend.linear_attn_backends.prefill.is_intel_xpu()
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -990,6 +997,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
+        use_xpu_prefill_views = False
         use_strided_prefill_z = False
         packed_verify = False
         if forward_batch.forward_mode.is_target_verify():
@@ -998,6 +1006,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             backend = get_attn_backend()
             backend = getattr(backend, "linear_attn_backend", backend)
             packed_verify = getattr(backend, "supports_packed_verify", False)
+        elif (
+            _is_xpu
+            and forward_batch.logical_forward_mode.is_extend_without_speculative()
+        ):
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            backend = get_attn_backend()
+            backend = getattr(backend, "linear_attn_backend", backend)
+            use_xpu_prefill_views = _resolved_prefill_is_intel_xpu(backend)
         use_fused_proj_conv = (
             _gdn_decode_fused_proj_conv
             and not (_is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu")
@@ -1015,7 +1032,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             z = None
             b = projected_states_ba
             a = projected_states_ba
-        elif use_fused_contiguous_unpack:
+        elif use_fused_contiguous_unpack or use_xpu_prefill_views:
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
@@ -1025,7 +1042,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # The strided views feed only prefill GDN; DP-relabeled decode rows
             # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (
-                _is_cuda or _is_hip
+                _is_cuda or _is_hip or use_xpu_prefill_views
             ) and forward_batch.logical_forward_mode.is_extend_without_speculative()
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
