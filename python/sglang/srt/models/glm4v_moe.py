@@ -15,7 +15,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
 from sglang.srt.runtime_context import get_mm, get_parallel
@@ -147,6 +150,11 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     ):
                         continue
 
+            # Handle FP8 kv-scale remapping
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
