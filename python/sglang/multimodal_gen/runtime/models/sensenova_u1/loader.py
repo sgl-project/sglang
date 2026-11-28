@@ -10,6 +10,9 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models import (  # noqa: F401
     sensenova_u1 as _sensenova_u1,
 )
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+    Qwen3MLP,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
@@ -39,4 +42,15 @@ def load_model_and_tokenizer(
     device = get_local_torch_device()
     current_platform.set_device(device)
     model = model.to(device)
+    if device.type != "cpu":
+        _pack_mlp_gate_up_weights(model, device)
     return {"model": model, "tokenizer": tokenizer}
+
+
+def _pack_mlp_gate_up_weights(model: torch.nn.Module, device: torch.device) -> None:
+    for module in model.modules():
+        if isinstance(module, Qwen3MLP):
+            module.pack_gate_up_weight()
+    # Each pack frees a gate/up pair whose blocks cannot hold the next packed
+    # buffer; return them now rather than keep them reserved while serving.
+    torch.get_device_module(device).empty_cache()
