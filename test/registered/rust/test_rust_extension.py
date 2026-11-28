@@ -31,6 +31,52 @@ def _hold_filesystem_lock(path: str, ready, release) -> None:
         release.wait(timeout=10)
 
 
+def _probe_toolchain(crate, lock_path: str, environment: dict, start) -> None:
+    os.environ.update(environment)
+    os.environ.pop("RUSTUP_AUTO_INSTALL", None)
+    start.wait(timeout=10)
+    rust_extension._build_context(crate, toolchain_lock=Path(lock_path))
+
+
+def _probe_and_build(crate, target_dir: str, lock_path: str, environment: dict, start):
+    os.environ.update(environment)
+    os.environ.pop("RUSTUP_AUTO_INSTALL", None)
+    start.wait(timeout=10)
+    rust_extension._build_context(crate, toolchain_lock=Path(lock_path))
+    rust_extension._cargo_build(crate, Path(target_dir), toolchain_lock=Path(lock_path))
+
+
+# Returns a PATH whose first entry holds `cargo` and `rustc` stand-ins running `script`.
+def _fake_toolchain(root: Path, script: str) -> str:
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    for name in ("cargo", "rustc"):
+        executable = bin_dir / name
+        executable.write_text("#!/bin/sh\n" + script, encoding="utf-8")
+        executable.chmod(0o755)
+    return f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+
+
+# Like a rustup proxy, installs unless RUSTUP_AUTO_INSTALL=0, logging to `installs`;
+# with `installed` but not `complete`, the toolchain runs but lacks components.
+def _rustup_proxy(toolchain: Path) -> str:
+    return (
+        f'if [ ! -e "{toolchain}/complete" ]; then\n'
+        '  if [ "$RUSTUP_AUTO_INSTALL" != 0 ]; then\n'
+        f'    echo >> "{toolchain}/installs"; sleep 0.3\n'
+        f'    touch "{toolchain}/installed" "{toolchain}/complete"\n'
+        f'  elif [ ! -e "{toolchain}/installed" ]; then\n'
+        '    echo "error: toolchain is not installed" >&2; exit 1\n'
+        "  fi\n"
+        "fi\n"
+        'if [ "$1" = build ]; then\n'
+        '  mkdir -p "$CARGO_TARGET_DIR/release"\n'
+        '  touch "$CARGO_TARGET_DIR/release/libdemo_extension.so"\n'
+        "fi\n"
+        "echo stand-in 1.0\n"
+    )
+
+
 class _FailingExtensionLoader(importlib.abc.Loader):
     def create_module(self, spec):
         return None
@@ -441,6 +487,9 @@ crate-type = ["cdylib"]
                     "features": ("python", "inspection"),
                     "build_fingerprint": {"native": "abi"},
                     "extension_module": "demo._inspection",
+                    "toolchain_lock": (root / "cache").resolve()
+                    / "locks"
+                    / "toolchain.lock",
                 },
             )
             self.assertEqual(
@@ -448,6 +497,9 @@ crate-type = ["cdylib"]
                 {
                     "features": ("python", "inspection"),
                     "build_environment": environment,
+                    "toolchain_lock": (root / "cache").resolve()
+                    / "locks"
+                    / "toolchain.lock",
                 },
             )
             self.assertEqual(load_from_path.call_args.args[0], "demo._inspection")
@@ -582,6 +634,174 @@ crate-type = ["cdylib"]
                 thread.join(timeout=5)
             self.assertEqual(process.exitcode, 0)
             self.assertTrue(acquired.is_set())
+
+    def test_concurrent_processes_install_the_toolchain_once(self):
+        # Installs into one RUSTUP_HOME race, so only one process may install.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            crate = rust_extension._discover_crate(self._workspace(root), "demo._core")
+            toolchain = root / "toolchain"
+            toolchain.mkdir()
+            path = _fake_toolchain(root, _rustup_proxy(toolchain))
+            context = multiprocessing.get_context("fork")
+            start = context.Event()
+            processes = [
+                context.Process(
+                    target=_probe_toolchain,
+                    args=(
+                        crate,
+                        os.fspath(root / "locks" / "toolchain.lock"),
+                        {"PATH": path},
+                        start,
+                    ),
+                )
+                for _ in range(4)
+            ]
+            for process in processes:
+                process.start()
+            start.set()
+            for process in processes:
+                process.join(timeout=30)
+            self.assertEqual([process.exitcode for process in processes], [0] * 4)
+            self.assertEqual(
+                (toolchain / "installs").read_text(encoding="utf-8").count("\n"), 1
+            )
+
+    def test_concurrent_builds_complete_the_toolchain_once(self):
+        # The unlocked probe accepts a toolchain missing components;
+        # every cargo build would then add them at once.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            crate = rust_extension._discover_crate(self._workspace(root), "demo._core")
+            toolchain = root / "toolchain"
+            toolchain.mkdir()
+            (toolchain / "installed").touch()
+            path = _fake_toolchain(root, _rustup_proxy(toolchain))
+            context = multiprocessing.get_context("fork")
+            start = context.Event()
+            processes = [
+                context.Process(
+                    target=_probe_and_build,
+                    args=(
+                        crate,
+                        os.fspath(root / f"target{index}"),
+                        os.fspath(root / "locks" / "toolchain.lock"),
+                        {"PATH": path},
+                        start,
+                    ),
+                )
+                for index in range(4)
+            ]
+            for process in processes:
+                process.start()
+            start.set()
+            for process in processes:
+                process.join(timeout=30)
+            self.assertEqual([process.exitcode for process in processes], [0] * 4)
+            self.assertEqual(
+                (toolchain / "installs").read_text(encoding="utf-8").count("\n"), 1
+            )
+
+    def test_toolchain_probe_that_never_returns_fails_within_the_timeout(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = _fake_toolchain(root, "exec sleep 30\n")
+            started = time.monotonic()
+            with (
+                mock.patch.dict(os.environ, {"PATH": path}),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    r"timed out after 0\.5 s waiting for `cargo --version --verbose`",
+                ),
+            ):
+                rust_extension.probe_rust_toolchain(root, timeout=0.5)
+            self.assertLess(time.monotonic() - started, 10)
+
+    def test_toolchain_probe_waits_for_the_lock_only_to_install(self):
+        # Another process holds the lock for up to 10 s;
+        # only a probe that must install waits for it, until its own deadline.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            crate = rust_extension._discover_crate(self._workspace(root), "demo._core")
+            toolchain = root / "toolchain"
+            toolchain.mkdir()
+            path = _fake_toolchain(root, _rustup_proxy(toolchain))
+            no_cargo = root / "no_cargo"
+            no_cargo.mkdir()
+            lock_path = root / "locks" / "toolchain.lock"
+            context = multiprocessing.get_context("fork")
+            ready = context.Event()
+            release = context.Event()
+            holder = context.Process(
+                target=_hold_filesystem_lock,
+                args=(os.fspath(lock_path), ready, release),
+            )
+            holder.start()
+            try:
+                self.assertTrue(ready.wait(timeout=5))
+                with (
+                    self.subTest("missing toolchain"),
+                    mock.patch.dict(os.environ, {"PATH": path}),
+                    self.assertRaisesRegex(
+                        RuntimeError, r"timed out after 1\.5 s waiting for the lock"
+                    ),
+                ):
+                    rust_extension.probe_rust_toolchain(
+                        root, lock_path=lock_path, timeout=1.5
+                    )
+                self.assertFalse((toolchain / "installs").exists())
+                (toolchain / "installed").touch()
+                with (
+                    self.subTest("installed toolchain"),
+                    mock.patch.dict(os.environ, {"PATH": path}),
+                ):
+                    self.assertEqual(
+                        rust_extension.probe_rust_toolchain(
+                            root, lock_path=lock_path, timeout=2
+                        ),
+                        {"cargo": "stand-in 1.0", "rustc": "stand-in 1.0"},
+                    )
+                with (
+                    self.subTest("fingerprint of an installed toolchain"),
+                    mock.patch.dict(os.environ, {"PATH": path}),
+                ):
+                    started = time.monotonic()
+                    rust_extension._build_context(crate, toolchain_lock=lock_path)
+                    self.assertLess(time.monotonic() - started, 2.0)
+                with (
+                    self.subTest("no cargo"),
+                    mock.patch.dict(os.environ, {"PATH": os.fspath(no_cargo)}),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        r"failed to query the Rust toolchain with `cargo --version",
+                    ),
+                ):
+                    rust_extension.probe_rust_toolchain(
+                        root, lock_path=lock_path, timeout=2
+                    )
+                slow = root / "slow"
+                slow.mkdir()
+                slow_path = _fake_toolchain(
+                    slow,
+                    'if [ "$RUSTUP_AUTO_INSTALL" = 0 ]; then sleep 2; exit 1; fi\n'
+                    "echo stand-in 1.0\n",
+                )
+                with self.subTest("one deadline for both probes"):
+                    started = time.monotonic()
+                    with (
+                        mock.patch.dict(os.environ, {"PATH": slow_path}),
+                        self.assertRaisesRegex(
+                            RuntimeError, r"timed out after 3 s waiting for the lock"
+                        ),
+                    ):
+                        rust_extension.probe_rust_toolchain(
+                            root, lock_path=lock_path, timeout=3
+                        )
+                    # A fresh deadline for the lock wait would end it near 5 s.
+                    self.assertLess(time.monotonic() - started, 4.0)
+            finally:
+                release.set()
+                holder.join(timeout=5)
 
     def test_failed_import_does_not_poison_sys_modules(self):
         module_name = "demo._broken_core"

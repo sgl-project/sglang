@@ -15,7 +15,8 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
-from contextlib import contextmanager
+import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -41,6 +42,9 @@ _BUILD_ENVIRONMENT_VARIABLES = (
     "CARGO_ENCODED_RUSTFLAGS",
     "RUSTFLAGS",
 )
+# A probe may download the pinned toolchain; one that outlives this, lock wait included,
+# fails like a missing toolchain instead of blocking startup.
+_TOOLCHAIN_PROBE_TIMEOUT_SECONDS = 300
 
 _RUST_WORKSPACE = Path(__file__).resolve().parents[4] / "rust"
 
@@ -122,13 +126,15 @@ def load_rust_extension(
 
     crate = _discover_crate(workspace, python_module)
     features = tuple(dict.fromkeys((*crate.features, *additional_features)))
+    cache_root = _cache_root(cache_dir)
+    toolchain_lock = toolchain_lock_path(cache_dir)
     context = _build_context(
         crate,
         features=features,
         build_fingerprint=build_fingerprint,
         extension_module=load_module,
+        toolchain_lock=toolchain_lock,
     )
-    cache_root = _cache_root(cache_dir)
     extension_path = _cached_extension_path(
         cache_root, crate, context.fingerprint, load_module
     )
@@ -153,6 +159,7 @@ def load_rust_extension(
             target_dir,
             features=features,
             build_environment=build_environment,
+            toolchain_lock=toolchain_lock,
         )
         if (
             _source_digest(crate.workspace, crate.source_inputs)
@@ -249,18 +256,14 @@ def _build_context(
     features: tuple[str, ...] | None = None,
     build_fingerprint: Mapping[str, object] | None = None,
     extension_module: str | None = None,
+    toolchain_lock: Path | None = None,
 ) -> _BuildContext:
     if features is None:
         features = crate.features
     if extension_module is None:
         extension_module = crate.python_module
     source_digest = _source_digest(crate.workspace, crate.source_inputs)
-    toolchain = {
-        "cargo": _command_version(
-            "cargo", "--version", "--verbose", cwd=crate.workspace
-        ),
-        "rustc": _command_version("rustc", "-vV", cwd=crate.workspace),
-    }
+    toolchain = probe_rust_toolchain(crate.workspace, lock_path=toolchain_lock)
     python_abi = {
         "cache_tag": sys.implementation.cache_tag,
         "ext_suffix": sysconfig.get_config_var("EXT_SUFFIX"),
@@ -329,7 +332,82 @@ def _source_files(workspace: Path) -> Iterator[Path]:
             yield root_path / filename
 
 
-def _command_version(command: str, *arguments: str, cwd: Path) -> str:
+def probe_rust_toolchain(
+    workspace: Path,
+    *,
+    lock_path: Path | None = None,
+    timeout: float = _TOOLCHAIN_PROBE_TIMEOUT_SECONDS,
+    locked_only: bool = False,
+) -> dict[str, str]:
+    """Query the cargo and rustc versions that fingerprint a build in ``workspace``.
+
+    rustup's cargo and rustc proxies install the toolchain pinned by
+    rust-toolchain.toml on first use, and concurrent installs into one
+    RUSTUP_HOME race. With a ``lock_path`` (see ``toolchain_lock_path``), the
+    probe first runs unlocked with installs disabled. Only if a proxy then
+    fails, or with ``locked_only``, does it probe under the lock with installs
+    allowed, so processes sharing the lock install one at a time. ``timeout``
+    covers both probes and the wait for the lock. Past it, or if the lock cannot
+    be taken, the probe raises ``RuntimeError``, as for a missing toolchain.
+    """
+    deadline = time.monotonic() + timeout
+    try:
+        if lock_path is not None and not locked_only:
+            try:
+                # rustup older than 1.28.1 ignores this and may install here, unlocked.
+                return _query_toolchain(
+                    workspace,
+                    deadline=deadline,
+                    env={**os.environ, "RUSTUP_AUTO_INSTALL": "0"},
+                )
+            except RuntimeError as exc:
+                # A command that could not run is not a toolchain rustup can install.
+                if not isinstance(exc.__cause__, subprocess.CalledProcessError):
+                    raise
+        with _filesystem_lock(lock_path, deadline) if lock_path else nullcontext():
+            return _query_toolchain(workspace, deadline=deadline)
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"the Rust toolchain probe timed out after {timeout:g} s "
+            f"waiting for the lock {lock_path}"
+        ) from exc
+    except OSError as exc:
+        # _command_version wraps its own OSErrors, so this one came from the lock.
+        raise RuntimeError(
+            f"the Rust toolchain probe could not take the lock {lock_path}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"the Rust toolchain probe timed out after {timeout:g} s "
+            f"waiting for `{' '.join(exc.cmd)}`"
+        ) from exc
+
+
+def _query_toolchain(
+    workspace: Path, *, deadline: float, env: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    return {
+        command: _command_version(
+            command,
+            *arguments,
+            cwd=workspace,
+            timeout=max(deadline - time.monotonic(), 0.0),
+            env=env,
+        )
+        for command, *arguments in (
+            ("cargo", "--version", "--verbose"),
+            ("rustc", "-vV"),
+        )
+    }
+
+
+def _command_version(
+    command: str,
+    *arguments: str,
+    cwd: Path,
+    timeout: float,
+    env: Mapping[str, str] | None = None,
+) -> str:
     try:
         result = subprocess.run(
             [command, *arguments],
@@ -337,6 +415,8 @@ def _command_version(command: str, *arguments: str, cwd: Path) -> str:
             capture_output=True,
             text=True,
             cwd=cwd,
+            timeout=timeout,
+            env=env,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(
@@ -359,6 +439,14 @@ def _cache_root(cache_dir: Path | None) -> Path:
     return Path(sglang_cache).expanduser().resolve() / "rust_extensions"
 
 
+def toolchain_lock_path(cache_dir: Path | None = None) -> Path:
+    """The ``probe_rust_toolchain`` lock of processes sharing an extension cache.
+
+    ``cache_dir`` defaults as in ``load_rust_extension``.
+    """
+    return _cache_root(cache_dir) / "locks" / "toolchain.lock"
+
+
 def _cached_extension_path(
     cache_root: Path,
     crate: _CrateSpec,
@@ -379,10 +467,21 @@ def _cached_extension_path(
 
 
 @contextmanager
-def _filesystem_lock(path: Path) -> Iterator[None]:
+def _filesystem_lock(path: Path, deadline: float | None = None) -> Iterator[None]:
+    # deadline is a time.monotonic() value; past it, a held lock raises TimeoutError.
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        if deadline is None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        else:
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"timed out waiting for {path}") from None
+                    time.sleep(0.1)
         try:
             yield
         finally:
@@ -395,9 +494,16 @@ def _cargo_build(
     *,
     features: tuple[str, ...] | None = None,
     build_environment: Mapping[str, str] | None = None,
+    toolchain_lock: Path | None = None,
 ) -> Path:
     if features is None:
         features = crate.features
+    if toolchain_lock is not None:
+        # The unlocked fingerprint probe accepts a toolchain missing listed components;
+        # add them under the lock, or every building process installs them at once.
+        probe_rust_toolchain(
+            crate.workspace, lock_path=toolchain_lock, locked_only=True
+        )
     target_dir.mkdir(parents=True, exist_ok=True)
     command = [
         "cargo",
