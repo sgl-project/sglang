@@ -33,7 +33,6 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
     _pp_held_key,
-    _PPStagingOutstanding,
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
@@ -1308,8 +1307,7 @@ class TestClearDoesNotRaceStagingSync(CustomTestCase):
         mgr = _make_prefill_manager()
         mgr._status_lock = threading.Lock()
         mgr.request_status = _bare_pp_store()
-        mgr._staging_outstanding = _PPStagingOutstanding(mgr)
-        mgr._staging_outstanding._lock = _ContentionSignalingLock()
+        mgr._staging_lock = _ContentionSignalingLock()
         paused, resume = threading.Event(), threading.Event()
         holds_success = mgr.staging_holds_success
 
@@ -1322,15 +1320,15 @@ class TestClearDoesNotRaceStagingSync(CustomTestCase):
 
         mgr.staging_holds_success = pausing_holds_success
         mgr.request_status[room] = KVPoll.Transferring
-        mgr._staging_outstanding[room] += 1
+        mgr._add_staging_outstanding(room, 1)
         sender = _TestSender.__new__(_TestSender)
         sender.kv_mgr = mgr
         sender.bootstrap_room = room
         sender.conclude_state = KVPoll.Success
         worker = threading.Thread(
             name="worker",
-            target=mgr._staging_outstanding.__setitem__,
-            args=(room, 0),
+            target=mgr._add_staging_outstanding,
+            args=(room, -1),
         )
         scheduler = threading.Thread(name="scheduler", target=sender.clear)
 
@@ -1340,7 +1338,7 @@ class TestClearDoesNotRaceStagingSync(CustomTestCase):
         deadline = time.monotonic() + 10
         while (
             scheduler.is_alive()
-            and not mgr._staging_outstanding._lock.contended.is_set()
+            and not mgr._staging_lock.contended.is_set()
             and time.monotonic() < deadline
         ):
             scheduler.join(timeout=0.01)

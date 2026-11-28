@@ -3382,7 +3382,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # the predicate the abort ack relies on. The flag survives
                 # re-enqueue on defer.
                 if not kv_chunk.staging_counted:
-                    self._staging_outstanding[kv_chunk.room] += 1
+                    self._add_staging_outstanding(kv_chunk.room, 1)
                     kv_chunk.staging_counted = True
 
                 # Under overlap scheduling an early cached-prefix send can
@@ -3416,7 +3416,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                             thread_finish_flag=True,
                         )
-                    self._staging_outstanding.pop(kv_chunk.room, None)
+                    self._pop_staging_outstanding(kv_chunk.room)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -3767,8 +3767,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
                 # A room started anew since this chunk was counted no longer
                 # counts it: the decrement and the report find nothing.
-                if kv_chunk.room in self._staging_outstanding:
-                    self._staging_outstanding[kv_chunk.room] -= 1
+                self._add_staging_outstanding(kv_chunk.room, -1, if_counted=True)
                 self.note_send_finished(kv_chunk.room, kv_chunk.send_record)
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
@@ -3799,7 +3798,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # Publish worker cleanup last: deferred allocation must not
                     # acknowledge Success while this worker can still erase
                     # bookkeeping for a subsequent transfer using the same room.
-                    self._staging_outstanding.pop(kv_chunk.room, None)
+                    self._pop_staging_outstanding(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free

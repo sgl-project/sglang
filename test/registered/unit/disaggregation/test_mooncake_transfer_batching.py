@@ -2,6 +2,7 @@ import concurrent.futures
 import ctypes
 import unittest
 from collections import defaultdict
+from functools import partial
 from queue import SimpleQueue
 from threading import Event, Lock
 from types import SimpleNamespace
@@ -861,6 +862,8 @@ class TestMooncakeEarlySend(CustomTestCase):
             note_send_finished=MagicMock(),
         )
         manager.check_status = lambda room: manager.request_status[room]
+        for name in ("_add_staging_outstanding", "_pop_staging_outstanding"):
+            setattr(manager, name, partial(getattr(MooncakeKVManager, name), manager))
         return manager, queue
 
     def test_worker_waits_before_reading_kv(self):

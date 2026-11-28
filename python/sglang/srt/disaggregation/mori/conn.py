@@ -547,7 +547,7 @@ class MoriKVManager(CommonKVManager):
         if not self.enable_deferred_decode_kv_release:
             return
         with self._abort_ack_lock:
-            self._staging_outstanding[kv_chunk.room] += 1
+            self._add_staging_outstanding(kv_chunk.room, 1)
 
     def _mark_transfer_quiescent(self, kv_chunk: TransferKVChunk) -> None:
         if not self.enable_deferred_decode_kv_release:
@@ -556,9 +556,8 @@ class MoriKVManager(CommonKVManager):
         room = kv_chunk.room
         targets = None
         with self._abort_ack_lock:
-            self._staging_outstanding[room] -= 1
-            if self._staging_outstanding[room] <= 0:
-                self._staging_outstanding.pop(room)
+            if self._add_staging_outstanding(room, -1) <= 0:
+                self._pop_staging_outstanding(room)
                 if room not in self._deferred_ack_poisoned_rooms:
                     targets = self._deferred_ack_targets.pop(room, None)
         self._send_abort_acks(room, targets)
