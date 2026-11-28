@@ -281,6 +281,8 @@ class SynthIDSample:
             and not sampling_info.facts.truncates
             and not sampling_info.facts.seeded
             and sampling_info.sampling_mask_batch_indices is None
+            # The fused sample skips the stages after the watermark.
+            and not sampling_info.has_custom_logit_processor
         )
 
 
