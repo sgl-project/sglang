@@ -1412,19 +1412,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
     }
     fall_back_to_pt_during_load = False
 
-    @classmethod
-    def register_modelslim_projection_aliases(
-        cls, quant_config: Optional[QuantizationConfig]
-    ) -> None:
-        if quant_config is None or quant_config.get_name() != "modelslim":
-            return
-        quant_config.update_packed_modules_mapping(
-            {
-                "f_a_proj": ["forget_gate.f_a_proj"],
-                "f_b_proj": ["forget_gate.f_b_proj"],
-            }
-        )
-
     def __init__(
         self,
         config: Glm5NextConfig,
@@ -1446,7 +1433,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.config = text_config
         self.quant_config = quant_config
-        self.register_modelslim_projection_aliases(quant_config)
         self.use_dsa = is_deepseek_dsa(text_config)
         self.num_fused_shared_experts = 0
         self.model = None
