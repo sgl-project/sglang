@@ -304,23 +304,20 @@ def sample_generated_shared_prefix_requests(
             else None
         )
         turn_questions = questions[src_g][src_p]
+        first_question = turn_questions[0]
         if input_ids:
-            question_ids = turn_questions[0]
-            # Reuse the group's token IDs for prefix-only requests.
-            turn_prompts = [
-                system_prompt + question_ids if question_ids else system_prompt
-            ]
+            # The client only reads prompt IDs. Sharing the list also lets pickle
+            # store the prefix once per group.
+            full_prompt = (
+                system_prompt + first_question if first_question else system_prompt
+            )
+            prompt_len = len(full_prompt)
         else:
-            turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[
-                1:
-            ]
-        full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
-        if input_ids:
-            prompt_len = len(turn_prompts[0])
-        elif fast_prepare:
-            prompt_len = 1
-        else:
-            prompt_len = len(tokenizer.encode(turn_prompts[0]))
+            first_turn = f"{system_prompt}\n\n{first_question}"
+            full_prompt = (
+                first_turn if num_turns == 1 else [first_turn, *turn_questions[1:]]
+            )
+            prompt_len = 1 if fast_prepare else len(tokenizer.encode(first_turn))
         output_len_val = int(output_lens[src_g, src_p])
 
         input_requests.append(
