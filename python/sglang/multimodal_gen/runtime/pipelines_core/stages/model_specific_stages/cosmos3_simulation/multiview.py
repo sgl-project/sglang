@@ -116,9 +116,9 @@ COSMOS3_MULTIVIEW_MEDIA_THREADS = 8
 # 16, with bit-identical output. Whole-clip resizes of every camera at once,
 # on every rank, took a four-GPU replica past its 660 GB limit.
 COSMOS3_MULTIVIEW_RESIZE_CHUNK_FRAMES = 16
-# Byte bound on one chunk's float32 source frames. Measured on seven 121-frame
-# 1280x720 clips: the rig loads in 2.3 s at two frames a chunk, 3.0 s at 16.
-COSMOS3_MULTIVIEW_RESIZE_CHUNK_BYTES = 32 << 20
+# Per-rank host scratch budget shared across concurrent multiview resize loaders
+# (staging uint8 source, float32 source, and float32 resized frames).
+COSMOS3_MULTIVIEW_RESIZE_SCRATCH_BYTES = 256 << 20
 
 # ``batch.extra`` keys shared by the multiview stages.
 EXTRA_CONTROL_PIXELS = "multiview_control_pixels"
@@ -237,6 +237,7 @@ def load_media_uint8_cthw(
     width: int,
     max_frames: int,
     out: torch.Tensor | None = None,
+    concurrent_loaders: int = 1,
 ) -> torch.Tensor:
     """Load an image or the first ``max_frames`` of a clip as ``uint8 [3, T, H, W]``.
 
@@ -251,7 +252,12 @@ def load_media_uint8_cthw(
     else:
         frames = iter_video_frames(path, max_frames=max_frames)
     fitted = _fit_frames_uint8_cthw(
-        frames, max_frames=max_frames, height=height, width=width, out=out
+        frames,
+        max_frames=max_frames,
+        height=height,
+        width=width,
+        out=out,
+        concurrent_loaders=concurrent_loaders,
     )
     if fitted.shape[1] == 0:
         raise ValueError("No frames decoded from Cosmos3 multiview media.")
@@ -264,11 +270,24 @@ def _fit_geometry(orig_h: int, orig_w: int, height: int, width: int) -> tuple[in
     return int(math.ceil(scale * orig_h)), int(math.ceil(scale * orig_w))
 
 
-def _resize_chunk_frames(orig_h: int, orig_w: int, chunk_frames: int) -> int:
+def _resize_chunk_frames(
+    orig_h: int,
+    orig_w: int,
+    resize_h: int,
+    resize_w: int,
+    chunk_frames: int,
+    concurrent_loaders: int = 1,
+) -> int:
     if chunk_frames < 1:
         raise ValueError(f"chunk_frames must be positive, got {chunk_frames}")
-    float_frame_bytes = orig_h * orig_w * 3 * 4
-    by_bytes = COSMOS3_MULTIVIEW_RESIZE_CHUNK_BYTES // max(float_frame_bytes, 1)
+    if concurrent_loaders < 1:
+        raise ValueError(
+            f"concurrent_loaders must be positive, got {concurrent_loaders}"
+        )
+    # staging uint8 [H, W, 3] + source float32 [3, H, W] + resized float32 [3, Rh, Rw]
+    per_frame_bytes = orig_h * orig_w * 3 * (1 + 4) + resize_h * resize_w * 3 * 4
+    per_loader_budget = COSMOS3_MULTIVIEW_RESIZE_SCRATCH_BYTES // concurrent_loaders
+    by_bytes = per_loader_budget // max(per_frame_bytes, 1)
     return max(1, min(chunk_frames, by_bytes))
 
 
@@ -280,17 +299,8 @@ def _fit_frames_uint8_cthw(
     width: int,
     chunk_frames: int = COSMOS3_MULTIVIEW_RESIZE_CHUNK_FRAMES,
     out: torch.Tensor | None = None,
+    concurrent_loaders: int = 1,
 ) -> torch.Tensor:
-    """Fit up to ``max_frames`` decoded frames onto the canvas: ``uint8 [3, T, height, width]``.
-
-    Same arithmetic as imaginaire4's ``_resize_and_center_crop`` (torchvision
-    resize with antialias, crop offset rounded half to even). The single-view
-    helper in cosmos3.py keeps vLLM-Omni's floor offset without antialias,
-    which lands one row off on 1720x1080 fisheye sources.
-
-    Resize, crop, round and clamp act on each frame alone, so consuming the
-    frames a chunk at a time changes no value.
-    """
     if out is None:
         dest = torch.empty((3, max_frames, height, width), dtype=torch.uint8)
     else:
@@ -316,7 +326,12 @@ def _fit_frames_uint8_cthw(
             count = _copy_frames(arrays, dest)
         else:
             count = _resize_frames(
-                arrays, dest, orig_h=orig_h, orig_w=orig_w, chunk_frames=chunk_frames
+                arrays,
+                dest,
+                orig_h=orig_h,
+                orig_w=orig_w,
+                chunk_frames=chunk_frames,
+                concurrent_loaders=concurrent_loaders,
             )
     if out is None and count < max_frames:
         return dest[:, :count].contiguous()
@@ -348,10 +363,18 @@ def _resize_frames(
     orig_h: int,
     orig_w: int,
     chunk_frames: int,
+    concurrent_loaders: int = 1,
 ) -> int:
     height, width = int(dest.shape[2]), int(dest.shape[3])
     resize_h, resize_w = _fit_geometry(orig_h, orig_w, height, width)
-    chunk_frames = _resize_chunk_frames(orig_h, orig_w, chunk_frames)
+    chunk_frames = _resize_chunk_frames(
+        orig_h,
+        orig_w,
+        resize_h,
+        resize_w,
+        chunk_frames,
+        concurrent_loaders=concurrent_loaders,
+    )
     staging = np.empty((chunk_frames, orig_h, orig_w, 3), dtype=np.uint8)
     source = torch.empty((chunk_frames, 3, orig_h, orig_w), dtype=torch.float32)
     arrays = iter(arrays)
@@ -846,6 +869,7 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                     )
                 dest.fill_(COSMOS3_MULTIVIEW_GRAY_LEVEL)
                 return
+            concurrent_loaders = min(max(len(views), 1), COSMOS3_MULTIVIEW_MEDIA_THREADS)
             decoded = int(
                 load_media_uint8_cthw(
                     path,
@@ -853,6 +877,7 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                     width=width,
                     max_frames=frames_per_view,
                     out=dest,
+                    concurrent_loaders=concurrent_loaders,
                 ).shape[1]
             )
             if require_complete and decoded < num_frames:

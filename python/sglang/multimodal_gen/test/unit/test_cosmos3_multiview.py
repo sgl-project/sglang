@@ -1257,6 +1257,23 @@ class TestPixelHelpersAndPrompt(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "positive"):
             fit_uint8_cthw(clip, height=480, width=832, chunk_frames=0)
+        resize_h, resize_w = multiview_stage._fit_geometry(720, 1280, 480, 832)
+        per_frame = 720 * 1280 * 3 * (1 + 4) + resize_h * resize_w * 3 * 4
+        single_chunk = multiview_stage._resize_chunk_frames(
+            720, 1280, resize_h, resize_w, 16, concurrent_loaders=1
+        )
+        seven_chunk = multiview_stage._resize_chunk_frames(
+            720, 1280, resize_h, resize_w, 16, concurrent_loaders=7
+        )
+        self.assertLess(seven_chunk, single_chunk)
+        self.assertLessEqual(
+            7 * seven_chunk * per_frame,
+            multiview_stage.COSMOS3_MULTIVIEW_RESIZE_SCRATCH_BYTES,
+        )
+        with self.assertRaisesRegex(ValueError, "positive"):
+            multiview_stage._resize_chunk_frames(
+                720, 1280, resize_h, resize_w, 16, concurrent_loaders=0
+            )
 
     def test_load_media_fits_frames_as_they_decode(self):
         generator = torch.Generator().manual_seed(1)
