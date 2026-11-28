@@ -107,6 +107,7 @@ pub fn into_requests(
         token_ids_logprob,
         return_hidden_states,
         return_text_in_logprobs,
+        skip_detokenize,
         bootstrap_host,
         bootstrap_port,
         bootstrap_room,
@@ -516,6 +517,7 @@ pub fn into_requests(
                 return_sampling_mask: false,
                 return_hidden_states: return_hidden_states.unwrap_or(false),
                 return_text_in_logprobs,
+                skip_detokenize: skip_detokenize.unwrap_or(false),
                 bootstrap_host,
                 bootstrap_port,
                 bootstrap_room,
@@ -720,6 +722,9 @@ pub struct GenerateRequest {
     /// it is consumed on the way out, by `register_detok` → `DetokMsg::Register`
     /// → the shard's `decode_logprob_texts`.
     pub return_text_in_logprobs: Option<bool>,
+    /// Bypass output decoding for this request without disabling the tokenizer
+    /// shared by other requests. Output IDs and numeric metadata are unchanged.
+    pub skip_detokenize: bool,
     /// PD-disaggregation routing, forwarded verbatim to the scheduler (which
     /// fills a `None` port from `--disaggregation-bootstrap-port` and 400-aborts
     /// a room-less request in PD mode).
@@ -1291,6 +1296,25 @@ mod tests {
             serde_json::from_str::<api_v1::GenerateRequest>(body).unwrap(),
             policy,
         )
+    }
+
+    #[test]
+    fn skip_detokenize_defaults_to_false_and_applies_to_every_prompt() {
+        for (flag, expected) in [
+            ("", false),
+            (r#", "skip_detokenize": null"#, false),
+            (r#", "skip_detokenize": false"#, false),
+            (r#", "skip_detokenize": true"#, true),
+        ] {
+            let body = format!(r#"{{"text": ["first", "second"]{flag}}}"#);
+            let (batch, _) = requests(&body).unwrap();
+            assert_eq!(batch.len(), 2);
+            assert!(
+                batch
+                    .iter()
+                    .all(|request| request.skip_detokenize == expected)
+            );
+        }
     }
 
     #[test]

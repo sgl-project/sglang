@@ -2,6 +2,22 @@
 
 `sglang-server` is SGLang's Rust HTTP frontend and request-processing pipeline. It exchanges typed requests and responses with the Python scheduler while keeping latency-sensitive work outside Python.
 
+## Returning token IDs without decoding text
+
+Native HTTP `/generate` and gRPC `Generate` requests can set
+`skip_detokenize: true` to bypass output text decoding for that request:
+
+```json
+{"text": "Hello", "sampling_params": {"max_new_tokens": 16}, "skip_detokenize": true}
+```
+
+The response keeps `output_ids`, token counts, finish reasons and numeric
+logprobs. Its text is empty, and logprob token text remains absent even with
+`return_text_in_logprobs: true`. Input text is still tokenized normally; other
+requests served by the same process continue to decode their output. The flag
+defaults to false and applies to every prompt in a batch, for both streaming
+and non-streaming responses. This does not change scheduler stop handling.
+
 ## Code review principles
 
 1. **Use strongly typed boundaries.** Model every supported protocol shape with structs, enums, and validated newtypes; avoid opaque values such as `serde_json::Value` and `rmpv::Value` in production paths.

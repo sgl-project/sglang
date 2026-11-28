@@ -25,6 +25,8 @@ pub enum DetokMsg {
         /// The request has stop strings or regexes: the byte-table decoder holds
         /// a chunk that ends inside a character (see `ByteDecoder`).
         has_stop_strs: bool,
+        /// Emit token IDs without constructing an output decoder for this request.
+        skip_detokenize: bool,
     },
     /// One decode step's chunks for *this shard*. Batched because `from-scheduler` blocks
     /// per send.

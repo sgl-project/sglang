@@ -399,23 +399,30 @@ impl Intake {
     /// stop in the output) — so the shard needs no back-reference to the request.
     /// Returns `false` if the shard is gone.
     fn register_detok(&self, req: &Request) -> bool {
-        let (decode_logprob_text, no_stop_trim, skip_special_tokens, has_stop_strs) =
-            match &req.kind {
-                RequestKind::Generate(g) => (
-                    g.return_text_in_logprobs.unwrap_or(false),
-                    g.sampling_params.no_stop_trim,
-                    g.sampling_params.skip_special_tokens,
-                    has_stop_strings(&g.sampling_params),
-                ),
-                RequestKind::Control(_)
-                | RequestKind::Detokenize { .. }
-                | RequestKind::Tokenize { .. } => (
-                    false, /* decode_logprob_text */
-                    false, /* no_stop_trim */
-                    true,  /* skip_special_tokens */
-                    false, /* has_stop_strs */
-                ),
-            };
+        let (
+            decode_logprob_text,
+            no_stop_trim,
+            skip_special_tokens,
+            has_stop_strs,
+            skip_detokenize,
+        ) = match &req.kind {
+            RequestKind::Generate(g) => (
+                g.return_text_in_logprobs.unwrap_or(false),
+                g.sampling_params.no_stop_trim,
+                g.sampling_params.skip_special_tokens,
+                has_stop_strings(&g.sampling_params),
+                g.skip_detokenize,
+            ),
+            RequestKind::Control(_)
+            | RequestKind::Detokenize { .. }
+            | RequestKind::Tokenize { .. } => (
+                false, /* decode_logprob_text */
+                false, /* no_stop_trim */
+                true,  /* skip_special_tokens */
+                false, /* has_stop_strs */
+                false, /* skip_detokenize */
+            ),
+        };
         self.senders
             .detok_for(&req.rid)
             .send(DetokMsg::Register {
@@ -425,6 +432,7 @@ impl Intake {
                 no_stop_trim,
                 skip_special_tokens,
                 has_stop_strs,
+                skip_detokenize,
             })
             .is_ok()
     }
