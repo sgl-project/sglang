@@ -39,7 +39,6 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
         image_data: List[Union[str, bytes, Dict]],
         input_text,
         request_obj,
-        max_req_input_len,
         *args,
         **kwargs,
     ):
