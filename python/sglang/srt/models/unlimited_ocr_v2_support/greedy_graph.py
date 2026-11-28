@@ -81,8 +81,6 @@ class UocrGreedyGraph:
         if forward_batch is not self._replayed_batch:
             return None
         sampling_info = forward_batch.sampling_info
-        if sampling_info.watermark is not None:
-            return None
         if (
             not forward_batch.forward_mode.is_decode()
             or not sampling_info.facts.all_greedy
@@ -91,12 +89,7 @@ class UocrGreedyGraph:
             return None
         # The argmax ran inside the graph, before the sampling pipeline's
         # adjustments, so any transform of the logits invalidates it.
-        if (
-            sampling_info.logit_bias is not None
-            or sampling_info.grammars is not None
-            or sampling_info.has_custom_logit_processor
-            or sampling_info.step_penalties is not None
-        ):
+        if sampling_info.facts.edits_logits:
             return None
         rows = int(logits_output.next_token_logits.shape[0])
         if rows > self.ids.shape[0]:

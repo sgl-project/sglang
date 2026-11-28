@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from sglang.srt.sampling.sampling_batch_info import SamplingFacts
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components import dspark_sampling_accept_graph as sag
 from sglang.srt.speculative.dspark_components import (
     dspark_verify,
@@ -38,16 +37,8 @@ def _tp_sync():
     return sync
 
 
-def _sampling_info(**overrides):
-    fields = dict(
-        facts=SamplingFacts(),
-        has_custom_logit_processor=False,
-        step_penalties=None,
-        logit_bias=None,
-        watermark=None,
-    )
-    fields.update(overrides)
-    return SimpleNamespace(**fields)
+def _sampling_info(**facts):
+    return SimpleNamespace(facts=SamplingFacts(**facts))
 
 
 def _worker(enabled=True, mode="static"):
@@ -57,13 +48,8 @@ def _worker(enabled=True, mode="static"):
     return worker
 
 
-def _eligible(worker, info, *, folded=True, grammar=False, sim_bonus=None):
+def _eligible(worker, info, *, folded=True, sim_bonus=None):
     return worker._sampling_graph_eligible(
-        route=VerifyRoute.derive(
-            info,
-            has_grammar=grammar,
-            has_watermark=info is not None and info.watermark is not None,
-        ),
         proposal_folded=folded,
         sampling_info=info,
         simulate_bonus_sampling_info=sim_bonus,
@@ -75,14 +61,14 @@ def test_routes_only_all_sampled_static_steps():
     assert _eligible(worker, _sampling_info())
     # Greedy and mixed batches keep the greedy fold / the eager mixed accept.
     assert not _eligible(worker, None)
-    assert not _eligible(worker, _sampling_info(facts=SamplingFacts(any_greedy=True)))
-    assert not _eligible(worker, _sampling_info(facts=SamplingFacts(need_top_k=True)))
-    assert not _eligible(worker, _sampling_info(facts=SamplingFacts(need_top_p=True)))
-    assert not _eligible(worker, _sampling_info(facts=SamplingFacts(need_min_p=True)))
-    assert not _eligible(worker, _sampling_info(watermark=object()))
-    assert not _eligible(worker, _sampling_info(logit_bias=torch.zeros(1)))
+    assert not _eligible(worker, _sampling_info(any_greedy=True))
+    assert not _eligible(worker, _sampling_info(need_top_k=True))
+    assert not _eligible(worker, _sampling_info(need_top_p=True))
+    assert not _eligible(worker, _sampling_info(need_min_p=True))
+    assert not _eligible(worker, _sampling_info(watermark=True))
+    assert not _eligible(worker, _sampling_info(logit_bias=True))
     assert not _eligible(worker, _sampling_info(), folded=False)
-    assert not _eligible(worker, _sampling_info(), grammar=True)
+    assert not _eligible(worker, _sampling_info(grammar=True))
     assert not _eligible(worker, _sampling_info(), sim_bonus=_sampling_info())
     info = _sampling_info()
     assert _eligible(worker, info, sim_bonus=info)
@@ -143,7 +129,6 @@ def _eager_reference(io, sampler, bs, rejection_noise=None):
         target_logits=io.logits[: bs * STRIDE],
         draft_block=block,
         sampling_info=info,
-        route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
         draft_input=None,
         gamma=GAMMA,
         verify_num_draft_tokens=STRIDE,

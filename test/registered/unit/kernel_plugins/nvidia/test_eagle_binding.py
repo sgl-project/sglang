@@ -38,7 +38,6 @@ from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_megakernel, eagle_worker_v2
 from sglang.srt.speculative.eagle_megakernel import EagleMegakernel
@@ -938,7 +937,7 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
             torch.tensor([0]),
             torch.tensor([0]),
         )
-        # The route is derived from the view: logit_bias adjusts, top-p truncates.
+        # The facts come from the view: logit_bias edits the logits, top-p truncates.
         sampling = VerifySamplingView(
             sequence_lengths=torch.tensor([3]),
             temperatures=torch.ones(1, 1),
@@ -994,10 +993,8 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
         )
         self.assertTrue(torch.equal(output.token_ids, expected[0]))
         verify = sample.call_args.args[1]
-        self.assertEqual(
-            verify.route,
-            VerifyRoute(adjusts_logits=True, need_truncated_sampling=True),
-        )
+        self.assertTrue(verify.facts.edits_logits)
+        self.assertTrue(verify.facts.truncates)
         self.assertIsNone(verify.watermark)
         self.assertIsNone(verify.grammar_mask)
         batch = verify.batch

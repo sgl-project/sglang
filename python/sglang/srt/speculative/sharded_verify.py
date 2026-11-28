@@ -10,7 +10,7 @@ reuse :func:`reduce_sharded_token_keys` without owning the collective.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
@@ -18,6 +18,9 @@ import triton.language as tl
 
 from sglang.kernels.plugin_kernels.nvidia.spec import VocabShardView
 from sglang.srt.environ import envs
+
+if TYPE_CHECKING:
+    from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +38,8 @@ def spec_allows_vocab_shards(spec) -> bool:
 
 
 def sampling_allows_vocab_shards(
-    info,
+    facts: SamplingFacts,
     *,
-    adjusts_logits: bool,
-    need_truncated_sampling: bool,
     return_logprob: bool,
     has_local_keys: bool,
 ) -> bool:
@@ -55,8 +56,8 @@ def sampling_allows_vocab_shards(
         # invoking any optional local-key policy.
         not (has_local_keys and envs.SGLANG_SANITIZE_NAN_LOGITS.get())
         and not return_logprob
-        and not adjusts_logits
-        and (info.facts.all_greedy or (has_local_keys and not need_truncated_sampling))
+        and not facts.edits_logits
+        and (facts.all_greedy or (has_local_keys and not facts.truncates))
     )
 
 

@@ -19,10 +19,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class TestUnoTreeSparseSampling(CustomTestCase):
     def test_sparse_dispatch_guard(self):
-        sampling_info = SimpleNamespace(
-            sampling_seed=None,
-            facts=SamplingFacts(),
-        )
+        sampling_info = SimpleNamespace(facts=SamplingFacts())
         spec_config = SimpleNamespace(
             speculative_use_rejection_sampling=False,
         )
@@ -43,11 +40,10 @@ class TestUnoTreeSparseSampling(CustomTestCase):
                 _can_use_sparse_uno_tree_target_sampling(129, sampling_info)
             )
 
-            sampling_info.sampling_seed = torch.tensor([1])
+            sampling_info.facts = SamplingFacts(seeded=True)
             self.assertFalse(
                 _can_use_sparse_uno_tree_target_sampling(128, sampling_info)
             )
-            sampling_info.sampling_seed = None
             sampling_info.facts = SamplingFacts(need_min_p=True)
             self.assertFalse(
                 _can_use_sparse_uno_tree_target_sampling(128, sampling_info)

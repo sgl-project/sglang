@@ -4,7 +4,11 @@ import unittest
 import torch
 
 from sglang.srt.sampling.custom_logit_processor import apply_custom_logit_processor
-from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import (
+    ProcessorEntry,
+    SamplingBatchInfo,
+    SamplingFacts,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -25,7 +29,7 @@ class TestApplyCustomLogitProcessorCUDA(CustomTestCase):
             top_ks=torch.zeros(3, dtype=torch.int32, device="cuda"),
             min_ps=torch.zeros(3, device="cuda"),
             vocab_size=4,
-            has_custom_logit_processor=True,
+            facts=SamplingFacts(custom_logit_processor=True),
             custom_params=[{"token_id": 1}, None, {"token_id": 2}],
             custom_logit_processor={
                 0: ProcessorEntry(

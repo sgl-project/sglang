@@ -286,7 +286,7 @@ class SynthIDSample:
             and self.rows.all_on
             and not keep_logits
             and not sampling_info.facts.truncates
-            and sampling_info.sampling_seed is None
+            and not sampling_info.facts.seeded
             and sampling_info.sampling_mask_batch_indices is None
         )
 

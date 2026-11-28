@@ -84,7 +84,7 @@ class SchedulerMlxOverlapMixin:
         sampling_info = batch.sampling_info
         if sampling_info is None:
             return True
-        return not (batch.has_grammar or sampling_info.has_custom_logit_processor)
+        return not (batch.has_grammar or sampling_info.facts.custom_logit_processor)
 
     def _prepare_mlx_launch(self: Scheduler, batch: ScheduleBatch):
         """Stamp scheduler bookkeeping before an MLX forward is launched."""

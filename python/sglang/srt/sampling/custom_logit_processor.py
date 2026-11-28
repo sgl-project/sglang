@@ -519,7 +519,7 @@ def apply_custom_logit_processor(
 ):
     """Apply each request's custom logit processor to its `rows_per_request`
     consecutive logits rows, in place."""
-    if not sampling_info.has_custom_logit_processor:
+    if not sampling_info.facts.custom_logit_processor:
         return
 
     batch_size = len(sampling_info.custom_params)

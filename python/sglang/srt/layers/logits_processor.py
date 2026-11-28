@@ -637,15 +637,12 @@ class LogitsProcessor(nn.Module):
             spec_allows_vocab_shards,
         )
 
-        route = forward_batch.verify_route
         return sampling_allows_vocab_shards(
-            info,
-            adjusts_logits=route.adjusts_logits,
-            need_truncated_sampling=route.need_truncated_sampling,
+            info.facts,
             return_logprob=forward_batch.return_logprob,
             # request seeds stay on stock seeded sampling
             has_local_keys=self._sharded_verify_temperature_keys
-            and info.sampling_seed is None,
+            and not info.facts.seeded,
         ) and spec_allows_vocab_shards(get_spec())
 
     def _batch_vocab_shards(self, forward_batch: ForwardBatch) -> bool:

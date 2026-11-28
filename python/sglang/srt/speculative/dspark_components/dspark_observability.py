@@ -18,8 +18,8 @@ from sglang.kernels.ops.speculative.dflash import (
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
     create_block_accept_estimate_recorder,
 )
@@ -830,7 +830,7 @@ class DsparkStepObservers:
         draft_tokens: torch.Tensor,
         draft_block,
         sampling_info,
-        route: VerifyRoute,
+        facts: SamplingFacts,
         correct_len: torch.Tensor,
         cap_trim_lens: torch.Tensor,
         bonus: torch.Tensor,
@@ -881,7 +881,7 @@ class DsparkStepObservers:
                     if sampling_info is not None
                     else None
                 ),
-                logits_adjustments_are_noop=not route.adjusts_logits,
+                logits_adjustments_are_noop=not facts.edits_logits,
                 correct_len=correct_len,
                 cap_trim_lens=cap_trim_lens,
                 bonus=bonus,

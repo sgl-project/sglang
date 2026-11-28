@@ -11,7 +11,7 @@ from sglang.srt.sampling.sampling_batch_info import (
     SamplingFacts,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+from sglang.srt.sampling.sampling_pipeline import VerifyStep
 from sglang.srt.speculative import eagle_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.sampling_test_utils import build_step_penalties
@@ -61,7 +61,7 @@ def _row_counts(logits, tokens):
 def _verify(batch, grammar_mask=None):
     return VerifyStep(
         batch=batch,
-        route=VerifyRoute(adjusts_logits=True, need_truncated_sampling=False),
+        facts=batch.sampling_info.facts,
         watermark=None,
         watermark_full_mask=True,
         grammar_mask=grammar_mask,
@@ -81,7 +81,9 @@ class TestVerifyPenaltyPaths(CustomTestCase):
         batch = SimpleNamespace(
             device="cpu",
             seq_lens=torch.tensor([4]),
-            sampling_info=SimpleNamespace(step_penalties=step),
+            sampling_info=SimpleNamespace(
+                step_penalties=step, facts=SamplingFacts(penalties=True)
+            ),
             forward_mode=SimpleNamespace(is_idle=lambda: False),
         )
         logits_output = SimpleNamespace(
@@ -133,7 +135,9 @@ class TestVerifyPenaltyPaths(CustomTestCase):
             raise _Stop
 
         seen = []
-        info.has_custom_logit_processor = True
+        info.facts = SamplingFacts(
+            all_greedy=True, any_greedy=True, custom_logit_processor=True
+        )
         info.custom_params = [{"req": 0}, {"req": 1}]
         info.custom_logit_processor = {
             0: ProcessorEntry(processor=processor, rows=[1], indices=torch.tensor([1]))

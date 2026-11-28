@@ -3,7 +3,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.environ import envs
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
+from sglang.srt.sampling.sampling_pipeline import VerifyStep
 from sglang.srt.speculative import eagle_worker_common
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -24,9 +25,7 @@ class TestNativeEagerVerify(CustomTestCase):
             for enabled, custom in ((False, False), (True, False), (True, True)):
                 with self.subTest(options=label, enabled=enabled, custom=custom):
                     batch = SimpleNamespace(
-                        sampling_info=SimpleNamespace(
-                            has_custom_logit_processor=custom
-                        ),
+                        sampling_info=SimpleNamespace(),
                         seq_lens=object(),
                         req_pool_indices=object(),
                         device="cpu",
@@ -35,8 +34,8 @@ class TestNativeEagerVerify(CustomTestCase):
                     )
                     verify = VerifyStep(
                         batch=batch,
-                        route=VerifyRoute(
-                            adjusts_logits=True, need_truncated_sampling=False
+                        facts=SamplingFacts(
+                            logit_bias=True, custom_logit_processor=custom
                         ),
                         watermark=object(),
                         watermark_full_mask=True,

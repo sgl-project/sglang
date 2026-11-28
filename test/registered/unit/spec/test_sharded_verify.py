@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.sampling.sampling_batch_info import SamplingFacts
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+from sglang.srt.sampling.sampling_pipeline import VerifyStep
 from sglang.srt.speculative import eagle_utils, sharded_verify
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
@@ -49,7 +49,6 @@ def _sampling_info(*, greedy: bool):
         min_ps=torch.zeros(2),
         step_penalties=None,
         logit_bias=None,
-        has_custom_logit_processor=False,
         sampling_seed=None,
         facts=SamplingFacts(all_greedy=greedy),
         watermark=None,
@@ -154,9 +153,7 @@ class TestShardedPolicy(CustomTestCase):
                 _verify_tree(),
                 VerifyStep(
                     batch=batch,
-                    route=VerifyRoute(
-                        adjusts_logits=False, need_truncated_sampling=False
-                    ),
+                    facts=batch.sampling_info.facts,
                     watermark=None,
                     watermark_full_mask=True,
                 ),

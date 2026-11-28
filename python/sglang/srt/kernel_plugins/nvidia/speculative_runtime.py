@@ -63,7 +63,7 @@ def default_post_verify(
 ) -> PostVerifyOutput:
     """Run the existing verifier and preserve its outputs and mutation order."""
     from sglang.srt.model_executor.forward_mode import ForwardMode
-    from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+    from sglang.srt.sampling.sampling_pipeline import VerifyStep
     from sglang.srt.speculative import eagle_utils
 
     batch = StockVerifyBatch(
@@ -76,10 +76,12 @@ def default_post_verify(
     )
     verify = VerifyStep(
         batch=batch,
-        route=VerifyRoute.derive(
-            batch.sampling_info,
-            has_grammar=io.grammar_mask is not None,
-            has_watermark=io.watermark is not None,
+        # The view carries the param and row facts; the grammar mask and the
+        # bound watermark ride beside it.
+        facts=msgspec.structs.replace(
+            io.sampling_info.facts,
+            grammar=io.grammar_mask is not None,
+            watermark=io.watermark is not None,
         ),
         watermark=io.watermark,
         watermark_full_mask=io.watermark_full_mask,

@@ -56,11 +56,7 @@ class UOCRDecodeGraphIO:
             and batch.beam_tail is None
             and batch.return_logprob is False
             and sampling.facts.all_greedy
-            and sampling.logit_bias is None
-            and sampling.grammars is None
-            and not sampling.has_custom_logit_processor
-            and sampling.watermark is None
-            and sampling.step_penalties is None
+            and not sampling.facts.edits_logits
         )
 
     def seed(self, indices: torch.Tensor, tokens: torch.Tensor) -> None:

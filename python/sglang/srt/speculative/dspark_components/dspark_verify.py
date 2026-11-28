@@ -45,7 +45,7 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
@@ -183,7 +183,6 @@ class TargetVerifyExecutor:
         target_logits: Optional[torch.Tensor],
         draft_block: DraftBlockResult,
         sampling_info,
-        route: VerifyRoute,
         draft_input: DFlashDraftInputV2,
         layout: Optional[RaggedVerifyLayout],
         prefix_lens: torch.Tensor,
@@ -205,7 +204,6 @@ class TargetVerifyExecutor:
             target_logits=target_logits,
             draft_block=draft_block,
             sampling_info=sampling_info,
-            route=route,
             draft_input=draft_input,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
@@ -1267,7 +1265,7 @@ def _simulated_rows(correct_len: torch.Tensor, rows_per_request: int) -> torch.T
 
 
 def _accepts_on_shards(
-    draft_block: DraftBlockResult, route: VerifyRoute, block_verification: bool
+    draft_block: DraftBlockResult, facts: SamplingFacts, block_verification: bool
 ) -> bool:
     # The sharded accept is a Triton chain rule on temperature-only target
     # probabilities; block verification and truncated sampling need the whole vocab.
@@ -1277,7 +1275,7 @@ def _accepts_on_shards(
         shard is not None
         and not getattr(draft_block, "greedy_draft", False)
         and not block_verification
-        and not route.need_truncated_sampling
+        and not facts.truncates
     )
 
 
@@ -1304,14 +1302,12 @@ def _note_blockwise_rejection() -> None:
 
 def _blockwise_rejection_applies(
     *,
-    route: VerifyRoute,
+    facts: SamplingFacts,
     rejection_noise: Optional[RejectionNoise],
     block_verification: bool,
 ) -> bool:
     return (
-        rejection_noise is not None
-        and not block_verification
-        and not route.need_truncated_sampling
+        rejection_noise is not None and not block_verification and not facts.truncates
     )
 
 
@@ -1341,7 +1337,6 @@ def accept_draft_tokens(
     target_logits: torch.Tensor,
     draft_block: DraftBlockResult,
     sampling_info,
-    route: VerifyRoute,
     draft_input: DFlashDraftInputV2,
     gamma: int,
     verify_num_draft_tokens: int,
@@ -1359,7 +1354,7 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
-    if _accepts_on_shards(draft_block, route, block_verification):
+    if _accepts_on_shards(draft_block, sampling_info.facts, block_verification):
         # Block-wise rejection scans the whole draft vocab. This kernel is the
         # same chain rule and reads the draft logits on the local shard.
         shard = draft_block.vocab_shard
@@ -1376,7 +1371,7 @@ def accept_draft_tokens(
             verify_lens=cutoff_verify_lens,
         )
     elif _blockwise_rejection_applies(
-        route=route,
+        facts=sampling_info.facts,
         rejection_noise=rejection_noise,
         block_verification=block_verification,
     ):

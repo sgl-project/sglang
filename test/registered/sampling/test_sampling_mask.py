@@ -211,9 +211,12 @@ class TestSamplingMaskCapture(CustomTestCase):
                     top_ps=torch.full((2,), 0.9, device="cuda"),
                     top_ks=torch.full((2,), 3, dtype=torch.int32, device="cuda"),
                     min_ps=torch.zeros(2, device="cuda"),
-                    facts=SamplingFacts(need_top_p=True, need_top_k=True),
+                    facts=SamplingFacts(
+                        need_top_p=True,
+                        need_top_k=True,
+                        custom_logit_processor=True,
+                    ),
                     vocab_size=5,
-                    has_custom_logit_processor=True,
                     custom_params=[{"token_ids": [2]}, None],
                     custom_logit_processor={
                         0: ProcessorEntry(

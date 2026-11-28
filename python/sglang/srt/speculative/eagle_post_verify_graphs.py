@@ -27,7 +27,6 @@ from sglang.srt.speculative.eagle_worker_common import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +64,6 @@ class EaglePostVerifyGraphs:
         self,
         *,
         batch: ScheduleBatch,
-        route: VerifyRoute,
         verify_input: Any,
         logits_output: Any,
         can_run_cuda_graph: bool,
@@ -77,7 +75,7 @@ class EaglePostVerifyGraphs:
         support (compact_verify_max_top_k), None for the dense branch."""
         self.join()
         key = self._key(
-            batch, route, verify_input, logits_output, can_run_cuda_graph, max_top_k
+            batch, verify_input, logits_output, can_run_cuda_graph, max_top_k
         )
         if key is None:
             return None
@@ -122,7 +120,6 @@ class EaglePostVerifyGraphs:
     def _key(
         self,
         batch: ScheduleBatch,
-        route: VerifyRoute,
         verify_input: Any,
         logits_output: Any,
         can_run_cuda_graph: bool,
@@ -137,9 +134,9 @@ class EaglePostVerifyGraphs:
             or verify_input.topk != 1
             or batch.hisparse_coordinator is not None
             or verify_input.draft_probs is not None
-            or route.adjusts_logits
+            or info.facts.edits_logits
             # the replayed sampling view carries no seeds and no min-p
-            or info.sampling_seed is not None
+            or info.facts.seeded
             or info.facts.need_min_p
             # compute_spec_logprobs reads the gathered logits off logits_output
             or (
