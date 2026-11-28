@@ -1,18 +1,25 @@
 """Exercise Humming's online loader, schema conversion, and dense GPU forward."""
 
+import json
 import math
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from humming.schema import HummingInputSchema, HummingWeightSchema
 from humming.utils.weight import dequantize_weight
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.humming import (
+    HummingConfig,
     HummingLayerQuantizationConfig,
     HummingLinearMethod,
     HummingMoEMethod,
+    _get_dense_fp32_stream_k_tuning,
+    _lazy_import_humming,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -209,6 +216,176 @@ class TestHummingLinear(CustomTestCase):
                     reference = apply_reference_hadamard(weights, 32).cuda().float()
                     relative_error = (actual - reference).norm() / reference.norm()
                     self.assertLess(relative_error.item(), 0.15)
+
+
+class TestHummingFP32StreamKTuning(CustomTestCase):
+    def setUp(self):
+        _lazy_import_humming()
+        self.meta = SimpleNamespace(
+            a_dtype=SimpleNamespace(num_bits=16),
+            b_dtype="float8e4m3",
+            c_dtype="float16",
+            is_block_weight_scale=True,
+            has_input_scale_2=False,
+            is_channel_weight_scale_2=False,
+            is_tensor_weight_scale_2=False,
+            has_zero_point=False,
+        )
+        self.layer = SimpleNamespace(humming_metas={"": self.meta})
+        self.compute = dict(gemm_type="dense", use_f16_accum=False)
+
+    def test_disabled_and_unsupported_layers_keep_native_tuning(self):
+        with envs.SGLANG_HUMMING_USE_FP32_STREAM_K_REDUCE.override(False):
+            self.assertIsNone(_get_dense_fp32_stream_k_tuning(None, self.compute))
+        for name, value in (
+            ("c_dtype", "bfloat16"),
+            ("b_dtype", "uint4"),
+            ("is_block_weight_scale", False),
+            ("has_input_scale_2", True),
+            ("is_channel_weight_scale_2", True),
+            ("is_tensor_weight_scale_2", True),
+            ("has_zero_point", True),
+        ):
+            with self.subTest(name=name), patch.object(self.meta, name, value):
+                with envs.SGLANG_HUMMING_USE_FP32_STREAM_K_REDUCE.override(True):
+                    self.assertIsNone(
+                        _get_dense_fp32_stream_k_tuning(self.layer, self.compute)
+                    )
+
+    def test_only_supported_stream_k_intervals_are_changed(self):
+        from humming.kernel.humming import HummingKernel
+
+        from sglang.srt.layers.quantization import humming as adapter
+
+        configs = [
+            (0, 8, dict(mma_type="mma", use_stream_k=False)),
+            (8, 48, dict(mma_type="wgmma", use_stream_k=True)),
+            (48, 128, dict(mma_type="umma", use_stream_k=True)),
+        ]
+        with (
+            envs.SGLANG_HUMMING_USE_FP32_STREAM_K_REDUCE.override(True),
+            patch.object(
+                adapter.HummingMethod,
+                "get_default_tuning_configs",
+                return_value=configs,
+            ),
+            patch.object(
+                HummingKernel, "supports_dense_fp32_stream_k_reduce", True, create=True
+            ),
+        ):
+            result = json.loads(
+                _get_dense_fp32_stream_k_tuning(self.layer, self.compute)
+            )
+        self.assertEqual(result[0][2], configs[0][2])
+        self.assertEqual(result[2][2], configs[2][2])
+        self.assertTrue(result[1][2]["use_fp32_stream_k_reduce"])
+        self.assertNotIn("use_fp32_stream_k_reduce", configs[1][2])
+
+    def test_incompatible_accumulation_and_missing_dependency_fail_early(self):
+        from humming.kernel.humming import HummingKernel
+
+        from sglang.srt.layers.quantization import humming as adapter
+
+        with envs.SGLANG_HUMMING_USE_FP32_STREAM_K_REDUCE.override(True):
+            with self.assertRaisesRegex(ValueError, "USE_F16_ACCUM=false"):
+                _get_dense_fp32_stream_k_tuning(
+                    self.layer, dict(self.compute, use_f16_accum=True)
+                )
+            with (
+                patch.object(
+                    adapter.HummingMethod,
+                    "get_default_tuning_configs",
+                    return_value=[(0, 48, dict(mma_type="mma", use_stream_k=True))],
+                ),
+                patch.object(
+                    HummingKernel,
+                    "supports_dense_fp32_stream_k_reduce",
+                    False,
+                    create=True,
+                ),
+                self.assertRaisesRegex(RuntimeError, "dense FP16"),
+            ):
+                _get_dense_fp32_stream_k_tuning(self.layer, self.compute)
+
+
+class TestHummingDenseFP32StreamK(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        from humming.kernel.humming import HummingKernel
+
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
+            9,
+            0,
+        ):
+            raise unittest.SkipTest(
+                "Native Humming FP32 Stream-K regression requires SM90"
+            )
+        if not getattr(HummingKernel, "supports_dense_fp32_stream_k_reduce", False):
+            raise unittest.SkipTest(
+                "Requires the upstream dense FP32 Stream-K reduction dependency"
+            )
+
+    @torch.inference_mode()
+    def test_native_row_parallel_linear_cancellation_and_nonzero(self):
+        from sglang.srt.layers.linear import RowParallelLinear
+        from sglang.srt.runtime_context import get_parallel
+
+        for nonzero in (False, True):
+            with self.subTest(nonzero=nonzero):
+                quant = HummingConfig.from_config(
+                    dict(
+                        quant_method="humming",
+                        b_dtype="float8e4m3",
+                        weight_scale_group_size=128,
+                        weight_scale_group_size_n=128,
+                    )
+                )
+                with torch.device("cuda"):
+                    layer = RowParallelLinear(
+                        2048,
+                        6144,
+                        bias=False,
+                        reduce_results=False,
+                        params_dtype=torch.float16,
+                        quant_config=quant,
+                        parallel_group="replicated",
+                        prefix="model.layers.0.mlp.down_proj",
+                    )
+                weights = torch.full((6144, 2048), 64.0, dtype=torch.float32)
+                weights[:, 1024:] *= -1
+                if nonzero:
+                    weights[:, 1024] = 0
+                layer.weight.weight_loader(
+                    layer.weight, weights.to(torch.float8_e4m3fn).view(torch.int32)
+                )
+                layer.weight_scale.weight_loader(
+                    layer.weight_scale, torch.ones((48, 16), dtype=torch.float32)
+                )
+                with (
+                    envs.SGLANG_HUMMING_USE_FP32_STREAM_K_REDUCE.override(True),
+                    envs.SGLANG_HUMMING_USE_F16_ACCUM.override(False),
+                ):
+                    layer.quant_method.process_weights_after_loading(layer)
+                tuning = json.loads(layer.quant_method.tuning_config)
+                self.assertTrue(
+                    next(
+                        t["use_fp32_stream_k_reduce"]
+                        for low, high, t in tuning
+                        if low < 42 <= high
+                    )
+                )
+                with get_parallel().override(tp_group=None):
+                    for shape_m in (42, 49, 1, 42):
+                        inputs = torch.full(
+                            (shape_m, 2048), 64, dtype=torch.float16, device="cuda"
+                        )
+                        inputs[1::3] *= -1
+                        reference = inputs.cpu().float() @ weights.T
+                        output, _ = layer(inputs)
+                        torch.testing.assert_close(
+                            output.cpu(), reference.half(), rtol=0, atol=0
+                        )
+                        self.assertEqual(torch.count_nonzero(layer.locks).item(), 0)
 
 
 if __name__ == "__main__":
