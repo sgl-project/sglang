@@ -25,7 +25,7 @@ Which tier is private and which is shared decides where a cache hit can come fro
 | Tier | Medium | Scope | Shared across instances? |
 |---|---|---|---|
 | **L1** | GPU memory (HBM) | One inference instance | No |
-| **L2** | Host memory (CPU DRAM) | One inference instance, on its own node | **No** |
+| **L2** | Host memory (CPU DRAM) | One inference instance; node-local by default | **No** |
 | **L3** | Storage backend (`file`, `mooncake`, `hf3fs`, `nixl`, `aibrix`, or a custom one) | Whatever the backend is configured to span | **Only if the backend is set up for it** |
 
 ```mermaid
@@ -58,9 +58,9 @@ flowchart TB
     L2C --> L3
 ```
 
-**L2 is node-local and instance-private.** It is host memory owned by one inference instance's process, so two instances never read each other's L2, not even two instances on the same node. A KV cache produced by instance 0 becomes visible to instance 1 only after it reaches L3.
+**L2 is instance-private.** By default, it uses node-local host memory. The opt-in [remote EGM host pool](/docs/advanced_features/hicache_best_practices#remote-egm-backed-host-pool-on-nvidia-grace) can place a TP rank's private L2 in its peer's Grace memory. Two instances do not read each other's L2; a KV cache produced by instance 0 becomes visible to instance 1 only after it reaches L3.
 
-This is the answer to a common question: HiCache cannot pool the host memory of several machines into one larger L2. Growing `--hicache-ratio` or `--hicache-size` only makes each instance's own private L2 larger. Cross-instance reuse is the job of L3, so it needs `--hicache-storage-backend`.
+Growing `--hicache-ratio` or `--hicache-size` makes each instance's own private L2 larger. Cross-instance reuse is the job of L3, so it needs `--hicache-storage-backend`.
 
 L3 is the tier that *can* be shared, but whether it actually is depends on the backend and how it is configured. The `file` backend writes to `/tmp/hicache` by default (`SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` overrides it), which is node-local unless that path is a shared mount. Distributed backends such as `mooncake`, `hf3fs`, `nixl` and `aibrix` give cluster-wide scope, but only when every instance is pointed at the same namespace and configuration.
 
