@@ -96,7 +96,9 @@ def try_route_quant_fused(
     staged request covers it. Returns (weights, ids) on a hit, None otherwise
     (caller falls through to the unfused router)."""
     x = _handoff.request_x
-    if x is None or num_fused_shared_experts != 0:
+    # Both launches below hand the MoE the routes as routed, so a later rewrite
+    # (routing simulation, an expert-location remap) would leave them stale.
+    if x is None or num_fused_shared_experts != 0 or not _handoff.fused_routing_ok:
         return None
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
@@ -106,7 +108,6 @@ def try_route_quant_fused(
     layer = _handoff.request_layer
     if (
         layer is not None
-        and _handoff.fused_routing_ok
         and kimi_k3_fused_routing.covered(gating_output, correction_bias, topk, x)
         and kimi_k3_fused_routing.available()
     ):

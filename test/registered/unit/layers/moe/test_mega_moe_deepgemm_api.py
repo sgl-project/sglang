@@ -476,7 +476,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     batch = SimpleNamespace(
                         moe_num_token_non_padded=lambda: torch.tensor(
                             2, dtype=torch.int32
-                        )
+                        ),
+                        moe_dp_real_rows=lambda: None,
                     )
 
                     def run_experts(_experts, x, topk_ids, weights, **kwargs):

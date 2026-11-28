@@ -83,6 +83,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
     _dp_tp_moe_masks_pad_rows,
+    _dp_tp_moe_skips_pad_rows,
+    _model_skips_dp_pad_rows,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
     get_required_capture_hidden_mode,
@@ -312,6 +314,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     num_prefilled_input_skips = 0
     # SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW, read in __init__.
     _skip_glued_replay_view = False
+    # Set in __init__ under a MAX_LEN DP gather (see _set_dp_real_rows).
+    dp_real_rows: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -585,6 +589,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
             aux_hidden_states_width=self.model_runner.get_aux_hidden_states_width(),
+        )
+        # Real rows in each DP rank's slot of the gathered MoE input, so routing
+        # skips the padding rows; refreshed on every replay (_set_dp_real_rows).
+        self.dp_real_rows = (
+            torch.empty(self.num_dp_ranks, dtype=torch.int64, device=self.device)
+            if self.require_mlp_tp_gather
+            and self.capture_forward_mode.is_decode()
+            and self.captured_req_width == 1
+            and not self.model_runner.spec_algorithm.is_speculative()
+            and _dp_tp_moe_skips_pad_rows()
+            and _model_skips_dp_pad_rows(self.model_runner)
+            else None
         )
         # The early verify metadata writes these slots beside the draft graph, which
         # must not share their storage through the process-wide pool.
@@ -1232,6 +1248,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
             buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
+            if self.dp_real_rows is not None:
+                self.dp_real_rows.fill_(bs)
         else:
             global_dp_buffer_len = None
 
@@ -1302,6 +1320,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded=(
                 buffers.num_token_non_padded if enable_num_token_non_padded() else None
             ),
+            dp_real_rows_gpu=self.dp_real_rows,
             attn_tp_sequence_sharded=attn_tp_sharded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
@@ -1632,6 +1651,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if buf is not None and _dp_tp_moe_masks_pad_rows():
             buf.fill_(raw_num_token)
 
+    def _set_dp_real_rows(self, forward_batch: ForwardBatch) -> None:
+        # Each DP rank owns one bs-row slot of the gathered MoE input, and its
+        # first rows are real. Outside prepare_mlp_sync_batch (which the graph
+        # path skips), global_num_tokens_gpu still holds those per-rank counts.
+        if self.dp_real_rows is None:
+            return
+        counts = forward_batch.global_num_tokens_gpu
+        if counts is None or counts.shape != self.dp_real_rows.shape:
+            self.dp_real_rows.fill_(torch.iinfo(torch.int64).max)
+        else:
+            self.dp_real_rows.copy_(counts)
+
     def load_batch(
         self,
         forward_batch: ForwardBatch,
@@ -1676,6 +1707,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self._set_dp_real_num_tokens(self.raw_num_token)
+            self._set_dp_real_rows(forward_batch)
             self._copy_replay_inputs(forward_batch)
             if (
                 pp_proxy_tensors is not None
@@ -1785,6 +1817,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Padded tokens aren't read, so skip zeroing. Ragged input_ids arrive
         # from the planner already padded to the tier, invalid slots zeroed.
         self._set_dp_real_num_tokens(raw_num_token)
+        self._set_dp_real_rows(forward_batch)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,

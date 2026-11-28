@@ -10,6 +10,7 @@ from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
 )
+from sglang.srt.layers.moe import route_quant_handoff
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -136,6 +137,36 @@ class TestRouteQuant(CustomTestCase):
             torch.equal(quantized.view(torch.uint8), ref_q.view(torch.uint8))
         )
         torch.testing.assert_close(scale, ref_scale, rtol=0, atol=0)
+
+    def test_handoff_publishes_only_final_routes(self):
+        """select_experts binds fused_routing_ok=False when a later step rewrites
+        the routes (routing simulation, an expert-location remap); the fused route
+        + quant launch then leaves the packed ids to the MoE runner."""
+        torch.manual_seed(2)
+        scores = torch.randn(8, NUM_EXPERTS, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(NUM_EXPERTS, device="cuda", dtype=torch.float32)
+        hidden = torch.randn(8, 3584, device="cuda", dtype=torch.bfloat16)
+        for routes_final in (True, False):
+            route_quant_handoff.stage(hidden)
+            try:
+                route_quant_handoff.bind_select_experts(
+                    None, fused_routing_ok=routes_final
+                )
+                routed = route_quant_handoff.try_route_quant_fused(
+                    scores,
+                    bias,
+                    TOPK,
+                    num_fused_shared_experts=0,
+                    renormalize=True,
+                    routed_scaling_factor=2.5,
+                    apply_routed_scaling_factor_on_output=True,
+                )
+                handed = route_quant_handoff.take(hidden)
+            finally:
+                route_quant_handoff.clear()
+            with self.subTest(routes_final=routes_final):
+                self.assertEqual(routed is not None, routes_final)
+                self.assertEqual(handed is not None, routes_final)
 
     def test_route_radix_ties_and_nan(self):
         """The cases the self-comparison could not see.

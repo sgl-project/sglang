@@ -390,7 +390,9 @@ class TestPrefillGraphRankBarrierBreaks(CustomTestCase):
         runner.backend = SimpleNamespace(replay_session=nullcontext)
         runner.model_runner = SimpleNamespace(model=SimpleNamespace())
         forward_batch = SimpleNamespace(
-            lora_ids=None, moe_num_token_non_padded=lambda: None
+            lora_ids=None,
+            moe_num_token_non_padded=lambda: None,
+            moe_dp_real_rows=lambda: None,
         )
         runner.capture_prepare = mock.Mock(return_value=(forward_batch, mock.Mock()))
         seen = []

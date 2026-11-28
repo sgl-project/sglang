@@ -96,10 +96,10 @@ def _make_experts(seed: int):
 
 
 def _route(scores, bias, x, *, layer, num_valid):
-    # Drives the handoff as select_experts does; layer=None runs the unfused chain.
+    # Drives the handoff as select_experts does; layer=None skips the prepared
+    # routing, so the packed launch (or, past its 64 rows, route_radix) routes.
     route_quant_handoff.stage(x, layer=layer)
-    if layer is not None:
-        route_quant_handoff.bind_select_experts(num_valid, fused_routing_ok=True)
+    route_quant_handoff.bind_select_experts(num_valid, fused_routing_ok=True)
     out = route_quant_handoff.try_route_quant_fused(
         scores,
         bias,

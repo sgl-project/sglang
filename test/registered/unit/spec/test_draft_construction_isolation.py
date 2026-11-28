@@ -128,6 +128,7 @@ class TestSharedExpertsModelScope(CustomTestCase):
             input_ids=torch.tensor([3]),
             positions=None,
             moe_num_token_non_padded=None,
+            moe_dp_real_rows=None,
             global_num_tokens_cpu=None,
         )
         return runner._forward_raw(batch, None).logits_output
