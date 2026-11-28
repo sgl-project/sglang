@@ -2011,6 +2011,10 @@ class Envs:
     # its CPU pool's thread count. None = unset = min(8, CPU cores).
     SGLANG_MM_RS_THREADS = EnvInt(None)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
+    # Replay the Qwen3-Omni / Qwen3-ASR audio tower from token-budget CUDA
+    # graphs (TP 1). The tower then uses triton_attn unless
+    # --mm-attention-backend selects another backend, which disables the graphs.
+    SGLANG_AUDIO_ENCODER_ENABLE_CUDA_GRAPH = EnvBool(True)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
     # set False to fall back to the per-image loop.
