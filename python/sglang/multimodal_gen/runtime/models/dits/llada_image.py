@@ -26,6 +26,9 @@ from diffusers.models.normalization import RMSNorm
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
+from sglang.kernels.ops import diffusion as diffusion_kernels
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.llada_image import (
     SEQUENCE_MULTIPLE,
     LLaDAImageDitConfig,
@@ -51,6 +54,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 ADALN_EMBED_DIM = 256
 
@@ -69,6 +75,125 @@ LLADA_IMAGE_ATTENTION_BACKENDS = {
     AttentionBackendEnum.FA,
     AttentionBackendEnum.TORCH_SDPA,
 }
+
+
+_LLADA_IMAGE_QK_ROPE = BitExactFusionGate(
+    "LLaDA image strided QK RoPE", per_signature=True
+)
+
+
+def _llada_image_qk_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: SGLangRMSNorm,
+    k_norm: SGLangRMSNorm,
+    head_dim: int,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """QK RMSNorm + RoPE over the packed ``to_qkv`` slices without the copies.
+
+    ``q``/``k`` are the ``qkv.split`` views, so their tokens sit
+    ``3 * local_heads * head_dim`` apart. ``reference()`` materializes both and
+    runs the in-place fused kernel; the fused branch reads the packed stride and
+    writes contiguous outputs in one launch.
+    """
+
+    def reference():
+        return apply_qk_norm_with_optional_rope(
+            q=q.contiguous(),
+            k=k.contiguous(),
+            q_norm=q_norm,
+            k_norm=k_norm,
+            head_dim=head_dim,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
+            is_neox=False,
+            allow_inplace=True,
+        )
+
+    inner_dim = q.shape[-2] * head_dim
+    if (
+        not q.is_cuda
+        or torch.version.hip
+        or torch.compiler.is_compiling()
+        or q.ndim != 4
+        or q.shape[0] != 1
+        or q.shape != k.shape
+        or q.shape[-1] != head_dim
+        or q.numel() == 0
+        or q.dtype != torch.bfloat16
+        or k.dtype != q.dtype
+        or k.device != q.device
+        or q.stride() != (q.shape[1] * 3 * inner_dim, 3 * inner_dim, head_dim, 1)
+        or cos_sin_cache.ndim != 2
+        or cos_sin_cache.shape != (q.shape[1], head_dim)
+        or cos_sin_cache.dtype != torch.float32
+        or cos_sin_cache.device != q.device
+        or not cos_sin_cache.is_contiguous()
+        or positions.shape != (q.shape[1],)
+        or positions.dtype != torch.int64
+        or positions.device != q.device
+        or q_norm.variance_epsilon != k_norm.variance_epsilon
+        or any(
+            norm.weight.shape != (head_dim,)
+            or norm.weight.dtype != q.dtype
+            or norm.weight.device != q.device
+            or not norm.weight.is_contiguous()
+            for norm in (q_norm, k_norm)
+        )
+        or (
+            torch.is_grad_enabled()
+            and any(
+                x.requires_grad
+                for x in (q, k, q_norm.weight, k_norm.weight, cos_sin_cache)
+            )
+        )
+        or not envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
+    ):
+        return reference()
+    if not diffusion_kernels.can_use_fused_inplace_qknorm_rope(
+        head_dim, head_dim, False, q.dtype, cos_sin_cache.dtype
+    ):
+        return reference()
+
+    def fused():
+        q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+        k_out = torch.empty_like(q_out)
+        heads = q.shape[-2]
+        diffusion_kernels.fused_qknorm_rope_out_of_place(
+            q.view(-1, heads, head_dim),
+            k.view(-1, heads, head_dim),
+            q_out.view(-1, heads, head_dim),
+            k_out.view(-1, heads, head_dim),
+            q_norm.weight,
+            k_norm.weight,
+            cos_sin_cache,
+            positions,
+            is_neox=False,
+            eps=q_norm.variance_epsilon,
+            head_dim=head_dim,
+            rope_dim=head_dim,
+        )
+        return q_out, k_out
+
+    # The out-of-place kernel never writes into the packed projection, so a
+    # failure leaves it reusable for the fallback.
+    return _LLADA_IMAGE_QK_ROPE.run(
+        fused,
+        reference,
+        sig=(
+            q.device,
+            tuple(q.shape),
+            tuple(q.stride()),
+            q_norm.variance_epsilon,
+        ),
+        equal=lambda actual, expected: all(
+            torch.equal(a.view(torch.int16), b.view(torch.int16))
+            for a, b in zip(actual, expected, strict=True)
+        ),
+        logger=logger,
+    )
 
 
 class LLaDAImageRMSNorm(SGLangRMSNorm):
@@ -214,7 +339,7 @@ class LLaDAImageAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.to_qkv(hidden_states)
         query, key, value = (
-            tensor.unflatten(-1, (self.local_heads, self.head_dim)).contiguous()
+            tensor.unflatten(-1, (self.local_heads, self.head_dim))
             for tensor in qkv.split([self.inner_dim] * 3, dim=-1)
         )
         cos_sin_cache = torch.cat(
@@ -224,16 +349,14 @@ class LLaDAImageAttention(nn.Module):
             cos_sin_cache.shape[0], device=query.device, dtype=torch.long
         )
         if self.norm_q is not None:
-            query, key = apply_qk_norm_with_optional_rope(
-                q=query,
-                k=key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=self.head_dim,
-                cos_sin_cache=cos_sin_cache.contiguous(),
-                positions=positions,
-                is_neox=False,
-                allow_inplace=True,
+            query, key = _llada_image_qk_rope(
+                query,
+                key,
+                self.norm_q,
+                self.norm_k,
+                self.head_dim,
+                cos_sin_cache.contiguous(),
+                positions,
             )
         else:
             query, key = apply_flashinfer_rope_qk_inplace(
@@ -244,6 +367,8 @@ class LLaDAImageAttention(nn.Module):
                 positions=positions,
                 is_neox=False,
             )
+        # Only q/k skip the copy; the attention backends read a contiguous v.
+        value = value.contiguous()
         if attention_mask is not None:
             attention_mask = attention_mask[:, None, None, :]
         hidden_states = self.sgl_attention(query, key, value, attn_mask=attention_mask)
