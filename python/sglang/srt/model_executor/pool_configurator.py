@@ -1298,6 +1298,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     # A subclass that adds the draft's KV to the per-token bytes itself sets this,
     # replacing the (T+D)/T inflation.
     _draft_kv_priced_exactly = False
+    _npu_kv_row_bytes: Optional[dict[int, int]] = None
     _npu_dspark_draft_layers = 0
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -1406,6 +1407,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             use_fp4_indexer=not self._npu_low_ratio_bf16,
             use_bf16_indexer=self._npu_low_ratio_bf16,
         )
+
+        if _is_npu:
+            self._init_npu_row_bytes(cfg.compress_ratios)
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
@@ -1574,6 +1578,43 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
 
+    def _init_npu_row_bytes(self, model_ratios) -> None:
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+            NPUDSV4KVLayout,
+        )
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        arch35 = is_npu_arch35()
+        self._is_v41 = any(
+            ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS for ratio in model_ratios
+        )
+        v4_layout = NPUDSV4KVLayout.V4_FP8 if arch35 else NPUDSV4KVLayout.V4_BF16
+        self._npu_kv_row_bytes = {}
+        for ratio in (0, *self.stage_owner_layers):
+            layout = v4_layout
+            if self._is_v41:
+                if ratio == 0:
+                    layout = (
+                        NPUDSV4KVLayout.V41_SWA_FP8
+                        if arch35
+                        else NPUDSV4KVLayout.V41_BF16
+                    )
+                elif ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS:
+                    layout = (
+                        NPUDSV4KVLayout.V41_CMP_FP4
+                        if arch35
+                        else NPUDSV4KVLayout.V41_BF16
+                    )
+            dim, dtype = layout.kv_info(self.qk_nope_head_dim, self.qk_rope_head_dim)
+            self._npu_kv_row_bytes[ratio] = dim * dtype.itemsize
+        self.kv_bytes = self._npu_kv_row_bytes[0]
+        k, scale, k_dtype, scale_dtype = v4_layout.indexer_kv_info(
+            self.indexer_head_dim
+        )
+        self.indexer_bytes_per_token = (
+            k * k_dtype.itemsize + scale * scale_dtype.itemsize
+        )
+
     def num_layers(self, ratio: int) -> int:
         """Layers of this stage owning ratio's compressed storage."""
         return len(self.stage_owner_layers.get(ratio, ()))
@@ -1641,11 +1682,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(cap + headroom, self.page_size)
 
     def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
-        # Unified rings, the NPU pool and the trtllm uniform-FP8 pool do not go
-        # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
-        if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
-            if self._npu_low_ratio_bf16 and compress_ratio in (0, 1, 2):
-                return self.attn_head_dim * torch.bfloat16.itemsize
+        if _is_npu:
+            return self._npu_kv_row_bytes[compress_ratio]
+        # Unified rings and the trtllm uniform-FP8 pool have no page-internal pad.
+        if self._unified or get_exec().kernel.dsv4_attn_backend == "trtllm":
             return self.kv_bytes
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             resolve_compressed_kv_layout,
@@ -1701,35 +1741,44 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         assert ratio == 128, f"unsupported compression ratio: {ratio}"
         return 1 / 128 * self._get_paged_kv_bytes_per_token(128)
 
-    def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
-        """Reserved main/indexer pages beyond the token-scaled low-ratio bytes."""
-        if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
-            if self._npu_low_ratio_bf16:
-                from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-                    DSV41_INDEX_PAGE_SIZE,
-                )
+    def _get_npu_kv_padding_bytes(self, full_tokens: int) -> float:
+        padding_bytes = 0
+        if self._is_v41 or self.swa_cap_tokens is None:
+            swa_layers = self.num_swa_layers + self._npu_dspark_draft_layers
+            padding_bytes = self.page_size * self.kv_bytes * swa_layers
 
-                # A3 physical NPU pools reserve one page beyond their `size`.
-                # Indexer size already includes the reserved FULL logical page.
-                # Include SWA's reserved page here as well (not in the token
-                # coefficient, regardless of whether SWA uses cap or ratio sizing).
-                padding = (
-                    self.page_size
-                    * self._get_paged_kv_bytes_per_token()
-                    * (self.num_layers_total + self._npu_dspark_draft_layers)
-                )
-                for ratio in (1, 2):
-                    page = self.page_size // ratio
-                    size = (full_tokens + self.page_size) // ratio
-                    index_slots = (
-                        (size + DSV41_INDEX_PAGE_SIZE + 1) // DSV41_INDEX_PAGE_SIZE
-                    ) * DSV41_INDEX_PAGE_SIZE
-                    padding += self.num_layers(ratio) * (
-                        page * self._get_paged_kv_bytes_per_token(ratio)
-                        + (index_slots - full_tokens // ratio)
-                        * self.low_ratio_index_bytes
-                    )
-                return padding
+        if self._is_v41:
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                DSV41_INDEX_PAGE_SIZE,
+            )
+
+            # V4.1 uses the upstream SWA and low-ratio reserved-page budget.
+            for ratio in (1, 2):
+                num_layers = self.num_layers(ratio)
+                if not num_layers:
+                    continue
+                # FULL capacity is aligned, so main KV allocates one reserved page.
+                page = self.page_size // ratio
+                main_padding = page * self._get_paged_kv_bytes_per_token(ratio)
+                index_size = (full_tokens + self.page_size) // ratio
+                index_page = DSV41_INDEX_PAGE_SIZE
+                index_rows = ((index_size + index_page + 1) // index_page) * index_page
+                index_padding = (
+                    index_rows - full_tokens // ratio
+                ) * self.low_ratio_index_bytes
+                padding_bytes += (main_padding + index_padding) * num_layers
+            # Keep the upstream A3 V4.1 padding budget unscaled.
+            if self._npu_low_ratio_bf16:
+                return padding_bytes
+
+        return padding_bytes * self._spec_infl
+
+    def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
+        """Adjust the linear estimate for physical pool sizes."""
+        if _is_npu:
+            return self._get_npu_kv_padding_bytes(full_tokens)
+        # Reserved main/indexer pages beyond the token-scaled low-ratio bytes.
+        if self._unified or get_exec().kernel.dsv4_attn_backend == "trtllm":
             return 0
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DSV41_INDEX_PAGE_SIZE,
