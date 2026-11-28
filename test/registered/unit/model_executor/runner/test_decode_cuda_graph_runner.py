@@ -711,5 +711,42 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
         self.assertEqual((glue.calls, eager), ([], views))
 
 
+class TestDecodeGraphRows(CustomTestCase):
+    def test_report_ordinary_replay_only(self):
+        report = mock.Mock()
+        runner = SimpleNamespace(
+            model_runner=SimpleNamespace(decode_graph_rows_reporter=report),
+            captured_req_width=1,
+            ragged_verify_mode=False,
+            require_mlp_tp_gather=False,
+            raw_bs=3,
+            bs=4,
+        )
+        decode_batch = SimpleNamespace(forward_mode=mod.ForwardMode.DECODE)
+        DecodeCudaGraphRunner._report_decode_graph_rows(runner, decode_batch)
+        report.assert_called_once_with(3, 4)
+
+        for mode in (
+            mod.ForwardMode.IDLE,
+            mod.ForwardMode.EXTEND,
+            mod.ForwardMode.TARGET_VERIFY,
+        ):
+            report.reset_mock()
+            DecodeCudaGraphRunner._report_decode_graph_rows(
+                runner, SimpleNamespace(forward_mode=mode)
+            )
+            report.assert_not_called()
+        for field, value in (
+            ("captured_req_width", 4),
+            ("ragged_verify_mode", True),
+            ("require_mlp_tp_gather", True),
+            ("raw_bs", 0),
+        ):
+            with mock.patch.object(runner, field, value):
+                report.reset_mock()
+                DecodeCudaGraphRunner._report_decode_graph_rows(runner, decode_batch)
+                report.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

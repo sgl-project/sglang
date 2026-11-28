@@ -115,6 +115,36 @@ sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
 sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 ```
 
+## Decode CUDA graph padding efficiency
+
+With `--enable-metrics`, ordinary non-speculative CUDA decode graph replays
+increment two counters:
+
+- `sglang:decode_cuda_graph_live_rows_total`: the number of live request rows.
+- `sglang:decode_cuda_graph_captured_rows_total`: the number of rows in the
+  actual captured batch-size bucket, including padding.
+
+Only the final pipeline stage's attention-TP/CP logging rank reports these
+counters, once per batch on each independent data-parallel replica. Eager
+forwards, graph capture, idle, prefill, speculative decoding, and attention
+data parallelism are excluded. In particular, attention DP's rank-alignment
+padding is not counted as graph-bucket padding.
+
+The row-weighted padding efficiency over a time window is:
+
+```promql
+sum by (model_name) (rate(sglang:decode_cuda_graph_live_rows_total[5m]))
+/
+sum by (model_name) (rate(sglang:decode_cuda_graph_captured_rows_total[5m]))
+```
+
+A batch of 3 requests replaying a bucket of 4 adds 3 live and 4 captured rows
+(75% efficiency). Compare the ratio under the same workload when tuning
+`--cuda-graph-bs-decode`, alongside graph replay frequency
+(`sglang:cuda_graph_passes_total`), latency, and graph memory cost. The ratio is
+not GPU utilization or the fraction of forwards that use a graph; do not treat
+an absent or zero-rate denominator as a zero-efficiency measurement.
+
 ## Request-level time per output token (TPOT)
 
 `sglang:request_time_per_output_token_seconds` records TPOT once per successfully finished request:

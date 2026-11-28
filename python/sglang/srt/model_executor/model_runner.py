@@ -439,6 +439,7 @@ class ModelRunner:
         self.draft_load_format = self._resolve_draft_load_format()
         self.is_generation = model_config.is_generation
         self.device_timer = None
+        self.decode_graph_rows_reporter: Optional[Callable[[int, int], None]] = None
         self.is_multimodal = model_config.is_multimodal
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
