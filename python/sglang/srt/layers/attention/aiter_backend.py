@@ -791,6 +791,18 @@ class AiterAttnBackend(AttentionBackend):
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
+        # DSpark verify never has a custom_mask (block verification on or off).
+        # Cache this so the CUDA-graph verify path uses None at both capture and
+        # replay (see below).
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        _spec = get_spec()
+        self._dspark_verify = bool(
+            _spec is not None
+            and SpeculativeAlgorithm.from_string(
+                _spec.speculative_algorithm
+            ).is_dspark()
+        )
         self.topk = topk
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -4392,10 +4404,17 @@ class AiterAttnBackend(AttentionBackend):
                         verify_seqlen_k_i32=verify_seqlen_k_i32,
                     )
                 else:
-                    custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
+                    # Key the mask on config, not the per-call tensor: the capture
+                    # dummy is non-None but the real DSpark verify mask is
+                    # None, so keying off the tensor would bake USE_CUSTOM_MASK=True
+                    # at capture and read a stale buffer at replay. Both None here.
+                    if self._dspark_verify or spec_info.custom_mask is None:
+                        custom_mask = None
+                    else:
+                        custom_mask = self.cuda_graph_custom_mask
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
                     seq_mask_len = max_q_len * (seq_lens + max_q_len)
                     mask_indptr = self.mask_indptr[: bs + 1]
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
