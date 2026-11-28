@@ -594,6 +594,7 @@ def draft_kv_profile(
     dcp_size: int = 1,
     num_depths: Optional[int] = None,
     window: Optional[int] = None,
+    window_layer_ids: Optional[Tuple[int, ...]] = None,
 ) -> DraftKVProfile:
     """The draft's layer geometry and execution width, before storage placement.
 
@@ -601,6 +602,8 @@ def draft_kv_profile(
     ``num_depths`` overrides the checkpoint depth.
     ``window`` is the window the draft's sliding-window layers attend over, as
     its runner will resolve it, so a window equal to a target's shares its sub-pool.
+    ``window_layer_ids`` lists window layers the config cannot: an all-sliding
+    DFLASH draft is not hybrid-SWA, so ``draft_swa_layer_ids`` returns none.
     """
     from sglang.srt.configs.hybrid_arch import mambaish_config
     from sglang.srt.configs.model_config import AttentionArch
@@ -610,7 +613,9 @@ def draft_kv_profile(
         num_depths = mc.num_nextn_predict_layers
     num_depths = 1 if num_depths is None else int(num_depths)
     num_layers = int(num_layers)
-    window_ids = draft_swa_layer_ids(mc)
+    window_ids = (
+        draft_swa_layer_ids(mc) if window_layer_ids is None else window_layer_ids
+    )
     assert set(window_ids) <= set(range(num_layers)), (
         f"draft window layer ids {window_ids} outside range({num_layers})"
     )

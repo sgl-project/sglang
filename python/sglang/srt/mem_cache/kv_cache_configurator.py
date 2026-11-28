@@ -116,6 +116,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_model,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     mamba_cache_chunk_size,
@@ -157,6 +158,10 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
 
 
 _is_hip = is_hip()
+# Window bands discard older slots; only these backends honor window_left.
+_WINDOW_DRAFT_BACKENDS = ("trtllm_mha", "fa4")
+# Block-scaled KV dtypes stay on the full band.
+_PLAIN_KV_DTYPES = ("auto", "bf16", "bfloat16", "fp8_e4m3", "fp8_e5m2")
 
 
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
@@ -1382,6 +1387,62 @@ class KVCacheConfigurator:
         model_cls, _ = get_model_architecture(draft_model_config)
         return resolve_sliding_layer_window_size(model_cls, draft_model_config)
 
+    def _all_window_dflash_draft(self, draft_model_config, *, draft_backend) -> bool:
+        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
+
+        mc = draft_model_config
+        spec = get_spec()
+        parallel = get_parallel()
+        if not (
+            get_platform().is_cuda
+            and self.spec_algorithm.is_dflash()
+            and self._unified_window_and_state()[0]
+            and not self.is_hybrid_swa_compress
+            and not self.use_mla_backend
+            and mc.attention_arch != AttentionArch.MLA
+            and not mc.disable_hybrid_swa_memory
+            and spec.speculative_draft_window_size is None
+            and get_model().kv_cache_dtype in _PLAIN_KV_DTYPES
+            and spec.speculative_draft_kv_cache_dtype in (None, *_PLAIN_KV_DTYPES)
+            and not parallel.attn_dp_enabled
+            and parallel.attn_cp_size == 1
+            and parallel.attn_dcp_size == 1
+            and draft_backend in _WINDOW_DRAFT_BACKENDS
+            # DFlashAttention sizes K/V from the regular geometry; a window band
+            # sizes its rows from the swa_* one.
+            and mc.get_swa_num_kv_heads(1) == mc.get_num_kv_heads(1)
+            and (mc.swa_head_dim, mc.swa_v_head_dim) == (mc.head_dim, mc.v_head_dim)
+        ):
+            return False
+        layer_types = get_dflash_layer_types(mc.hf_config)
+        return (
+            layer_types is not None
+            and len(layer_types) == mc.num_hidden_layers > 0
+            and all(kind == "sliding_attention" for kind in layer_types)
+        )
+
+    def _draft_window_layers(self, draft_model_config, *, draft_backend) -> tuple:
+        from sglang.srt.mem_cache.layout.fused_draft import draft_swa_layer_ids
+
+        swa_ids = draft_swa_layer_ids(draft_model_config)
+        if swa_ids:
+            return swa_ids, self._draft_sliding_layer_window(draft_model_config)
+        if not self._all_window_dflash_draft(
+            draft_model_config, draft_backend=draft_backend
+        ):
+            return (), None
+        from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+            resolve_sliding_layer_window_size,
+        )
+        from sglang.srt.model_loader.utils import get_model_architecture
+
+        model_cls, _ = get_model_architecture(draft_model_config)
+        window = resolve_sliding_layer_window_size(model_cls, draft_model_config)
+        # sliding_window 1 resolves to window_left 0, which no window band holds.
+        if window is None or window <= 0:
+            return (), None
+        return tuple(range(draft_model_config.num_hidden_layers)), window
+
     def _fused_draft_decision(self):
         """Place each draft kind by lifetime and price its own row geometry.
 
@@ -1390,6 +1451,7 @@ class KVCacheConfigurator:
         """
         from sglang.srt.mem_cache.kv.layout.base import _store_dtype_for
         from sglang.srt.mem_cache.layout.fused_draft import (
+            WINDOW_HOST,
             FusedDraftDecision,
             PlacementContext,
             draft_kv_profile,
@@ -1451,6 +1513,9 @@ class KVCacheConfigurator:
             return FusedDraftDecision(
                 declined="draft prefill and decode backends use different DCP widths"
             )
+        window_layer_ids, window = self._draft_window_layers(
+            aux.draft_model_config, draft_backend=draft_backend
+        )
         profile = draft_kv_profile(
             aux.draft_model_config,
             num_layers=int(aux.draft_kv_num_layers),
@@ -1459,7 +1524,8 @@ class KVCacheConfigurator:
             # A DFLASH-family draft config inherits the target's NEXTN depth
             # count; its draft is one block, replicated per runner.
             num_depths=None if self.spec_algorithm.is_eagle() else 1,
-            window=self._draft_sliding_layer_window(aux.draft_model_config),
+            window=window,
+            window_layer_ids=window_layer_ids,
         )
         num_runners = (
             int(get_spec().speculative_num_steps)
@@ -1502,6 +1568,22 @@ class KVCacheConfigurator:
 
         if decision.placement is None:
             return decision
+        hosts = decision.placement.hosts()
+        # PD transfer of a fused draft is validated only for drafts riding in
+        # the target's window sub-pools.
+        if get_disagg().disaggregation_mode != "null" and (
+            decision.placement.new_bands
+            or any(decision.placement.host_kind(h) is not WINDOW_HOST for h in hosts)
+        ):
+            return FusedDraftDecision(
+                declined=(
+                    "PD disaggregation with unified memory supports a speculative "
+                    "draft only when all its layers share the target's "
+                    f"sliding-window sub-pools; this draft would use {list(hosts)}. "
+                    "Use an all-sliding-window DFLASH draft whose window matches "
+                    "the target's, without --speculative-draft-window-size."
+                )
+            )
         draft = aux.draft_model_config
         return msgspec.structs.replace(
             decision,
