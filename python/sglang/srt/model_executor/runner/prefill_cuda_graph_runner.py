@@ -1609,7 +1609,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             return_logprob=forward_batch.return_logprob,
-            has_custom_prefill_readout=has_custom_prefill_readout(forward_batch),
+            has_custom_prefill_readout=(
+                not forward_batch.return_logprob
+                and not self._uses_eager_prefill_tail()
+                and has_custom_prefill_readout(forward_batch)
+            ),
             contains_mm_inputs=forward_batch.contains_mm_inputs(),
             lora_ineligible=self.enable_lora
             and not (
@@ -2407,16 +2411,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.multi_item_delimiter_indices is not None
             and metadata_forward_batch is not static_forward_batch
         ):
-            static_forward_batch.positions[:num_tokens].copy_(
-                forward_batch.positions[:num_tokens]
-            )
-            if (
-                static_forward_batch.mrope_positions is not None
-                and forward_batch.mrope_positions is not None
-            ):
-                static_forward_batch.mrope_positions[:, :num_tokens].copy_(
-                    forward_batch.mrope_positions[:, :num_tokens]
-                )
+            rewritten_positions = forward_batch.positions[:num_tokens]
+            static_forward_batch.positions[:num_tokens].copy_(rewritten_positions)
+            if static_forward_batch.mrope_positions is not None:
+                if (
+                    forward_batch.mrope_positions is not None
+                    and forward_batch.contains_mm_inputs()
+                ):
+                    static_forward_batch.mrope_positions[:, :num_tokens].copy_(
+                        forward_batch.mrope_positions[:, :num_tokens]
+                    )
+                else:
+                    static_forward_batch.mrope_positions[:, :num_tokens].copy_(
+                        rewritten_positions.unsqueeze(0)
+                    )
 
         return static_forward_batch, shared_read_ends
 

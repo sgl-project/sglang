@@ -2390,9 +2390,9 @@ class CPUGraphRunner:
     def _can_run_prefill_graph(self, forward_batch: ForwardBatch) -> bool:
         if not self.capture_num_tokens:
             return False
-        if (
+        if not getattr(self, "_prefill_uses_eager_logits_tail", False) and (
             forward_batch.return_logprob or has_custom_prefill_readout(forward_batch)
-        ) and not self._prefill_uses_eager_logits_tail:
+        ):
             return False
         if forward_batch.input_embeds is not None:
             return False

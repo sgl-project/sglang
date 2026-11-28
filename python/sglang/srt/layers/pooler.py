@@ -103,8 +103,9 @@ def pool_at_delimiter_positions(
     all_index_tensors: List[torch.Tensor] = []
     delim_counts: List[int] = []
     offset = 0
-    for req_idx, req_seq_len in enumerate(forward_batch.extend_seq_lens_cpu):
-        indices_tensor = forward_batch.multi_item_delimiter_indices[req_idx]
+    for req_seq_len, indices_tensor in zip(
+        forward_batch.extend_seq_lens_cpu, forward_batch.multi_item_delimiter_indices
+    ):
         n = len(indices_tensor)
         if n > 0:
             # Clamp to 0 when first_delim == 0 at offset == 0 so

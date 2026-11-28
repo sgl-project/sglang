@@ -2238,6 +2238,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if self.seq_lens_cpu is not None:
                 self.seq_lens_cpu = self.seq_lens_cpu[:bs]
 
+        if logits_output is None or not hasattr(logits_output, "next_token_logits"):
+            return
+
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
                 num_tokens = self.hidden_states_backup.shape[0]
@@ -2309,7 +2312,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.out_cache_loc = self.output_cache_loc_backup
 
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
-            logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+            if logits_output.next_token_logits is not None:
+                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():
@@ -2320,9 +2324,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if self._original_num_tokens is not None
                 else self.seq_lens_sum
             )
-            logits_output.next_token_logits = logits_output.next_token_logits[
-                :num_tokens
-            ]
+            if logits_output.next_token_logits is not None:
+                logits_output.next_token_logits = logits_output.next_token_logits[
+                    :num_tokens
+                ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             if logits_output.mm_input_embeds is not None:

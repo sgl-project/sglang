@@ -805,9 +805,14 @@ class FlashInferAttnBackend(AttentionBackend):
         # on the single-threaded scheduler, which is its dominant cost under load.
         # The delimiter indices already live on the host, so we keep the whole
         # computation on the CPU and pay a single host->device copy per result.
+        mrope_positions = getattr(forward_batch, "mrope_positions", None)
+        mm_inputs = getattr(forward_batch, "mm_inputs", None)
         seq_start = 0
         for i, seq_len in enumerate(extend_seq_lens):
             seq_end = seq_start + seq_len
+            if seq_len == 0 or i >= len(precomputed_indices):
+                seq_start = seq_end
+                continue
             delimiter_indices_cpu = precomputed_indices[i]
             if len(delimiter_indices_cpu) == 0:
                 seq_start = seq_end
@@ -838,11 +843,31 @@ class FlashInferAttnBackend(AttentionBackend):
 
             # Clamp at 0 when prefix_len == 0 (e.g. empty query on BOS-less models)
             # so delimiters at pos_within_item == 0 do not index RoPE cache with -1.
-            forward_batch.positions[seq_start + first_delim : seq_end] = (
+            rewritten_positions = (
                 (prefix_len + pos_within_item - 1)
                 .clamp_min(0)
                 .to(device, non_blocking=True)
             )
+            forward_batch.positions[seq_start + first_delim : seq_end] = (
+                rewritten_positions
+            )
+            has_mm = (
+                mm_inputs is not None
+                and i < len(mm_inputs)
+                and mm_inputs[i] is not None
+                and (
+                    mm_inputs[i].contains_mm_input()
+                    if hasattr(mm_inputs[i], "contains_mm_input")
+                    else True
+                )
+            )
+            if mrope_positions is not None and not has_mm:
+                if mrope_positions.stride(0) == 0:
+                    mrope_positions = mrope_positions.clone()
+                    forward_batch.mrope_positions = mrope_positions
+                mrope_positions[:, seq_start + first_delim : seq_end] = (
+                    rewritten_positions.unsqueeze(0)
+                )
 
             seq_start = seq_end
 

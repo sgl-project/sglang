@@ -14,12 +14,16 @@ bugs in tensor shape handling (e.g., 2D tensors [num_delimiters, num_label_token
 """
 
 import asyncio
+import json
 import os
 import re
+import tempfile
 import unittest
+from pathlib import Path
 
 import requests
 import torch
+from safetensors.torch import save_file
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.srt.entrypoints.engine import Engine
@@ -810,6 +814,68 @@ class TestMultiItemScoringPrefillCudaGraphParity(CustomTestCase):
                 for gp, ep in zip(g_phs, e_phs):
                     torch.testing.assert_close(gp, ep, rtol=5e-2, atol=5e-2)
 
+    def test_mrope_qwen3_5_item_position_invariance(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = _make_tiny_qwen3_5_mrope_dir(Path(tmpdir))
+            tokenizer = AutoTokenizer.from_pretrained(model_dir)
+            labels = [
+                tokenizer.encode(lbl, add_special_tokens=False)[0]
+                for lbl in (" good", " bad")
+            ]
+            target_item = " candidate item with distinct tokens for scoring"
+            long_first_item = " ".join(["distractor"] * 24)
+            solo_call = dict(
+                query="Rate relevance:",
+                items=[target_item],
+                label_token_ids=labels,
+                apply_softmax=False,
+                return_token_logprobs=True,
+            )
+            multi_call = dict(
+                query="Rate relevance:",
+                items=[long_first_item, target_item],
+                label_token_ids=labels,
+                apply_softmax=False,
+                return_token_logprobs=True,
+            )
+            common = dict(
+                model_path=model_dir,
+                enable_mis=True,
+                attention_backend="flashinfer",
+                linear_attn_backend="triton",
+                disable_radix_cache=True,
+                chunked_prefill_size=-1,
+                mem_fraction_static=0.15,
+                dtype="bfloat16",
+                log_level="error",
+            )
+            for disable_cuda_graph in (True, False):
+                with self.subTest(disable_cuda_graph=disable_cuda_graph):
+                    engine = Engine(
+                        **common,
+                        disable_cuda_graph=disable_cuda_graph,
+                    )
+                    try:
+                        info = engine.get_server_info()
+                        expected_backend = (
+                            "disabled" if disable_cuda_graph else "breakable"
+                        )
+                        self.assertEqual(
+                            info["cuda_graph_config"]["prefill"]["backend"],
+                            expected_backend,
+                        )
+                        solo_out = engine.score(**solo_call)
+                        multi_out = engine.score(**multi_call)
+                    finally:
+                        engine.shutdown()
+                        torch.cuda.empty_cache()
+
+                    self._assert_token_logprobs_close(
+                        actual_tlp=[multi_out.token_logprobs[1]],
+                        expected_tlp=[solo_out.token_logprobs[0]],
+                        label=f"qwen3_5 mrope disable_cuda_graph={disable_cuda_graph}",
+                    )
+
 
 def _prefill_graph_count(base_url: str) -> float:
     metrics = requests.get(base_url + "/metrics", timeout=30).text
@@ -839,6 +905,149 @@ def _collect_engine_outputs(*, engine_kwargs, calls):
     finally:
         engine.shutdown()
         torch.cuda.empty_cache()
+
+
+def _make_tiny_qwen3_5_mrope_dir(root: Path) -> str:
+    """Write a minimal hybrid Qwen3_5ForCausalLM checkpoint with M-RoPE."""
+    tokenizer = AutoTokenizer.from_pretrained(TEST_MODEL_NAME)
+    tokenizer.save_pretrained(root)
+
+    hidden_size = 128
+    intermediate_size = 256
+    num_hidden_layers = 2
+    num_attention_heads = 4
+    num_key_value_heads = 2
+    head_dim = 64
+    linear_conv_kernel_dim = 4
+    linear_key_head_dim = 64
+    linear_value_head_dim = 64
+    linear_num_key_heads = 2
+    linear_num_value_heads = 4
+    key_dim = linear_key_head_dim * linear_num_key_heads
+    value_dim = linear_value_head_dim * linear_num_value_heads
+    conv_dim = key_dim * 2 + value_dim
+    vocab_size = len(tokenizer)
+
+    config = {
+        "architectures": ["Qwen3_5ForCausalLM"],
+        "model_type": "qwen3_5_text",
+        "vocab_size": vocab_size,
+        "hidden_size": hidden_size,
+        "intermediate_size": intermediate_size,
+        "num_hidden_layers": num_hidden_layers,
+        "num_attention_heads": num_attention_heads,
+        "num_key_value_heads": num_key_value_heads,
+        "head_dim": head_dim,
+        "hidden_act": "silu",
+        "max_position_embeddings": 1024,
+        "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": True,
+        "attn_output_gate": True,
+        "full_attention_interval": 2,
+        "linear_conv_kernel_dim": linear_conv_kernel_dim,
+        "linear_key_head_dim": linear_key_head_dim,
+        "linear_value_head_dim": linear_value_head_dim,
+        "linear_num_key_heads": linear_num_key_heads,
+        "linear_num_value_heads": linear_num_value_heads,
+        "partial_rotary_factor": 1.0,
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 1.0,
+            "mrope_section": [11, 11, 10],
+            "mrope_interleaved": True,
+        },
+        "torch_dtype": "bfloat16",
+    }
+    (root / "config.json").write_text(json.dumps(config, indent=2))
+
+    gen = torch.Generator().manual_seed(42)
+
+    def rand(shape):
+        return (torch.randn(shape, generator=gen, dtype=torch.float32) * 0.02).to(
+            torch.bfloat16
+        )
+
+    tensors = {
+        "model.embed_tokens.weight": rand((vocab_size, hidden_size)),
+        "model.norm.weight": torch.ones(hidden_size, dtype=torch.bfloat16),
+    }
+    for layer_idx in range(num_hidden_layers):
+        prefix = f"model.layers.{layer_idx}"
+        tensors.update(
+            {
+                f"{prefix}.input_layernorm.weight": torch.ones(
+                    hidden_size, dtype=torch.bfloat16
+                ),
+                f"{prefix}.post_attention_layernorm.weight": torch.ones(
+                    hidden_size, dtype=torch.bfloat16
+                ),
+                f"{prefix}.mlp.gate_proj.weight": rand(
+                    (intermediate_size, hidden_size)
+                ),
+                f"{prefix}.mlp.up_proj.weight": rand((intermediate_size, hidden_size)),
+                f"{prefix}.mlp.down_proj.weight": rand(
+                    (hidden_size, intermediate_size)
+                ),
+            }
+        )
+        if layer_idx == 0:
+            tensors.update(
+                {
+                    f"{prefix}.linear_attn.conv1d.weight": rand(
+                        (conv_dim, 1, linear_conv_kernel_dim)
+                    ),
+                    f"{prefix}.linear_attn.in_proj_qkv.weight": rand(
+                        (conv_dim, hidden_size)
+                    ),
+                    f"{prefix}.linear_attn.in_proj_z.weight": rand(
+                        (value_dim, hidden_size)
+                    ),
+                    f"{prefix}.linear_attn.in_proj_b.weight": rand(
+                        (linear_num_value_heads, hidden_size)
+                    ),
+                    f"{prefix}.linear_attn.in_proj_a.weight": rand(
+                        (linear_num_value_heads, hidden_size)
+                    ),
+                    f"{prefix}.linear_attn.dt_bias": torch.ones(
+                        linear_num_value_heads, dtype=torch.bfloat16
+                    ),
+                    f"{prefix}.linear_attn.A_log": torch.zeros(
+                        linear_num_value_heads, dtype=torch.float32
+                    ),
+                    f"{prefix}.linear_attn.norm.weight": torch.ones(
+                        linear_value_head_dim, dtype=torch.bfloat16
+                    ),
+                    f"{prefix}.linear_attn.out_proj.weight": rand(
+                        (hidden_size, value_dim)
+                    ),
+                }
+            )
+        else:
+            tensors.update(
+                {
+                    f"{prefix}.self_attn.q_proj.weight": rand(
+                        (num_attention_heads * head_dim * 2, hidden_size)
+                    ),
+                    f"{prefix}.self_attn.k_proj.weight": rand(
+                        (num_key_value_heads * head_dim, hidden_size)
+                    ),
+                    f"{prefix}.self_attn.v_proj.weight": rand(
+                        (num_key_value_heads * head_dim, hidden_size)
+                    ),
+                    f"{prefix}.self_attn.o_proj.weight": rand(
+                        (hidden_size, num_attention_heads * head_dim)
+                    ),
+                    f"{prefix}.self_attn.q_norm.weight": torch.ones(
+                        head_dim, dtype=torch.bfloat16
+                    ),
+                    f"{prefix}.self_attn.k_norm.weight": torch.ones(
+                        head_dim, dtype=torch.bfloat16
+                    ),
+                }
+            )
+    save_file(tensors, str(root / "model.safetensors"))
+    return str(root)
 
 
 if __name__ == "__main__":

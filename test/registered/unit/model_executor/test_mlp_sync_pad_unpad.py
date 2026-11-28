@@ -19,7 +19,12 @@ from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode
-from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -329,6 +334,57 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             logits_output.mm_input_embeds, mm_input_embeds[:real]
         )
         self.assertEqual(logits_output.next_token_logits.shape[0], 1)
+
+    def test_extend_post_forward_handles_mis_none_logits_and_pooler_output(self):
+        real, bucket, prefix = 6, 8, 0
+        expected_scores = [torch.tensor([[-0.2, -1.6], [-0.8, -0.5]])]
+        padded_hidden = torch.randn(bucket, 8)
+        cases = (
+            (
+                "mis_none_logits",
+                LogitsProcessorOutput(
+                    next_token_logits=None,
+                    input_token_logprobs=torch.zeros(2),
+                    input_token_ids_logprobs_val=expected_scores,
+                    hidden_states=padded_hidden,
+                ),
+            ),
+            (
+                "pooler_output",
+                EmbeddingPoolerOutput(
+                    embeddings=[torch.tensor([[0.1, 0.9], [0.7, 0.3]])]
+                ),
+            ),
+        )
+        for name, output in cases:
+            with self.subTest(case=name):
+                fb = ForwardBatch(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=1,
+                    input_ids=torch.arange(real),
+                    req_pool_indices=torch.tensor([0]),
+                    seq_lens=torch.tensor([prefix + real]),
+                    out_cache_loc=torch.arange(real),
+                    seq_lens_sum=prefix + real,
+                    positions=torch.arange(real),
+                    seq_lens_cpu=torch.tensor([prefix + real]),
+                    lora_ids=[None],
+                )
+                fb._original_batch_size = fb.batch_size
+                fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=bucket, bs=1)
+                self.assertEqual(fb.positions.shape[0], bucket)
+
+                fb.post_forward_mlp_sync_batch(output)
+
+                torch.testing.assert_close(fb.positions, torch.arange(real))
+                if isinstance(output, LogitsProcessorOutput):
+                    self.assertIsNone(output.next_token_logits)
+                    torch.testing.assert_close(
+                        output.hidden_states, padded_hidden[:real]
+                    )
+                    self.assertIs(output.input_token_ids_logprobs_val, expected_scores)
+                else:
+                    self.assertEqual(len(output.embeddings), 1)
 
     def test_draft_extend_dummy_request_pads_cpu_and_gpu_lens(self):
         spec_info = MagicMock()

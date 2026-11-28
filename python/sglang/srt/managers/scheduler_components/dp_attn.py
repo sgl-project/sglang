@@ -453,9 +453,6 @@ def _local_prefill_cuda_graph_vote(
         replace_embeds = local_batch.replace_embeds
         prefix_lens = local_batch.prefix_lens
         return_logprob = local_batch.return_logprob
-        has_custom_prefill_readout = has_custom_prefill_readout_reqs(
-            getattr(local_batch, "reqs", ())
-        )
     elif (
         mode.is_decode()
         # Conversion replays the breakable graphs only; full's fixed
@@ -487,7 +484,6 @@ def _local_prefill_cuda_graph_vote(
         replace_embeds = None
         prefix_lens = None
         return_logprob = False
-        has_custom_prefill_readout = False
     else:
         return False
 
@@ -511,7 +507,12 @@ def _local_prefill_cuda_graph_vote(
         is_target_verify=mode.is_target_verify(),
         capture_hidden_mode=None,
         return_logprob=return_logprob,
-        has_custom_prefill_readout=has_custom_prefill_readout,
+        has_custom_prefill_readout=(
+            mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and not return_logprob
+            and not prefill_graph_runner._uses_eager_prefill_tail()
+            and has_custom_prefill_readout_reqs(getattr(local_batch, "reqs", ()))
+        ),
         contains_mm_inputs=any(
             mm_input is not None and mm_input.contains_mm_input()
             for mm_input in local_batch.multimodal_inputs or ()

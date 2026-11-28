@@ -26,6 +26,8 @@ def _build(
     seq_lens=None,
     prefix_lens=None,
     mode=ForwardMode.EXTEND,
+    mrope_positions=None,
+    mm_inputs=None,
 ):
     """Construct a minimal forward_batch stub for the builder."""
     fb = SimpleNamespace(
@@ -38,6 +40,10 @@ def _build(
         fb.extend_seq_lens_cpu = seq_lens
     if prefix_lens is not None:
         fb.extend_prefix_lens_cpu = prefix_lens
+    if mrope_positions is not None:
+        fb.mrope_positions = mrope_positions
+    if mm_inputs is not None:
+        fb.mm_inputs = mm_inputs
     return fb
 
 
@@ -166,6 +172,84 @@ class TestMISMetadataBuild(CustomTestCase):
         # builder returns empty params.
         fb = _build([torch.tensor([], dtype=torch.int64)], 14)
         self.assertFalse(_run(fb).is_enabled())
+
+    def test_mrope_positions_keep_second_item_invariant_when_first_item_lengthens(
+        self,
+    ):
+        short_mrope = torch.arange(9, dtype=torch.int64).unsqueeze(0).repeat(3, 1)
+        long_mrope = torch.arange(13, dtype=torch.int64).unsqueeze(0).repeat(3, 1)
+        short_fb = _build(
+            [torch.tensor([3, 5, 7], dtype=torch.int64)],
+            9,
+            mrope_positions=short_mrope,
+        )
+        short_fb.positions = torch.arange(9, dtype=torch.int64)
+        long_fb = _build(
+            [torch.tensor([3, 9, 11], dtype=torch.int64)],
+            13,
+            mrope_positions=long_mrope,
+        )
+        long_fb.positions = torch.arange(13, dtype=torch.int64)
+
+        self.assertTrue(_run(short_fb).is_enabled())
+        self.assertTrue(_run(long_fb).is_enabled())
+        torch.testing.assert_close(
+            short_fb.mrope_positions,
+            short_fb.positions.unsqueeze(0).expand(3, -1),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            long_fb.mrope_positions,
+            long_fb.positions.unsqueeze(0).expand(3, -1),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            long_fb.mrope_positions[:, -2:],
+            short_fb.mrope_positions[:, -2:],
+            rtol=0,
+            atol=0,
+        )
+
+    def test_mrope_positions_stride0_expand_is_materialized_before_write(self):
+        fb = _build(
+            [torch.tensor([4, 7, 10], dtype=torch.int64)],
+            13,
+            mrope_positions=torch.arange(13, dtype=torch.int64)
+            .unsqueeze(0)
+            .expand(3, -1),
+        )
+        fb.positions = torch.arange(13, dtype=torch.int64)
+        self.assertTrue(_run(fb).is_enabled())
+        self.assertNotEqual(fb.mrope_positions.stride(0), 0)
+        torch.testing.assert_close(
+            fb.mrope_positions,
+            fb.positions.unsqueeze(0).expand(3, -1),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_dp_padded_extend_seq_lens_with_trailing_zero_is_ignored(self):
+        fb = _build(
+            [torch.tensor([3, 5, 7], dtype=torch.int64)],
+            9,
+            seq_lens=[9, 0],
+            mrope_positions=torch.arange(9, dtype=torch.int64)
+            .unsqueeze(0)
+            .repeat(3, 1),
+        )
+        p = _run(fb)
+        self.assertTrue(p.is_enabled())
+        self.assertEqual(p.prefix_len_ptr.tolist(), [3])
+        torch.testing.assert_close(
+            fb.mrope_positions[:, 3:],
+            torch.tensor([2, 3, 2, 3, 2, 3], dtype=torch.int64)
+            .unsqueeze(0)
+            .expand(3, -1),
+            rtol=0,
+            atol=0,
+        )
 
 
 if __name__ == "__main__":

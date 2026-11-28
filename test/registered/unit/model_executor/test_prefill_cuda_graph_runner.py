@@ -1031,8 +1031,9 @@ class TestPrefillCudaGraphRunnerMISAndReadout(CustomTestCase):
         rewritten_mrope = rewritten.unsqueeze(0).repeat(3, 1)
 
         def fake_prepare(metadata_fb, _static_fb, _shape_key):
+            # Mirror FlashInfer rewriting only positions while leaving 3D M-RoPE
+            # offsets at their packed values.
             metadata_fb.positions.copy_(rewritten)
-            metadata_fb.mrope_positions.copy_(rewritten_mrope)
             return None
 
         runner._prepare_forward_metadata_for_replay = fake_prepare
@@ -1181,6 +1182,88 @@ class TestPrefillCudaGraphRunnerMISAndReadout(CustomTestCase):
                             model_config=None,
                         ),
                         expected,
+                    )
+
+    def test_eager_tail_backends_skip_custom_readout_checks(self):
+        class _FailIfIteratedReqs:
+            def __iter__(self):
+                raise AssertionError(
+                    "Eager-tail DP vote must not walk local_batch.reqs"
+                )
+
+        for backend in (Backend.BREAKABLE, Backend.FULL):
+            with self.subTest(backend=backend):
+                runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+                runner._is_full_backend = backend == Backend.FULL
+                runner._fa4_prefill = False
+                runner._capture_req_slots = 4
+                runner.enable_lora = False
+                runner._capture_chunked_prefix = False
+                runner._captured_attn_metadata_max_bs = None
+                runner._qwen_bcg_hc_sidechannel = False
+                runner._qwen_bcg_mtp_draft = False
+                runner.prefill_backend_name = backend
+                runner.has_mha_companion_layers = False
+                runner.prefer_eager_mixed_prefill = False
+                runner._backend_vote_prefill_cuda_graph = None
+                runner._backend_can_run_prefill_cuda_graph = None
+                runner.capture_hidden_mode = CaptureHiddenMode.NULL
+                runner.capture_num_tokens = [4]
+                runner.max_context_size = None
+                runner.max_seq_len = None
+                runner.max_num_tokens = 4
+
+                fb = SimpleNamespace(
+                    batch_size=1,
+                    input_ids=torch.zeros(4, dtype=torch.int64),
+                    input_embeds=None,
+                    replace_embeds=None,
+                    extend_prefix_lens_cpu=[0],
+                    forward_mode=ForwardMode.EXTEND,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    return_logprob=False,
+                    global_num_tokens_cpu=None,
+                    contains_mm_inputs=lambda: False,
+                    multi_item_delimiter_indices=[[2, 4]],
+                )
+                schedule_batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=lambda: 1,
+                    extend_num_tokens=4,
+                    input_embeds=None,
+                    replace_embeds=None,
+                    prefix_lens=[0],
+                    return_logprob=False,
+                    multimodal_inputs=None,
+                    reqs=_FailIfIteratedReqs(),
+                )
+                with (
+                    patch(
+                        "sglang.srt.model_executor.runner.prefill_cuda_graph_runner"
+                        ".has_custom_prefill_readout",
+                        side_effect=AssertionError(
+                            "Eager-tail can_run_graph must skip has_custom_prefill_readout"
+                        ),
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.dp_attn"
+                        ".has_custom_prefill_readout_reqs",
+                        side_effect=AssertionError(
+                            "Eager-tail DP vote must skip has_custom_prefill_readout_reqs"
+                        ),
+                    ),
+                ):
+                    self.assertTrue(runner.can_run_graph(fb))
+                    self.assertTrue(
+                        _local_prefill_cuda_graph_vote(
+                            local_batch=schedule_batch,
+                            num_tokens=4,
+                            prefill_graph_runner=runner,
+                            coordinated_prefill=True,
+                            breakable_prefill=(backend == Backend.BREAKABLE),
+                            spec_algorithm=None,
+                            model_config=None,
+                        )
                     )
 
 
