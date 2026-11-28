@@ -37,5 +37,47 @@ def test_fused_gelu_mul(dim, batch_size, seq_len):
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize(
+    "fn",
+    [
+        sgl_kernel.silu_and_mul,
+        sgl_kernel.gelu_tanh_and_mul,
+        sgl_kernel.gelu_and_mul,
+    ],
+)
+def test_act_and_mul_rejects_non_contiguous_and_misaligned(fn):
+    dim = 128
+
+    # Non-contiguous input view (e.g. sliced columns from a wider buffer)
+    buf = torch.randn(4, 4 * dim, dtype=torch.bfloat16, device="cuda")
+    x_nc = buf[:, : 2 * dim]
+    assert not x_nc.is_contiguous()
+    with pytest.raises(ValueError, match="contiguous"):
+        fn(x_nc)
+
+    # Non-contiguous output view
+    x = torch.randn(4, 2 * dim, dtype=torch.bfloat16, device="cuda")
+    out_buf = torch.empty(4, 2 * dim, dtype=torch.bfloat16, device="cuda")
+    out_nc = out_buf[:, :dim]
+    assert not out_nc.is_contiguous()
+    with pytest.raises(ValueError, match="contiguous"):
+        fn(x, out=out_nc)
+
+    # Contiguous but 16-byte misaligned input pointer (+1 element shift)
+    x_mis = torch.randn(1, 2 * dim + 1, dtype=torch.bfloat16, device="cuda")[:, 1:]
+    assert x_mis.is_contiguous()
+    assert x_mis.data_ptr() % 16 != 0
+    with pytest.raises(ValueError, match="16 bytes"):
+        fn(x_mis)
+
+    # Contiguous but 16-byte misaligned output pointer (+1 element shift)
+    x_1d = torch.randn(1, 2 * dim, dtype=torch.bfloat16, device="cuda")
+    out_mis = torch.empty(1, dim + 1, dtype=torch.bfloat16, device="cuda")[:, 1:]
+    assert out_mis.is_contiguous()
+    assert out_mis.data_ptr() % 16 != 0
+    with pytest.raises(ValueError, match="16 bytes"):
+        fn(x_1d, out=out_mis)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

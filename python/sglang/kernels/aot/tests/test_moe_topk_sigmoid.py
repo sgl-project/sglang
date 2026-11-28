@@ -189,5 +189,38 @@ def test_topk_sigmoid_renormalize_correction_bias(num_tokens, num_experts, topk)
     )
 
 
+def test_topk_sigmoid_rejects_non_contiguous():
+    num_tokens, num_experts, topk = 4, 8, 2
+    gating = torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda")
+    weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
+    indices = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+    bias = torch.zeros((num_experts,), dtype=torch.float32, device="cuda")
+
+    gating_nc = torch.randn(
+        (num_tokens, 2 * num_experts), dtype=torch.float32, device="cuda"
+    )[:, :num_experts]
+    with pytest.raises(ValueError, match="gating_output must be contiguous"):
+        topk_sigmoid(weights, indices, gating_nc)
+
+    weights_nc = torch.empty(
+        (num_tokens, 2 * topk), dtype=torch.float32, device="cuda"
+    )[:, :topk]
+    with pytest.raises(ValueError, match="topk_weights must be contiguous"):
+        topk_sigmoid(weights_nc, indices, gating)
+
+    indices_nc = torch.empty((num_tokens, 2 * topk), dtype=torch.int32, device="cuda")[
+        :, :topk
+    ]
+    with pytest.raises(ValueError, match="topk_ids must be contiguous"):
+        topk_sigmoid(weights, indices_nc, gating)
+
+    bias_nc = torch.zeros((2 * num_experts,), dtype=torch.float32, device="cuda")[::2]
+    with pytest.raises(ValueError, match="correction_bias must be contiguous"):
+        topk_sigmoid(weights, indices, gating, correction_bias=bias_nc)
+
+    # Contiguous inputs still succeed
+    topk_sigmoid(weights, indices, gating, correction_bias=bias)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
