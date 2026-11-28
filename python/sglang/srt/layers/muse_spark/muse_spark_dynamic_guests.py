@@ -31,6 +31,14 @@ def maybe_prepare_dynamic_guests(layers: Sequence[torch.nn.Module]) -> None:
             "MoE dynamic guests off: CUDA IPC cannot map expandable segments"
         )
         return
+    if get_parallel().enable_p2p_check:
+        # The flag distrusts the driver's peer-access report, and its probe
+        # (gpu_p2p_access_check) builds a cache behind a barrier on local rank 0;
+        # it cannot run inside the per-rank check below.
+        logger.warning(
+            "MoE dynamic guests off: --enable-p2p-check asks for a probed P2P check"
+        )
+        return
     if not _all_peers_accessible(group):
         logger.warning(
             "MoE dynamic guests off: some GPU pair of the TP group has no peer access"
@@ -63,11 +71,9 @@ def _all_peers_accessible(group) -> bool:
 
     Peers are matched by GPU UUID: with SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS every
     rank is cuda:0 and sees only its own GPU, so a peer it cannot see cannot be
-    checked and counts as inaccessible. Under --enable-p2p-check the cached P2P
-    probe must pass too. A collective: every rank must reach it in the same order.
+    checked and counts as inaccessible. The per-rank part runs no collective, so
+    every rank makes the same two calls whatever it finds.
     """
-    from sglang.srt.distributed.device_communicators import custom_all_reduce_utils
-
     me = torch.cuda.current_device()
     visible = {_gpu_uuid(i): i for i in range(torch.cuda.device_count())}
     mine = _gpu_uuid(me)
@@ -75,12 +81,7 @@ def _all_peers_accessible(group) -> bool:
     dist.all_gather_object(peers, mine, group=group.cpu_group)
     ok = all(
         uuid == mine
-        or (
-            uuid in visible
-            and torch.cuda.can_device_access_peer(me, visible[uuid])
-            # True unless --enable-p2p-check (bootstrap patches it otherwise)
-            and custom_all_reduce_utils.gpu_p2p_access_check(me, visible[uuid])
-        )
+        or (uuid in visible and torch.cuda.can_device_access_peer(me, visible[uuid]))
         for uuid in peers
     )
     agreed = torch.tensor([int(ok)], dtype=torch.int32)

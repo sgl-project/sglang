@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.distributed.device_communicators import custom_all_reduce_utils
 from sglang.srt.layers.muse_spark import muse_spark_dynamic_guests as guests
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -28,14 +27,16 @@ class TestMuseSparkDynamicGuests(unittest.TestCase):
         *,
         rank: int,
         no_peer_access=(),
-        probe_fails=(),
+        enable_p2p_check=False,
         one_visible_device=False,
         other_ranks_agree=True,
+        collectives=None,
     ):
         """Run the setup on ``rank`` of a one-host TP8 group on GPUs ``GPU-0..7``:
-        pairs in ``no_peer_access`` lack P2P, pairs in ``probe_fails`` fail the
-        --enable-p2p-check probe, and ``other_ranks_agree`` is the other ranks' vote.
-        ``one_visible_device`` shows each rank only its own GPU, as cuda:0."""
+        pairs in ``no_peer_access`` lack P2P and ``other_ranks_agree`` is the other
+        ranks' vote. ``one_visible_device`` shows each rank only its own GPU, as
+        cuda:0. The collectives the rank calls are appended to ``collectives``."""
+        collectives = [] if collectives is None else collectives
         layer = SimpleNamespace(
             use_fused_w4a16=True, global_num_experts=256, num_local_experts=32
         )
@@ -44,9 +45,11 @@ class TestMuseSparkDynamicGuests(unittest.TestCase):
         physical = [rank] if one_visible_device else list(range(8))
 
         def gather(out, obj, group):
+            collectives.append("all_gather_object")
             out[:] = [f"GPU-{i}" for i in range(8)]
 
         def all_reduce(t, op, group):
+            collectives.append("all_reduce")
             t.fill_(min(int(t.item()), int(other_ranks_agree)))
 
         def pair(pairs):
@@ -55,7 +58,9 @@ class TestMuseSparkDynamicGuests(unittest.TestCase):
         with (
             patch(
                 "sglang.srt.runtime_context.get_parallel",
-                return_value=SimpleNamespace(tp_group=group, nnodes=1),
+                return_value=SimpleNamespace(
+                    tp_group=group, nnodes=1, enable_p2p_check=enable_p2p_check
+                ),
             ),
             patch.object(
                 torch._C,
@@ -79,11 +84,6 @@ class TestMuseSparkDynamicGuests(unittest.TestCase):
                 "can_device_access_peer",
                 side_effect=pair(no_peer_access),
             ),
-            patch.object(
-                custom_all_reduce_utils,
-                "gpu_p2p_access_check",
-                side_effect=pair(probe_fails),
-            ),
             patch.object(guests.dist, "all_gather_object", side_effect=gather),
             patch.object(guests.dist, "all_reduce", side_effect=all_reduce),
         ):
@@ -96,7 +96,26 @@ class TestMuseSparkDynamicGuests(unittest.TestCase):
         self.assertTrue(self._prepare(rank=0))
         self.assertFalse(self._prepare(rank=3, no_peer_access=[{3, 5}]))
         self.assertFalse(self._prepare(rank=0, other_ranks_agree=False))
-        self.assertFalse(self._prepare(rank=0, probe_fails=[{0, 6}]))
+
+    def test_every_rank_makes_the_same_collectives(self):
+        """Ranks that find different peers still make the same collective calls in
+        the same order, or the vote hangs; --enable-p2p-check keeps guests off on
+        every rank before any collective."""
+        for options in ({}, {"enable_p2p_check": True}):
+            calls = []
+            for rank in range(8):
+                calls.append([])
+                self._prepare(
+                    rank=rank,
+                    no_peer_access=[{3, 5}],
+                    collectives=calls[-1],
+                    **options,
+                )
+            with self.subTest(**options):
+                expected = [] if options else ["all_gather_object", "all_reduce"]
+                self.assertEqual(calls, [expected] * 8)
+        # The probed check is not available here: guests stay off even with full P2P.
+        self.assertFalse(self._prepare(rank=0, enable_p2p_check=True))
 
     def test_unseen_peer_gpus_keep_guests_off(self):
         """With one visible device per process every rank is cuda:0 and cannot check
