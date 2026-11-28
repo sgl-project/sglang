@@ -17,11 +17,21 @@ on:
         type: string
         default: ''
         description: name of test suite to run via run_suite.py (mutually exclusive with test_case)
+      test_case:
+        required: false
+        type: string
+        default: ''
+        description: 'Repo-relative test file run directly (python <file>) instead of the suite; test_suite then only names the output directory.'
       image:
         required: true
         type: string
         description: image for pods
         default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.2.0-a3"
+      container_patches:
+        required: false
+        type: string
+        default: ""
+        description: "Comma separated https URLs of container patch zip archives. Each archive is downloaded and extracted into the workspace, then its install.sh is run inside the container before the test. Empty keeps the image untouched."
       install_sglang_deps:
         required: false
         type: boolean
@@ -75,6 +85,14 @@ on:
         description: 'Coverage-recommended test files for this suite (one repo-relative path per line, from recommend-tests-from-coverage). Empty = run the full suite.'
         type: string
         default: ''
+      use_image_sglang:
+        description: "If 'true', import sglang from the image's site-packages (the checkout's test helpers are synced on top). Empty/false runs the checkout's sglang."
+        type: string
+        default: ''
+      upload_metrics_artifact:
+        description: 'Upload the nightly per-case output directory as npu-metrics-* so release-data pipelines can aggregate it.'
+        type: boolean
+        default: false
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -100,6 +118,86 @@ jobs:
           # Pin to the event SHA (not the branch name) so every job in this run
           # checks out the same commit even if the branch advances mid-run.
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Prepare container patches
+        id: container_patches
+        if: inputs.container_patches != ''
+        shell: bash
+        env:
+          CONTAINER_PATCHES: ${{ inputs.container_patches }}
+        run: |
+          set -euo pipefail
+          mkdir -p container-patches
+          dirs=""
+          while IFS= read -r url; do
+            url="$(echo "${url}" | tr -d '[:space:]')"
+            if [ -z "${url}" ]; then
+              continue
+            fi
+
+            # Only plain https .zip URLs: the extracted path ends up in an
+            # install.sh lookup, so reject anything with shell metacharacters.
+            if ! echo "${url}" | grep -Eq '^https://[A-Za-z0-9._~:/@%+=-]+\.zip$'; then
+              echo "Invalid container patch url: ${url}"
+              exit 1
+            fi
+
+            slug="$(printf '%s' "${url}" | sha256sum | awk '{print $1}')"
+            dest="container-patches/${slug}"
+            # A repeated URL would otherwise install twice.
+            case ",${dirs}," in
+              *",${dest},"*) continue ;;
+            esac
+            rm -rf "${dest}"
+            mkdir -p "${dest}"
+            archive="/tmp/container-patch-${slug}.zip"
+
+            # OBS lives in the same region as the cluster; bypass any proxy.
+            if command -v curl >/dev/null 2>&1; then
+              ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; curl -fsSL -o "${archive}" "${url}" )
+            elif command -v wget >/dev/null 2>&1; then
+              ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; wget -q -O "${archive}" "${url}" )
+            else
+              echo "Neither curl nor wget is available to download ${url}"
+              exit 1
+            fi
+
+            if command -v python3 >/dev/null 2>&1; then
+              python3 -m zipfile -e "${archive}" "${dest}"
+            else
+              python -m zipfile -e "${archive}" "${dest}"
+            fi
+            if [ -z "$(find "${dest}" -type f -name install.sh -print -quit)" ]; then
+              echo "install.sh not found in ${url}"
+              exit 1
+            fi
+
+            dirs="${dirs:+${dirs},}${dest}"
+          done <<< "$(echo "${CONTAINER_PATCHES}" | tr ',' '\n')"
+          echo "dirs=${dirs}" >> "$GITHUB_OUTPUT"
+          echo "Container patch dirs: ${dirs}"
+
+      - name: Apply container patches
+        if: inputs.container_patches != ''
+        shell: bash
+        env:
+          CONTAINER_PATCH_DIRS: ${{ steps.container_patches.outputs.dirs }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r patch_dir; do
+            patch_dir="$(echo "${patch_dir}" | tr -d '[:space:]')"
+            if [ -z "${patch_dir}" ]; then
+              continue
+            fi
+            install_sh="$(pwd)/${patch_dir}/install.sh"
+            if [ ! -f "${install_sh}" ]; then
+              echo "install.sh not found: ${install_sh}" >&2
+              exit 1
+            fi
+            echo "===== Apply container patch: ${patch_dir} - Begin ====="
+            ( cd "$(dirname "${install_sh}")" && bash ./install.sh )
+            echo "===== Apply container patch: ${patch_dir} - End ====="
+          done <<< "$(echo "${CONTAINER_PATCH_DIRS}" | tr ',' '\n')"
 
       - name: Check PR test health
         uses: actions/github-script@v8
@@ -243,9 +341,14 @@ jobs:
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
 
-          # Determine test mode: suite (run_suite.py --suite) or single case file.
+          # Determine test mode: a single test case file, or a registered suite.
           test_suite="${{ inputs.test_suite }}"
-          echo "Test mode: suite (${test_suite})"
+          test_case="${{ inputs.test_case }}"
+          if [ -n "${test_case}" ]; then
+            echo "Test mode: single case (${test_case})"
+          else
+            echo "Test mode: suite (${test_suite})"
+          fi
           tc_name="${test_suite}"
 
           # The ID is used to locate the current job instance,
@@ -347,8 +450,19 @@ jobs:
           echo "SGLANG_SET_CPU_AFFINITY: $SGLANG_SET_CPU_AFFINITY"
 
 
-          # Run the checkout's sglang; the image only supplies the environment.
-          export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
+          # Release-data runs may import sglang from the image's site-packages
+          # (the published artifact); the checkout's test helpers are synced on
+          # top of it. Every other caller runs the checkout's sglang.
+          if [ "${{ inputs.use_image_sglang }}" = "true" ] || [ "${{ inputs.use_image_sglang }}" = "True" ]; then
+            image_sglang_pkg="$(${PYTHON_FOR_SGLANG} -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')"
+            if [ -d "${image_sglang_pkg}/test" ] && [ -d "${sglang_source_path}/python/sglang/test" ]; then
+              echo "Syncing checkout sglang/test → ${image_sglang_pkg}/test"
+              cp -r "${sglang_source_path}/python/sglang/test/"* "${image_sglang_pkg}/test/"
+            fi
+          else
+            # Run the checkout's sglang; the image only supplies the environment.
+            export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
+          fi
 
           # External env scripts may reference unset shell vars (e.g. ZSH_VERSION),
           # which abort the whole script under `set -u`. Temporarily disable -u.
@@ -373,7 +487,15 @@ jobs:
 
           echo "Running test: ${tc_name}"
           test_exit_code=0
-          cd test
+          if [ -n "${test_case}" ] && [ ! -f "${sglang_source_path}/${test_case}" ]; then
+            echo "The test case does not exist: ${sglang_source_path}/${test_case}"
+            exit 1
+          fi
+          # A single case file runs from the repo root, the same way the pods
+          # invoke it; the suite mode keeps the run_suite.py working directory.
+          if [ -z "${test_case}" ]; then
+            cd test
+          fi
 
           # Append `--nightly` and `--continue-on-error` arguments when the job belongs to the nightly pipeline.
           # --nightly: Collect test cases registered for nightly runs.
@@ -430,10 +552,15 @@ jobs:
             exit 0
           fi
 
-          # Run NPU test suite with run_suite.py.
-          # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
-          # tee pipe, so leftover server processes cannot block the pipeline on exit.
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${ONLY_FILE_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          if [ -n "${test_case}" ]; then
+            # Single-case mode: run the file directly with unittest's __main__.
+            ${PYTHON_FOR_SGLANG} -u "${test_case}" 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          else
+            # Run NPU test suite with run_suite.py.
+            # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
+            # tee pipe, so leftover server processes cannot block the pipeline on exit.
+            ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${ONLY_FILE_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          fi
 
           echo "Finished test: ${tc_name}"
 
@@ -474,3 +601,15 @@ jobs:
           path: /tmp/test-logs/*.log
           if-no-files-found: ignore
           retention-days: 7
+
+      # Same artifact shape as the multi-node template, so release-data
+      # pipelines aggregate single-node cases without extra special-casing.
+      - name: Upload metrics artifact
+        if: ${{ always() && inputs.upload_metrics_artifact && inputs.is_nightly_pipeline_job }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-metrics-${{ inputs.test_suite }}-attempt-${{ github.run_attempt }}
+          path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/*
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 9
