@@ -5316,7 +5316,7 @@ class Scheduler(
             forward_steps.forward_processed(getattr(result, "forward_launch", None))
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
-        """Requests whose step in flight commits their last output by length."""
+        """Requests whose step in flight finishes by discard or length."""
         if not self.enable_skip_finishing_decode:
             return []
         return [
@@ -5324,7 +5324,10 @@ class Scheduler(
             for req in batch.reqs
             if req.inflight_steps > 0
             and req.beam_group is None
-            and req.next_output_finishes_by_length()
+            and (
+                req.discard_output_reason is not None
+                or req.next_output_finishes_by_length()
+            )
         ]
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
@@ -6837,9 +6840,7 @@ class Scheduler(
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
             if not req.finished() and recv_req.matches(req.rid):
-                # A running request is finished through `request_finish` and
-                # still runs one decode forward pass.
-                # Then we reuse all existing code to clean up the KV cache allocation.
+                # Finish through result processing so it releases the in-flight KV.
                 logger.debug(f"Abort running request. {req.rid=}")
                 if recv_req.abort_message:
                     # Timeout aborts carry an SLA message + 503 for the client.
@@ -6850,6 +6851,14 @@ class Scheduler(
                     )
                 else:
                     req.request_finish(FINISH_ABORT())
+                if (
+                    self.disaggregation_mode == DisaggregationMode.NULL
+                    and req in self.prefill_launched_reqs
+                    and req.inflight_steps > 0
+                    and req.beam_group is None
+                ):
+                    # Final prefill has not committed; decode keeps its in-flight token.
+                    req.request_discard(req.to_finish)
 
     def _start_pause_window(self) -> None:
         """Stop counting busy time; a repeated pause keeps the first start."""
