@@ -13,6 +13,7 @@ for _module in ("sgl_kernel", "sgl_kernel.quantization", "sgl_kernel.scalar_type
 from sglang.srt.layers.attention import flashattention_backend  # noqa: E402
 from sglang.srt.layers.attention.flashattention_backend import (  # noqa: E402
     FlashAttentionBackend,
+    _forward_splitkv_policy,
 )
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (  # noqa: E402
     UnquantizedKVCacheMethod,
@@ -21,6 +22,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind  # noqa:
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds  # noqa: E402
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter  # noqa: E402
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -67,6 +69,49 @@ def _layer():
 
 
 class TestFlashAttentionPagedMHA(unittest.TestCase):
+    def test_target_verify_uses_decode_splitkv_policy_only_when_eligible(self):
+        common = {
+            "prefill_num_splits": 4,
+            "decode_num_splits": 0,
+        }
+        self.assertEqual(
+            _forward_splitkv_policy(
+                forward_mode=ForwardMode.EXTEND,
+                target_verify_uses_decode_policy=True,
+                max_seqlen_k=1024,
+                **common,
+            ),
+            (4, None),
+        )
+        self.assertEqual(
+            _forward_splitkv_policy(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                target_verify_uses_decode_policy=True,
+                max_seqlen_k=1024,
+                **common,
+            ),
+            (0, 1024),
+        )
+        self.assertEqual(
+            _forward_splitkv_policy(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                target_verify_uses_decode_policy=False,
+                max_seqlen_k=1024,
+                **common,
+            ),
+            (4, None),
+        )
+        self.assertEqual(
+            _forward_splitkv_policy(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                prefill_num_splits=4,
+                decode_num_splits=1,
+                target_verify_uses_decode_policy=True,
+                max_seqlen_k=1024,
+            ),
+            (1, 1024),
+        )
+
     def test_get_paged_mha_kv_cache_supports_head_groups(self):
         backend = _backend()
         backend.token_to_kv_pool = _pool_reading(

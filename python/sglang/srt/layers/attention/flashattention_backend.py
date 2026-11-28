@@ -109,6 +109,20 @@ def _should_disable_scheduler_metadata_precompute() -> bool:
     return bool(get_parallel().enable_prefill_cp or get_parallel().attn_dp_enabled)
 
 
+def _forward_splitkv_policy(
+    *,
+    forward_mode: ForwardMode,
+    prefill_num_splits: int,
+    decode_num_splits: int,
+    target_verify_uses_decode_policy: bool,
+    max_seqlen_k: int,
+) -> tuple[int, Optional[int]]:
+    """Select the runtime-owned split policy and its planning KV length."""
+    if forward_mode.is_target_verify() and target_verify_uses_decode_policy:
+        return decode_num_splits, max_seqlen_k
+    return prefill_num_splits, None
+
+
 @dataclass
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
@@ -325,6 +339,7 @@ class FlashAttentionBackend(AttentionBackend):
         self._anchor_window_cache = {}
         self._anchor_first_layer = {}
         device_capability = get_device_capability()
+        self.device_capability = device_capability
         if self.fa3_upgrades_to_fa4 and device_capability[0] < 9:
             raise ValueError(
                 f"The fa3 backend runs head_dim {model_head_dim} layers on FA4, "
@@ -2026,6 +2041,37 @@ class FlashAttentionBackend(AttentionBackend):
                     window_left=window_size[0],
                 )
 
+            target_verify_uses_decode_policy = (
+                ver == 4
+                and self.device_capability[0] == 12
+                and forward_batch.forward_mode.is_target_verify()
+                and not cp_active
+                and q.dtype == torch.bfloat16
+                and key_cache.dtype == torch.bfloat16
+                and value_cache.dtype == torch.bfloat16
+                and causal
+                and not use_cascade_attn
+                and not use_local_attn
+                and not is_swa_layer
+                and not self.fa_skip_kv_cache
+                and not layer.is_cross_attention
+                and score_mod is None
+                and sinks is None
+                and rel_bias is None
+                and layer.logit_cap in (None, 0.0)
+            )
+            forward_num_splits, forward_max_seqlen_k = _forward_splitkv_policy(
+                forward_mode=forward_batch.forward_mode,
+                prefill_num_splits=num_splits,
+                decode_num_splits=(
+                    self.decode_num_splits
+                    if layer.num_splits is None
+                    else layer.num_splits
+                ),
+                target_verify_uses_decode_policy=target_verify_uses_decode_policy,
+                max_seqlen_k=metadata.max_seq_len_k,
+            )
+
             if cp_active:
 
                 def _fa_cp_attn(
@@ -2150,12 +2196,13 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                     max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=forward_max_seqlen_k,
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     return_softmax_lse=use_cascade_attn or return_lse,
-                    num_splits=num_splits,
+                    num_splits=forward_num_splits,
                     out=_fa_out,
                     **kwargs,
                     ver=ver,
