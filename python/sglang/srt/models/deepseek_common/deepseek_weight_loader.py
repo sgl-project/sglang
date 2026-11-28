@@ -612,19 +612,27 @@ class DeepseekV2WeightLoaderMixin:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
+        # A load that paired every half leaves the model holding what it was
+        # built with: the holder is no state of a loaded model (a weight
+        # snapshot would have to hand it to a process that never loads).
+        if not (pending_qkv_a_proj or pending_indexer_wk):
+            self.__dict__.pop("_pending_weight_halves", None)
+
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def _get_pending_weight_halves(self) -> _PendingWeightHalves:
-        # The mixin has no __init__ of its own, so the first load creates it.
-        if not hasattr(self, "_pending_weight_halves"):
+        # The mixin has no __init__ of its own: a load creates the holder and
+        # keeps it only while a half waits for its pair.
+        if "_pending_weight_halves" not in self.__dict__:
             self._pending_weight_halves = _PendingWeightHalves()
         return self._pending_weight_halves
 
     def discard_pending_weight_halves(self) -> List[str]:
         """Drop the halves still waiting for their pair and return their names.
         A weight update calls it before it loads, and when its session ends."""
-        halves = self._get_pending_weight_halves()
-        self._pending_weight_halves = _PendingWeightHalves()
+        halves = self.__dict__.pop("_pending_weight_halves", None)
+        if halves is None:
+            return []
         return sorted(
             [
                 *halves.qkv_a_proj,
