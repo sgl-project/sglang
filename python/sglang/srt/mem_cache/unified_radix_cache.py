@@ -507,6 +507,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         if self.write_back_overlap is not None:
+            self.write_back_overlap.cancel_lookahead()
             self.writing_check(write_back=True)
             self.write_back_overlap.staged.clear()
         # In-flight restores still read their host slots; finish them first.

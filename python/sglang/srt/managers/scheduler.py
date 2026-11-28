@@ -2320,12 +2320,28 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            overlap = self.write_back_overlap
+            if overlap is not None:
+                # A plan that decode did not consume expires at this decision.
+                overlap.cancel_lookahead()
 
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
+                if (
+                    overlap is not None
+                    and not TEST_RETRACT
+                    and batch is self.running_batch
+                    and batch.forward_mode.is_decode()
+                    and batch_result.delay_sample_func is None
+                    and not self.waiting_queue
+                    and self.chunked_req is None
+                    and not self.grammar_manager.has_waiting_grammars()
+                    and not self._reqs_finishing_inflight(batch)
+                ):
+                    overlap.prepare_lookahead(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -2419,6 +2435,9 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
+        if recv_reqs and self.write_back_overlap is not None:
+            # Input dispatch can change the batch or reset/release the KV pools.
+            self.write_back_overlap.cancel_lookahead()
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
 
@@ -4460,6 +4479,17 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        overlap = self.write_back_overlap
+        if (
+            overlap is not None
+            and overlap.lookahead is not None
+            and (
+                self.waiting_queue
+                or self.chunked_req is not None
+                or self.grammar_manager.has_waiting_grammars()
+            )
+        ):
+            overlap.cancel_lookahead()
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
