@@ -351,6 +351,10 @@ class SRTPlatform(DeviceMixin):
         """
         pass
 
+    def skip_untracked_mamba_commit_on_cpu(self) -> bool:
+        """Whether post-verify Mamba commit should skip tracking on CPU when no page boundary can cross."""
+        return False
+
     # ------------------------------------------------------------------
     # Teardown
     # ------------------------------------------------------------------

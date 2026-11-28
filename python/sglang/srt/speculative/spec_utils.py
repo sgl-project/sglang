@@ -41,6 +41,7 @@ from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -1232,6 +1233,30 @@ def _verify_commit_step_indices(
     return last_correct_step_indices, mamba_steps_to_track
 
 
+def _can_skip_mamba_track_on_cpu(
+    batch: ScheduleBatch, bs: int, draft_token_num: int
+) -> bool:
+    """Return True when no request in ``batch`` can cross a Mamba track page boundary."""
+    seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
+    tree_cache = getattr(batch, "tree_cache", None)
+    if (
+        seq_lens_cpu is None
+        or tree_cache is None
+        or seq_lens_cpu.device.type != "cpu"
+        or seq_lens_cpu.ndim != 1
+        or seq_lens_cpu.numel() < bs
+        or seq_lens_cpu.dtype not in (torch.int32, torch.int64)
+    ):
+        return False
+    interval = mamba_track_grid(tree_cache.page_size)
+    # Under 1-step overlap, post-verify seq_len <= seq_len_cpu + 2 * draft_token_num.
+    max_span = 2 * draft_token_num
+    return interval > max_span and all(
+        sl >= 0 and sl // interval == (sl + max_span) // interval
+        for sl in seq_lens_cpu[:bs].tolist()
+    )
+
+
 def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,
@@ -1438,10 +1463,19 @@ def commit_mamba_states_after_verify(
 
     attn_backend = model_runner.attn_backend
     if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+        eff_track_indices = batch.mamba_track_indices
+        eff_steps_to_track = mamba_steps_to_track
+        if (
+            eff_track_indices is not None
+            and current_platform.skip_untracked_mamba_commit_on_cpu()
+            and _can_skip_mamba_track_on_cpu(batch, bs, draft_token_num)
+        ):
+            eff_track_indices = None
+            eff_steps_to_track = None
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
-            mamba_steps_to_track=mamba_steps_to_track,
+            mamba_track_indices=eff_track_indices,
+            mamba_steps_to_track=eff_steps_to_track,
             model=model_runner.model,
             req_pool_indices=batch.req_pool_indices[:bs],
             state_slots=state_slots,
