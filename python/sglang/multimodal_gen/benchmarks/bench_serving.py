@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.test.test_utils import print_divider, print_value_formatted
+from sglang.srt.utils.auth import admin_auth_headers
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -524,6 +525,7 @@ class ProfileReqOutput:
 
 async def async_request_profile(
     api_url: str,
+    admin_api_key: Optional[str] = None,
     session: Optional[aiohttp.ClientSession] = None,
 ) -> ProfileReqOutput:
     """Send a profile start/stop request to the server."""
@@ -535,7 +537,9 @@ async def async_request_profile(
         close_session = True
 
     try:
-        async with session.post(api_url) as response:
+        async with session.post(
+            api_url, headers=admin_auth_headers(admin_api_key)
+        ) as response:
             response_text = await response.text()
             if response.status == 200:
                 output.success = True
@@ -695,7 +699,8 @@ async def benchmark(args):
         # Start profiler if --profile is enabled (after warmup)
         if args.profile:
             profile_output = await async_request_profile(
-                api_url=f"{args.base_url}/start_profile"
+                api_url=f"{args.base_url}/start_profile",
+                admin_api_key=args.admin_api_key,
             )
             if profile_output.success:
                 logger.info(f"Profiler started: {profile_output.message}")
@@ -724,7 +729,8 @@ async def benchmark(args):
     if args.profile:
         logger.info("Stopping profiler and saving traces...")
         profile_output = await async_request_profile(
-            api_url=f"{args.base_url}/stop_profile"
+            api_url=f"{args.base_url}/stop_profile",
+            admin_api_key=args.admin_api_key,
         )
         if profile_output.success:
             logger.info(f"Profiler stopped: {profile_output.message}")
@@ -907,6 +913,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable full pipeline profiling. "
         "Traces are saved to the server's SGLANG_TORCH_PROFILER_DIR.",
+    )
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which --profile requires "
+        "(default: SGLANG_ADMIN_API_KEY).",
     )
     parser.add_argument(
         "--log-level",

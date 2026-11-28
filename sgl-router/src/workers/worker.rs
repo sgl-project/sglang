@@ -3,8 +3,8 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use sglang_api_types::api::v1::sglang_service_client::SglangServiceClient;
 use sglang_processor::openai::OpenAiSettings;
-use sglang_runtime_v1_types::sglang_service_client::SglangServiceClient;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -53,6 +53,8 @@ pub struct EngineProfile {
     pub grpc_port: Option<u16>,
     /// The engine's chat template renders a system message after the first.
     pub supports_inline_system: bool,
+    /// A prefill engine answers a request for at most one token with no decode.
+    pub prefill_answers_alone: bool,
 }
 
 impl From<WireProtocol> for EngineProfile {
@@ -63,12 +65,13 @@ impl From<WireProtocol> for EngineProfile {
             openai: None,
             grpc_port: None,
             supports_inline_system: false,
+            prefill_answers_alone: false,
         }
     }
 }
 
 /// The engine's own default message cap (`DEFAULT_GRPC_MAX_MESSAGE_SIZE` in
-/// rust/sglang-grpc), so the router never rejects what the engine accepts.
+/// rust/sglang-server/src/api_server/grpc/app.rs).
 pub const GRPC_MAX_MESSAGE_BYTES: usize = 64 << 20;
 
 /// A client that dials on first use; only an unparsable address yields `None`.
@@ -264,6 +267,7 @@ pub struct Worker {
     dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
     supports_inline_system: bool,
+    prefill_answers_alone: bool,
 }
 
 impl Worker {
@@ -285,6 +289,7 @@ impl Worker {
             openai,
             grpc_port,
             supports_inline_system,
+            prefill_answers_alone,
         } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -316,6 +321,7 @@ impl Worker {
             dp_rank_turn: AtomicUsize::new(0),
             openai,
             supports_inline_system,
+            prefill_answers_alone,
         }
     }
 
@@ -325,6 +331,12 @@ impl Worker {
 
     pub fn supports_inline_system(&self) -> bool {
         self.supports_inline_system
+    }
+
+    /// Whether this prefill engine answers a request for at most one token by
+    /// itself, as reported by its `/server_info`.
+    pub fn prefill_answers_alone(&self) -> bool {
+        self.prefill_answers_alone
     }
 
     pub fn services(&self) -> BTreeSet<String> {

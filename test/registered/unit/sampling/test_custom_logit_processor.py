@@ -106,7 +106,8 @@ class TestCustomLogitProcessorRows(CustomTestCase):
         and the gathered-rows path."""
         processor_str = _WriteRowId.to_str()
         exec_context = SimpleNamespace(
-            features=SimpleNamespace(enable_custom_logit_processor=True)
+            features=SimpleNamespace(enable_custom_logit_processor=True),
+            deterministic=SimpleNamespace(enable_deterministic_inference=False),
         )
         # Row j holds request order[j].
         order = [2, 0, 1]
@@ -118,8 +119,11 @@ class TestCustomLogitProcessorRows(CustomTestCase):
                             processor_str if rid in opted_in else None
                         ),
                         grammar=None,
+                        return_sampling_mask=False,
                         sampling_params=SimpleNamespace(
-                            custom_params={"row": rid}, logit_bias=None
+                            custom_params={"row": rid},
+                            logit_bias=None,
+                            sampling_seed=None,
                         ),
                     )
                     for rid in order
@@ -129,7 +133,7 @@ class TestCustomLogitProcessorRows(CustomTestCase):
                     "sglang.srt.sampling.sampling_batch_info.get_exec",
                     return_value=exec_context,
                 ):
-                    info.set_plugin_state(reqs)
+                    info.set_step_state(reqs)
                 logits = torch.full((3, 4), -1.0)
                 apply_custom_logit_processor(logits, info)
                 want = [float(rid) if rid in opted_in else -1.0 for rid in order]

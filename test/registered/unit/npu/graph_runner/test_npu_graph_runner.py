@@ -44,7 +44,10 @@ def make_backend(*, dflash=False, dspark=False, width=1, bs=4, raw_bs=2):
 def test_cpu_lengths_are_padded_without_reading_device_lengths():
     backend, _, _ = make_backend()
     batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+        forward_mode=SimpleNamespace(
+            is_target_verify=lambda: False,
+            is_idle=mock.Mock(return_value=False),
+        ),
         seq_lens_cpu=torch.tensor([10, 11, 999]),
         seq_lens=mock.Mock(),
     )
@@ -169,7 +172,10 @@ def test_replay_respects_attention_cpu_length_capability(
     verify = dflash or dspark
     lengths = [13, 14] if verify else [10, 11]
     batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(is_target_verify=lambda: verify),
+        forward_mode=SimpleNamespace(
+            is_target_verify=lambda: verify,
+            is_idle=mock.Mock(return_value=False),
+        ),
         seq_lens_cpu=torch.tensor(lengths) if needs_cpu_seq_lens else None,
         seq_lens=torch.tensor([10, 11]),
     )
@@ -250,7 +256,10 @@ def test_common_replay_builds_host_payload_but_dsa_skips_host_update():
 
     backend.replay_with_input_update = updated_output
     batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+        forward_mode=SimpleNamespace(
+            is_target_verify=lambda: False,
+            is_idle=mock.Mock(return_value=False),
+        ),
         seq_lens_cpu=torch.tensor([10, 11]),
     )
     with (
@@ -280,6 +289,7 @@ def test_common_replay_builds_host_payload_but_dsa_skips_host_update():
 def test_dflash_preparation_refreshes_lengths_and_cache_slots():
     backend, runner, attention = make_backend(dflash=True)
     runner.require_mlp_tp_gather = False
+    runner.require_attn_tp_gather = False
     runner.require_gathered_buffer = False
     runner.capture_bs = [4]
     runner._pad_to_bucket = lambda size, buckets: 4

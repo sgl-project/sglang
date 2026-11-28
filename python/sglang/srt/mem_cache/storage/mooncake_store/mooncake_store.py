@@ -103,6 +103,55 @@ def _normalize_tenant_id(value) -> str:
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
 
 
+def _normalize_egm_numa_nodes(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(node) for node in value)
+    text = str(value).strip()
+    return text if text else None
+
+
+def _mooncake_supports_egm_store_pool(store_cls) -> bool:
+    # setup(config) ignores keys it does not know, so an older Mooncake would
+    # build an ordinary pool; its pybind docstring lists the supported keys.
+    return "enable_egm_store_pool" in (store_cls.setup.__doc__ or "")
+
+
+def _current_gpu_host_numa_node() -> Optional[int]:
+    # Only a hint for the default egm_numa_nodes: the caller falls back to
+    # Mooncake's "auto" on None, so a missing cuda-bindings package, a driver
+    # too old to know the attribute, or a failed query must not abort setup.
+    try:
+        from cuda.bindings import driver
+
+        err, node = driver.cuDeviceGetAttribute(
+            driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID,
+            torch.cuda.current_device(),
+        )
+    except Exception as e:
+        logger.debug("Host NUMA probe of the current GPU failed: %r", e)
+        return None
+    if err != driver.CUresult.CUDA_SUCCESS or node < 0:
+        return None
+    return node
+
+
+def _resolve_egm_numa_nodes(configured: Optional[str]) -> str:
+    if configured is not None:
+        return configured
+    # Keep each rank's segment on its own GPU's socket; Mooncake's "auto"
+    # spreads it over the nodes of every GPU the process can see.
+    node = _current_gpu_host_numa_node()
+    if node is None:
+        logger.warning(
+            "Could not read the host NUMA node of the current GPU; "
+            "using egm_numa_nodes='auto'."
+        )
+        return "auto"
+    return str(node)
+
+
 @dataclass
 class MooncakeStoreConfig:
     local_hostname: str
@@ -120,6 +169,8 @@ class MooncakeStoreConfig:
     tenant_id: str = DEFAULT_TENANT_ID
     # TCP and other staged GPU transports need space for in-flight transfers.
     local_buffer_size: int = DEFAULT_LOCAL_BUFFER_SIZE
+    enable_egm_store_pool: bool = False
+    egm_numa_nodes: Optional[str] = None
 
     def __post_init__(self):
         self.local_buffer_size = int(self.local_buffer_size)
@@ -207,6 +258,18 @@ class MooncakeStoreConfig:
             local_buffer_size=config.get(
                 "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
             ),
+            # Like "protocol", fall back to the env vars when the keys are omitted.
+            enable_egm_store_pool=envs.MOONCAKE_ENABLE_EGM_STORE_POOL.parse(
+                str(
+                    config.get(
+                        "enable_egm_store_pool",
+                        envs.MOONCAKE_ENABLE_EGM_STORE_POOL.get(),
+                    )
+                ).strip()
+            ),
+            egm_numa_nodes=_normalize_egm_numa_nodes(
+                config.get("egm_numa_nodes", envs.MOONCAKE_EGM_NUMA_NODES.get())
+            ),
         )
 
     @staticmethod
@@ -239,6 +302,10 @@ class MooncakeStoreConfig:
             enable_ssd_offload=envs.MOONCAKE_ENABLE_SSD_OFFLOAD.get(),
             ssd_offload_path=envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.get(),
             tenant_id=_normalize_tenant_id(envs.MOONCAKE_TENANT_ID.get()),
+            enable_egm_store_pool=envs.MOONCAKE_ENABLE_EGM_STORE_POOL.get(),
+            egm_numa_nodes=_normalize_egm_numa_nodes(
+                envs.MOONCAKE_EGM_NUMA_NODES.get()
+            ),
         )
 
     @staticmethod
@@ -292,7 +359,51 @@ class MooncakeStoreConfig:
             local_buffer_size=extra_config.get(
                 "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
             ),
+            # Like "protocol", fall back to the env vars when the keys are omitted.
+            enable_egm_store_pool=envs.MOONCAKE_ENABLE_EGM_STORE_POOL.parse(
+                str(
+                    extra_config.get(
+                        "enable_egm_store_pool",
+                        envs.MOONCAKE_ENABLE_EGM_STORE_POOL.get(),
+                    )
+                ).strip()
+            ),
+            egm_numa_nodes=_normalize_egm_numa_nodes(
+                extra_config.get("egm_numa_nodes", envs.MOONCAKE_EGM_NUMA_NODES.get())
+            ),
         )
+
+
+def load_mooncake_store_config(extra_config: Optional[dict]) -> MooncakeStoreConfig:
+    """Resolve the store config from extra_config, the config file, or the env."""
+    if extra_config and (
+        extra_config.get("master_server_address") is not None
+        or extra_config.get("client_server_address") is not None
+    ):
+        config = MooncakeStoreConfig.load_from_extra_config(extra_config)
+        logger.info("Mooncake Configuration loaded from extra_config successfully.")
+
+    elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
+        config = MooncakeStoreConfig.from_file()
+        logger.info("Mooncake Configuration loaded from file successfully.")
+
+    else:
+        config = MooncakeStoreConfig.load_from_env()
+        logger.info("Mooncake Configuration loaded from env successfully.")
+
+    # The EGM keys configure this rank's own segment, so an explicit value in
+    # extra_config applies even when the endpoint comes from a file or env.
+    if extra_config:
+        if "enable_egm_store_pool" in extra_config:
+            config.enable_egm_store_pool = envs.MOONCAKE_ENABLE_EGM_STORE_POOL.parse(
+                str(extra_config["enable_egm_store_pool"]).strip()
+            )
+        if "egm_numa_nodes" in extra_config:
+            config.egm_numa_nodes = _normalize_egm_numa_nodes(
+                extra_config["egm_numa_nodes"]
+            )
+
+    return config
 
 
 class MooncakeBaseStore:
@@ -338,26 +449,9 @@ class MooncakeBaseStore:
         return ReplicateConfig, supports_group_ids
 
     def _load_config(self, storage_config: Any = None):
-        extra_config = (
+        return load_mooncake_store_config(
             getattr(storage_config, "extra_config", None) if storage_config else None
         )
-
-        if extra_config and (
-            extra_config.get("master_server_address") is not None
-            or extra_config.get("client_server_address") is not None
-        ):
-            config = MooncakeStoreConfig.load_from_extra_config(extra_config)
-            logger.info("Mooncake Configuration loaded from extra_config successfully.")
-
-        elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
-            config = MooncakeStoreConfig.from_file()
-            logger.info("Mooncake Configuration loaded from file successfully.")
-
-        else:
-            config = MooncakeStoreConfig.load_from_env()
-            logger.info("Mooncake Configuration loaded from env successfully.")
-
-        return config
 
     def register_buffer(self, tensor: torch.Tensor):
         if self.store is None:
@@ -530,6 +624,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.store = MooncakeDistributedStore()
 
             self.config = self._load_config(storage_config)
+            self._validate_egm_store_pool(store_cls=MooncakeDistributedStore)
             extra_config = (
                 getattr(storage_config, "extra_config", None)
                 if storage_config
@@ -682,41 +777,49 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if self.config.tenant_id != DEFAULT_TENANT_ID:
                     setup_kwargs["tenant_id"] = self.config.tenant_id
 
-                while True:
-                    try:
-                        ret_code = self.store.setup(
-                            client_hostname,
-                            self.config.metadata_server,
-                            per_rank_global_segment_size,
-                            self.config.local_buffer_size,
-                            self.config.protocol,
-                            device_name,
-                            self.config.master_server_address,
-                            transfer_engine,
-                            **setup_kwargs,
-                        )
-                        break
-                    except TypeError as e:
-                        unsupported_kwargs = [
-                            key for key in list(setup_kwargs) if key in str(e)
-                        ]
-                        if not unsupported_kwargs:
-                            raise
-                        if "tenant_id" in unsupported_kwargs:
-                            raise RuntimeError(
-                                "The installed Mooncake version does not support "
-                                "tenant_id in MooncakeDistributedStore.setup(). "
-                                "Please upgrade Mooncake to use non-default "
-                                "Mooncake tenants with SGLang."
-                            ) from e
-                        logger.warning(
-                            "The installed Mooncake version does not support the "
-                            f"{', '.join(unsupported_kwargs)} parameter(s) in setup(). "
-                            f"Retrying without {', '.join(unsupported_kwargs)}. "
-                            "Please upgrade Mooncake to enable SSD offload support."
-                        )
-                        for key in unsupported_kwargs:
-                            setup_kwargs.pop(key, None)
+                if self.config.enable_egm_store_pool:
+                    ret_code = self._setup_egm_store_pool(
+                        local_hostname=client_hostname,
+                        device_name=device_name,
+                        global_segment_size=per_rank_global_segment_size,
+                        setup_kwargs=setup_kwargs,
+                    )
+                else:
+                    while True:
+                        try:
+                            ret_code = self.store.setup(
+                                client_hostname,
+                                self.config.metadata_server,
+                                per_rank_global_segment_size,
+                                self.config.local_buffer_size,
+                                self.config.protocol,
+                                device_name,
+                                self.config.master_server_address,
+                                transfer_engine,
+                                **setup_kwargs,
+                            )
+                            break
+                        except TypeError as e:
+                            unsupported_kwargs = [
+                                key for key in list(setup_kwargs) if key in str(e)
+                            ]
+                            if not unsupported_kwargs:
+                                raise
+                            if "tenant_id" in unsupported_kwargs:
+                                raise RuntimeError(
+                                    "The installed Mooncake version does not support "
+                                    "tenant_id in MooncakeDistributedStore.setup(). "
+                                    "Please upgrade Mooncake to use non-default "
+                                    "Mooncake tenants with SGLang."
+                                ) from e
+                            logger.warning(
+                                "The installed Mooncake version does not support the "
+                                f"{', '.join(unsupported_kwargs)} parameter(s) in setup(). "
+                                f"Retrying without {', '.join(unsupported_kwargs)}. "
+                                "Please upgrade Mooncake to enable SSD offload support."
+                            )
+                            for key in unsupported_kwargs:
+                                setup_kwargs.pop(key, None)
             if ret_code:
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"
@@ -793,7 +896,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
             self.registered_pools = {}
 
-            self.gb_per_page = None
             self.prefetch_pgs = []
             self.backup_pgs = []
             self.prefetch_bandwidth = []
@@ -805,6 +907,58 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         except Exception as exc:
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
+
+    def _validate_egm_store_pool(self, *, store_cls) -> None:
+        if not self.config.enable_egm_store_pool:
+            return
+        if self.config.protocol != "nvlink":
+            raise ValueError(
+                "enable_egm_store_pool requires protocol 'nvlink', "
+                f"got {self.config.protocol!r}."
+            )
+        if self.config.standalone_storage:
+            raise ValueError(
+                "enable_egm_store_pool configures this process's own Mooncake "
+                "client; it cannot be combined with standalone_storage."
+            )
+        if not _mooncake_supports_egm_store_pool(store_cls):
+            raise RuntimeError(
+                "The installed Mooncake does not support enable_egm_store_pool. "
+                "Please upgrade Mooncake to 0.3.14 or later."
+            )
+
+    def _setup_egm_store_pool(
+        self,
+        *,
+        local_hostname: str,
+        device_name: str,
+        global_segment_size: int,
+        setup_kwargs: dict,
+    ) -> int:
+        # Only the setup(config) overload accepts the EGM keys; every value is
+        # passed as a string, matching Mooncake's ConfigDict.
+        setup_config = {
+            "local_hostname": local_hostname,
+            "metadata_server": self.config.metadata_server,
+            "global_segment_size": str(global_segment_size),
+            "local_buffer_size": str(self.config.local_buffer_size),
+            "protocol": self.config.protocol,
+            "rdma_devices": device_name,
+            "master_server_addr": self.config.master_server_address,
+            "enable_egm_store_pool": "true",
+            "egm_numa_nodes": _resolve_egm_numa_nodes(self.config.egm_numa_nodes),
+        }
+        for key, value in setup_kwargs.items():
+            setup_config[key] = (
+                str(value).lower() if isinstance(value, bool) else str(value)
+            )
+        logger.info(
+            "Setting up Mooncake store with an EGM-backed pool of %d bytes on "
+            "NUMA node(s) %s.",
+            global_segment_size,
+            setup_config["egm_numa_nodes"],
+        )
+        return self.store.setup(setup_config)
 
     @staticmethod
     def _iter_host_pool_buffers(host_pool: HostKVCache):
@@ -888,12 +1042,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
-
-        bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
-        if self.unified_chunk_spans is not None:
-            # A unified page is every chunk this rank owns, K and V together.
-            bytes_per_page = sum(length for _, length in self.unified_chunk_spans)
-        self.gb_per_page = bytes_per_page / (1 << 30)
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         # KV anchor memory is already registered via register_mem_pool_host().
@@ -1492,6 +1640,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return key_list, ptr_list, element_size_list
 
     @staticmethod
+    def _transfer_gb(sizes: List[Any]) -> float:
+        return sum(
+            sum(size) if isinstance(size, Sequence) else size for size in sizes
+        ) / (1 << 30)
+
+    @staticmethod
     def _uses_multi_buffer(buffer_ptrs: List[Any]) -> bool:
         return bool(buffer_ptrs) and isinstance(buffer_ptrs[0], Sequence)
 
@@ -1633,7 +1787,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
             self.prefetch_bandwidth.append(
-                len(keys) / (end_time - start_time) * self.gb_per_page
+                self._transfer_gb(buffer_sizes) / (end_time - start_time)
             )
 
         if self.unified_suffixes is not None:
@@ -1704,12 +1858,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         # Chunks differ in size (a short final layer range), so count
                         # the pages touched and the bytes actually put.
                         backup_pages = len({i // key_multiplier for i in set_indices})
-                        backup_gb = sum(set_buffer_sizes) / (1 << 30)
                     else:
                         backup_pages = len(set_keys)
-                        backup_gb = backup_pages * self.gb_per_page
                     self.backup_pgs.append(backup_pages)
-                    self.backup_bandwidth.append(backup_gb / (end_time - start_time))
+                    self.backup_bandwidth.append(
+                        self._transfer_gb(set_buffer_sizes) / (end_time - start_time)
+                    )
 
                 for i in range(len(set_indices)):
                     set_results[set_indices[i]] = put_results[i]
@@ -1776,7 +1930,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.enable_storage_metrics:
             self.backup_pgs.append(len(set_keys))
             self.backup_bandwidth.append(
-                len(set_keys) / (end_time - start_time) * self.gb_per_page
+                self._transfer_gb(set_target_sizes) / (end_time - start_time)
             )
 
         for i in range(len(set_indices)):
@@ -1827,7 +1981,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
             self.prefetch_bandwidth.append(
-                len(keys) / (end_time - start_time) * self.gb_per_page
+                self._transfer_gb(target_sizes) / (end_time - start_time)
             )
 
         for i in range(len(keys)):

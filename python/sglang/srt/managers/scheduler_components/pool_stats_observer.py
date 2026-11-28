@@ -81,6 +81,9 @@ class PoolStats:
     # The sub-pool of the target's own window (`window_sub_pool_of`), which
     # the single-window `swa_*` numbers report.
     target_window: Optional[str] = None
+    # Unified pools of a full band and exactly one swa band, with no state band:
+    # the share of the arena's bytes in used (non-evictable) full and swa pages
+    total_kv_bytes_usage: Optional[float] = None
 
     # For mamba pools
     mamba_capacity: Optional[int] = None
@@ -144,6 +147,8 @@ class PoolStats:
                     f"#{w.name} token: {w.num_used}",
                     f"{w.name} token usage: {w.token_usage:.2f}",
                 ]
+            if self.total_kv_bytes_usage is not None:
+                parts.append(f"total kv bytes usage: {self.total_kv_bytes_usage:.2f}")
         if self.is_hybrid_ssm:
             if not self.windows:
                 parts += [
@@ -173,6 +178,7 @@ class PoolStats:
         stats.num_used_tokens = num_used
         stats.token_usage = round(self.get_max_pool_usage(), 2)
         stats.full_token_usage = self.full_token_usage
+        stats.total_kv_bytes_usage = self.total_kv_bytes_usage
         stats.window_token_usage = {w.name: w.token_usage for w in self.windows}
         stats.window_available_tokens = {w.name: w.available_size for w in self.windows}
         stats.window_evictable_tokens = {w.name: w.evictable_size for w in self.windows}
@@ -413,6 +419,11 @@ class SchedulerPoolStatsObserver:
                     token_usage=token_usage,
                 )
             )
+        total_kv_bytes_usage = (
+            self.storage.kv_bytes_usage(full_num_used, window_stats[0].num_used)
+            if len(window_stats) == 1
+            else None
+        )
 
         return PoolStats(
             full_capacity=full_capacity,
@@ -422,4 +433,5 @@ class SchedulerPoolStatsObserver:
             full_evictable_size=full_evictable_size,
             windows=tuple(window_stats),
             target_window=window_sub_pool_of(self.token_to_kv_pool_allocator),
+            total_kv_bytes_usage=total_kv_bytes_usage,
         )
