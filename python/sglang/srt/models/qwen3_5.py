@@ -268,6 +268,9 @@ def _qwen3_5_stage_facts(
 def _linear_uses_npu_mxfp8(linear: nn.Module) -> bool:
     if not (_is_npu and envs.SGLANG_NPU_ENABLE_MXFP8_FUSION.get()):
         return False
+    # LoRA wrappers attach after layer __init__ and expect unquantized tensors.
+    if hasattr(linear, "base_layer"):
+        return False
     npu_ops = getattr(torch.ops, "npu", None)
     if not (
         hasattr(npu_ops, "npu_add_rms_norm_dynamic_mx_quant")
@@ -1240,7 +1243,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         ffn_quant = (
             "npu_mxfp8"
-            if self._ffn_npu_mxfp8 and self.ffn_boundary.reads_quantized(forward_batch)
+            if self._ffn_npu_mxfp8
+            and not hasattr(self.mlp.gate_up_proj, "base_layer")
+            and self.ffn_boundary.reads_quantized(forward_batch)
             else ""
         )
         hidden_states = self.ffn_boundary.prepare(
@@ -1689,6 +1694,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_quant = (
             "npu_mxfp8"
             if self._attn_npu_mxfp8
+            and not hasattr(self.qkv_proj, "base_layer")
             and captured_last_layer_outputs is None
             and self.attn_boundary.reads_quantized(forward_batch)
             else ""
@@ -1713,7 +1719,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         ffn_quant = (
             "npu_mxfp8"
-            if self._ffn_npu_mxfp8 and self.ffn_boundary.reads_quantized(forward_batch)
+            if self._ffn_npu_mxfp8
+            and not hasattr(self.mlp.gate_up_proj, "base_layer")
+            and self.ffn_boundary.reads_quantized(forward_batch)
             else ""
         )
         hidden_states = self.ffn_boundary.prepare(

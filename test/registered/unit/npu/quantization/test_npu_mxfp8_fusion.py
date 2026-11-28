@@ -58,15 +58,76 @@ class TestNPUMXFP8Fusion(CustomTestCase):
         self.assertIs(npu_ops.npu_quant_matmul.call_args.kwargs["pertoken_scale"], xs)
         self.assertEqual(out.shape, (6, 64))
 
-    def test_dtype_utils_handles_missing_torch_npu_on_cpu(self):
+    def test_dtype_utils_keeps_tensor_dtype_separate_from_npu_enum(self):
         old_cache = dtype_utils._E8M0_DTYPE
         try:
+            dtype_utils._E8M0_DTYPE = None
+            fake_torch_npu = SimpleNamespace(float8_e8m0fnu=293)
+            with (
+                patch("sglang.srt.utils.is_npu", return_value=True),
+                patch.dict("sys.modules", {"torch_npu": fake_torch_npu}),
+            ):
+                # _get_float8_e8m0fnu_dtype() must remain a real torch.dtype for tensor.view(...)
+                view_dtype = dtype_utils._get_float8_e8m0fnu_dtype()
+                self.assertEqual(view_dtype, getattr(torch, "float8_e8m0fnu", None))
+                self.assertNotIsInstance(view_dtype, int)
+                # _require_e8m0_dtype() resolves the NPU enum for operator scale_dtype args
+                self.assertEqual(dtype_utils._require_e8m0_dtype(), 293)
+
             dtype_utils._E8M0_DTYPE = None
             with patch("sglang.srt.utils.is_npu", return_value=False):
                 resolved = dtype_utils._get_float8_e8m0fnu_dtype()
             self.assertEqual(resolved, getattr(torch, "float8_e8m0fnu", None))
         finally:
             dtype_utils._E8M0_DTYPE = old_cache
+
+    def test_add_norm_npu_mxfp8_respects_fp16_and_native_gemma_override(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.layernorm import GemmaRMSNorm
+
+        fn = _norm_quant_kernel("npu_mxfp8")
+        plain_out = torch.randn((4, 64), dtype=torch.float16)
+        norm = MagicMock(
+            weight=torch.ones(64, dtype=torch.float16), variance_epsilon=1e-6
+        )
+        norm.return_value = plain_out
+        x_fp16 = torch.randn((4, 64), dtype=torch.float16)
+
+        npu_ops = MagicMock()
+        with patch.object(torch.ops, "npu", npu_ops, create=True):
+            out_fp16, res_fp16 = fn(norm, x_fp16, None, None)
+        npu_ops.npu_rms_norm_dynamic_mx_quant.assert_not_called()
+        self.assertIs(out_fp16, plain_out)
+        self.assertIs(res_fp16, x_fp16)
+
+        # GemmaRMSNorm with SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM=1 must stay on plain path
+        gemma = GemmaRMSNorm(64, eps=1e-6).to(torch.bfloat16)
+        x_bf16 = torch.randn((4, 64), dtype=torch.bfloat16)
+        with (
+            patch.object(torch.ops, "npu", npu_ops, create=True),
+            patch.object(
+                envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM,
+                "get",
+                return_value=True,
+            ),
+            patch.object(gemma, "forward", return_value=x_bf16) as mock_fwd,
+        ):
+            out_g, _ = fn(gemma, x_bf16, None, None)
+        npu_ops.npu_rms_norm_dynamic_mx_quant.assert_not_called()
+        mock_fwd.assert_called_once()
+        self.assertIs(out_g, x_bf16)
+
+    def test_lora_wrapped_linear_disables_npu_mxfp8_readout(self):
+        from sglang.srt.models import qwen3_5
+
+        lora_wrapped = SimpleNamespace(
+            base_layer=SimpleNamespace(),
+            quant_method=SimpleNamespace(
+                w8a8_block_fp8_linear=npu_w8a8_mxfp8_linear,
+            ),
+        )
+        with patch.object(qwen3_5, "_is_npu", True):
+            self.assertFalse(qwen3_5._linear_uses_npu_mxfp8(lora_wrapped))
 
     def test_add_norm_npu_mxfp8_dispatch(self):
         fn = _norm_quant_kernel("npu_mxfp8")

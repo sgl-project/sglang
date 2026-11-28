@@ -227,7 +227,10 @@ class Qwen2MoeMLP(nn.Module):
         self._enable_npu_swiglu_mx_quant = None
 
     def _can_run_npu_swiglu_mx_quant(self, gate_up: torch.Tensor) -> bool:
-        if not _is_npu:
+        if not _is_npu or gate_up.ndim != 2 or gate_up.dtype != torch.bfloat16:
+            return False
+        # LoRA wrappers expect floating-point activations rather than (qx, xs) tuples.
+        if hasattr(self.down_proj, "base_layer"):
             return False
         if self._enable_npu_swiglu_mx_quant is None:
             enabled = False
@@ -241,11 +244,7 @@ class Qwen2MoeMLP(nn.Module):
                 elif qm is not None and qm.__class__.__name__ == "NPUMXFP8LinearMethod":
                     enabled = True
             self._enable_npu_swiglu_mx_quant = enabled
-        return (
-            self._enable_npu_swiglu_mx_quant
-            and gate_up.ndim == 2
-            and gate_up.dtype in (torch.bfloat16, torch.float16)
-        )
+        return self._enable_npu_swiglu_mx_quant
 
     def forward(
         self,

@@ -270,6 +270,13 @@ def _update_and_read_residual_npu_mxfp8(
     norm, hidden_states, residual, post_residual_addition
 ):
     """Ascend 950 fused (add +) RMSNorm + dynamic MXFP8 quantization."""
+    if hidden_states.dtype != torch.bfloat16 or (
+        isinstance(norm, GemmaRMSNorm)
+        and envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get()
+    ):
+        return _update_and_read_residual_plain(
+            norm, hidden_states, residual, post_residual_addition
+        )
     weight = norm.gemma_weight if isinstance(norm, GemmaRMSNorm) else norm.weight
     if weight.dtype != hidden_states.dtype:
         weight = weight.to(hidden_states.dtype)

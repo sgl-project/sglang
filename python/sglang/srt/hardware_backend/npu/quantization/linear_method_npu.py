@@ -16,6 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.quantization.dtype_utils import (
     _get_float4_e2m1fn_x2_dtype,
     _get_float8_e8m0fnu_dtype,
+    _require_e8m0_dtype,
 )
 from sglang.srt.hardware_backend.npu.quantization.linear_utils import (
     cache_linear_bias_fp32,
@@ -270,7 +271,7 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
         quant_bias = get_linear_bias_fp32(layer, bias)
 
-        e8m0_dtype = _get_float8_e8m0fnu_dtype()
+        e8m0_dtype = _require_e8m0_dtype()
         output = torch.ops.npu.npu_quant_matmul(
             qx,
             layer.weight,
@@ -328,7 +329,7 @@ def npu_w8a8_mxfp8_linear(
         x_fp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
             input_2d, dst_type=torch.float8_e4m3fn
         )
-    e8m0_dtype = _get_float8_e8m0fnu_dtype()
+    e8m0_dtype = _require_e8m0_dtype()
     quant_bias = (
         bias.to(torch.float32)
         if bias is not None and bias.dtype != torch.float32
@@ -475,7 +476,7 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        e8m0_dtype = _get_float8_e8m0fnu_dtype()
+        e8m0_dtype = _require_e8m0_dtype()
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
 
         original_dtype = x.dtype
@@ -587,7 +588,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        e8m0_dtype = _get_float8_e8m0fnu_dtype()
+        e8m0_dtype = _require_e8m0_dtype()
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
 
         original_dtype = x.dtype
@@ -710,7 +711,7 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        e8m0_dtype = _get_float8_e8m0fnu_dtype()
+        e8m0_dtype = _require_e8m0_dtype()
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
 
         original_dtype = x.dtype
