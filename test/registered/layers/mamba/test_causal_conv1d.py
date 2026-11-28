@@ -24,6 +24,12 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.mamba.causal_conv1d import (
+    causal_conv1d_fn as layer_causal_conv1d_fn,
+)
+from sglang.srt.layers.attention.mamba.causal_conv1d import (
+    causal_conv1d_update as layer_causal_conv1d_update,
+)
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import empty_gpu_cache
 
@@ -660,6 +666,211 @@ def test_causal_conv1d_oot_dispatch(monkeypatch):
 
     actual = causal_conv1d_fn(expected, expected, None, expected, expected, [])
     assert actual is expected
+
+
+@pytest.mark.parametrize("itype", [torch.bfloat16, torch.float16])
+def test_causal_conv1d_fn_fp32_conv_state_cache(itype):
+    """SGLANG_MAMBA_CONV_DTYPE=float32 with bf16/fp16 activations must route
+    contiguous inputs through Triton, compile all three conv_states write-back
+    branches, and preserve fp32 precision on shifted conv_states columns."""
+    device = get_device()
+    torch.manual_seed(0)
+    dim, width = 96, 4
+    # Covers: (0) seqlen < state_len with init state (tl.where fp32 shift),
+    # (1) seqlen < state_len without init state, (2) state_len <= seqlen <= BLOCK_M,
+    # and (3) multi-chunk seqlen > BLOCK_M (chunk_offset > 0).
+    seqlens = [1, 2, 9, 2049]
+    bounds = [0] + torch.tensor(seqlens).cumsum(0).tolist()
+    query_start_loc = torch.tensor(bounds, dtype=torch.int32, device=device)
+
+    x = torch.randn(dim, sum(seqlens), dtype=itype, device=device).contiguous()
+    assert x.stride(-1) == 1
+    weight = torch.randn(dim, width, dtype=itype, device=device)
+    bias = torch.randn(dim, dtype=itype, device=device)
+
+    fp32_probe = 1.0 + 2.0**-20 + 2.0**-23
+    conv_states = torch.randn(6, width - 1, dim, dtype=torch.float32, device=device)
+    conv_states = conv_states.transpose(1, 2)
+    cache_indices = torch.tensor([4, 1, 5, 2], dtype=torch.int32, device=device)
+    has_initial_state = torch.tensor(
+        [True, False, True, True], dtype=torch.bool, device=device
+    )
+    conv_states[4, 0, 1] = fp32_probe
+    conv_states_init = conv_states.clone()
+
+    out = layer_causal_conv1d_fn(
+        x,
+        weight,
+        bias=bias,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        conv_states=conv_states,
+        activation="silu",
+        seq_lens_cpu=seqlens,
+    )
+
+    assert out.dtype == itype
+    assert conv_states.dtype == torch.float32
+    # Slot 4 had seqlen=1 and has_initial_state=True: col 1 shifts to col 0 in fp32.
+    assert conv_states[4, 0, 0].item() == fp32_probe
+    assert torch.equal(conv_states[0], conv_states_init[0])
+    assert torch.equal(conv_states[3], conv_states_init[3])
+
+    expected_outs = []
+    state_len = width - 1
+    for i, seqlen in enumerate(seqlens):
+        slot = int(cache_indices[i])
+        x_i = x[:, bounds[i] : bounds[i + 1]].unsqueeze(0)
+        init_i = (
+            conv_states_init[slot].unsqueeze(0).to(itype)
+            if has_initial_state[i]
+            else None
+        )
+        out_i, _ = causal_conv1d_ref(
+            x_i,
+            weight,
+            bias,
+            initial_states=init_i,
+            return_final_states=False,
+            activation="silu",
+        )
+        expected_outs.append(out_i.squeeze(0))
+
+        x_fp32 = x_i.squeeze(0).to(torch.float32)
+        if seqlen >= state_len:
+            expected_state = x_fp32[:, -state_len:]
+        elif has_initial_state[i]:
+            expected_state = torch.cat(
+                [conv_states_init[slot, :, seqlen:], x_fp32], dim=-1
+            )
+        else:
+            expected_state = F.pad(x_fp32, (state_len - seqlen, 0))
+        assert torch.equal(conv_states[slot], expected_state)
+
+    rtol, atol = (1e-2, 5e-2) if itype == torch.bfloat16 else (3e-3, 5e-3)
+    torch.testing.assert_close(
+        out, torch.cat(expected_outs, dim=-1), rtol=rtol, atol=atol
+    )
+
+
+@pytest.mark.parametrize("itype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("seqlen", [1, 3])
+def test_causal_conv1d_update_fp32_conv_state_cache(itype, seqlen):
+    """Decode and multi-token causal_conv1d_update with fp32 conv_state and
+    bf16/fp16 activations must route through Triton and preserve fp32 state."""
+    device = get_device()
+    torch.manual_seed(1)
+    batch, dim, width, num_slots = 3, 96, 4, 8
+    x = torch.randn(batch + 1, seqlen, dim, dtype=itype, device=device).transpose(1, 2)
+    weight = torch.randn(dim, width, dtype=itype, device=device)
+    bias = torch.randn(dim, dtype=itype, device=device)
+
+    fp32_probe = 1.0 + 2.0**-20 + 2.0**-23
+    conv_state = torch.randn(
+        num_slots, width - 1, dim, dtype=torch.float32, device=device
+    ).transpose(1, 2)
+    conv_state[5, 0, 1] = fp32_probe
+    conv_state_before = conv_state.clone()
+    indices = torch.tensor([5, 2, 6, PAD_SLOT_ID], dtype=torch.int32, device=device)
+
+    out = layer_causal_conv1d_update(
+        x.squeeze(-1) if seqlen == 1 else x,
+        conv_state,
+        weight,
+        bias=bias,
+        activation="silu",
+        conv_state_indices=indices,
+        pad_slot_id=PAD_SLOT_ID,
+    )
+    if seqlen == 1:
+        out = out.unsqueeze(-1)
+
+    assert out.dtype == itype
+    assert conv_state.dtype == torch.float32
+    if seqlen == 1:
+        assert conv_state[5, 0, 0].item() == fp32_probe
+
+    state_len = width - 1
+    rtol, atol = (1e-2, 5e-2) if itype == torch.bfloat16 else (3e-3, 5e-3)
+    for b, slot in enumerate([5, 2, 6]):
+        cat_fp32 = torch.cat([conv_state_before[slot], x[b].float()], dim=-1)
+        expected_state = cat_fp32[:, -state_len:]
+        assert torch.equal(conv_state[slot], expected_state)
+        out_ref = F.silu(
+            F.conv1d(
+                cat_fp32.unsqueeze(0),
+                weight.float().unsqueeze(1),
+                bias.float(),
+                padding=0,
+                groups=dim,
+            ).squeeze(0)[:, -seqlen:]
+        ).to(itype)
+        torch.testing.assert_close(out[b], out_ref, rtol=rtol, atol=atol)
+
+    for untouched in [0, 1, 3, 4, 7]:
+        assert torch.equal(conv_state[untouched], conv_state_before[untouched])
+
+
+def test_causal_conv1d_update_eagle_tree_fp32_conv_state_cache():
+    """Tree speculative verify (HAS_EAGLE_TREE_CUSTOM_ATTN_MASK) must unify
+    matrix_x across in-chunk tokens (bf16) and prior conv_state taps (fp32)."""
+    device = get_device()
+    torch.manual_seed(2)
+    batch, seqlen, dim, width = 2, 3, 64, 4
+    x = torch.randn(batch, seqlen, dim, dtype=torch.bfloat16, device=device).transpose(
+        1, 2
+    )
+    weight = torch.randn(dim, width, dtype=torch.bfloat16, device=device)
+    bias = torch.randn(dim, dtype=torch.bfloat16, device=device)
+    conv_state = torch.randn(batch, dim, width - 1, dtype=torch.float32, device=device)
+    conv_state_ref = conv_state.clone()
+    conv_state_indices = torch.arange(batch, dtype=torch.int32, device=device)
+    intermediate_indices = torch.arange(batch, dtype=torch.int32, device=device)
+    window = torch.zeros(
+        batch, seqlen, dim, width - 1, dtype=torch.float32, device=device
+    )
+
+    # Linear chain represented as an Eagle tree: 0 -> 1 -> 2, no siblings.
+    retrieve_next_token = torch.tensor(
+        [[1, 2, -1], [1, 2, -1]], dtype=torch.int32, device=device
+    )
+    retrieve_next_sibling = torch.full(
+        (batch, seqlen), -1, dtype=torch.int32, device=device
+    )
+    retrieve_parent_token = torch.full(
+        (batch, seqlen), -1, dtype=torch.int32, device=device
+    )
+
+    out_tree = causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias=bias,
+        activation="silu",
+        conv_state_indices=conv_state_indices,
+        intermediate_conv_window=window,
+        intermediate_state_indices=intermediate_indices,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
+        retrieve_parent_token=retrieve_parent_token,
+    )
+    window_ref = torch.zeros_like(window)
+    out_chain = causal_conv1d_update(
+        x,
+        conv_state_ref,
+        weight,
+        bias=bias,
+        activation="silu",
+        conv_state_indices=conv_state_indices,
+        intermediate_conv_window=window_ref,
+        intermediate_state_indices=intermediate_indices,
+    )
+
+    assert out_tree.dtype == torch.bfloat16
+    assert torch.equal(conv_state, conv_state_ref)
+    assert torch.equal(window, window_ref)
+    torch.testing.assert_close(out_tree, out_chain, rtol=1e-2, atol=5e-2)
 
 
 if __name__ == "__main__":

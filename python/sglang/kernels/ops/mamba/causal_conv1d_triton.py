@@ -213,7 +213,12 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 & (idx_feats < dim)[None, :]
             )  # token-index  # token-index  # feature-index
             loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-            new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
+            # Keep each conv_states write-back branch in its own variable: this
+            # branch and the !load_init_state branch load x's dtype, whereas the
+            # load_init_state tl.where promotes to conv_states' dtype (e.g. fp32
+            # when SGLANG_MAMBA_CONV_DTYPE=float32), which would otherwise fail
+            # Triton's if/else SSA type join.
+            new_conv_state_small = tl.load(x_ptrs, mask_x, 0.0)
             idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
             conv_states_ptrs_target = (
                 conv_states_base[None, :]
@@ -222,7 +227,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
             tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
-            tl.store(conv_states_ptrs_target, new_conv_state, mask)
+            tl.store(conv_states_ptrs_target, new_conv_state_small, mask)
 
         else:
             if load_init_state:
@@ -257,7 +262,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 loaded_x = tl.load(x_ptrs, mask_x, 0.0)
 
                 tl.debug_barrier()  # need this due to the bug in tl.where not enforcing this when data is the result of another tl.load
-                new_conv_state = tl.where(
+                new_conv_state_init = tl.where(
                     mask, conv_state, loaded_x
                 )  # BUG in 'tl.where'  which requires a barrier before this
                 conv_states_ptrs_target = (
@@ -267,7 +272,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[
                     None, :
                 ]
-                tl.store(conv_states_ptrs_target, new_conv_state, mask)
+                tl.store(conv_states_ptrs_target, new_conv_state_init, mask)
             else:  # load_init_state == False
                 # update conv_state by shifting left, BUT
                 # set cols prior to 'x' as zeros + cols from 'x'
@@ -285,7 +290,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                     & (idx_tokens_conv - VAL < seqlen)[:, None]
                     & (idx_feats < dim)[None, :]
                 )  # token-index  # token-index  # feature-index
-                new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
+                new_conv_state_noinit = tl.load(x_ptrs, mask_x, 0.0)
 
                 conv_states_ptrs_target = (
                     conv_states_base
@@ -294,7 +299,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[
                     None, :
                 ]
-                tl.store(conv_states_ptrs_target, new_conv_state, mask)
+                tl.store(conv_states_ptrs_target, new_conv_state_noinit, mask)
 
     else:  # chunk_offset > 0
         # read prior-token data from `x`
@@ -1007,9 +1012,10 @@ def _causal_conv1d_update_kernel(
                     parent_idx_tokens,
                 )
 
+            conv_elem_ty = conv_state_ptr.dtype.element_ty
             _idx_token = idx_token
             x_ptrs_1d = x_base_1d + _idx_token * stride_x_token  # [BLOCK_N]
-            matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+            matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d).to(conv_elem_ty)
             # convolution operation: itself * wcol[-1] + parent * wcol[-2] + grand-parent * wcol[-3] + ...
             for j in tl.static_range(KERNEL_WIDTH):
                 if KERNEL_WIDTH == 2:
@@ -1060,7 +1066,7 @@ def _causal_conv1d_update_kernel(
                         tl.where(idx_tokens == _idx_token, parent_idx_tokens, 0)
                     )
                     x_ptrs_1d = x_base_1d + _idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d).to(conv_elem_ty)
                 else:
                     # no parent within the current chunk, load from prev conv state: col[-1] (idx 0's parent), col[-2] (idx 0's grand parent), ...
                     if KERNEL_WIDTH == 2:
