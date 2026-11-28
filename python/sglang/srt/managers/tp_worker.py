@@ -43,7 +43,11 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.managers.utils import (
+    GenerationBatchResult,
+    compute_num_reserved_tokens,
+    get_request_length_limits,
+)
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_page_size,
     get_max_decode_ahead,
@@ -425,11 +429,13 @@ class TpModelWorker(BaseTpWorker):
 
         # Validation
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            self.model_runner.effective_logical_max_total_num_tokens - 1,
-        )
-        assert max_req_len > 0, "Memory pool size is too small"
+        assert (
+            min(
+                self.model_config.context_len,
+                self.model_runner.effective_logical_max_total_num_tokens,
+            )
+            > 1
+        ), "Memory pool size is too small"
 
     def init_attention_backends(self):
         """Initialize attention backends for all model runners."""
@@ -571,11 +577,7 @@ class TpModelWorker(BaseTpWorker):
                 kv_capacity,
                 self.model_config.context_len,
             )
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            kv_capacity - 1,
-        )
-        max_req_input_len = max_req_len - 5
+        effective_kv_capacity = kv_capacity
         spec = get_spec()
         if spec.speculative_algorithm == "UBTREE":
             # Reserve the double-buffered speculative decode write-ahead on the
@@ -590,13 +592,20 @@ class TpModelWorker(BaseTpWorker):
                     "--mem-fraction-static, or lower "
                     "--speculative-num-draft-tokens."
                 )
-            max_req_len = min(
-                self.model_config.context_len - 1,
-                kv_capacity - 1 - reserve,
-            )
-            max_req_input_len = min(max_req_input_len, max_req_len - 5)
-        if self.dllm_algorithm is not None:
-            max_req_input_len -= self.dllm_algorithm.block_size
+            effective_kv_capacity = kv_capacity - reserve
+        max_req_len, max_req_input_len = get_request_length_limits(
+            self.model_config.context_len,
+            effective_kv_capacity,
+            dllm_block_size=(
+                self.dllm_algorithm.block_size if self.dllm_algorithm is not None else 0
+            ),
+            num_reserved_tokens=compute_num_reserved_tokens(),
+        )
+        assert max_req_input_len >= 1, (
+            f"No prompt fits: max_req_input_len={max_req_input_len} from "
+            f"context_len={self.model_config.context_len} and "
+            f"kv_capacity={kv_capacity}; raise the context length or the KV pool size."
+        )
         return (
             self.model_runner.logical_max_total_num_tokens,
             get_schedule().max_prefill_tokens,
