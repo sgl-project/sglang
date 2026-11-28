@@ -269,10 +269,13 @@ def get_attn_backend(
 ) -> type[AttentionBackend]:
     """Resolve an attention backend for one layer.
 
-    ``supported_attention_backends`` constrains automatic selection only. An
+    ``supported_attention_backends`` constrains automatic selection. An
     explicitly requested backend may be newer than a model's preference set;
     it is admitted when the platform resolves it and the backend satisfies the
-    layer's semantic requirements.
+    layer's semantic requirements. The exception is a fallback-capable
+    component (auxiliary components, platform defaults): there the declared set
+    wins, because it is how a model excludes layers the requested backend
+    cannot actually serve.
     """
     attention_role = AttentionRole.CROSS if is_cross_attention else AttentionRole.SELF
     requirements = attention_requirements or AttentionRequirements()
@@ -383,9 +386,17 @@ def get_attn_backend(
                 )
             continue
         explicit_candidate = selection_is_explicit and candidate_index == 0
+        # An explicit request may name a backend newer than the layer's declared
+        # set, so it is honored when there is nothing to fall back to, or when it
+        # comes from a component/role override. A global --attention-backend
+        # request on a fallback-capable component yields instead: the declared set
+        # is how a model excludes layers that backend cannot actually serve.
+        explicit_overrides_declaration = explicit_candidate and (
+            allowed_fallback_reason is None or not selected_from_global_cli
+        )
         if (
             automatic_backends
-            and not explicit_candidate
+            and not explicit_overrides_declaration
             and not _is_backend_supported(candidate_backend, automatic_backends)
         ):
             if selection_error is None:
@@ -436,6 +447,16 @@ def get_attn_backend(
             f"Attention backend '{selected_backend.name.lower()}' was requested "
             f"for '{make_component_role_key(component_name, attention_role)}' but "
             f"could not be used ({fallback_reason}); using {backend_name} instead"
+        )
+    if selected_from_global_cli and fallback_reason is not None:
+        # --attention-backend named a backend that these layers declare they
+        # cannot use. Falling back is correct, but the request was clamped.
+        component_name = get_component_attn_backend_name() or "component"
+        logger.warning_once(
+            f"Attention backend '{selected_backend.name.lower()}' requested via "
+            f"--attention-backend is not supported by '{component_name}' layers "
+            f"({[str(backend) for backend in be_tuple]} declared); using "
+            f"{backend_name} instead"
         )
     if reason is None and selected_from_role_override:
         # Diverging from the component-wide backend is the point of a role

@@ -293,6 +293,22 @@ class TestAttentionBackendFallback(unittest.TestCase):
         self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
 
+    def test_explicit_global_backend_respects_declared_set_on_auxiliary_component(
+        self,
+    ):
+        # A model declaring {fa, torch_sdpa} is stating that aiter cannot serve
+        # these layers. --attention-backend must not silently override that on a
+        # component that is allowed to fall back.
+        backend = self._resolve(
+            AttentionBackendEnum.AITER,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            allow_global_backend_fallback=True,
+        )
+
+        self.assertIs(backend, _FakeFABackend)
+
     def test_explicit_component_backend_ignores_automatic_selection_set(self):
         backend = self._resolve(
             AttentionBackendEnum.FA,
