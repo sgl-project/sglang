@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -10,6 +10,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import (
+    get_argument_type,
     get_schema_properties,
     safe_literal_eval,
 )
@@ -30,18 +31,6 @@ _PARAM_WITH_NAME_REGEX = re.compile(
     r"<param\s+name=[\'\"]([^\'\"]+)[\'\"]>([\s\S]*?)</param>", re.DOTALL
 )
 _PARAM_MISSING_NAME_REGEX = re.compile(r"<param(?![^>]*\bname=)[^>]*>", re.DOTALL)
-
-
-def get_argument_type(
-    func_name: str, arg_key: str, name_to_tool: Dict[str, Tool]
-) -> Optional[str]:
-    tool = name_to_tool.get(func_name)
-    if not tool:
-        return None
-    params = tool.function.parameters or {}
-    if not isinstance(params, dict):
-        return None
-    return get_schema_properties(params).get(arg_key, {}).get("type")
 
 
 def parse_arguments(json_value):
@@ -83,6 +72,7 @@ class MiniCPM5Detector(BaseFormatDetector):
         calls = []
         name_to_tool = {t.function.name: t for t in tools if t.function.name}
         tool_names = set(name_to_tool.keys())
+        defined_tools = list(name_to_tool.values())
         name_to_allowed_props = {}
         name_to_required = {}
         for name, t in name_to_tool.items():
@@ -157,7 +147,7 @@ class MiniCPM5Detector(BaseFormatDetector):
                             val_text = param.text or ""
                             val_text = val_text.strip()
                             arg_type = get_argument_type(
-                                func_name or "", key, name_to_tool
+                                func_name or "", key, defined_tools
                             )
                             if arg_type != "string":
                                 parsed_val, _ = parse_arguments(val_text)
@@ -200,7 +190,7 @@ class MiniCPM5Detector(BaseFormatDetector):
                                 val_text = val_text[len("<![CDATA[") : -len("]]>")]
                             val_text = val_text.strip()
                             arg_type = get_argument_type(
-                                func_name or "", key, name_to_tool
+                                func_name or "", key, defined_tools
                             )
                             if arg_type != "string":
                                 parsed_val, _ = parse_arguments(val_text)
