@@ -542,6 +542,17 @@ sglang serve \
   --port 30010
 ```
 
+### MP4 encoding
+
+MP4 output uses CPU libx264 by default. Set `SGLANG_USE_NVENC=1` before launching
+`sglang serve` or `sglang generate` to try hardware H.264 encoding on supported
+NVIDIA GPUs with PyNvVideoCodec installed. An explicit `--x264-preset` or
+`--output-quality maximum` keeps the x264 path.
+
+`--quality` controls model inference, not file compression. Selecting `high`
+does not enable NVENC, and `lossless` does not imply a lossless MP4. Enabling
+NVENC can change the decoded pixels and file size even with the same VAE frames.
+
 ### Asynchronous output saving
 
 Use `--async-output-save` to overlap output saving with the next request during

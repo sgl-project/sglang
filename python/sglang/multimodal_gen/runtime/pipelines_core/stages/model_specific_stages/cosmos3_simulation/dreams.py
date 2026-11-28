@@ -21,6 +21,7 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
+from sglang.multimodal_gen import envs as diffusion_envs
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     HISTORY_MODE_FULL,
     TEXT_TOKENS_TRAINING_MAX,
@@ -53,6 +54,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+    EncodeWhileDecoding,
+    streamed_video_output_path,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     denormalize_vae_latents,
@@ -851,17 +856,24 @@ class CausalDecodeQueue:
     """Decode committed latent chunks with the causal Wan VAE on a side stream.
 
     Each chunk waits for the producing stream, decodes with the decoder's
-    feature cache carried across chunks, and lands in pinned host memory
-    asynchronously; leaving the context drains the stream and resets the VAE,
-    then ``finish`` concatenates the completed frames.
+    feature cache carried across chunks, optionally submits frames for video
+    encoding, and lands them in pinned host memory asynchronously. Leaving the
+    context drains the stream and resets the VAE; ``finish`` concatenates the
+    host frames if encoding needs to fall back.
     """
 
     def __init__(
-        self, vae: Any, *, device: torch.device, quality: str = "exact"
+        self,
+        vae: Any,
+        *,
+        device: torch.device,
+        quality: str = "exact",
+        encoder: EncodeWhileDecoding | None = None,
     ) -> None:
         self.vae = vae
         self.fast_path = quality_allows(quality, "lossless")
         self.device = device
+        self.encoder = encoder
         self.stream = torch.cuda.Stream(device=device)
         self.outputs: list[torch.Tensor] = []
         self.submitted = 0
@@ -883,6 +895,8 @@ class CausalDecodeQueue:
             self.vae.reset_causal_decode_state()
             if exc_type is not None:
                 self.outputs.clear()
+                if self.encoder is not None:
+                    self.encoder.abort()
         finally:
             # Drain last: freeing pinned outputs records host-allocator events
             # on this stream, so they must land before the final sync.
@@ -901,6 +915,8 @@ class CausalDecodeQueue:
             use_vae_fast_path(self.vae, self.fast_path),
         ):
             video = self.vae.causal_decode(self._denormalize(latents))
+            if self.encoder is not None:
+                self.encoder(video)
             host = torch.empty(
                 video.shape, dtype=video.dtype, device="cpu", pin_memory=True
             )
@@ -1460,7 +1476,11 @@ class CosmosDreamsRolloutStage(PipelineStage):
         self.transformer.release_cuda_graphs(reason)
 
     def _decode_queue(
-        self, device: torch.device, *, quality: str = "exact"
+        self,
+        device: torch.device,
+        batch: Req | None = None,
+        *,
+        quality: str = "exact",
     ) -> "CausalDecodeQueue | None":
         if (
             not self.overlap_vae_decode
@@ -1468,7 +1488,25 @@ class CosmosDreamsRolloutStage(PipelineStage):
             or self.server_args.should_start_component_on_cpu("vae")
         ):
             return None
-        return CausalDecodeQueue(self.vae, device=device, quality=quality)
+        encoder = None
+        if batch is not None and diffusion_envs.SGLANG_USE_NVENC:
+            from sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder import (
+                supports_nvenc,
+            )
+
+            path = streamed_video_output_path(batch, self.server_args, 1)
+            if path is not None and supports_nvenc(device):
+                encoder = EncodeWhileDecoding(
+                    path,
+                    batch,
+                    finish_frames=lambda frames: (
+                        frames.mul(0.5).add_(0.5).clamp_(0, 1).float()
+                    ),
+                    use_nvenc=True,
+                )
+        return CausalDecodeQueue(
+            self.vae, device=device, quality=quality, encoder=encoder
+        )
 
     def _rollout(self, batch: Req) -> torch.Tensor:
         target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
@@ -1545,7 +1583,9 @@ class CosmosDreamsRolloutStage(PipelineStage):
                     max_history_frames=selected_frames + current_frames,
                 )
         latents: list[torch.Tensor] = []
-        decode_queue = self._decode_queue(device, quality=batch.sampling_params.quality)
+        decode_queue = self._decode_queue(
+            device, batch, quality=batch.sampling_params.quality
+        )
         with (
             archive if archive is not None else nullcontext(),
             history if isinstance(history, CosmosDreamsKVCache) else nullcontext(),
@@ -1681,7 +1721,16 @@ class CosmosDreamsRolloutStage(PipelineStage):
                     f"({len(self.profile.sigmas_for_frame(chunk_start))} denoise steps){retrieval}"
                 )
         if decode_queue is not None:
-            batch.extra[EXTRA_DECODED_OUTPUT] = decode_queue.finish()
+            output_paths = (
+                decode_queue.encoder.finish()
+                if decode_queue.encoder is not None
+                else None
+            )
+            if output_paths is not None:
+                batch.extra["streamed_video_output_file_paths"] = output_paths
+                decode_queue.outputs.clear()
+            else:
+                batch.extra[EXTRA_DECODED_OUTPUT] = decode_queue.finish()
             self.log_info(
                 "Decoded %d chunks during the rollout", decode_queue.submitted
             )

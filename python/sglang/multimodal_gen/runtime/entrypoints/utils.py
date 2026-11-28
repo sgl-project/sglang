@@ -21,7 +21,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence, Union
 
 import imageio
-import imageio_ffmpeg
 import numpy as np
 import torch
 from PIL import Image
@@ -31,9 +30,11 @@ try:
 except ImportError:  # pragma: no cover
     scipy_wavfile = None
 
+from sglang.multimodal_gen import envs as diffusion_envs
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.postprocess import ffmpeg_video_encoder as x264
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
@@ -296,28 +297,6 @@ def _pick_audio_sample_rate(
     return selected_sr
 
 
-def _resolve_ffmpeg_exe() -> str:
-    # keep the pinned encoder binary: x264 upgrades change lossy video pixels
-    return imageio_ffmpeg.get_ffmpeg_exe()
-
-
-# ffmpeg's implicit libx264 default is `medium`. On diffusion output `fast` is
-# both quicker and measurably closer to the frames the model produced.
-X264_PRESET = "fast"
-
-
-def _x264_auto_thread_count(height: int) -> int:
-    """Match x264's auto frame-thread count for progressive video."""
-    try:
-        cpu_count = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        cpu_count = os.cpu_count() or 1
-    cpu_limit = max(1, cpu_count * 3 // 2)
-    macroblock_rows = max(1, (height + 15) // 16)
-    row_limit = max(1, macroblock_rows // 2)
-    return min(cpu_limit, row_limit, 128)
-
-
 def _conversion_chunk_frames(
     num_frames: int, height: int, width: int, element_size: int
 ) -> int:
@@ -344,75 +323,6 @@ def _remove_quietly(path: Optional[str]) -> None:
             os.remove(path)
         except OSError:
             pass
-
-
-def _cuda_video_ffmpeg_command(
-    save_file_path: str,
-    *,
-    width: int,
-    height: int,
-    fps: int,
-    crf: int,
-    x264_preset: Optional[str],
-    wav_path: Optional[str],
-) -> list[str]:
-    command = [
-        _resolve_ffmpeg_exe(),
-        "-y",
-        "-f",
-        "rawvideo",
-        "-vcodec",
-        "rawvideo",
-        "-s",
-        f"{width}x{height}",
-        "-pix_fmt",
-        "rgb24",
-        "-r",
-        f"{fps:.02f}",
-        "-i",
-        "pipe:0",
-    ]
-    if wav_path is None:
-        command += ["-an"]
-    else:
-        command += ["-i", wav_path]
-    command += [
-        "-vcodec",
-        "libx264",
-        "-preset",
-        x264_preset or X264_PRESET,
-        "-pix_fmt",
-        "yuv420p",
-        "-crf",
-        str(crf),
-    ]
-
-    macro_block_size = 16
-    if width % macro_block_size or height % macro_block_size:
-        output_width = (
-            width
-            if width % macro_block_size == 0
-            else width + macro_block_size - width % macro_block_size
-        )
-        output_height = (
-            height
-            if height % macro_block_size == 0
-            else height + macro_block_size - height % macro_block_size
-        )
-        command += ["-vf", f"scale={output_width}:{output_height}"]
-
-    command += ["-threads", str(_x264_auto_thread_count(height))]
-    if wav_path is not None:
-        command += [
-            "-acodec",
-            "aac",
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-        ]
-    command += ["-v", "warning", save_file_path]
-    return command
 
 
 class CudaVideoEncoder:
@@ -475,7 +385,7 @@ class CudaVideoEncoder:
                     wav_path = f.name
             if audio_np is not None:
                 write_wav(audio_np)
-            command = _cuda_video_ffmpeg_command(
+            command = x264.cuda_video_ffmpeg_command(
                 save_file_path,
                 width=width,
                 height=height,
@@ -690,48 +600,88 @@ def _try_save_cuda_video_direct(
     output_compression: Optional[int],
     x264_preset: Optional[str] = None,
 ) -> bool:
-    """Stream CUDA RGB chunks to ffmpeg through a registered memfd."""
+    """Save CUDA frames, or CPU tensor frames with NVENC enabled."""
     video, audio = _split_sample_audio(sample)
+    use_nvenc = diffusion_envs.SGLANG_USE_NVENC
     if not (
         isinstance(video, torch.Tensor)
-        and video.device.type == "cuda"
         and video.dim() in (3, 4)
+        and video.shape[0] == 3
+        and (
+            video.device.type == "cuda"
+            or (use_nvenc and video.device.type == "cpu" and torch.cuda.is_available())
+        )
     ):
         return False
     if video.dim() == 3:
         video = video.unsqueeze(1)
-    if video.shape[0] != 3:
-        return False
-
     _, num_frames, height, width = video.shape
+    device = (
+        video.device
+        if video.device.type == "cuda"
+        else torch.device("cuda", torch.cuda.current_device())
+    )
     encoder = None
+    using_nvenc = False
     try:
-        encoder = CudaVideoEncoder.open(
-            save_file_path,
-            device=video.device,
+        encoder_kwargs = dict(
+            device=device,
             height=height,
             width=width,
             fps=fps,
             num_frames=num_frames,
             element_size=video.element_size(),
-            audio=audio,
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
             x264_preset=x264_preset,
         )
+        if use_nvenc:
+            from sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder import (
+                NvencVideoEncoder,
+            )
+
+            encoder = NvencVideoEncoder.try_open(
+                save_file_path, audio=None, **encoder_kwargs
+            )
+            using_nvenc = encoder is not None
         if encoder is None:
-            return False
-        encoder.write(video)
+            if video.device.type != "cuda":
+                return False
+            encoder = CudaVideoEncoder.open(
+                save_file_path, audio=audio, **encoder_kwargs
+            )
+            if encoder is None:
+                return False
+        if using_nvenc and video.device.type == "cpu":
+            chunk_frames = min(
+                4,
+                _conversion_chunk_frames(
+                    num_frames, height, width, video.element_size()
+                ),
+            )
+            for chunk in video.split(chunk_frames, dim=1):
+                encoder.write(chunk.to(device))
+        else:
+            encoder.write(video)
         encoder.close()
+        if using_nvenc and audio is not None:
+            _maybe_mux_audio_into_mp4(
+                save_file_path=save_file_path,
+                audio=audio,
+                frames=range(num_frames),
+                fps=fps,
+                audio_sample_rate=audio_sample_rate,
+            )
         return True
     except Exception:
         if encoder is not None:
             encoder.abort()
         logger.warning_once(
-            "Direct CUDA video save failed; falling back to CPU ffmpeg encoding. "
-            "Enable debug logging for exception details."
+            "%s video save failed; falling back to CPU ffmpeg encoding. "
+            "Enable debug logging for exception details.",
+            "NVENC" if using_nvenc else "Direct CUDA",
         )
-        logger.debug("Direct CUDA video save failure", exc_info=True)
+        logger.debug("Direct video save failure", exc_info=True)
         return False
 
 
@@ -745,7 +695,11 @@ def _try_save_cuda_videos_direct(
     x264_preset: Optional[str] = None,
 ) -> list[bool] | None:
     """Save independent CUDA videos concurrently when memory permits."""
-    if len(samples) < 2 or len(samples) != len(save_file_paths):
+    if (
+        diffusion_envs.SGLANG_USE_NVENC
+        or len(samples) < 2
+        or len(samples) != len(save_file_paths)
+    ):
         return None
 
     videos = []
@@ -790,7 +744,7 @@ def _try_save_cuda_videos_direct(
     except (AttributeError, OSError):
         available_cpus = os.cpu_count() or 1
     encoder_threads = sorted(
-        (_x264_auto_thread_count(int(video.shape[-2])) for video in videos),
+        (x264.x264_auto_thread_count(int(video.shape[-2])) for video in videos),
         reverse=True,
     )[:_MAX_PARALLEL_CUDA_VIDEO_SAVES]
     if sum(encoder_threads) > available_cpus:
@@ -893,7 +847,7 @@ def _maybe_mux_audio_into_mp4(
     )
 
     try:
-        ffmpeg_exe = _resolve_ffmpeg_exe()
+        ffmpeg_exe = x264.resolve_ffmpeg_exe()
         _mux_audio_np_into_mp4(
             save_file_path=save_file_path,
             audio_np=audio_np,
@@ -905,84 +859,6 @@ def _maybe_mux_audio_into_mp4(
             "Failed to mux audio into mp4 (saved silent video): %s",
             str(e),
         )
-
-
-def _save_video_ffmpeg(
-    save_file_path: str,
-    frames: list,
-    *,
-    fps: int,
-    quality: float,
-    x264_preset: Optional[str] = None,
-    audio_path: Optional[str] = None,
-) -> None:
-    if not frames:
-        raise ValueError("video output requires at least one frame")
-    if not 1 <= quality <= 10:
-        raise ValueError("video quality must be between 1 and 10")
-    first_frame = np.asarray(frames[0])
-    height, width = first_frame.shape[:2]
-    channels = first_frame.shape[2] if first_frame.ndim == 3 else 1
-    pixel_format = {1: "gray", 3: "rgb24", 4: "rgba"}[channels]
-    command = [
-        _resolve_ffmpeg_exe(),
-        "-y",
-        "-f",
-        "rawvideo",
-        "-vcodec",
-        "rawvideo",
-        "-s",
-        f"{width}x{height}",
-        "-pix_fmt",
-        pixel_format,
-        "-r",
-        f"{fps:.02f}",
-        "-i",
-        "pipe:0",
-    ]
-    if audio_path is None:
-        command += ["-an"]
-    else:
-        command += ["-i", audio_path, "-acodec", "aac"]
-    command += [
-        "-vcodec",
-        "libx264",
-        "-preset",
-        x264_preset or X264_PRESET,
-        "-pix_fmt",
-        "yuv420p",
-        "-crf",
-        str(int((1 - quality / 10.0) * 51)),
-    ]
-    if width % 16 or height % 16:
-        command += [
-            "-vf",
-            f"scale={(width + 15) // 16 * 16}:{(height + 15) // 16 * 16}",
-        ]
-    command += [save_file_path]
-    with tempfile.TemporaryFile() as stderr:
-        with subprocess.Popen(
-            command,
-            env=local_media_subprocess_env(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=stderr,
-        ) as process:
-            try:
-                for frame in frames:
-                    frame = np.asarray(frame)
-                    if frame.shape != first_frame.shape or frame.dtype != np.uint8:
-                        raise ValueError(
-                            "video frames must have matching shapes and uint8 dtype"
-                        )
-                    process.stdin.write(memoryview(np.ascontiguousarray(frame)))
-            finally:
-                process.stdin.close()
-            if process.wait() != 0:
-                stderr.seek(0)
-                raise RuntimeError(
-                    f"ffmpeg video encoding failed: {stderr.read().decode(errors='replace')}"
-                )
 
 
 def _try_save_video_with_audio(
@@ -1015,7 +891,7 @@ def _try_save_video_with_audio(
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp_wav_path = f.name
         scipy_wavfile.write(tmp_wav_path, selected_sr, audio_np)
-        _save_video_ffmpeg(
+        x264.save_video_ffmpeg(
             save_file_path,
             frames,
             fps=fps,
@@ -1275,7 +1151,7 @@ def save_materialized_output(
             x264_preset=x264_preset,
         )
         if not saved_with_audio:
-            _save_video_ffmpeg(
+            x264.save_video_ffmpeg(
                 save_file_path,
                 materialized.frames,
                 fps=materialized.fps,
