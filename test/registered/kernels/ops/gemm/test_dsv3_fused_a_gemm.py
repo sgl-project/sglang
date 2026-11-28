@@ -35,7 +35,10 @@ def test_dsv3_fused_a_gemm(num_tokens, hd_in, hd_out):
         0, 1
     )
 
-    ref = F.linear(mat_a, mat_b.T)
+    # FP32 reference rounded once to BF16, like the kernel's FP32 accumulator.
+    # A BF16 F.linear may split K and round partial sums to BF16 (cuBLAS picks
+    # split-K for these skinny shapes on SM120), which drifts past the tolerance.
+    ref = F.linear(mat_a.float(), mat_b.T.float()).bfloat16()
     out = dsv3_fused_a_gemm(mat_a, mat_b)
 
     assert out.shape == (num_tokens, hd_out)
