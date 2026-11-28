@@ -165,11 +165,11 @@ Each input item produces one embedding. In this API, an item carries at most one
 
 ## Input limits
 
-All modalities share the 8,192-token context. Requests that exceed it fail with HTTP 400 (`The input (N tokens) is longer than the model's context length (8192 tokens).`).
+All modalities share the 8,192-token context, of which a request's input may use 8,186 tokens. Longer requests fail with HTTP 400 (`Input length (N tokens) exceeds the maximum allowed length (8186 tokens). This model's maximum context length is 8186 tokens on this server. ...`); requests with images, video, or audio get a `Multimodal prompt is too long after expanding multimodal tokens.` prefix.
 
 | Modality | Cost | Max, single modality |
 | :-- | :-- | :-- |
-| Text | 1 token per subword | 8,192 tokens |
+| Text | 1 token per subword | 8,186 tokens |
 | Image | up to 280 tokens per image | about 29 images |
 | Video | up to 140 tokens per sampled frame | about 58 frames |
 | Audio | 25 tokens per second | about 327 seconds |

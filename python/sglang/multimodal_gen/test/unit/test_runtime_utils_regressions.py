@@ -2,7 +2,7 @@ import base64
 import io
 import traceback
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import requests
@@ -10,6 +10,7 @@ from PIL import Image, UnidentifiedImageError
 
 from sglang.multimodal_gen.runtime.utils import common, vision
 from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
+from sglang.srt.multimodal.media_io import get_mm_http_session
 
 # A public literal avoids DNS; the tests mock the HTTP transfer.
 _GIF_URL = "https://93.184.216.34/fixture.gif"
@@ -26,8 +27,9 @@ def _gif_bytes() -> bytes:
     "loader, dependency, category",
     [
         (vision.load_image, "srt_get_image_bytes", requests.HTTPError),
-        (vision.load_video, "requests.get", requests.Timeout),
-        (vision.load_video, "requests.get", requests.TooManyRedirects),
+        (vision.load_video, "get", requests.HTTPError),
+        (vision.load_video, "get", requests.Timeout),
+        (vision.load_video, "get", requests.TooManyRedirects),
     ],
 )
 def test_media_download_errors_keep_category_not_request(loader, dependency, category):
@@ -40,7 +42,11 @@ def test_media_download_errors_keep_category_not_request(loader, dependency, cat
         response.status_code = 403
     original = category(url, request=request, response=response)
     original.__cause__ = OSError(marker)
-    with patch(f"{vision.__name__}.{dependency}", side_effect=original):
+    with patch.object(
+        vision if dependency != "get" else get_mm_http_session(),
+        dependency,
+        side_effect=original,
+    ):
         with pytest.raises(category) as caught:
             loader(url)
     error = caught.value
@@ -69,7 +75,7 @@ def test_invalid_media_source_does_not_echo_user_input():
     [
         (200, _gif_bytes(), None),
         (200, b"not a gif", UnidentifiedImageError),
-        (404, b"", ValueError),
+        (404, b"", requests.HTTPError),
     ],
 )
 def test_load_video_removes_downloaded_temp_file(
@@ -78,13 +84,33 @@ def test_load_video_removes_downloaded_temp_file(
     """A downloaded URL video must not outlive load_video, on success or failure."""
     monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
     closed = []
-    response = SimpleNamespace(
-        headers={},
-        status_code=status_code,
-        iter_content=lambda chunk_size: iter([payload]),
-        close=lambda: closed.append(True),
+
+    class Response:
+        headers = {}
+        url = _GIF_URL
+
+        def __init__(self):
+            self.status_code = status_code
+            body = iter([payload])
+            self.raw = SimpleNamespace(
+                media_sock=Mock(),
+                isclosed=lambda: False,
+                read1=lambda amt, decode_content: next(body, b""),
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            closed.append(True)
+
+        def raise_for_status(self):
+            if status_code >= 400:
+                raise requests.HTTPError(f"{status_code}", response=None)
+
+    monkeypatch.setattr(
+        get_mm_http_session(), "get", lambda *args, **kwargs: Response()
     )
-    monkeypatch.setattr(vision.requests, "get", lambda *args, **kwargs: response)
 
     if error is None:
         frames = vision.load_video(_GIF_URL)

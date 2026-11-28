@@ -34,15 +34,26 @@ def minimax_h3_time_shift_sigmas(
     num_steps: int = 50,
     shift_scale: float = 6.0,
     dmd_steps: tuple[int, ...] | None = None,
+    raw_sigmas: tuple[float, ...] | None = None,
 ) -> list[float]:
     if shift_scale <= 0:
         raise ValueError("MiniMax H3 shift_scale must be > 0")
     if num_steps <= 0:
         raise ValueError("MiniMax H3 num_steps must be > 0")
+    if dmd_steps is not None and raw_sigmas is not None:
+        raise ValueError("MiniMax H3 takes dmd_steps or raw_sigmas, not both")
 
     import torch
 
-    if dmd_steps is not None:
+    if raw_sigmas is not None:
+        if int(num_steps) != len(raw_sigmas):
+            raise ValueError(
+                f"this checkpoint is distilled for {len(raw_sigmas)} DiT forwards; "
+                f"got num_inference_steps={num_steps}"
+            )
+        # trained knots are unshifted sigmas; append the final step to sigma 0
+        base = torch.tensor(list(raw_sigmas) + [0.0], dtype=torch.float32)
+    elif dmd_steps is not None:
         if int(num_steps) != len(dmd_steps):
             raise ValueError(
                 f"this checkpoint is distilled for {len(dmd_steps)} DiT forwards "

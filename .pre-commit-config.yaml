@@ -1,5 +1,5 @@
 default_stages: [pre-commit, pre-push, manual]
-exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/kernels/ops/diffusion/render|python/sglang/kernels/ops/attention/flash_attn/cute|python/sglang/kernels/jit/csrc/diffusion/vsa_block_sparse_sm100|python/sglang/kernels/tlx_ops/)
+exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/kernels/ops/diffusion/render|python/sglang/kernels/ops/attention/flash_attn/cute|python/sglang/kernels/jit/csrc/diffusion/vsa_block_sparse_sm100|python/sglang/kernels/ops/(gemm/tlx_mm|gemm/tlx_mm_invariance|gemm/tlx_router_gemm|layernorm/tlx_rmsnorm|layernorm/tlx_norm_residual_norm|attention/tlx_qk_norm_rope_kv_cache|moe/tlx_moe)\.py$)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
