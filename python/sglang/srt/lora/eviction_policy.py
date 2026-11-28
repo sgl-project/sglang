@@ -55,18 +55,17 @@ class LRUEvictionPolicy(EvictionPolicy):
     def mark_used(self, uid: Optional[str]) -> None:
         if uid is not None:
             current_time = time.monotonic()
-            # Remove and re-add to move to end (most recent)
-            self.access_order.pop(uid, None)
             self.access_order[uid] = current_time
+            self.access_order.move_to_end(uid)
             self.total_accesses += 1
-            logger.debug(f"LoRA {uid} marked as used at {current_time}")
+            logger.debug("LoRA %s marked as used at %s", uid, current_time)
 
     def select_victim(self, candidates: Set[Optional[str]]) -> Optional[str]:
         """Select the least recently used adapter from candidates."""
         # Iterate through access_order (oldest first) to find LRU victim
-        for uid in list(self.access_order.keys()):
+        for uid in self.access_order:
             if uid in candidates:
-                logger.debug(f"Selected LoRA {uid} for eviction (LRU)")
+                logger.debug("Selected LoRA %s for eviction (LRU)", uid)
                 self.eviction_count += 1
                 return uid
 
@@ -84,7 +83,7 @@ class LRUEvictionPolicy(EvictionPolicy):
     def remove(self, uid: Optional[str]) -> None:
         if uid is not None:
             self.access_order.pop(uid, None)
-            logger.debug(f"Removed LoRA {uid} from LRU tracking")
+            logger.debug("Removed LoRA %s from LRU tracking", uid)
 
 
 class FIFOEvictionPolicy(EvictionPolicy):
@@ -106,9 +105,9 @@ class FIFOEvictionPolicy(EvictionPolicy):
     def select_victim(self, candidates: Set[Optional[str]]) -> Optional[str]:
         """Select the first inserted adapter from candidates."""
         # Iterate through insertion_order (oldest first) to find FIFO victim
-        for uid in list(self.insertion_order.keys()):
+        for uid in self.insertion_order:
             if uid in candidates:
-                logger.debug(f"Selected LoRA {uid} for eviction (FIFO)")
+                logger.debug("Selected LoRA %s for eviction (FIFO)", uid)
                 self.eviction_count += 1
                 return uid
 
