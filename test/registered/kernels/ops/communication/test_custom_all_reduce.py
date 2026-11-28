@@ -344,7 +344,9 @@ def _init_hier_comm_once() -> CustomAllReduceV2 | None:
         eager=base.eager._replace(hier_2shot_push=hier),
     )
     get_config = v2.get_all_reduce_config
-    v2.get_all_reduce_config = lambda ws: config if ws == world_size else get_config(ws)
+    v2.get_all_reduce_config = lambda ws, **kwargs: (
+        config if ws == world_size else get_config(ws, **kwargs)
+    )
     try:
         comm = CustomAllReduceV2(cpu_group, device, max_size=HIER_MAX_BYTES // 2)
     finally:

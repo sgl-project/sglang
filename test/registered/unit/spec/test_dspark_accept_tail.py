@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import msgspec
 import torch
 
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
@@ -99,6 +100,7 @@ class TestAcceptTailParity(CustomTestCase):
                 greedy_draft=True,
             ),
             sampling_info=None,
+            route=VerifyRoute.derive(None, has_grammar=False, has_watermark=False),
             draft_input=None,
             layout=None
             if verify_lens is None

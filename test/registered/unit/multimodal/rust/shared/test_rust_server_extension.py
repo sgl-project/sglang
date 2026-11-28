@@ -679,6 +679,7 @@ def launch_context(server_cls, cores=(None, None)):
             "get_disagg",
             return_value=SimpleNamespace(disaggregation_mode="null"),
         ),
+        patch.object(server_module, "vlm_warmup_image_base64", return_value=None),
         patch.object(
             server_module, "_build_server_args", return_value=sentinel.args
         ) as build_args,
@@ -733,6 +734,8 @@ class TestRustServerExtension(CustomTestCase):
             request_class=GenerateReqInput,
             server_added_custom_params=(),
             port_offset=1,
+            vlm_warmup_image_base64=None,
+            vlm_warmup_prompt=None,
         )
         # What a crash dump carries.
         self.assertIs(instance.server_args, sentinel.server_args)

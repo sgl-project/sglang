@@ -67,6 +67,8 @@ def _server_args(ext, port: int):
         detokenizer_worker_num=1,
         skip_tokenizer_init=True,
         skip_server_warmup=True,
+        vlm_warmup_image_base64=None,
+        vlm_warmup_prompt=None,
         gc_threshold=None,
         custom_warmups_pending=False,
         default_priority_value=None,

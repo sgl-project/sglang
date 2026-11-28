@@ -938,6 +938,7 @@ class TestAdmissionOverlap(CustomTestCase):
                 _nonblocking_admit_in_scope=lambda _: nonblocking,
                 _verify_kv_checksums=lambda _: calls.append("verify"),
                 ngram_embedding_manager=MagicMock(),
+                spec_algorithm=SimpleNamespace(is_ngram=lambda: False),
                 chunked_req=None,
                 future_map=object(),
                 enable_overlap=True,

@@ -168,7 +168,7 @@ class TestForwardCadenceRetirementIsPriced(unittest.TestCase):
                     ),
                     # The rows a decode step allocates ahead (its own term).
                     patch(
-                        "sglang.srt.mem_cache.allocation_sizing.get_spec_decode_reserve",
+                        "sglang.srt.mem_cache.allocation_sizing.get_decode_ahead",
                         return_value=4,
                     ),
                 ):

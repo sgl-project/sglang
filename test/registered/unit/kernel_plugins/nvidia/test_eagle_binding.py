@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_megakernel, eagle_worker_v2
 from sglang.srt.speculative.eagle_megakernel import EagleMegakernel
@@ -929,11 +930,29 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
         self.assertIs(selected.post_verify.local_keys, custom_keys)
 
     def test_default_post_verify_uses_the_stock_signature(self):
+        def local_keys(view):
+            return None
+
+        expected = (
+            torch.tensor([1]),
+            torch.tensor([0]),
+            torch.tensor([0]),
+        )
+        # The route is derived from the view: logit_bias adjusts, top-p truncates.
+        sampling = SimpleNamespace(
+            step_penalties=None,
+            logit_bias=torch.zeros(1, 4),
+            has_custom_logit_processor=False,
+            need_top_k_sampling=False,
+            need_top_p_sampling=True,
+            need_min_p_sampling=False,
+        )
         io = SimpleNamespace(
             device=torch.device("cpu"),
             is_idle=False,
             seq_lens=torch.tensor([3]),
-            sampling_info=SimpleNamespace(),
+            sampling=sampling,
+            sampling_info=sampling,
             req_pool_indices=torch.tensor([0]),
             return_logprob=False,
             verify_tree=object(),
@@ -946,35 +965,30 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
             simulated_accept_length_rng=None,
             sparse_bonus_argmax=False,
         )
-        expected = (
-            torch.tensor([1]),
-            torch.tensor([0]),
-            torch.tensor([0]),
-        )
-        with (
-            patch(
-                "sglang.srt.speculative.eagle_utils.LOCAL_KEYS_SUPPORTED",
-                False,
-                create=True,
-            ),
-            patch(
-                "sglang.srt.speculative.eagle_utils.eagle_sample",
-                return_value=expected,
-            ) as sample,
-        ):
-            output = speculative_runtime.default_post_verify(io, lambda view: None)
+        with patch(
+            "sglang.srt.speculative.eagle_utils.eagle_sample",
+            return_value=expected,
+        ) as sample:
+            output = speculative_runtime.default_post_verify(io, local_keys)
         self.assertEqual(
             sample.call_args.kwargs,
             {
                 "uno_target_max_top_k": None,
-                "watermark": None,
                 "simulated_acc_len": None,
                 "simulated_acc_len_rng": None,
                 "sparse_bonus_argmax": False,
+                "local_keys": local_keys,
             },
         )
         self.assertTrue(torch.equal(output.token_ids, expected[0]))
-        batch = sample.call_args.args[1]
+        verify = sample.call_args.args[1]
+        self.assertEqual(
+            verify.route,
+            VerifyRoute(adjusts_logits=True, need_truncated_sampling=True),
+        )
+        self.assertIsNone(verify.watermark)
+        self.assertIsNone(verify.grammar_mask)
+        batch = verify.batch
         self.assertIsInstance(batch, speculative_runtime.StockVerifyBatch)
         self.assertIs(batch.forward_mode, ForwardMode.TARGET_VERIFY)
         self.assertIs(batch.sampling_info, io.sampling_info)

@@ -349,6 +349,7 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.metrics_collector = Mock()
         self.streamed_aborts = []
         self.ngram_embedding_manager = Mock()
+        self.spec_algorithm = SimpleNamespace(is_ngram=lambda: False)
         self.chunked_req = None
         self.future_map = None
         self.attn_tp_cpu_group = None

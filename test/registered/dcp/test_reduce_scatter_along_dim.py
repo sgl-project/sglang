@@ -70,6 +70,8 @@ def multiprocess_test(file: str, nproc: int, timeout: int = 120) -> None:
     cmd = [
         "torchrun",
         f"--nproc_per_node={nproc}",
+        "--local-addr",
+        "127.0.0.1",
         file,
     ]
     try:
@@ -79,6 +81,7 @@ def multiprocess_test(file: str, nproc: int, timeout: int = 120) -> None:
             stderr=subprocess.STDOUT,
             text=True,
             timeout=timeout,
+            env={"GLOO_SOCKET_IFNAME": "lo", **os.environ},
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(

@@ -472,7 +472,10 @@ class TestTriJointReclaim(CustomTestCase):
         batch.tree_cache = c
         batch.spec_algorithm = SpeculativeAlgorithm.NONE
         batch.reqs = [
-            SimpleNamespace(kv=SimpleNamespace(kv_committed_len=8), beam_group=None)
+            SimpleNamespace(
+                kv=SimpleNamespace(kv_committed_len=8, kv_allocated_len=8),
+                beam_group=None,
+            )
             for _ in range(4)
         ]
         self.assertTrue(batch.check_decode_mem())

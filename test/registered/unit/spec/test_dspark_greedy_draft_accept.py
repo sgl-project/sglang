@@ -4,6 +4,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components import dspark_verify
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -41,6 +42,7 @@ class TestGreedyDraftAccept(CustomTestCase):
                 target_logits=torch.randn(BS * (GAMMA + 1), VOCAB),
                 draft_block=block,
                 sampling_info=SimpleNamespace(is_all_greedy=False, is_any_greedy=False),
+                route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
                 draft_input=None,
                 gamma=GAMMA,
                 verify_num_draft_tokens=GAMMA + 1,

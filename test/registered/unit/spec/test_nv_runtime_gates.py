@@ -3,8 +3,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.environ import envs
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_worker_common
-from sglang.srt.speculative.target_verify import TargetVerify
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,10 +33,14 @@ class TestNativeEagerVerify(CustomTestCase):
                         return_logprob=False,
                         forward_mode=SimpleNamespace(is_idle=lambda: False),
                     )
-                    verify = TargetVerify(
-                        grammar_mask=object(),
+                    verify = VerifyStep(
+                        batch=batch,
+                        route=VerifyRoute(
+                            adjusts_logits=True, need_truncated_sampling=False
+                        ),
                         watermark=object(),
                         watermark_full_mask=True,
+                        grammar_mask=object(),
                     )
                     verify_input = object()
                     logits_output = SimpleNamespace(next_token_logits=None)
@@ -64,8 +68,7 @@ class TestNativeEagerVerify(CustomTestCase):
                         ),
                     ):
                         accept = eagle_worker_common.accept_draft_tree(
-                            batch,
-                            verify=verify,
+                            verify,
                             verify_input=verify_input,
                             logits_output=logits_output,
                             speculative_runtime_hooks=hooks,
@@ -84,16 +87,13 @@ class TestNativeEagerVerify(CustomTestCase):
                         hooks.post_verify.assert_not_called()
                         sample.assert_called_once_with(
                             verify_input,
-                            batch,
+                            verify,
                             logits_output,
-                            verify.grammar_mask,
                             uno_target_max_top_k=options.get("uno_target_max_top_k"),
-                            watermark=verify.watermark,
                             simulated_acc_len_rng=options.get("simulated_acc_len_rng"),
                             sparse_bonus_argmax=options.get(
                                 "sparse_bonus_argmax", False
                             ),
-                            has_custom_logit_processor=custom,
                         )
 
 
