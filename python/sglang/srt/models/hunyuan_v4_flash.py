@@ -31,12 +31,22 @@ from sglang.kernels.ops.layernorm.hy4_ihc import (
     hy4_ihc_post_pre_norm,
     ihc_fuses_out_norm,
 )
+from sglang.kernels.ops.layernorm.hy4_ihc_cluster import (
+    hy4_ihc_cluster_supported,
+    prepare_hy4_ihc_cluster,
+)
+from sglang.kernels.ops.layernorm.hy4_ihc_single_pass import (
+    hy4_ihc_single_pass_supported,
+    prepare_hy4_ihc_single_pass,
+)
 from sglang.srt.configs.hy_v4_flash import (
     SLIDING_ATTENTION,
     HYV4FlashConfig,
     HYV4FlashTextConfig,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.engram import EngramHasher
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -47,6 +57,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import (
+    deepgemm_w8a8_block_fp8_linear_with_fallback,
+)
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -78,7 +92,7 @@ from sglang.srt.models.hunyuan_v4 import (
 )
 from sglang.srt.models.hunyuan_v4_vl import HYV4VisionTransformer
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import BumpAllocator
 
 logger = logging.getLogger(__name__)
@@ -947,6 +961,24 @@ class FlashEngram(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _takes_fp8_group_pair(linear) -> bool:
+    """Whether `linear` runs DeepGEMM on fp8 activations with fp32 1x128 scales,
+    so an (fp8, column-major TMA-aligned scale) pair replaces its activation quant."""
+    method = linear.quant_method
+    return (
+        isinstance(method, Fp8LinearMethod)
+        and method.block_quant
+        and not method.use_marlin
+        and not method.use_mxfp8
+        and not method.block_fp8_as_mxfp8
+        and method.weight_block_size == [128, 128]
+        and method.w8a8_block_fp8_linear is deepgemm_w8a8_block_fp8_linear_with_fallback
+        and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        # The opt-in M <= 16 GEMV reads row-major scales.
+        and not envs.SGLANG_ENABLE_FP8_BLOCK_GEMV.get()
+    )
+
+
 class HYV4FlashAttention(HYV4Attention):
     def __init__(
         self,
@@ -997,6 +1029,7 @@ class HYV4FlashAttention(HYV4Attention):
             and (self.is_window_layer or not config.dsa_skip_attn_post_norm)
             else None
         )
+        self._gate_input = None
 
     def should_run_indexer(self, prev_topk_indices=None) -> bool:
         return True
@@ -1005,6 +1038,17 @@ class HYV4FlashAttention(HYV4Attention):
     def out_norm(self):
         return self.post_proj_norm
 
+    def prepare_attention_output_gate(self, hidden_states):
+        # The iHC kernel already quantized this activation for linear_gate.
+        pending = self._gate_input
+        if (
+            pending is not None
+            and pending[0] is hidden_states
+            and not get_forward().sp_active
+        ):
+            return self.linear_gate(pending[1])[0]
+        return super().prepare_attention_output_gate(hidden_states)
+
     def forward(
         self,
         positions,
@@ -1012,9 +1056,20 @@ class HYV4FlashAttention(HYV4Attention):
         forward_batch,
         zero_allocator,
         apply_out_norm=True,
+        gate_input_fp8=None,
         **kwargs,
     ):
-        out = super().forward(positions, hidden_states, forward_batch, zero_allocator)
+        """`gate_input_fp8`: `hidden_states` as the (fp8, scale) pair linear_gate
+        consumes, or None."""
+        self._gate_input = (
+            None if gate_input_fp8 is None else (hidden_states, gate_input_fp8)
+        )
+        try:
+            out = super().forward(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        finally:
+            self._gate_input = None
         if isinstance(out, tuple):
             out = out[0]
         if apply_out_norm and self.post_proj_norm is not None and out.shape[0] > 0:
@@ -1152,10 +1207,20 @@ class HYV4FlashMoE(nn.Module):
 
 class HYV4FlashDecoderLayer(nn.Module):
     def __init__(
-        self, config, layer_id, quant_config, prefix, alt_stream, rope_store=None
+        self,
+        config,
+        layer_id,
+        quant_config,
+        prefix,
+        alt_stream,
+        rope_store=None,
+        ihc_single_pass=False,
+        ihc_cluster=False,
     ):
         super().__init__()
         self.layer_id = layer_id
+        self.ihc_single_pass = ihc_single_pass
+        self.ihc_cluster = ihc_cluster
         self.self_attn = HYV4FlashAttention(
             config,
             layer_id,
@@ -1173,9 +1238,24 @@ class HYV4FlashDecoderLayer(nn.Module):
         self.hc_attn_layer = HYV4HCLayer(config, f"{prefix}.hc_attn_layer")
         self.hc_mlp_layer = HYV4HCLayer(config, f"{prefix}.hc_mlp_layer")
         self.engram_layer: Optional[FlashEngram] = None
+        # The attention iHC kernel also emits the fp8 input of linear_gate,
+        # which saves linear_gate's own activation-quant launch.
+        self.gate_input_fp8 = ihc_cluster and _takes_fp8_group_pair(
+            self.self_attn.linear_gate
+        )
 
     @staticmethod
-    def _ihc_pre(hc_layer, norm, residual, output=None, post=None, out_norm=None):
+    def _ihc_pre(
+        hc_layer,
+        norm,
+        residual,
+        output=None,
+        post=None,
+        out_norm=None,
+        single_pass=False,
+        cluster=False,
+        quant=False,
+    ):
         """iHC pre and the block's input RMSNorm, with the previous block's
         output RMSNorm (`out_norm`) and iHC post folded in when given."""
         p = hc_layer.hc_pre
@@ -1193,6 +1273,9 @@ class HYV4FlashDecoderLayer(nn.Module):
             norm.variance_epsilon,
             out_norm.weight if out_norm is not None else None,
             out_norm.variance_epsilon if out_norm is not None else 0.0,
+            single_pass=single_pass,
+            cluster=cluster,
+            quant=quant,
         )
 
     @staticmethod
@@ -1213,7 +1296,9 @@ class HYV4FlashDecoderLayer(nn.Module):
     ):
         """`pending` is the previous layer's (mlp output, post gates, deferred out
         norm); its iHC post is fused into this layer's iHC pre when possible."""
-        defer_norm = ihc_fuses_out_norm(hidden_states.shape[0])
+        defer_norm = ihc_fuses_out_norm(
+            hidden_states.shape[0], single_pass=self.ihc_single_pass
+        )
         if pending is not None and self.engram_layer is not None:
             hidden_states = self._finish_post(hidden_states, pending)
             pending = None
@@ -1221,12 +1306,23 @@ class HYV4FlashDecoderLayer(nn.Module):
             residual = self.hc_attn_layer.prepare_input(hidden_states)
             if self.engram_layer is not None:
                 residual = self.engram_layer(residual, engram_hashes)
-            residual, x, post = self._ihc_pre(
-                self.hc_attn_layer, self.input_layernorm, residual
+            residual, x, post, *x_fp8 = self._ihc_pre(
+                self.hc_attn_layer,
+                self.input_layernorm,
+                residual,
+                single_pass=self.ihc_single_pass,
+                cluster=self.ihc_cluster,
+                quant=self.gate_input_fp8,
             )
         else:
-            residual, x, post = self._ihc_pre(
-                self.hc_attn_layer, self.input_layernorm, hidden_states, *pending
+            residual, x, post, *x_fp8 = self._ihc_pre(
+                self.hc_attn_layer,
+                self.input_layernorm,
+                hidden_states,
+                *pending,
+                single_pass=self.ihc_single_pass,
+                cluster=self.ihc_cluster,
+                quant=self.gate_input_fp8,
             )
         context = get_attn_tp_context()
         context.set_attn_inputs(
@@ -1239,6 +1335,7 @@ class HYV4FlashDecoderLayer(nn.Module):
                 forward_batch,
                 zero_allocator,
                 apply_out_norm=not defer_norm,
+                gate_input_fp8=x_fp8[0] if x_fp8 else None,
             )
         finally:
             context.clear_attn_inputs()
@@ -1249,6 +1346,8 @@ class HYV4FlashDecoderLayer(nn.Module):
             x,
             post,
             self.self_attn.out_norm if defer_norm else None,
+            single_pass=self.ihc_single_pass,
+            cluster=self.ihc_cluster,
         )
         x = self.mlp(x, forward_batch, apply_out_norm=not defer_norm)
         return residual, (x, post, self.mlp.out_norm if defer_norm else None)
@@ -1275,6 +1374,18 @@ class HYV4FlashModel(nn.Module):
             **get_embedding_tp_kwargs(),
         )
         self.alt_stream = None
+        ihc_single_pass = hy4_ihc_single_pass_supported(
+            hc_mult=config.hc_mult,
+            hidden_size=config.hidden_size,
+            dtype=self.embed_tokens.weight.dtype,
+        )
+        # The cluster kernel serves the small token counts in front of the
+        # single-pass Triton kernels, so it is enabled only together with them.
+        ihc_cluster = ihc_single_pass and hy4_ihc_cluster_supported(
+            hc_mult=config.hc_mult,
+            hidden_size=config.hidden_size,
+            dtype=self.embed_tokens.weight.dtype,
+        )
         self.rope_store = (
             _MRopePositionStore(config.mrope_section)
             if visual_token_ids is not None
@@ -1288,9 +1399,18 @@ class HYV4FlashModel(nn.Module):
                 f"{prefix}.layers.{i}",
                 self.alt_stream,
                 rope_store=self.rope_store,
+                ihc_single_pass=ihc_single_pass,
+                ihc_cluster=ihc_cluster,
             )
             for i in range(config.num_hidden_layers)
         )
+        if ihc_single_pass:
+            out_norms = [layer.self_attn.out_norm for layer in self.layers]
+            out_norms += [layer.mlp.out_norm for layer in self.layers]
+            prepare_hy4_ihc_single_pass(
+                device=torch.device("cuda", torch.cuda.current_device()),
+                out_norm_variants=tuple({n is not None for n in out_norms}),
+            )
         self.engram_hasher = None
         self.engram_index = {}
         if config.engram_layer_ids:
@@ -1307,6 +1427,25 @@ class HYV4FlashModel(nn.Module):
                 self.engram_index[layer_number - 1] = index
         self.hc_head = HYV4HCHeadLayer(config, f"{prefix}.hc_head")
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        if ihc_cluster:
+            prepare_hy4_ihc_cluster(
+                hc_mult=config.hc_mult,
+                hidden_size=config.hidden_size,
+                device=torch.device("cuda", torch.cuda.current_device()),
+                variants=self._ihc_cluster_variants(),
+            )
+
+    def _ihc_cluster_variants(self) -> tuple[tuple[bool, bool, bool], ...]:
+        """(has_output, out_norm, quant) of every iHC call the layers make: the
+        attention call folds the previous layer's post unless it is the first
+        layer or an Engram layer; the MLP call always folds the attention's."""
+        variants = set()
+        for i, layer in enumerate(self.layers):
+            folds = i > 0 and layer.engram_layer is None
+            prev_norm = folds and self.layers[i - 1].mlp.out_norm is not None
+            variants.add((folds, prev_norm, layer.gate_input_fp8))
+            variants.add((True, layer.self_attn.out_norm is not None, False))
+        return tuple(sorted(variants))
 
     def forward(
         self, input_ids, positions, forward_batch, input_embeds=None, mm_pad_ids=None

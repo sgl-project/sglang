@@ -7,6 +7,12 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.layernorm.hy4_ihc_cluster import (
+    hy4_ihc_cluster,
+    hy4_ihc_cluster_max_tokens,
+)
+from sglang.kernels.ops.layernorm.hy4_ihc_single_pass import hy4_ihc_single_pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -738,10 +744,10 @@ _IHC_DOT_BLOCK_K = 128
 _IHC_DOT_POST_CONFIG = (64, 256, 8)  # (BLOCK_T, BLOCK_K, num_warps)
 
 
-def ihc_fuses_out_norm(num_tokens: int) -> bool:
+def ihc_fuses_out_norm(num_tokens: int, single_pass: bool = False) -> bool:
     """Whether `hy4_ihc_post_pre_norm` can take the output RMSNorm for this many
-    tokens."""
-    return num_tokens < _IHC_TOKEN_BLOCKED_MIN_T
+    tokens; the single-pass kernel takes it at every token count."""
+    return single_pass or num_tokens < _IHC_TOKEN_BLOCKED_MIN_T
 
 
 def hy4_ihc_post_pre_norm(
@@ -758,14 +764,106 @@ def hy4_ihc_post_pre_norm(
     rms_eps: float,
     out_norm_weight: torch.Tensor | None = None,
     out_norm_eps: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """iHC post (when `output` is given) + iHC pre + RMSNorm in two launches.
+    single_pass: bool = False,
+    cluster: bool = False,
+    quant: bool = False,
+) -> tuple:
+    """iHC post (when `output` is given) + iHC pre + RMSNorm.
 
     Returns (new residual, normalized block input, new post gates). Without
     `output` the residual is used as is and returned unchanged.
     `out_norm_weight` applies the previous block's output RMSNorm to `output`
     first; only for token counts where `ihc_fuses_out_norm` holds.
+    `single_pass` selects the SM90 kernels of `hy4_ihc_single_pass`; set it only
+    where `hy4_ihc_single_pass_supported` holds.
+    `cluster` serves token counts up to `hy4_ihc_cluster_max_tokens` with the
+    thread-block-cluster kernel; set it only where `hy4_ihc_cluster_supported`
+    holds and `prepare_hy4_ihc_cluster` ran for the variant.
+    `quant` (with `cluster`) appends the normalized input as an fp8 pair for a
+    block-fp8 linear (see `hy4_ihc_cluster`), or None where the token count took
+    another kernel.
     """
+    T, hc_mult, hidden_size = residual.shape
+    if cluster and 0 < T <= hy4_ihc_cluster_max_tokens(
+        hc_mult=hc_mult,
+        hidden_size=hidden_size,
+        has_output=output is not None,
+        out_norm=out_norm_weight is not None,
+        quant=quant,
+        device=residual.device,
+    ):
+        # One launch with the row reductions in cluster shared memory: below
+        # the Triton kernels' latency at the token counts one wave holds.
+        result = hy4_ihc_cluster(
+            output=output,
+            residual=residual,
+            post=post,
+            hc_fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            magnitude=magnitude,
+            norm_eps=norm_eps,
+            hc_eps=hc_eps,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            out_norm_weight=out_norm_weight,
+            out_norm_eps=out_norm_eps,
+            quant=quant,
+        )
+        return result if quant else result[:3]
+    result = _hy4_ihc_post_pre_norm_triton(
+        output=output,
+        residual=residual,
+        post=post,
+        hc_fn=hc_fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        magnitude=magnitude,
+        norm_eps=norm_eps,
+        hc_eps=hc_eps,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        out_norm_weight=out_norm_weight,
+        out_norm_eps=out_norm_eps,
+        single_pass=single_pass,
+    )
+    return (*result, None) if quant else result
+
+
+def _hy4_ihc_post_pre_norm_triton(
+    output: torch.Tensor | None,
+    residual: torch.Tensor,
+    post: torch.Tensor | None,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    magnitude: float,
+    norm_eps: float,
+    hc_eps: float,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    out_norm_weight: torch.Tensor | None,
+    out_norm_eps: float,
+    single_pass: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if single_pass:
+        # H200-tuned, hidden 3072 only (one launch at decode sizes); the kernels
+        # below serve every other architecture and shape.
+        return hy4_ihc_single_pass(
+            output=output,
+            residual=residual,
+            post=post,
+            hc_fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            magnitude=magnitude,
+            norm_eps=norm_eps,
+            hc_eps=hc_eps,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            out_norm_weight=out_norm_weight,
+            out_norm_eps=out_norm_eps,
+        )
     residual = residual.contiguous()
     hc_fn = hc_fn.contiguous()
     T, hc_mult, hidden_size = residual.shape

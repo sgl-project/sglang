@@ -87,6 +87,27 @@ register_kernel(
     )
 )
 
+# One dispatcher: the generic two-launch kernels, the SM90 single-pass kernels
+# (hy4_ihc_single_pass) with single_pass=True, and the thread-block-cluster kernel
+# (hy4_ihc_cluster) for small token counts with cluster=True.
+register_kernel(
+    KernelSpec(
+        op="layernorm.hy4_ihc_post_pre_norm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.hy4_ihc:hy4_ihc_post_pre_norm",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="layernorm.hy4_ihc_post_pre_norm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.layernorm.hy4_ihc_cluster:hy4_ihc_cluster",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(10, 3))}
+        ),
+    )
+)
+
 register_kernel(
     KernelSpec(
         op="layernorm.mhc_post_combine_norm_decode",
