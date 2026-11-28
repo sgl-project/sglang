@@ -31,10 +31,10 @@ Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, 
     }
   }
 
-  // zero padding to length
+  // zero padding to length; pads get no parent so tree verify never reaches them
   while (info.token.size() < static_cast<size_t>(draft_token_num)) {
     info.token.emplace_back(0);
-    prevs.emplace_back(0);
+    prevs.emplace_back(-1);
   }
 
   int n = info.token.size();
