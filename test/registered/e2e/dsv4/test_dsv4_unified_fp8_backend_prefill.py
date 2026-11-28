@@ -139,6 +139,7 @@ class TestUnifiedFp8BackendPrefill(CustomTestCase):
             pf_chunk_start=_ints([0] * tokens),
             pf_cu_q=_ints(CU_Q),
             pf_final_pos=_ints([max(POSITIONS)] * tokens),
+            pf_indices={},
         )
         core_meta = SimpleNamespace(
             unified=unified_meta,
