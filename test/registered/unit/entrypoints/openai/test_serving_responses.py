@@ -2572,14 +2572,7 @@ def test_pd_builtin_tool_admission(response_serving):
     serving.tokenizer_manager.generate_request.assert_not_called()
 
 
-@pytest.mark.parametrize("stream", [False, True])
-def test_standalone_builtin_tools_without_storage(response_serving, stream):
-    serving = response_serving(harmony=True)
-    tool_session = Mock()
-    tool_session.call_tool = AsyncMock(
-        return_value=Mock(content=[Mock(text="Search result: 42")])
-    )
-
+def _setup_harmony_search(serving, tool_session, *, stream):
     @asynccontextmanager
     async def session(name):
         yield tool_session
@@ -2613,13 +2606,23 @@ def test_standalone_builtin_tools_without_storage(response_serving, stream):
         name="browser", description="Browser", tools=[]
     )
     serving.supports_browsing = True
-    request = ResponsesRequest(
+    return ResponsesRequest(
         model="x",
         instructions="Use the search tool.",
         input="What is the answer?",
         tools=[{"type": "web_search"}],
         stream=stream,
     )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_standalone_builtin_tools_without_storage(response_serving, stream):
+    serving = response_serving(harmony=True)
+    tool_session = Mock()
+    tool_session.call_tool = AsyncMock(
+        return_value=Mock(content=[Mock(text="Search result: 42")])
+    )
+    request = _setup_harmony_search(serving, tool_session, stream=stream)
     response = asyncio.run(create_response_result(serving, request))
     assert isinstance(response, ResponsesResponse), response.body
     tool_session.call_tool.assert_awaited_once_with("search", {"query": "answer"})
@@ -2632,6 +2635,66 @@ def test_standalone_builtin_tools_without_storage(response_serving, stream):
     assert request.input in prompt
     assert "Search result: 42" in prompt
     assert not serving.msg_store and not serving.response_store
+
+
+def test_harmony_stream_completes_web_search_after_backend_returns(response_serving):
+    """A parsed search call stays open in the stream while its backend is blocked."""
+    serving = response_serving(harmony=True)
+
+    async def run():
+        search_started = asyncio.Event()
+        release_search = asyncio.Event()
+        events = []
+
+        async def search(_name, _arguments):
+            search_started.set()
+            await release_search.wait()
+            return Mock(content=[Mock(text="Search result: 42")])
+
+        request = _setup_harmony_search(serving, Mock(call_tool=search), stream=True)
+
+        async def consume():
+            stream = await serving.create_responses(request)
+            async for event in stream:
+                events.extend(event_payloads([event]))
+
+        consumer = asyncio.create_task(consume())
+        try:
+            await asyncio.wait_for(search_started.wait(), timeout=5)
+            assert [event["type"] for event in events] == [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.web_search_call.in_progress",
+                "response.web_search_call.searching",
+            ]
+            added = events[2]
+            assert added["item"]["type"] == "web_search_call"
+            assert added["item"]["status"] == "in_progress"
+            blocked_event_count = len(events)
+        finally:
+            release_search.set()
+            await asyncio.wait_for(consumer, timeout=5)
+
+        completed, done, *continuation = events[blocked_event_count:]
+        assert completed["type"] == "response.web_search_call.completed"
+        assert completed["item_id"] == added["item"]["id"]
+        assert done["type"] == "response.output_item.done"
+        assert done["item"]["id"] == added["item"]["id"]
+        assert done["item"]["status"] == "completed"
+        assert continuation[0]["type"] == "response.output_item.added"
+        assert continuation[0]["item"]["type"] == "message"
+        assert (
+            "".join(
+                event["delta"]
+                for event in continuation
+                if event["type"] == "response.output_text.delta"
+            )
+            == "The answer is 42."
+        )
+        assert continuation[-1]["type"] == "response.completed"
+
+    asyncio.run(run())
 
 
 def _harmony_turn_ids(message):
