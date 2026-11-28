@@ -295,6 +295,7 @@ async def init_multi_tokenizer() -> ServerArgs:
         completion_template=get_serving().completion_template,
     )
 
+    tokenizer_manager.max_req_len = scheduler_info["max_req_len"]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
 
@@ -311,8 +312,6 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    grpc_handle = None
-    sidecar = None
     warmup_thread = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
@@ -440,27 +439,10 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    # Start the native gRPC server and warmup inside the try so a failure in
-    # either still runs the finally cleanup below. Native gRPC is enabled via
-    # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
-    # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
+    # Start the warmup inside the try so a failure still runs the finally
+    # cleanup below. Native gRPC (--grpc-port / SGLANG_GRPC_PORT) is served by
+    # the Rust server only; __post_init__ rejects it without SGLANG_RUST_SERVER.
     try:
-        if (
-            getattr(fast_api_app, "is_single_tokenizer_mode", False)
-            and get_serving().grpc_port is not None
-        ):
-            grpc_handle = _start_native_grpc_server_for_runtime(
-                server_args=server_args,
-                tokenizer_manager=_global_state.tokenizer_manager,
-                template_manager=_global_state.template_manager,
-                scheduler_info=_global_state.scheduler_info,
-                grpc_port=get_serving().grpc_port,
-            )
-            if get_serving().sidecar is not None:
-                from sglang.srt.entrypoints.sidecar import start_sidecar
-
-                sidecar = start_sidecar()
-
         # Execute the general warmup
         warmup_thread = threading.Thread(
             target=_wait_and_warmup,
@@ -471,12 +453,6 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
-        if sidecar is not None:
-            try:
-                sidecar.stop()
-            except Exception:
-                logger.exception("Failed to stop sidecar")
-        _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
         if warmup_thread is not None:
@@ -1244,6 +1220,18 @@ async def hicache_storage_backend_status():
             "hicache_write_policy",
         )
     }
+
+
+@app.api_route("/unified-cache/external-linker", methods=["PUT", "DELETE"])
+async def update_cache_linker(request: Request):
+    """Re-attach (PUT) or detach (DELETE) the launch-time external linker while all schedulers are idle."""
+    ret = await _global_state.tokenizer_manager.update_cache_linker(
+        attach=request.method == "PUT"
+    )
+    return ORJSONResponse(
+        msgspec_to_builtins(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 # example usage:
@@ -3277,45 +3265,6 @@ def _setup_and_run_http_server(
                 multi_tokenizer_args_shm.unlink()
             if _global_state is not None:
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
-
-
-def _start_native_grpc_server_for_runtime(
-    server_args,
-    tokenizer_manager,
-    template_manager,
-    scheduler_info,
-    grpc_port,
-):
-    from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-    from sglang.srt.rust_extensions import load_rust_extension
-
-    grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
-
-    runtime_handle = RuntimeHandle(
-        tokenizer_manager=tokenizer_manager,
-        template_manager=template_manager,
-        server_args=server_args,
-        scheduler_info=scheduler_info or {},
-    )
-
-    grpc_handle = grpc_native.start_server(
-        host=get_serving().host,
-        port=grpc_port,
-        runtime_handle=runtime_handle,
-        worker_threads=get_serving().grpc_worker_threads,
-        response_timeout_secs=get_serving().grpc_response_timeout_secs,
-    )
-    logger.info(f"Native gRPC server started on {get_serving().host}:{grpc_port}")
-    return grpc_handle
-
-
-def _shutdown_native_grpc_server(grpc_handle) -> None:
-    if grpc_handle is None:
-        return
-    try:
-        grpc_handle.shutdown()
-    except Exception as e:
-        logger.warning(f"Failed to shut down native gRPC server: {e}")
 
 
 def launch_server(

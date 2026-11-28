@@ -687,8 +687,15 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    # Only the text attention stacks q/k/v; the vision attn.qkv_proj is the
+    # checkpoint's single attn.qkv tensor, so qkv_proj is scoped to self_attn.
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
+        "self_attn.qkv_proj": [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+        ],
     }
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
