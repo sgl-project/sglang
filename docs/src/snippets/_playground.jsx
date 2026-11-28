@@ -963,22 +963,15 @@ export const Playground = ({ config }) => {
 
       apply: ({ flags, env, value, fc, h, derived }) => {
         const items = fc.items || [];
-        // Effective state per item: explicit > derived > false. Skip
-        // strip+emit when nothing differs from base.
-        const eff = {};
-        const baseOf = {};
-        for (const item of items) {
-          baseOf[item.id] = derived ? !!derived[item.id] : false;
-          const v = value[item.id];
-          eff[item.id] = (v === null || v === undefined) ? baseOf[item.id] : v;
-        }
-        const anyOverride = items.some((it) => eff[it.id] !== baseOf[it.id]);
-        if (!anyOverride) return { flags, env };
-        flags = h.stripFlagsByFirstToken(flags, ["--reasoning-parser", "--tool-call-parser"]);
-        const adds = [];
-        for (const item of items) {
-          if (eff[item.id]) adds.push(item.flag);
-        }
+        // Keep untouched parser values, which can differ between recipes.
+        const overrides = items.filter((item) => {
+          const selected = value[item.id];
+          return selected != null && selected !== !!derived?.[item.id];
+        });
+        if (!overrides.length) return { flags, env };
+        const prefixes = overrides.map((item) => item.flag.split(/[\s=]/)[0]);
+        flags = h.stripFlagsByFirstToken(flags, prefixes);
+        const adds = overrides.filter((item) => value[item.id]).map((item) => item.flag);
         if (adds.length) flags = h.insertBeforeTail(flags, adds);
         return { flags, env };
       },
