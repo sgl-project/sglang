@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 
+from sglang.srt.arg_groups.model_override_base import runs_prefill_of
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
@@ -324,9 +325,8 @@ class SchedulePolicy:
             # Keep the existing FCFS refresh cadence/cap for non-members.
             # Touch them first so matching the current batch makes its prefixes
             # more recent. Fast-match caches retain the existing match-anyway path.
-            if (
-                self.tree_cache.supports_fast_match_prefix()
-                and get_disagg().disaggregation_mode != "decode"
+            if self.tree_cache.supports_fast_match_prefix() and runs_prefill_of(
+                get_disagg()
             ):
                 for r in tail:
                     r.init_next_round_input(self.tree_cache)
@@ -349,11 +349,12 @@ class SchedulePolicy:
         policy = self._determine_active_policy(waiting_queue)
 
         # Cache-agnostic policies sort without matching; match anyway so the load
-        # snapshot sees num_matched_prefix_tokens. Decode never prefills.
+        # snapshot sees num_matched_prefix_tokens. A decode server's waiting
+        # queue holds prompts to prefill only with local prefill.
         if (
             not isinstance(policy, CacheAwarePolicy)
             and self.tree_cache.supports_fast_match_prefix()
-            and get_disagg().disaggregation_mode != "decode"
+            and runs_prefill_of(get_disagg())
         ):
             for r in waiting_queue:
                 match_kv_cache(r, self.tree_cache)
@@ -519,7 +520,7 @@ class SchedulePolicy:
             )
             or not (waiting_queue or (bootstrap_queue and bootstrap_max > 0))
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
-            or get_disagg().disaggregation_mode == "decode"
+            or not runs_prefill_of(get_disagg())
             or get_memory().radix_eviction_policy.lower()
             not in ("lru", "joint_lru", "state_cost")
             or self.tree_cache.supports_fast_match_prefix()
