@@ -2,9 +2,10 @@
 
 import argparse
 import unittest
+from types import SimpleNamespace
 
 from sglang.benchmark.goodput import calculate_goodput
-from sglang.benchmark.serving import RequestFuncOutput, _goodput_slo
+from sglang.benchmark.serving import RequestFuncOutput, _goodput_slo, calculate_metrics
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -50,6 +51,44 @@ class TestBenchServingGoodput(CustomTestCase):
                 self.assertEqual(goodput.request_goodput, num_good / DURATION_S)
                 self.assertEqual(goodput.slo_attainment, num_good / len(OUTPUTS))
                 self.assertEqual(goodput.slo_attainment_by_metric, by_metric)
+
+    def test_retokenized_metrics_allow_empty_token_chunks(self):
+        """Zero-token chunks retain time until the next reportable token."""
+        output = RequestFuncOutput(
+            success=True,
+            ttft=0.1,
+            latency=0.7,
+            output_len=3,
+            start_time=0,
+            generated_text="first answer next ",
+            itl=[0.05, 0.15, 0.1, 0.3],
+            text_chunks=[" ", "answer", "next", " "],
+        )
+        following = RequestFuncOutput(
+            success=True,
+            ttft=0.1,
+            latency=0.5,
+            output_len=2,
+            start_time=0,
+            generated_text="first answer",
+            itl=[0.4],
+            text_chunks=["answer"],
+        )
+        tokenizer = SimpleNamespace(encode=lambda text, **kwargs: text.split())
+        metrics, lengths = calculate_metrics(
+            None,
+            [output, following],
+            1.0,
+            tokenizer,
+            "sglang-oai-chat",
+            accept_length=2,
+        )
+        self.assertEqual(lengths, [3, 2])
+        self.assertEqual(metrics.completed, 2)
+        self.assertEqual(metrics.total_output_retokenized, 5)
+        # Preserve the 50ms zero-token gap, reset after each token-bearing chunk,
+        # and do not carry the final 300ms of the first request into the second.
+        self.assertAlmostEqual(metrics.mean_itl_ms, (200 + 100 + 400) / 3)
 
     def test_invalid_slo_entries_are_rejected(self):
         for entry in ["itl:10", "ttft:0"]:
