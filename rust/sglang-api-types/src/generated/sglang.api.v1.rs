@@ -1485,14 +1485,15 @@ pub struct CachedTokensDetails {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {
-    /// JSON key order is FIELD-NUMBER order: text, meta_info, then the
-    /// conditionally-present output_ids and index — matching frame_value's
+    /// JSON key order is FIELD-NUMBER order: text, meta_info, then output_ids
+    /// and the conditionally-present index — matching frame_value's
     /// insertion order byte-for-byte.
     #[prost(string, tag = "1")]
     pub text: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub meta_info: ::core::option::Option<GenerateMetaInfo>,
-    /// Omitted while empty (a text-only frame).
+    /// Set on every frame, as Python's output_ids is: empty when the frame
+    /// carries no tokens (a zero-token finish, a text-only delta).
     #[prost(message, optional, tag = "3")]
     pub output_ids: ::core::option::Option<TokenIds>,
     /// Batch position; only on batch responses/frames.
@@ -2960,13 +2961,34 @@ pub struct OpenAiClassifyRequest {
     pub priority: ::core::option::Option<i64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiClassifyProbabilityRows {
+    #[prost(message, repeated, tag = "1")]
+    pub rows: ::prost::alloc::vec::Vec<DoubleList>,
+}
+/// Sequence probabilities are flat; token classifiers add one row per token.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiClassifyProbabilities {
+    #[prost(oneof = "open_ai_classify_probabilities::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<open_ai_classify_probabilities::Value>,
+}
+/// Nested message and enum types in `OpenAiClassifyProbabilities`.
+pub mod open_ai_classify_probabilities {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        Sequence(super::DoubleList),
+        #[prost(message, tag = "2")]
+        PerToken(super::OpenAiClassifyProbabilityRows),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OpenAiClassifyData {
     #[prost(int64, tag = "1")]
     pub index: i64,
-    #[prost(string, tag = "2")]
-    pub label: ::prost::alloc::string::String,
-    #[prost(double, repeated, tag = "3")]
-    pub probs: ::prost::alloc::vec::Vec<f64>,
+    #[prost(message, optional, tag = "2")]
+    pub label: ::core::option::Option<StringOrList>,
+    #[prost(message, optional, tag = "3")]
+    pub probs: ::core::option::Option<OpenAiClassifyProbabilities>,
     #[prost(int64, tag = "4")]
     pub num_classes: i64,
 }

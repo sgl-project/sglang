@@ -778,10 +778,24 @@ message OpenAiClassifyRequest {
   optional int64 priority = 5;
 }
 
+message OpenAiClassifyProbabilityRows {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated DoubleList rows = 1;
+}
+
+// Sequence probabilities are flat; token classifiers add one row per token.
+message OpenAiClassifyProbabilities {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    DoubleList sequence = 1;
+    OpenAiClassifyProbabilityRows per_token = 2;
+  }
+}
+
 message OpenAiClassifyData {
   int64 index = 1;
-  string label = 2;
-  repeated double probs = 3;
+  StringOrList label = 2;
+  OpenAiClassifyProbabilities probs = 3;
   int64 num_classes = 4;
 }
 
