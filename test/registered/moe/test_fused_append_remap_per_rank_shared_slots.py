@@ -2,14 +2,20 @@
 
 Covers ``fused_append_remap_shared_experts_deepep``, the single Triton launch
 form of ``remap_topk_for_per_rank_shared_slots()`` on the per-rank shared-slot
-path, and ``select_experts`` on that path with the real routers. The kernels are
+path, and ``_post_process_topk_ids`` wiring on the HIP+aiter per-rank path --
+including the padded-weight contract: the kernel fills padded ids and, unless
+SGLANG_MORI_NO_PAD_MASK keeps them live, zeroes padded routed/shared weights in
+place of the trailing _zero_topk_weights_padded_region pass. The kernels are
 GPU-only (Triton), so these tests are skipped when no accelerator is present.
 """
 
+import types
 import unittest
+from unittest import mock
 
 import torch
 
+import sglang.srt.layers.moe.topk as topk_mod
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     fused_append_remap_shared_experts_deepep,
 )
@@ -232,13 +238,15 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
         self.assertTrue(torch.all(got_w[:, -s:] == 1.0))
 
     def test_pad_fold_matches_separate_fill(self):
-        """HAS_PADDING fold == separate padded-fill(0) then append+remap.
+        """HAS_PADDING fold == the separate two-step padded path it replaces.
 
-        The fusion folds the padded-topk_ids fill into this kernel: rows
-        >= num_token_non_padded get pad_fill_id in every routed slot. With
-        pad_fill_id=0 this is bit-identical to the previous path that filled the
-        padded region with 0 (topk_ids=0 -> remap 0 + 0//nlr = 0) via a separate
-        _fill_padded_rows launch before append+remap ran.
+        On padded rows (>= num_token_non_padded) the fold does two things the
+        old path did in separate launches: fill pad_fill_id into every routed
+        id slot (was _fill_padded_rows on topk_ids, before append+remap), and
+        zero the full k+s weight row -- routed and shared alike (was
+        _zero_topk_weights_padded_region on topk_weights, after append+remap).
+        With pad_fill_id=0 the ids match bit-for-bit (remap 0 -> 0 + 0//nlr = 0),
+        and the weights match the post-zeroing baseline.
         """
         for m, k, npr, ep_size, ep_rank, s in self.CASES:
             for n_valid in (0, max(m // 2, 1), m):
@@ -248,7 +256,9 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
                     )
                     topk_ids, topk_weights = self._make_inputs(m, k, npr)
 
-                    # Baseline: pre-fill padded rows to 0, no fold.
+                    # Baseline: pre-fill padded ids to 0, append+remap, then the
+                    # separate _zero_topk_weights_padded_region pass that zeroed
+                    # the whole padded weight row.
                     base_ids = topk_ids.clone()
                     base_ids[n_valid:] = 0
                     exp_ids, exp_w = fused_append_remap_shared_experts_deepep(
@@ -259,6 +269,7 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
                         shared_id_base,
                         num_local_routed,
                     )
+                    exp_w[n_valid:] = 0.0
 
                     # Fused: fold the fill (no pre-fill), pad_fill_id=0.
                     ntnp = torch.tensor(
@@ -286,6 +297,86 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
         )
         self.assertTrue(torch.equal(got_ids, topk_ids))
         self.assertTrue(torch.equal(got_w, topk_weights))
+
+    def test_post_process_per_rank_pad_weight_gating(self):
+        """Padded-weight contract of _post_process_topk_ids, HIP per-rank path.
+
+        Regression guard for the fold: the gate must forward num_token_non_padded
+        to the fused deepep append+remap so padded rows always get their routed
+        ids filled, while the weight zeroing tracks SGLANG_MORI_NO_PAD_MASK. With
+        the flag off, every padded routed/shared weight must leave this helper
+        zeroed (the kernel folds the trailing _zero_topk_weights_padded_region
+        pass); with it on, the id fill stays but padded weights must remain live.
+        A wiring regression -- zeroing under the flag, or leaving live weights on
+        padded shared slots without it -- is otherwise uncaught, since only the
+        kernel, not this gating, is exercised elsewhere.
+        """
+        device = get_device()
+        # (m, routed k, num_physical_routed, ep_size, ep_rank, s).
+        CASES = [(8, 6, 258, 6, 2, 1), (16, 8, 256, 8, 3, 2)]
+        for m, k, npr, ep_size, ep_rank, s in CASES:
+            for skip_pad_mask in (False, True):
+                for n_valid in (0, max(m // 2, 1), m):
+                    with self.subTest(
+                        m=m, k=k, s=s, skip=skip_pad_mask, n_valid=n_valid
+                    ):
+                        topk_ids, topk_weights = self._make_inputs(m, k, npr)
+                        router_logits = torch.empty(
+                            (m, npr), dtype=torch.float32, device=device
+                        )
+                        topk_config = TopKConfig(
+                            top_k=k + s,
+                            shared_experts=SharedExpertsConfig(
+                                num_fused_shared_experts=s
+                            ),
+                        )
+                        ntnp = torch.tensor(n_valid, dtype=torch.int32, device=device)
+                        parallel = types.SimpleNamespace(
+                            moe_ep_size=ep_size, moe_ep_rank=ep_rank
+                        )
+                        with mock.patch.multiple(
+                            topk_mod,
+                            _is_hip=True,
+                            _is_cuda=False,
+                            _is_npu=False,
+                            _use_aiter=True,
+                            _skip_hip_pad_mask=skip_pad_mask,
+                            has_per_rank_fused_shared_slots=lambda *_: True,
+                            is_expert_remapping_enabled=lambda: False,
+                            get_parallel=lambda: parallel,
+                        ):
+                            out_ids, out_w, _ = topk_mod._post_process_topk_ids(
+                                topk_ids,
+                                topk_weights,
+                                topk_config,
+                                router_logits,
+                                layer_id=0,
+                                num_token_non_padded=ntnp,
+                            )
+
+                        self.assertEqual(tuple(out_w.shape), (m, k + s))
+                        # Padded routed ids are always filled with 0 (aiter needs
+                        # in-range ids), independent of the weight flag.
+                        self.assertTrue(torch.all(out_ids[n_valid:, :k] == 0))
+                        # Valid rows keep routed weights and 1.0 shared slots.
+                        if n_valid > 0:
+                            self.assertTrue(
+                                torch.allclose(
+                                    out_w[:n_valid, :k], topk_weights[:n_valid]
+                                )
+                            )
+                            self.assertTrue(torch.all(out_w[:n_valid, k:] == 1.0))
+                        if not skip_pad_mask:
+                            # Folded zeroing: all padded weights are zero.
+                            self.assertTrue(torch.all(out_w[n_valid:] == 0.0))
+                        elif n_valid < m:
+                            # NO_PAD_MASK keeps padded weights live.
+                            self.assertTrue(
+                                torch.allclose(
+                                    out_w[n_valid:, :k], topk_weights[n_valid:]
+                                )
+                            )
+                            self.assertTrue(torch.all(out_w[n_valid:, k:] == 1.0))
 
 
 if __name__ == "__main__":
