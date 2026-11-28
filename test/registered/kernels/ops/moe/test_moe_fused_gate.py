@@ -46,6 +46,9 @@ def _reference_gate(
     """Definition-based eager reference for the fused-gate semantics."""
     if scoring_func == "sigmoid":
         activated = scores.sigmoid()
+    elif scoring_func == "softmax":
+        # The softmax_bias_on_probs rule: the bias ranks the probabilities only.
+        activated = scores.float().softmax(dim=-1)
     else:
         activated = torch.nn.functional.softplus(scores).sqrt()
 
@@ -598,6 +601,93 @@ def test_moe_fused_gate_accepts_non_fp32_bias(
         rtol=0,
         atol=0,
     )
+
+
+def _ernie_like_inputs(M: int, num_experts: int, dtype: torch.dtype, seed: int):
+    torch.manual_seed(seed)
+    scores = torch.randn(M, num_experts, device=DEVICE).to(dtype)
+    # ERNIE-4.5-21B-A3B layer 1: a large common offset with a ~1e-3 per-expert spread.
+    bias = 62.85 + 1e-3 * torch.randn(num_experts, device=DEVICE)
+    return scores, bias
+
+
+def _decided_rows(scores: torch.Tensor, bias: torch.Tensor, k: int) -> torch.Tensor:
+    """Rows whose top-k is decided by more than ~3 fp32 ulps at the bias offset;
+    the kernel's exp may order closer rows differently from torch."""
+    top = (scores.float().softmax(dim=-1) + bias).topk(k + 1, dim=-1).values
+    return top[:, k - 1] - top[:, k] > 1e-5
+
+
+@pytest.mark.parametrize(
+    "M,num_experts,topk,num_shared,renormalize,apply_scale,dtype",
+    [
+        (1, 64, 6, 0, True, False, torch.bfloat16),  # ERNIE-4.5-21B-A3B decode
+        (300, 64, 6, 0, True, False, torch.bfloat16),
+        (512, 64, 8, 1, True, True, torch.float32),
+        # moe_route_warp covers this shape for plain softmax; this mode must skip it.
+        (512, 256, 8, 0, False, False, torch.float32),
+    ],
+)
+def test_moe_fused_gate_softmax_bias_on_probs_matches_reference(
+    M: int,
+    num_experts: int,
+    topk: int,
+    num_shared: int,
+    renormalize: bool,
+    apply_scale: bool,
+    dtype: torch.dtype,
+) -> None:
+    scores, bias = _ernie_like_inputs(M, num_experts, dtype, seed=num_experts + topk)
+    kwargs = dict(
+        topk=topk,
+        scoring_func="softmax",
+        num_fused_shared_experts=num_shared,
+        renormalize=renormalize,
+        routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=apply_scale,
+    )
+    tri_w, tri_i = moe_fused_gate(scores, bias, softmax_bias_on_probs=True, **kwargs)
+    ref_w, ref_i = _reference_gate(scores, bias, **kwargs)
+    torch.cuda.synchronize()
+
+    rows = _decided_rows(scores, bias, topk - num_shared)
+    assert rows.float().mean() > 0.97
+    num_columns = num_experts + num_shared
+    torch.testing.assert_close(
+        _scatter_by_expert(tri_w, tri_i, num_columns)[rows],
+        _scatter_by_expert(ref_w, ref_i, num_columns)[rows],
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+
+def test_moe_fused_gate_softmax_bias_on_probs_differs_from_logit_space() -> None:
+    scores, bias = _ernie_like_inputs(512, 64, torch.float32, seed=0)
+    _, probs_i = moe_fused_gate(
+        scores, bias, topk=6, scoring_func="softmax", softmax_bias_on_probs=True
+    )
+    _, logit_i = moe_fused_gate(scores, bias, topk=6, scoring_func="softmax")
+    changed = (probs_i.sort(dim=-1).values != logit_i.sort(dim=-1).values).any(dim=-1)
+    assert changed.float().mean() > 0.05
+
+
+def test_moe_fused_gate_softmax_bias_on_probs_padding_and_packed() -> None:
+    M, num_experts, topk, live = 16, 64, 6, 11
+    scores, bias = _ernie_like_inputs(M, num_experts, torch.bfloat16, seed=1)
+    kwargs = dict(topk=topk, scoring_func="softmax", softmax_bias_on_probs=True)
+    full_w, full_i = moe_fused_gate(scores, bias, **kwargs)
+    packed = torch.empty(M, topk, dtype=torch.int32, device=DEVICE)
+    num_live = torch.tensor([live], dtype=torch.int32, device=DEVICE)
+    w, i = moe_fused_gate(
+        scores, bias, num_token_non_padded=num_live, packed_out=packed, **kwargs
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(w[:live], full_w[:live], rtol=0, atol=0)
+    torch.testing.assert_close(i[:live], full_i[:live], rtol=0, atol=0)
+    assert (i[live:] == -1).all() and (w[live:] == 0).all()
+    w_bits = w.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
+    torch.testing.assert_close(packed, (i << 16) | w_bits, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

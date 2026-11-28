@@ -45,6 +45,7 @@ def _router_triton_kernel(
     SCORING_FUNC: tl.constexpr,  # 0 = sigmoid, 1 = sqrtsoftplus, 2 = softmax
     SQRTSOFTPLUS_LOG1P: tl.constexpr,  # sqrtsoftplus via log1p (V4.1 numerics)
     HAS_SOFTCAP: tl.constexpr,  # tanh softcapping (softmax only)
+    SOFTMAX_BIAS_ON_PROBS: tl.constexpr,  # softmax: bias ranks the probabilities only
     RENORMALIZE: tl.constexpr,
     APPLY_SCALE: tl.constexpr,  # apply_routed_scaling_factor_on_output
     HAS_BIAS: tl.constexpr,
@@ -131,20 +132,25 @@ def _router_triton_kernel(
             activated = tl.sqrt(sp)
         biased = activated + row_bias
     else:
-        # softmax over the row: weight is the softmax probability (bias kept), with
-        # optional tanh softcapping. Ranking by the (softcapped, biased) logit is
-        # monotonic with the softmax prob, so the topk loop below ranks on `biased`.
+        # softmax with optional tanh softcap; the bias is added to the logit and kept
+        # in the weight, or (SOFTMAX_BIAS_ON_PROBS) to the probability, to rank only.
         logit = scores
         if HAS_SOFTCAP:
             # tanh(z) = 2*sigmoid(2z) - 1 (avoids relying on tl.math.tanh availability).
             z = logit / moe_softcapping
             logit = moe_softcapping * (2.0 * tl.sigmoid(2.0 * z) - 1.0)
-        biased = logit + row_bias
+        if SOFTMAX_BIAS_ON_PROBS:
+            biased = logit
+        else:
+            biased = logit + row_bias
         biased = tl.where(mask_n[None, :], biased, -float("inf"))
         row_max = tl.max(biased, axis=1)[:, None]  # [BLOCK_M, 1]
         exp_row = tl.where(mask_n[None, :], tl.exp(biased - row_max), 0.0)
         row_sum = tl.sum(exp_row, axis=1)[:, None]  # [BLOCK_M, 1]
         activated = exp_row / row_sum
+        if SOFTMAX_BIAS_ON_PROBS:
+            # As in the sigmoid branch: rank on probability + bias, weight is bias-free.
+            biased = activated + row_bias
 
     biased = tl.where(mask_n[None, :], biased, -float("inf"))  # [BLOCK_M, BLOCK_N]
 
@@ -281,6 +287,7 @@ def moe_fused_gate(
     renormalize_epsilon: float = 0.0,
     packed_out: Optional[torch.Tensor] = None,
     sqrtsoftplus_log1p: bool = False,
+    softmax_bias_on_probs: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
@@ -294,6 +301,8 @@ def moe_fused_gate(
     (DeepSeek-V4.1); off, the DeepSeek-V4 formula and NaN order are kept.
     ``packed_out`` ([M, topk] int32, optional) receives the FlashInfer routed-MoE form
     ``(id << 16) | bf16_bits(weight)``, bitwise identical to ``fused_pack_topk``.
+    A softmax ``bias`` is added to the logits and kept in the weights;
+    ``softmax_bias_on_probs`` adds it to the probabilities, to rank only (ERNIE-4.5).
     """
     scoring_func = scoring_func.lower()
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func)
@@ -332,6 +341,10 @@ def moe_fused_gate(
             scores.size(0),
             topk,
         ), "packed_out must be [M, topk]"
+    if softmax_bias_on_probs:
+        assert scoring_func == "softmax" and bias is not None, (
+            "softmax_bias_on_probs needs softmax scoring and a bias"
+        )
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
@@ -367,9 +380,10 @@ def moe_fused_gate(
             return moe_route_radix.route_radix(*radix_args, sorted=False)
 
     # One-warp-per-token CUDA router: same selection, order and padding contract
-    # as the Triton kernel below.
+    # as the Triton kernel below, but its softmax bias is logit-space only.
     if (
         moe_softcapping == 0.0
+        and not softmax_bias_on_probs
         and moe_route_warp.covered(
             scores.dtype,
             scores.shape[1],
@@ -461,6 +475,7 @@ def moe_fused_gate(
         SCORING_FUNC=scoring_func_int,
         SQRTSOFTPLUS_LOG1P=bool(sqrtsoftplus_log1p),
         HAS_SOFTCAP=bool(moe_softcapping != 0.0),
+        SOFTMAX_BIAS_ON_PROBS=bool(softmax_bias_on_probs),
         RENORMALIZE=bool(renormalize),
         APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
         HAS_BIAS=bias is not None,
