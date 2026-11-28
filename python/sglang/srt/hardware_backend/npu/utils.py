@@ -2,6 +2,7 @@ import functools
 import logging
 import sys
 from enum import IntEnum
+from inspect import signature
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -44,6 +45,33 @@ def is_npu_arch22() -> bool:
 def is_npu_arch35() -> bool:
     """Whether the runtime is on NPU architecture 35."""
     return _is_npu_arch(3510)
+
+
+@functools.lru_cache(maxsize=2)
+def get_grouped_matmul_swiglu_quant(*, require_w4a8: bool) -> Optional[Callable]:
+    """Find the bundled GMM operator for the requested weight format."""
+    if is_npu_arch35():
+        return None
+    try:
+        import sgl_kernel_npu
+    except ImportError:
+        return None
+
+    if not any(
+        "sgl_grouped_matmul_swiglu_quant" in item.get("ops", ())
+        for item in getattr(sgl_kernel_npu, "_manifest", {}).get("third_party", ())
+    ):
+        return None
+    from sgl_kernel_npu.operators.moe import grouped_matmul_swiglu_quant
+
+    # The first version of this operator only supports W8A8.
+    if (
+        require_w4a8
+        and "weight_assist_matrix"
+        not in signature(grouped_matmul_swiglu_quant).parameters
+    ):
+        return None
+    return grouped_matmul_swiglu_quant
 
 
 # SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only

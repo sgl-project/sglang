@@ -269,7 +269,36 @@ class AscendRunnerCore(MoeRunnerCore):
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if _uses_fused_gmm1(w13_kernel, self.config):
+        fused_int8 = None
+        swiglu_limit = self.config.swiglu_limit
+        if (
+            isinstance(w13_kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod))
+            and isinstance(
+                self.config.layer.w2_kernel,
+                (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod),
+            )
+            and self.config.activation == "silu"
+            and self.config.is_gated
+            and self.config.gemm1_alpha is None
+            and self.config.gemm1_clamp_limit is None
+            and not self.config.use_tp_all_gather_activation
+            and (swiglu_limit is None or 0 < swiglu_limit < float("inf"))
+            and (
+                swiglu_limit is not None or isinstance(w13_kernel, NPUW8A8Int8MoEMethod)
+            )
+        ):
+            fused_int8 = w13_kernel.try_apply_fused_gmm1_swiglu(
+                quant_info,
+                x,
+                expert_tokens,
+                pertoken_scale=runner_input.hidden_states_scale,
+                group_list_type=group_list_type,
+                swiglu_limit=swiglu_limit or 0.0,
+            )
+
+        if fused_int8 is not None:
+            hidden_states, pertoken_scale = fused_int8
+        elif _uses_fused_gmm1(w13_kernel, self.config):
             # --- w13 projection + activation, fused into one kernel ---
             # The fused gmm1 returns activations already requantised for gmm2,
             # so there is no separate activation step to run.
