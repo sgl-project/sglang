@@ -249,6 +249,7 @@ def _gated_decode_req(poll, restore_status):
         kv_receiver=_GateReceiver(poll),
         metadata_buffer_index=3,
         hicache_restore_status=restore_status,
+        is_rebootstrap=False,
         pending_metadata=None,
         pending_receive=None,
     )
@@ -413,6 +414,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
 
     def _deferring_queue(self, decode_reqs):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.token_to_kv_pool = None
         queue.pp_size = 1
         queue.gloo_group = object()
         queue.queue = decode_queue(ListKind.PD_PREALLOC, decode_reqs)
