@@ -434,7 +434,7 @@ def test_mhc_refresh_without_deepgemm_prenorm():
     layer = _hopper_mhc_layer(norm, w, scale, base)
     layer._can_fuse_attn_mhc = layer._can_fuse_ffn_mhc = True
     with (
-        override_platform(is_sm100=True, is_sm90=False),
+        override_platform(is_sm100=True, is_sm90=False, is_sm120=False),
         envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True),
         patch.object(configurer, "ENABLE_JIT_DEEPGEMM", True),
         patch.dict("sys.modules", {"deep_gemm": SimpleNamespace()}),
