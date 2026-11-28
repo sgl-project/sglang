@@ -527,7 +527,12 @@ class TestBoundaryIntegrations(unittest.TestCase):
 
     @staticmethod
     def _qwen3_decode_quant_formats(
-        qkv_proj, gate_up_proj, num_tokens, compiling=False
+        qkv_proj,
+        gate_up_proj,
+        num_tokens,
+        compiling=False,
+        gfx95=True,
+        gfx942_takes=lambda linear: False,
     ):
         from sglang.srt import batch_invariant_ops
         from sglang.srt.layers.quantization import fp8_activation
@@ -548,8 +553,10 @@ class TestBoundaryIntegrations(unittest.TestCase):
         )
         with (
             patch.object(qwen3, "_use_aiter", True),
-            patch.object(qwen3, "_is_gfx95", True),
+            patch.object(qwen3, "_is_gfx95", gfx95),
             patch.object(qwen3, "aiter_takes_fp8_group_input", lambda linear: True),
+            patch.object(qwen3, "aiter_gfx942_takes_fp8_group_input", gfx942_takes),
+            patch.object(fp8_activation, "is_gfx95_supported", lambda: gfx95),
             patch.object(qwen3, "get_exec", lambda: exec_),
             patch.object(fp8_activation, "get_exec", lambda: exec_),
             patch.object(
@@ -611,6 +618,32 @@ class TestBoundaryIntegrations(unittest.TestCase):
                 self.assertEqual(
                     self._qwen3_decode_quant_formats(
                         qkv_proj, gate_up_proj, num_tokens=num_tokens
+                    ),
+                    expected,
+                )
+
+    def test_qwen3_fused_norm_quant_on_gfx942_needs_the_plain_block_fp8_gemm(self):
+        """On gfx942 a norm fuses the quant only before a linear on the plain
+        block-FP8 GEMM, which has no small-M bf16 GEMM to yield to."""
+        qkv_proj, gate_up_proj = (
+            SimpleNamespace(
+                params_dtype=torch.bfloat16,
+                weight=torch.empty(n, 1024, device="meta"),
+                bias=None,
+            )
+            for n in (4096, 6144)
+        )
+        for qkv_takes, expected in ((True, ("fp8", "fp8")), (False, ("", "fp8"))):
+            with self.subTest(qkv_takes=qkv_takes):
+                self.assertEqual(
+                    self._qwen3_decode_quant_formats(
+                        qkv_proj,
+                        gate_up_proj,
+                        num_tokens=16,
+                        gfx95=False,
+                        gfx942_takes=lambda linear: (
+                            qkv_takes if linear is qkv_proj else True
+                        ),
                     ),
                     expected,
                 )

@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
 )
@@ -57,6 +58,7 @@ _is_sm100_supported = _is_cuda and get_platform().is_sm100
 _use_aiter = envs.SGLANG_USE_AITER.get() and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+_is_gfx942_supported = is_gfx942_supported()
 
 
 if _use_aiter:
@@ -266,6 +268,45 @@ def _update_and_read_residual_aiter_fp8_per_token(
     )
 
 
+def _update_and_read_residual_aiter_fp8_group_gfx942(
+    norm, hidden_states, residual, post_residual_addition
+):
+    """aiter (ROCm gfx942) fused (add +) RMSNorm + FP8 1x128 group quant in the
+    HIP add_rmsnorm_quant kernel: fp8 (fnuz) output and the row-major
+    (M, N/128) fp32 scale the gfx942 blockscale GEMM reads, the same operand
+    aiter's per-1x128 quant would produce from the bf16 norm output."""
+    group_size = 128
+    M, N = hidden_states.shape
+    out_fp8 = torch.empty((M, N), dtype=_aiter_fp8_dtype, device=hidden_states.device)
+    scale = torch.empty(
+        (M, N // group_size), dtype=torch.float32, device=hidden_states.device
+    )
+    if residual is None:
+        _aiter_rmsnorm_quant(
+            out_fp8,
+            hidden_states,
+            scale,
+            norm.weight.data,
+            norm.variance_epsilon,
+            group_size,
+        )
+        return (out_fp8, scale), hidden_states
+    if post_residual_addition is not None:
+        residual = residual + post_residual_addition
+    residual_out = torch.empty_like(hidden_states)
+    _aiter_add_rmsnorm_quant(
+        out_fp8,
+        hidden_states,
+        residual,
+        residual_out,
+        scale,
+        norm.weight.data,
+        norm.variance_epsilon,
+        group_size,
+    )
+    return (out_fp8, scale), residual_out
+
+
 def _norm_quant_kernel(quant_format: str):
     """Add the previous layer's output to the residual and read the attention
     input from it: the input norm, fused with the quantization this format
@@ -275,6 +316,8 @@ def _norm_quant_kernel(quant_format: str):
         return _update_and_read_residual_aiter_mxfp4
     if _use_aiter and _is_gfx95_supported and quant_format == "fp8":
         return _update_and_read_residual_aiter_fp8_group
+    if _use_aiter and _is_gfx942_supported and quant_format == "fp8":
+        return _update_and_read_residual_aiter_fp8_group_gfx942
     if _use_aiter and quant_format == "fp8_per_token":
         return _update_and_read_residual_aiter_fp8_per_token
     return _update_and_read_residual_plain

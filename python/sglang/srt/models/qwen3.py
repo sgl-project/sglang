@@ -23,6 +23,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_activation import (
+    aiter_gfx942_takes_fp8_group_input,
     aiter_prefers_bf16_input,
     aiter_takes_fp8_group_input,
     fp8_group_quant_fusion_allowed,
@@ -65,6 +66,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
     is_npu,
 )
@@ -76,6 +78,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_gfx95 = is_gfx95_supported()
+_is_gfx942 = is_gfx942_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 _has_fused_qk_norm_mrope = False
@@ -612,9 +615,11 @@ class Qwen3DecoderLayer(nn.Module):
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
         )
-        # Only aiter on gfx95 needs detection after weight loading.
+        # Only aiter on gfx95 and gfx942 needs detection after weight loading.
         # Other platforms can resolve the empty formats before tracing forward.
-        self._decode_quant_formats = None if (_use_aiter and _is_gfx95) else ("", "")
+        self._decode_quant_formats = (
+            None if (_use_aiter and (_is_gfx95 or _is_gfx942)) else ("", "")
+        )
 
     @staticmethod
     def stage_facts(config: Qwen3Config, layer_id: int):
@@ -637,7 +642,7 @@ class Qwen3DecoderLayer(nn.Module):
             self._decode_quant_formats = tuple(
                 "fp8"
                 if _use_aiter
-                and _is_gfx95
+                and (_is_gfx95 or aiter_gfx942_takes_fp8_group_input(linear))
                 and aiter_takes_fp8_group_input(linear)
                 # The GEMM returns bf16 for a pre-quantized input.
                 and linear.params_dtype == torch.bfloat16
