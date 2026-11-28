@@ -3,10 +3,13 @@ split-KV partials of paged_rel_bias_decode (unnormalized o, max, sum), reduced b
 combine_gate_sink, for one query per sequence or a causal block of queries per
 sequence (MTP verify). Each split takes an equal share of the sequence's own keys."""
 
+from __future__ import annotations
+
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.kvcache.mxfp8_dequant_paged import (
     MXFP8_PAGE,
     mxfp8_dequant_rows,
@@ -14,6 +17,40 @@ from sglang.kernels.ops.kvcache.mxfp8_dequant_paged import (
 )
 
 MAX_SPLITS = 64
+
+
+def _sm12x_swa_launch_config(
+    *,
+    batch: int,
+    heads_k: int,
+    qlen: int,
+    rows: int,
+    head_dim: int,
+    page_size: int,
+    span: int,
+    sms: int,
+    max_splits: int,
+) -> tuple[int, int, int] | None:
+    if (
+        not current_arch().is_sm(12)
+        or batch <= 0
+        or qlen <= 0
+        or heads_k <= 0
+        or page_size <= 0
+        or sms <= 0
+        or rows > 32
+        or head_dim > 128
+    ):
+        return None
+    ctas = batch * heads_k
+    candidates = (64, 128) if qlen == 1 else (128, 64)
+    for block_n in candidates:
+        if page_size % block_n != 0 or span < 2 * block_n:
+            continue
+        splits = triton.cdiv(span + block_n - 1, block_n)
+        if splits <= max_splits and ctas * splits <= sms:
+            return block_n, splits, 2
+    return None
 
 
 @triton.jit
@@ -163,8 +200,28 @@ def decode_partials(
     )
     sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     max_splits = max(1, min(2 * sms // max(1, batch * heads_k), MAX_SPLITS))
-    block_n = 128 if qlen == 1 and span >= 128 * max_splits else 32
-    splits = min(triton.cdiv(span, block_n), max_splits)
+    rows = max(16, triton.next_power_of_2(qlen * group))
+    swa_cfg = (
+        _sm12x_swa_launch_config(
+            batch=batch,
+            heads_k=heads_k,
+            qlen=qlen,
+            rows=rows,
+            head_dim=head_dim,
+            page_size=page_size,
+            span=span,
+            sms=sms,
+            max_splits=max_splits,
+        )
+        if window_size_left is not None and window_size_left >= 0
+        else None
+    )
+    if swa_cfg is not None:
+        block_n, splits, num_stages = swa_cfg
+    else:
+        block_n = 128 if qlen == 1 and span >= 128 * max_splits else 32
+        splits = min(triton.cdiv(span, block_n), max_splits)
+        num_stages = 2 if qlen == 1 else 3
     mxfp8 = k_scale is not None
     if mxfp8:
         assert v_scale is not None and page_size == MXFP8_PAGE
@@ -210,7 +267,7 @@ def decode_partials(
         heads_k,
         qlen,
         group,
-        max(16, triton.next_power_of_2(qlen * group)),
+        rows,
         head_dim,
         page_size,
         rel_bias.shape[-1],
@@ -218,7 +275,7 @@ def decode_partials(
         block_n,
         mxfp8,
         num_warps=4,
-        num_stages=2 if qlen == 1 else 3,
+        num_stages=num_stages,
         launch_pdl=True,
     )
     return o, m, l

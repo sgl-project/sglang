@@ -81,6 +81,7 @@ except ImportError:
     initialize_mamba_selective_state_update_backend = None
 import traceback
 
+from sglang.srt.beam_search.batch_tail import is_beam_only_batch
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
@@ -742,6 +743,9 @@ class Scheduler(
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
+        self.metrics_reporter.shortest_prefill_load_scaling = (
+            self.policy.shortest_prefill_load_scaling
+        )
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -1966,8 +1970,9 @@ class Scheduler(
         Without DCP the prefix-relative rule already donates, so leave the
         existing alignment alone, except where unified memory retires window
         rows behind the checkpoints (`mamba_prefill_chunk_grid`): there every
-        cut lands on the checkpoint grid. Use the LCM to preserve any alignment
-        that is already set."""
+        cut lands on the checkpoint grid. Under deterministic inference with a
+        mamba cache every cut also lands on the kernel chunk grid. Use the LCM
+        to preserve any alignment that is already set."""
         chunk_size = mamba_prefill_chunk_grid(getattr(self, "tree_cache", None))
         if chunk_size <= 1:
             return
@@ -2000,11 +2005,12 @@ class Scheduler(
             f"chunked prefill size is {chunk}{dp_note}; a prompt longer than "
             f"{chunk} tokens could never be scheduled. Raise --chunked-prefill-size "
             f"to at least {align * attn_dp_size}. The alignment includes the Mamba "
-            f"state checkpoint grid under DCP, and under --enable-unified-memory "
+            f"state checkpoint grid (under DCP, or under --enable-unified-memory "
             f"when sliding-window layers retire their rows behind the cached "
-            f"checkpoints; with the flashinfer backend under deterministic "
-            f"inference, lowering SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE also "
-            f"helps."
+            f"checkpoints) and the Mamba kernel chunk grid (under "
+            f"--enable-deterministic-inference); with the flashinfer backend "
+            f"under deterministic inference, lowering "
+            f"SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE also helps."
         )
 
     def init_request_dispatcher(self):
@@ -5913,6 +5919,12 @@ class Scheduler(
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(batch_result.next_draft_input)
                 self.future_map.stash(future_indices, payload)
+            return
+        if is_beam_only_batch(batch):
+            # Nothing was sampled; the coordinator relays every row.
+            self.beam_coordinator.maybe_select_and_relay(
+                batch, batch_result, chunked_req=self.chunked_req
+            )
             return
         if batch_result.next_draft_input is not None:
             payload = RelayPayload.from_draft_input(batch_result.next_draft_input)

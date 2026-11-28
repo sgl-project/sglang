@@ -13,9 +13,9 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_npu_ci(est_time=9, suite="extra-a-test-npu")
 
 
 def _make_glm51_model_config():

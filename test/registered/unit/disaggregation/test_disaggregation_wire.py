@@ -3934,5 +3934,50 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
         self.assertEqual(items, [16])
 
 
+class TestAscendHybridLayerSplitMetadata(CustomTestCase):
+    def test_owned_entries_keep_model_layer_ids(self):
+        """A compact CP shard must address the same model layers as decode."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        pool = object.__new__(HybridLinearKVPool)
+        pool.use_mla = True
+        pool.full_attention_layer_id_mapping = {3: 0, 7: 1, 11: 2, 15: 3, 19: 4}
+        # Three buffer groups, one owned layer, fewer entries than model layers.
+        pool.full_kv_pool = SimpleNamespace(
+            get_kv_layer_ids=lambda: [2, 2, 2],
+            get_contiguous_buf_infos=lambda: ([10, 20, 30], [4096] * 3, [256] * 3),
+        )
+        with patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
+            self.assertEqual(pool.get_kv_layer_ids(), [11, 11, 11])
+        pool.full_kv_pool = SimpleNamespace(
+            get_kv_layer_ids=lambda: [], get_contiguous_buf_infos=lambda: ([], [], [])
+        )
+        with patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
+            self.assertEqual(pool.get_kv_layer_ids(), [])
+
+    def test_ascend_index_entries_are_not_registered_twice(self):
+        """NPU index pages travel with KV; Mamba remains a separate state."""
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+        from sglang.srt.mem_cache.static_kv_storage import _static_state_entries
+
+        child = object.__new__(NPUMLATokenToKVPool)
+        child.get_state_buf_infos = lambda: ([20], [4096], [256])
+        child.get_compress_tail_buf_infos = lambda: ([], [], [])
+        root = SimpleNamespace(
+            use_dsa=True,
+            full_kv_pool=child,
+            layer_router=SimpleNamespace(
+                sub_pool=lambda _: None, wrapped_view=lambda: child
+            ),
+            get_state_buf_infos=lambda: ([10], [1024], [128]),
+            get_state_layer_ids=lambda: [0],
+        )
+        result = _static_state_entries(
+            root, draft_token_to_kv_pool=None, total_kv_layers=20, state_pool=None
+        )
+        self.assertEqual(len(result.wire_entries), 1)
+        self.assertNotIn(StateType.DSA, result.regions)
+
+
 if __name__ == "__main__":
     unittest.main()

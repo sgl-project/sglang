@@ -1,3 +1,4 @@
+# Vendored from facebookexperimental/triton third_party/tlx/ops/kernels/fused/norm_residual_norm/gfx950.py at 87abb3f5a (MIT); see kernels/README.md.
 """Post-RMSNorm, gated residual add and pre-RMSNorm of one residual-stream boundary, on gfx950.
 
 One program owns one row. Three kernels cover the token range, measured on MI350X at H=4096, 8192 and 16384:
