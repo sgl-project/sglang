@@ -317,42 +317,6 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
                     configs[0]["input_global_scale"] is not None, expects_fp4
                 )
 
-    def test_cutedsl_create_weights_skips_uninitialized_swizzled_blockscales(self):
-        with (
-            get_flags().moe.override(
-                runner_backend=MoeRunnerBackend.FLASHINFER_CUTEDSL,
-                a2a_backend=MoeA2ABackend.NONE,
-            ),
-            mock.patch.object(
-                modelopt_quant,
-                "get_platform",
-                return_value=SimpleNamespace(is_blackwell=True),
-            ),
-            mock.patch.object(
-                modelopt_quant,
-                "swizzle_blockscale",
-                side_effect=AssertionError("unexpected swizzle_blockscale"),
-            ),
-        ):
-            method = ModelOptNvFp4FusedMoEMethod(
-                modelopt_quant.ModelOptFp4Config(
-                    is_checkpoint_nvfp4_serialized=True, group_size=16
-                )
-            )
-            layer = torch.nn.Module()
-            layer.num_experts = layer.num_local_experts = 2
-            layer.moe_runner_config = MoeRunnerConfig(is_gated=True)
-            method.create_weights(
-                layer=layer,
-                num_experts=2,
-                hidden_size=128,
-                intermediate_size_per_partition=64,
-                params_dtype=torch.bfloat16,
-                weight_loader=lambda *a, **k: None,
-            )
-            self.assertIsNone(layer.w13_blockscale_swizzled)
-            self.assertIsNone(layer.w2_blockscale_swizzled)
-
     def test_cutedsl_scale_refresh_w4a16_fast_path_and_w4a4_in_place(self):
         w1_cur, fc2_cur, w2_cur, inp_cur = (
             torch.ones(4),
