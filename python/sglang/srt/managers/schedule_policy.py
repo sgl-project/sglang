@@ -601,7 +601,7 @@ class SchedulePolicy:
         candidates = []
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
-            match_kv_cache(r, self.tree_cache, prefix_ids)
+            self._match_for_ranking(r, prefix_ids)
             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 # Only the first DEPRIORITIZE_THRESHOLD tokens can decide a match.
                 key_ids = prefix_ids[:IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD]
@@ -653,6 +653,20 @@ class SchedulePolicy:
                     )
                 )
         return temporary_deprioritized
+
+    def _match_for_ranking(self, r: Req, token_ids=None) -> None:
+        # The external store lookup is a remote call plus a collective, so ranking
+        # does it once per request and reuses the hit; admission looks up afresh.
+        probe = r.external_hit_end is None
+        match_kv_cache(r, self.tree_cache, token_ids, probe_external=probe)
+        if not self.tree_cache.probes_external_store():
+            return
+        if probe:
+            r.external_hit_end = r.num_matched_prefix_tokens
+        else:
+            r.num_matched_prefix_tokens = max(
+                r.num_matched_prefix_tokens, r.external_hit_end
+            )
 
     def poll_storage_prefetches(self, waiting_queue: Iterable[Req]) -> None:
         """Observe finished storage prefetches before ranking. Completion is
@@ -975,7 +989,7 @@ class SchedulePolicy:
             # (new or retracted: last_node is None); its count may go stale.
             for r in waiting_queue:
                 if r.last_node is None:
-                    match_kv_cache(r, self.tree_cache)
+                    self._match_for_ranking(r)
             waiting_queue.sort(key=phi)
         window = waiting_queue[:UNIBOOST_MATCH_WINDOW_SIZE]
         deprioritized = self._compute_prefix_matches(window, CacheAwarePolicy.UNIBOOST)
