@@ -51,12 +51,16 @@ class IndexTopKShareState:
         return self._topk_indices
 
     def update(self, topk_indices: Optional[torch.Tensor]) -> None:
-        if (
-            topk_indices is not None
-            and self.should_publish
-            and is_cp_active(self._forward_batch)
-        ):
-            topk_indices = cp_gather_after_forward(topk_indices, self._forward_batch)
+        if topk_indices is not None and self.should_publish:
+            if is_cp_active(self._forward_batch):
+                topk_indices = cp_gather_after_forward(
+                    topk_indices, self._forward_batch
+                )
+            elif getattr(self._forward_batch, "npu_indexer_topk_is_local", False):
+                shard = getattr(self._forward_batch, "npu_indexer_query_shard", None)
+                if shard is not None:
+                    topk_indices = shard.gather(topk_indices, shard.total)
+
         self._topk_indices = topk_indices
 
     def publish(self) -> None:
