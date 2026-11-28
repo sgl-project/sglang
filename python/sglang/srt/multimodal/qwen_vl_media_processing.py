@@ -9,7 +9,6 @@ import torchvision
 from torchvision.transforms import InterpolationMode
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
@@ -213,8 +212,6 @@ def preprocess_video_sync(
         [resized_height, resized_width],
         interpolation=InterpolationMode.BILINEAR,
     )
-    if not is_cpu() and video.device.type == "cpu":
-        video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,
         "duration": total_frames / video_fps,

@@ -990,8 +990,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
         self.assertNotIn("attention_mask", media)
         self.assertEqual([expanded], [[AUDIO] * 3 + [EOS] + [AUDIO] * 16])
 
-    @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
-    def test_qwen2_video_reader_keeps_legacy_resize(self, _is_cpu):
+    def test_qwen2_video_reader_keeps_legacy_resize(self):
         processor = _make_hf_processor(Qwen2VLProcessor, 14, model_type="qwen2_vl")
         processor._core.strategy.video_config = {
             "nframes": 2,
@@ -1024,8 +1023,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
         for key in ("pixel_values_videos", "video_grid_thw"):
             self.assert_tensor_bytes_equal(output[key], reference[key])
 
-    @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
-    def test_video_reader_items_keep_their_own_hf_options(self, _is_cpu):
+    def test_video_reader_items_keep_their_own_hf_options(self):
         """An item's do_normalize must reach the HF processor, not only its sampling.
 
         Video readers take a separate route from frame tensors on both families.
@@ -1060,8 +1058,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
                     configured["pixel_values_videos"],
                 )
 
-    @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
-    def test_video_url_options_of_other_models_do_not_reach_hf(self, _is_cpu):
+    def test_video_url_options_of_other_models_do_not_reach_hf(self):
         video_data = []
         process_content_for_template_format(
             {
@@ -1117,8 +1114,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
                         from_request[key], qwen_options_only[key]
                     )
 
-    @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
-    def test_item_video_options_cannot_change_the_processor_layout(self, _is_cpu):
+    def test_item_video_options_cannot_change_the_processor_layout(self):
         frames = (
             torch.arange(8 * 64 * 64 * 3)
             .remainder(251)
@@ -1217,8 +1213,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
             rebuilt["feature_attention_mask"], media["feature_attention_mask"]
         )
 
-    @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
-    def test_omni_seconds_per_grid_follow_the_item_fps(self, _is_cpu):
+    def test_omni_seconds_per_grid_follow_the_item_fps(self):
         """A video_url fps sets both the frames sampled and the M-RoPE seconds per grid.
 
         Two 4 s videos at 8 fps (32 frames), temporal_patch_size 2:
@@ -1241,8 +1236,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
         )
         self.assertEqual(output["video_second_per_grid"].tolist(), [0.5, 2.0])
 
-    @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
-    def test_omni_videos_with_equal_frames_but_different_fps_hash_apart(self, _is_cpu):
+    def test_omni_videos_with_equal_frames_but_different_fps_hash_apart(self):
         """Equal frames at different seconds per grid must not share a KV cache key.
 
         Their M-RoPE positions differ, temporal_patch_size 2:
