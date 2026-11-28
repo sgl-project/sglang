@@ -53,6 +53,7 @@ def _run(request: ServeRequest) -> None:
         description="Motubrain 2.0 action serving",
     )
     add_multimodal_gen_serve_args(parser)
+    Motubrain2PipelineConfig.add_pipeline_cli_args(parser)
     argv = list(request.argv)
     if "-h" in argv or "--help" in argv:
         parser.print_help()

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
 import os
@@ -275,7 +276,10 @@ class Motubrain2PolicyModel(nn.Module):
         )
         if not os.path.isdir(bundle):
             raise ValueError(f"Motubrain2 bundle directory not found: {bundle}")
-        for name in ("config.json", "model.safetensors"):
+        if type(config.mxfp8) is not bool:
+            raise ValueError("mxfp8 must be a boolean")
+        weights = "model-mxfp8.safetensors" if config.mxfp8 else "model.safetensors"
+        for name in ("config.json", weights):
             if not os.path.isfile(os.path.join(bundle, name)):
                 raise ValueError(f"Motubrain2 bundle is missing {name}: {bundle}")
         if not os.path.isfile(profile):
@@ -284,8 +288,15 @@ class Motubrain2PolicyModel(nn.Module):
         device = _resolve_device()
         dtype = _materialize_dtype(config.materialize_dtype)
         bf16 = dtype == torch.bfloat16
-        if config.video_mxfp8 and not bf16:
-            raise ValueError("video_mxfp8 requires materialize_dtype=bf16")
+        if config.mxfp8:
+            if not bf16:
+                raise ValueError("mxfp8 requires materialize_dtype=bf16")
+            from motubrain2.inference.__main__ import add_policy_options
+
+            native_options = argparse.ArgumentParser(add_help=False)
+            add_policy_options(native_options)
+            if native_options.get_default("mxfp8") is None:
+                raise ImportError("Upgrade Motubrain2 to load standalone MXFP8 weights")
         args = SimpleNamespace(
             model=bundle,
             profile=profile,
@@ -303,8 +314,7 @@ class Motubrain2PolicyModel(nn.Module):
             compile=bool(getattr(config, "compile", False)),
             multistream=str(getattr(config, "multistream", "off")),
             async_io=False,
-            video_mxfp8=bool(getattr(config, "video_mxfp8", False)),
-            video_mxfp8_overlay=getattr(config, "video_mxfp8_overlay", None),
+            mxfp8=config.mxfp8,
             sampler=config.native_sampler_override(),
             steps=getattr(config, "steps_override", None),
             video_shift=getattr(config, "video_shift_override", None),
@@ -318,11 +328,12 @@ class Motubrain2PolicyModel(nn.Module):
         )
         _check_native_dit_cache(args)
         logger.info(
-            "Loading Motubrain2 policy: bundle=%s profile=%s device=%s bf16=%s",
+            "Loading Motubrain2 policy: bundle=%s profile=%s device=%s bf16=%s mxfp8=%s",
             bundle,
             profile,
             device,
             bf16,
+            config.mxfp8,
         )
         policy = RawPolicy.from_options(args)
         # RawPolicy retains the checkpoint dtype when bf16 is disabled.

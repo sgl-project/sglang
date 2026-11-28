@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,8 +61,7 @@ class Motubrain2PipelineConfig(PipelineConfig):
     compile: bool = False
     enforce_eager: bool = False
     multistream: str = "off"
-    video_mxfp8: bool = False
-    video_mxfp8_overlay: str | None = None
+    mxfp8: bool = False
     deterministic: bool = False
     # ``None`` keeps the sampling recipe stored in the bundle (the released
     # RoboTwin/Astribot bundles already record sampler/steps/shifts).
@@ -120,6 +120,25 @@ class Motubrain2PipelineConfig(PipelineConfig):
     prefix_parallel_strategy: str = "monolithic"
     action_parallel_strategy: str = "monolithic"
     parallel_layout_version: str = "motubrain2-policy-v0"
+
+    @staticmethod
+    def add_pipeline_cli_args(parser: argparse.ArgumentParser) -> None:
+        if parser.get_default("mxfp8") is None:
+            parser.add_argument(
+                "--mxfp8",
+                action="store_true",
+                help="Load standalone Motubrain MXFP8 weights",
+            )
+
+    def update_pipeline_config(self, source_pipeline_dict: dict[str, Any]) -> None:
+        if source_pipeline_dict.get("video_mxfp8") or source_pipeline_dict.get(
+            "video_mxfp8_overlay"
+        ):
+            raise ValueError(
+                "Use mxfp8=true with a standalone MXFP8 checkpoint in place of "
+                "video_mxfp8 and video_mxfp8_overlay"
+            )
+        super().update_pipeline_config(source_pipeline_dict)
 
     def check_pipeline_config(self) -> None:
         super().check_pipeline_config()

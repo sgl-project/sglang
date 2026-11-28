@@ -58,7 +58,51 @@ class NativeOutputValidityTest(unittest.TestCase):
                 endpoints = [r.endpoint for r in app.routes if r.path == route.path]
                 self.assertEqual(endpoints, [route.endpoint])
 
-    def test_dit_cache_options_reach_native_policy_loader(self):
+    def test_mxfp8_cli_and_pipeline_json_precedence(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.motubrain2 import (
+            Motubrain2PipelineConfig,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.motubrain2_backend import _run
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "serve.json"
+            for configured, flags, expected in (
+                (False, [], False),
+                (True, [], True),
+                (False, ["--mxfp8"], True),
+            ):
+                with self.subTest(configured=configured, flags=flags):
+                    path.write_text(json.dumps({"mxfp8": configured}))
+                    argv = [
+                        "--model-path",
+                        root,
+                        "--pipeline-config-path",
+                        str(path),
+                        *flags,
+                    ]
+                    with (
+                        patch.object(sys, "argv", ["sglang", *argv]),
+                        patch.object(ServerArgs, "__post_init__"),
+                        patch(
+                            "sglang.multimodal_gen.registry.get_model_info",
+                            return_value=SimpleNamespace(
+                                pipeline_config_cls=Motubrain2PipelineConfig
+                            ),
+                        ),
+                        patch(
+                            "sglang.multimodal_gen.registry.get_pipeline_config_classes",
+                            return_value=(Motubrain2PipelineConfig, None),
+                        ),
+                        patch(
+                            "sglang.multimodal_gen.runtime.entrypoints.motubrain2_backend._serve"
+                        ) as serve,
+                    ):
+                        _run(SimpleNamespace(argv=argv))
+                        server_args = serve.call_args.args[0]
+                    self.assertIs(server_args.pipeline_config.mxfp8, expected)
+
+    def test_weight_selection_and_dit_cache_options_reach_native_policy_loader(self):
         from sglang.multimodal_gen.configs.pipeline_configs.motubrain2 import (
             Motubrain2PipelineConfig,
         )
@@ -78,23 +122,60 @@ class NativeOutputValidityTest(unittest.TestCase):
         module = SimpleNamespace(DiTCacheConfig=SimpleNamespace(for_recipe=object()))
         load = Mock(side_effect=StopIteration)
         policy_module = SimpleNamespace(RawPolicy=SimpleNamespace(from_options=load))
+        native_cli = SimpleNamespace(
+            add_policy_options=lambda parser: parser.add_argument(
+                "--mxfp8", action="store_true"
+            )
+        )
         with tempfile.TemporaryDirectory() as bundle:
-            for name in ("model.safetensors", "config.json", "profile.json"):
-                (Path(bundle) / name).touch()
+            root = Path(bundle)
+            for filename in ("config.json", "profile.json"):
+                (root / filename).touch()
             with (
                 patch.dict(
                     sys.modules,
                     {
                         "motubrain2.inference.dit_cache": module,
                         "motubrain2.inference.policy": policy_module,
+                        "motubrain2.inference.__main__": native_cli,
                     },
                 ),
                 patch.object(config, "load_serving_profile"),
-                self.assertRaises(StopIteration),
             ):
-                Motubrain2PolicyModel.from_pretrained(bundle, config)
-            args = load.call_args.args[0]
-            self.assertEqual({k: getattr(args, k) for k in options}, options)
+                self.assertFalse(config.mxfp8)
+                for enabled in (False, True):
+                    config.update_pipeline_config({"mxfp8": enabled})
+                    for present in (False, True):
+                        with self.subTest(mxfp8=enabled, artifact_present=present):
+                            (root / "model.safetensors").touch()
+                            quant = root / "model-mxfp8.safetensors"
+                            if present:
+                                quant.touch()
+                            else:
+                                quant.unlink(missing_ok=True)
+                            if enabled and not present:
+                                with self.assertRaisesRegex(ValueError, quant.name):
+                                    Motubrain2PolicyModel.from_pretrained(
+                                        bundle, config
+                                    )
+                                continue
+                            if enabled:
+                                (root / "model.safetensors").unlink()
+                            with self.assertRaises(StopIteration):
+                                Motubrain2PolicyModel.from_pretrained(bundle, config)
+                            args = load.call_args.args[0]
+                            self.assertIs(args.mxfp8, enabled)
+                            self.assertEqual(
+                                {k: getattr(args, k) for k in options}, options
+                            )
+                (root / "model.safetensors").touch()
+                with (
+                    patch.object(native_cli, "add_policy_options", lambda parser: None),
+                    self.assertRaisesRegex(ImportError, "Upgrade Motubrain2"),
+                ):
+                    Motubrain2PolicyModel.from_pretrained(bundle, config)
+            with self.assertRaisesRegex(ValueError, "standalone MXFP8"):
+                config.update_pipeline_config({"video_mxfp8": True})
 
     def test_optional_dependency_is_needed_only_when_loading_a_policy(self):
         from sglang.multimodal_gen.runtime.pipelines.motubrain2 import (

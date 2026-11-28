@@ -32,7 +32,13 @@ To supply controller-space waypoints directly, send `input.observation.rtc` with
 
 ## Precision
 
-The pipeline defaults to BF16. For video-stream MXFP8 the native loader accepts `video_mxfp8` and an optional `video_mxfp8_overlay`. SGLang pins FlashInfer 0.7.4, while the current Motubrain MXFP8 extra requires 0.7.5. The BF16 configuration is the tested installation for this integration.
+The default BF16 policy loads `model.safetensors`. Pass `--mxfp8` on the serve command or set `"mxfp8": true` in the pipeline JSON to load `model-mxfp8.safetensors` from the same bundle. The bundle must include the matching `manifest.json`, `config.json` and `sampling.json`. On a CUDA Blackwell GPU, the native loader verifies the weight, model config and sampling config against the manifest. Leave compilation disabled for MXFP8. The HTTP and WebSocket request formats are identical for both precisions.
+
+For a dedicated MXFP8 deployment, use FlashInfer 0.7.5 in the policy environment. SGLang's default environment pins 0.7.4. After installing SGLang, run the following command in that environment.
+
+```bash
+python -m pip install 'flashinfer-python[cu13]==0.7.5' 'motubrain2[mxfp8] @ git+https://github.com/shengshu-ai/Motubrain-2.0.git@308137cd0ce9de48ec5e6ed3bd0619859db22c9f'
+```
 
 ## Optional DiT cache
 
