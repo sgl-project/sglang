@@ -305,7 +305,11 @@ def sample_generated_shared_prefix_requests(
         )
         turn_questions = questions[src_g][src_p]
         if input_ids:
-            turn_prompts = [system_prompt + turn_questions[0]]
+            question_ids = turn_questions[0]
+            # Reuse the group's token IDs for prefix-only requests.
+            turn_prompts = [
+                system_prompt + question_ids if question_ids else system_prompt
+            ]
         else:
             turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[
                 1:
