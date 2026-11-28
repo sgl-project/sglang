@@ -4701,7 +4701,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return the requests whose KV did not land, marked so their output is
         dropped and their KV never reaches the tree. Their slots are private
         (see :meth:`UnifiedCacheLinkerWrapper.load_back`), so nothing else read
-        them."""
+        them. Under pipeline parallelism a failed load raises instead."""
         if self.linker is None:
             return []
         failed_rids = set(self.linker.finish_loads())
@@ -4735,20 +4735,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
-            finish_counts = torch.tensor(
-                [self.linker.num_completed_offloads()],
-                dtype=torch.int,
-                device="cpu",
-            )
-            self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            offload_count = int(finish_counts.item())
-            local_successes = self.linker.take_completed_offloads(offload_count)
-            if local_successes:
-                successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
-                self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
-                self.linker.commit_completed_offloads(
-                    [bool(success) for success in successes.tolist()]
-                )
+            self._check_linker_offloads()
             self.linker.check_prefetch_events()
             return
 
@@ -4805,6 +4792,29 @@ class UnifiedRadixCache(BasePrefixCache):
             or self.ongoing_prefetch
             or (self.buffer_pipeline is not None and not self.buffer_pipeline.is_idle())
         )
+
+    def _check_linker_offloads(self) -> None:
+        # PP stages persist their own layers but must unlock and publish the same
+        # nodes, so they adopt PP0's count and verdicts and wait for their copies.
+        is_pp = self.pp_size > 1
+        reduce = self._all_reduce if is_pp else self._all_reduce_attn_groups
+        if is_pp:
+            self._bound_async_work()
+        finish_counts = torch.tensor(
+            [self.linker.num_completed_offloads()], dtype=torch.int, device="cpu"
+        )
+        reduce(finish_counts, torch.distributed.ReduceOp.MIN)
+        local_successes = self.linker.take_completed_offloads(
+            int(finish_counts.item()), block=is_pp and self.pp_rank > 0
+        )
+        if local_successes:
+            successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
+            # A later stage's own failed put is overridden by PP0's verdict: its
+            # missing pages make PP0's lookup miss, and the node is not retried.
+            reduce(successes, torch.distributed.ReduceOp.MIN)
+            self.linker.commit_completed_offloads(
+                [bool(success) for success in successes.tolist()]
+            )
 
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""
