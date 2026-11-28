@@ -3,8 +3,9 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import mmap
 from enum import Enum
-from functools import cached_property
+from functools import cache, cached_property
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -53,6 +54,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_deepep_v2_dispatcher_output_dtype,
     has_per_rank_fused_shared_slots,
+    requires_global_experts,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import (
@@ -156,12 +158,39 @@ def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
     return loaded_weight.clone(memory_format=torch.contiguous_format)
 
 
+@cache
+def _faults_pageable_copies(device_index: int) -> bool:
+    """Whether the GPU reads pageable host memory through the host page tables
+    (e.g. Grace Hopper/Blackwell): host-to-device copies from an unfaulted
+    mapping then take their page faults inside the driver copy."""
+    try:
+        from cuda.bindings import runtime as cudart
+    except ImportError:
+        return False
+    attr = cudart.cudaDeviceAttr.cudaDevAttrPageableMemoryAccessUsesHostPageTables
+    err, value = cudart.cudaDeviceGetAttribute(attr, device_index)
+    return err == cudart.cudaError_t.cudaSuccess and bool(value)
+
+
 def _maybe_copy_weight_view_before_h2d(
     loaded_weight: torch.Tensor,
 ) -> torch.Tensor:
-    if not envs.SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D.get():
-        return loaded_weight
-    return _copy_weight_view_before_h2d(loaded_weight)
+    if envs.SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D.get():
+        return _copy_weight_view_before_h2d(loaded_weight)
+    # Faulting a safetensors mmap inside the driver copy is several times
+    # slower than faulting it on the CPU: touch one byte per page first.
+    # Non-contiguous sources are already gathered on the CPU by copy_.
+    if (
+        loaded_weight.device.type == "cpu"
+        and loaded_weight.numel() > 1
+        and loaded_weight.is_contiguous()
+        and torch.cuda.is_available()
+        and _faults_pageable_copies(torch.cuda.current_device())
+    ):
+        flat = loaded_weight.reshape(-1).view(torch.uint8)
+        flat[:: mmap.PAGESIZE].sum()
+        flat[-1:].sum()
+    return loaded_weight
 
 
 def _weight_layout_method(layer):
@@ -1252,7 +1281,10 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
-        for local_expert_id in self._weight_loader_expert_ids(param, expert_id):
+        for local_expert_id in self._weight_loader_expert_ids(
+            expert_id,
+            require_global_experts=requires_global_experts(param),
+        ):
             self._weight_loader_impl(
                 param=param,
                 loaded_weight=loaded_weight,
@@ -1261,20 +1293,28 @@ class FusedMoE(torch.nn.Module):
                 expert_id=local_expert_id,
             )
 
-    def _weight_loader_expert_ids(self, param: torch.nn.Parameter, expert_id: int):
+    def loads_checkpoint_expert(self, expert_id: int) -> bool:
+        """Whether this rank loads the checkpoint's routed expert ``expert_id``."""
+        expert_ids = self._weight_loader_expert_ids(
+            expert_id, require_global_experts=False
+        )
+        return next(expert_ids, None) is not None
+
+    def _weight_loader_expert_ids(
+        self, expert_id: int, *, require_global_experts: bool
+    ):
         """Resolve destinations before online loaders allocate a source tensor."""
         global_expert_location_metadata = (
             get_global_expert_location_metadata() if self.uses_expert_location else None
         )
         if global_expert_location_metadata is None:
-            if not getattr(param, "_sglang_require_global_experts", False):
+            if not require_global_experts:
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
                 if expert_id == -1:
                     return
             yield expert_id
             return
 
-        require_global_experts = getattr(param, "_sglang_require_global_experts", False)
         shared_expert_id = (
             expert_id - global_expert_location_metadata.num_logical_experts
             if self._has_fused_shared and expert_id is not None
@@ -1306,7 +1346,7 @@ class FusedMoE(torch.nn.Module):
         for expert_id in physical_expert_ids:
             # Expert IDs are local unless this parameter explicitly requires
             # global expert storage. Preserve EPLB replicas and shared slots.
-            if not getattr(param, "_sglang_require_global_experts", False):
+            if not require_global_experts:
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
                 if expert_id < 0 or expert_id >= self.num_local_experts:
                     continue

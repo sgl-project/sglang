@@ -7,15 +7,18 @@
 import collections
 import concurrent.futures
 import contextlib
+import ctypes
 import fnmatch
 import glob
 import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import struct
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -34,7 +37,9 @@ from typing import (
 
 import filelock
 import huggingface_hub.constants
+import msgspec
 import numpy as np
+import psutil
 import safetensors.torch
 import torch
 from huggingface_hub import (
@@ -147,6 +152,14 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
         if _ROUTED_EXPERT_KEY_RE.search(k):
             return meta.get("dtype")
     return None
+
+
+class CheckpointTensorReaders(msgspec.Struct, frozen=True):
+    # (name, nbytes) -> (index, count) of this rank among the node's readers, or None.
+    rank_of: Callable[[str, int], Optional[Tuple[int, int]]]
+    # (name, nbytes) -> whether the node reads the tensor; None if experts are not
+    # placed in order, so the node's share cannot be told from the tensor name.
+    node_reads: Optional[Callable[[str, int], bool]] = None
 
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
@@ -1108,16 +1121,213 @@ def np_cache_weights_iterator(
 def _prefetch_checkpoint_file(
     file_path: str,
     cancel_event: Optional[threading.Event] = None,
+    select: Optional[Callable[[str, int], bool]] = None,
 ) -> None:
     """Prefetch a checkpoint file into the OS page cache.
 
-    Reads the file sequentially in 16 MB blocks so the kernel caches its pages
-    before workers load the same file via mmap.
+    Reads the file, or only the tensors ``select(name, nbytes)`` picks,
+    sequentially in 16 MB blocks so the kernel caches its pages before workers
+    load the same file via mmap.
     """
     with open(file_path, "rb") as f:
-        while cancel_event is None or not cancel_event.is_set():
-            if not f.read(_get_prefetch_block_size()):
-                break
+        ranges = [(0, os.fstat(f.fileno()).st_size)]
+        if select is not None:
+            offsets = _safetensors_offsets(file_path)
+            ranges = sorted(r for k, r in offsets.items() if select(k, r[1] - r[0]))
+        for start, end in ranges:
+            f.seek(start)
+            while start < end and (cancel_event is None or not cancel_event.is_set()):
+                n = len(f.read(min(_get_prefetch_block_size(), end - start)))
+                if not n:
+                    break
+                start += n
+
+
+def _safetensors_offsets(path: str) -> Dict[str, Tuple[int, int]]:
+    """Return each tensor's byte range in a safetensors file."""
+    with open(path, "rb") as f:
+        (size,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(size))
+    header.pop("__metadata__", None)
+    return {
+        k: tuple(8 + size + o for o in v["data_offsets"]) for k, v in header.items()
+    }
+
+
+_SAFETENSORS_DTYPES = {
+    **safetensors.torch._TYPES,
+    "F8_E8M0": torch.float8_e8m0fnu,
+}
+
+
+def _read_tensors(
+    path: str,
+    readers: Optional[CheckpointTensorReaders] = None,
+    num_threads: int = 4,
+    max_bytes_ahead: int = 1 << 30,
+):
+    """Yield the tensors of a safetensors file this rank reads, in name order.
+
+    With ``readers`` (EP), each is read with ``pread`` into its own host memory
+    by ``num_threads`` threads, at most ``max_bytes_ahead`` ahead of the caller:
+    copies to the GPU out of such memory run several times faster than out of a
+    mapping of the file. Without, tensors stay mapped views, of which tensor
+    parallelism may read only a slice."""
+    if readers is None:
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            for name in f.keys():
+                yield name, f.get_tensor(name)
+        return
+    with open(path, "rb") as f:
+        (size,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(size))
+    header.pop("__metadata__", None)
+    plan, todo, nbytes = [], collections.deque(), 0
+    for name in sorted(header):
+        info = header[name]
+        begin, end = info["data_offsets"]
+        begin, end = begin + 8 + size, end + 8 + size
+        if readers.rank_of(name, end - begin) is None:
+            continue
+        dtype = _SAFETENSORS_DTYPES.get(info["dtype"])
+        read = (  # Experts stacked in one tensor stay mapped; a rank copies its part.
+            not re.search(r"\.experts\.(?!\d+\.)", name)
+            and dtype is not None
+            and math.prod(info["shape"]) * dtype.itemsize == end - begin > 0
+        )
+        plan.append((name, read, dtype, info["shape"]))
+        if read:  # One read task per 4 MiB or more of consecutive tensors.
+            if not todo or nbytes >= 1 << 22:
+                todo.append([])
+                nbytes = 0
+            todo[-1].append((begin, end))
+            nbytes += end - begin
+
+    def pread(fd: int, ranges: List[Tuple[int, int]]) -> List[torch.Tensor]:
+        tensors = []
+        for begin, end in ranges:
+            data = torch.empty(end - begin, dtype=torch.uint8)
+            view, done = memoryview(data.numpy()), 0
+            while done < end - begin:
+                n = os.preadv(fd, [view[done:]], begin + done)
+                if n == 0:
+                    raise EOFError(f"{path} ends before byte {end}")
+                done += n
+            tensors.append(data)
+        return tensors
+
+    with (
+        safetensors.safe_open(path, framework="pt", device="cpu") as mapped,
+        open(path, "rb") as f,
+        concurrent.futures.ThreadPoolExecutor(num_threads) as pool,
+    ):
+        pending, ready, ahead = collections.deque(), collections.deque(), 0
+        for name, read, dtype, shape in plan:
+            if not read:
+                yield name, mapped.get_tensor(name)
+                continue
+            if not ready:
+                while todo and (not pending or ahead < max_bytes_ahead):
+                    ranges = todo.popleft()
+                    pending.append(pool.submit(pread, f.fileno(), ranges))
+                    ahead += sum(end - begin for begin, end in ranges)
+                ready.extend(pending.popleft().result())
+                ahead -= sum(data.numel() for data in ready)
+            data = ready.popleft()
+            yield name, data.view(dtype).view(shape)
+
+
+def _node_local_peers(ranks: Iterable[int]) -> Tuple[int, int]:
+    """Return this rank's index among, and the count of, ``ranks`` on its node."""
+    world_group = get_parallel().world_group
+    per_node = world_group.local_size or (
+        get_parallel().launch_world_size // get_parallel().nnodes
+    )
+    node = world_group.rank // per_node
+    peers = [rank for rank in ranks if rank // per_node == node]
+    return peers.index(world_group.rank), len(peers)
+
+
+_LUSTRE_SUPER_MAGIC = 0x0BD00BD0
+
+
+def _statfs_type(path: str) -> Optional[int]:
+    """Return the ``f_type`` magic of the filesystem holding ``path``."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        buf = ctypes.create_string_buffer(256)  # >= sizeof(struct statfs)
+        if libc.statfs(os.fsencode(path), buf) != 0:
+            return None
+        return ctypes.c_long.from_buffer(buf).value & 0xFFFFFFFF  # f_type is first
+    except (OSError, AttributeError):
+        return None
+
+
+class _PrefetchPacer:
+    """Keeps background checkpoint prefetch a bounded number of bytes ahead of
+    the loader.
+
+    A Lustre client caches a file's pages under the extent locks it holds on
+    the file's objects, and drops the pages when it cancels a lock, which it
+    does to unused locks older than ``lru_max_age``. Page-cache hits do not
+    refresh a lock's age. Prefetching the whole checkpoint up front can
+    therefore lose the part the loader has not reached yet, and the loader reads
+    it again. Prefetch reads several times faster than the loader consumes, so a
+    fixed window ahead of the loader keeps it fed and the cached pages young.
+
+    File ``i`` may be prefetched once the files from the loader's current file
+    through file ``i`` total at most ``window_bytes``, or ``i`` is among the
+    next ``min_files`` files. Files the loader has passed are skipped.
+    """
+
+    def __init__(
+        self, files: List[str], sizes: List[int], window_bytes: int, min_files: int
+    ) -> None:
+        self.index = {path: i for i, path in enumerate(files)}
+        self.cum = list(itertools.accumulate(sizes, initial=0))
+        self.window_bytes = window_bytes
+        self.min_files = min_files
+        self.pos = 0
+        self.finished = False
+        self.cv = threading.Condition()
+
+    def advance(self, path: str) -> None:
+        """Record that the loader has started on ``path``."""
+        with self.cv:
+            self.pos = max(self.pos, self.index.get(path, 0))
+            self.cv.notify_all()
+
+    def finish(self) -> None:
+        """Release every waiting prefetch thread."""
+        with self.cv:
+            self.finished = True
+            self.cv.notify_all()
+
+    def _allowed(self, i: int) -> bool:
+        return (
+            self.finished
+            or i < self.pos + self.min_files
+            or self.cum[i + 1] - self.cum[self.pos] <= self.window_bytes
+        )
+
+    def wait(self, path: str, cancel_event: threading.Event) -> bool:
+        """Block until ``path`` may be prefetched; False if it is no longer needed."""
+        i = self.index[path]
+        with self.cv:
+            while not self._allowed(i) and not cancel_event.is_set():
+                self.cv.wait(timeout=1.0)
+            return not self.finished and i >= self.pos
+
+
+def _paced_prefetch_checkpoint_file(
+    pacer: _PrefetchPacer, path: str, cancel_event: threading.Event, *args
+) -> None:
+    # Wait and read in one task, so a thread waiting for a later file never
+    # delays the read of an earlier one.
+    if pacer.wait(path, cancel_event) and not cancel_event.is_set():
+        _prefetch_checkpoint_file(path, cancel_event, *args)
 
 
 class CheckpointFilePrefetchHandle:
@@ -1130,11 +1340,18 @@ class CheckpointFilePrefetchHandle:
         cancel_event: threading.Event,
         succeeded_event: threading.Event,
         errors: List[Tuple[str, Exception]],
+        pacer: Optional[_PrefetchPacer] = None,
     ) -> None:
         self._thread = thread
         self._cancel_event = cancel_event
         self._succeeded_event = succeeded_event
         self._errors = errors
+        self._pacer = pacer
+
+    def advance(self, path: str) -> None:
+        """Tell a paced prefetch that the loader has started on ``path``."""
+        if self._pacer is not None:
+            self._pacer.advance(path)
 
     def wait(self, timeout: Optional[float] = None) -> None:
         self._thread.join(timeout)
@@ -1144,6 +1361,8 @@ class CheckpointFilePrefetchHandle:
     def cancel(self) -> None:
         """Stop scheduling shards and interrupt reads at the next block."""
         self._cancel_event.set()
+        if self._pacer is not None:
+            self._pacer.finish()
 
     def stop(self, timeout: Optional[float] = _PREFETCH_STOP_TIMEOUT_SECONDS) -> None:
         """Cancel prefetching and wait for the background worker to finish."""
@@ -1170,6 +1389,9 @@ class CheckpointFilePrefetchHandle:
 def _prefetch_all_checkpoints(
     sorted_files: List[str],
     num_threads: int = 4,
+    readers: Optional[CheckpointTensorReaders] = None,
+    pace: bool = False,
+    loader_files: Optional[List[str]] = None,
 ) -> CheckpointFilePrefetchHandle:
     """Start prefetching checkpoint files into page cache in a background thread.
 
@@ -1185,6 +1407,12 @@ def _prefetch_all_checkpoints(
     rather than blocking until all files are prefetched. This pipelining
     naturally adapts to any RAM size — even if the full checkpoint does
     not fit in page cache, the prefetch thread stays ahead of the loader.
+
+    With ``pace``, on filesystems that drop cached pages of unused files on a
+    timer (Lustre), each rank prefetches a file only when its loader nears it;
+    the loader reports its position through ``CheckpointFilePrefetchHandle.advance``.
+    ``loader_files`` is the order this rank's loader reads the files in
+    (default: ``sorted_files``); pacing follows that order.
     """
     import time
 
@@ -1206,7 +1434,55 @@ def _prefetch_all_checkpoints(
         local_rank = 0
         local_world_size = 1
 
-    my_files = sorted_files[local_rank::local_world_size]
+    # Whole shards are read faster; prefetch only what the node reads when they
+    # do not fit in RAM. Ranks see different free RAM, so they pick one mode.
+    if readers is not None:
+        size = sum(map(os.path.getsize, sorted_files))
+        fits = torch.tensor(int(size <= 0.9 * psutil.virtual_memory().available))
+        group = get_parallel().moe_ep_group.cpu_group
+        torch.distributed.all_reduce(fits, torch.distributed.ReduceOp.MIN, group)
+    if readers is None or fits:
+        my_files = [(path, None) for path in sorted_files[local_rank::local_world_size]]
+    elif (node_reads := readers.node_reads) is not None:
+        # Each rank reads all that the node reads of its share of the files.
+        files = sorted_files[local_rank::local_world_size]
+        my_files = [(path, node_reads) for path in files]
+    else:  # Prefetch only what the node reads, split by file among its readers.
+        my_files = [
+            (
+                path,
+                lambda name, n, i=i: (
+                    (r := readers.rank_of(name, n)) and i % r[1] == r[0]
+                ),
+            )
+            for i, path in enumerate(sorted_files)
+        ]
+    pacer = None
+    window_gb = envs.SGLANG_PREFETCH_PACE_LEAD_GB.get()
+    # Only Lustre is known to drop cached pages of unused files on a timer.
+    if (
+        pace
+        and my_files
+        and window_gb > 0
+        and _statfs_type(sorted_files[0]) == _LUSTRE_SUPER_MAGIC
+    ):
+        order = sorted_files if loader_files is None else loader_files
+        pacer = _PrefetchPacer(
+            order,
+            [os.path.getsize(path) for path in order],
+            round(window_gb * (1 << 30)),
+            # Always allow a file per prefetch thread on the node.
+            min_files=num_threads * local_world_size,
+        )
+        if local_rank == 0:
+            logger.info(
+                "Pacing checkpoint prefetch on Lustre to %g GiB ahead of the "
+                "loader (SGLANG_PREFETCH_PACE_LEAD_GB=0 disables pacing).",
+                window_gb,
+            )
+        # Submit in the loader's order, so no thread waits on a file the loader
+        # reaches after one queued behind it.
+        my_files.sort(key=lambda item: pacer.index[item[0]])
     total_for_rank = len(my_files)
     cancel_event = threading.Event()
     succeeded_event = threading.Event()
@@ -1246,12 +1522,20 @@ def _prefetch_all_checkpoints(
             file_iter = iter(my_files)
             pending: Dict[concurrent.futures.Future, str] = {}
 
-            for path in itertools.islice(file_iter, num_threads):
+            def submit(path, select):
+                args = (path, cancel_event) + ((select,) if select else ())
+                if pacer is None:
+                    future = executor.submit(_prefetch_checkpoint_file, *args)
+                else:
+                    future = executor.submit(
+                        _paced_prefetch_checkpoint_file, pacer, *args
+                    )
+                pending[future] = path
+
+            for path, select in itertools.islice(file_iter, num_threads):
                 if cancel_event.is_set():
                     break
-                pending[
-                    executor.submit(_prefetch_checkpoint_file, path, cancel_event)
-                ] = path
+                submit(path, select)
 
             while pending:
                 done, _ = concurrent.futures.wait(
@@ -1270,15 +1554,9 @@ def _prefetch_all_checkpoints(
                         )
                     record_complete()
 
-                    next_path = None if cancel_event.is_set() else next(file_iter, None)
-                    if next_path is not None:
-                        pending[
-                            executor.submit(
-                                _prefetch_checkpoint_file,
-                                next_path,
-                                cancel_event,
-                            )
-                        ] = next_path
+                    next_file = None if cancel_event.is_set() else next(file_iter, None)
+                    if next_file is not None:
+                        submit(*next_file)
 
     def _run_prefetch() -> None:
         start = time.perf_counter()
@@ -1296,6 +1574,7 @@ def _prefetch_all_checkpoints(
         cancel_event=cancel_event,
         succeeded_event=succeeded_event,
         errors=errors,
+        pacer=pacer,
     )
     thread.start()
     return handle
@@ -1325,6 +1604,7 @@ def safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    readers: Optional[CheckpointTensorReaders] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -1334,27 +1614,36 @@ def safetensors_weights_iterator(
     prefetch_handle = None
     if prefetch and not disable_mmap:
         prefetch_handle = _prefetch_all_checkpoints(
-            sorted(hf_weights_files), num_threads=prefetch_num_threads
+            sorted(hf_weights_files),
+            num_threads=prefetch_num_threads,
+            readers=readers,
+            pace=True,
+            loader_files=hf_weights_files,
         )
 
-    for st_file in tqdm(
-        hf_weights_files,
-        desc="Loading safetensors checkpoint shards",
-        disable=not enable_tqdm,
-        bar_format=BAR_FORMAT,
-        position=tqdm._get_free_pos(),
-    ):
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-                for name in sorted(result.keys()):
-                    yield name, result[name]
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                for name in f.keys():
-                    yield name, f.get_tensor(name)
-        if drop_cache_after_load:
-            _drop_file_cache_after_load(st_file)
+    try:
+        for st_file in tqdm(
+            hf_weights_files,
+            desc="Loading safetensors checkpoint shards",
+            disable=not enable_tqdm,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+        ):
+            if prefetch_handle is not None:
+                prefetch_handle.advance(st_file)
+            if disable_mmap:
+                with open(st_file, "rb") as f:
+                    result = safetensors.torch.load(f.read())
+                    for name in sorted(result.keys()):
+                        yield name, result[name]
+            else:
+                yield from _read_tensors(st_file, readers, prefetch_num_threads)
+            if drop_cache_after_load:
+                _drop_file_cache_after_load(st_file)
+    except BaseException:  # Release a paced prefetch if loading stops early.
+        if prefetch_handle is not None:
+            prefetch_handle.cancel()
+        raise
     if prefetch_handle is not None:
         prefetch_handle.stop()
 
@@ -1555,6 +1844,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    readers: Optional[CheckpointTensorReaders] = None,
     max_inflight_bytes: Optional[int] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
@@ -1571,7 +1861,11 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch_handle = None
     if prefetch and not disable_mmap:
         prefetch_handle = _prefetch_all_checkpoints(
-            sorted(hf_weights_files), num_threads=prefetch_num_threads
+            sorted(hf_weights_files),
+            num_threads=prefetch_num_threads,
+            readers=readers,
+            pace=True,
+            loader_files=hf_weights_files,
         )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -1582,62 +1876,68 @@ def buffered_multi_thread_safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
         else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+            result = dict(_read_tensors(st_file, readers, num_threads=1))
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.
     buffer_size = max_workers + 1
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        file_iter = iter(hf_weights_files)
-        pending: collections.deque = collections.deque()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            file_iter = iter(hf_weights_files)
+            pending: collections.deque = collections.deque()
 
-        next_file = next(file_iter, None)
-        inflight_bytes = 0
+            next_file = next(file_iter, None)
+            inflight_bytes = 0
 
-        def fill_window():
-            nonlocal next_file, inflight_bytes
-            while next_file is not None and len(pending) < buffer_size:
-                size = os.path.getsize(next_file)
-                if (
-                    max_inflight_bytes is not None
-                    and pending
-                    and inflight_bytes + size > max_inflight_bytes
-                ):
-                    break
-                pending.append(
-                    (next_file, size, executor.submit(_load_file, next_file))
-                )
-                inflight_bytes += size
-                next_file = next(file_iter, None)
+            def fill_window():
+                nonlocal next_file, inflight_bytes
+                while next_file is not None and len(pending) < buffer_size:
+                    size = os.path.getsize(next_file)
+                    if (
+                        max_inflight_bytes is not None
+                        and pending
+                        and inflight_bytes + size > max_inflight_bytes
+                    ):
+                        break
+                    pending.append(
+                        (next_file, size, executor.submit(_load_file, next_file))
+                    )
+                    inflight_bytes += size
+                    next_file = next(file_iter, None)
 
-        fill_window()
+            fill_window()
 
-        with tqdm(
-            total=len(hf_weights_files),
-            desc="Multi-thread loading shards",
-            disable=not enable_tqdm,
-            bar_format=BAR_FORMAT,
-            position=tqdm._get_free_pos(),
-        ) as pbar:
-            while pending:
-                st_file, size, future = pending.popleft()
-                state_dict = future.result()
-                del future  # let GC reclaim the Future's internal result
+            with tqdm(
+                total=len(hf_weights_files),
+                desc="Multi-thread loading shards",
+                disable=not enable_tqdm,
+                bar_format=BAR_FORMAT,
+                position=tqdm._get_free_pos(),
+            ) as pbar:
+                while pending:
+                    st_file, size, future = pending.popleft()
+                    if prefetch_handle is not None:
+                        prefetch_handle.advance(st_file)
+                    state_dict = future.result()
+                    del future  # let GC reclaim the Future's internal result
 
-                # Replenish the window.
-                inflight_bytes -= size
-                fill_window()
+                    # Replenish the window.
+                    inflight_bytes -= size
+                    fill_window()
 
-                for name in sorted(state_dict.keys()):
-                    yield name, state_dict[name]
-                del state_dict
-                if drop_cache_after_load:
-                    # DONTNEED reduces page-cache pressure after copying weights,
-                    # but later mmap-backed tensor access may fault pages again.
-                    _drop_file_cache_after_load(st_file)
-                pbar.update(1)
+                    for name in sorted(state_dict.keys()):
+                        yield name, state_dict[name]
+                    del state_dict
+                    if drop_cache_after_load:
+                        # DONTNEED reduces page-cache pressure after copying weights,
+                        # but later mmap-backed tensor access may fault pages again.
+                        _drop_file_cache_after_load(st_file)
+                    pbar.update(1)
+    except BaseException:  # Release a paced prefetch if loading stops early.
+        if prefetch_handle is not None:
+            prefetch_handle.cancel()
+        raise
     if prefetch_handle is not None:
         prefetch_handle.stop()
 
