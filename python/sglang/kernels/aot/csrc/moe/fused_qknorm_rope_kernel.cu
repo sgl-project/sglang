@@ -215,7 +215,8 @@ __global__ void fusedQKNormRopeKernel(
       // Before data exchange with in warp, we need to sync.
       __syncwarp();
       int const half_rotary_lanes = rotary_lanes / 2;
-      unsigned int active_mask = (1u << rotary_lanes) - 1;
+      // Avoid UB from (1u << 32) when rotary_lanes == 32
+      unsigned int active_mask = 0xffffffffu >> (32 - rotary_lanes);
       // Limitation: The operation below requires half_rotary_lanes to be a power of 2.
       // because it relies on __shfl_xor_sync to exchange data within a warp.
       for (int i = 0; i < numElemsPerThread; i++) {
