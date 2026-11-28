@@ -22,7 +22,6 @@ from lmcache.integration.sglang.unified_lmcache_mp_connector import (
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
-    EvictParams,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
@@ -453,7 +452,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         allocator = self.token_to_kv_pool_allocator.state_slots
         slot = allocator.alloc(1)
         if slot is None:
-            self.evict(EvictParams(num_tokens=0, mamba_num=1))
+            self.evict_for_alloc(KVDemand(state_slots=1))
             slot = allocator.alloc(1)
         if slot is not None:
             physical = self.token_to_kv_pool_allocator.state_ids(
@@ -502,24 +501,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             if swa_tail_tokens
             else None
         )
+        demand = KVDemand(
+            full_tokens=num_tokens,
+            window_tokens={window: swa_tail_tokens} if window else {},
+        )
         if shares_memory(allocator):
-            # Sub-pools share one memory: reclaim the load's whole demand.
-            reclaim_for_load_back(
-                self,
-                allocator,
-                KVDemand(
-                    full_tokens=num_tokens,
-                    window_tokens={window: swa_tail_tokens} if window else {},
-                ),
-            )
-        elif not self.is_swa_enabled:
-            if allocator.available_size() < num_tokens:
-                self.evict(EvictParams(num_tokens=num_tokens))
-        else:
-            if allocator.full_attn_allocator.available_size() < num_tokens:
-                self.evict(EvictParams(num_tokens=num_tokens))
-            if allocator.swa_attn_allocator.available_size() < swa_tail_tokens:
-                self.evict(EvictParams(window_num_tokens={window: swa_tail_tokens}))
+            reclaim_for_load_back(self, allocator, demand)
+        elif self.is_swa_enabled or allocator.available_size() < num_tokens:
+            self.evict_for_alloc(demand)
         if not self.is_swa_enabled:
             return allocator.alloc(num_tokens)
 

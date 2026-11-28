@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
     IncLockRefResult,
     InsertResult,
     MatchResult,
@@ -176,6 +177,96 @@ def test_external_slots_on_a_shared_memory_reclaim_the_load_demand(
     cache.evict_for_alloc.assert_called_once_with(
         KVDemand(full_tokens=8, window_tokens=window)
     )
+
+
+@pytest.mark.parametrize("available", [0, 3840, 4095, 4096, 4097])
+def test_external_slots_on_independent_full_pool_reclaim_for_allocation(
+    cache_class, available
+):
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+    cache = cache_class.__new__(cache_class)
+    cache.tree_components = (ComponentType.FULL,)
+    cache.is_swa_enabled = False
+    cache.evict_for_alloc = mock.Mock()
+    allocator = mock.Mock(pools_share_memory=False)
+    allocator.available_size.return_value = available
+    cache.token_to_kv_pool_allocator = allocator
+
+    assert cache._allocate_external_slots(4096) is allocator.alloc.return_value
+    if available < 4096:
+        cache.evict_for_alloc.assert_called_once_with(KVDemand(full_tokens=4096))
+    else:
+        cache.evict_for_alloc.assert_not_called()
+    allocator.alloc.assert_called_once_with(4096)
+
+
+def test_external_slots_on_independent_full_mamba_pool_reclaim_only_full_tokens(
+    cache_class,
+):
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+    cache = cache_class.__new__(cache_class)
+    cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+    cache.is_swa_enabled = False
+    cache.evict = mock.Mock()
+    cache.evict_for_alloc = mock.Mock()
+    allocator = mock.Mock(pools_share_memory=False)
+    allocator.available_size.return_value = 3840
+    cache.token_to_kv_pool_allocator = allocator
+
+    assert cache._allocate_external_slots(4096) is allocator.alloc.return_value
+    cache.evict_for_alloc.assert_called_once_with(KVDemand(full_tokens=4096))
+    cache.evict.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("full_free", "window_free", "expected"),
+    [
+        (8, 4, None),
+        (6, 4, EvictParams(num_tokens=2)),
+        (8, 3, EvictParams(window_num_tokens={FIRST: 1})),
+        (6, 3, EvictParams(num_tokens=2, window_num_tokens={FIRST: 1})),
+    ],
+)
+def test_independent_window_load_evicts_only_pool_shortfalls(
+    cache_class, full_free, window_free, expected
+):
+    cache, _, _ = _cache_and_request(cache_class, swa_enabled=True)
+    cache.disable = False
+    cache.tree_components = (ComponentType.FULL, FIRST_WINDOW)
+    cache._evict = mock.Mock()
+    allocator = mock.Mock(pools_share_memory=False, hands_out_virtual_ids=False)
+    allocator.owner_available_size.return_value = full_free
+    allocator.window_available_size.return_value = window_free
+    allocator.full_attn_allocator.alloc.return_value = torch.arange(8)
+    allocator.swa_attn_allocator.alloc.return_value = torch.arange(4)
+    cache.token_to_kv_pool_allocator = allocator
+    with mock.patch.object(cache_class, "sliding_window_size", 4):
+        slots = cache._allocate_external_slots(8)
+    assert slots is allocator.full_attn_allocator.alloc.return_value
+    if expected is None:
+        cache._evict.assert_not_called()
+    else:
+        cache._evict.assert_called_once()
+        assert cache._evict.call_args.args == (expected,)
+    allocator.swa_attn_allocator.alloc.assert_called_once_with(4)
+
+
+def test_mamba_slot_allocation_reclaims_one_checkpoint_on_exhaustion(cache_class):
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+    cache = cache_class.__new__(cache_class)
+    cache._mamba_component = mock.Mock()
+    cache.evict_for_alloc = mock.Mock()
+    allocator = mock.Mock()
+    cache.token_to_kv_pool_allocator = allocator
+    slot = torch.tensor([7])
+    allocator.state_slots.alloc.side_effect = [None, slot]
+    cache.req_to_token_pool = mock.Mock()
+    cache.lmcache_connector = mock.Mock()
+    assert cache._allocate_external_mamba_slot() is slot
+    cache.evict_for_alloc.assert_called_once_with(KVDemand(state_slots=1))
 
 
 if __name__ == "__main__":
