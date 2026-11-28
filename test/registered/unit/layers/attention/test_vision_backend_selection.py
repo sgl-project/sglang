@@ -1,5 +1,6 @@
+import importlib
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -7,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+import sglang.srt.utils as srt_utils
 from sglang.srt.layers.attention import vision
 from sglang.test.ci.ci_register import register_cpu_ci, register_npu_ci
 
@@ -50,6 +52,48 @@ def test_npu_backend_selection_priority(
     backend = vision.VisionAttention._determine_attention_backend(None, passed_backend)
 
     assert backend == expected
+
+
+def test_musa_fa3_backend_has_flash_attn_func():
+    # Bug regression: `flash_attn_func` was only defined under `if _is_cuda:`,
+    # but VisionFlash3Attention (selectable on MUSA) calls it unconditionally,
+    # so every VL model died at vision warmup with NameError on MUSA.
+    sentinel = object()
+    original_fai = sys.modules.get("flash_attn_interface", sentinel)
+    real_is_musa, real_is_cuda = srt_utils.is_musa, srt_utils.is_cuda
+    calls = []
+
+    fake_fai = ModuleType("flash_attn_interface")
+
+    def fake_varlen(*args, **kwargs):
+        calls.append((args, kwargs))
+        return args[0]
+
+    fake_fai.flash_attn_varlen_func = fake_varlen
+    sys.modules["flash_attn_interface"] = fake_fai
+    srt_utils.is_musa = lambda: True
+    srt_utils.is_cuda = lambda: False
+    try:
+        importlib.reload(vision)
+
+        assert hasattr(vision, "flash_attn_func")
+        vision.VisionFlash3Attention()
+        q = torch.randn(6, 2, 8)
+        vision.flash_attn_func(
+            q, q, q, ver=3, cu_seqlens_q=torch.tensor([0, 6]), softmax_scale=0.5
+        )
+    finally:
+        srt_utils.is_musa, srt_utils.is_cuda = real_is_musa, real_is_cuda
+        if original_fai is sentinel:
+            sys.modules.pop("flash_attn_interface", None)
+        else:
+            sys.modules["flash_attn_interface"] = original_fai
+        importlib.reload(vision)
+
+    ((args, kwargs),) = calls
+    assert all(a is q for a in args)
+    assert "ver" not in kwargs
+    assert kwargs["softmax_scale"] == 0.5
 
 
 @pytest.mark.parametrize(
