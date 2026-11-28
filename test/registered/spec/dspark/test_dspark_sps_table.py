@@ -1,7 +1,9 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+from sglang.benchmark import dspark_sps_profiler
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -22,6 +24,45 @@ def _make_table() -> SpsCostTable:
         sample_steps_per_sec=[1000.0, 950.0, 500.0, 480.0],
         max_batch_tokens=128,
     )
+
+
+class TestSpsProfilerServerContext(CustomTestCase):
+    def test_counts_scheduler_ranks_for_attention_dp(self):
+        """Attention DP must profile every scheduler even when dp_size is one."""
+        for num_ranks, replica_dp_size in ((4, 1), (4, 4), (1, 1)):
+            with self.subTest(num_ranks=num_ranks, replica_dp_size=replica_dp_size):
+                info = {
+                    "speculative_algorithm": "DSPARK",
+                    "tokenizer_path": "/model",
+                    "dp_size": replica_dp_size,
+                    "attn_dp_size": num_ranks // replica_dp_size,
+                    "internal_states": [
+                        {
+                            "dp_size": replica_dp_size,
+                            "effective_max_running_requests_per_dp": 64,
+                            "dspark_info_record": {
+                                "mode": "static",
+                                "components": ["core", "step_cpu_time"],
+                                "simulate_acc_len": 1.0,
+                                "verify_num_draft_tokens": 4,
+                            },
+                        }
+                        for _ in range(num_ranks)
+                    ],
+                }
+                response = Mock()
+                response.json.return_value = info
+                with patch.object(
+                    dspark_sps_profiler.requests, "get", return_value=response
+                ):
+                    context = dspark_sps_profiler.fetch_server_context(
+                        base_url="http://localhost:8001", local_tokenizer_path=None
+                    )
+
+                self.assertEqual(context.dp_size, num_ranks)
+                self.assertEqual(
+                    context.skip_max_running_requests_threshold, 64 * num_ranks
+                )
 
 
 class TestSpsCostTableInvariants(CustomTestCase):
