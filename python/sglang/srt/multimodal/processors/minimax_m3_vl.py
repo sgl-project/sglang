@@ -531,6 +531,7 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         ).build(_processor)
 
     preserve_processor_input_ids = True
+    prefer_tokenized_input = True
 
     @cached_property
     def feature_dtype(self) -> torch.dtype:

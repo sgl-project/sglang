@@ -91,10 +91,31 @@ class TestRenderAndEncode(unittest.TestCase):
 
 
 class TestEnginePrompt(unittest.TestCase):
-    def _server(self, lossy):
+    def _server(self, lossy, takes_ids=False):
         return SimpleNamespace(
-            _prompt_text_round_trip_is_lossy=lossy, chat_encoding_spec=None
+            _prompt_text_round_trip_is_lossy=lossy,
+            _mm_processor_takes_prompt_ids=takes_ids,
+            chat_encoding_spec=None,
         )
+
+    def test_processor_that_takes_ids_gets_ids_with_media(self):
+        for lossy in (True, False):
+            key, value = engine_prompt(
+                self._server(lossy, takes_ids=True),
+                _messages([1, 3, 4], image_data=["img"]),
+                is_multimodal=True,
+            )
+            self.assertEqual(key, "input_ids")
+            self.assertEqual(value, [1, 3, 4])
+
+    def test_processor_that_takes_ids_without_ids_falls_back_to_text(self):
+        key, value = engine_prompt(
+            self._server(False, takes_ids=True),
+            _messages([], image_data=["img"]),
+            is_multimodal=True,
+        )
+        self.assertEqual(key, "text")
+        self.assertEqual(value, "rendered")
 
     def test_lossy_text_only_sends_ids(self):
         key, value = engine_prompt(

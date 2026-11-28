@@ -254,6 +254,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
+    tm.mm_processor = None
     return tm
 
 
