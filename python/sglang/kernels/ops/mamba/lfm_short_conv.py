@@ -237,7 +237,7 @@ def can_use_fused_lfm_short_conv(
     return (
         b.is_cuda
         and torch.version.hip is None
-        and current_arch().is_sm(9, 0)
+        and (current_arch().is_sm(9, 0) or current_arch().is_sm(8, 0))
         and c.is_cuda
         and x.is_cuda
         and weight.is_cuda
