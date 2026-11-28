@@ -8,6 +8,7 @@ import torch
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.serving_hook import handle_watermark_config
 from sglang.srt.arg_groups.validation_hook import check_watermark_server_args
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
@@ -322,6 +323,36 @@ class TestSynthIDEngine(CustomTestCase):
         assert_synthid_state_equal(
             synthid_state(watermark.state), synthid_state(twin.state)
         )
+
+    def test_verify_watermarks_sanitized_logits_in_sanitize_mode(self):
+        """As the sample does: the candidate top-k never reads a NaN."""
+        watermark, _ = _watermarks()
+        engine = adapter.SynthIDEngine(watermark, allow_fused_sample=False)
+        logits = torch.randn(3, 16)
+        logits[1, 0] = float("nan")
+        verify = engine.bind_verify(
+            SynthIDRows.from_candidates([True], "cpu"), full_mask=True
+        )
+        # The NaN probe would raise first when a run enables it (rerun CI does).
+        with (
+            envs.SGLANG_SANITIZE_NAN_LOGITS.override(True),
+            envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.override(False),
+            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(False),
+        ):
+            verified, _ = verify.apply(
+                logits,
+                sampling_info=_info(1),
+                req_pool_indices=torch.tensor([5]),
+                draft_tokens=torch.tensor([1, 2, 3]),
+                positions=torch.zeros(3, dtype=torch.int64),
+                draft_token_num=3,
+                custom_mask=torch.ones(9, dtype=torch.bool),
+                keep_logits=True,
+            )
+
+        self.assertFalse(verified.isnan().any())
+        # The kept logits are the pipeline's to sanitize at the end of the stages.
+        self.assertTrue(logits[1, 0].isnan())
 
 
 if __name__ == "__main__":

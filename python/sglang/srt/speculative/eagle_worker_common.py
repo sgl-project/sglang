@@ -48,7 +48,6 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
-    maybe_detect_nan,
     maybe_detect_oob,
 )
 from sglang.srt.utils.device import is_npu
@@ -184,7 +183,6 @@ def accept_draft_tree(
     """The tree accept core of EAGLE and NGRAM: the runtime hooks' post-verify
     under the NV mega runtime, eagle_sample otherwise."""
     batch = verify.batch
-    maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
     # The provider's sampling view carries no custom logit processors.
     if (

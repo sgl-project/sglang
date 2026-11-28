@@ -332,6 +332,8 @@ class SynthIDVerify:
     ) -> tuple[torch.Tensor, SamplingBatchInfo]:
         if keep_logits:
             logits = logits.clone()
+        # As in SynthIDSample.apply: the candidate top-k reads these logits.
+        sanitize_nan_logits(logits, "watermark: verify logits")
         rows = self.rows
         self._req_pool_indices = req_pool_indices
         self.watermark.apply_verify(

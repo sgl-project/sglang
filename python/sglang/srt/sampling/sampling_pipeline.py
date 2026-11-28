@@ -2,7 +2,7 @@
 speculative target verify:
 
     penalty -> grammar mask -> logit_bias -> watermark -> custom logit processor
-    -> sanitize (decode only) -> sampler or accept core -> commit
+    -> sanitize -> sampler or accept core -> commit
 
 Two entries run it:
 
@@ -22,6 +22,12 @@ that read each row's draft prefix. Penalty and watermark keep
 per-request state, so each commits the sampled tokens or the verify's
 `VerifyAccept`. A `SamplingObserver` sees the decode logits between the penalty
 and the grammar mask.
+
+Each entry probes the model's logits for NaN before the stages
+(`detect_nan_logits`): decode in `SamplingPipeline.sample`, verify in
+`VerifyStep.build_row_inputs`. The sanitize, which heals NaN and inf only under
+SGLANG_SANITIZE_NAN_LOGITS, ends the stages on every path; a verify's route turns
+off the fast paths that skip the stages in that mode.
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.sampling.custom_logit_processor import (
     apply_custom_logit_processor,
@@ -78,6 +85,7 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
         logits; they replace the stages after the watermark.
         """
         sampling_info = forward_batch.sampling_info
+        detect_nan_logits(logits_output.next_token_logits, "sampler")
         if observer is not None and not observer.is_active(sampling_info):
             observer = None
         observer_state = _adjust_before_watermark(
@@ -105,9 +113,6 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
             next_token_ids = graph_token_ids
 
         if next_token_ids is None:
-            maybe_detect_nan(
-                logits_output.next_token_logits, "sampler: next_token_logits"
-            )
             _adjust_after_watermark(
                 logits_output.next_token_logits,
                 sampler_info,
@@ -234,9 +239,7 @@ def _adjust_after_watermark(
     logprob_logits: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     _custom_logit_processor_stage(logits, sampling_info, logprob_logits=logprob_logits)
-    sanitize_nan_logits(logits, "sampler: next_token_logits")
-    if logprob_logits is not None:
-        sanitize_nan_logits(logprob_logits, "sampler: next_token_logits")
+    _sanitize_stage(logits, logprob_logits=logprob_logits)
     return logits
 
 
@@ -266,10 +269,42 @@ def _custom_logit_processor_stage(
         )
 
 
+def _sanitize_stage(
+    logits: torch.Tensor, *, logprob_logits: Optional[torch.Tensor]
+) -> None:
+    """The last stage, in place, on the logits the sampler or accept core reads
+    and on `logprob_logits`: `sanitize_nan_logits`, which probes for NaN and
+    heals only under SGLANG_SANITIZE_NAN_LOGITS."""
+    sanitize_nan_logits(logits, "sampling: logits after the stages")
+    if logprob_logits is not None:
+        sanitize_nan_logits(logprob_logits, "sampling: logprob logits after the stages")
+
+
+def detect_nan_logits(logits: Optional[torch.Tensor], entry: str) -> None:
+    """The NaN probe each sampling entry runs on the model's logits, a vocab shard
+    included, before any stage edits them: a grammar mask would hide a NaN on a
+    masked token from the probe in the sanitize. Off unless
+    SGLANG_ENABLE_NAN_LOGITS_CHECK or SGLANG_ENABLE_ASYNC_ASSERT is set."""
+    maybe_detect_nan(logits, f"{entry}: model logits")
+
+
+def edits_verify_logits(
+    info: SamplingBatchInfo, *, has_grammar: bool, has_watermark: bool
+) -> bool:
+    return (
+        has_grammar
+        or has_watermark
+        or info.step_penalties is not None
+        or info.logit_bias is not None
+        or info.has_custom_logit_processor
+    )
+
+
 class VerifyRoute(msgspec.Struct, frozen=True):
     """The sampling facts that pick a target verify's fast paths."""
 
-    # Some stage edits the logits before the accept reads them.
+    # Some stage edits the logits before the accept reads them; under
+    # SGLANG_SANITIZE_NAN_LOGITS always, as the sanitize ends the stages.
     adjusts_logits: bool
     # Some row truncates its distribution with top-k, top-p, or min-p.
     need_truncated_sampling: bool
@@ -289,11 +324,10 @@ class VerifyRoute(msgspec.Struct, frozen=True):
             return cls(adjusts_logits=has_grammar, need_truncated_sampling=False)
         return cls(
             adjusts_logits=(
-                has_grammar
-                or has_watermark
-                or info.step_penalties is not None
-                or info.logit_bias is not None
-                or info.has_custom_logit_processor
+                edits_verify_logits(
+                    info, has_grammar=has_grammar, has_watermark=has_watermark
+                )
+                or envs.SGLANG_SANITIZE_NAN_LOGITS.get()
             ),
             need_truncated_sampling=need_truncated_sampling(info),
         )
@@ -330,7 +364,9 @@ class VerifyStep(msgspec.Struct):
         Call it after the target verify launches, so the host work overlaps the
         forward. Under overlap the previous step's result is still queued;
         `barrier` advances the grammar FSM over its tokens and returns them per
-        request, as result processing will append them to req.output_ids."""
+        request, as result processing will append them to req.output_ids. It
+        also probes the target's logits for NaN."""
+        detect_nan_logits(logits_output.next_token_logits, "verify")
         if tree is None:
             return
         # Lazy: spec_utils imports the scheduler stack.
@@ -416,6 +452,9 @@ class VerifyStep(msgspec.Struct):
                 rows_per_request=draft_tokens.shape[1],
                 row_prefixes=self.row_prefixes,
             )
+        _sanitize_stage(
+            verify_logits, logprob_logits=None if verify_logits is logits else logits
+        )
         return verify_logits, sampling_info
 
     def cap_tree_accept(

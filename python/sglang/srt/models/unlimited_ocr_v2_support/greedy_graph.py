@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 import torch
 
 from sglang.srt.configs.model_config import is_unlimited_ocr_v2
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -92,7 +93,8 @@ class UocrGreedyGraph:
         # The argmax ran inside the graph, before the sampling pipeline's
         # adjustments, so any transform of the logits invalidates it.
         if (
-            sampling_info.logit_bias is not None
+            envs.SGLANG_SANITIZE_NAN_LOGITS.get()
+            or sampling_info.logit_bias is not None
             or sampling_info.grammars is not None
             or sampling_info.has_custom_logit_processor
             or sampling_info.step_penalties is not None

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.kernels.ops.attention.clamp_position import clamp_position
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -61,6 +62,8 @@ class UOCRDecodeGraphIO:
             and not sampling.has_custom_logit_processor
             and sampling.watermark is None
             and sampling.step_penalties is None
+            # The graph's argmax reads the logits before the sanitize.
+            and not envs.SGLANG_SANITIZE_NAN_LOGITS.get()
         )
 
     def seed(self, indices: torch.Tensor, tokens: torch.Tensor) -> None:

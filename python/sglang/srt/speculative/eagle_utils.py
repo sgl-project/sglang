@@ -817,7 +817,6 @@ def eagle_sample(
     the compact top-k branch too, as on the dense one.
     """
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.utils.async_probe import sanitize_nan_logits
 
     batch = verify.batch
     device = batch.device
@@ -840,8 +839,6 @@ def eagle_sample(
         )
         logits_output.next_token_logits = next_token_logits
         logits_output.next_token_logits_vocab_shard = vocab_shard = None
-
-    sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     next_token_logits, sampling_info = verify.adjust(
