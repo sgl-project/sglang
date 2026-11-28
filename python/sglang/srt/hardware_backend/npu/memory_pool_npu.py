@@ -11,10 +11,7 @@ from sglang.srt.hardware_backend.npu.kv_capability import (
     resolve_npu_kv_capability,
 )
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
-from sglang.srt.mem_cache.kv_cache_dtype import (
-    QUANT_MODE_TOKEN_INT8,
-    QUANT_MODE_TOKEN_MXFP8,
-)
+from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_TOKEN_INT8
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -854,12 +851,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         # --indexer-kv-cache-dtype opts into a quantized indexer K cache
         if (
-            indexer_quant_mode in (QUANT_MODE_TOKEN_INT8, QUANT_MODE_TOKEN_MXFP8)
+            indexer_quant_mode == QUANT_MODE_TOKEN_INT8
             and get_memory().enable_hierarchical_cache
-            and not (
-                indexer_quant_mode == QUANT_MODE_TOKEN_INT8
-                and dtype in (torch.bfloat16, torch.int8)
-            )
+            and dtype not in (torch.bfloat16, torch.int8)
         ):
             raise ValueError(
                 "A quantized indexer cache with --enable-hierarchical-cache "
@@ -875,22 +869,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.indexer_quant = self.indexer_kv_store_int8 or (
             kv_capability is not None and kv_capability.indexer_quant
         )
-        self.indexer_kv_store_mxfp8 = (
-            indexer_quant_mode == QUANT_MODE_TOKEN_MXFP8
-            and not (kv_capability is not None and kv_capability.indexer_quant)
-            and index_head_dim is not None
-        )
-        if self.indexer_kv_store_mxfp8 and index_kpool <= 1:
-            raise ValueError(
-                "The NPU LightningIndexer does not support MXFP8 index cache; "
-                "--indexer-kv-cache-dtype=mxfp8 requires KPool (index_kpool > 1)."
-            )
         if self.indexer_kv_store_int8:
             self.index_k_store_dtype = torch.int8
             self.index_k_scale_dtype = torch.float16
-        elif self.indexer_kv_store_mxfp8:
-            self.index_k_store_dtype = torch.float8_e4m3fn
-            self.index_k_scale_dtype = torch.uint8  # e8m0 scale
         else:
             index_k_dtype = (
                 dtype if kv_capability is None else kv_capability.indexer_kv_dtype
@@ -1052,31 +1033,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
-                if self.num_indexer_layers > 0:
-                    if self.indexer_quant:
-                        from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
-                            create_npu_hadamard_128,
-                        )
+                if self.indexer_quant and self.num_indexer_layers > 0:
+                    from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
+                        create_npu_hadamard_128,
+                    )
 
-                        self.index_k_scale_buffer = torch.zeros(
-                            (*self.index_k_buffer.shape[:-2], 1),
-                            dtype=self.index_k_scale_dtype,
-                            device=self.device,
-                        )
-                        self.indexer_hadamard_128 = create_npu_hadamard_128(
-                            self.index_head_dim, self.device
-                        )
-                    elif self.indexer_kv_store_mxfp8:
-                        # MXFP8: E8M0 scales per 32 elements, no Hadamard; pair-packed as [D/64, 2].
-                        self.index_k_scale_buffer = torch.zeros(
-                            (
-                                *self.index_k_buffer.shape[:-1],
-                                self.index_head_dim // 64,
-                                2,
-                            ),
-                            dtype=torch.uint8,
-                            device=self.device,
-                        )
+                    self.index_k_scale_buffer = torch.zeros(
+                        (*self.index_k_buffer.shape[:-2], 1),
+                        dtype=self.index_k_scale_dtype,
+                        device=self.device,
+                    )
+                    self.indexer_hadamard_128 = create_npu_hadamard_128(
+                        self.index_head_dim, self.device
+                    )
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         # Return the index-key cache, which stores compressed keys in KPool mode.
@@ -1324,10 +1293,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_index_k_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
-        if self.indexer_kv_store_mxfp8:
-            return buf.view(torch.float8_e8m0fnu)
-        return buf
+        return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
         assert scale.dtype == self.index_k_scale_dtype, (
@@ -1435,6 +1401,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
+        self._set_kv_buffer_npu(layer, layer_id, loc, cache_k, cache_v)
+
+    def _set_kv_buffer_npu(
+        self,
+        layer: "RadixAttention",
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: Optional[torch.Tensor],
+    ):
+        """Write a layer's KV on the separated/combined/NZ ascend layouts."""
         if self.dsa_kv_cache_store_c8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
@@ -1497,6 +1474,23 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 loc.view(-1, 1),
                 cache_v.view(-1, 1, self.qk_rope_head_dim),
             )
+
+    def set_mla_kv_buffer(
+        self,
+        layer,
+        loc_info,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
+    ):
+        # The GPU base class writes the fused self.kv_buffer, which the ascend
+        # separated/combined/NZ layouts do not have; use the ordinary NPU path.
+        loc, _, _ = unwrap_write_loc(loc_info)
+        self._raise_if_native_kv_cache_disabled()
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        self._set_kv_buffer_npu(layer, layer_id, loc, cache_k_nope, cache_k_rope)
 
     def _set_fia_nz_kv_buffer(
         self,
@@ -1791,6 +1785,9 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
         assert index_kpool == 1, (
             "The Ascend hybrid DSA pool does not support index_kpool > 1 yet"
         )
+        # Hybrid PD registration also queries the optional compressed-tail state.
+        # Ascend currently only supports the uncompressed index layout above.
+        self.kpool_use_compress = False
         if skip_topk_layers is None:
             # Default (and draft-worker) pools index every full-attention layer.
             indexer_layer_ids = None

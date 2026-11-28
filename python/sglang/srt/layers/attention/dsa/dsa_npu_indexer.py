@@ -51,22 +51,6 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
 def _quantize_npu_indexer_activation(
     x, hadamard, dst_type, scale_type, *, kpool_query=False
 ):
-    if kpool_query and scale_type == torch.float8_e8m0fnu:
-        from sgl_kernel_npu.operators.activation import dynamic_mx_quant
-
-        head_dim = x.shape[-1]
-        # One E8M0 scale per 32 channels, packed in pairs for PI.
-        scale_shape = x.shape[:-1] + (head_dim // 64, 2)
-        if x.numel() == 0:
-            return (
-                torch.empty_like(x, dtype=dst_type),
-                torch.empty(scale_shape, dtype=scale_type, device=x.device),
-            )
-        quantized, scale = dynamic_mx_quant(
-            x.reshape(-1, head_dim), dst_type=dst_type, axis=-1
-        )
-        return quantized.view(x.shape), scale.reshape(scale_shape).view(scale_type)
-
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
         return (
@@ -74,7 +58,7 @@ def _quantize_npu_indexer_activation(
             torch.empty(x.shape[:-1], dtype=scale_type, device=x.device),
         )
     if kpool_query and dst_type == torch.int8:
-        from sgl_kernel_npu.operators.activation import dynamic_quant
+        from sgl_kernel_npu.operators.quant import dynamic_quant
 
         quantized, scale = dynamic_quant(x.reshape(-1, 128), dst_type=dst_type)
         # PI requires positive descales, including padding rows.
@@ -141,8 +125,8 @@ class _IndexerQueryShard(NamedTuple):
     def resolve(
         self, topk_indices: torch.Tensor, num_tokens: int, forward_batch
     ) -> torch.Tensor:
-        """Full-width top-k, or this rank's own rows when the token shard will
-        slice the gathered tensor straight back to them anyway.
+        """Full-width top-k, or local rows when only token-sharded attention
+        consumes them. MTP seed export still needs batch-global row offsets.
 
         Sets ``npu_indexer_topk_is_local`` so attention knows which it got.
         """
@@ -156,6 +140,12 @@ class _IndexerQueryShard(NamedTuple):
                 f"(plan {plan.local_start}+{plan.rows} against shard "
                 f"{self.start}+{self.rows}); keeping the top-k all-gather"
             )
+            local = False
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if getattr(spec_info, "dsa_seed_topk_capture", None) is not None:
+            # write_mtp_seed selects each request's last prefill token using
+            # global row indices. Keep the gather for that extra consumer;
+            # attention will slice the full-width top-k back to its own rows.
             local = False
         forward_batch.npu_indexer_topk_is_local = local
         if not local:
@@ -300,12 +290,12 @@ class DSANPUIndexerMixin:
         # indexer (before the attention backend's forward_extend), so prepare it
         # here rather than in the shared eager runner.
         attn_backend = get_attn_backend()
-        if hasattr(attn_backend, "prepare_dsa_cp_metadata"):
-            attn_backend.prepare_dsa_cp_metadata(forward_batch)
         # Hybrid models (Kimi K2/K3) wrap a full-attn and a linear backend;
-        # the forward metadata consumed here lives on the full-attn side.
+        # unwrap before preparing CP metadata as well as reading it.
         if hasattr(attn_backend, "full_attn_backend"):
             attn_backend = attn_backend.full_attn_backend
+        if hasattr(attn_backend, "prepare_dsa_cp_metadata"):
+            attn_backend.prepare_dsa_cp_metadata(forward_batch)
         if attn_backend.forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = attn_backend.forward_metadata.seq_lens
         else:

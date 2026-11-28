@@ -30,11 +30,9 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
 # runs the v1 npu_quant_lightning_indexer op, where the quantization is
 # implied by the INT8 key dtype (its quant_mode args stay 0).
 QUANT_MODE_TOKEN_INT8 = 0
-QUANT_MODE_TOKEN_MXFP8 = 1
 
 _INDEXER_KV_CACHE_DTYPE_TO_QUANT_MODE = {
     "int8": QUANT_MODE_TOKEN_INT8,
-    "mxfp8": QUANT_MODE_TOKEN_MXFP8,
 }
 
 

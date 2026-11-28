@@ -50,7 +50,7 @@ with BF16 or INT8 main KV, both for the standard LightningIndexer
 Combine `--kv-cache-dtype int8`, `--indexer-kv-cache-dtype int8` and
 `--enable-hierarchical-cache` to enable HiCache with both caches quantized.
 The host cache preserves the packed MLA record, INT8 indexer keys and FP16
-indexer scales. MXFP8 index caches do not support HiCache.
+indexer scales.
 Packed INT8 main KV supports speculative decoding,
 prefill context parallelism and HiCache.
 For RoPE64 models, `SGLANG_NPU_USE_MLAPO` enables MLAProlog writes during decode.

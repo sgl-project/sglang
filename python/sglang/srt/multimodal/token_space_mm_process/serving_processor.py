@@ -162,7 +162,6 @@ class TokenSpaceSGLangProcessor:
         input_ids=None,
         audio_data=None,
         video_data=None,
-        max_req_input_len=None,
         **kwargs,
     ) -> MultimodalProcessorOutput:
         """The processor entry; `input_text` holds the request's input_ids when it has them."""

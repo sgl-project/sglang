@@ -259,11 +259,9 @@ class Model(msgspec.Struct):
                 "(Ascend NPU only). None disables the quantized indexer cache "
                 'and keeps the default indexer behavior. "int8" stores the '
                 "indexer keys in INT8 with FP16 scales to speed up the "
-                'lightning indexer and the KPool indexer. "mxfp8" stores the '
-                "indexer keys in MXFP8 (E4M3FN) with per-32-element E8M0 "
-                "scales on Ascend A5 for the KPool indexer."
+                "lightning indexer and the KPool indexer."
             ),
-            choices=["int8", "mxfp8"],
+            choices=["int8"],
         ),
     ] = None
     qsa_indexer_dtype: A[

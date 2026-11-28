@@ -412,7 +412,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
 
 
 def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
-    """Check the DSA indexer INT8/MXFP8 cache recipes.
+    """Check the DSA indexer INT8 cache recipe.
 
     npu_quant_lightning_indexer is a CANN op, so an explicitly requested
     indexer recipe only makes sense on Ascend NPU and on a model that
