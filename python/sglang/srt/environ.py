@@ -2247,6 +2247,12 @@ class Envs:
     # Single-pass Mega-mHC prefill. SM100 uses DeepGEMM; gfx950 uses aiter
     # flydsl_mega_mhc (ROCm/aiter#6179). Off by default.
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
+    # With SGLANG_OPT_DSV41_MEGA_MHC_PREFILL, gfx950 Mega-mHC also runs the decode and
+    # verify steps SGLang runs, not the AMD monokernel's. Off by default.
+    SGLANG_OPT_DSV41_MEGA_MHC_DECODE = EnvBool(False)
+    # With SGLANG_OPT_DSV41_MEGA_MHC_PREFILL, gfx950 Mega-mHC also runs the seams of the
+    # DSpark draft stages that SGLang serves. Off by default.
+    SGLANG_OPT_DSV41_MEGA_MHC_DRAFT = EnvBool(False)
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
