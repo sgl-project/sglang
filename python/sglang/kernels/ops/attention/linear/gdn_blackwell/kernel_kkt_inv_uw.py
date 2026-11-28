@@ -488,26 +488,83 @@ class Sm100ChunkUWKernel:
                 for i in cutlass.range_constexpr(4):
                     M[i] ^= Uint32(0x80008000)
 
-                # 3 rounds of Newton-Schulz
+                # 3 rounds of Newton-Schulz.
+                # The persistent iterate Ai_f32 is kept in fp32, but the MMA
+                # operands are bf16. For ill-conditioned (I+A) the iterate has
+                # large-magnitude entries (~cond), so truncating the operand to
+                # bf16 loses ~cond*2^-8 and the weakly-gated recurrence amplifies
+                # it into garbage. We therefore feed the operands as bf16x2
+                # (hi+lo limbs, ~fp32 mantissa): C = A@B ~= Ahi@Bhi + Ahi@Blo +
+                # Alo@Bhi. M = -(I+A) is already exactly bf16 (Phase 2 packs A to
+                # bf16), so M needs no lo limb. Only the diagonal NS is corrected;
+                # the off-diagonal substitution / U / W stay bf16 (validated to be
+                # sufficient by test/manual/gdn_cutedsl_inverse_precision.py).
+                Ai_lo_bf16 = cute.make_rmem_tensor(8, BFloat16)
+                Ai_lo = cute.recast_tensor(Ai_lo_bf16, Uint32)
+                P_hi_bf16 = cute.make_rmem_tensor(8, BFloat16)
+                P_hi = cute.recast_tensor(P_hi_bf16, Uint32)
+                P_lo_bf16 = cute.make_rmem_tensor(8, BFloat16)
+                P_lo = cute.recast_tensor(P_lo_bf16, Uint32)
+                mma_B_lo_bf16 = cute.make_rmem_tensor(8, BFloat16)
+                mma_B_lo = cute.logical_divide(
+                    cute.recast_tensor(mma_B_lo_bf16, Uint32), 2
+                )
                 for _ in cutlass.range_constexpr(3):
-                    # First MMA: -AiM = Ai @ (-M)
+                    # split the fp32 iterate Ai_old into hi + lo bf16 limbs
+                    Ai_bf16.store(Ai_f32.load().to(BFloat16))  # hi
+                    Ai_hi_f32 = cute.logical_divide(cvt.bf16x2_to_fp32x2(Ai), 4)
+                    Ai_lo_bf16.store(
+                        (Ai_f32.load() - Ai_hi_f32.load()).to(BFloat16)
+                    )  # lo = round(Ai_old - hi)
+                    # stash both limbs so MMA2 can read Ai_old^T at bf16x2
+                    # (sAi is unused until after this loop -> safe scratch).
                     cute.copy(stsm_atom, Ai_bf16, sA_ldsm[warp_id_, None, warp_id_])
+                    cute.copy(
+                        stsm_atom, Ai_lo_bf16, sAi_ldsm[warp_id_, None, warp_id_]
+                    )
                     cute.arch.sync_warp()
+
+                    # First MMA: -AiM = Ai_old @ (-M), Ai_old split hi+lo
                     acc[None, 0] = mma_bf16(Ai, M[None, 0], zeros_f32)
                     acc[None, 1] = mma_bf16(Ai, M[None, 1], zeros_f32)
-                    Ai_bf16.store(acc.load().to(BFloat16))
+                    acc[None, 0] = mma_bf16(Ai_lo, M[None, 0], acc[None, 0])
+                    acc[None, 1] = mma_bf16(Ai_lo, M[None, 1], acc[None, 1])
+                    # split -AiM into hi + lo bf16 limbs
+                    P_hi_bf16.store(acc.load().to(BFloat16))
+                    P_hi_f32 = cute.logical_divide(cvt.bf16x2_to_fp32x2(P_hi), 4)
+                    P_lo_bf16.store(
+                        (acc.load() - P_hi_f32.load()).to(BFloat16)
+                    )
 
-                    # Second MMA: Ai_new = 2Ai + (-AiM) @ Ai
+                    # Second MMA: Ai_new = 2Ai_old + (-AiM) @ Ai_old
+                    # both operands bf16x2 (drop the lo*lo cross term):
+                    #   P_hi@Bhi + P_hi@Blo + P_lo@Bhi
                     for j in cutlass.range_constexpr(8):
                         Ai_f32[j] *= 2.0
                     cute.copy(
                         ldsm_trans_atom,
                         sA_ldsm[warp_id_, None, warp_id_],
                         mma_B_bf16,
+                    )  # Ai_old_hi^T
+                    cute.copy(
+                        ldsm_trans_atom,
+                        sAi_ldsm[warp_id_, None, warp_id_],
+                        mma_B_lo_bf16,
+                    )  # Ai_old_lo^T
+                    Ai_f32[None, 0] = mma_bf16(P_hi, mma_B[None, 0], Ai_f32[None, 0])
+                    Ai_f32[None, 1] = mma_bf16(P_hi, mma_B[None, 1], Ai_f32[None, 1])
+                    Ai_f32[None, 0] = mma_bf16(
+                        P_hi, mma_B_lo[None, 0], Ai_f32[None, 0]
                     )
-                    Ai_f32[None, 0] = mma_bf16(Ai, mma_B[None, 0], Ai_f32[None, 0])
-                    Ai_f32[None, 1] = mma_bf16(Ai, mma_B[None, 1], Ai_f32[None, 1])
-                    Ai_bf16.store(Ai_f32.load().to(BFloat16))
+                    Ai_f32[None, 1] = mma_bf16(
+                        P_hi, mma_B_lo[None, 1], Ai_f32[None, 1]
+                    )
+                    Ai_f32[None, 0] = mma_bf16(P_lo, mma_B[None, 0], Ai_f32[None, 0])
+                    Ai_f32[None, 1] = mma_bf16(P_lo, mma_B[None, 1], Ai_f32[None, 1])
+
+                # materialize the final fp32 inverse as bf16 for the off-diagonal
+                # substitution / U / W consumers.
+                Ai_bf16.store(Ai_f32.load().to(BFloat16))
 
                 cute.copy(stsm_atom, Ai_bf16, sAi_ldsm[warp_id_, None, warp_id_])
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
