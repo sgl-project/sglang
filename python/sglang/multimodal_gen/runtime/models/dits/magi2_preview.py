@@ -633,7 +633,7 @@ class Magi2SinkAttention(nn.Module):
         world_size = get_ulysses_parallel_world_size()
         if world_size <= 1:
             return 1
-        # Measured on 4x5090 with 6 local heads: 3 groups 17.82 s, 6 groups 18.17 s.
+        # Measured on magi-2-preview with 6 local heads: 3 groups 17.82 s, 6 groups 18.17 s.
         return resolve_pipeline_groups(
             local_heads=self.num_heads // world_size,
             preferred=4,

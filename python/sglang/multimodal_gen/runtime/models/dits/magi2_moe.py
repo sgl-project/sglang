@@ -69,8 +69,8 @@ def resolve_pipeline_groups(
     if requested in (0, 1) or local_heads < 2:
         return 1
     if requested < 0:
-        # Measured on the 896x512 preview: 4x5090 over PCIe 19.98 -> 17.82 s,
-        # 4xH20 over NVLink 24.14 -> 25.31 s; an NVLink exchange is too cheap to hide.
+        # Measured on magi-2-preview: pipelining wins on a PCIe exchange and loses
+        # on an NVLink one, where the exchange is too cheap to hide.
         if group is None or _exchange_group_is_nvlink(group):
             return 1
         groups = preferred

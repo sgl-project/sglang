@@ -75,10 +75,10 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND: str = "auto"
     # head groups for pipelining an exchange against compute: the Ulysses
     # exchange over the copy-engine transport (MiniMax-H3, and USPAttention's
-    # plain path), the collective one for MiniMax-H3 on aiter, and MAGI-2's
+    # plain path), the collective one for MiniMax-H3 on aiter, and magi-2-preview's
     # Ulysses and expert-parallel exchanges.
     # -1 lets each consumer pick its own count and steps aside when the buffers
-    # do not fit; MAGI-2 also keeps the exchange sequential on a fully
+    # do not fit; magi-2-preview also keeps the exchange sequential on a fully
     # NVLink-connected node, where splitting it costs more than it hides.
     # 0 or 1 keeps the sequential exchange; N >= 2 forces N groups
     SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
