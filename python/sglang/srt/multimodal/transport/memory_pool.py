@@ -2,11 +2,13 @@
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -14,6 +16,9 @@ logger = logging.getLogger(__name__)
 CONTROL_WORD_BYTES = 4
 DATA_ALIGNMENT = 256
 DEFAULT_MAX_INFLIGHT_SLICES = 4096
+# Arbitrary; a published slice is normally ready on the first read.
+_READY_POLL_INITIAL_SEC = 0.0005
+_READY_POLL_MAX_SEC = 0.05
 
 
 class InactivePoolLeaseError(RuntimeError):
@@ -62,6 +67,50 @@ def stream_write_value32(
     )
 
 
+def read_value32(device_id: int, address: int, transport_name: str) -> int:
+    """Read one device word without queueing behind the compute stream."""
+    cuda, check_drv = _driver_modules()
+    # Pool streams are non-blocking, so the copy cannot wait on a spinning
+    # compute stream.
+    side_stream = torch.cuda.Stream(device=device_id)
+    host_word = torch.empty(1, dtype=torch.int32, pin_memory=True)
+    check_drv(
+        cuda.cuMemcpyDtoHAsync(
+            host_word.data_ptr(),
+            address,
+            CONTROL_WORD_BYTES,
+            side_stream.cuda_stream,
+        ),
+        f"cuMemcpyDtoHAsync(mm {transport_name})",
+    )
+    side_stream.synchronize()
+    return int(host_word.item())
+
+
+def wait_value32_on_host(
+    *,
+    device_id: int,
+    address: int,
+    value: int,
+    timeout_sec: float,
+    transport_name: str,
+) -> None:
+    """Poll a device word until it reaches value, or raise TimeoutError."""
+    deadline = time.monotonic() + timeout_sec
+    poll_sec = _READY_POLL_INITIAL_SEC
+    # Slot generations only grow, so >= matches cuStreamWaitValue32 GEQ.
+    while read_value32(device_id, address, transport_name) < value:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"{transport_name} multimodal feature was not published within "
+                f"{timeout_sec:.1f}s (expected generation {value}); failing the "
+                "request instead of blocking the scheduler. Raise "
+                "SGLANG_MM_FEATURE_READY_TIMEOUT_SEC if the producer is slow."
+            )
+        time.sleep(poll_sec)
+        poll_sec = min(poll_sec * 2, _READY_POLL_MAX_SEC)
+
+
 def resolve_consumer_rank(
     total_consumer_count: int,
     consumer_rank: Optional[int] = None,
@@ -108,11 +157,40 @@ class StreamOrderedPoolConsumerMixin:
         self.total_consumer_count = total_consumer_count
         self.transport_name = transport_name
         self._consumer_acknowledged = False
+        self._ready_timed_out = False
 
     def _wait_until_ready(self, base_address: int, device_id: int) -> None:
+        ready_address = base_address + self.ready_byte_offset
+        if self._ready_timed_out:
+            # Never acknowledge an unpublished slice: a late producer copy
+            # would overwrite the slice after the pool reuses it.
+            raise TimeoutError(
+                f"{self.transport_name} multimodal feature was never published; "
+                "leaking its pool slice"
+            )
+        try:
+            # cuStreamWaitValue32 has no timeout, so bound the wait on the host
+            # before enqueueing it on the compute stream.
+            wait_value32_on_host(
+                device_id=device_id,
+                address=ready_address,
+                value=self.generation,
+                timeout_sec=envs.SGLANG_MM_FEATURE_READY_TIMEOUT_SEC.get(),
+                transport_name=self.transport_name,
+            )
+        except TimeoutError:
+            self._ready_timed_out = True
+            logger.error(
+                "%s multimodal feature slice (ready offset %d, generation %d) "
+                "was never published; failing its request",
+                self.transport_name,
+                self.ready_byte_offset,
+                self.generation,
+            )
+            raise
         stream_wait_value32(
             device_id,
-            base_address + self.ready_byte_offset,
+            ready_address,
             self.generation,
             self.transport_name,
         )

@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     MultimodalInputs,
@@ -28,7 +29,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=54, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
 
 def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
@@ -112,6 +113,72 @@ class TestCudaIpcTransport(CustomTestCase):
             # consumer exits quickly, so it must close the mapping before the
             # producer destroys the shared allocation.
             del reconstructed, proxy
+            _pool_handle_cache_clear()
+            gc.collect()
+            torch.cuda.ipc_collect()
+            consumer_done.set()
+            producer.join(timeout=60)
+            try:
+                if producer_result is None:
+                    producer_result = producer_results.get(timeout=5)
+                status, payload = producer_result
+                self.assertEqual(status, "ok", payload)
+            finally:
+                if producer.is_alive():
+                    producer.terminate()
+                    producer.join(timeout=10)
+            self.assertEqual(producer.exitcode, 0)
+
+    def test_unpublished_slice_fails_request_instead_of_hanging(self):
+        """A slice whose ready word never reaches its generation must fail the
+        request within the timeout instead of spinning the consumer stream."""
+        ctx = mp.get_context("spawn")
+        proxy_queue = ctx.Queue()
+        producer_results = ctx.Queue()
+        consumer_done = ctx.Event()
+        producer = ctx.Process(
+            target=_produce_pooled_tensor,
+            args=(proxy_queue, consumer_done, producer_results),
+        )
+        producer.start()
+        proxy = None
+        producer_result = None
+        try:
+            try:
+                proxy, _expected = proxy_queue.get(timeout=60)
+            except queue.Empty:
+                producer_result = producer_results.get(timeout=5)
+                _status, payload = producer_result
+                self.fail(
+                    f"CUDA IPC producer failed before sending its proxy: {payload}"
+                )
+
+            published_generation = proxy.generation
+            proxy.generation = published_generation + 1
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=1,
+                pad_value=1,
+                feature=proxy,
+            )
+            output = MultimodalProcessorOutput(input_ids=[1], mm_items=[item])
+            with (
+                envs.SGLANG_MM_FEATURE_READY_TIMEOUT_SEC.override(0.5),
+                self.assertRaisesRegex(TimeoutError, "not published"),
+            ):
+                MultimodalInputs.from_processor_output(output)
+
+            # Hangs if an unbounded stream wait was enqueued.
+            torch.cuda.synchronize()
+            self.assertFalse(proxy._consumer_acknowledged)
+
+            # Release the real lease so the producer tears down cleanly.
+            proxy.generation = published_generation
+            proxy._ready_timed_out = False
+            proxy.acknowledge_consumption()
+            torch.cuda.synchronize()
+        finally:
+            del proxy
             _pool_handle_cache_clear()
             gc.collect()
             torch.cuda.ipc_collect()
