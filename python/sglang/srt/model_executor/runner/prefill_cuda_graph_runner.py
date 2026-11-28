@@ -41,12 +41,14 @@ import copy
 import dataclasses
 import inspect
 import logging
+import sys
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
+import msgspec
 import torch
 import tqdm
 
@@ -165,10 +167,12 @@ from sglang.srt.model_executor.runner_utils.shared_read_event import (
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
+    get_context,
     get_exec,
     get_flags,
     get_memory,
     get_parallel,
+    get_platform,
     get_schedule,
 )
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
@@ -194,6 +198,243 @@ _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
 # Prefix attention adds one loop body per chunk to the captured topology, so
 # capture a small geometric set and round each replay up to the nearest one.
 _CHUNKED_PREFIX_VARIANTS = (1, 2, 4, 8, 16)
+
+
+def _uses_gdn_linear_attention(attn_backend: Any) -> bool:
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+    from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+    return isinstance(attn_backend, GDNAttnBackend) or (
+        isinstance(attn_backend, HybridLinearAttnBackend)
+        and isinstance(attn_backend.linear_attn_backend, GDNAttnBackend)
+    )
+
+
+class _GdnPrefillNormLayout(msgspec.Struct, frozen=True):
+    rows_per_token: int
+    width: int
+    dtype: torch.dtype
+    device: torch.device
+    activation: str
+    fused: bool
+
+    def row_tile(self, num_tokens: int) -> int:
+        rows = num_tokens * self.rows_per_token
+        if self.fused:
+            from sglang.kernels.ops.attention.fla.fused_norm_gate import (
+                layer_norm_gated_launch_config,
+            )
+
+            return layer_norm_gated_launch_config(
+                rows,
+                self.width,
+                self.dtype,
+                is_rms_norm=True,
+                activation=self.activation,
+            )[0]
+        from sglang.kernels.ops.attention.fla.layernorm_gated import calc_rows_per_block
+
+        return calc_rows_per_block(rows, self.device)
+
+
+def _gdn_prefill_norm_layouts(
+    model_runner: ModelRunner,
+) -> Optional[tuple[_GdnPrefillNormLayout, ...]]:
+    if not is_cuda() or not _uses_gdn_linear_attention(model_runner.attn_backend):
+        return ()
+    from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+    from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
+    from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+    from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
+
+    layouts = set()
+    for module in _resolve_transformer_layer_model(model_runner.model).modules():
+        if isinstance(module, (Qwen3_5GatedDeltaNet, Qwen3GatedDeltaNet)):
+            norm = module.norm
+            if type(norm) not in (RMSNorm, FusedRMSNormGated):
+                return None
+            layouts.add(
+                _GdnPrefillNormLayout(
+                    rows_per_token=module.num_v_heads // module.attn_tp_size,
+                    width=module.head_v_dim,
+                    dtype=module.in_proj_qkvz.params_dtype,
+                    device=norm.weight.device,
+                    activation=norm.activation,
+                    fused=type(norm) is FusedRMSNormGated,
+                )
+            )
+    return tuple(layouts)
+
+
+def _deterministic_inference_enabled() -> bool:
+    return (
+        get_context().is_config_namespace_published("exec")
+        and get_exec().deterministic.enable_deterministic_inference
+    )
+
+
+def _gdn_projection_is_m_invariant(projection: torch.nn.Module) -> bool:
+    """Qualify the selected loaded method, not a checkpoint's precision label."""
+    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        ModelOptFp4LinearMethod,
+        ModelOptFp8LinearMethod,
+    )
+
+    method = projection.quant_method
+    if projection.bias is not None:
+        return False
+    if type(method) is ModelOptFp8LinearMethod:
+        if (
+            method.use_marlin
+            or projection.input_scale is None
+            or projection.weight.dtype != torch.float8_e4m3fn
+        ):
+            return False
+        if method.use_sm120_fp8:
+            # The normal SM12x facade/BMM is M-dependent. Main's existing
+            # deterministic implementation has a fixed reduction schedule.
+            return _deterministic_inference_enabled()
+        return get_platform().is_sm100 and projection.use_flashinfer_bmm
+    if type(method) is ModelOptFp4LinearMethod:
+        return (
+            get_platform().is_sm100
+            and method.quant_mode == "w4a4"
+            and get_fp4_gemm_runner_backend().is_flashinfer()
+            and projection.weight.dtype == torch.uint8
+        )
+    return False
+
+
+def _layer_model_requires_exact_gdn_prefill_bucket(
+    layer_model: torch.nn.Module,
+    *,
+    has_external_body: bool = False,
+) -> bool:
+    if not is_cuda():
+        return False
+    if (
+        get_flags().sp.enabled
+        or has_external_body
+        or external_prefill_body(layer_model) is not None
+    ):
+        # Loaded Python projection methods do not describe an external body.
+        return True
+
+    from sglang.srt.layers.linear import LinearBase, MergedColumnParallelLinear
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+    from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+    from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
+
+    skipped = set()
+    found_gdn = False
+    for module in layer_model.modules():
+        if isinstance(module, (Qwen3_5GatedDeltaNet, Qwen3GatedDeltaNet)):
+            found_gdn = True
+            # conv1d stores a convolution weight in a LinearBase wrapper.
+            skipped.add(module.conv1d)
+            ba = module.in_proj_ba
+            if (
+                type(ba) is MergedColumnParallelLinear
+                and isinstance(ba.quant_method, UnquantizedLinearMethod)
+                and ba.params_dtype == torch.bfloat16
+                and ba.weight.dtype == torch.bfloat16
+                and ba.bias is None
+                and not ba.gather_output
+            ):
+                # _forward_ba_proj uses the persistent, row-invariant matmul.
+                skipped.add(ba)
+        if (
+            isinstance(module, LinearBase)
+            and module not in skipped
+            and not _gdn_projection_is_m_invariant(module)
+        ):
+            return True
+    # Includes MHA and FFN projections, but not the eager LM head or vision tower.
+    return not found_gdn
+
+
+def _requires_exact_gdn_prefill_bucket(model_runner: ModelRunner) -> bool:
+    if not is_cuda() or not _uses_gdn_linear_attention(model_runner.attn_backend):
+        return False
+    layer_model = _resolve_transformer_layer_model(model_runner.model)
+    return _layer_model_requires_exact_gdn_prefill_bucket(
+        layer_model,
+        has_external_body=external_prefill_body(model_runner.model) is not None,
+    )
+
+
+def _loaded_gdn_module_types() -> tuple[type[torch.nn.Module], ...]:
+    types = []
+    for mod_name, cls_name in (
+        ("sglang.srt.models.qwen3_5", "Qwen3_5GatedDeltaNet"),
+        ("sglang.srt.models.qwen3_next", "Qwen3GatedDeltaNet"),
+    ):
+        mod = sys.modules.get(mod_name)
+        cls = getattr(mod, cls_name, None) if mod is not None else None
+        if isinstance(cls, type):
+            types.append(cls)
+    return tuple(types)
+
+
+def _stamp_gdn_prefill_max_tokens(
+    gdn_modules: Sequence[torch.nn.Module], max_tokens: Optional[int]
+) -> None:
+    for module in gdn_modules:
+        module._gdn_prefill_max_tokens = max_tokens
+        module.in_proj_ba._gdn_prefill_max_tokens = max_tokens
+
+
+def configure_gdn_prefill_model(
+    model: torch.nn.Module,
+    *,
+    attn_backend: Any = None,
+) -> Optional[int]:
+    """Synchronize per-module prefill invariance with the loaded bucket policy."""
+    if not isinstance(model, torch.nn.Module):
+        return 0
+    gdn_types = _loaded_gdn_module_types()
+    if not gdn_types:
+        return 0
+    try:
+        layer_model = _resolve_transformer_layer_model(model)
+    except RuntimeError:
+        layer_model = model
+    gdn_modules = [m for m in layer_model.modules() if isinstance(m, gdn_types)]
+    if not gdn_modules:
+        return 0
+    has_external = (
+        external_prefill_body(model) is not None
+        or external_prefill_body(layer_model) is not None
+    )
+    if not is_cuda() or (
+        attn_backend is not None and not _uses_gdn_linear_attention(attn_backend)
+    ):
+        max_tokens: Optional[int] = 0
+    elif has_external or get_flags().sp.enabled:
+        max_tokens = 0
+    elif _deterministic_inference_enabled():
+        max_tokens = None
+    elif _layer_model_requires_exact_gdn_prefill_bucket(
+        layer_model, has_external_body=has_external
+    ):
+        max_tokens = 0
+    else:
+        from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+        from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
+
+        max_tokens = (
+            None
+            if all(
+                type(module.norm) in (RMSNorm, FusedRMSNormGated)
+                for module in gdn_modules
+            )
+            else 0
+        )
+    _stamp_gdn_prefill_max_tokens(gdn_modules, max_tokens)
+    return max_tokens
 
 
 def get_prefill_num_tokens_to_capture(capture_tokens: Sequence[int]) -> list[int]:
@@ -240,6 +481,13 @@ def set_external_prefill_body(model: torch.nn.Module, body: Any) -> None:
     """Mark the transformer body prefill graphs capture as a kernel plugin's
     (spec.SupportsPrefillBody), which reads the pools inside the graph."""
     model.__dict__["_external_prefill_body"] = body
+    try:
+        layer_model = _resolve_transformer_layer_model(model)
+    except RuntimeError:
+        layer_model = None
+    if layer_model is not None:
+        layer_model.__dict__["_external_prefill_body"] = body
+    configure_gdn_prefill_model(model)
 
 
 def external_prefill_body(model: torch.nn.Module) -> Optional[Any]:
@@ -349,7 +597,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _dcp_extend_active = False
     _kimi_k31_rocm_bcg = False
     _is_breakable_backend = False
+    _requires_exact_prefill_bucket: bool = False
+    _gdn_norm_layouts: tuple[_GdnPrefillNormLayout, ...] = ()
     dllm_attention = None
+
+    def _init_gdn_prefill_policy(self, model_runner: ModelRunner) -> None:
+        self._requires_exact_prefill_bucket = _requires_exact_gdn_prefill_bucket(
+            model_runner
+        )
+        self._gdn_norm_layouts = ()
+        if not self._requires_exact_prefill_bucket:
+            layouts = _gdn_prefill_norm_layouts(model_runner)
+            if layouts is None:
+                self._requires_exact_prefill_bucket = True
+            else:
+                self._gdn_norm_layouts = layouts
+        model = getattr(model_runner, "model", None)
+        if isinstance(model, torch.nn.Module):
+            configure_gdn_prefill_model(
+                model, attn_backend=getattr(model_runner, "attn_backend", None)
+            )
 
     @property
     def _attn_backend_is_dsa(self) -> bool:
@@ -414,6 +681,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 False,
             )
         )
+        self._init_gdn_prefill_policy(model_runner)
         # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
         capture_tokens = prefill_config.bs
@@ -1558,15 +1826,42 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return True
         if num_tokens > self.max_num_tokens:
             return False
-        # No exact-shape check: load_batch bucket-pads; only reject
-        # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        if padded_num_tokens != num_tokens:
+            if self._requires_exact_prefill_bucket:
+                return False
+            if any(
+                layout.row_tile(num_tokens) != layout.row_tile(padded_num_tokens)
+                for layout in self._gdn_norm_layouts
+            ):
+                return False
         is_below_minimum_capture = 0 < num_tokens < self.capture_num_tokens[0]
         if (
             not is_below_minimum_capture
             and padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR
         ):
             return False
+        return True
+
+    def can_replay_dp_tokens(self, global_num_tokens: Sequence[int]) -> bool:
+        """Check gathered DP rank counts against their shared replay bucket."""
+        if not global_num_tokens:
+            return False
+        max_tokens = max(int(n) for n in global_num_tokens)
+        if max_tokens <= 0 or max_tokens > self.max_num_tokens:
+            return False
+        common_bucket = self._pad_to_bucket(max_tokens, self.capture_num_tokens)
+        for raw in global_num_tokens:
+            num_tokens = int(raw)
+            if num_tokens <= 0 or num_tokens == common_bucket:
+                continue
+            if self._requires_exact_prefill_bucket:
+                return False
+            if any(
+                layout.row_tile(num_tokens) != layout.row_tile(common_bucket)
+                for layout in self._gdn_norm_layouts
+            ):
+                return False
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -1581,6 +1876,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Every dp rank must hold tokens this forward (reads the synced
         # table post dp-padding; idle ranks vote permissively upstream).
         if self._has_inactive_dp_rank(forward_batch):
+            return False
+
+        raw_dp_tokens = (
+            getattr(forward_batch, "original_global_num_tokens_cpu", None)
+            or forward_batch.global_num_tokens_cpu
+        )
+        if (
+            raw_dp_tokens is not None
+            and len(raw_dp_tokens) > 1
+            and not prefill_graph_tolerates_sum_len()
+            and not self.can_replay_dp_tokens(raw_dp_tokens)
+        ):
             return False
 
         # A batch can be too small to activate CP. Its unsharded inputs must

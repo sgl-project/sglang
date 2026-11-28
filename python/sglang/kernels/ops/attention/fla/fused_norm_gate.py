@@ -197,6 +197,31 @@ def layer_norm_gated_fwd_kernel1(
     tl.store(y + o_d, b_y, mask=m_d)
 
 
+def layer_norm_gated_launch_config(
+    rows: int,
+    width: int,
+    dtype: torch.dtype,
+    *,
+    is_rms_norm: bool,
+    activation: str,
+) -> tuple[int, bool]:
+    """Return the row tile and PDL flag used by the existing norm kernels."""
+    if width > 512:
+        return 1, False
+    use_pdl = is_arch_support_pdl()
+    use_bt8 = (
+        8 <= rows <= 256 if is_rms_norm and activation == "sigmoid" else rows == 64
+    )
+    if (
+        use_pdl
+        and use_bt8
+        and (width, dtype) == (128, torch.bfloat16)
+        and current_arch().is_sm(10, 3)
+    ):
+        return 8, use_pdl
+    return 32, use_pdl
+
+
 def layer_norm_gated_fwd(
     x: torch.Tensor,
     g: torch.Tensor,
@@ -241,14 +266,9 @@ def layer_norm_gated_fwd(
     # heuristics for number of warps
 
     if D <= 512:
-        use_pdl = is_arch_support_pdl()
-        BT = 32
-        use_bt8 = 8 <= T <= 256 if is_rms_norm and activation == "sigmoid" else T == 64
-        if use_pdl and use_bt8 and (D, x.dtype) == (128, torch.bfloat16):
-            if current_arch().is_sm(10, 3):
-                # Small sigmoid-gated RMSNorm batches use eight rows per CTA.
-                # Other norm modes retain their T=64 selection.
-                BT = 8
+        BT, use_pdl = layer_norm_gated_launch_config(
+            T, D, x.dtype, is_rms_norm=is_rms_norm, activation=activation
+        )
         pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if use_pdl else {}
         layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](
             x=x,

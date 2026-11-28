@@ -93,6 +93,38 @@ python -m sglang.launch_server \
     --cuda-graph-backend-decode breakable
 ```
 
+### Gated-DeltaNet Prefill Buckets
+
+For CUDA Gated-DeltaNet (GDN) models, prefill graph eligibility is determined
+from the loaded projection methods, not the checkpoint's quantization label.
+On SM100/SM103, padded replay remains enabled when the transformer's remaining
+linear projections use the supported static ModelOpt FP8 FlashInfer BMM or
+ModelOpt NVFP4 W4A4 FlashInfer paths. The BF16 `in_proj_ba` is exempt only when
+it uses the batch-invariant prefill matmul; the convolution weight is not a GEMM.
+
+If a remaining projection (including `in_proj_qkvz`, `out_proj`, attention or
+MLP projections) stays BF16 or selects an unqualified kernel, replay requires
+an exact captured token count, and `in_proj_ba` keeps its native linear path
+instead of switching to the persistent batch-invariant matmul. SM12x's normal
+FP8 facade/BMM (including SM120 and SM121/GB10) is also M-dependent; only its
+already-selected deterministic FP8 implementation can qualify without changing
+the GEMM. Unknown external prefill bodies cannot be certified from the model's
+Python projection methods.
+
+Qualified projections are not sufficient if padding changes a gated norm's
+row tile. Replay also compares the existing norm launch selectors for the real
+and captured sizes; it does not change either norm kernel or its tiling policy.
+Stable-layout padding remains enabled, while crossing a row-tile boundary runs
+eagerly. Existing batch-invariant/TC-piecewise norm settings are respected.
+
+For example, with buckets `[16, 20]`, a model with an M-dependent projection
+can replay 20-token extends but runs 17-token extends eagerly.
+
+`--enable-mixed-chunk` does not override this numerical check, even for batches
+containing only prefill requests. Non-GDN models and non-CUDA backends retain
+their existing eligibility rules. Exact-bucket fallbacks trade graph coverage
+for avoiding additional projection drift in logits and cached recurrent states.
+
 ### Server Args
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
