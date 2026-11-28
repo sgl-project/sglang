@@ -263,6 +263,30 @@ class _PendingWeightHalves:
     )
 
 
+def get_pending_weight_halves(module: object) -> _PendingWeightHalves:
+    """Return the pending fused-weight buffer on ``module``, creating it lazily."""
+    if not hasattr(module, "_pending_weight_halves"):
+        module._pending_weight_halves = _PendingWeightHalves()
+    return module._pending_weight_halves
+
+
+def discard_pending_weight_halves(module: object) -> List[str]:
+    """Drop the halves still waiting for their counterpart on ``module`` and
+    return their sorted checkpoint names."""
+    halves = get_pending_weight_halves(module)
+    module._pending_weight_halves = _PendingWeightHalves()
+    return sorted(
+        [
+            *halves.qkv_a_proj,
+            *(
+                f"{module_name}.{suffix}"
+                for module_name, entry in halves.indexer_wk_weights_proj.items()
+                for suffix in entry
+            ),
+        ]
+    )
+
+
 @dataclass(frozen=True)
 class NextNEnabledConfig:
     num_nextn_layers: int
@@ -616,25 +640,12 @@ class DeepseekV2WeightLoaderMixin:
 
     def _get_pending_weight_halves(self) -> _PendingWeightHalves:
         # The mixin has no __init__ of its own, so the first load creates it.
-        if not hasattr(self, "_pending_weight_halves"):
-            self._pending_weight_halves = _PendingWeightHalves()
-        return self._pending_weight_halves
+        return get_pending_weight_halves(self)
 
     def discard_pending_weight_halves(self) -> List[str]:
         """Drop the halves still waiting for their pair and return their names.
         A weight update calls it before it loads, and when its session ends."""
-        halves = self._get_pending_weight_halves()
-        self._pending_weight_halves = _PendingWeightHalves()
-        return sorted(
-            [
-                *halves.qkv_a_proj,
-                *(
-                    f"{module_name}.{suffix}"
-                    for module_name, entry in halves.indexer_wk_weights_proj.items()
-                    for suffix in entry
-                ),
-            ]
-        )
+        return discard_pending_weight_halves(self)
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """

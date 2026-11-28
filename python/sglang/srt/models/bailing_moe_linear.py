@@ -61,6 +61,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bailing_moe import BailingMoEGate
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    discard_pending_weight_halves,
+    get_pending_weight_halves,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, bind_or_assign
 from sglang.srt.runtime_context import (
@@ -1326,7 +1330,9 @@ class BailingMoELinearForCausalLM(nn.Module):
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
+        pending_qkv_a_proj = (
+            get_pending_weight_halves(self).qkv_a_proj if fuse_qkv_a_proj else None
+        )
 
         for name, loaded_weight in weights:
             if name.startswith("model.mtp"):
@@ -1410,28 +1416,41 @@ class BailingMoELinearForCausalLM(nn.Module):
                     if "slope" in name:
                         continue
 
-                    if fuse_qkv_a_proj and (
-                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                    if (
+                        fuse_qkv_a_proj
+                        and name not in params_dict
+                        and (".q_a_proj." in name or ".kv_a_proj_with_mqa." in name)
                     ):
-                        cached_a_proj[name] = loaded_weight
+                        param_name = (
+                            name.replace(".q_a_proj.", ".fused_qkv_a_proj_with_mqa.")
+                            if ".q_a_proj." in name
+                            else name.replace(
+                                ".kv_a_proj_with_mqa.",
+                                ".fused_qkv_a_proj_with_mqa.",
+                            )
+                        )
+                        if param_name not in params_dict:
+                            continue
+                        # The caller may reuse its buffer while the half waits.
+                        pending_qkv_a_proj[name] = loaded_weight.clone()
                         q_a_proj_name = (
                             name
-                            if "q_a_proj" in name
-                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                            if ".q_a_proj." in name
+                            else name.replace(".kv_a_proj_with_mqa.", ".q_a_proj.")
                         )
                         kv_a_proj_name = (
                             name
-                            if "kv_a_proj_with_mqa" in name
-                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                            if ".kv_a_proj_with_mqa." in name
+                            else name.replace(".q_a_proj.", ".kv_a_proj_with_mqa.")
                         )
 
-                        # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
+                        # When both q_a_proj and kv_a_proj_with_mqa have been cached, load the fused weight to parameter
                         if (
-                            q_a_proj_name in cached_a_proj
-                            and kv_a_proj_name in cached_a_proj
+                            q_a_proj_name in pending_qkv_a_proj
+                            and kv_a_proj_name in pending_qkv_a_proj
                         ):
-                            q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                            q_a_proj_weight = pending_qkv_a_proj[q_a_proj_name]
+                            kv_a_proj_weight = pending_qkv_a_proj[kv_a_proj_name]
                             cat_dim = 0
                             if self.quant_config is not None and (
                                 self.quant_config.get_name() == "awq"
@@ -1442,24 +1461,14 @@ class BailingMoELinearForCausalLM(nn.Module):
                             fused_weight = torch.cat(
                                 [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
                             )
-                            param_name = (
-                                name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
-                                if "q_a_proj" in name
-                                else name.replace(
-                                    "kv_a_proj_with_mqa",
-                                    "fused_qkv_a_proj_with_mqa",
-                                )
-                            )
-                            if param_name not in params_dict:
-                                continue
                             param = params_dict[param_name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
 
                             weight_loader(param, fused_weight)
-                            cached_a_proj.pop(q_a_proj_name)
-                            cached_a_proj.pop(kv_a_proj_name)
+                            pending_qkv_a_proj.pop(q_a_proj_name)
+                            pending_qkv_a_proj.pop(kv_a_proj_name)
                     else:
                         if name not in params_dict:
                             name = name.replace(".dense.", ".o_proj.")
@@ -1483,6 +1492,10 @@ class BailingMoELinearForCausalLM(nn.Module):
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
         return loaded_params
+
+    def discard_pending_weight_halves(self) -> list[str]:
+        """Drop fused halves waiting for their pair and return their names."""
+        return discard_pending_weight_halves(self)
 
 
 class BailingMoeV2_5ForCausalLM(BailingMoELinearForCausalLM):

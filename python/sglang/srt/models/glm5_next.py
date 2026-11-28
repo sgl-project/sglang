@@ -99,6 +99,8 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
+    discard_pending_weight_halves,
+    get_pending_weight_halves,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
@@ -1909,7 +1911,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             ]
 
         fuse_qkv_a_proj = getattr(self, "fuse_qkv_a_proj", False)
-        cached_a_proj: dict[str, torch.Tensor] = {} if fuse_qkv_a_proj else None
+        pending_qkv_a_proj = (
+            get_pending_weight_halves(self).qkv_a_proj if fuse_qkv_a_proj else None
+        )
         qc = self.quant_config
         if qc is not None and qc.get_name() in {"awq", "awq_marlin", "moe_wna16"}:
             fused_cat_dim = 1
@@ -2039,48 +2043,52 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     if name.endswith(".bias") and name not in params_dict:
                         continue
 
-                    if fuse_qkv_a_proj and (
-                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                    if (
+                        fuse_qkv_a_proj
+                        and maybe_map_fp8_block_scale_name(name) not in params_dict
+                        and (".q_a_proj." in name or ".kv_a_proj_with_mqa." in name)
                     ):
-                        cached_a_proj[name] = loaded_weight
+                        target = (
+                            name.replace(".q_a_proj.", ".fused_qkv_a_proj_with_mqa.")
+                            if ".q_a_proj." in name
+                            else name.replace(
+                                ".kv_a_proj_with_mqa.",
+                                ".fused_qkv_a_proj_with_mqa.",
+                            )
+                        )
+                        target = maybe_map_fp8_block_scale_name(target)
+                        if target not in params_dict:
+                            continue
+                        # The caller may reuse its buffer while the half waits.
+                        pending_qkv_a_proj[name] = loaded_weight.clone()
                         q_a_proj_name = (
                             name
-                            if "q_a_proj" in name
-                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                            if ".q_a_proj." in name
+                            else name.replace(".kv_a_proj_with_mqa.", ".q_a_proj.")
                         )
                         kv_a_proj_name = (
                             name
-                            if "kv_a_proj_with_mqa" in name
-                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                            if ".kv_a_proj_with_mqa." in name
+                            else name.replace(".q_a_proj.", ".kv_a_proj_with_mqa.")
                         )
                         if (
-                            q_a_proj_name in cached_a_proj
-                            and kv_a_proj_name in cached_a_proj
+                            q_a_proj_name in pending_qkv_a_proj
+                            and kv_a_proj_name in pending_qkv_a_proj
                         ):
                             fused_weight = torch.cat(
                                 [
-                                    cached_a_proj[q_a_proj_name],
-                                    cached_a_proj[kv_a_proj_name],
+                                    pending_qkv_a_proj[q_a_proj_name],
+                                    pending_qkv_a_proj[kv_a_proj_name],
                                 ],
                                 dim=fused_cat_dim,
                             )
-                            target = (
-                                name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
-                                if "q_a_proj" in name
-                                else name.replace(
-                                    "kv_a_proj_with_mqa",
-                                    "fused_qkv_a_proj_with_mqa",
-                                )
+                            param = params_dict[target]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
                             )
-                            target = maybe_map_fp8_block_scale_name(target)
-                            if target in params_dict:
-                                param = params_dict[target]
-                                weight_loader = getattr(
-                                    param, "weight_loader", default_weight_loader
-                                )
-                                weight_loader(param, fused_weight)
-                            cached_a_proj.pop(q_a_proj_name, None)
-                            cached_a_proj.pop(kv_a_proj_name, None)
+                            weight_loader(param, fused_weight)
+                            pending_qkv_a_proj.pop(q_a_proj_name, None)
+                            pending_qkv_a_proj.pop(kv_a_proj_name, None)
                         continue
 
                     name = maybe_map_fp8_block_scale_name(name)
@@ -2111,6 +2119,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
             )
+
+    def discard_pending_weight_halves(self) -> List[str]:
+        """Drop fused halves waiting for their pair and return their names."""
+        return discard_pending_weight_halves(self)
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
         if self.encoder_only:

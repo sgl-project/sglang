@@ -51,6 +51,9 @@ from sglang.srt.models.bailing_moe_v3 import (
 from sglang.srt.models.bailing_moe_v3 import (
     BailingMoeV3ForCausalLM,
 )
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    discard_pending_weight_halves,
+)
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator
@@ -291,6 +294,10 @@ class BailingMoeForCausalLMNextN(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         self.base_load_weights_func(self, weights, is_nextn=True)
+
+    def discard_pending_weight_halves(self) -> list[str]:
+        """Drop fused halves waiting for their pair and return their names."""
+        return discard_pending_weight_halves(self)
 
     def post_load_weights(self, is_nextn=True, weight_names=None):
         # `is_nextn` is pinned to True for the NextN subclass; the parameter is kept
