@@ -2268,6 +2268,11 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_qlen,
                 actual_seq_lengths_kv,
             )
+            logical_rows = getattr(self.forward_metadata, "cp_query_num_tokens", None)
+            if logical_rows is not None:
+                # All-masked physical PCP rows can produce NaNs. They must
+                # not reach the output projection or subsequent reductions.
+                attn_out[logical_rows:].zero_()
         else:
             # extend_kv is set by the model only for a DCP extend that gathered the KV.
             dcp_metadata = forward_batch.attn_dcp_metadata

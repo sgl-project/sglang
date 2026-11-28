@@ -117,6 +117,51 @@ class TestLoadsResponse(CustomTestCase):
         self.assertEqual(response["loads"][0]["num_waiting_reqs"], 2)
 
 
+class TestLoadsStoragePrefetchCounters(CustomTestCase):
+    def test_response_carries_both_storage_prefetch_counters(self):
+        manager = _FakeHttpTokenizerManager(
+            [
+                LoadSnapshot(
+                    dp_rank=0,
+                    total_storage_prefetch_hit_tokens=500,
+                    total_storage_prefetch_unfulfilled_tokens={
+                        "storage_transfer": 20,
+                        "device_covered": 3,
+                    },
+                ),
+                LoadSnapshot(dp_rank=1),
+            ],
+            dp_size=2,
+        )
+        self.addCleanup(manager.restore)
+        loads = asyncio.run(get_loads(tokenizer_manager=manager))["loads"]
+        self.assertEqual(loads[0]["total_storage_prefetch_hit_tokens"], 500)
+        self.assertEqual(
+            loads[0]["total_storage_prefetch_unfulfilled_tokens"],
+            {"storage_transfer": 20, "device_covered": 3},
+        )
+        # Without storage metrics a rank reports neither counter.
+        self.assertIsNone(loads[1]["total_storage_prefetch_hit_tokens"])
+        self.assertIsNone(loads[1]["total_storage_prefetch_unfulfilled_tokens"])
+
+    def test_counters_survive_the_msgpack_slot(self):
+        snapshot = LoadSnapshot(
+            dp_rank=0,
+            total_storage_prefetch_hit_tokens=7,
+            total_storage_prefetch_unfulfilled_tokens={"storage_transfer": 1},
+        )
+        decoded = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(snapshot), type=LoadSnapshot
+        )
+        self.assertEqual(decoded, snapshot)
+        self.assertEqual(
+            msgspec.msgpack.decode(
+                msgspec.msgpack.encode(LoadSnapshot()), type=LoadSnapshot
+            ).total_storage_prefetch_unfulfilled_tokens,
+            None,
+        )
+
+
 class TestLoadsAcceleratorField(CustomTestCase):
     def test_accelerator_metadata_reported_in_json(self):
         """Guards the response contract: the JSON envelope carries an

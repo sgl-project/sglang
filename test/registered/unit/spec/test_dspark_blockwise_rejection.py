@@ -10,6 +10,8 @@ import pytest
 import torch
 
 from sglang.kernels.ops.speculative.dspark import blockwise_rejection as bwr
+from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components import dspark_verify
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -217,6 +219,10 @@ def test_routes_to_blockwise_only_with_noise(monkeypatch):
             target_logits=torch.zeros(3, 8),
             draft_block=block,
             sampling_info=info,
+            route=VerifyRoute(
+                adjusts_logits=False,
+                need_truncated_sampling=need_truncated_sampling(info),
+            ),
             draft_input=None,
             gamma=2,
             verify_num_draft_tokens=3,

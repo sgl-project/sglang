@@ -50,7 +50,7 @@ class _VisionTower(nn.Module):
         self.use_data_parallel = True
         self.deepstack_visual_indexes = []
         self.deepstack_merger_list = None
-        self.max_context_len = None
+        self.max_position_embeddings = None
         self.register_buffer("anchor", torch.empty(0, device="cuda"))
 
     @property

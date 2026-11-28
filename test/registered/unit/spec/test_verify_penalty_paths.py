@@ -7,6 +7,7 @@ import torch
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -56,6 +57,16 @@ def _row_counts(logits, tokens):
     return (-logits[:, tokens]).round().long().tolist()
 
 
+def _verify(batch, grammar_mask=None):
+    return VerifyStep(
+        batch=batch,
+        route=VerifyRoute(adjusts_logits=True, need_truncated_sampling=False),
+        watermark=None,
+        watermark_full_mask=True,
+        grammar_mask=grammar_mask,
+    )
+
+
 class TestVerifyPenaltyPaths(CustomTestCase):
     def test_eagle_sample_feeds_the_draft_tree(self):
         # Root 0 has children 1 and 2; node 3 is a child of 1.
@@ -84,7 +95,7 @@ class TestVerifyPenaltyPaths(CustomTestCase):
 
         with patch.object(step, "apply_verify", side_effect=apply_then_stop):
             with self.assertRaises(_Stop):
-                eagle_utils.eagle_sample(verify_input, batch, logits_output)
+                eagle_utils.eagle_sample(verify_input, _verify(batch), logits_output)
 
         self.assertEqual(
             _row_counts(logits_output.next_token_logits, [5, 6, 9]),
@@ -143,11 +154,7 @@ class TestVerifyPenaltyPaths(CustomTestCase):
         )
         with self.assertRaises(_Stop):
             eagle_utils.eagle_sample(
-                verify_input,
-                batch,
-                logits_output,
-                grammar_mask,
-                has_custom_logit_processor=True,
+                verify_input, _verify(batch, grammar_mask), logits_output
             )
         self.assertEqual(len(seen), 1)
         self.assertTrue(torch.equal(seen[0][0], expected[width:]))

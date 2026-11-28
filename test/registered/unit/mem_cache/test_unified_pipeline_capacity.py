@@ -60,6 +60,7 @@ def worker(rank, path):
             pp_size=2, pp_rank=rank, world_group=NS(cpu_group=dist.group.WORLD)
         ),
         get_schedule().override(
+            page_size=4,
             max_running_requests=128,
             mamba_full_memory_ratio=1 / 9,
             disable_overlap_schedule=False,
