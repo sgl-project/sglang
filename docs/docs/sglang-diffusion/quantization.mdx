@@ -413,6 +413,11 @@ weights and per-row scales, so the choice is made per layer at load time:
   rotate and quantize it once, and the Qwen-Image FFN down-projection folds its
   GELU(tanh) into the rotate kernel; both are bitwise identical to the
   per-linear ops.
+  On SM120, the MiniMax-H3 BF16 MLP also fuses its gate/up projection and
+  SwiGLU activation with TMA loads. It uses the existing planar INT8 weights
+  and preserves the projection, SiLU and product rounding. This path applies
+  to plain JIT linears; LoRA wrappers, deferred bias and communication paths
+  retain their existing execution.
 - `comfy_kitchen`: `comfy_kitchen.int8_linear` from the optional
   `comfy-kitchen` package (`pip install comfy-kitchen`). Turing and later
   (SM75); group size 16, 64 or 256.

@@ -34,6 +34,7 @@ from sglang.kernels.ops.gemm.convrot_int8 import (
     convrot_int8_linear_prequant,
     convrot_int8_local_capability,
     convrot_int8_supported_capabilities,
+    convrot_int8_swiglu,
     convrot_rotate_quantize_activation,
     load_convrot_int8_module,
 )
@@ -60,7 +61,9 @@ __all__ = [
     "apply_convrot_int8_gelu_input",
     "apply_convrot_int8_shared_input",
     "apply_convrot_int8_shared_input_out",
+    "apply_convrot_int8_swiglu_output",
     "convrot_int8_fuses_gelu_input",
+    "convrot_int8_fuses_swiglu_output",
     "convrot_int8_shares_input",
     "jit_convrot_available",
     "jit_convrot_unavailable_reason",
@@ -378,5 +381,28 @@ def apply_convrot_int8_gelu_input(layer: LinearBase, x: torch.Tensor) -> torch.T
         layer.bias,
         layer.quant_method.group_size,
         gelu_input=True,
+    )
+    return _like_input(out=out, x=x)
+
+
+def convrot_int8_fuses_swiglu_output(layer: torch.nn.Module) -> bool:
+    return (
+        _is_jit_int8(layer)
+        and _forward_is_plain_apply(layer)
+        and convrot_int8_local_capability() == (12, 0)
+    )
+
+
+def apply_convrot_int8_swiglu_output(
+    layer: LinearBase, x: torch.Tensor
+) -> torch.Tensor:
+    if x.dtype != torch.bfloat16:
+        raise ValueError("SwiGLU output fusion requires BF16 activations")
+    out = convrot_int8_swiglu(
+        _as_rows(x),
+        layer.weight,
+        layer.weight_scale,
+        layer.bias,
+        layer.quant_method.group_size,
     )
     return _like_input(out=out, x=x)
