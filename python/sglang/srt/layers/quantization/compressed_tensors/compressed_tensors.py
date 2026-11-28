@@ -1290,6 +1290,26 @@ class CompressedTensorsConfig(QuantizationConfig):
             layer=layer, layer_name=layer_name, matched_target=matched_target
         )
 
+    # Calibration-only QuantizationArgs fields; the loader never reads them.
+    _CALIBRATION_ONLY_ARGS = frozenset({"observer", "observer_kwargs"})
+
+    # What the loader builds for a target: the group format with its top-level
+    # fallback resolved, and the args without calibration-only fields.
+    def _loaded_scheme_key(self, target: str) -> tuple:
+        scheme = self.target_scheme_map[target]
+
+        def args_key(args: Optional[QuantizationArgs]):
+            if args is None:
+                return None
+            return args.model_dump(exclude=self._CALIBRATION_ONLY_ARGS)
+
+        group_format = scheme.get("format")
+        return (
+            group_format if group_format is not None else self.quant_format,
+            args_key(scheme.get("weights")),
+            args_key(scheme.get("input_activations")),
+        )
+
     def get_scheme_dict(
         self,
         layer: torch.nn.Module,
@@ -1323,6 +1343,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     module=layer,
                     targets=self.target_scheme_map.keys(),
                     fused_mapping=self.packed_modules_mapping,
+                    scheme_key=self._loaded_scheme_key,
                 )
 
             return self.target_scheme_map[matched_target]

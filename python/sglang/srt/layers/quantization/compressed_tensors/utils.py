@@ -4,10 +4,12 @@
 
 import re
 from types import MappingProxyType
-from typing import Iterable, List, Mapping, Optional
+from typing import Any, Callable, Iterable, List, Mapping, Optional
 
 from compressed_tensors import CompressionFormat
 from torch.nn import Module
+
+from sglang.srt.layers.quantization.utils import _FALLBACK_FUSED_SHARDS
 
 
 def is_activation_quantization_format(format: str) -> bool:
@@ -35,51 +37,57 @@ def should_ignore_layer(
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
 
+    # Some checkpoints store a real qkv_proj / gate_up_proj, so an entry that
+    # names the fused layer itself wins.
+    if check_equal_or_regex_match(
+        layer_name=layer_name, targets=[t for t in ignore if not t.startswith("re:")]
+    ):
+        return True
+    fused_name_ignored = check_equal_or_regex_match(
+        layer_name=layer_name, targets=ignore
+    )
+
     # Fused layers like gate_up_proj or qkv_proj will not be fused
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
     # each shard of the fused layer has the same scheme.
-    if proj_name in fused_mapping and layer_name not in ignore:
-        shard_proj_names = fused_mapping[proj_name]
-
-        # Convert fused_name --> [shard_names]
-        shard_names = [
-            layer_name.replace(proj_name, shard_proj_name)
-            for shard_proj_name in shard_proj_names
-        ]
-
-        # Layer should be ignored if shards are ignored.
-        should_ignore_layer = None
-        for shard_name in shard_names:
-            should_ignore_shard = check_equal_or_regex_match(
-                layer_name=shard_name, targets=ignore
-            )
-            if not should_ignore_shard:
-                should_ignore_shard = check_equal_or_regex_match(
-                    layer_name=f"{shard_name}.linear", targets=ignore
-                )
-
-            # If shard_idx=0, set layer ignore to match shard.
-            if should_ignore_layer is None:
-                should_ignore_layer = should_ignore_shard
-
-            # If shard_idx=1+ confirm scheme matches prior shards.
-            elif should_ignore_shard != should_ignore_layer:
-                raise ValueError(
-                    f"Found different quantization schemes for "
-                    f"{shard_proj_names} in {layer_name}. SGLang "
-                    "requires all to use the same scheme."
-                )
+    shard_proj_names = fused_mapping.get(proj_name)
+    if shard_proj_names is None:
+        # The model declares no fusion, so its checkpoint may store the fused
+        # tensor (MiMoV2 Pro's qkv_proj): a regex on the fused name decides.
+        if fused_name_ignored:
+            return True
+        shard_proj_names = _FALLBACK_FUSED_SHARDS.get(proj_name)
 
     # Unfused layers like down_proj and o_proj will match
     # the safetensors checkpoint already.
-    else:
-        should_ignore_layer = check_equal_or_regex_match(
-            layer_name=layer_name, targets=ignore
-        )
+    if shard_proj_names is None:
+        return False
 
-    assert should_ignore_layer is not None
-    return should_ignore_layer
+    # Convert fused_name --> [shard_names]
+    shard_names = [
+        layer_name.replace(proj_name, shard_proj_name)
+        for shard_proj_name in shard_proj_names
+    ]
+    shards_ignored = {
+        check_equal_or_regex_match(layer_name=shard_name, targets=ignore)
+        or check_equal_or_regex_match(layer_name=f"{shard_name}.linear", targets=ignore)
+        for shard_name in shard_names
+    }
+
+    # Reject a list that covers only some shards. With a declared fusion this
+    # holds even if a regex also matches the fused name: `re:.*v_proj$` matches
+    # qkv_proj too, but the checkpoint's q/k shards are packed.
+    if len(shards_ignored) > 1:
+        raise _mixed_shard_schemes_error(shard_proj_names, layer_name)
+    return fused_name_ignored or shards_ignored.pop()
+
+
+def _mixed_shard_schemes_error(shards: List[str], layer_name: str) -> ValueError:
+    return ValueError(
+        f"Found different quantization schemes for {shards} in {layer_name}. "
+        "SGLang requires all to use the same scheme."
+    )
 
 
 def check_equal_or_regex_match(layer_name: str, targets: Iterable[str]) -> bool:
@@ -111,6 +119,7 @@ def find_matched_target(
     module: Module,
     targets: Iterable[str],
     fused_mapping: Mapping[str, List[str]] = MappingProxyType({}),
+    scheme_key: Optional[Callable[[str], Any]] = None,
 ) -> str:
     """
     Helper function to look up which "target" in the compressed-tensors
@@ -133,6 +142,8 @@ def find_matched_target(
     :param module: torch.nn.Module
     :param targets: list of targets to match the layer against
     :param fused_mapping: map from fused layer names to its components
+    :param scheme_key: target -> what the loader builds from it; when given,
+        the components of a fused layer must resolve to the same key
     :param fused_strategy: either "all" or "any". If using "all", fused
         layers match if "all" of its components match
     """
@@ -143,7 +154,12 @@ def find_matched_target(
     matched_target = (
         _find_first_match(layer_name, targets)
         or _find_first_match(module.__class__.__name__, targets, True)
-        or _match_fused_layer(layer_name, targets, fused_mapping)
+        or _match_fused_layer(
+            layer_name=layer_name,
+            target_layers=targets,
+            fused_mapping=fused_mapping,
+            scheme_key=scheme_key,
+        )
     )
 
     if matched_target is None:
@@ -199,6 +215,7 @@ def _match_fused_layer(
     layer_name: str,
     target_layers: Iterable[str],
     fused_mapping: Mapping[str, List[str]],
+    scheme_key: Optional[Callable[[str], Any]] = None,
 ) -> Optional[str]:
     """
     Match a fused layer name to its corresponding individual layer in
@@ -237,4 +254,14 @@ def _match_fused_layer(
         else:
             unfused_matches.append(None)
 
-    return unfused_matches[0] if all(unfused_matches) else None
+    if not all(unfused_matches):
+        return None
+
+    # Exact per-shard targets can give the shards different schemes (FP8 q/k,
+    # INT4 v); taking the first one would build v with q's scheme.
+    if scheme_key is not None and any(
+        scheme_key(match) != scheme_key(unfused_matches[0])
+        for match in unfused_matches[1:]
+    ):
+        raise _mixed_shard_schemes_error(fused_mapping[fused], layer_name)
+    return unfused_matches[0]

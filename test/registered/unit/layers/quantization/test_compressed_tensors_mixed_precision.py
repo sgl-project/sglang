@@ -9,9 +9,12 @@ for every group. Both are config-parsing paths, so these tests run on CPU.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
+import ast
+import re
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -402,6 +405,322 @@ class TestMixedPrecisionFormat(CustomTestCase):
         self.assertEqual(scheme.pack_factor, 32 // 4)
         self.assertEqual(scheme.strategy, "group")
         self.assertEqual(scheme.group_size, 128)
+
+
+# Layer-0 excerpt of cyankiwi/GLM-4.5-Air-AWQ-4bit's ignore list. Glm4Moe declares
+# no packed_modules_mapping; AFMoE and DeepSeek-V3 AWQ repos use the same names.
+GLM_IGNORE = [
+    "model.layers.0.self_attn.q_proj",
+    "model.layers.0.self_attn.k_proj",
+    "model.layers.0.self_attn.v_proj",
+    "model.layers.0.self_attn.o_proj",
+    "model.layers.0.mlp.gate_proj",
+    "model.layers.0.mlp.up_proj",
+    "model.layers.0.mlp.down_proj",
+]
+
+# Layer-0/2 excerpt of cyankiwi/LFM2-8B-A1B-AWQ-4bit's ignore list.
+LFM2_IGNORE = [
+    "model.layers.0.conv.in_proj",
+    "model.layers.0.feed_forward.w1",
+    "model.layers.0.feed_forward.w3",
+    "model.layers.0.feed_forward.w2",
+    "model.layers.2.self_attn.q_proj",
+    "model.layers.2.self_attn.k_proj",
+    "model.layers.2.self_attn.v_proj",
+    "model.layers.2.self_attn.out_proj",
+]
+
+
+class TestFusedIgnoreWithoutModelMapping(CustomTestCase):
+    """Ignore lists name unfused shards even when the model declares no mapping."""
+
+    def test_fused_layers_follow_their_ignored_shards(self):
+        """qkv_proj / gate_up_proj are ignored exactly when all their shards are."""
+        for name in ("self_attn.qkv_proj", "mlp.gate_up_proj"):
+            with self.subTest(name=name):
+                self.assertTrue(
+                    should_ignore_layer(f"model.layers.0.{name}", ignore=GLM_IGNORE)
+                )
+                self.assertFalse(
+                    should_ignore_layer(f"model.layers.1.{name}", ignore=GLM_IGNORE)
+                )
+
+    def test_direct_match_on_a_real_fused_tensor_wins(self):
+        """A checkpoint that stores a real qkv_proj tensor can ignore it by name."""
+        for ignore in (
+            ["model.layers.0.self_attn.qkv_proj"],
+            ["re:.*self_attn\\.qkv_proj$"],
+        ):
+            with self.subTest(ignore=ignore):
+                self.assertTrue(
+                    should_ignore_layer(
+                        "model.layers.0.self_attn.qkv_proj", ignore=ignore
+                    )
+                )
+
+    def test_partially_ignored_fused_layer_raises(self):
+        """Ignoring only some shards of a fused layer is rejected, not half-loaded."""
+        with self.assertRaisesRegex(ValueError, "same scheme"):
+            should_ignore_layer(
+                "model.layers.0.self_attn.qkv_proj", ignore=GLM_IGNORE[:2]
+            )
+
+    def test_fused_regex_matching_some_shards_raises(self):
+        """`re:.*v_proj$` also matches qkv_proj, but q/k stay quantized, so it raises."""
+        with self.assertRaisesRegex(ValueError, "same scheme"):
+            should_ignore_layer(
+                "model.layers.0.self_attn.qkv_proj",
+                ignore=["re:.*v_proj$"],
+                fused_mapping={"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
+            )
+
+    def test_fused_regex_decides_when_the_model_declares_no_fusion(self):
+        """MiMoV2 Pro stores one fused qkv_proj, so `re:.*v_proj$` ignores it whole."""
+        self.assertTrue(
+            should_ignore_layer(
+                "model.layers.0.self_attn.qkv_proj", ignore=["re:.*v_proj$"]
+            )
+        )
+
+    def test_literal_fused_name_wins_over_a_partial_regex(self):
+        """A real fused tensor named literally stays ignored even if a regex hits one shard."""
+        self.assertTrue(
+            should_ignore_layer(
+                "visual.blocks.0.attn.qkv_proj",
+                ignore=["visual.blocks.0.attn.qkv_proj", "re:.*v_proj$"],
+            )
+        )
+
+    @staticmethod
+    def _lfm2_scheme(ignore):
+        """Scheme lookup with LFM2-MoE's class mapping and mapper, as the loader applies them."""
+        from sglang.srt.models.lfm2_moe import Lfm2MoeForCausalLM
+
+        quant_config = CompressedTensorsConfig.from_config(
+            {
+                "quant_method": "compressed-tensors",
+                "format": "pack-quantized",
+                "config_groups": {"group_0": {**WNA16_GROUP, "targets": ["Linear"]}},
+                "ignore": list(ignore),
+            }
+        )
+        quant_config.update_packed_modules_mapping(
+            Lfm2MoeForCausalLM.packed_modules_mapping
+        )
+        quant_config.apply_weight_name_mapper(Lfm2MoeForCausalLM.hf_to_sglang_mapper)
+        return lambda name: quant_config.get_scheme_dict(torch.nn.Linear(1, 1), name)
+
+    def test_lfm2_moe_ignore_list_reaches_its_dense_layers(self):
+        """LFM2-MoE's w1/w3/w2 names leave its ignored dense layers unquantized."""
+        scheme = self._lfm2_scheme(LFM2_IGNORE)
+        for name in (
+            "model.layers.0.feed_forward.gate_up_proj",
+            "model.layers.0.feed_forward.down_proj",
+            "model.layers.2.self_attn.qkv_proj",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(scheme(name))
+        for name in (
+            "model.layers.1.feed_forward.gate_up_proj",
+            "model.layers.6.self_attn.qkv_proj",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNotNone(scheme(name))
+
+    def test_lfm2_moe_partial_qkv_regex_raises(self):
+        """LFM2-MoE stores split q/k/v, so `re:.*v_proj$` alone is a mixed scheme."""
+        scheme = self._lfm2_scheme(["re:.*v_proj$"])
+        with self.assertRaisesRegex(ValueError, "same scheme"):
+            scheme("model.layers.2.self_attn.qkv_proj")
+
+    @staticmethod
+    def _lfm2_qkv_scheme(*groups, quant_format="mixed-precision"):
+        """Scheme of layer 2's qkv_proj with per-shard exact targets."""
+        from sglang.srt.models.lfm2_moe import Lfm2MoeForCausalLM
+
+        quant_config = CompressedTensorsConfig.from_config(
+            {**_mixed_precision_config(*groups), "format": quant_format}
+        )
+        quant_config.update_packed_modules_mapping(
+            Lfm2MoeForCausalLM.packed_modules_mapping
+        )
+        return quant_config.get_scheme_dict(
+            torch.nn.Linear(1, 1), "model.layers.2.self_attn.qkv_proj"
+        )
+
+    def test_lfm2_moe_qkv_shards_with_different_schemes_raise(self):
+        """FP8 q/k with INT4 v is rejected instead of building v with q's scheme."""
+        attn = "model.layers.2.self_attn"
+        with self.assertRaisesRegex(ValueError, "same scheme"):
+            self._lfm2_qkv_scheme(
+                {**FP8_GROUP, "targets": [f"{attn}.q_proj", f"{attn}.k_proj"]},
+                {**WNA16_GROUP, "targets": [f"{attn}.v_proj"]},
+            )
+
+    def test_lfm2_moe_qkv_shards_listed_separately_share_a_scheme(self):
+        """One group naming q, k and v as three exact targets still resolves."""
+        attn = "model.layers.2.self_attn"
+        scheme = self._lfm2_qkv_scheme(
+            {
+                **WNA16_GROUP,
+                "targets": [f"{attn}.{p}" for p in ("q_proj", "k_proj", "v_proj")],
+            },
+            FP8_GROUP,
+        )
+        self.assertEqual(scheme["weights"].num_bits, 4)
+
+    def test_lfm2_moe_qkv_shards_with_an_inherited_format_share_a_scheme(self):
+        """q/k inheriting pack-quantized match a v that sets it explicitly."""
+        attn = "model.layers.2.self_attn"
+        inherited = {k: v for k, v in WNA16_GROUP.items() if k != "format"}
+        scheme = self._lfm2_qkv_scheme(
+            {**inherited, "targets": [f"{attn}.q_proj", f"{attn}.k_proj"]},
+            {**WNA16_GROUP, "targets": [f"{attn}.v_proj"]},
+            quant_format="pack-quantized",
+        )
+        self.assertEqual(scheme["weights"].num_bits, 4)
+
+    def test_lfm2_moe_qkv_shards_differing_only_in_observer_share_a_scheme(self):
+        """The calibration observer is not loaded, so it does not split a scheme."""
+        attn = "model.layers.2.self_attn"
+        mse = {**WNA16_GROUP["weights"], "observer": "mse"}
+        scheme = self._lfm2_qkv_scheme(
+            {**WNA16_GROUP, "targets": [f"{attn}.q_proj", f"{attn}.k_proj"]},
+            {**WNA16_GROUP, "weights": mse, "targets": [f"{attn}.v_proj"]},
+        )
+        self.assertEqual(scheme["weights"].num_bits, 4)
+
+    def test_lfm2_moe_fused_name_entry_still_wins_over_its_shards(self):
+        """An entry naming the fused gate_up_proj keeps working once w1/w3 are declared."""
+        scheme = self._lfm2_scheme(["layers.0.feed_forward.gate_up_proj"])
+        self.assertIsNone(scheme("model.layers.0.feed_forward.gate_up_proj"))
+        self.assertIsNotNone(scheme("model.layers.1.feed_forward.gate_up_proj"))
+
+    def test_lfm2_moe_regex_w2_entry_reaches_down_proj(self):
+        """A regex written against w2 matches the renamed dense down_proj."""
+        scheme = self._lfm2_scheme(["re:.*layers\\.0\\.feed_forward\\.w2$"])
+        self.assertIsNone(scheme("model.layers.0.feed_forward.down_proj"))
+        self.assertIsNotNone(scheme("model.layers.1.feed_forward.down_proj"))
+
+
+def _declared_fused_mappings():
+    """(model, fused, shards) for every literal packed_modules_mapping entry.
+
+    Read with ast so the sweep needs no model imports. Mappings built at
+    runtime (Qwen3.5, Glm5Next, ...) are left out, and so are entries whose
+    shards are not plain leaf names: Solar's (name, shard_id) tuples are read
+    only by its own load_weights, and dotted keys (Gemma3n's ".qkv_proj") are
+    never found by the leaf-name lookup, so the fallback table covers them.
+    """
+    import sglang
+
+    models_dir = Path(sglang.__file__).parent / "srt" / "models"
+    entries = []
+    for path in sorted(models_dir.rglob("*.py")):
+        for cls in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for stmt in cls.body:
+                if not (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and stmt.targets[0].id == "packed_modules_mapping"
+                ):
+                    continue
+                try:
+                    mapping = ast.literal_eval(stmt.value)
+                except ValueError:
+                    continue
+                for fused, shards in mapping.items():
+                    names = [fused, *shards]
+                    if all(isinstance(n, str) and "." not in n for n in names):
+                        entries.append((f"{path.stem}.{cls.name}", fused, shards))
+    return entries
+
+
+class TestDeclaredFusedMappingSweep(CustomTestCase):
+    """Every model's declared fusion resolves ignore lists and schemes the same way."""
+
+    PREFIX = "model.layers.0.blk"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.entries = _declared_fused_mappings()
+
+    def _cases(self):
+        for model, fused, shards in self.entries:
+            with self.subTest(model=model, fused=fused):
+                yield (
+                    f"{self.PREFIX}.{fused}",
+                    [f"{self.PREFIX}.{shard}" for shard in shards],
+                    {fused: list(shards)},
+                )
+
+    def test_the_sweep_sees_the_common_fusions(self):
+        """Guard against the ast reader silently finding nothing."""
+        fused_names = {fused for _, fused, _ in self.entries}
+        self.assertGreater(len(self.entries), 50)
+        self.assertLessEqual({"qkv_proj", "gate_up_proj"}, fused_names)
+
+    def test_ignore_list_follows_the_shards(self):
+        """All shards listed: ignored. None: kept. The fused name itself: ignored."""
+        for layer, shard_names, mapping in self._cases():
+            self.assertTrue(
+                should_ignore_layer(layer, ignore=shard_names, fused_mapping=mapping)
+            )
+            self.assertFalse(
+                should_ignore_layer(layer, ignore=["lm_head"], fused_mapping=mapping)
+            )
+            self.assertTrue(
+                should_ignore_layer(layer, ignore=[layer], fused_mapping=mapping)
+            )
+
+    def test_some_shards_ignored_raises(self):
+        """A literal entry or a regex on one shard only is a mixed scheme, even
+        when the regex also matches the fused name (`re:.*v_proj$` on qkv_proj)."""
+        for layer, shard_names, mapping in self._cases():
+            if len(shard_names) < 2:
+                continue
+            last = re.escape(shard_names[-1].rsplit(".", 1)[1])
+            for ignore in (
+                shard_names[:1],
+                [f"re:.*\\.{last}$"],
+                [f"re:.*{last}$"],
+            ):
+                with self.assertRaisesRegex(ValueError, "same scheme"):
+                    should_ignore_layer(layer, ignore=ignore, fused_mapping=mapping)
+
+    @staticmethod
+    def _scheme(mapping, *groups):
+        quant_config = CompressedTensorsConfig.from_config(
+            _mixed_precision_config(*groups)
+        )
+        quant_config.update_packed_modules_mapping(mapping)
+        return quant_config
+
+    def test_shard_targets_resolve_to_one_scheme(self):
+        """Per-shard exact targets: one scheme loads, two different schemes raise."""
+        for layer, shard_names, mapping in self._cases():
+            linear = torch.nn.Linear(1, 1)
+            mse = {**WNA16_GROUP["weights"], "observer": "mse"}
+            same = self._scheme(
+                mapping,
+                {**WNA16_GROUP, "targets": shard_names[:1]},
+                {**WNA16_GROUP, "weights": mse, "targets": shard_names[1:]},
+            )
+            self.assertEqual(same.get_scheme_dict(linear, layer)["weights"].num_bits, 4)
+            if len(shard_names) < 2:
+                continue
+            mixed = self._scheme(
+                mapping,
+                {**FP8_GROUP, "targets": shard_names[:-1]},
+                {**WNA16_GROUP, "targets": shard_names[-1:]},
+            )
+            with self.assertRaisesRegex(ValueError, "same scheme"):
+                mixed.get_scheme_dict(linear, layer)
 
 
 class TestCheckSchemeSupportedError(CustomTestCase):

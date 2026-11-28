@@ -631,6 +631,23 @@ impl PreparedRequest {
 
     /// A request of `lengths` prompts that generates nothing. No PD serves it,
     /// so it keeps no parsed body for bootstrap fields.
+    /// A single-prompt, single-sample text generation whose whole output is the
+    /// at most one token a PD prefill samples itself.
+    pub(super) fn wants_at_most_one_token(&self) -> bool {
+        matches!(self.path, CHAT_PATH | COMPLETIONS_PATH | GENERATE_PATH)
+            && !self.fans_out
+            && matches!(self.output_tokens, Some(0 | 1))
+    }
+
+    /// A one-prompt `/generate` with this output budget, for dispatch tests.
+    #[cfg(test)]
+    pub(super) fn test_generate(output_tokens: Option<u64>) -> Self {
+        Self {
+            output_tokens,
+            ..Self::no_output(GENERATE_PATH, ModelId("m".into()), Bytes::new(), &[4])
+        }
+    }
+
     fn no_output(path: &'static str, model: ModelId, body: Bytes, lengths: &[usize]) -> Self {
         let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
         Self {
@@ -1890,6 +1907,27 @@ mod tests {
             .unwrap();
         let input = serde_json::from_slice::<Value>(&r.body).unwrap()["input"].take();
         (r, input)
+    }
+
+    /// Only a whole output of at most one token may skip decode: a second
+    /// token, a second sample or prompt, an unknown budget, or a route that
+    /// generates nothing must keep the PD path.
+    #[test]
+    fn at_most_one_token_needs_one_prompt_one_sample_and_a_known_budget() {
+        let generate = |params: Value, text: Value| {
+            prepare_generate(json!({"text": text, "sampling_params": params}))
+                .wants_at_most_one_token()
+        };
+        assert!(generate(json!({"max_new_tokens": 1}), json!("hi")));
+        assert!(generate(json!({"max_new_tokens": 0}), json!("hi")));
+        assert!(!generate(json!({"max_new_tokens": 2}), json!("hi")));
+        assert!(!generate(json!({}), json!("hi")));
+        assert!(!generate(json!({"max_new_tokens": 1, "n": 2}), json!("hi")));
+        assert!(!generate(json!({"max_new_tokens": 1}), json!(["a", "b"])));
+
+        let (embeddings, _) = prepare_embeddings(&tokenizer_ctx(), json!("hi"));
+        assert_eq!(embeddings.output_tokens, Some(0));
+        assert!(!embeddings.wants_at_most_one_token());
     }
 
     #[test]

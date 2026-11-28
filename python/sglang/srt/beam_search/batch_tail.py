@@ -11,7 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Beam member rows riding a decode batch: layout, append/strip, retract.
+"""Beam helpers over ScheduleBatch: member-row tail layout, append/strip, retract,
+beam-only check.
 
 Everything here mutates or reads ScheduleBatch, but lives outside it so the
 batch class carries only the beam_tail field and one-line hook calls.
@@ -23,6 +24,8 @@ from typing import TYPE_CHECKING, Any, List, NamedTuple
 
 import msgspec
 import torch
+
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -66,20 +69,23 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
     if not entries:
         return
 
-    leader_idx_cpu = torch.tensor(leader_idx, dtype=torch.int64)
-    widths_cpu = torch.tensor(widths, dtype=torch.int64)
-    leader_idx_dev = leader_idx_cpu.to(batch.device, non_blocking=True)
-    widths_dev = widths_cpu.to(batch.device, non_blocking=True)
+    leader_idx_dev = async_h2d(leader_idx, dtype=torch.int64, device=batch.device)
+    widths_dev = async_h2d(widths, dtype=torch.int64, device=batch.device)
 
     batch.req_pool_indices = torch.cat([batch.req_pool_indices, *tails])
     batch.req_pool_indices_cpu = torch.cat([batch.req_pool_indices_cpu, *tails_cpu])
+    # output_size avoids a device-to-host read of the repeat counts (overlap host sync).
     batch.seq_lens = torch.cat(
         [
             batch.seq_lens,
-            torch.repeat_interleave(batch.seq_lens[leader_idx_dev], widths_dev),
+            torch.repeat_interleave(
+                batch.seq_lens[leader_idx_dev], widths_dev, output_size=t
+            ),
         ]
     )
     if batch.seq_lens_cpu is not None:
+        leader_idx_cpu = torch.tensor(leader_idx, dtype=torch.int64)
+        widths_cpu = torch.tensor(widths, dtype=torch.int64)
         batch.seq_lens_cpu = torch.cat(
             [
                 batch.seq_lens_cpu,
@@ -89,7 +95,9 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
     batch.orig_seq_lens = torch.cat(
         [
             batch.orig_seq_lens,
-            torch.repeat_interleave(batch.orig_seq_lens[leader_idx_dev], widths_dev),
+            torch.repeat_interleave(
+                batch.orig_seq_lens[leader_idx_dev], widths_dev, output_size=t
+            ),
         ]
     )
     batch.seq_lens_sum = None
@@ -128,6 +136,19 @@ def num_beam_member_rows(reqs) -> int:
     """Extra decode-slot demand: one slot per member row per step (beam
     requires page_size == 1)."""
     return sum(r.beam_group.num_member_rows for r in reqs if r.beam_group is not None)
+
+
+def is_beam_only_batch(batch: ScheduleBatch) -> bool:
+    """Every reqs-aligned row is a beam leader, so the sampler has no reader."""
+    tail = batch.beam_tail
+    if tail is not None:
+        return len(tail.entries) == tail.num_base_rows
+    mode = batch.forward_mode
+    return (
+        mode.is_extend()
+        and not mode.is_mixed()
+        and all(req.beam_group is not None for req in batch.reqs)
+    )
 
 
 def beam_retraction_order(sorted_indices: List[int], reqs: List[Req]) -> List[int]:

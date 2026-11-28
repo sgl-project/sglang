@@ -1,6 +1,7 @@
 ---
 title: MiniMax-H3-Image
 description: "Run native six-step MiniMax-H3-Image generation and image editing with SGLang Diffusion."
+tag: NEW
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';

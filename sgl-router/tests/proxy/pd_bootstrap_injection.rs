@@ -402,3 +402,119 @@ async fn pd_mode_disconnect_aborts_decode_but_not_prefill() {
 }
 
 mod reliability;
+
+// --- --pd-one-token-on-prefill-only -------------------------------------------
+
+/// A PD router with the flag on; `prefill_answers_alone` is what the prefill
+/// engine's `/server_info` reports.
+fn build_single_token_ctx(
+    prefill_url: &str,
+    decode_url: &str,
+    prefill_answers_alone: bool,
+) -> Arc<AppContext> {
+    let mut cfg = config();
+    cfg.proxy.one_token_on_prefill_only = true;
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    let profile = sgl_router::workers::worker::EngineProfile {
+        prefill_answers_alone,
+        ..sgl_router::workers::WireProtocol::default().into()
+    };
+    registry
+        .add_with_cb(
+            WorkerSpec {
+                id: WorkerId("p1".into()),
+                url: prefill_url.into(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+                ..Default::default()
+            },
+            None,
+            profile,
+        )
+        .unwrap();
+    registry
+        .add(WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode_url.into(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            ..Default::default()
+        })
+        .unwrap();
+    let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
+    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+}
+
+fn chat_request_with_max_tokens(max_tokens: u64) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": max_tokens,
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+/// With the flag on and a prefill that reports it can, a one-token request
+/// is answered by prefill alone: no bootstrap fields, and decode never sees it.
+#[tokio::test]
+async fn single_token_request_is_answered_by_prefill_alone() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let app = build_router(build_single_token_ctx(&prefill.url, &decode.url, true));
+
+    let res = app.oneshot(chat_request_with_max_tokens(1)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = parse_body(&await_captured_body(&prefill, Duration::from_secs(2), "prefill").await);
+    assert_eq!(bootstrap_host(&body), None, "{body}");
+    assert_eq!(bootstrap_port(&body), None, "{body}");
+    assert_eq!(bootstrap_room(&body), None, "{body}");
+    assert!(
+        decode.captured.lock().unwrap().last_body.is_none(),
+        "decode must not be called"
+    );
+}
+
+/// A prefill engine that does not report `prefill_answers_alone` (an older
+/// SGLang) keeps the normal prefill and decode dispatch.
+#[tokio::test]
+async fn single_token_request_falls_back_to_pd_for_an_older_prefill() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let app = build_router(build_single_token_ctx(&prefill.url, &decode.url, false));
+
+    let res = app.oneshot(chat_request_with_max_tokens(1)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let decode_body =
+        parse_body(&await_captured_body(&decode, Duration::from_secs(2), "decode").await);
+    let prefill_body =
+        parse_body(&await_captured_body(&prefill, Duration::from_secs(2), "prefill").await);
+    assert!(bootstrap_room(&decode_body).is_some(), "{decode_body}");
+    assert_eq!(bootstrap_room(&prefill_body), bootstrap_room(&decode_body));
+}
+
+/// A request for more than one token still needs decode.
+#[tokio::test]
+async fn longer_request_keeps_pd_even_with_a_capable_prefill() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let app = build_router(build_single_token_ctx(&prefill.url, &decode.url, true));
+
+    let res = app.oneshot(chat_request_with_max_tokens(2)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let decode_body =
+        parse_body(&await_captured_body(&decode, Duration::from_secs(2), "decode").await);
+    assert!(bootstrap_room(&decode_body).is_some(), "{decode_body}");
+}

@@ -905,8 +905,8 @@ class ExecComm(msgspec.Struct):
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
                 "Requires SM90 or SM10X NVIDIA GPUs. "
-                "When unspecified, supported MiMo configurations use cutedsl; "
-                "other supported models use auto. "
+                "When unspecified, it can be enabled automatically only on "
+                "SM10X for supported models; on SM90, fusion is opt-in. "
                 "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
                 "(single- and multi-node) and trtllm on SM90 single-node systems. "
                 "'trtllm': available on single-node systems only. "
