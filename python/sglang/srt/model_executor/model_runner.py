@@ -1165,11 +1165,8 @@ class ModelRunner:
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
             and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
         ):
-            raise RuntimeError(
-                "Fused sparse KV manager requires "
-                "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1 and "
-                "SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA=1."
-            )
+            return None
+
         if self.fused_sparse_kv_manager is None:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
                 FusedSparseKVCacheManager,
