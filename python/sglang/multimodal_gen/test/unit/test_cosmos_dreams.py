@@ -39,6 +39,9 @@ from sglang.multimodal_gen.registry import (
     _discover_and_register_pipelines,
     _get_config_info,
 )
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
+    spatial_parallel_decode_disabled,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
@@ -62,6 +65,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     EXTRA_DECODED_OUTPUT,
     EXTRA_STREAMED_OUTPUT_PATHS,
     EXTRA_TARGET_LATENT_FRAMES,
+    EXTRA_UNSHARDED_DECODE,
     CausalDecodeQueue,
     CosmosDreamsDecodingStage,
     CosmosDreamsPrepareStage,
@@ -1757,7 +1761,7 @@ class TestCosmosDreamsStreamedOutput(unittest.TestCase):
         saved = SimpleNamespace(finish=lambda: ["out.mp4"])
         failed = SimpleNamespace(finish=lambda: None)
         self.assertEqual(hand_over(saved), {EXTRA_STREAMED_OUTPUT_PATHS: ["out.mp4"]})
-        self.assertEqual(hand_over(failed), {})
+        self.assertEqual(hand_over(failed), {EXTRA_UNSHARDED_DECODE: True})
         self.assertEqual(hand_over(None), {EXTRA_DECODED_OUTPUT: "frames"})
 
         decoding = object.__new__(CosmosDreamsDecodingStage)
@@ -1775,47 +1779,18 @@ class TestCosmosDreamsStreamedOutput(unittest.TestCase):
             batch.extra.clear()
             decoding.forward(batch, None)
             decode.assert_called_once()
-
-    def test_no_rank_hands_over_frames_after_the_output_rank_encode_failed(self):
-        """A rank without the encoder hands over nothing once the output rank's
-        encode failed: the output rank then decodes the latents, a decode shared
-        across ranks, and waits forever for a rank that skipped it."""
-        stage = object.__new__(CosmosDreamsRolloutStage)
-        encode = (
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding"
-        )
-
-        def hand_over(encoder, *, rank, verdict=None):
-            sent = []
-
-            def broadcast_object(obj, src):
-                sent.append(obj)
-                return obj if rank == src else verdict
-
-            group = SimpleNamespace(
-                world_size=2, rank_in_group=rank, broadcast_object=broadcast_object
-            )
-            batch = SimpleNamespace(extra={})
-            queue = SimpleNamespace(
-                submitted=1, encoder=encoder, finish=lambda: "frames"
-            )
-            with (
-                mock.patch.object(CosmosDreamsRolloutStage, "log_info"),
-                mock.patch(
-                    f"{encode}.model_parallel_is_initialized", return_value=True
-                ),
-                mock.patch(f"{encode}.get_replica_group", return_value=group),
-            ):
-                stage._hand_over_decode(batch, queue)
-            return batch.extra, sent
-
-        failed = SimpleNamespace(finish=lambda: None)
-        self.assertEqual(hand_over(failed, rank=0), ({}, [True]))
-        self.assertEqual(hand_over(None, rank=1, verdict=True), ({}, [None]))
-        self.assertEqual(
-            hand_over(None, rank=1, verdict=False),
-            ({EXTRA_DECODED_OUTPUT: "frames"}, [None]),
-        )
+        disabled = []
+        with mock.patch.object(
+            Cosmos3DecodingStage,
+            "forward",
+            side_effect=lambda *args: disabled.append(
+                spatial_parallel_decode_disabled()
+            ),
+        ):
+            for extra in ({EXTRA_UNSHARDED_DECODE: True}, {}):
+                batch.extra = extra
+                decoding.forward(batch, None)
+        self.assertEqual(disabled, [True, False])
 
 
 class TestCosmosDreamsInferenceProfile(unittest.TestCase):

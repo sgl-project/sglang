@@ -36,6 +36,9 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
+    disable_spatial_parallel_decode,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -55,7 +58,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
-    finish_streamed_encode,
     streamed_video_output_path,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
@@ -108,6 +110,8 @@ EXTRA_DECODED_OUTPUT = "transfer_decoded_output"
 # Paths of the MP4 the rollout encoded while it decoded; the decoding stage
 # returns them instead of frames.
 EXTRA_STREAMED_OUTPUT_PATHS = "cosmos_dreams_streamed_output_paths"
+# The output rank's encode failed, and the other ranks keep their frames.
+EXTRA_UNSHARDED_DECODE = "cosmos_dreams_unsharded_decode"
 EXTRA_TARGET_LATENT_FRAMES = "cosmos_dreams_target_latent_frames"
 # FrustumHistorySelector of the request, None without retrieval.
 EXTRA_FRUSTUM_SELECTOR = "cosmos_dreams_frustum_selector"
@@ -1618,16 +1622,14 @@ class CosmosDreamsRolloutStage(PipelineStage):
 
     def _hand_over_decode(self, batch: Req, decode_queue: "CausalDecodeQueue") -> None:
         self.log_info("Decoded %d chunks during the rollout", decode_queue.submitted)
-        output_file_paths, encode_failed = finish_streamed_encode(decode_queue.encoder)
-        if encode_failed:
-            # A failed encode leaves nothing behind, so the decoding stage decodes
-            # the latents itself and the worker saves the frames. Ranks without
-            # the encoder keep their frames back too, to take part in that decode.
+        if decode_queue.encoder is None:
+            batch.extra[EXTRA_DECODED_OUTPUT] = decode_queue.finish()
             return
+        output_file_paths = decode_queue.encoder.finish()
         if output_file_paths is not None:
             batch.extra[EXTRA_STREAMED_OUTPUT_PATHS] = output_file_paths
         else:
-            batch.extra[EXTRA_DECODED_OUTPUT] = decode_queue.finish()
+            batch.extra[EXTRA_UNSHARDED_DECODE] = True
 
     def _rollout_chunks(
         self,
@@ -1888,7 +1890,12 @@ class CosmosDreamsDecodingStage(Cosmos3DecodingStage):
     def forward(self, batch: Req, server_args: ServerArgs):
         output_file_paths = batch.extra.get(EXTRA_STREAMED_OUTPUT_PATHS)
         if output_file_paths is None:
-            return super().forward(batch, server_args)
+            with (
+                disable_spatial_parallel_decode()
+                if batch.extra.get(EXTRA_UNSHARDED_DECODE)
+                else nullcontext()
+            ):
+                return super().forward(batch, server_args)
         return OutputBatch(
             output=None,
             output_file_paths=output_file_paths,
