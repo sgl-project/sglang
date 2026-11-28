@@ -148,15 +148,6 @@ def _make_eagle_draft_extend_v2_input(case, batch, *, device: str):
     return draft_extend_input
 
 
-def _set_draft_extend_v2_prefix_lens(batch, case, *, device: str):
-    # Production sets seq_lens = prefix + extend before init_forward_metadata
-    # (the draft-extend path bumps seq_lens by num_draft_tokens). Match that here.
-    seq_lens = tuple(p + e for p, e in zip(case.prefix_lens, case.input_lens))
-    batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-    batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32, device="cpu")
-    batch.seq_lens_sum = sum(seq_lens)
-
-
 def _prepare_eagle_draft_extend_v2_batch(case, batch, *, device: str) -> None:
     _set_draft_extend_v2_prefix_lens(batch, case, device=device)
     batch.spec_info = _make_eagle_draft_extend_v2_input(
