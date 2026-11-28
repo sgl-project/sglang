@@ -1,3 +1,4 @@
+import inspect
 import logging
 from typing import Optional, Union
 
@@ -6,6 +7,24 @@ import triton
 from sgl_kernel_npu.operators.mamba import (
     conv_state_rollback,
     move_intermediate_cache,
+)
+
+try:
+    from sgl_kernel_npu.operators.mamba import (
+        copy_tracked_conv_states as _sgl_copy_tracked_conv_states,
+    )
+except ImportError:
+    _sgl_copy_tracked_conv_states = None
+
+try:
+    from sgl_kernel_npu.operators.attention.gdn import (
+        fused_gdn_commit as _sgl_fused_gdn_commit,
+    )
+except ImportError:
+    _sgl_fused_gdn_commit = None
+
+_CONV_ROLLBACK_SUPPORTS_ACTIVE_TAIL = (
+    "active_tail" in inspect.signature(conv_state_rollback).parameters
 )
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -50,6 +69,54 @@ def _mamba_scatter_h_block_size(intermediate_state_cache: torch.Tensor) -> int:
             "--mamba-ssm-dtype bfloat16."
         )
     return max(h_block_size, 1)
+
+
+def _copy_tracked_conv_states(
+    conv_states: torch.Tensor,
+    src_slots: torch.Tensor,
+    dst_slots: torch.Tensor,
+    track_steps: torch.Tensor,
+) -> None:
+    if dst_slots.shape[0] == 0:
+        return
+    if _sgl_copy_tracked_conv_states is not None:
+        _sgl_copy_tracked_conv_states(conv_states, src_slots, dst_slots, track_steps)
+        return
+    # Fallback for older sgl-kernel-npu wheels without copy_tracked_conv_states.
+    track_mask = track_steps >= 0
+    eff_src = torch.where(track_mask, src_slots, dst_slots)
+    conv_states[:, dst_slots] = conv_states[:, eff_src]
+
+
+def _rollback_conv_states(
+    conv_states: torch.Tensor,
+    state_indices: torch.Tensor,
+    step_indices: torch.Tensor,
+    draft_token_num: int,
+) -> None:
+    if state_indices.numel() == 0:
+        return
+    # For kernel_size=4 depthwise conv1d (win_len == draft_token_num + 2), only
+    # the trailing 3 rows are read by subsequent decode/verify steps.
+    if (
+        _CONV_ROLLBACK_SUPPORTS_ACTIVE_TAIL
+        and conv_states.ndim == 4
+        and conv_states.shape[2] == draft_token_num + 2
+    ):
+        conv_state_rollback(
+            conv_states,
+            state_indices,
+            step_indices,
+            draft_token_num,
+            active_tail=3,
+        )
+    else:
+        conv_state_rollback(
+            conv_states,
+            state_indices,
+            step_indices,
+            draft_token_num,
+        )
 
 
 class AscendMambaAttnBackendBase(MambaAttnBackendBase):
@@ -302,48 +369,83 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
         last_steps = last_correct_step_indices.to(torch.int64)  # [N]
 
-        h_block_size = _mamba_scatter_h_block_size(intermediate_state_cache)
-
-        move_intermediate_cache(
-            ssm_states,
-            intermediate_state_cache,
-            dst_indices_tensor,
-            src_indices_tensor,
-            last_steps,
-            h_block_size=h_block_size,
-        )
-
         draft_token_num = intermediate_state_cache.shape[2]
-        if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
-            mamba_track_indices = mamba_track_indices.to(torch.int64)
-            mamba_steps_to_track = mamba_steps_to_track.to(torch.int64)
+        if (
+            getattr(self.linear_attn_backend, "_fused_verify_active", False)
+            and _sgl_fused_gdn_commit is not None
+        ):
+            ws = self.linear_attn_backend._fused_verify_ws
+            track_slots_i64 = None
+            track_steps_i64 = None
+            if mamba_track_indices is not None:
+                assert mamba_steps_to_track is not None
+                mamba_track_indices = mamba_track_indices.to(torch.int64)
+                mamba_steps_to_track = mamba_steps_to_track.to(torch.int64)
+                track_slots_i64 = mamba_track_indices
+                track_steps_i64 = mamba_steps_to_track
+
+            _sgl_fused_gdn_commit(
+                ssm_states,
+                ws.rec_k_all,
+                ws.rec_v_all,
+                ws.rec_g_all,
+                dst_indices_tensor,
+                last_steps,
+                track_slots=track_slots_i64,
+                track_steps=track_steps_i64,
+            )
+            self.linear_attn_backend._fused_verify_active = False
+
+            if mamba_track_indices is not None:
+                _copy_tracked_conv_states(
+                    conv_states,
+                    dst_indices_tensor,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
+        else:
+            h_block_size = _mamba_scatter_h_block_size(intermediate_state_cache)
 
             move_intermediate_cache(
                 ssm_states,
                 intermediate_state_cache,
-                mamba_track_indices,
+                dst_indices_tensor,
                 src_indices_tensor,
-                mamba_steps_to_track,
+                last_steps,
                 h_block_size=h_block_size,
             )
 
-            track_mask = mamba_steps_to_track >= 0
-            # Track conv state from the verify-time window before rolling back
-            # the working slot; NPU does not keep per-step conv intermediates.
-            src_slots = torch.where(track_mask, dst_indices_tensor, mamba_track_indices)
-            conv_states[:, mamba_track_indices] = conv_states[:, src_slots]
+            if mamba_track_indices is not None:
+                assert mamba_steps_to_track is not None
+                mamba_track_indices = mamba_track_indices.to(torch.int64)
+                mamba_steps_to_track = mamba_steps_to_track.to(torch.int64)
 
-        if dst_indices_tensor.numel() > 0:
-            conv_state_rollback(
-                conv_states,
-                dst_indices_tensor,
-                last_steps,
-                draft_token_num,
-            )
+                move_intermediate_cache(
+                    ssm_states,
+                    intermediate_state_cache,
+                    mamba_track_indices,
+                    src_indices_tensor,
+                    mamba_steps_to_track,
+                    h_block_size=h_block_size,
+                )
 
-        if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
-            conv_state_rollback(
+                # Track conv state from the verify-time window before rolling back
+                # the working slot; NPU does not keep per-step conv intermediates.
+                _copy_tracked_conv_states(
+                    conv_states,
+                    dst_indices_tensor,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
+
+        _rollback_conv_states(
+            conv_states,
+            dst_indices_tensor,
+            last_steps,
+            draft_token_num,
+        )
+        if mamba_track_indices is not None:
+            _rollback_conv_states(
                 conv_states,
                 mamba_track_indices,
                 mamba_steps_to_track,

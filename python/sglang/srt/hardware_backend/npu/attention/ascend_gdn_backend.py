@@ -11,9 +11,11 @@ from sgl_kernel_npu.operators.attention.gdn.gdn_utils import prepare_chunk_indic
 from sgl_kernel_npu.operators.mamba import causal_conv1d
 from sgl_kernel_npu.operators.norm import l2norm_fwd
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -21,6 +23,121 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+
+try:
+    from sgl_kernel_npu.operators.attention.gdn import (
+        create_gdn_verify_workspace as _create_gdn_verify_workspace,
+    )
+    from sgl_kernel_npu.operators.attention.gdn import (
+        fused_conv1d_gdn_verify as _sgl_fused_conv1d_gdn_verify,
+    )
+    from sgl_kernel_npu.operators.attention.gdn import (
+        fused_gdn_verify as _sgl_fused_gdn_verify,
+    )
+except ImportError:
+    _create_gdn_verify_workspace = None
+    _sgl_fused_conv1d_gdn_verify = None
+    _sgl_fused_gdn_verify = None
+
+
+def _check_common_gdn_verify_layer(
+    layer,
+    ssm_states: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+    topk: int,
+) -> Optional[Tuple[int, int, int]]:
+    """Shared shape/env/dtype gate for Ascend 950 fused GDN verify."""
+    if (
+        _sgl_fused_gdn_verify is None
+        or not envs.SGLANG_NPU_ENABLE_FUSED_GDN_VERIFY.get()
+        or not is_npu_arch35()
+        or topk > 1
+        or batch_size <= 0
+        or not (2 <= draft_token_num <= 16)
+        or ssm_states.dtype != torch.bfloat16
+        or not (
+            ssm_states.is_contiguous()
+            and layer.A_log.is_contiguous()
+            and layer.dt_bias.is_contiguous()
+        )
+    ):
+        return None
+    nk, nv = layer.num_q_heads, layer.num_v_heads
+    dk, dv = layer.head_q_dim, layer.head_v_dim
+    if (
+        dk != 128
+        or dv != 128
+        or layer.num_k_heads != nk
+        or layer.head_k_dim != dk
+        or nk <= 0
+        or nv % nk != 0
+    ):
+        return None
+    return nk, nv, (2 * nk + nv) * dk
+
+
+def _can_use_fused_gdn_verify(
+    layer,
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    ssm_states: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+    topk: int,
+) -> bool:
+    dims = _check_common_gdn_verify_layer(
+        layer, ssm_states, batch_size, draft_token_num, topk
+    )
+    if dims is None:
+        return False
+    _, _, qkv_dim = dims
+    return (
+        mixed_qkv.dtype == torch.bfloat16
+        and mixed_qkv.shape[0] == batch_size * draft_token_num
+        and mixed_qkv.shape[-1] == qkv_dim
+        and mixed_qkv.is_contiguous()
+        and a.is_contiguous()
+        and b.is_contiguous()
+    )
+
+
+def _can_use_fused_conv1d_verify(
+    layer,
+    qkvz: torch.Tensor,
+    ba: torch.Tensor,
+    conv_states: torch.Tensor,
+    ssm_states: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+    topk: int,
+) -> bool:
+    if _sgl_fused_conv1d_gdn_verify is None:
+        return False
+    dims = _check_common_gdn_verify_layer(
+        layer, ssm_states, batch_size, draft_token_num, topk
+    )
+    if dims is None:
+        return False
+    _, nv, qkv_dim = dims
+    return (
+        layer.bias is None
+        and layer.conv_weights.shape[-1] == 4
+        and conv_states.ndim == 3
+        and conv_states.shape[1] == draft_token_num + 2
+        and conv_states.shape[2] == qkv_dim
+        and qkvz.shape[0] == batch_size * draft_token_num
+        and ba.shape[0] == qkvz.shape[0]
+        and qkvz.shape[-1] >= qkv_dim
+        and ba.shape[-1] == 2 * nv
+        and qkvz.dtype == torch.bfloat16
+        and ba.dtype == torch.bfloat16
+        and conv_states.dtype == torch.bfloat16
+        and qkvz.is_contiguous()
+        and ba.is_contiguous()
+        and conv_states.is_contiguous()
+    )
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
@@ -39,6 +156,43 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         decode_backend = backends.decode
         prefill_backend = backends.prefill
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        # Persistent static int32 constant buffers safe for NPU verify graph capture/replay.
+        self._const_int32_cache: dict[tuple[int, int], torch.Tensor] = {}
+        # Persistent static workspace & state for Ascend 950 fused GDN verify.
+        self._fused_verify_ws = (
+            _create_gdn_verify_workspace()
+            if _create_gdn_verify_workspace is not None
+            else None
+        )
+        self._fused_verify_active: bool = False
+        self._captured_fused_verify_keys: set[tuple[int, int]] = set()
+        self._max_graph_bs: int = 0
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        self._max_graph_bs = max(self._max_graph_bs, int(max_bs))
+
+    def _capture_metadata(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        self._fused_verify_active = False
+        return super()._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
+
+    def _get_static_int32_full(
+        self, size: int, fill_value: int, device: torch.device
+    ) -> torch.Tensor:
+        key = (size, fill_value)
+        buf = self._const_int32_cache.get(key)
+        if buf is not None and buf.device == device:
+            return buf
+        buf = torch.full((size,), fill_value, dtype=torch.int32, device=device)
+        if not torch.get_device_module().is_current_stream_capturing():
+            self._const_int32_cache[key] = buf
+        return buf
 
     def _prepare_mamba_track_metadata(self, forward_batch: ForwardBatch):
         if self.forward_metadata.has_mamba_track_mask:
@@ -93,6 +247,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         )
         self._prepare_mamba_track_metadata(forward_batch)
         self.graph_mode = True
+        if (
+            not in_capture
+            and forward_batch.forward_mode.is_target_verify()
+            and forward_batch.spec_info is not None
+        ):
+            key = (forward_batch.batch_size, forward_batch.spec_info.draft_token_num)
+            self._fused_verify_active = key in self._captured_fused_verify_keys
+        else:
+            self._fused_verify_active = False
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
@@ -105,6 +268,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         )
         self._prepare_mamba_track_metadata(forward_batch)
         self.graph_mode = False
+        self._fused_verify_active = False
 
     def _get_conv_weights_t(self, layer: RadixLinearAttention) -> torch.Tensor:
         w = getattr(layer, "_conv_weights_t", None)
@@ -178,8 +342,6 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        assert isinstance(mixed_qkv, torch.Tensor)
-        seq_len = mixed_qkv.shape[0]
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
 
@@ -198,31 +360,108 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            has_initial_states = torch.ones(
-                seq_len // forward_batch.spec_info.draft_token_num,
-                dtype=torch.bool,
-                device=forward_batch.input_ids.device,
-            )
-        else:
-            has_initial_states = forward_batch.extend_prefix_lens > 0
-        if is_target_verify:
-            num_token_padding = mixed_qkv.shape[0]
-            if (
-                not self.graph_mode
-                and forward_batch.global_num_token_non_padded_cpu != num_token_padding
-            ):
-                mixed_qkv = mixed_qkv[: forward_batch.global_num_token_non_padded_cpu]
-                a = a[: forward_batch.global_num_token_non_padded_cpu]
-                b = b[: forward_batch.global_num_token_non_padded_cpu]
-                seq_len = forward_batch.global_num_token_non_padded_cpu
-
+            num_heads, head_k_dim = layer.num_q_heads, layer.head_q_dim
+            num_value_heads, head_v_dim = layer.num_v_heads, layer.head_v_dim
             batch_size = cache_indices.shape[0]
             draft_token_num = forward_batch.spec_info.draft_token_num
-            num_accepted_tokens = torch.full(
-                (batch_size,),
-                draft_token_num,
-                dtype=torch.int32,
-                device=mixed_qkv.device,
+
+            if isinstance(mixed_qkv, tuple):
+                qkvz, ba = mixed_qkv
+                num_token_padding = qkvz.shape[0]
+                if (
+                    not self.graph_mode
+                    and forward_batch.global_num_token_non_padded_cpu
+                    != num_token_padding
+                ):
+                    non_pad = forward_batch.global_num_token_non_padded_cpu
+                    qkvz = qkvz[:non_pad]
+                    ba = ba[:non_pad]
+
+                linear_layer_idx = self.state_layer_indices.get(layer.layer_id)
+                num_linear_layers = len(self.state_layer_indices)
+                if (
+                    linear_layer_idx is not None
+                    and num_linear_layers > 0
+                    and self._fused_verify_ws is not None
+                    and _can_use_fused_conv1d_verify(
+                        layer,
+                        qkvz,
+                        ba,
+                        conv_states,
+                        ssm_states,
+                        batch_size=batch_size,
+                        draft_token_num=draft_token_num,
+                        topk=self.topk,
+                    )
+                    and self._fused_verify_ws.ensure_allocated(
+                        num_layers=num_linear_layers,
+                        min_bs=max(batch_size, self._max_graph_bs),
+                        k_ver=draft_token_num,
+                        nk=num_heads,
+                        nv=num_value_heads,
+                        head_dim=head_k_dim,
+                        device=qkvz.device,
+                    )
+                ):
+                    core_attn_out = _sgl_fused_conv1d_gdn_verify(
+                        qkvz,
+                        ba,
+                        self._get_conv_weights_t(layer),
+                        conv_states,
+                        layer.A_log,
+                        layer.dt_bias,
+                        ssm_states,
+                        cache_indices,
+                        batch_size=batch_size,
+                        k_ver=draft_token_num,
+                        num_k_heads=num_heads,
+                        num_v_heads=num_value_heads,
+                        head_dim=head_k_dim,
+                        query_start_loc=query_start_loc,
+                        workspace=self._fused_verify_ws,
+                        linear_layer_idx=linear_layer_idx,
+                    )[0]
+                    self._fused_verify_active = True
+                    if self.graph_mode:
+                        self._captured_fused_verify_keys.add(
+                            (batch_size, draft_token_num)
+                        )
+                    core_attn_out = core_attn_out.view(-1, num_value_heads, head_v_dim)
+                    if (not self.graph_mode) and core_attn_out.shape[
+                        0
+                    ] < num_token_padding:
+                        core_attn_out = torch.cat(
+                            [
+                                core_attn_out,
+                                core_attn_out.new_zeros(
+                                    num_token_padding - core_attn_out.shape[0],
+                                    *core_attn_out.shape[1:],
+                                ),
+                            ],
+                            dim=0,
+                        )
+                    return core_attn_out
+
+                # Fallback when fused conv1d+verify is disabled or shapes don't match.
+                qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+                mixed_qkv = qkvz[:, :qkv_dim].contiguous()
+                b = ba[:, :num_value_heads].contiguous()
+                a = ba[:, num_value_heads:].contiguous()
+            else:
+                num_token_padding = mixed_qkv.shape[0]
+                if (
+                    not self.graph_mode
+                    and forward_batch.global_num_token_non_padded_cpu
+                    != num_token_padding
+                ):
+                    mixed_qkv = mixed_qkv[
+                        : forward_batch.global_num_token_non_padded_cpu
+                    ]
+                    a = a[: forward_batch.global_num_token_non_padded_cpu]
+                    b = b[: forward_batch.global_num_token_non_padded_cpu]
+
+            num_accepted_tokens = self._get_static_int32_full(
+                batch_size, draft_token_num, mixed_qkv.device
             )
             mixed_qkv = causal_conv1d(
                 mixed_qkv,
@@ -237,6 +476,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 run_mode=1,
             )
         else:
+            assert isinstance(mixed_qkv, torch.Tensor)
+            has_initial_states = forward_batch.extend_prefix_lens > 0
             if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[forward_metadata.track_conv_indices]
                 conv_states[forward_metadata.conv_states_mask_indices] = (
@@ -260,29 +501,75 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
             conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
         if is_target_verify:
-            g, beta = fused_gdn_gating_without_sigmoid(layer.A_log, a, b, layer.dt_bias)
-            beta = beta.unsqueeze(0)
             num_heads, head_k_dim = layer.num_q_heads, layer.head_q_dim
             num_value_heads, head_v_dim = layer.num_v_heads, layer.head_v_dim
-
             mixed_qkv_last_dim = mixed_qkv.shape[-1]
-
-            mixed_qkv = mixed_qkv.view(batch_size, -1, mixed_qkv_last_dim)
-            beta = beta.view(batch_size, -1, num_value_heads)
-            g = g.view(batch_size, -1, num_value_heads)
-
-            core_attn_out = self.fused_recurrent_gated_delta_rule_update(
-                mixed_qkv,
-                num_heads,
-                num_value_heads,
-                head_k_dim,
-                head_v_dim,
-                recurrent_state=ssm_states,
-                beta=beta,
-                g=g,
-                cache_indices=cache_indices,
-                intermediate_state=intermediate_state_cache,
+            linear_layer_idx = self.state_layer_indices.get(layer.layer_id)
+            num_linear_layers = len(self.state_layer_indices)
+            use_fused_950 = (
+                linear_layer_idx is not None
+                and num_linear_layers > 0
+                and self._fused_verify_ws is not None
+                and _can_use_fused_gdn_verify(
+                    layer,
+                    mixed_qkv,
+                    a,
+                    b,
+                    ssm_states,
+                    batch_size=batch_size,
+                    draft_token_num=draft_token_num,
+                    topk=self.topk,
+                )
+                and self._fused_verify_ws.ensure_allocated(
+                    num_layers=num_linear_layers,
+                    min_bs=max(batch_size, self._max_graph_bs),
+                    k_ver=draft_token_num,
+                    nk=num_heads,
+                    nv=num_value_heads,
+                    head_dim=head_k_dim,
+                    device=mixed_qkv.device,
+                )
             )
+            if use_fused_950:
+                core_attn_out = _sgl_fused_gdn_verify(
+                    mixed_qkv.view(batch_size, draft_token_num, mixed_qkv_last_dim),
+                    a.view(batch_size, draft_token_num, num_value_heads),
+                    b.view(batch_size, draft_token_num, num_value_heads),
+                    layer.A_log,
+                    layer.dt_bias,
+                    ssm_states,
+                    cache_indices,
+                    num_k_heads=num_heads,
+                    num_v_heads=num_value_heads,
+                    head_dim=head_k_dim,
+                    workspace=self._fused_verify_ws,
+                    linear_layer_idx=linear_layer_idx,
+                )[0]
+                self._fused_verify_active = True
+                if self.graph_mode:
+                    self._captured_fused_verify_keys.add((batch_size, draft_token_num))
+            else:
+                g, beta = fused_gdn_gating_without_sigmoid(
+                    layer.A_log, a, b, layer.dt_bias
+                )
+                beta = beta.unsqueeze(0)
+
+                mixed_qkv = mixed_qkv.view(batch_size, -1, mixed_qkv_last_dim)
+                beta = beta.view(batch_size, -1, num_value_heads)
+                g = g.view(batch_size, -1, num_value_heads)
+
+                core_attn_out = self.fused_recurrent_gated_delta_rule_update(
+                    mixed_qkv,
+                    num_heads,
+                    num_value_heads,
+                    head_k_dim,
+                    head_v_dim,
+                    recurrent_state=ssm_states,
+                    beta=beta,
+                    g=g,
+                    cache_indices=cache_indices,
+                    intermediate_state=intermediate_state_cache,
+                )
             core_attn_out = core_attn_out.view(-1, num_value_heads, head_v_dim)
             if (not self.graph_mode) and core_attn_out.shape[0] < num_token_padding:
                 core_attn_out = torch.cat(
@@ -393,11 +680,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
 
         if self.graph_mode:
-            num_accept_tokens = torch.full(
-                [batch_size], 1, dtype=torch.int32, device=cache_indices.device
+            num_accept_tokens = self._get_static_int32_full(
+                batch_size, 1, cache_indices.device
             )
-            actual_seq_lengths = torch.full(
-                [batch_size], seq_len, dtype=torch.int32, device=cache_indices.device
+            actual_seq_lengths = self._get_static_int32_full(
+                batch_size, seq_len, cache_indices.device
             )
             ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn
         else:

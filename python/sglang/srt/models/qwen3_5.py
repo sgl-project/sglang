@@ -1015,6 +1015,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             z = None
             b = projected_states_ba
             a = projected_states_ba
+        elif (
+            _is_npu
+            and forward_batch.forward_mode.is_target_verify()
+            and envs.SGLANG_NPU_ENABLE_FUSED_GDN_VERIFY.get()
+            and self.conv_kernel_size == 4
+            and self.conv1d.bias is None
+            and isinstance(projected_states_qkvz, torch.Tensor)
+            and isinstance(projected_states_ba, torch.Tensor)
+            and projected_states_qkvz.is_contiguous()
+            and projected_states_ba.is_contiguous()
+        ):
+            qkv_dim = (self.key_dim * 2 + self.value_dim) // self.attn_tp_size
+            mixed_qkv = (projected_states_qkvz, projected_states_ba)
+            a = projected_states_ba
+            b = projected_states_ba
+            z = projected_states_qkvz[:, qkv_dim:].reshape(
+                projected_states_qkvz.shape[0], -1, self.head_v_dim
+            )
         elif use_fused_contiguous_unpack:
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size

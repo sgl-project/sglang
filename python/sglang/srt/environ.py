@@ -1320,6 +1320,8 @@ class Envs:
     # Requantization is lossy (128x128 FP32 scales -> 1x32 UE8M0): enable
     # explicitly for performance after validating workload accuracy.
     SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 = EnvBool(False)
+    # Enable Ascend 950 (arch35) fused Triton GDN speculative verify & commit operators.
+    SGLANG_NPU_ENABLE_FUSED_GDN_VERIFY = EnvBool(True)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
@@ -1353,7 +1355,7 @@ class Envs:
     # can increase memory usage during NPU compiled graph capture.
     SGLANG_NPU_USE_SCATTER_PA_KV_CACHE = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
-    SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
+    SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(True)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
