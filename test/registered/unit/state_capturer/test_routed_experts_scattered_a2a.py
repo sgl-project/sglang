@@ -402,5 +402,39 @@ class TestOutputRankHostCache(CustomTestCase):
         self.assertEqual(int(first_stage.host_cache.buffer.count_nonzero()), 0)
 
 
+class TestRoutedExpertsTopkConfig(CustomTestCase):
+    def _make_capturer(self, hf_text_config):
+        model_config = SimpleNamespace(hf_text_config=hf_text_config)
+        parallel = SimpleNamespace(pp_size=1, num_dp_ranks=1)
+        schedule = SimpleNamespace(chunked_prefill_size=8)
+        with (
+            mock.patch.object(re_mod, "get_parallel", return_value=parallel),
+            mock.patch.object(re_mod, "get_schedule", return_value=schedule),
+            mock.patch.object(re_mod, "is_scheduler_io_rank", return_value=False),
+            mock.patch.object(re_mod, "_is_scattered_a2a_backend", return_value=False),
+        ):
+            return re_mod.RoutedExpertsCapturer(
+                model_config=model_config,
+                num_tokens=8,
+                max_running_requests=1,
+                num_fused_shared_experts=0,
+                stage_start_layer=0,
+                stage_end_layer=2,
+                device="cpu",
+            )
+
+    def test_accepts_gemma4_and_other_moe_topk_attrs(self):
+        for attr in ("num_experts_per_tok", "top_k_experts", "moe_topk"):
+            with self.subTest(attr=attr):
+                cfg = SimpleNamespace(num_hidden_layers=2, **{attr: 8})
+                cap = self._make_capturer(cfg)
+                self.assertEqual(cap.topk_size, 8)
+
+    def test_raises_when_moe_topk_attr_missing(self):
+        cfg = SimpleNamespace(num_hidden_layers=2)
+        with self.assertRaises(ValueError):
+            self._make_capturer(cfg)
+
+
 if __name__ == "__main__":
     unittest.main()
