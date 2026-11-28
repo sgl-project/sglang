@@ -3,15 +3,15 @@
 
 pub mod adapter;
 pub mod chat_formatter;
-mod kimi;
 pub mod prompt;
 pub mod stats;
 
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
-use dynamo_tokenizers::{EncodeSegment, Tokenizer};
-use sglang_processor::openai::{ChatModel, OpenAiTokenizer, ReasoningToggle, TokenPieces};
+use dynamo_tokenizers::Tokenizer;
+use sglang_processor::openai::{ChatModel, OpenAiTokenizer, ReasoningToggle};
+use sglang_processor::SglangTokenizer;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -69,15 +69,13 @@ impl ChatFormatterEntry {
 
 #[derive(Default)]
 pub struct TokenizerRegistry {
-    inner: DashMap<String, Arc<Tokenizer>>,
+    inner: DashMap<String, Arc<SglangTokenizer>>,
     /// Per-model chat formatter, present only when the model's prompt format is
     /// known; models without one fall back to raw prompt-text tokenization.
     formatters: DashMap<String, Arc<ChatFormatterEntry>>,
     /// Resolved encode backend and L1 cache counters of the served model's tokenizer.
     stats: Arc<stats::TokenizerStats>,
-    /// Special tokens the engine adds around a raw prompt; `None` if unknown.
-    prompt_affixes: Option<adapter::PromptAffixes>,
-    /// What SGLang's OpenAI layer asks of the tokenizer; needs `tokenizer.json`.
+    /// The served tokenizer, for SGLang's OpenAI layer; needs `tokenizer.json`.
     openai: Option<Arc<dyn OpenAiTokenizer>>,
     /// The model config SGLang's OpenAI chat layer reads.
     chat_model: ChatModel,
@@ -178,22 +176,6 @@ fn context_length(config: &serde_json::Value) -> u64 {
     .map_or(2048, |len| (factor * len) as u64)
 }
 
-/// The served model's tokenizer as SGLang's OpenAI layer uses it.
-struct OpenAiTokens {
-    tokenizer: Arc<Tokenizer>,
-    pieces: TokenPieces,
-}
-
-impl OpenAiTokenizer for OpenAiTokens {
-    fn decode(&self, ids: &[u32]) -> Option<String> {
-        adapter::decode_complete(&self.tokenizer, ids, true).ok()
-    }
-
-    fn byte_level_bytes(&self, id: u32) -> Option<Vec<u8>> {
-        self.pieces.byte_level_bytes(id)
-    }
-}
-
 impl std::fmt::Debug for TokenizerRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenizerRegistry")
@@ -210,17 +192,15 @@ impl TokenizerRegistry {
             tracing::info!(model = %m.id, "tokenizer disabled; workers tokenize requests");
             return Ok(me);
         };
-        let (t, stats) = adapter::load_with(tokenizer_path, m.tokenizer)?;
+        let files = adapter::ModelFiles::open(tokenizer_path);
+        let (tokenizer, stats) = adapter::load_sglang(tokenizer_path, m.tokenizer, &files)?;
         tracing::info!(model = %m.id, backend = stats.backend().as_str(),
             l1 = stats.l1_state().as_str(), l1_cache_mb = m.tokenizer.l1_cache_mb,
-            "tokenizer loaded");
-        let files = adapter::ModelFiles::open(tokenizer_path);
+            special_tokens_known = tokenizer.knows_special_tokens(), "tokenizer loaded");
+        let tokenizer = Arc::new(tokenizer);
         if let Ok(Some(json)) = files.json("tokenizer.json") {
             me.media_token_ids = media_token_ids(&json);
-            me.openai = Some(Arc::new(OpenAiTokens {
-                tokenizer: Arc::clone(&t),
-                pieces: TokenPieces::from_tokenizer_json(&json),
-            }));
+            me.openai = Some(Arc::clone(&tokenizer) as Arc<dyn OpenAiTokenizer>);
         }
         me.chat_model = ChatModel {
             context_length: files
@@ -240,20 +220,11 @@ impl TokenizerRegistry {
             chat_encoding_spec: None,
             deepseek: None,
         };
-        me.inner.insert(m.id.clone(), t);
+        me.inner.insert(m.id.clone(), tokenizer);
         me.stats = stats;
-        me.prompt_affixes = adapter::prompt_affixes(tokenizer_path, &files)
-            .map_err(|e| {
-                tracing::warn!(model = %m.id, error = %format!("{e:#}"),
-                    "cannot reproduce the engine's tokens; /generate, /v1/embeddings and \
-                     /v1/classify forward text")
-            })
-            .ok();
         match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
-                let mut formatter = formatter
-                    .with_defaults(&m.default_chat_template_kwargs)
-                    .with_prompt_affixes(me.prompt_affixes.as_ref());
+                let mut formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
                 // The processor encodes DeepSeek prompts with HF `tokenizers`. The
                 // router's tokenizer beats it only with the L1 cache (a new turn
                 // re-encodes only its new segments) or fastokens; HF without L1
@@ -328,7 +299,14 @@ impl TokenizerRegistry {
         &self.stats
     }
 
-    pub fn get(&self, model_id: &str) -> Option<Arc<Tokenizer>> {
+    /// The Dynamo backend, for raw-text hashing and `/tokenize`, which encode
+    /// without SGLang's special tokens.
+    pub fn get(&self, model_id: &str) -> Option<Tokenizer> {
+        self.inner.get(model_id).map(|r| r.dynamo().clone())
+    }
+
+    /// The tokenizer as SGLang's serving path uses it.
+    pub fn sglang(&self, model_id: &str) -> Option<Arc<SglangTokenizer>> {
         self.inner.get(model_id).map(|r| Arc::clone(&*r))
     }
 
@@ -343,20 +321,17 @@ impl TokenizerRegistry {
     /// Whether [`Self::encode_prompt`] can tokenize for `model_id`; callers check
     /// it before handing a batch off the worker for nothing.
     pub fn can_encode_prompt(&self, model_id: &str) -> bool {
-        self.prompt_affixes.is_some() && self.inner.contains_key(model_id)
+        self.inner
+            .get(model_id)
+            .is_some_and(|t| t.knows_special_tokens())
     }
 
     fn encode_prompt_now(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
-        let affixes = self.prompt_affixes.as_ref()?;
-        let tokenizer = self.get(model_id)?;
-        // The supported tiktoken models use Kimi's chunked encoding, also used for chat.
-        let ids = if self.stats.backend().is_tiktoken() {
-            kimi::encode(&tokenizer, &[EncodeSegment::control(text)])
-        } else {
-            adapter::encode(&tokenizer, text)
+        // An empty prompt is the engine's to reject, not ours to encode as bare specials.
+        if text.is_empty() {
+            return None;
         }
-        .ok()?;
-        (!ids.is_empty()).then(|| affixes.apply(&ids))
+        self.sglang(model_id)?.encode_prompt(text).ok()
     }
 
     /// Whether this model has a chat formatter (and thus the chat-aware
@@ -402,7 +377,7 @@ impl TokenizerRegistry {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
         let entry = Arc::clone(&*self.formatters.get(model_id)?);
-        let tokenizer = self.get(model_id)?;
+        let tokenizer = self.sglang(model_id)?;
         let ids = if routing {
             entry.formatter.encode_for_routing(&tokenizer, request)
         } else {
@@ -451,10 +426,20 @@ impl TokenizerRegistry {
     }
 }
 
+/// The tokenizer at `source` without SGLang's special tokens or BOS, as most
+/// tests want it.
+#[cfg(test)]
+pub(crate) fn sglang_for_test(source: &str) -> SglangTokenizer {
+    let tokenizer = adapter::load(source).expect("test tokenizer loads");
+    SglangTokenizer::new((*tokenizer).clone(), source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    const TINY: &str = "tests/fixtures/tiny_tokenizer.json";
 
     use crate::config::PolicyKind;
 
@@ -594,7 +579,7 @@ mod tests {
 
         let mut set = JoinSet::new();
         for (i, text) in inputs.into_iter().enumerate() {
-            let shared = Arc::clone(&t);
+            let shared = t.clone();
             set.spawn(async move {
                 let ids = adapter::encode(&shared, &text).expect("concurrent encode must not fail");
                 (i, ids)
@@ -715,11 +700,7 @@ mod tests {
         let formatter = ChatFormatter::load("m", tok.to_str().unwrap())
             .unwrap()
             .expect("DeepSeek-V4.1 formatter");
-        let (tokenizer, _) = adapter::load_with(
-            tok.to_str().unwrap(),
-            crate::config::TokenizerConfig::default(),
-        )
-        .unwrap();
+        let tokenizer = sglang_for_test(tok.to_str().unwrap());
         let image_chat = serde_json::json!({"messages": [{"role": "user", "content": [
             {"type": "text", "text": "look"},
             {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
@@ -843,10 +824,8 @@ mod tests {
     #[test]
     fn encode_chat_renders_then_tokenizes() {
         let reg = TokenizerRegistry::default();
-        reg.inner.insert(
-            "tiny".into(),
-            adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap(),
-        );
+        reg.inner
+            .insert("tiny".into(), Arc::new(sglang_for_test(TINY)));
         let cfg = serde_json::json!({
             "chat_template": "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}{% endfor %}",
             "bos_token": "<s>",
@@ -880,7 +859,8 @@ mod tests {
     fn routing_tokenization_receives_tools_and_template_kwargs() {
         let reg = TokenizerRegistry::default();
         let tok = adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap();
-        reg.inner.insert("tiny".into(), Arc::clone(&tok));
+        reg.inner
+            .insert("tiny".into(), Arc::new(sglang_for_test(TINY)));
         reg.attach_chat_template_for_test(
             "tiny",
             &serde_json::json!({
@@ -901,10 +881,8 @@ mod tests {
     #[test]
     fn encode_chat_none_without_template() {
         let reg = TokenizerRegistry::default();
-        reg.inner.insert(
-            "tiny".into(),
-            adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap(),
-        );
+        reg.inner
+            .insert("tiny".into(), Arc::new(sglang_for_test(TINY)));
         assert!(!reg.has_chat_formatter("tiny"));
         let request = serde_json::json!({"messages": [{"role":"user","content":"hi"}]});
         assert!(reg.encode_chat("tiny", &request).is_none());
@@ -916,10 +894,8 @@ mod tests {
     #[test]
     fn encode_chat_none_on_render_failure() {
         let reg = TokenizerRegistry::default();
-        reg.inner.insert(
-            "tiny".into(),
-            adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap(),
-        );
+        reg.inner
+            .insert("tiny".into(), Arc::new(sglang_for_test(TINY)));
         reg.attach_chat_template_for_test(
             "tiny",
             &serde_json::json!({

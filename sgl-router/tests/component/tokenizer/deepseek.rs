@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use sgl_router::config::{TokenizerBackend, TokenizerConfig};
 use sgl_router::tokenizer::adapter::{self, ModelFiles};
 use sgl_router::tokenizer::chat_formatter::ChatFormatter;
+use sglang_processor::SglangTokenizer;
 
 /// The router renders text only; chats with media go to the worker.
 #[test]
@@ -53,6 +54,11 @@ fn tokenizer_with_l1(
     .unwrap()
 }
 
+/// The tokenizer as the router hands it to chat encodes.
+fn sglang(tokenizer: &dynamo_tokenizers::Tokenizer) -> SglangTokenizer {
+    SglangTokenizer::new(tokenizer.clone(), "tokenizer.json")
+}
+
 /// A conversation that grows by one exchange per turn, each message long
 /// enough (>= 128 bytes) for the L1 segment cache.
 fn turns(n: usize) -> Vec<Value> {
@@ -85,15 +91,17 @@ fn v41_router_tokenizer_matches_processor_and_reuses_segments() {
         assert!(routed.encodes_with_router_tokenizer(), "{backend:?}");
         let (cached_before, _) = stats.l1_tokens();
         for (turn, request) in turns(4).iter().enumerate() {
-            let expected = processor.encode(&tok, request).unwrap();
+            let expected = processor.encode(&sglang(&tok), request).unwrap();
             assert_eq!(
-                routed.encode(&tok, request).unwrap(),
+                routed.encode(&sglang(&tok), request).unwrap(),
                 expected,
                 "{backend:?} turn {turn}"
             );
             assert_eq!(
-                routed.encode_for_routing(&tok, request).unwrap(),
-                processor.encode_for_routing(&tok, request).unwrap(),
+                routed.encode_for_routing(&sglang(&tok), request).unwrap(),
+                processor
+                    .encode_for_routing(&sglang(&tok), request)
+                    .unwrap(),
                 "{backend:?} turn {turn}"
             );
         }
@@ -116,8 +124,8 @@ fn v41_mismatched_router_tokenizer_keeps_processor_encodes() {
     assert!(!routed.encodes_with_router_tokenizer());
     let request = &turns(1)[0];
     assert_eq!(
-        routed.encode(&other, request).unwrap(),
-        processor.encode(&tok, request).unwrap()
+        routed.encode(&sglang(&other), request).unwrap(),
+        processor.encode(&sglang(&tok), request).unwrap()
     );
 }
 
@@ -140,17 +148,17 @@ fn v41_router_tokenizer_leaves_images_to_the_processor() {
             {"type": "text", "text": "what is in this picture? ".repeat(10)},
             image.clone()
         ]}]});
-        let expected = processor.encode_for_routing(&tok, &request);
+        let expected = processor.encode_for_routing(&sglang(&tok), &request);
         let Ok(expected) = expected else {
             // A shape the processor rejects must fail the routed encode as well.
             assert!(
-                routed.encode_for_routing(&tok, &request).is_err(),
+                routed.encode_for_routing(&sglang(&tok), &request).is_err(),
                 "{image}"
             );
             continue;
         };
         assert_eq!(
-            routed.encode_for_routing(&tok, &request).unwrap(),
+            routed.encode_for_routing(&sglang(&tok), &request).unwrap(),
             expected,
             "{image}"
         );
@@ -173,8 +181,8 @@ fn v4_checkpoint_router_tokenizer_matches_processor() {
         assert!(routed.encodes_with_router_tokenizer(), "{backend:?}");
         for (turn, request) in turns(6).iter().enumerate() {
             assert_eq!(
-                routed.encode(&tok, request).unwrap(),
-                processor.encode(&tok, request).unwrap(),
+                routed.encode(&sglang(&tok), request).unwrap(),
+                processor.encode(&sglang(&tok), request).unwrap(),
                 "{backend:?} turn {turn}"
             );
         }
@@ -271,10 +279,10 @@ fn assert_router_ids_match_processor(dir: &str) {
             // Twice: the second pass encodes from L1 where it is on.
             for pass in 0..2 {
                 for (case, request) in agentic_requests().iter().enumerate() {
-                    let expected = processor.encode(&tok, request).unwrap();
+                    let expected = processor.encode(&sglang(&tok), request).unwrap();
                     assert!(expected.len() > 50, "case {case} rendered almost nothing");
                     assert_eq!(
-                        routed.encode(&tok, request).unwrap(),
+                        routed.encode(&sglang(&tok), request).unwrap(),
                         expected,
                         "{backend:?} l1={l1_cache_mb} pass {pass} case {case}"
                     );

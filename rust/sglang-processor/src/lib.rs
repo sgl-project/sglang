@@ -24,6 +24,8 @@ mod py;
 mod render;
 #[cfg(any(feature = "parser", feature = "openai"))]
 mod think;
+#[cfg(any(feature = "openai", feature = "tokenizer"))]
+mod token_pieces;
 #[cfg(feature = "tokenizer")]
 mod tokenizer;
 #[cfg(any(feature = "parser", feature = "openai"))]
@@ -53,7 +55,9 @@ pub use render::{
 #[cfg(any(feature = "parser", feature = "openai"))]
 pub use think::ReasoningOptions;
 #[cfg(feature = "tokenizer")]
-pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
+pub use tokenizer::{
+    DynamoTokenizer, PromptAffixes, SglangTokenizer, TextTokenizer, load_tokenizer,
+};
 #[cfg(any(feature = "parser", feature = "openai"))]
 pub use tool_call::tool_call_id;
 

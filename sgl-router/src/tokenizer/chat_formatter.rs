@@ -20,7 +20,7 @@ use dynamo_renderer::{
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use minijinja::Value;
 use serde_json::Value as JsonValue;
-use sglang_processor::ChatFormatter as ProcessorFormatter;
+use sglang_processor::{ChatFormatter as ProcessorFormatter, SglangTokenizer};
 
 pub type ChatTemplateKwargs = HashMap<String, JsonValue>;
 
@@ -41,8 +41,6 @@ pub struct ChatFormatter {
     formatter: Arc<dyn OAIPromptFormatter>,
     /// Template context defaults; request `chat_template_kwargs` override them.
     defaults: ChatTemplateKwargs,
-    /// Stripped from a separately tokenized continuation prefix, as SGLang does.
-    bos_token: Option<String>,
     /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun render
     /// through `sglang_processor`.
     processor: Option<ProcessorFormatter>,
@@ -51,9 +49,6 @@ pub struct ChatFormatter {
     minimax_m31: bool,
     /// Worker defaults, merged before model-specific effort conversion.
     worker_defaults: ChatTemplateKwargs,
-    /// The special tokens the tokenizer adds around a text, which SGLang keeps on
-    /// a separately encoded continuation prefix; `None` adds none.
-    prompt_affixes: Option<super::adapter::PromptAffixes>,
     /// DeepSeek-V4 / V4.1 prompts encode with the router's tokenizer; see
     /// [`Self::with_router_tokenizer`].
     router_encodes_segments: bool,
@@ -214,18 +209,15 @@ impl ChatFormatter {
         if template.chat_template.is_none() {
             return Ok(None);
         }
-        let bos_token = template.bos_tok();
         let PromptFormatter::OAI(formatter) =
             PromptFormatter::from_parts(template, ContextMixins::default(), true)
                 .context("compile chat template")?;
         Ok(Some(Self {
             formatter,
             defaults,
-            bos_token,
             processor,
             minimax_m31,
             worker_defaults: ChatTemplateKwargs::new(),
-            prompt_affixes: None,
             router_encodes_segments: false,
         }))
     }
@@ -239,11 +231,9 @@ impl ChatFormatter {
         Some(Self {
             formatter,
             defaults: HashMap::new(),
-            bos_token: Some("[BOS]".into()),
             processor: Some(ProcessorFormatter::KimiK3),
             minimax_m31: false,
             worker_defaults: ChatTemplateKwargs::new(),
-            prompt_affixes: None,
             router_encodes_segments: false,
         })
     }
@@ -283,7 +273,6 @@ impl ChatFormatter {
         Some(Self {
             formatter,
             defaults,
-            bos_token: Some("<｜begin▁of▁sentence｜>".into()),
             processor: if is_deepseek_v41 {
                 Some(ProcessorFormatter::DeepSeekV41(None))
             } else {
@@ -291,7 +280,6 @@ impl ChatFormatter {
             },
             minimax_m31: false,
             worker_defaults: ChatTemplateKwargs::new(),
-            prompt_affixes: None,
             router_encodes_segments: false,
         })
     }
@@ -341,12 +329,6 @@ impl ChatFormatter {
     /// request leaves unset, and a default `reasoning_effort` acts as the request's.
     pub fn with_defaults(mut self, defaults: &ChatTemplateKwargs) -> Self {
         self.worker_defaults = defaults.clone();
-        self
-    }
-
-    /// The tokenizer's own special tokens around a text (`adapter::prompt_affixes`).
-    pub fn with_prompt_affixes(mut self, affixes: Option<&super::adapter::PromptAffixes>) -> Self {
-        self.prompt_affixes = affixes.cloned();
         self
     }
 
@@ -557,7 +539,7 @@ impl ChatFormatter {
     /// The chat's prompt ids as the engine renders them. A DeepSeek chat with
     /// images renders with its image placeholders (the engine expands each from
     /// the image's pixels), so these ids count the prompt without its images.
-    pub fn encode(&self, tokenizer: &Tokenizer, request: &JsonValue) -> Result<Vec<u32>> {
+    pub fn encode(&self, tokenizer: &SglangTokenizer, request: &JsonValue) -> Result<Vec<u32>> {
         self.encode_rendered(tokenizer, request).map(|(ids, _)| ids)
     }
 
@@ -568,7 +550,7 @@ impl ChatFormatter {
     /// eligible for input_ids forwarding, and token counts use [`Self::encode`].
     pub fn encode_for_routing(
         &self,
-        tokenizer: &Tokenizer,
+        tokenizer: &SglangTokenizer,
         request: &JsonValue,
     ) -> Result<Vec<u32>> {
         let (ids, images) = self.encode_rendered(tokenizer, request)?;
@@ -577,7 +559,7 @@ impl ChatFormatter {
         }
         Ok(super::tag_images(
             ids,
-            &media_placeholders(tokenizer),
+            &media_placeholders(tokenizer.dynamo()),
             &images,
         ))
     }
@@ -585,7 +567,7 @@ impl ChatFormatter {
     /// The chat's ids, with the sources of the images its placeholders stand for.
     fn encode_rendered(
         &self,
-        tokenizer: &Tokenizer,
+        tokenizer: &SglangTokenizer,
         request: &JsonValue,
     ) -> Result<(Vec<u32>, Vec<String>)> {
         if let Some(formatter) = self.processor.as_ref() {
@@ -594,7 +576,7 @@ impl ChatFormatter {
             // as an image, a video) takes the multimodal path below, which keeps
             // placeholders or reports the error.
             if self.router_encodes_segments && text_only_chat(request) {
-                let ids = self.encode_processor_segments(formatter, tokenizer, request)?;
+                let ids = self.encode_processor_segments(formatter, tokenizer.dynamo(), request)?;
                 return Ok((ids, Vec::new()));
             }
             // DeepSeek renders once, images included: a text chat's ids are the text
@@ -613,31 +595,12 @@ impl ChatFormatter {
             }
         }
         let (prompt, prefix) = self.render_parts(request)?;
-        let mut ids = match prompt.encode_segments() {
-            Some(segments) if self.is_kimi_k3() => super::kimi::encode(tokenizer, &segments)?,
-            Some(segments) => tokenizer.encode_segments(&segments)?.token_ids().to_vec(),
-            None => super::adapter::encode(tokenizer, prompt.as_str())?,
-        };
-        if !prefix.is_empty() {
-            // `_append_assistant_prefix_to_prompt_ids`: SGLang encodes the assistant
-            // prefix separately, special tokens included, and removes its leading BOS.
-            let text = if self.is_kimi_k3() {
-                super::kimi::encode(tokenizer, &[EncodeSegment::control(&prefix)])?
-            } else {
-                super::adapter::encode(tokenizer, &prefix)?
-            };
-            let mut suffix = match &self.prompt_affixes {
-                Some(affixes) => [affixes.prefix.as_slice(), &text, &affixes.suffix].concat(),
-                None => text,
-            };
-            if let Some(bos) = self.bos_token.as_deref().filter(|s| !s.is_empty()) {
-                let bos = super::adapter::encode(tokenizer, bos)?;
-                if bos.len() == 1 && suffix.first() == bos.first() {
-                    suffix.remove(0);
-                }
-            }
-            ids.extend(suffix);
-        }
+        let segments = prompt
+            .encode_segments()
+            .unwrap_or_else(|| vec![EncodeSegment::control(prompt.as_str())]);
+        let ids = tokenizer
+            .encode_chat(&segments, &prefix)
+            .context("tokenize chat")?;
         Ok((ids, Vec::new()))
     }
 
@@ -1499,7 +1462,11 @@ mod tests {
         cfg["model"]["merges"] = json!(["a b"]);
         let path = dir.path().join("tokenizer.json");
         std::fs::write(&path, cfg.to_string()).unwrap();
-        let tokenizer = super::super::adapter::load(path.to_str().unwrap()).unwrap();
+        let file = path.to_str().unwrap();
+        let raw = super::super::adapter::load(file).unwrap();
+        // SGLang drops `tokenizer.bos_token_id`, which `tokenizer_config.json` names.
+        let bos_config = json!({"bos_token": "<|endoftext|>"});
+        let tokenizer = SglangTokenizer::new((*raw).clone(), file).with_bos_token(&bos_config);
         let formatter = jinja(json!({"chat_template":"a", "bos_token":"<|endoftext|>"}));
         let mut req = request(json!([
             {"role":"user","content":"hi"}, {"role":"assistant","content":"b"}
@@ -1507,22 +1474,22 @@ mod tests {
         req["continue_final_message"] = json!(true);
         assert_eq!(formatter.encode(&tokenizer, &req).unwrap(), vec![97, 98]);
         assert_eq!(
-            super::super::adapter::encode(&tokenizer, "ab").unwrap(),
+            super::super::adapter::encode(&raw, "ab").unwrap(),
             vec![257]
         );
         req["messages"][1]["content"] = json!("<|endoftext|>b");
         assert_eq!(formatter.encode(&tokenizer, &req).unwrap(), vec![97, 98]);
         // A tokenizer that adds BOS itself keeps the prefix's own: SGLang encodes
         // `[BOS, BOS, b]` and drops only the first.
-        let bos = super::super::adapter::encode(&tokenizer, "<|endoftext|>").unwrap();
-        let affixes = super::super::adapter::PromptAffixes {
-            prefix: bos.clone(),
-            ..Default::default()
-        };
-        let auto_bos = jinja(json!({"chat_template":"a", "bos_token":"<|endoftext|>"}))
-            .with_prompt_affixes(Some(&affixes));
+        let bos = super::super::adapter::encode(&raw, "<|endoftext|>").unwrap();
+        let auto_bos = SglangTokenizer::new((*raw).clone(), file)
+            .with_bos_token(&bos_config)
+            .with_prompt_affixes(super::super::adapter::PromptAffixes {
+                prefix: bos.clone(),
+                ..Default::default()
+            });
         assert_eq!(
-            auto_bos.encode(&tokenizer, &req).unwrap(),
+            formatter.encode(&auto_bos, &req).unwrap(),
             [vec![97], bos, vec![98]].concat()
         );
         req["continue_final_message"] = json!(false);

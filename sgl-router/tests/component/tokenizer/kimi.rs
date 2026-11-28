@@ -72,7 +72,8 @@ fn kimi_tokens_match_sglang_on(backend: TokenizerBackend) {
         backend,
         l1_cache_mb: 0,
     };
-    let (tokenizer, stats) = adapter::load_with(path, cfg).unwrap();
+    let (tokenizer, stats) =
+        adapter::load_sglang(path, cfg, &adapter::ModelFiles::open(path)).unwrap();
     // `fast` must really encode on fastokens here, not fall back to tiktoken-rs.
     let expected = match backend {
         TokenizerBackend::Hf => EncodeBackend::Tiktoken,
