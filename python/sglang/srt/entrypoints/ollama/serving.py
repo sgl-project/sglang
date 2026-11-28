@@ -48,6 +48,7 @@ class OllamaServing:
                 "temperature": "temperature",
                 "top_p": "top_p",
                 "top_k": "top_k",
+                "min_p": "min_p",
                 "num_predict": "max_new_tokens",
                 "stop": "stop",
                 "presence_penalty": "presence_penalty",
