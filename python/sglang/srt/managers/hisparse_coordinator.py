@@ -661,9 +661,9 @@ class HiSparseCoordinator:
         )
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
-        max_context_len = req_to_token_pool.max_context_len
+        req_to_token_row_width = req_to_token_pool.row_width
         max_compressed_context_len = (
-            max_context_len + self.compress_ratio - 1
+            req_to_token_row_width + self.compress_ratio - 1
         ) // self.compress_ratio
 
         # to have an extra page for new tokens

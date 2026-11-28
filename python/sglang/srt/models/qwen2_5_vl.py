@@ -360,7 +360,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
-        max_context_len: Optional[int] = None,
+        max_position_embeddings: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -419,7 +419,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         )
 
         # Resource prepared for vit cuda graph
-        self.max_context_len = max_context_len
+        self.max_position_embeddings = max_position_embeddings
         self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
 
         self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = None
@@ -749,7 +749,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,
-            max_context_len=self.config.max_position_embeddings,
+            max_position_embeddings=self.config.max_position_embeddings,
         )
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling

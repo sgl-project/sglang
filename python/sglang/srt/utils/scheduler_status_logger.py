@@ -17,6 +17,7 @@ class SchedulerStatusLogger:
         self.loggers = create_log_targets(targets=targets, name_prefix=__name__)
         self.dump_interval = dump_interval
         self.last_dump_time = 0.0
+        self._last_dump_was_idle = False
         self.rank = dist.get_rank() if dist.is_initialized() else 0
 
     @staticmethod
@@ -39,11 +40,16 @@ class SchedulerStatusLogger:
     def maybe_dump(
         self, running_batch: ScheduleBatch, waiting_queue: List[Req]
     ) -> None:
+        is_idle = not running_batch.reqs and not waiting_queue
+        if self.dump_interval == 0 and is_idle and self._last_dump_was_idle:
+            return
+
         now = time.time()
         if now - self.last_dump_time < self.dump_interval:
             return
 
         self.last_dump_time = now
+        self._last_dump_was_idle = is_idle
         log_json(
             self.loggers,
             "scheduler.status",

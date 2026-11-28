@@ -59,6 +59,7 @@ def _build(*, window, lazy):
                 max_total_tokens=512,
                 max_running_requests=2,
                 context_len=512,
+                req_to_token_row_width=512,
                 alignment=1,
             ),
         ),
@@ -75,7 +76,6 @@ def _build(*, window, lazy):
             need_sort=False,
             lazy_compaction=lazy,
             max_num_reqs=2,
-            model_context_len=512,
             state_cache_params=SimpleNamespace(layers=(2,)),
         ),
     )
@@ -331,6 +331,7 @@ def _build_token_heavy(
             budget_bytes=budget_bytes,
             max_running_requests=2,
             context_len=context_len,
+            req_to_token_row_width=context_len,
             alignment=page_size,
         ),
     )
@@ -345,7 +346,6 @@ def _build_token_heavy(
             need_sort=False,
             lazy_compaction=True,
             max_num_reqs=2,
-            model_context_len=context_len,
             state_cache_params=SimpleNamespace(layers=(2,)),
         ),
     )

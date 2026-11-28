@@ -31,7 +31,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_extend,
 )
 from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
-from sglang.srt.mem_cache.allocation_sizing import decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import decode_alloc_targets
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
@@ -328,7 +328,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         self.evict_to_free_tokens(tree_cache, num_tokens)
         if spec_algorithm is not None and spec_algorithm.is_some():
-            prefix_lens, seq_lens, _ = decode_alloc_lens(
+            prefix_lens, seq_lens, _ = decode_alloc_targets(
                 requests, page_size=self.page_size
             )
         else:
