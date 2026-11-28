@@ -33,6 +33,22 @@ sgl-router --model-id qwen3 --service-discovery \
   --pd-version-group-label sglang.ai/version-group
 ```
 
+### Single-token requests on prefill
+
+A PD prefill engine samples the first output token itself, so a request whose
+whole output is that token (prompt scoring, classification, a yes/no judge)
+does not need decode. With `--pd-one-token-on-prefill-only`, the router sends
+a chat, completions or `/generate` request for at most one token, one sample and
+one prompt to the chosen prefill worker alone, with no bootstrap fields. Decode
+reserves no KV for it and no KV is transferred; the prompt still enters that
+prefill's prefix cache. Routing and the DP rank are chosen as for any request.
+
+The router does this only for prefill workers whose `/server_info` reports
+`prefill_answers_alone: true`. A worker running an SGLang that predates the
+field, or one on the `fake` transfer backend, keeps the normal prefill and
+decode path, so the flag is safe to set during a rolling upgrade. A request
+without an explicit `max_tokens` (or `max_new_tokens`) always uses decode.
+
 ### External KV indexer
 
 ```bash
