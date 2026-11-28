@@ -179,6 +179,24 @@ class TestDisallowedTokensLogitsProcessor(CustomTestCase):
         with self.assertRaises(AssertionError):
             self.processor(logits, params)
 
+    def test_negative_token_id_raises(self):
+        """Negative ids would wrap around and ban an unrelated token."""
+        logits = torch.zeros(1, 10)
+        with self.assertRaises(ValueError):
+            self.processor(logits, [{"token_ids": [-1]}])
+
+    def test_out_of_vocab_token_id_raises(self):
+        """Ids at or above the vocab size would index out of bounds."""
+        logits = torch.zeros(1, 10)
+        with self.assertRaises(ValueError):
+            self.processor(logits, [{"token_ids": [10]}])
+
+    def test_non_integer_token_id_raises(self):
+        """Non-integer ids are rejected instead of being truncated."""
+        logits = torch.zeros(1, 10)
+        with self.assertRaises(ValueError):
+            self.processor(logits, [{"token_ids": [1.5]}])
+
 
 # ThinkingBudgetLogitProcessor (using Qwen3 variant)
 class TestThinkingBudgetLogitProcessor(CustomTestCase):
