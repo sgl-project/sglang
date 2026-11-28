@@ -335,11 +335,13 @@ def fp4_ragged_mqa_logits(
     ks: torch.Tensor,
     ke: torch.Tensor,
     plans: Optional[dict] = None,
+    ks_cpu: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Prefill logits [rows, num_keys] of each row over keys [ks, ke), as fp8_mqa_logits
     lays them out; AITER writes only each row's window. weights: bf16 [rows, H], scaled
     by weight_scale in the kernel. plans, a dict that lives as long as the batch whose
-    ks/ke these rows slice, keeps their schedules for the batch's other layers."""
+    ks/ke these rows slice, keeps their schedules for the batch's other layers.
+    ks_cpu: ks on the host, read back when None."""
     rows = query.shape[0]
     logits = torch.empty(
         (rows, keys.num_keys), dtype=torch.float32, device=keys.payload.device
@@ -350,7 +352,7 @@ def fp4_ragged_mqa_logits(
     key = (ks.data_ptr(), ke.data_ptr(), rows, keys.payload.shape[0], keys.num_keys)
     runs = None if plans is None else plans.get(key)
     if runs is None:
-        runs = _fp4_request_runs(keys, ks, ke)
+        runs = _fp4_request_runs(keys, ks, ke, ks_cpu)
         if plans is not None:
             plans[key] = runs
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
@@ -396,7 +398,10 @@ class _Fp4RequestRun(NamedTuple):
 
 
 def _fp4_request_runs(
-    keys: Fp4IndexKeys, ks: torch.Tensor, ke: torch.Tensor
+    keys: Fp4IndexKeys,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    ks_cpu: Optional[torch.Tensor],
 ) -> list[_Fp4RequestRun]:
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
         compute_prefill_schedule,
@@ -407,7 +412,7 @@ def _fp4_request_runs(
     device = keys.payload.device
     # AITER scans keys [0, ke) of a row's table, so each request (a run of rows with one
     # ks) gets a table starting at its first page instead of paying for the keys before it
-    ks_cpu = ks.cpu()
+    ks_cpu = ks.cpu() if ks_cpu is None else ks_cpu
     cuts = (torch.nonzero(ks_cpu[1:] != ks_cpu[:-1]).flatten() + 1).tolist()
     runs = []
     for r0, r1 in zip([0, *cuts], [*cuts, rows]):
