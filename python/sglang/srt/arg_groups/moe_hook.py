@@ -107,10 +107,11 @@ def handle_moe_kernel_config(server_args: Any):
     if view.moe_runner_backend == "flashinfer_cutedsl":
         # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
         assert (
-            view.quantization in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online"]
+            view.quantization
+            in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online", "mxfp8"]
             or model_config_of(server_args).nvfp4_moe_meta is not None
         ), (
-            f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', or hybrid NVFP4 models."
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', 'mxfp8', or hybrid NVFP4 models."
         )
         assert view.ep_size in [
             1,

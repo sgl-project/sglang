@@ -700,7 +700,22 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers=num_layers,
             kv_shard_size=kvc.kv_shard_size,
         )
+        cell_size += self._compute_sdsa_cell_size(
+            hf_config=model_config.hf_config, num_layers=num_layers
+        )
         return cell_size
+
+    @staticmethod
+    def _compute_sdsa_cell_size(*, hf_config, num_layers: int) -> int:
+        from sglang.srt.configs.nemotron_shortcut import sdsa_index_head_dim
+        from sglang.srt.mem_cache.sdsa_kv_pool import SdsaTokenToKVPool
+
+        index_head_dim = sdsa_index_head_dim(hf_config)
+        if index_head_dim is None or num_layers == 0:
+            return 0
+        return SdsaTokenToKVPool.sdsa_bytes_per_token(
+            index_head_dim=index_head_dim, num_layers=num_layers
+        )
 
     @staticmethod
     def _compute_qsa_cell_size(

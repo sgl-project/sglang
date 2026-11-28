@@ -173,6 +173,7 @@ def fused_experts_none_to_marlin(
         clamp_limit=(
             runner_config.gemm1_clamp_limit
             if runner_config.gemm1_alpha is not None
+            or runner_config.activation == "relu2"
             else runner_config.swiglu_limit
         ),
         gemm1_alpha=runner_config.gemm1_alpha,

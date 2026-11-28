@@ -933,7 +933,13 @@ def _fused_moe_kernel_sequence(
     elif activation == "gelu" and not is_gated:
         intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
     elif activation == "relu2" and not is_gated:
-        intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
+        gemm1_out = intermediate_cache1.view(-1, N)
+        if gemm1_limit is not None:
+            # Nemotron Shortcut: relu(c * tanh(x / c))^2, the soft clamp taken in FP32.
+            gemm1_out = (gemm1_limit * torch.tanh(gemm1_out.float() / gemm1_limit)).to(
+                gemm1_out.dtype
+            )
+        intermediate_cache2 = torch.square(F.relu(gemm1_out))
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 

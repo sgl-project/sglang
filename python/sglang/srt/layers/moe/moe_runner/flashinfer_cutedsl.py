@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FP4_SF_VEC_SIZE = 16
+_MXFP8_SF_VEC_SIZE = 32
 _cutedsl_logged_scalarize: set = set()
 
 
@@ -217,16 +218,31 @@ def resolve_cutedsl_standard_scales(
     return w1_alpha, fc2_input_scale, w2_alpha, used_input_scale
 
 
-def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) -> Any:
+def _cutedsl_wrapper_activation_type(
+    activation: str, activation_type_cls: Any, clamp_limit: Optional[float] = None
+) -> Any:
     # FlashInfer selects SiTU as the gated Swiglu path plus situ_beta.
     if activation in ("silu", "situ"):
         return activation_type_cls.Swiglu
     if activation == "relu2":
+        # relu(L * tanh(x / L))^2 when the layer carries a clamp limit.
+        if clamp_limit is not None:
+            return activation_type_cls.ClampedRelu2
         return activation_type_cls.Relu2
     raise ValueError(
         f"CuteDSL MoE wrapper supports 'silu'/'situ' (gated) or 'relu2' "
         f"(non-gated) activation, got {activation!r}."
     )
+
+
+def cutedsl_supports_clamped_relu2() -> bool:
+    """Whether the installed FlashInfer CuTe-DSL MoE takes a ClampedRelu2 limit
+    (FlashInfer >= 0.7.4)."""
+    import inspect
+
+    from flashinfer import CuteDslMoEWrapper
+
+    return "clamped_relu2_limit" in inspect.signature(CuteDslMoEWrapper).parameters
 
 
 def _make_per_token_global_scale(input_tensor: torch.Tensor) -> torch.Tensor:
@@ -290,8 +306,14 @@ def refresh_cutedsl_standard_scales_for_weight_update(
             current.copy_(new)
 
 
-def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
+def ensure_cutedsl_wrapper(
+    layer: torch.nn.Module, quant_mode: Optional[str] = None
+) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
+
+    ``quant_mode`` defaults to the NVFP4 modes; ``"mxfp8"`` serves MXFP8
+    experts (E4M3 weights with UE8M0 block-32 scales and MXFP8 activations),
+    whose block scales carry the whole dequantization, so no alphas apply.
 
     The wrapper is created lazily (not in __init__ / create_weights) because
     it depends on final weight shapes and EP configuration.  The wrapper's
@@ -313,7 +335,10 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             "Install with: pip install flashinfer"
         ) from e
 
-    quant_mode = "w4a16" if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() else "w4a4"
+    if quant_mode is None:
+        quant_mode = (
+            "w4a16" if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() else "w4a4"
+        )
 
     assert layer.intermediate_size_per_partition > 0, (
         f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
@@ -342,6 +367,17 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     # be inplace-updated during later CUDA graph capture (which runs outside
     # inference_mode), so we must opt out here.
     situ_kwargs = {}
+    relu2_clamp = (
+        layer.moe_runner_config.gemm1_clamp_limit
+        if layer.moe_runner_config.activation == "relu2"
+        else None
+    )
+    if relu2_clamp is not None:
+        # Kept on the layer: captured CUDA graphs read it by address.
+        layer._cutedsl_clamped_relu2_limit = torch.tensor(
+            [relu2_clamp], dtype=torch.float32, device=layer.w13_weight.device
+        )
+        situ_kwargs = dict(clamped_relu2_limit=layer._cutedsl_clamped_relu2_limit)
     if layer.moe_runner_config.activation == "situ":
         # SiTU's beta / linear beta, applied in the GEMM1 epilogue.
         situ_kwargs = dict(
@@ -362,7 +398,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             device=str(layer.w13_weight.device),
             use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
             activation_type=_cutedsl_wrapper_activation_type(
-                layer.moe_runner_config.activation, ActivationType
+                layer.moe_runner_config.activation, ActivationType, relu2_clamp
             ),
             quant_mode=quant_mode,
             swap_ab=use_cutedsl_moe_swap_ab(layer.w13_weight.device),
@@ -370,11 +406,24 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             **(dict(swiglu_limit=swiglu_limit) if swiglu_limit is not None else {}),
         )
 
-        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-            resolve_cutedsl_standard_scales(layer)
-        )
-        if layer.quant_config.use_per_token_activation and quant_mode == "w4a4":
-            used_input_scale = _make_per_token_global_scale(used_input_scale)
+        if quant_mode == "mxfp8":
+            ones = torch.ones(
+                layer.num_local_experts,
+                dtype=torch.float32,
+                device=layer.w13_weight.device,
+            )
+            w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+                ones,
+                None,
+                ones,
+                None,
+            )
+        else:
+            w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+                resolve_cutedsl_standard_scales(layer)
+            )
+            if layer.quant_config.use_per_token_activation and quant_mode == "w4a4":
+                used_input_scale = _make_per_token_global_scale(used_input_scale)
     layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     layer._cutedsl_input_scale = used_input_scale
 
@@ -479,6 +528,15 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         x_fp4 = hidden_states
         x_sf = None
         per_token_scale = None
+    elif quant_info.quant_mode == "mxfp8":
+        from flashinfer import mxfp8_quantize
+
+        seq_len, hidden_size = hidden_states.shape
+        x_fp4, x_sf = mxfp8_quantize(hidden_states, is_sf_swizzled_layout=False)
+        x_sf = x_sf.view(torch.uint8).reshape(
+            seq_len, hidden_size // _MXFP8_SF_VEC_SIZE
+        )
+        per_token_scale = None
     else:
         x_fp4, x_sf = fp4_quantize(
             hidden_states,
@@ -488,7 +546,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         )
         per_token_scale = None
 
-    if quant_info.quant_mode != "w4a16":
+    if quant_info.quant_mode in ("w4a4", "w4a8"):
         seq_len, hidden_size = hidden_states.shape
         x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
         x_sf = x_sf.view(torch.float8_e4m3fn).reshape(

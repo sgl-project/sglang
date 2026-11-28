@@ -616,6 +616,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             spec_result = get_linear_attn_config(runner.model_config.hf_config)
             if spec_result is not None:
                 spec, cfg = spec_result
+                if spec.full_attn_backend_factory_name is not None:
+                    full_attn_backend = import_backend_class(
+                        spec.full_attn_backend_factory_name
+                    )(runner, full_attn_backend)
                 BackendClass = import_backend_class(spec.backend_class_name)
                 linear_attn_backend = _create_linear_attention_backend(
                     runner, BackendClass

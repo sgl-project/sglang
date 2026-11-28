@@ -38,7 +38,13 @@ class LinearAttnModelSpec:
     support_mamba_cache_extra_buffer: bool = False
     unwrap_text_config: bool = False  # call get_text_config() before isinstance check
     hybrid_backend_class_name: str | None = None
+    # Dotted name of ``fn(runner, full_attn_backend) -> AttentionBackend`` that may
+    # replace the full-attention side (e.g. with a sparse-attention backend).
+    full_attn_backend_factory_name: str | None = None
     config_predicate: Callable[[Any], bool] | None = None
+    # Wraps a matched config that lacks the hybrid bookkeeping (mamba2_cache_params,
+    # full_attention_layer_ids), e.g. a checkpoint's remote-code config.
+    config_view: Callable[[Any], Any] | None = None
 
 
 _LINEAR_ATTN_MODEL_REGISTRY: list[LinearAttnModelSpec] = []
@@ -60,6 +66,8 @@ def get_linear_attn_config(hf_config: Any) -> Optional[tuple[LinearAttnModelSpec
         if isinstance(config, spec.config_class) and (
             spec.config_predicate is None or spec.config_predicate(config)
         ):
+            if spec.config_view is not None:
+                config = spec.config_view(config)
             return spec, config
     return None
 

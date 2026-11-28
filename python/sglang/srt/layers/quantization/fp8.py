@@ -422,6 +422,18 @@ class Fp8Config(QuantizationConfig):
 
                 return NPUBlockFp8MoEMethod(self)
 
+            if (
+                self.use_mxfp8
+                and not self.is_fp4_experts
+                and _is_cuda
+                and get_moe_runner_backend().is_flashinfer_cutedsl()
+            ):
+                from sglang.srt.layers.quantization.mxfp8_cutedsl_moe import (
+                    Mxfp8CuteDslMoEMethod,
+                )
+
+                return Mxfp8CuteDslMoEMethod(self)
+
             fp8_method = Fp8MoEMethod(self)
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
