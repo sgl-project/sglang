@@ -13,6 +13,12 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
 from sglang.srt.runtime_context import get_context, get_model
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sglang.kernels.ops.embeddings.mean_pool import mean_pool
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -66,6 +72,15 @@ def pool_hidden_states(
         return hidden_states[first_token_flat_indices]
     elif pooling_type == PoolingType.MEAN:
         prompt_lens = forward_batch.extend_seq_lens
+        if (
+            _is_cuda
+            and hidden_states.is_cuda
+            and not hidden_states.requires_grad
+            and hidden_states.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and hidden_states.numel()
+            and prompt_lens.numel()
+        ):
+            return mean_pool(hidden_states, prompt_lens)
         end_indices = torch.cumsum(prompt_lens, dim=0) - 1
         # fp32: a fp16/bf16 batch-wide cumsum swamps short requests after long ones.
         cumulative_hidden_states = torch.cumsum(
