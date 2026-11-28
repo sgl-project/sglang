@@ -2866,6 +2866,26 @@ class TestSSLArgs(unittest.TestCase):
             self.assertIn("--enable-http-worker-reuseport", str(context.exception))
         self._validate_ssl(enable_http_worker_reuseport=True, tokenizer_worker_num=2)
 
+    def test_max_payload_size_must_be_positive(self):
+        for size in (0, -1):
+            with self.subTest(size=size), self.assertRaises(ValueError) as context:
+                self._validate_ssl(max_payload_size=size)
+            self.assertIn("--max-payload-size", str(context.exception))
+
+    def test_max_payload_size_below_granian_minimum_with_http2_raises(self):
+        with self.assertRaises(ValueError) as context:
+            self._validate_ssl(enable_http2=True, max_payload_size=4096)
+        self.assertIn("--max-payload-size", str(context.exception))
+        self.assertIn("8192", str(context.exception))
+
+    def test_max_payload_size_accepted(self):
+        server_args = self._validate_ssl(
+            enable_http2=True, max_payload_size=50 * 1024 * 1024
+        )
+        self.assertEqual(server_args.max_payload_size, 50 * 1024 * 1024)
+        defaults = ServerArgs(model_path="dummy")
+        self.assertEqual(defaults.max_payload_size, 10 * 1024 * 1024)
+
     def test_enable_http2_needs_granian_only_on_the_python_frontend(self):
         # Real models run this validation; the Rust listener serves HTTP/2
         # itself, so only the Python frontend needs Granian. Both frontends
