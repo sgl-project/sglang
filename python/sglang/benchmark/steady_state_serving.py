@@ -9,6 +9,8 @@ Usage example::
 All arguments other than the two steady-state options are forwarded unchanged to
 ``sglang.benchmark.serving``.  The regular serving module is not modified and its
 normal full-run result remains intact.
+
+Steady-state reporting requires the Python client for per-request timing data.
 """
 
 from __future__ import annotations
@@ -78,6 +80,12 @@ def _run_with_capture(
     output_file: Optional[str],
     run_serving_benchmark: Callable[[argparse.Namespace], Dict[str, Any]],
 ) -> Tuple[Dict[str, Any], SteadyStateMetrics]:
+    if getattr(args, "rust_client", False):
+        raise ValueError(
+            "Steady-state reporting requires the Python benchmark client. "
+            "Remove --rust-client to measure a steady-state window."
+        )
+
     captured: Dict[str, Any] = {}
     original_calculate_metrics = serving.calculate_metrics
     calculate_signature = inspect.signature(original_calculate_metrics)
