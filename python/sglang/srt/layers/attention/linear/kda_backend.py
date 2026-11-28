@@ -275,6 +275,11 @@ class KDAKernelDispatcher:
         self.supports_packed_decode_safe_gate = getattr(
             self.decode_kernel, "supports_packed_decode_safe_gate", False
         )
+        # FlashInfer and both Triton extends (chunk_kda, the gfx950 HIP kernel) read
+        # q/k/v as contiguous [tokens, dim] planes; the prefill conv writes them so.
+        self.extend_takes_qkv_planes = (
+            prefill_backend.is_flashinfer() or self.extend_kernel is triton_kernel
+        )
 
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
@@ -1059,12 +1064,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         cache_indices: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return Q/K/V, using contiguous planes for equal-width FlashInfer prefill."""
+        """Return Q/K/V, as contiguous planes when they are equal-width and the
+        extend kernel takes planes."""
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width matches the decode path and saves two kernel launches.
         split_size = (
             layer.q_dim
-            if self.kernel_dispatcher.prefill_backend.is_flashinfer()
+            if self.kernel_dispatcher.extend_takes_qkv_planes
             and layer.q_dim == layer.k_dim == layer.v_dim
             else 0
         )

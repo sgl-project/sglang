@@ -13,7 +13,6 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNKernelDispatcher,
 )
 from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
-from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -108,26 +107,14 @@ class TestTrackMambaStateDtype(CustomTestCase):
         convolved = qkv + 100
         states = torch.zeros(8, 6, 2)
         indices = torch.tensor([6, 2])
-        for backend_type, module, prefill_backend, dims, split_size in (
+        for backend_type, module, takes_planes, dims, split_size in (
             (GDNAttnBackend, gdn_backend, None, (2, 2, 2), 0),
-            (KDAAttnBackend, kda_backend, LinearAttnKernelBackend.TRITON, (2, 2, 2), 0),
-            (
-                KDAAttnBackend,
-                kda_backend,
-                LinearAttnKernelBackend.FLASHINFER,
-                (2, 2, 2),
-                2,
-            ),
-            (
-                KDAAttnBackend,
-                kda_backend,
-                LinearAttnKernelBackend.FLASHINFER,
-                (1, 2, 3),
-                0,
-            ),
+            (KDAAttnBackend, kda_backend, False, (2, 2, 2), 0),
+            (KDAAttnBackend, kda_backend, True, (2, 2, 2), 2),
+            (KDAAttnBackend, kda_backend, True, (1, 2, 3), 0),
         ):
             with self.subTest(
-                backend=backend_type.__name__, prefill=prefill_backend, dims=dims
+                backend=backend_type.__name__, takes_planes=takes_planes, dims=dims
             ):
                 layer = SimpleNamespace(
                     conv_weights=object(),
@@ -140,7 +127,7 @@ class TestTrackMambaStateDtype(CustomTestCase):
                 backend = object.__new__(backend_type)
                 if backend_type is KDAAttnBackend:
                     backend.kernel_dispatcher = SimpleNamespace(
-                        prefill_backend=prefill_backend
+                        extend_takes_qkv_planes=takes_planes
                     )
                 starts = torch.tensor([0, 2, 4])
                 backend.forward_metadata = SimpleNamespace(
