@@ -694,9 +694,17 @@ def run_text_encoder_accuracy_pair(
 
 
 def _run_single_text_encoder_forward(
-    model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    output_layers: Optional[Tuple[int, ...]] = None,
 ) -> torch.Tensor:
-    """Run one encoder forward and normalize its output into a tensor."""
+    """Run one encoder forward and normalize its output into a tensor.
+
+    With ``output_layers`` the result is the stack of the hidden states the
+    pipeline reads. The loader drops the layers after them, so the final
+    hidden state no longer matches the full reference encoder.
+    """
     with torch.no_grad():
         forward_model = resolve_text_encoder_forward_module(model)
         model_device = _module_device(forward_model)
@@ -705,6 +713,8 @@ def _run_single_text_encoder_forward(
             attention_mask=attention_mask.to(device=model_device),
             output_hidden_states=True,
         )
+    if output_layers:
+        return torch.stack([output.hidden_states[k] for k in output_layers], dim=1)
     return extract_output_tensor(output)
 
 
@@ -824,10 +834,17 @@ def _run_staged_text_encoder_accuracy_case(
         input_ids, attention_mask = build_deterministic_text_encoder_inputs(
             ref.config, "cpu"
         )
+        output_layers = getattr(
+            get_global_server_args().pipeline_config,
+            "text_encoder_output_layers",
+            None,
+        )
 
         sgl = sgl.to(device=device, dtype=torch.bfloat16).eval()
         sgl_out = (
-            _run_single_text_encoder_forward(sgl, input_ids, attention_mask)
+            _run_single_text_encoder_forward(
+                sgl, input_ids, attention_mask, output_layers
+            )
             .detach()
             .cpu()
         )
@@ -838,7 +855,9 @@ def _run_staged_text_encoder_accuracy_case(
 
         ref = ref.to(device=device, dtype=torch.bfloat16).eval()
         ref_out = (
-            _run_single_text_encoder_forward(ref, input_ids, attention_mask)
+            _run_single_text_encoder_forward(
+                ref, input_ids, attention_mask, output_layers
+            )
             .detach()
             .cpu()
         )
