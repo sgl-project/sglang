@@ -207,7 +207,6 @@ def _shared_context_attention_kernel(
 
 
 def max_element_offset(tensor: torch.Tensor) -> int:
-    """Largest element offset from the tensor's base that a kernel can address."""
     return sum(
         (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
     )
