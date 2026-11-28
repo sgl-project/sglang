@@ -1,4 +1,4 @@
-"""-1 drop-sentinel handling at the sgl-kernel-xpu fused_experts call sites."""
+"""What the sgl-kernel-xpu fused_experts call sites pass: no -1 drop sentinel, kernel activation names."""
 
 import sys
 import types
@@ -63,6 +63,7 @@ class TestXpuCallSitesNeverPassTheSentinel(CustomTestCase):
 
     def setUp(self) -> None:
         self.kernel_calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self.kernel_options: list[dict[str, object]] = []
 
         def fused_experts(
             hidden_states: torch.Tensor,
@@ -73,6 +74,7 @@ class TestXpuCallSitesNeverPassTheSentinel(CustomTestCase):
             **kernel_options: object,
         ) -> torch.Tensor:
             self.kernel_calls.append((hidden_states, topk_weights, topk_ids))
+            self.kernel_options.append(kernel_options)
             return torch.zeros_like(hidden_states)
 
         self.fake_sgl_kernel = types.ModuleType("sgl_kernel")
@@ -172,6 +174,20 @@ class TestXpuCallSitesNeverPassTheSentinel(CustomTestCase):
                             kernel_weights, (topk_ids >= 0).to(topk_weights.dtype)
                         )
                     )
+
+    def test_unquant_forward_xpu_passes_gelu_tanh_as_kernel_gelu(self) -> None:
+        """Gemma 4 MoE (gelu_pytorch_tanh) failed here with "activation =
+        gelu_tanh is not supported"; sgl-kernel-xpu names tanh-GELU "gelu"."""
+        topk_weights, topk_ids = self.routing(top_k=2)
+        moe_method = SimpleNamespace(
+            moe_runner_config=MoeRunnerConfig(activation="gelu_tanh"),
+            runner=SimpleNamespace(runner_backend=None),
+        )
+        with self.xpu_branch(unquant_module):
+            unquant_module.UnquantizedFusedMoEMethod.forward_xpu(
+                moe_method, self.layer, self.dispatch_output(topk_weights, topk_ids)
+            )
+        self.assertEqual(self.kernel_options[-1]["activation"], "gelu")
 
     def test_fp8_apply(self) -> None:
         topk_weights, topk_ids = self.routing(top_k=2)
