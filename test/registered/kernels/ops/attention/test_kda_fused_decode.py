@@ -131,7 +131,21 @@ def _run_unfused_reference(
     return ref.transpose(0, 1).contiguous()
 
 
+@pytest.fixture(scope="module")
+def _prebuild_modules() -> None:
+    """Build the (heads, gate form) modules the cases reach at once."""
+    from functools import partial
+
+    from sglang.kernels.jit.utils import parallel_compile
+
+    parallel_compile(
+        partial(kda_fused_decode.precompile_kda_fused_decode, heads, heads in (8, 16))
+        for heads in (3, 6, 12, 8, 16)
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("_prebuild_modules")
 @pytest.mark.parametrize(
     "heads,tp_size",
     [

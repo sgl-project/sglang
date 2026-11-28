@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -12,32 +12,39 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_hadamard_module(dtype: torch.dtype) -> Module:
-    args = make_cpp_args(dtype)
+def _jit_hadamard_module(dtype: torch.dtype, multiple: int, log_n: int) -> Module:
+    """One kernel: rows of up to ``multiple << log_n`` elements; unsupported sizes
+    fail the build (static_assert in hadamard_jit.cuh)."""
+    args = make_cpp_args(multiple, log_n, dtype)
     hadamard_include_dir = (KERNEL_PATH / "csrc" / "fast-hadamard-transform").resolve()
     return load_jit(
         "hadamard",
         *args,
         cuda_files=["fast-hadamard-transform/hadamard_jit.cuh"],
-        cuda_wrappers=[
-            ("hadamard_transform", f"HadamardKernel<{args}>::run"),
-            ("hadamard_transform_12n", f"Hadamard12NKernel<{args}>::run"),
-            ("hadamard_transform_20n", f"Hadamard20NKernel<{args}>::run"),
-            ("hadamard_transform_28n", f"Hadamard28NKernel<{args}>::run"),
-            ("hadamard_transform_40n", f"Hadamard40NKernel<{args}>::run"),
-        ],
+        cuda_wrappers=[("hadamard_transform", f"HadamardKernel<{args}>::run")],
         extra_include_paths=[str(hadamard_include_dir)],
     )
+
+
+@cache_once
+def precompile_hadamard(
+    dtype: torch.dtype, dim: int, multiple: int, pad_multiple: int
+) -> Module:
+    """The module serving rows of ``dim`` elements (``multiple`` x 2^k Hadamard)."""
+    padded_dim = (dim + pad_multiple - 1) // pad_multiple * pad_multiple
+    # dim / multiple rounded up to a power of two; the kernel zero-fills the rest.
+    log_n = (padded_dim // multiple - 1).bit_length()
+    return _jit_hadamard_module(dtype, multiple, log_n)
 
 
 def _hadamard_transform_impl(
     x: torch.Tensor,
     scale: float,
+    multiple: int,
     pad_multiple: int,
-    kernel_fn: Callable,
 ) -> torch.Tensor:
     if not x.is_cuda:
-        raise RuntimeError(f"{kernel_fn.__name__} only supports CUDA tensors")
+        raise RuntimeError("hadamard_transform only supports CUDA tensors")
 
     shapes_og = x.size()
     dim_og = x.size(-1)
@@ -49,8 +56,9 @@ def _hadamard_transform_impl(
     if needs_pad:
         x = torch.nn.functional.pad(x, (0, pad_multiple - dim_og % pad_multiple))
 
+    module = precompile_hadamard(x.dtype, dim_og, multiple, pad_multiple)
     out = torch.empty_like(x)
-    kernel_fn(x, out, scale)
+    module.hadamard_transform(x, out, scale)
 
     if needs_pad:
         out = out[:, :dim_og]
@@ -66,25 +74,20 @@ def _hadamard_transform_fake_impl(
 
 @register_custom_op(fake_impl=_hadamard_transform_fake_impl)
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 8, module.hadamard_transform)
+    return _hadamard_transform_impl(x, scale, 1, 8)
 
 
 def hadamard_transform_12n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 4 * 12, module.hadamard_transform_12n)
+    return _hadamard_transform_impl(x, scale, 12, 4 * 12)
 
 
 def hadamard_transform_20n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 4 * 20, module.hadamard_transform_20n)
+    return _hadamard_transform_impl(x, scale, 20, 4 * 20)
 
 
 def hadamard_transform_28n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 4 * 28, module.hadamard_transform_28n)
+    return _hadamard_transform_impl(x, scale, 28, 4 * 28)
 
 
 def hadamard_transform_40n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 4 * 40, module.hadamard_transform_40n)
+    return _hadamard_transform_impl(x, scale, 40, 4 * 40)

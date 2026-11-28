@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
@@ -366,8 +367,7 @@ struct HopperFp8BlockGemvKernel {
     auto* kernel = hopper_fp8_block_gemv_kernel<kMaxM, kRowTiles, kKSplit, kUnroll>;
     static size_t s_smem_opt_in = 48 * 1024;
     if (smem_bytes > s_smem_opt_in) {
-      CHECK_CUDA(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+      runtime::set_max_dynamic_smem(kernel, smem_bytes);
       s_smem_opt_in = smem_bytes;
     }
 

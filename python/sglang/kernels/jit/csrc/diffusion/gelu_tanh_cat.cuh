@@ -48,32 +48,31 @@ __global__ void gelu_tanh_cat_kernel(
 template <typename T>
 void gelu_tanh_cat(tvm::ffi::TensorView attn, tvm::ffi::TensorView mlp, tvm::ffi::TensorView output) {
   using namespace host;
-  CHECK_HOST(attn.ndim() >= 2) << "gelu_tanh_cat: expected at least two dimensions";
-  auto dtype = SymbolicDType{};
-  dtype.set_options<T>();
+  constexpr int kVecN = 16 / sizeof(T);
   auto device_ = SymbolicDevice{};
   device_.set_options<kDLGPU>();
-  for (const auto tensor : {attn, mlp, output}) {
-    dtype.verify(tensor.dtype());
-    device_.verify(tensor.device());
-    CHECK_HOST(tensor.ndim() == attn.ndim() && tensor.is_contiguous())
-        << "gelu_tanh_cat: expected contiguous tensors of equal rank";
-    for (int64_t dim = 0; dim < attn.ndim() - 1; ++dim) {
-      CHECK_HOST(tensor.size(dim) == attn.size(dim)) << "gelu_tanh_cat: leading dimensions must match";
+  // Any number of leading dimensions, equal across the three tensors, so the rank check is by hand.
+  const int64_t rank = attn.ndim();
+  CHECK_HOST(rank >= 2) << "gelu_tanh_cat: expected at least two dimensions";
+  const auto verify = [&](const tvm::ffi::TensorView t) {
+    CHECK_HOST(t.ndim() == rank && is_type<T>(t.dtype()) && t.is_contiguous())
+        << "gelu_tanh_cat: expected contiguous tensors of equal rank and dtype";
+    for (int64_t dim = 0; dim < rank - 1; ++dim) {
+      CHECK_HOST(t.size(dim) == attn.size(dim)) << "gelu_tanh_cat: leading dimensions must match";
     }
-  }
+    device_.verify(t.device());
+    CHECK_HOST(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0) << "gelu_tanh_cat: tensors must be 16-byte aligned";
+  };
+  verify(attn);
+  verify(mlp);
+  verify(output);
   const int64_t a = attn.size(-1);
   const int64_t m = mlp.size(-1);
   CHECK_HOST(output.size(-1) == a + m) << "gelu_tanh_cat: incorrect output width";
-  constexpr int kVecN = 16 / sizeof(T);
   CHECK_HOST(a > 0 && m > 0 && a % kVecN == 0 && m % kVecN == 0)
       << "gelu_tanh_cat: both widths must be positive multiples of " << kVecN;
   const int64_t rows = attn.numel() / a;
   CHECK_HOST(rows > 0) << "gelu_tanh_cat: rows must be positive";
-  CHECK_HOST(
-      reinterpret_cast<uintptr_t>(attn.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(mlp.data_ptr()) % 16 == 0 &&
-      reinterpret_cast<uintptr_t>(output.data_ptr()) % 16 == 0)
-      << "gelu_tanh_cat: tensors must be 16-byte aligned";
   const int64_t n = rows * ((a + m) / kVecN);
   CHECK_HOST(n <= std::numeric_limits<int32_t>::max()) << "gelu_tanh_cat: tensor is too large";
   constexpr int kBlockSize = 256;

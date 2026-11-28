@@ -12,6 +12,8 @@
 //   A = A_left + A_right - 1             (mod 65521)
 //   B = B_left + B_right + len_right * (A_left - 1)  (mod 65521)
 
+#include <sgl_kernel/bits.h>
+#include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
@@ -19,6 +21,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -204,21 +207,35 @@ struct Adler32StridedKernel {
   run(tvm::ffi::TensorView ptrs, tvm::ffi::TensorView lens, tvm::ffi::TensorView states, int64_t num_items) {
     using namespace host;
 
+    auto device = SymbolicDevice{};
+    device.set_options<kDLGPU>();
+    TensorMatcher({num_items})  // ptrs
+        .with_dtype<int64_t>()
+        .with_device(device)
+        .verify(ptrs);
+    TensorMatcher({num_items})  // lens
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(lens);
+    TensorMatcher({-1})  // states: a and b as uint32[num_blocks] each, then len as uint64[num_blocks]
+        .with_dtype<int64_t>()
+        .with_device(device)
+        .verify(states);
+    CHECK_HOST(num_items > 0);
+
     const int64_t* ptrs_ptr = static_cast<const int64_t*>(ptrs.data_ptr());
     const int32_t* lens_ptr = static_cast<const int32_t*>(lens.data_ptr());
 
-    int64_t num_blocks = (num_items + kBlockSize - 1) / kBlockSize;
+    const int64_t num_blocks = div_ceil(num_items, kBlockSize);
+    CHECK_HOST(states.size(0) >= 2 * num_blocks)
+        << "adler32: states holds " << states.size(0) << " int64, needs " << 2 * num_blocks;
 
     uint32_t* out_a = static_cast<uint32_t*>(states.data_ptr());
     uint32_t* out_b = out_a + num_blocks;
     uint64_t* out_len = reinterpret_cast<uint64_t*>(out_b + num_blocks);
 
-    DLDevice device;
-    device.device_type = kDLGPU;
-    device.device_id = ptrs.device().device_id;
-
     size_t smem_bytes = (kBlockSize / 32) * sizeof(Adler32State);
-    LaunchKernel(num_blocks, kBlockSize, device, smem_bytes)(
+    LaunchKernel(num_blocks, kBlockSize, device.unwrap(), smem_bytes)(
         adler32_strided_kernel, ptrs_ptr, lens_ptr, out_a, out_b, out_len, num_items);
   }
 };
@@ -262,27 +279,30 @@ struct Adler32ReduceKernel {
   static void run(tvm::ffi::TensorView states, tvm::ffi::TensorView output, int64_t num_blocks_to_reduce) {
     using namespace host;
 
+    auto device = SymbolicDevice{};
+    device.set_options<kDLGPU>();
+    TensorMatcher({-1})  // states, as written by Adler32StridedKernel
+        .with_dtype<int64_t>()
+        .with_device(device)
+        .verify(states);
+    TensorMatcher({1})  // output
+        .with_dtype<int64_t>()
+        .with_device(device)
+        .verify(output);
+    CHECK_HOST(num_blocks_to_reduce > 0 && states.size(0) >= 2 * num_blocks_to_reduce)
+        << "adler32: states holds " << states.size(0) << " int64, cannot hold " << num_blocks_to_reduce << " blocks";
+
     uint32_t* in_a = static_cast<uint32_t*>(states.data_ptr());
     uint32_t* in_b = in_a + num_blocks_to_reduce;
     uint64_t* in_len = reinterpret_cast<uint64_t*>(in_b + num_blocks_to_reduce);
 
     int64_t* out_ptr = static_cast<int64_t*>(output.data_ptr());
 
-    uint32_t threads = kBlockSize;
-    if (num_blocks_to_reduce < (int64_t)threads) threads = (uint32_t)num_blocks_to_reduce;
-    // Round up to next power of 2 for reduction
-    uint32_t t = 1;
-    while (t < threads)
-      t *= 2;
-    threads = t;
-    if (threads > kBlockSize) threads = kBlockSize;
-
-    DLDevice device;
-    device.device_type = kDLGPU;
-    device.device_id = states.device().device_id;
-
-    size_t smem_bytes = ((threads + 31) / 32) * sizeof(Adler32State);
-    LaunchKernel(1, threads, device, smem_bytes)(
+    // One thread per block to reduce, rounded up to a power of two for the tree reduction.
+    static_assert(is_pow2(kBlockSize), "the rounded-up thread count must stay within kBlockSize");
+    const auto threads = static_cast<uint32_t>(round_up_pow2(std::min<uint64_t>(num_blocks_to_reduce, kBlockSize)));
+    const size_t smem_bytes = div_ceil(threads, 32u) * sizeof(Adler32State);
+    LaunchKernel(1, threads, device.unwrap(), smem_bytes)(
         adler32_reduce_kernel, in_a, in_b, in_len, out_ptr, num_blocks_to_reduce);
   }
 };

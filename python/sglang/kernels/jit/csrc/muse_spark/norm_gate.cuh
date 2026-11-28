@@ -1,5 +1,5 @@
 /**
- * \brief Fused per-head RMS norm + sigmoid gate for the MuseSpark v1.2 attention output.
+ * Fused per-head RMS norm + sigmoid gate for the MuseSpark v1.2 attention output.
  *
  * x: [num_tokens * num_heads, head_dim], contiguous, row = (token, head).
  * y: same shape and dtype as x.
@@ -43,18 +43,17 @@ struct NormGateParams {
   float eps;
 };
 
-/// \brief One kVecBytes vector per thread; a head_dim row spans kThreadsPerRow lanes.
+// One kVecBytes vector per thread; a head_dim row spans kThreadsPerRow lanes.
 template <typename T, int64_t kHeadDim, int32_t kVecBytes>
 struct NormGateTrait {
   using Packed = packed_t<T>;
   static constexpr int64_t kPack = kVecBytes / static_cast<int64_t>(sizeof(Packed));
   static constexpr int64_t kElemsPerThread = kPack * 2;
-  static constexpr bool kValid = kVecBytes <= static_cast<int32_t>(device::kMaxVecBytes) &&
-                                 kHeadDim % kElemsPerThread == 0 && kHeadDim / kElemsPerThread <= 32;
-  // Keep the dependent types well-formed even for a rejected (vector, head_dim) pair.
-  static constexpr int64_t kThreadsPerRow = kValid ? kHeadDim / kElemsPerThread : 1;
+  static_assert(kVecBytes <= static_cast<int32_t>(device::kMaxVecBytes), "vector wider than this arch loads");
+  static_assert(kHeadDim % kElemsPerThread == 0 && kHeadDim / kElemsPerThread <= 32, "a row must fit in one warp");
+  static constexpr int64_t kThreadsPerRow = kHeadDim / kElemsPerThread;
   static constexpr int64_t kRowsPerWarp = device::kWarpThreads / kThreadsPerRow;
-  using Storage = device::AlignedVector<Packed, kValid ? kPack : 1>;
+  using Storage = device::AlignedVector<Packed, kPack>;
 };
 
 template <
@@ -161,132 +160,114 @@ __global__ __launch_bounds__(
   }
 }
 
-#define SGL_NORM_GATE_DISPATCH_BOOL(cond, kFlag, ...) \
-  [&] {                                               \
-    if (cond) {                                       \
-      constexpr bool kFlag = true;                    \
-      return (__VA_ARGS__)();                         \
-    } else {                                          \
-      constexpr bool kFlag = false;                   \
-      return (__VA_ARGS__)();                         \
-    }                                                 \
-  }()
-
 struct NormGateConfig {
   int32_t vec_bytes;
   int32_t warps_per_block;
 };
 
-template <typename T, int64_t kHeadDim, bool kUsePDL>
+// One module per (layer shape, flags). The (vector width, block size) choice is
+// constexpr per (desired width, 32B alignment); run() picks one by input size and alignment.
+template <
+    typename T,
+    int64_t kHeadDim,
+    uint32_t kNumHeads,
+    bool kHasNorm,
+    bool kHasWeight,
+    bool kHasGate,
+    bool kSingleGroup,
+    bool kUsePDL>
 struct NormGateKernel {
-  static constexpr NormGateConfig kConfigs[] = {
-      {4, 1},
-      {4, 2},
-      {4, 4},
-      {4, 8},
-      {8, 1},
-      {8, 2},
-      {8, 4},
-      {8, 8},
-      {16, 1},
-      {16, 2},
-      {16, 4},
-      {16, 8},
-      {32, 1},
-      {32, 2},
-      {32, 4},
-      {32, 8},
-  };
-  static constexpr int32_t kNumConfigs = sizeof(kConfigs) / sizeof(NormGateConfig);
+  static_assert(kHasNorm || !kHasWeight, "a weight only scales the normed row");
+  static constexpr int64_t kWideBytes = 32;
+  static constexpr uint32_t kMaxGridY = 65535;
 
-  template <int32_t kConfig, bool kHasNorm, bool kHasWeight, bool kHasGate, bool kSingleGroup, bool kExact>
-  static void launch(const NormGateParams& params, DLDevice device) {
-    using Trait = NormGateTrait<T, kHeadDim, kConfigs[kConfig].vec_bytes>;
-    if constexpr (Trait::kValid) {
-      constexpr auto kCfg = kConfigs[kConfig];
-      constexpr auto kernel = norm_gate_kernel<
-          T,
-          kHeadDim,
-          kCfg.vec_bytes,
-          kCfg.warps_per_block,
-          kHasNorm,
-          kHasWeight,
-          kHasGate,
-          kSingleGroup,
-          kExact,
-          kUsePDL>;
-
-      constexpr uint32_t kRowsPerBlock = Trait::kRowsPerWarp * kCfg.warps_per_block;
-      const uint32_t grid_x = host::div_ceil(params.num_heads, kRowsPerBlock);
-      // gridDim.y is capped by the hardware limit; the kernel strides over tokens.
-      const uint32_t grid_y = std::min<uint32_t>(params.num_tokens, 65535u);
-      host::LaunchKernel(dim3(grid_x, grid_y), kCfg.warps_per_block * device::kWarpThreads, device)
-          .enable_pdl(kUsePDL)(kernel, params);
-    }
-  }
-
-  template <int32_t kConfig, bool kHasNorm, bool kHasWeight, bool kHasGate, bool kSingleGroup, bool kExact>
-  static void dispatch_config(const NormGateParams& params, DLDevice device, int32_t config) {
-    if constexpr (kConfig < kNumConfigs) {
-      if (config == kConfig) {
-        return launch<kConfig, kHasNorm, kHasWeight, kHasGate, kSingleGroup, kExact>(params, device);
-      }
-      return dispatch_config<kConfig + 1, kHasNorm, kHasWeight, kHasGate, kSingleGroup, kExact>(params, device, config);
-    }
-  }
-
-  static int64_t elems_per_thread(const NormGateConfig& cfg) {
-    return cfg.vec_bytes / static_cast<int64_t>(sizeof(packed_t<T>)) * 2;
-  }
-
-  /// \brief Rows per block for a config, or 0 when it cannot run on this input.
-  static uint32_t runtime_rows_per_block(const NormGateConfig& cfg, bool vec32_ok) {
+  // Rows (heads) per block for a config, or 0 when it cannot run.
+  static constexpr uint32_t rows_per_block(NormGateConfig cfg, bool vec32_ok) {
     if (cfg.vec_bytes > static_cast<int32_t>(device::kMaxVecBytes)) return 0;
     if (cfg.vec_bytes > 16 && !vec32_ok) return 0;
-    if (kHeadDim % elems_per_thread(cfg) != 0) return 0;
-    const int64_t threads_per_row = kHeadDim / elems_per_thread(cfg);
+    // The kernel loads packed pairs (packed_t<T>).
+    const int64_t elems_per_thread = cfg.vec_bytes / static_cast<int64_t>(sizeof(packed_t<T>)) * 2;
+    if (elems_per_thread == 0 || kHeadDim % elems_per_thread != 0) return 0;
+    const int64_t threads_per_row = kHeadDim / elems_per_thread;
     if (threads_per_row > device::kWarpThreads) return 0;
     return static_cast<uint32_t>(device::kWarpThreads / threads_per_row) * cfg.warps_per_block;
   }
 
-  /// \brief Vector width from the total thread count, then the largest block
-  /// that still divides the head axis evenly.
-  static int32_t select_config(uint32_t num_tokens, uint32_t num_heads, bool vec32_ok, int32_t device_id) {
-    static const uint32_t num_sm = host::runtime::get_sm_count(device_id);
-    const uint64_t num_rows = static_cast<uint64_t>(num_tokens) * num_heads;
-    const auto threads_for = [&](int32_t vec_bytes) {
-      return num_rows * static_cast<uint64_t>(kHeadDim * sizeof(T)) / static_cast<uint64_t>(vec_bytes);
-    };
-    int32_t desired_vec = 8;
-    if (threads_for(8) > static_cast<uint64_t>(num_sm) * 256) desired_vec = 16;
-    if (desired_vec == 16 && threads_for(16) > static_cast<uint64_t>(num_sm) * 2048) desired_vec = 32;
+  // The largest-vector, near-target block that divides the head axis evenly.
+  static constexpr NormGateConfig select_config(int32_t desired_vec, bool vec32_ok) {
+    constexpr int32_t kVecBytes[] = {4, 8, 16, 32};
+    constexpr int32_t kWarps[] = {1, 2, 4, 8};
     // 32B saturates bandwidth with half the threads; the others want a full block.
     const uint32_t target_threads = desired_vec == 32 ? 128 : 256;
-
-    int32_t best = -1;
+    NormGateConfig best{0, 0}, fallback{0, 0};
     uint64_t best_key = 0;
-    for (int32_t config = 0; config < kNumConfigs; ++config) {
-      const NormGateConfig& cfg = kConfigs[config];
-      const uint32_t rows = runtime_rows_per_block(cfg, vec32_ok);
-      if (rows == 0 || num_heads % rows != 0) continue;
-      const uint32_t threads = cfg.warps_per_block * device::kWarpThreads;
-      const uint32_t distance = threads > target_threads ? threads - target_threads : target_threads - threads;
-      const uint64_t key = (static_cast<uint64_t>(threads >= 128) << 40) |
-                           (static_cast<uint64_t>(cfg.vec_bytes == desired_vec) << 32) |
-                           (static_cast<uint64_t>(1024 - std::min<uint32_t>(distance, 1023)) << 8) |
-                           static_cast<uint64_t>(cfg.vec_bytes);
-      if (best < 0 || key > best_key) {
-        best = config;
-        best_key = key;
+    for (const auto vec_bytes : kVecBytes) {
+      for (const auto warps : kWarps) {
+        const NormGateConfig cfg{vec_bytes, warps};
+        const uint32_t rows = rows_per_block(cfg, vec32_ok);
+        if (rows == 0) continue;
+        if (fallback.vec_bytes == 0) fallback = cfg;
+        if (kNumHeads % rows != 0) continue;
+        const uint32_t threads = warps * device::kWarpThreads;
+        const uint32_t distance = threads > target_threads ? threads - target_threads : target_threads - threads;
+        const uint64_t key = (uint64_t{threads >= 128} << 40) | (uint64_t{vec_bytes == desired_vec} << 32) |
+                             (uint64_t{1024 - std::min<uint32_t>(distance, 1023)} << 8) |
+                             static_cast<uint64_t>(vec_bytes);
+        if (key > best_key) {
+          best = cfg;
+          best_key = key;
+        }
       }
     }
-    if (best < 0) {
-      // No block divides the head axis; fall back to anything that runs.
-      for (int32_t config = 0; config < kNumConfigs; ++config) {
-        if (runtime_rows_per_block(kConfigs[config], vec32_ok) > 0) return config;
-      }
+    // No block divides the head axis: fall back to anything that runs.
+    return best.vec_bytes != 0 ? best : fallback;
+  }
+
+  // Indexed by [desired vector width 8 / 16 / 32][32B-aligned].
+  static constexpr NormGateConfig kChoices[3][2] = {
+      {select_config(8, false), select_config(8, true)},
+      {select_config(16, false), select_config(16, true)},
+      {select_config(32, false), select_config(32, true)},
+  };
+  static_assert(kChoices[0][0].vec_bytes != 0, "no norm_gate config covers this head_dim");
+
+  template <NormGateConfig kCfg, bool kExact>
+  static void launch(const NormGateParams& params, DLDevice device) {
+    using Trait = NormGateTrait<T, kHeadDim, kCfg.vec_bytes>;
+    constexpr uint32_t kRowsPerBlock = Trait::kRowsPerWarp * kCfg.warps_per_block;
+    constexpr auto kernel = norm_gate_kernel<
+        T,
+        kHeadDim,
+        kCfg.vec_bytes,
+        kCfg.warps_per_block,
+        kHasNorm,
+        kHasWeight,
+        kHasGate,
+        kSingleGroup,
+        kExact,
+        kUsePDL>;
+    // gridDim.y is capped by the hardware limit; the non-exact kernel strides over tokens.
+    const uint32_t grid_x = host::div_ceil(kNumHeads, kRowsPerBlock);
+    const uint32_t grid_y = std::min(params.num_tokens, kMaxGridY);
+    host::LaunchKernel(dim3(grid_x, grid_y), kCfg.warps_per_block * device::kWarpThreads, device)
+        .enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  template <int kDesired, bool kVec32>
+  static void launch_choice(const NormGateParams& params, DLDevice device) {
+    constexpr auto kCfg = kChoices[kDesired][kVec32];
+    // One token per block and a grid that never over-covers the head axis: drops
+    // the grid-stride backedge, the safe_head clamp and the store predicate.
+    if constexpr (kNumHeads % rows_per_block(kCfg, kVec32) == 0) {
+      if (params.num_tokens <= kMaxGridY) return launch<kCfg, true>(params, device);
     }
-    return best;
+    launch<kCfg, false>(params, device);
+  }
+
+  template <int kDesired>
+  static void dispatch_alignment(const NormGateParams& params, DLDevice device, bool vec32_ok) {
+    if (vec32_ok) return launch_choice<kDesired, true>(params, device);
+    launch_choice<kDesired, false>(params, device);
   }
 
   static void
@@ -294,98 +275,79 @@ struct NormGateKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> gate,    // [num_tokens, num_groups, group_width]
       const tvm::ffi::Optional<tvm::ffi::TensorView> weight,  // [head_dim]
       const tvm::ffi::TensorView y,                           // [num_tokens * num_heads, head_dim]
-      int64_t num_heads,
-      double eps,
-      bool has_norm,
-      int64_t config_override) {
+      double eps) {
     using namespace host;
 
-    auto N = SymbolicSize{"num_rows"};
-    auto D = SymbolicSize{"head_dim"};
     auto device = SymbolicDevice{};
-    D.set_value(kHeadDim);
     device.set_options<kDLGPU>();
 
-    TensorMatcher({N, D}).with_strides({D, 1}).with_dtype<T>().with_device(device).verify(x).verify(y);
-    if (weight.has_value()) {
-      TensorMatcher({D}).with_strides({1}).with_dtype<T>().with_device(device).verify(weight.value());
+    TensorMatcher({-1, kHeadDim})  //
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(x)
+        .verify(y);
+    CHECK_HOST(weight.has_value() == kHasWeight);
+    if constexpr (kHasWeight) {
+      TensorMatcher({kHeadDim})  //
+          .with_dtype<T>()
+          .with_device(device)
+          .verify(weight.value());
     }
-
-    const auto num_rows = static_cast<uint64_t>(N.unwrap());
-    RuntimeCheck(num_heads > 0 && num_rows % static_cast<uint64_t>(num_heads) == 0);
-    const auto num_tokens = static_cast<uint32_t>(num_rows / static_cast<uint64_t>(num_heads));
+    const auto num_rows = static_cast<uint64_t>(x.size(0));
+    CHECK_HOST(num_rows % kNumHeads == 0);
+    const auto num_tokens = static_cast<uint32_t>(num_rows / kNumHeads);
 
     auto params = NormGateParams{
         .x = x.data_ptr(),
         .gate = nullptr,
-        .weight = weight.has_value() ? weight.value().data_ptr() : nullptr,
+        .weight = kHasWeight ? weight.value().data_ptr() : nullptr,
         .y = y.data_ptr(),
         .gate_stride_token = 0,
         .gate_stride_group = 0,
         .num_tokens = num_tokens,
-        .num_heads = static_cast<uint32_t>(num_heads),
-        .heads_per_group = static_cast<uint32_t>(num_heads),
+        .num_heads = kNumHeads,
+        .heads_per_group = kNumHeads,
         .eps = static_cast<float>(eps),
     };
 
-    constexpr int64_t kWideBytes = 32;
-    const auto aligned = [](const void* ptr) { return reinterpret_cast<uintptr_t>(ptr) % kWideBytes == 0; };
-    const auto aligned_elems = [](int64_t elems) { return elems * sizeof(T) % kWideBytes == 0; };
-    bool vec32_ok = kHeadDim * sizeof(T) % kWideBytes == 0 && aligned(params.x) && aligned(params.y);
+    // Every address the kernel vectorizes over, OR-ed: its lowest set bit is the alignment.
+    uint64_t address_bits = kHeadDim * sizeof(T) | reinterpret_cast<uintptr_t>(params.x) |
+                            reinterpret_cast<uintptr_t>(params.y) | reinterpret_cast<uintptr_t>(params.weight);
 
-    bool single_group = true;
-    if (gate.has_value()) {
-      auto Tk = SymbolicSize{"num_tokens"};
-      auto G = SymbolicSize{"num_groups"};
-      auto W = SymbolicSize{"group_width"};
-      auto S0 = SymbolicSize{"gate_stride_token"};
-      auto S1 = SymbolicSize{"gate_stride_group"};
-      Tk.set_value(num_tokens);
-      TensorMatcher({Tk, G, W}).with_strides({S0, S1, 1}).with_dtype<T>().with_device(device).verify(gate.value());
-      const auto num_groups = static_cast<int64_t>(G.unwrap());
-      const auto group_width = static_cast<int64_t>(W.unwrap());
-      RuntimeCheck(group_width % kHeadDim == 0 && num_groups * group_width == num_heads * kHeadDim);
-      params.gate = gate.value().data_ptr();
-      params.gate_stride_token = S0.unwrap();
-      params.gate_stride_group = S1.unwrap();
+    CHECK_HOST(gate.has_value() == kHasGate);
+    if constexpr (kHasGate) {
+      const auto& g = gate.value();
+      TensorMatcher({num_tokens, kSingleGroup ? 1 : -1, -1})  //
+          .with_strides({-1, -1, 1})
+          .with_dtype<T>()
+          .with_device(device)
+          .verify(g);
+      const auto num_groups = g.size(1);
+      const auto group_width = g.size(2);
+      CHECK_HOST(group_width % kHeadDim == 0 && num_groups * group_width == kNumHeads * kHeadDim);
+      params.gate = g.data_ptr();
+      params.gate_stride_token = g.stride(0);
+      params.gate_stride_group = g.stride(1);
       params.heads_per_group = static_cast<uint32_t>(group_width / kHeadDim);
-      single_group = num_groups == 1;
-      vec32_ok = vec32_ok && aligned(params.gate) && aligned_elems(params.gate_stride_token) &&
-                 aligned_elems(params.gate_stride_group);
-    }
-    if (weight.has_value()) {
-      vec32_ok = vec32_ok && aligned(params.weight);
+      address_bits |= reinterpret_cast<uintptr_t>(params.gate) | params.gate_stride_token * sizeof(T) |
+                      params.gate_stride_group * sizeof(T);
     }
 
     if (num_tokens == 0) return;
 
+    // The vector width follows the thread count the whole input needs:
+    // 8B up to num_sm * 256 threads, 16B up to num_sm * 2048, then 32B.
     const auto dl_device = device.unwrap();
-    int32_t config = select_config(num_tokens, params.num_heads, vec32_ok, dl_device.device_id);
-    // dispatch_config matches on equality, so a -1 here would fall through every
-    // config and leave y unwritten rather than failing.
-    RuntimeCheck(config >= 0, "no norm_gate config covers this head_dim");
-    if (config_override >= 0) {
-      config = static_cast<int32_t>(config_override);
-      RuntimeCheck(config < kNumConfigs && runtime_rows_per_block(kConfigs[config], vec32_ok) > 0);
-    }
-    const bool has_weight = has_norm && weight.has_value();
-    const bool has_gate = gate.has_value();
-    // One token per block and a grid that never over-covers the head axis: drops
-    // the grid-stride backedge, the safe_head clamp and the store predicate.
-    const uint32_t rows_per_block = runtime_rows_per_block(kConfigs[config], vec32_ok);
-    const bool exact = num_tokens <= 65535 && params.num_heads % rows_per_block == 0;
-
-    SGL_NORM_GATE_DISPATCH_BOOL(has_norm, kHasNorm, [&] {
-      SGL_NORM_GATE_DISPATCH_BOOL(has_weight, kHasWeight, [&] {
-        SGL_NORM_GATE_DISPATCH_BOOL(has_gate, kHasGate, [&] {
-          SGL_NORM_GATE_DISPATCH_BOOL(single_group, kSingleGroup, [&] {
-            SGL_NORM_GATE_DISPATCH_BOOL(exact, kExact, [&] {
-              dispatch_config<0, kHasNorm, kHasWeight, kHasGate, kSingleGroup, kExact>(params, dl_device, config);
-            });
-          });
-        });
-      });
-    });
+    const uint64_t num_sm = runtime::get_sm_count(dl_device.device_id);
+    const uint64_t num_bytes = uint64_t{num_tokens} * kNumHeads * kHeadDim * sizeof(T);
+    const int desired = num_bytes / 8 <= num_sm * 256 ? 0 : num_bytes / 16 <= num_sm * 2048 ? 1 : 2;
+    const bool vec32_ok = address_bits % kWideBytes == 0;
+    // The narrow choices load at most 16B; check that they are aligned to their width.
+    CHECK_HOST(address_bits % kChoices[desired][vec32_ok].vec_bytes == 0)
+        << "norm_gate: inputs are not aligned to " << kChoices[desired][vec32_ok].vec_bytes << " bytes";
+    if (desired == 0) return dispatch_alignment<0>(params, dl_device, vec32_ok);
+    if (desired == 1) return dispatch_alignment<1>(params, dl_device, vec32_ok);
+    dispatch_alignment<2>(params, dl_device, vec32_ok);
   }
 };
 

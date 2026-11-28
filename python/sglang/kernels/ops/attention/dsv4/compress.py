@@ -28,9 +28,7 @@ if _is_xpu:
         flash_compress128_decode,
         flash_compress128_prefill,
         plan_compress_decode,
-        plan_compress_decode_legacy,
         plan_compress_prefill,
-        plan_compress_prefill_legacy,
     )
 
     _XPU_COMPRESS_FNS = {
@@ -136,14 +134,13 @@ def _jit_compress_plan_module() -> Module:
         cuda_wrappers=[
             ("plan_prefill", "plan_compress_prefill"),
             ("plan_decode", "plan_compress_decode"),
-            ("plan_prefill_legacy", "plan_compress_prefill_legacy"),
-            ("plan_decode_legacy", "plan_compress_decode_legacy"),
         ],
     )
 
 
 # ----------------------------------------------------------------------------
-# Plan tensor sizes (must match the C++ structs in compress.cuh).
+# Pinned staging bytes per query token: one CompressPlan (16 B) and one
+# WritePlan (8 B); must match the C++ structs in compress_v2.cuh.
 # ----------------------------------------------------------------------------
 _PREFILL_PLAN_BYTES = 24
 
@@ -194,21 +191,6 @@ class CompressorDecodePlan(NamedTuple):
             "use_req_ring is not supported by the XPU compress plan builder"
         )
         plan_d = fn(*args) if _is_xpu else fn(*args, bool(use_req_ring))
-        return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
-
-    @staticmethod
-    def generate_legacy(
-        compress_ratio: Literal[4, 128],
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ) -> CompressorDecodePlan:
-        if _is_xpu:
-            fn = plan_compress_decode_legacy
-        else:
-            module = _jit_compress_plan_module()
-            fn = module.plan_decode_legacy
-
-        plan_d = fn(req_pool_indices, seq_lens, compress_ratio)
         return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
 
     @staticmethod
@@ -310,43 +292,6 @@ class CompressorPrefillPlan(NamedTuple):
             fn(*args, bool(use_cuda_graph))
             if _is_xpu
             else fn(*args, bool(use_req_ring), bool(use_cuda_graph))
-        )
-        return CompressorPrefillPlan(
-            compress_ratio,
-            torch.from_dlpack(plan_c) if not _is_xpu else plan_c,
-            torch.from_dlpack(plan_w) if not _is_xpu else plan_w,
-            pin_buffer,
-        )
-
-    @staticmethod
-    def generate_legacy(
-        compress_ratio: Literal[4, 128],
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        extend_lens: torch.Tensor,
-        num_q_tokens: int,
-        device: torch.device,
-        use_cuda_graph: bool = False,
-    ) -> CompressorPrefillPlan:
-        pin_buffer = torch.empty(
-            num_q_tokens * _PREFILL_PLAN_BYTES,
-            dtype=torch.uint8,
-            pin_memory=True,
-        )
-        if _is_xpu:
-            fn = plan_compress_prefill_legacy
-        else:
-            module = _jit_compress_plan_module()
-            fn = module.plan_prefill_legacy
-
-        plan_c, plan_w = fn(
-            req_pool_indices,
-            seq_lens,
-            extend_lens,
-            pin_buffer,
-            int(num_q_tokens),
-            int(compress_ratio),
-            bool(use_cuda_graph),
         )
         return CompressorPrefillPlan(
             compress_ratio,

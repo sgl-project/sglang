@@ -13,10 +13,7 @@ from typing import Tuple
 import torch
 
 from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
-from sglang.kernels.ops.attention.dsv4.compress import (
-    CompressorDecodePlan,
-    compress_norm_rope_store,
-)
+from sglang.kernels.ops.attention.dsv4.compress import compress_norm_rope_store
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     dequantize_k_cache_paged_dsv4,
 )
@@ -30,6 +27,7 @@ from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_compressed
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.deepseek_v4 import dsv41_kv_quant_reference as tq
+from sglang.test.kernels.deepseek_v4.common import make_legacy_context
 from sglang.test.test_utils import CustomTestCase
 
 # the V4.1 store kernels are the SM100 / gfx950 JIT kernels; the only Blackwell runner
@@ -417,9 +415,7 @@ class TestV41KVStore(CustomTestCase):
                 * ratio
             )
             seq_lens[3] += 1  # not a group boundary: writes nothing
-            plan = CompressorDecodePlan.generate_legacy(
-                ratio, torch.arange(n, device="cuda", dtype=torch.int64), seq_lens
-            )
+            plan = make_legacy_context(n, ratio).make_decode_plan(seq_lens)
             valid = seq_lens % ratio == 0
             pos = seq_lens - ratio
             out_loc = torch.randperm(num_pages * page_size, generator=g, device="cuda")[

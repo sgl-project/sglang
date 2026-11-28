@@ -240,22 +240,18 @@ struct FP8WoAGroupMajorQuantUE8M0Kernel {
   }
 };
 
+// Minimum resident blocks per SM for the RoPE kernel's __launch_bounds__.
+constexpr uint32_t kRopeMinBlocks = 16;
+static_assert(SUBWARPS_PER_BLOCK * THREADS_PER_GROUP * kRopeMinBlocks <= 2048, "exceeds the SM thread limit");
+
 // Fused inverse RoPE with vectorized frequency loads and early dependency loads.
-template <
-    typename T,
-    bool kUsePDL,
-    uint32_t kGPT,
-    uint32_t kSubwarps,
-    bool kStreamLoad,
-    bool kPrefetchRope,
-    uint32_t kMinBlocks>
-__global__ void __launch_bounds__(kSubwarps* THREADS_PER_GROUP, kMinBlocks)
+template <typename T, bool kUsePDL>
+__global__ void __launch_bounds__(SUBWARPS_PER_BLOCK* THREADS_PER_GROUP, kRopeMinBlocks)
     fp8_wo_a_group_major_quant_ue8m0_rope_kernel(
         const T* __restrict__ input,
         fp8_e4m3_t* __restrict__ output_q,
         int32_t* __restrict__ output_s,
         uint32_t total_scale_groups,
-        uint32_t num_tokens,
         uint32_t hidden_dim_groups,
         int packed_hidden_dim_groups,
         uint32_t num_outer_groups,
@@ -265,13 +261,16 @@ __global__ void __launch_bounds__(kSubwarps* THREADS_PER_GROUP, kMinBlocks)
         const int64_t* __restrict__ positions) {
   constexpr int kRopeDim = 64;
   constexpr int kHeadDim = 512;
+  // scale groups per subwarp
+  constexpr uint32_t kGPT = 1;
+  static_assert(kGPT == 1, "the host grid launches one scale group per subwarp");
   constexpr uint32_t INPUT_VEC_SIZE = INPUT_VEC_NUM_BYTES / sizeof(T);
   static_assert(INPUT_VEC_SIZE * THREADS_PER_GROUP == GROUP_SIZE);
   static_assert(INPUT_VEC_SIZE == 16, "inverse RoPE assumes 8 (cos, sin) pairs per lane");
 
   const int subwarp_id = threadIdx.x / THREADS_PER_GROUP;
   const int lane_id = threadIdx.x % THREADS_PER_GROUP;
-  const uint32_t block_base = blockIdx.x * (kSubwarps * kGPT) + subwarp_id;
+  const uint32_t block_base = blockIdx.x * (SUBWARPS_PER_BLOCK * kGPT) + subwarp_id;
 
   int4 input_int4[kGPT][INPUT_INT4_SIZE];
   float4 freq[kGPT][INPUT_VEC_SIZE / 4];
@@ -283,7 +282,7 @@ __global__ void __launch_bounds__(kSubwarps* THREADS_PER_GROUP, kMinBlocks)
   // Phase 1: index math (no global reads).
 #pragma unroll
   for (uint32_t k = 0; k < kGPT; ++k) {
-    const uint32_t group_id = block_base + k * kSubwarps;
+    const uint32_t group_id = block_base + k * SUBWARPS_PER_BLOCK;
     valid[k] = group_id < total_scale_groups;
     hidden_group[k] = group_id % hidden_dim_groups;
     const uint32_t token_outer = group_id / hidden_dim_groups;
@@ -294,25 +293,23 @@ __global__ void __launch_bounds__(kSubwarps* THREADS_PER_GROUP, kMinBlocks)
     pair0[k] = (col_in_head - (kHeadDim - kRopeDim)) / 2;
   }
 
-  // positions -> freqs is a dependent 2-load chain; with kPrefetchRope it is
-  // issued ahead of the input loads so its latency overlaps them.
-  auto load_rope = [&]() {
+  // positions -> freqs is a dependent 2-load chain; it is issued ahead of the
+  // input loads so its latency overlaps them.
+  device::PDLWaitPrimary<kUsePDL>();
 #pragma unroll
-    for (uint32_t k = 0; k < kGPT; ++k)
-      position[k] = do_rope[k] ? __ldg(positions + token_idx[k]) : 0;
+  for (uint32_t k = 0; k < kGPT; ++k) {
+    position[k] = do_rope[k] ? __ldg(positions + token_idx[k]) : 0;
+  }
 #pragma unroll
-    for (uint32_t k = 0; k < kGPT; ++k) {
-      if (do_rope[k]) {
-        const float4* f = reinterpret_cast<const float4*>(freqs_cis + position[k] * kRopeDim + 2 * pair0[k]);
+  for (uint32_t k = 0; k < kGPT; ++k) {
+    if (do_rope[k]) {
+      const float4* f = reinterpret_cast<const float4*>(freqs_cis + position[k] * kRopeDim + 2 * pair0[k]);
 #pragma unroll
-        for (uint32_t q = 0; q < INPUT_VEC_SIZE / 4; ++q)
-          freq[k][q] = __ldg(f + q);
+      for (uint32_t q = 0; q < INPUT_VEC_SIZE / 4; ++q) {
+        freq[k][q] = __ldg(f + q);
       }
     }
-  };
-  device::PDLWaitPrimary<kUsePDL>();
-
-  if constexpr (kPrefetchRope) load_rope();
+  }
 
   // Phase 2: input loads for all kGPT groups.
 #pragma unroll
@@ -323,15 +320,10 @@ __global__ void __launch_bounds__(kSubwarps* THREADS_PER_GROUP, kMinBlocks)
           hidden_group[k] * GROUP_SIZE + lane_id * INPUT_VEC_SIZE);
 #pragma unroll
       for (uint32_t j = 0; j < INPUT_INT4_SIZE; ++j) {
-        if constexpr (kStreamLoad) {
-          input_int4[k][j] = __ldcs(src + j);
-        } else {
-          input_int4[k][j] = src[j];
-        }
+        input_int4[k][j] = src[j];
       }
     }
   }
-  if constexpr (!kPrefetchRope) load_rope();
 
   // Phase 3: rope + absmax + UE8M0 quant, preserving the BF16 rounding boundary.
 #pragma unroll
@@ -351,7 +343,7 @@ __global__ void __launch_bounds__(kSubwarps* THREADS_PER_GROUP, kMinBlocks)
       }
     }
 
-    const int64_t group_id = block_base + k * kSubwarps;
+    const int64_t group_id = block_base + k * SUBWARPS_PER_BLOCK;
     QuantizeWoAGroup(
         input_vec,
         output_q,
@@ -393,12 +385,11 @@ struct FP8WoAGroupMajorQuantUE8M0RopeKernel {
     const auto block = dim3(SUBWARPS_PER_BLOCK * THREADS_PER_GROUP);
     host::LaunchKernel(grid, block, params.device.unwrap())
         .enable_pdl(kUsePDL)(
-            fp8_wo_a_group_major_quant_ue8m0_rope_kernel<T, kUsePDL, 1, 16, false, true, 16>,
+            fp8_wo_a_group_major_quant_ue8m0_rope_kernel<T, kUsePDL>,
             static_cast<const T*>(input.data_ptr()),
             static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
             static_cast<int32_t*>(output_s.data_ptr()),
             static_cast<uint32_t>(total_scale_groups),
-            static_cast<uint32_t>(params.num_tokens),
             static_cast<int>(params.hidden_dim_groups),
             static_cast<int>(params.packed_hidden_dim_groups),
             static_cast<int>(params.num_outer_groups),

@@ -13,9 +13,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "tvm_ffi_utils.h"
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/utils.cuh>
+
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/function.h>
+
 #include <algorithm>
-#include <cuda_runtime.h>
+#include <cstdint>
 #include <limits>
 
 namespace sglang {
@@ -42,8 +49,7 @@ __global__ void moe_permute_prepare_kernel(
     int32_t* __restrict__ src2dst,
     int32_t num_experts,
     int32_t numel,
-    bool use_int64_offset,
-    bool is_ep) {
+    bool use_int64_offset) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
   // Padding and nonlocal routes are both inactive, independently of EP.
@@ -70,56 +76,58 @@ __global__ void moe_permute_prepare_kernel(
 }
 
 void moe_permute_prepare(
-    TensorView sorted_topk_ids,
-    TensorView reorder_ids,
-    TensorView expert_offsets,
-    TensorView src2dst,
+    tvm::ffi::TensorView sorted_topk_ids,
+    tvm::ffi::TensorView reorder_ids,
+    tvm::ffi::TensorView expert_offsets,
+    tvm::ffi::TensorView src2dst,
     int64_t num_experts,
-    bool use_int64_offset,
-    bool is_ep) {
-  CHECK_INPUT_AND_TYPE(sorted_topk_ids, dl_int32);
-  CHECK_INPUT_AND_TYPE(reorder_ids, dl_int64);
-  CHECK_INPUT_AND_TYPE(src2dst, dl_int32);
-  CHECK_CUDA(expert_offsets);
-  CHECK_CONTIGUOUS(expert_offsets);
-  CHECK_DEVICE(sorted_topk_ids, reorder_ids);
-  CHECK_DEVICE(sorted_topk_ids, expert_offsets);
-  CHECK_DEVICE(sorted_topk_ids, src2dst);
-  CHECK_DIM(1, sorted_topk_ids);
-  CHECK_DIM(1, reorder_ids);
-  CHECK_DIM(1, expert_offsets);
-  CHECK_DIM(1, src2dst);
-  TVM_FFI_ICHECK_EQ(reorder_ids.size(0), sorted_topk_ids.size(0));
-  TVM_FFI_ICHECK_EQ(src2dst.size(0), sorted_topk_ids.size(0));
-  TVM_FFI_ICHECK_GE(num_experts, 0);
-  TVM_FFI_ICHECK_LT(num_experts, std::numeric_limits<int32_t>::max());
-  TVM_FFI_ICHECK_LE(sorted_topk_ids.size(0), std::numeric_limits<int32_t>::max());
-  TVM_FFI_ICHECK_EQ(expert_offsets.size(0), num_experts + 1);
+    bool use_int64_offset) {
+  using namespace host;
+
+  auto N = SymbolicSize{"numel"};
+  auto device = SymbolicDevice{};
+  device.set_options<kDLGPU>();
+  TensorMatcher({N})  // sorted_topk_ids
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(sorted_topk_ids);
+  TensorMatcher({N})  // reorder_ids
+      .with_dtype<int64_t>()
+      .with_device(device)
+      .verify(reorder_ids);
+  TensorMatcher({N})  // src2dst
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(src2dst);
+  CHECK_HOST(num_experts >= 0 && num_experts < std::numeric_limits<int32_t>::max());
+  CHECK_HOST(N.unwrap() <= std::numeric_limits<int32_t>::max());
   if (use_int64_offset) {
-    CHECK_INPUT_TYPE(expert_offsets, dl_int64);
+    TensorMatcher({num_experts + 1})  // expert_offsets
+        .with_dtype<int64_t>()
+        .with_device(device)
+        .verify(expert_offsets);
   } else {
-    CHECK_INPUT_TYPE(expert_offsets, dl_int32);
+    TensorMatcher({num_experts + 1})  // expert_offsets
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(expert_offsets);
   }
 
-  cudaSetDevice(sorted_topk_ids.device().device_id);
-  cudaStream_t stream = get_stream(sorted_topk_ids.device());
-  int32_t numel = static_cast<int32_t>(sorted_topk_ids.size(0));
-  int32_t num_experts_i32 = static_cast<int32_t>(num_experts);
-  constexpr int threads = 256;
-  int num_blocks = std::max(1, (std::max(numel, num_experts_i32 + 1) + threads - 1) / threads);
+  const auto numel = static_cast<int32_t>(N.unwrap());
+  const auto num_experts_i32 = static_cast<int32_t>(num_experts);
+  constexpr uint32_t kThreads = 256;
+  const auto num_work = static_cast<uint32_t>(std::max(numel, num_experts_i32 + 1));
+  const auto num_blocks = div_ceil(num_work, kThreads);
 
-  moe_permute_prepare_kernel<<<num_blocks, threads, 0, stream>>>(
+  LaunchKernel(num_blocks, kThreads, device.unwrap())(
+      moe_permute_prepare_kernel,
       static_cast<const int32_t*>(sorted_topk_ids.data_ptr()),
       static_cast<const int64_t*>(reorder_ids.data_ptr()),
       expert_offsets.data_ptr(),
       static_cast<int32_t*>(src2dst.data_ptr()),
       num_experts_i32,
       numel,
-      use_int64_offset,
-      is_ep);
-
-  cudaError_t err = cudaGetLastError();
-  TVM_FFI_ICHECK(err == cudaSuccess) << "moe_permute_prepare launch failed: " << cudaGetErrorString(err);
+      use_int64_offset);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_permute_prepare, moe_permute_prepare);

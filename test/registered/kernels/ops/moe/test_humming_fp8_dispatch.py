@@ -60,7 +60,6 @@ class TestHummingFp8Dispatch(CustomTestCase):
             input_scale=hidden_states_scale,
             topk_ids=topk_ids,
             num_experts=3,
-            is_ep=True,
         )
 
         for token in range(topk_ids.size(0)):
@@ -343,7 +342,7 @@ class TestHummingInactiveRoutes(CustomTestCase):
             (ids.numel(), 128), float("nan"), device="cuda", dtype=inputs.dtype
         )
         permuted, src2dst, offsets = moe_permute(
-            inputs, ids, num_experts=2, is_ep=False, outputs=output
+            inputs, ids, num_experts=2, outputs=output
         )
         self.assertTrue((src2dst.view_as(ids)[ids < 0] < 0).all().item())
         torch.testing.assert_close(
