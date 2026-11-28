@@ -49,6 +49,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_gfx95_supported,
     is_gfx1250_supported,
+    is_hip,
     print_info_once,
 )
 
@@ -235,6 +236,45 @@ def _asm_cprr_kernel_heads(gathered_heads: int, q_len: int) -> int:
         if heads >= gathered_heads and _asm_cprr_supports_shape(heads, q_len):
             return heads
     return 0
+
+
+def _keep_mla_ps_without_nps_kernel(
+    *,
+    use_ps: bool,
+    fast_mode: bool,
+    intra_batch_mode: bool,
+    kv_cache_dtype: torch.dtype,
+    kernel_num_head: int,
+    head_pad_mode: str,
+    dcp_world_size: int,
+) -> tuple[bool, bool, bool]:
+    """(use_ps, fast_mode, intra_batch_mode), with PS turned back on where aiter
+    has no non-persistent decode kernel for the query and KV dtypes.
+
+    Below gfx950 decode keeps q in bf16 (only gfx95 quantizes it to fp8), and
+    aiter's gfx942 table has a bf16-q / fp8-KV / 16-head MLA decode kernel only
+    in its persistent form, so SGLANG_AITER_MLA_PERSIST=0 fails at the first
+    decode with "cannot get heuristic kernel".
+    """
+    if (
+        use_ps
+        or not is_hip()
+        or is_gfx95_supported()
+        or is_gfx1250_supported()
+        or kv_cache_dtype != fp8_dtype
+        or kernel_num_head != 16
+        or head_pad_mode == "zero"
+        or dcp_world_size > 1
+    ):
+        return use_ps, fast_mode, intra_batch_mode
+    logger.warning(
+        "SGLANG_AITER_MLA_PERSIST=0 is ignored: aiter on this GPU has no "
+        "non-persistent MLA decode kernel for a bf16 query with an fp8 KV cache "
+        "at 16 heads, so the persistent kernel is used. Use --kv-cache-dtype "
+        "auto to run the non-persistent kernel."
+    )
+    # The module defaults for SGLANG_AITER_MLA_PERSIST=1.
+    return True, False, True
 
 
 # (v_head_dim -> query head counts) that aiter's mla_reduce_v1 has an
@@ -1271,6 +1311,17 @@ class AiterAttnBackend(AttentionBackend):
                     intra_batch_mode = False
                 log_mla_gluon_capability(logger)
 
+            _use_mla_ps_kernel, fast_mode, intra_batch_mode = (
+                _keep_mla_ps_without_nps_kernel(
+                    use_ps=_use_mla_ps_kernel,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    kernel_num_head=self.mla_kernel_num_head_padded,
+                    head_pad_mode=self.head_pad_mode,
+                    dcp_world_size=self.dcp_world_size,
+                )
+            )
             use_any_mla_persist = _use_mla_ps_kernel or self.use_mla_dcp_asm
             self.max_split_per_batch = 32 if use_any_mla_persist else None
 
