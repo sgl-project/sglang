@@ -19,6 +19,7 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.utils import (
     _is_complete_json,
     get_schema_properties,
+    schema_allows_null,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,8 +75,11 @@ class DotsToolDetector(BaseFormatDetector):
             return json_repair.loads(value)
 
     @classmethod
-    def _convert_param_value(cls, value: str, param_type: Any) -> Any:
-        if value.lower() == "null":
+    def _convert_param_value(
+        cls, value: str, param_type: Any, param_schema: Any = None
+    ) -> Any:
+        # The text "null" is a real string unless the schema accepts null.
+        if value.lower() == "null" and schema_allows_null(param_schema):
             return None
 
         if isinstance(param_type, list):
@@ -98,7 +102,15 @@ class DotsToolDetector(BaseFormatDetector):
             except (TypeError, ValueError):
                 return value
         if param_type in {"boolean", "bool"}:
-            return value.lower() in {"true", "1"}
+            lowered = value.lower()
+            if lowered not in {"true", "1", "false", "0"}:
+                logger.warning(
+                    "Parsed value '%s' of a boolean parameter is not `true`/`false`, "
+                    "keeping the raw string.",
+                    value,
+                )
+                return value
+            return lowered in {"true", "1"}
 
         try:
             return cls._load_json(value)
@@ -156,11 +168,14 @@ class DotsToolDetector(BaseFormatDetector):
             param_name = self._extract_name(parameter.group("name"))
             value = parameter.group("value").strip()
             param_type: Any = "string"
+            param_schema = properties.get(param_name)
             if param_name in properties:
                 param_type = (
                     self._resolve_param_type(properties[param_name], defs) or "string"
                 )
-            arguments[param_name] = self._convert_param_value(value, param_type)
+            arguments[param_name] = self._convert_param_value(
+                value, param_type, param_schema
+            )
 
         return {"name": name, "arguments": arguments}
 
