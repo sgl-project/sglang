@@ -457,7 +457,12 @@ def get_quant_config(
                 )
             )
         )
-        if not modelopt_mixed_config_incomplete:
+        # Backend-only ModelSlim metadata has its per-layer descriptions in
+        # quant_model_description.json rather than config.json.
+        modelslim_config_incomplete = model_config.quantization == "modelslim" and not (
+            hf_quant_config.keys() - {"quant_method"}
+        )
+        if not (modelopt_mixed_config_incomplete or modelslim_config_incomplete):
             hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
             hf_quant_config["hf_config"] = model_config.hf_config
 

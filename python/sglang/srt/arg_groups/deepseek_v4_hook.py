@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.engram_config import (
     EngramConfig,
     EngramLookup,
+    EngramPlacement,
+    EngramPoolConfig,
     EngramReplication,
     cols_per_rank,
 )
@@ -77,6 +80,10 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
             raise ValueError("--engram-config applies to DeepSeek-V4.1 only.")
         return
     config = EngramConfig() if raw is None else EngramConfig.from_dict(raw)
+    if config.pool is not None and not is_npu():
+        raise ValueError("--engram-config: pool requires an NPU server")
+    if config.placement == EngramPlacement.CPU and is_npu():
+        config = dataclasses.replace(config, pool=config.pool or EngramPoolConfig())
     if config.lookup == EngramLookup.PEER_READ and not get_platform().is_cuda:
         raise ValueError("--engram-config: lookup 'peer_read' needs CUDA.")
     if config.lookup in (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL) and (
@@ -93,8 +100,13 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
                 f"--engram-config: lookup 'all_to_all' needs the {columns} hash "
                 f"columns to divide over --tp-size {cfg.tp_size}."
             )
-    # One mapping per TP group, which its ranks open through /proc.
-    if config.replication == EngramReplication.PER_NODE and cfg.nnodes > 1:
+    # CUDA host tables open one mapping through /proc within a TP group.
+    # NPU pools instead derive node-local members from the distributed TP ranks.
+    if (
+        config.replication == EngramReplication.PER_NODE
+        and cfg.nnodes > 1
+        and not is_npu()
+    ):
         raise ValueError(
             "--engram-config: replication 'per_node' needs the TP group on one node."
         )

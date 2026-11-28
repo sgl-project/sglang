@@ -1,7 +1,10 @@
 """ModelSlim name resolution and weight dtypes, using small CPU layers."""
 
+import json
+import tempfile
 import unittest
 from copy import copy, deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,6 +27,31 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestModelSlimMapping(CustomTestCase):
+    def test_backend_only_metadata_loads_external_description(self):
+        from sglang.srt.configs.load_config import LoadConfig
+        from sglang.srt.model_loader.weight_utils import get_quant_config
+
+        description = {"model.layers.0.mlp.gate_proj.weight": "W8A8_DYNAMIC"}
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "quant_model_description.json").write_text(
+                json.dumps(description)
+            )
+            model_config = SimpleNamespace(
+                quantization="modelslim",
+                hf_config={"quantization_config": {"quant_method": "ascend"}},
+                model_path=folder,
+                is_draft_model=False,
+            )
+            with patch(
+                "sglang.srt.model_loader.weight_utils.get_quantization_config",
+                return_value=ModelSlimConfig,
+            ):
+                result = get_quant_config(model_config, LoadConfig(), {})
+        self.assertEqual(
+            result.quant_description["model.layers.0.mlp.gate_proj.weight"],
+            "W8A8_DYNAMIC",
+        )
+
     def make_linear(self, config, prefix):
         """Build a small CPU layer: input width 4, output width 6."""
         with torch.device("cpu"):

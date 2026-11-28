@@ -19,9 +19,10 @@ defaults:
 
 | Key | Question | Values |
 |---|---|---|
-| `placement` | Where do the rows live? | `gpu` (default): device memory. `cpu`: pinned host memory, which the GPU reads in place; the HBM goes to the KV cache. |
+| `placement` | Where do the rows live? | `gpu` (default): device memory, including NPU HBM. `cpu`: host memory, read in place on CUDA or through the MemFabric acc_offload host pool on Ascend A3/A5. |
 | `replication` | How many copies are there? | `none` (default): one table, its rows split across the TP group. `per_node`: each node holds the whole table, mapped by all of its ranks. `group_shards`: one table split across the GPUs of several servers (for example every prefill server of a disaggregated deployment), in their GPU or host memory (`placement`); each rank reads its tokens' rows in place. |
 | `lookup` | How does a rank get rows another rank holds? Only with `replication` `none`; `group_shards` always reads in place. | `auto` (default): `peer_read` for GPU tables whose TP group is one NVLink domain, otherwise a collective SGLang picks for each step. `all_reduce`, `reduce_scatter`, `all_to_all`: that collective (see below). `peer_read`: each rank reads its tokens' rows straight from the owning GPU's shard over NVLink, with no collective. |
+| `pool` | Which NPU ranks share and contribute host memory? | Optional MemFabric pool object; see [Ascend host pools](#ascend-host-pools). |
 
 The configuration is logged at startup as `DeepSeek-V4.1 Engram tables: ...`, and the lookup
 `auto` resolves to, once the model is built, as `Engram lookup auto -> ...`.
@@ -35,6 +36,66 @@ sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 4
 sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 4 \
   --engram-config '{"placement": "cpu"}'
 ```
+
+## Ascend host pools
+
+On Linux Ascend servers, install `memfabric-hybrid` and its matching acc_offload kernels
+before enabling host offload. A3 uses mapped codes/scales with fused lookup and dequantization;
+A5 uses `entry_gather` with device-resident scales. Pool configuration does not change either
+lookup path or its graph behavior.
+
+For one serving instance per node, keep a complete table on each node with:
+
+```bash
+sglang serve --model-path "$MODEL_PATH" --device npu --tp-size 16 \
+  --engram-config '{"placement":"cpu","replication":"per_node"}'
+```
+
+The example uses 16 local NPU ranks; adjust TP to your deployment. MemFabric derives the
+node-local members from the serving topology. On NPU, the default `replication="none"` also
+uses a node-shared pool when no cross-instance topology is configured. Ordinary DP replicas
+(`--dp-size` greater than one, distinct from attention DP) require an explicit `pool.store_url`.
+
+To share one table across independent P/D instances, set `pool` in each instance's existing
+`--engram-config`. Keep `replication="none"` (the default) for an explicit pool topology.
+
+| Pool field | Default | Meaning |
+|---|---|---|
+| `store_url` | `""` | MemFabric config-store endpoint. Required as `tcp://host:port` for cross-instance or ordinary-DP pools. |
+| `world_size` | `0` | Total pool ranks, including consumers. `0` uses the number of local participating workers; it does not discover remote instances. |
+| `rank_offset` | `0` | Added to each worker's node-local rank to obtain its pool rank. |
+| `owner_ranks` | omitted | JSON array of ranks contributing DRAM. Omitted means all pool ranks; an empty array is invalid. Rows are evenly sharded among owners in the listed order. |
+
+For example, P and D can each have four local NPU workers, with D contributing the entire table.
+Add these arguments to the respective P/D launch commands:
+
+```bash
+# P: pool ranks 0..3, no Engram DRAM allocation.
+--engram-config '{"placement":"cpu","pool":{"store_url":"tcp://POOL_HOST:18500","world_size":8,"rank_offset":0,"owner_ranks":[4,5,6,7]}}'
+
+# D: pool ranks 4..7, each owns one quarter of the table.
+--engram-config '{"placement":"cpu","pool":{"store_url":"tcp://POOL_HOST:18500","world_size":8,"rank_offset":4,"owner_ranks":[4,5,6,7]}}'
+```
+
+Replace `POOL_HOST` with the address reachable by all workers that runs pool rank 0. The
+examples configure Engram sharing only; retain your model, TP, attention-DP and KV-transfer
+options for P/D serving. With eight workers per instance, use `world_size=16`, D's
+`rank_offset=8`, and `owner_ranks=[8,9,10,11,12,13,14,15]` on both sides.
+
+To let P and D contribute equal amounts, omit `owner_ranks` on both sides. For independent
+complete replicas, use separate node-local pools instead of a common endpoint. Multiple
+independent instances on the same host need distinct store endpoints.
+
+Pool ranks must be dense and machine-contiguous. Assign non-overlapping rank ranges; the
+current coordinate validation requires the world size and offset to be multiples of the local
+worker count. All members must use the same endpoint, table layout and ordered owner list.
+Start all members together: initialization and weight readiness are coordinated across the
+fixed membership. This is not a dynamic-join service. Cross-instance pools also use TCP port
+`port + 1` for layout and load synchronization; reserve both ports. A3 cross-node mapped reads
+require the nodes to belong to a supported shared-memory fabric.
+
+Configure the pool through `--engram-config` only. Omitted `pool` fields use the defaults
+above. Startup logs show the effective endpoint, world size, pool rank and owners.
 
 ## Choosing a configuration
 
@@ -93,7 +154,7 @@ all-reduce.
 - **`placement` `cpu`**: host RAM for the whole table across the node's ranks, and a longer load.
   With `replication` `none`, each rank maps its shard with 2 MiB transparent huge pages and logs
   the coverage it got; without them, lookups are several times slower.
-- **`replication` `per_node`**: one shared memory file per TP group, which the other ranks open
+- **`replication` `per_node` on CUDA**: one shared memory file per TP group, which the other ranks open
   through `/proc`. The TP group must sit on one node (`--nnodes 1`) and the ranks must share a PID
   namespace. This mapping usually gets no huge pages unless shmem transparent huge pages are on.
 - **`replication` `group_shards`**: CUDA with fabric handles between all GPUs of the group (one
