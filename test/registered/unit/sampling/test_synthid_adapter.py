@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
@@ -293,6 +294,19 @@ class TestSynthIDEngine(CustomTestCase):
                 assert_synthid_state_equal(
                     synthid_state(watermark.state), synthid_state(reference.state)
                 )
+
+    def test_fused_sample_is_skipped_for_a_custom_logit_processor(self):
+        engine = adapter.SynthIDEngine(_watermarks()[0], allow_fused_sample=True)
+        rows = _rows([True, True])
+        info = _info(2, watermark=rows)
+        forward_batch = SimpleNamespace(
+            sampling_info=info, req_pool_indices=torch.tensor([0, 1])
+        )
+        sample = engine.bind_sample(forward_batch)
+
+        self.assertTrue(sample._can_fuse(keep_logits=False))
+        info.facts = msgspec.structs.replace(info.facts, custom_logit_processor=True)
+        self.assertFalse(sample._can_fuse(keep_logits=False))
 
     def test_sample_watermarks_on_rows_and_commits_their_slots(self):
         watermark, twin = _watermarks()

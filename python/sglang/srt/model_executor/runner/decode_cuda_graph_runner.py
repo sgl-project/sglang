@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import inspect
 import logging
 from types import SimpleNamespace
@@ -99,8 +100,10 @@ from sglang.srt.model_executor.runner.early_verify_metadata import (
     VerifyInputSources,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    capture_with_flashinfer_replay,
     flashinfer_tactics_cache_for_persistence,
     maybe_flashinfer_autotune_speculative_draft,
+    uses_flashinfer_capture_replay,
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
@@ -1388,6 +1391,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # and write KV -- through the previous batch's live values. Replay is
         # already covered by the registry's padding policy.
         self.buffers.reset_index_buffers()
+        if uses_flashinfer_capture_replay(self):
+            logger.info(
+                "FlashInfer autotune: decode graphs capture only stored tactics."
+            )
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -1598,11 +1605,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                     run_lm_head=True,
                 )
-                self.backend.capture_one(
-                    shape_key,
+                capture_with_flashinfer_replay(
+                    self,
+                    functools.partial(
+                        self.backend.capture_one,
+                        shape_key,
+                        run_once,
+                        capture_inputs=None,
+                        post_warmup_hook=post_warmup_hook,
+                    ),
                     run_once,
-                    capture_inputs=None,
-                    post_warmup_hook=post_warmup_hook,
+                    post_warmup_hook,
                 )
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
