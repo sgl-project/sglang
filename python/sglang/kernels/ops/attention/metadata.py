@@ -71,6 +71,85 @@ def prepare_tree_spec_metadata(
 
 
 @triton.jit
+def _prepare_tree_suffix_indices_kernel(
+    qo_indptr,
+    prefix_lens,
+    mask_indptr,
+    custom_mask,
+    tree_indices,
+    tree_lengths,
+    num_queries,
+    mask_numel,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    batch, row = tl.program_id(0), tl.program_id(1)
+    query_start = tl.load(qo_indptr + batch)
+    query_len = tl.load(qo_indptr + batch + 1) - query_start
+    query = query_start + row
+    if row >= query_len or query >= num_queries:
+        return
+
+    cols = tl.arange(0, BLOCK)
+    prefix_len = tl.load(prefix_lens + batch).to(tl.int64)
+    mask_start = tl.load(mask_indptr + batch).to(tl.int64)
+    mask_offset = mask_start + row * (prefix_len + query_len) + prefix_len + cols
+    # Padded graph requests need not have corresponding input-mask rows.
+    visible = (
+        tl.load(
+            custom_mask + mask_offset,
+            (cols < query_len) & (mask_offset < mask_numel),
+            0,
+        )
+        != 0
+    )
+    rank = tl.cumsum(visible.to(tl.int32))
+    count = tl.sum(visible.to(tl.int32), 0)
+    destination = tl.where(visible, rank - 1, count + cols - rank)
+    tl.store(tree_indices + query * WIDTH + destination, cols, cols < WIDTH)
+    tl.store(tree_lengths + query, count)
+
+
+def prepare_tree_suffix_indices(
+    qo_indptr: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    mask_indptr: torch.Tensor,
+    custom_mask: torch.Tensor,
+    max_extend_len: int,
+    num_queries: int,
+):
+    """Pack each verify query's ancestors into logical token order.
+
+    The mask is the original full tree mask: all prefix columns are visible,
+    and suffix nodes are stored in topological order. Window masking must be
+    applied after packing, so it does not change an ancestor's logical column.
+    Return relative suffix columns and their counts, shared by all layers;
+    neither prefix indices nor K/V tensors are duplicated.
+    """
+    tree_indices = torch.empty(
+        (num_queries, max_extend_len), dtype=torch.int32, device=custom_mask.device
+    )
+    tree_lengths = torch.empty(
+        (num_queries,), dtype=torch.int32, device=custom_mask.device
+    )
+    if num_queries:
+        _prepare_tree_suffix_indices_kernel[(qo_indptr.numel() - 1, max_extend_len)](
+            qo_indptr,
+            prefix_lens,
+            mask_indptr,
+            custom_mask,
+            tree_indices,
+            tree_lengths,
+            num_queries=num_queries,
+            mask_numel=custom_mask.numel(),
+            WIDTH=max_extend_len,
+            BLOCK=triton.next_power_of_2(max_extend_len),
+            num_warps=4,
+        )
+    return tree_indices, tree_lengths
+
+
+@triton.jit
 def get_num_kv_splits_triton(
     num_kv_splits_ptr,
     seq_lens_ptr,
