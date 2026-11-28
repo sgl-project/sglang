@@ -1,0 +1,2 @@
+gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,us1,kernelName1,err1,us2,kernelName2,err2,us,run_1stage,xbf16,flat,tflops,bw,_tag
+gfx950,256,16384,6144,1536,128,4,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,128,0,1502.2771,flydsl_mxmoe_g1_a4w4_128x256x256_xcd4,1.2%,0.0,flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x256_scatter_sbm128,1.2%,1502.2771,0,0,0,2470.15,2613.28,mistral_large4_tp4
