@@ -167,6 +167,7 @@ from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
+    get_forward,
     get_memory,
     get_parallel,
     get_schedule,
@@ -2628,6 +2629,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._rank_barrier_scope(
                 self._every_rank_reaches_rank_barrier(forward_batch)
             ),
+            # The body was captured outside maybe_input_scattered; keep the
+            # replay's eager embedding unscattered to match it.
+            get_forward().scoped(prefill_graph_replay=True),
         ):
             static_forward_batch, shared_read_ends = self.load_batch(
                 forward_batch, **kwargs
