@@ -34,7 +34,11 @@ class ChatTemplate:
             elif (
                 role == "user"
                 and len(hist_messages) == 1
-                and hist_messages[0]["content"] is not None
+                and hist_messages[0].get("role") == "system"
+                and (
+                    hist_messages[0].get("content") is not None
+                    or self.default_system_prompt is not None
+                )
             ):
                 return ("", suffix)
 
@@ -42,15 +46,17 @@ class ChatTemplate:
 
     def get_prompt(self, messages: List[Dict]) -> str:
         prompt = ""
-        for i, message in enumerate(messages):
+        rendered_messages: List[Dict] = []
+        for message in messages:
             role, content = message["role"], message["content"]
             if role == "system" and content is None:
                 content = self.default_system_prompt
                 if content is None:
                     continue
 
-            prefix, suffix = self.get_prefix_and_suffix(role, messages[:i])
+            prefix, suffix = self.get_prefix_and_suffix(role, rendered_messages)
             prompt += f"{prefix}{content}{suffix}"
+            rendered_messages.append({"role": role, "content": content})
         return prompt
 
 
