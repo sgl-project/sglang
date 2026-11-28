@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use futures::{Stream, StreamExt};
 use sglang_api_types::api::v1 as api;
 use sglang_api_types::api::v1::sglang_service_server::SglangService;
+use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
@@ -19,6 +20,7 @@ use crate::api_server::handlers::{
     HiCacheManager, LORA_DISABLED, ToolSpec, WeightGroupOutcome, WeightUpdateOutcome,
     parse_function_call, separate_reasoning,
 };
+use crate::api_server::http::openai::pd_routing::{DATA_PARALLEL_RANK_HEADER, python_int};
 use crate::api_server::http::openai::{ChatFormatter, load_chat_support};
 use crate::api_server::http::weights::{decode_payloads, json_object};
 use crate::api_server::ollama::Ollama;
@@ -49,6 +51,7 @@ struct AdapterConfig {
     /// `/health_generate`'s heartbeat window (`SGLANG_HEALTH_CHECK_TIMEOUT`).
     health_timeout: Duration,
     has_tokenizer: bool,
+    enable_request_header_overrides: bool,
     generation_policy: GenerationPolicy,
 }
 
@@ -79,6 +82,7 @@ impl GrpcService {
                     environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
                 ),
                 has_tokenizer: !server_args.skip_tokenizer_init,
+                enable_request_header_overrides: server_args.enable_request_header_overrides,
                 generation_policy: server_args.as_ref().into(),
             },
             hicache_manager,
@@ -108,6 +112,7 @@ impl GrpcService {
                 response_timeout,
                 health_timeout: Duration::from_millis(20),
                 has_tokenizer: true,
+                enable_request_header_overrides: false,
                 generation_policy: GenerationPolicy::default(),
             },
             server_args: Arc::new(ServerArgs {
@@ -134,6 +139,92 @@ fn response_timeout(secs: u64) -> Duration {
         return Duration::from_secs(DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS);
     }
     Duration::from_secs(secs)
+}
+
+fn metadata_str<'a>(metadata: &'a MetadataMap, name: &str) -> Result<Option<&'a str>, Status> {
+    metadata
+        .get(name)
+        .map(|value| {
+            value.to_str().map_err(|_| {
+                Status::invalid_argument(format!("invalid {name} header: not visible ASCII"))
+            })
+        })
+        .transpose()
+}
+
+fn metadata_int(metadata: &MetadataMap, name: &str) -> Result<Option<i64>, Status> {
+    metadata_str(metadata, name)?
+        .map(|text| {
+            text.parse().map_err(|e| {
+                Status::invalid_argument(format!("invalid {name} header {text:?}: {e}"))
+            })
+        })
+        .transpose()
+}
+
+/// Apply DP-rank and router override metadata to a gRPC `GenerateRequest`,
+/// matching the HTTP routes (`pd_routing::HintRoute` and `request_headers`).
+/// `x-data-parallel-rank` is always read and validated first. Router
+/// `x-override-*` metadata applies only when `--enable-request-header-overrides`
+/// is enabled and takes precedence over `x-data-parallel-rank` and body fields.
+fn apply_generate_metadata(
+    request: &mut api::GenerateRequest,
+    metadata: &MetadataMap,
+    enable_header_overrides: bool,
+) -> Result<(), Status> {
+    if let Some(value) = metadata.get(DATA_PARALLEL_RANK_HEADER) {
+        let text = String::from_utf8_lossy(value.as_bytes());
+        let rank = python_int(&text).ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "Invalid X-Data-Parallel-Rank header: must be an integer, got '{text}'"
+            ))
+        })?;
+        request.routed_dp_rank = Some(rank);
+    }
+    if !enable_header_overrides {
+        return Ok(());
+    }
+    if let Some(rid) = metadata_str(metadata, "x-override-rid")? {
+        request.rid = Some(api::StringOrList {
+            value: Some(api::string_or_list::Value::One(rid.to_owned())),
+        });
+    }
+    if let Some(host) = metadata_str(metadata, "x-override-bootstrap-host")? {
+        request.bootstrap_host = Some(api::OptionalStringOrList {
+            value: Some(api::optional_string_or_list::Value::One(
+                api::OptionalString {
+                    value: Some(host.to_owned()),
+                },
+            )),
+        });
+    }
+    if let Some(port) = metadata_int(metadata, "x-override-bootstrap-port")? {
+        request.bootstrap_port = Some(api::OptionalInt64OrList {
+            value: Some(api::optional_int64_or_list::Value::One(
+                api::OptionalInt64 { value: Some(port) },
+            )),
+        });
+    }
+    if let Some(room) = metadata_int(metadata, "x-override-bootstrap-room")? {
+        request.bootstrap_room = Some(api::OptionalInt64OrList {
+            value: Some(api::optional_int64_or_list::Value::One(
+                api::OptionalInt64 { value: Some(room) },
+            )),
+        });
+    }
+    // `conversation_id` has no consumer past Python's TokenizerManager; still
+    // validate ASCII parity with `http/request_headers.rs`.
+    let _ = metadata_str(metadata, "x-override-conversation-id")?;
+    if let Some(rank) = metadata_int(metadata, "x-override-routed-dp-rank")? {
+        request.routed_dp_rank = Some(rank);
+    }
+    if let Some(rank) = metadata_int(metadata, "x-override-disagg-prefill-dp-rank")? {
+        request.disagg_prefill_dp_rank = Some(rank);
+    }
+    if let Some(priority) = metadata_int(metadata, "x-override-priority")? {
+        request.priority = Some(priority);
+    }
+    Ok(())
 }
 
 fn openai_unimplemented() -> Status {
@@ -216,7 +307,12 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        let mut request = request.into_inner();
+        let (metadata, _, mut request) = request.into_parts();
+        apply_generate_metadata(
+            &mut request,
+            &metadata,
+            self.config.enable_request_header_overrides,
+        )?;
         // Read before the fills below: only a `max_new_tokens` the client set
         // is checked against the context window.
         let client_max_new_tokens = ClientMaxNewTokens::of_proto(request.sampling_params.as_ref());
@@ -1407,8 +1503,11 @@ mod tests {
                     abort_hook: None,
                 },
             );
+            let mut service = GrpcService::for_test(core, preferred, incremental, response_timeout);
+            service.config.enable_request_header_overrides =
+                server_args.enable_request_header_overrides;
             Self {
-                service: GrpcService::for_test(core, preferred, incremental, response_timeout),
+                service,
                 intake_rx,
                 abort_rx,
             }
@@ -2596,5 +2695,184 @@ mod tests {
         assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &intake.rid);
         drop(stream);
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    fn dp_server_args(
+        dp_size: u32,
+        dp_rank: Option<u32>,
+        enable_request_header_overrides: bool,
+    ) -> ServerArgs {
+        let mut args = test_server_args();
+        args.deployment_info.dp_size = dp_size;
+        args.deployment_info.dp_rank = dp_rank;
+        args.enable_request_header_overrides = enable_request_header_overrides;
+        args
+    }
+
+    /// `x-data-parallel-rank` metadata sets `routed_dp_rank` unconditionally,
+    /// wins over a body value, and fails fast with `INVALID_ARGUMENT` when it
+    /// is malformed or targets another DP rank.
+    #[tokio::test]
+    async fn generate_reads_data_parallel_rank_metadata() {
+        let harness = Harness::build(
+            2,
+            false,
+            Duration::from_secs(1),
+            true,
+            None,
+            dp_server_args(2, Some(1), false),
+        );
+
+        // Matching rank overrides a mismatched body value and reaches intake.
+        let mut body = text_request("prompt", "dp-match");
+        body.routed_dp_rank = Some(0);
+        let mut req = Request::new(body);
+        req.metadata_mut()
+            .insert("x-data-parallel-rank", "1".parse().unwrap());
+        let stream = harness.service.generate(req).await.unwrap().into_inner();
+        let intake = harness.next_generation().await;
+        assert!(intake.admission.try_accept());
+        assert_eq!(intake.request.routed_dp_rank, Some(1));
+        drop(stream);
+
+        // Mismatched rank is rejected before scheduler intake.
+        let mut wrong = Request::new(text_request("prompt", "dp-wrong"));
+        wrong
+            .metadata_mut()
+            .insert("x-data-parallel-rank", "0".parse().unwrap());
+        let err = harness
+            .service
+            .generate(wrong)
+            .await
+            .err()
+            .expect("wrong rank rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message().contains("does not serve"),
+            "unexpected message: {}",
+            err.message()
+        );
+        assert!(harness.intake_rx.try_recv().is_err());
+
+        // Malformed header is rejected before scheduler intake.
+        let mut malformed = Request::new(text_request("prompt", "dp-bad"));
+        malformed
+            .metadata_mut()
+            .insert("x-data-parallel-rank", "not-an-int".parse().unwrap());
+        let err = harness
+            .service
+            .generate(malformed)
+            .await
+            .err()
+            .expect("malformed header rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message()
+                .contains("Invalid X-Data-Parallel-Rank header"),
+            "unexpected message: {}",
+            err.message()
+        );
+        assert!(harness.intake_rx.try_recv().is_err());
+
+        // Override headers stay ignored when `enable_request_header_overrides` is false.
+        let mut ignored = Request::new(text_request("prompt", "client-rid"));
+        ignored
+            .metadata_mut()
+            .insert("x-override-rid", "router-rid".parse().unwrap());
+        ignored
+            .metadata_mut()
+            .insert("x-override-disagg-prefill-dp-rank", "1".parse().unwrap());
+        let stream = harness
+            .service
+            .generate(ignored)
+            .await
+            .unwrap()
+            .into_inner();
+        let intake = harness.next_generation().await;
+        assert!(intake.admission.try_accept());
+        assert_eq!(intake.rid.client_facing(), "client-rid");
+        assert_eq!(intake.request.disagg_prefill_dp_rank, None);
+        drop(stream);
+    }
+
+    /// When `--enable-request-header-overrides` is enabled, gRPC `Generate`
+    /// applies the same `x-override-*` metadata fields as HTTP `/generate`,
+    /// with `x-override-routed-dp-rank` taking precedence over
+    /// `x-data-parallel-rank` after `x-data-parallel-rank` is validated.
+    #[tokio::test]
+    async fn generate_applies_request_header_overrides_metadata() {
+        let harness = Harness::build(
+            2,
+            false,
+            Duration::from_secs(1),
+            true,
+            None,
+            dp_server_args(2, Some(1), true),
+        );
+
+        let mut body = text_request("prompt", "client-rid");
+        body.routed_dp_rank = Some(0);
+        let mut req = Request::new(body);
+        for (key, value) in [
+            ("x-data-parallel-rank", "0"),
+            ("x-override-rid", "router-rid"),
+            ("x-override-bootstrap-host", "10.0.0.1"),
+            ("x-override-bootstrap-port", "8998"),
+            ("x-override-bootstrap-room", "9223372036854775807"),
+            ("x-override-conversation-id", "conv-1"),
+            ("x-override-routed-dp-rank", "1"),
+            ("x-override-disagg-prefill-dp-rank", "0"),
+            ("x-override-priority", "-2"),
+        ] {
+            req.metadata_mut().insert(key, value.parse().unwrap());
+        }
+        let stream = harness.service.generate(req).await.unwrap().into_inner();
+        let intake = harness.next_generation().await;
+        assert!(intake.admission.try_accept());
+        assert_eq!(intake.rid.client_facing(), "router-rid");
+        assert_eq!(intake.request.bootstrap_host.as_deref(), Some("10.0.0.1"));
+        assert_eq!(intake.request.bootstrap_port, Some(8998));
+        assert_eq!(intake.request.bootstrap_room, Some(i64::MAX));
+        assert_eq!(intake.request.routed_dp_rank, Some(1));
+        assert_eq!(intake.request.disagg_prefill_dp_rank, Some(0));
+        assert_eq!(intake.request.priority, Some(-2));
+        drop(stream);
+
+        // A malformed `x-data-parallel-rank` fails even under a valid override.
+        let mut bad_dp = Request::new(text_request("prompt", "bad-dp"));
+        bad_dp
+            .metadata_mut()
+            .insert("x-data-parallel-rank", "x".parse().unwrap());
+        bad_dp
+            .metadata_mut()
+            .insert("x-override-routed-dp-rank", "1".parse().unwrap());
+        let err = harness
+            .service
+            .generate(bad_dp)
+            .await
+            .err()
+            .expect("malformed x-data-parallel-rank rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(harness.intake_rx.try_recv().is_err());
+
+        // A malformed `x-override-*` integer fails with `INVALID_ARGUMENT`.
+        let mut bad_override = Request::new(text_request("prompt", "bad-override"));
+        bad_override
+            .metadata_mut()
+            .insert("x-override-disagg-prefill-dp-rank", "one".parse().unwrap());
+        let err = harness
+            .service
+            .generate(bad_override)
+            .await
+            .err()
+            .expect("malformed override rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message()
+                .contains("invalid x-override-disagg-prefill-dp-rank header \"one\""),
+            "unexpected message: {}",
+            err.message()
+        );
+        assert!(harness.intake_rx.try_recv().is_err());
     }
 }
