@@ -24,6 +24,7 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_rmsnorm_mean_square,
+    rmsnorm_cast_before_weight_bitexact,
     rmsnorm_mean_square_bitexact,
 )
 from sglang.multimodal_gen.configs.models.vaes.nomas import NomasVAEConfig
@@ -44,6 +45,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 _QK_MROPE_FUSION = BitExactFusionGate("Nomas VAE Q/K norm + MRoPE", per_signature=True)
+_TOKEN_NORM_FUSION = BitExactFusionGate("Nomas VAE token RMSNorm", per_signature=True)
 _MEAN_SQUARE_FUSION = BitExactFusionGate("Nomas VAE mean-square", per_signature=True)
 TUBELET = (4, 16, 16)
 TUBE_DIM = TUBELET[0] * TUBELET[1] * TUBELET[2] * 3
@@ -273,13 +275,31 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
-        if _fused_ok(x):
+        if not _fused_ok(x):
+            x = x.float()
+            x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+            return self.weight * x.to(dtype)
+
+        def reference():
             return _compiled_rms_scale()(
                 x, _mean_square(x), self.eps, self.weight, dtype
             )
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return self.weight * x.to(dtype)
+
+        if (
+            x.shape[-1] == 4096
+            and current_arch().is_sm(12, 0)
+            and self.weight.dtype == dtype
+            and self.weight.is_contiguous()
+            and self.eps in (1e-6, 1e-5)
+            and can_use_rmsnorm_mean_square(x)
+        ):
+            return _TOKEN_NORM_FUSION.run(
+                lambda: rmsnorm_cast_before_weight_bitexact(x, self.weight, self.eps),
+                reference,
+                sig=(x.shape, x.device, self.eps),
+                logger=logger,
+            )
+        return reference()
 
 
 class GenAttention(nn.Module):

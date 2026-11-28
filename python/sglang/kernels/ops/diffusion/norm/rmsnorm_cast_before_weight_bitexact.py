@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """RMSNorm with FP32 statistics and BF16 rounding before learned scale.
 
-For widths 128/3072/3840 with at least 16 rows, reproduce ATen's vectorized FP32
-mean reduction in one kernel. CUDA Reduce.cuh uses 32 lanes, four accumulators
+For widths 128/3072/3840 and SM120 width 4096 with at least 16 rows,
+reproduce ATen's vectorized FP32 mean reduction in one kernel. CUDA Reduce.cuh uses 32 lanes, four accumulators
 per lane, sequential fragment accumulation, then descending shuffle offsets.
 Other shapes retain ATen's mean with fused pointwise operations around it.
 Callers must verify against the live eager chain for each reduction regime.
@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.numerics import cuda_rsqrtf, mul_rn_f32
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
@@ -469,14 +470,18 @@ def rmsnorm_cast_before_weight_bitexact(
         # At least 16 rows keeps ATen's reduction width at 32 lanes for
         # these dimensions. Smaller row counts can select a different tree.
         # Larger FP32 workspaces can make TensorIterator split the reduction.
-        if dim in (128, 3072, 3840) and rows >= 16 and x.numel() < 2**29:
-            _ordered_norm_kernel[(triton.cdiv(rows, 4),)](
+        ordered_dim = dim in (128, 3072, 3840) or (
+            dim == 4096 and current_arch().is_sm(12, 0)
+        )
+        if ordered_dim and rows >= 16 and x.numel() < 2**29:
+            rows_per_cta = 2 if dim == 4096 else 4
+            _ordered_norm_kernel[(triton.cdiv(rows, rows_per_cta),)](
                 x,
                 weight,
                 out,
                 rows,
                 dim,
-                4,
+                rows_per_cta,
                 triton.next_power_of_2(dim),
                 eps,
                 num_warps=4,
