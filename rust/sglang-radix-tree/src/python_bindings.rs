@@ -2118,6 +2118,11 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().set_enable_storage(value));
             }
 
+            /// Seed new storage chains with the served weights' epoch.
+            fn set_storage_weight_epoch(&self, py: Python<'_>, epoch: Option<String>) {
+                py.detach(|| self.core().set_storage_weight_epoch(epoch));
+            }
+
             /// Whether the storage tier (L3) is wired.
             fn enable_storage(&self, py: Python<'_>) -> bool {
                 self.core_attached(py).enable_storage()
@@ -3498,6 +3503,19 @@ macro_rules! tree_core_binding {
             fn set_enable_storage(&self, py: Python<'_>, value: bool) -> PyResult<()> {
                 catch_native_panic(|| {
                     self.inner.set_enable_storage(py, value);
+                    Ok(())
+                })
+            }
+
+            /// Seed new storage chains with the served weights' epoch.
+            #[pyo3(signature = (epoch=None))]
+            fn set_storage_weight_epoch(
+                &self,
+                py: Python<'_>,
+                epoch: Option<String>,
+            ) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_storage_weight_epoch(py, epoch);
                     Ok(())
                 })
             }

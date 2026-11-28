@@ -3946,6 +3946,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.enable_storage = value;
     }
 
+    /// Seed new storage chains with the served weights' epoch; None keeps the keys.
+    pub fn set_storage_weight_epoch(&mut self, epoch: Option<String>) {
+        self.arena.set_storage_weight_epoch(epoch);
+    }
+
     /// Enable or disable the direct external-cache linker.
     pub fn set_enable_external_cache_linker(
         &mut self,

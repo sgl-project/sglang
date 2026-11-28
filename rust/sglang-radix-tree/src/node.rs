@@ -1138,6 +1138,8 @@ pub struct NodeArena<K: ChildKeyType> {
     component_types: Vec<ComponentType>,
     /// Atoms per radix page; children are keyed by their key's first page.
     page_size: usize,
+    /// Weight epoch folded into new storage chains; survives `reset`.
+    storage_weight_epoch: Option<String>,
 }
 
 impl<K: ChildKeyType> NodeArena<K> {
@@ -1152,9 +1154,15 @@ impl<K: ChildKeyType> NodeArena<K> {
             access_counter: 0,
             component_types,
             page_size,
+            storage_weight_epoch: None,
         };
         arena.reset();
         arena
+    }
+
+    /// Seed new storage chains with the served weights' epoch; None keeps the keys.
+    pub fn set_storage_weight_epoch(&mut self, epoch: Option<String>) {
+        self.storage_weight_epoch = epoch;
     }
 
     /// Drop all nodes, then reinstall the root.
@@ -1225,7 +1233,8 @@ impl<K: ChildKeyType> NodeArena<K> {
         });
         let prior = parent_hash.map(str::to_owned).or_else(|| {
             let namespace = node.namespace.as_ref();
-            if namespace == KeyNamespaceRef::default() {
+            let epoch = self.storage_weight_epoch.as_deref();
+            if namespace == KeyNamespaceRef::default() && epoch.is_none() {
                 return None;
             }
             // Match Python's storage_namespace_seed byte for byte.
@@ -1240,6 +1249,11 @@ impl<K: ChildKeyType> NodeArena<K> {
                         hasher.update(part.as_bytes());
                     }
                 }
+            }
+            if let Some(epoch) = epoch {
+                hasher.update([2u8]);
+                hasher.update((epoch.len() as u64).to_le_bytes());
+                hasher.update(epoch.as_bytes());
             }
             Some(digest_to_hex(&hasher.finalize().into()))
         });

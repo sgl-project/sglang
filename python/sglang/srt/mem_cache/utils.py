@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.evict_policy import (
     StateCostStrategy,
     TLRUStrategy,
 )
+from sglang.srt.runtime_context import get_flags
 
 _EVICTION_POLICY_FACTORIES: dict[str, Callable[..., EvictionStrategy]] = {
     "lru": LRUStrategy,
@@ -105,7 +106,8 @@ def storage_namespace_seed(
     extra_key: Optional[str], cache_salt: Optional[str]
 ) -> Optional[str]:
     """Seed storage chains; preserve unnamespaced keys and Rust byte parity."""
-    if extra_key is None and cache_salt is None:
+    weight_epoch = get_flags().storage.weight_epoch
+    if extra_key is None and cache_salt is None and weight_epoch is None:
         return None
     digest = hashlib.sha256(b"sglang-cache-namespace-v1")
     # Presence and UTF-8 byte length distinguish absent, empty and joined parts.
@@ -115,6 +117,10 @@ def storage_namespace_seed(
             continue
         encoded = part.encode("utf-8")
         digest.update(b"\x01" + len(encoded).to_bytes(8, "little") + encoded)
+    # KV computed by other weights must not answer the same storage keys.
+    if weight_epoch is not None:
+        encoded = weight_epoch.encode("utf-8")
+        digest.update(b"\x02" + len(encoded).to_bytes(8, "little") + encoded)
     return digest.hexdigest()
 
 

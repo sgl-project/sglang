@@ -556,6 +556,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return None
         return lambda node: node.component_data[ct].session_ref > 0
 
+    def set_storage_weight_epoch(self, epoch: Optional[str]) -> None:
+        # Python chains read the flag through storage_namespace_seed.
+        pass
+
     def reset(self) -> None:
         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
         match result."""
