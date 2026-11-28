@@ -289,6 +289,15 @@ def decode_state_free_radix_of(cfg: Any) -> bool:
     return cfg.decode_state_free_radix_default if forced is None else forced
 
 
+def mamba_strategy_is_auto(cfg: Any) -> bool:
+    """Whether the mamba cache strategy is still one of the auto tokens.
+
+    A model override that pins a strategy fires only while the user has not
+    chosen one, and both auto tokens mean "you decide".
+    """
+    return cfg.mamba_radix_cache_strategy in ("auto", "auto_high_throughput")
+
+
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """Return whether the resolved Mamba cache strategy requires an extra buffer."""
     if decode_state_free_radix_of(cfg):
@@ -296,6 +305,9 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",
+        # Still unresolved: `auto_high_throughput` becomes one of the two above
+        # at the end of resolution, and reads as the non-lazy one until then.
+        "auto_high_throughput",
     )
 
 

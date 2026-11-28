@@ -3447,7 +3447,7 @@ class KVCacheConfigurator:
                 lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
             )
 
-        skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+        skip_decode_lock = get_exec().mamba.mamba_skip_decode_lock
         base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO - (
             MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP if skip_decode_lock else 0
         )
@@ -3680,7 +3680,7 @@ class KVCacheConfigurator:
                 extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
                 overlap=not schedule.disable_overlap_schedule,
                 lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
-                skip_decode_lock=envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get(),
+                skip_decode_lock=get_exec().mamba.mamba_skip_decode_lock,
             ),
             radix_cache=not get_memory().disable_radix_cache,
             window_ratio=schedule.swa_full_tokens_ratio,

@@ -624,11 +624,44 @@ class ExecMamba(msgspec.Struct):
     mamba_radix_cache_strategy: A[
         str,
         Arg(
-            help="The strategy to use for mamba radix cache.",
-            choices=["auto", "no_buffer", "extra_buffer", "extra_buffer_lazy"],
+            help="The strategy to use for mamba radix cache. "
+            "`auto_high_throughput` resolves like `auto` and additionally takes "
+            "the lazy track buffer and the decode-lock skip wherever they are "
+            "supported, cutting the state slots a running request reserves from "
+            "5 to 3; it falls back to `auto`'s choice wherever they are not. It "
+            "is an opt-in: the gate is capability and compatibility, not a list "
+            "of benchmarked deployments, and end-to-end throughput has been "
+            "measured on one of them (Qwen3.5-35B-A3B, H20, TP1, BF16).",
+            choices=[
+                "auto",
+                "auto_high_throughput",
+                "no_buffer",
+                "extra_buffer",
+                "extra_buffer_lazy",
+            ],
             resolvable=True,
         ),
     ] = "auto"
+    mamba_high_throughput_capacity: A[
+        bool,
+        Arg(
+            help="(Derived) whether `auto_high_throughput` selected the "
+            "high-throughput capacity strategy. It does not by itself say the "
+            "decode lock is skipped: an explicitly set "
+            "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK still wins, and with the skip off "
+            "the lazy strategy reserves four slots rather than three. Read "
+            "`mamba_skip_decode_lock` for the lock. No CLI surface.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
+    mamba_skip_decode_lock = Derived(
+        fn="sglang.srt.arg_groups.overrides.mamba_skip_decode_lock_of",
+        doc="Whether decode leaves the matched-prefix mamba state evictable. An "
+        "explicit SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK always wins; otherwise it "
+        "follows the high-throughput capacity decision. Pool sizing and the "
+        "decode-time lock must read the same answer.",
+    )
     uses_mamba_radix_cache: A[
         bool,
         Arg(

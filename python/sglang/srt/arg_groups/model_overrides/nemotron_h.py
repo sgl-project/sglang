@@ -6,6 +6,7 @@ from typing import Any, Dict
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     is_attention_backend_not_set,
+    mamba_strategy_is_auto,
     model_config_of,
     resolving_view,
 )
@@ -156,7 +157,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 overrides["attention_backend"] = "trtllm_mha"
                 if cfg.page_size is None:
                     overrides["page_size"] = 64
-                if cfg.mamba_radix_cache_strategy == "auto":
+                if mamba_strategy_is_auto(cfg):
                     overrides["mamba_radix_cache_strategy"] = "extra_buffer"
                 if (
                     cfg.speculative_draft_attention_backend is None

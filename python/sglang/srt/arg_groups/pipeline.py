@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.kv_shard_hook import handle_kv_cache_sharding
 from sglang.srt.arg_groups.memory_hook import finalize_prefill_token_budget
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import (
+    _mamba_high_throughput_capacity,
     _page_size_default,
     _pipeline_parallel_overlap_disable,
     _sampling_backend_default,
@@ -415,5 +416,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
+
+    # Last, so the high-throughput capacity choice sees the final overlap
+    # schedule: pipeline parallelism, the sparse-head path and diffusion LLM all
+    # disable it after the mamba strategy was first resolved.
+    run_post_process_pass(server_args, _mamba_high_throughput_capacity)
 
     server_args._resolution_finished = True
