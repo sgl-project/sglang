@@ -1640,6 +1640,19 @@ def _fp8_kv_reference(inputs, q_lens, window=None, q=None, images=()):
     return torch.cat(outs)
 
 
+def _assert_fp8_kv_close(out, ref, fp8_mma):
+    """The fp16 cast matches the fp32 reference to 1e-2. FP8 MMA (hd 512, page 64,
+    intra-WG overlap) rounds Q and P to e4m3 pairs and sums QK in FP8 WGMMA, which
+    accumulates below fp32, so a few outputs land further out: bound the worst
+    and the mean error instead (observed on Gemma-4 shapes: 0.048 and 1.5e-3)."""
+    if not fp8_mma:
+        torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.01)
+        return
+    err = (out.float() - ref).abs()
+    assert err.max().item() <= 0.06, f"max abs error {err.max().item()}"
+    assert err.mean().item() <= 2.5e-3, f"mean abs error {err.mean().item()}"
+
+
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9,
     "Requires Hopper",
@@ -1650,8 +1663,9 @@ class TestFlashAttention4SM90(CustomTestCase):
 
         Covers both K/V producers (TMA at page 64, cp.async at page 1), both
         consumer schedules, split-KV with empty splits, decode, MTP verify and
-        chunked prefill over a cached prefix, at hd 512 (full attention, V cast
-        per warpgroup half) and hd 256 (Gemma-4 sliding window, V cast whole).
+        chunked prefill over a cached prefix, at hd 512 (full attention: FP8 MMA
+        at page 64 with intra-WG overlap, otherwise V cast per warpgroup half)
+        and hd 256 (Gemma-4 sliding window, V cast whole).
         """
         cases = (
             # page_size, q_len, cache lengths, num_splits, intra_wg_overlap
@@ -1693,11 +1707,35 @@ class TestFlashAttention4SM90(CustomTestCase):
                     intra_wg_overlap=overlap,
                 )
                 self.assertEqual(out.dtype, torch.bfloat16)
-                torch.testing.assert_close(
-                    out.float(),
+                _assert_fp8_kv_close(
+                    out,
                     _fp8_kv_reference(inputs, q_len, window),
-                    atol=0.01,
-                    rtol=0.01,
+                    fp8_mma=dim == 512 and page_size == 64 and overlap,
+                )
+
+    def test_fp8_kv_cache_fp16_q(self):
+        """fp16 Q on both hd 512 paths: FP8 MMA (page 64) keeps 8 of its 11
+        significant bits in the e4m3 + e5m2 pair, the cast (page 1) all of them."""
+        for page_size in (64, 1):
+            with self.subTest(page=page_size):
+                inputs = _gemma4_fp8_kv_inputs((2100, 3000), 2048, page_size, seed=2)
+                q = inputs["q"].half()
+                out, _ = _flash_attn_fwd(
+                    q,
+                    inputs["k"],
+                    inputs["v"],
+                    cu_seqlens_q=inputs["cu_seqlens_q"],
+                    seqused_k=inputs["cache_seqlens"],
+                    max_seqlen_q=2048,
+                    page_table=inputs["page_table"],
+                    softmax_scale=1.0,
+                    causal=True,
+                    k_descale=inputs["k_descale"],
+                    v_descale=inputs["v_descale"],
+                )
+                self.assertEqual(out.dtype, torch.float16)
+                _assert_fp8_kv_close(
+                    out, _fp8_kv_reference(inputs, 2048, q=q), fp8_mma=page_size == 64
                 )
 
     def test_fp8_kv_cache_rejects_smem_pv(self):
@@ -1762,7 +1800,191 @@ class TestFlashAttention4SM90(CustomTestCase):
                         q=q,
                         images=images,
                     )
-                    torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.01)
+                    _assert_fp8_kv_close(out, ref, fp8_mma=dim == 512)
+
+    def test_fp8_kv_cache_long_tail(self):
+        """FP8 MMA at 64k context: the newest key scores 13, the other 65,535
+        score 0. Their probabilities (e^-13 of the max) are below e4m3's range
+        after the P scale and must reach PV through the e5m2 residual term
+        (V = 1 everywhere gives 1; dropped, it gives 0.87)."""
+        length = 65536
+        inputs = _gemma4_fp8_kv_inputs((length,), 1, 64, seed=0)
+        one, thirteen = (
+            torch.tensor(x, device="cuda").to(torch.float8_e4m3fn).view(torch.uint8)
+            for x in (1.0, 13.0)
+        )
+        q = torch.zeros_like(inputs["q"])
+        q[..., 0] = 1.0
+        newest = (inputs["page_table"][0, -1].item(), (length - 1) % 64)
+        k, v = (inputs[x].view(torch.uint8) for x in ("k", "v"))
+        k.zero_()
+        k[newest[0], newest[1], :, 0] = thirteen
+        inputs.update(q=q, k_descale=torch.ones_like(inputs["k_descale"]))
+        inputs["v_descale"] = torch.ones_like(inputs["v_descale"])
+        for newest_v in (1.0, 0.0):
+            with self.subTest(newest_v=newest_v):
+                v.copy_(one.expand_as(v))
+                if newest_v == 0.0:
+                    v[newest[0], newest[1]] = 0
+                out, _ = _flash_attn_fwd(
+                    q,
+                    inputs["k"],
+                    inputs["v"],
+                    cu_seqlens_q=inputs["cu_seqlens_q"],
+                    seqused_k=inputs["cache_seqlens"],
+                    max_seqlen_q=1,
+                    page_table=inputs["page_table"],
+                    softmax_scale=1.0,
+                    causal=True,
+                    k_descale=inputs["k_descale"],
+                    v_descale=inputs["v_descale"],
+                    num_splits=1,
+                )
+                ref = _fp8_kv_reference(inputs, 1)
+                # newest_v=0: ref = 0.129, the tail's share of the mass.
+                torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.0)
+
+    def test_fp8_kv_cache_q_range(self):
+        """FP8 MMA with Q outside e4m3's range. Small: every component at
+        +-2^-11 rounds to 0 in e4m3, so the scores must come from the e5m2
+        residual (dropped, every score is 0 and attention goes uniform). Large:
+        components of +-480 and +-512 saturate the high term at 448, and the
+        residual must carry the rest exactly."""
+        cases = (
+            # name, |q| values, softmax_scale (scores of a few units)
+            ("small", (2.0**-11,), 1024.0),
+            ("large", (480.0, 512.0), 1.0 / 256),
+        )
+        for name, mags, softmax_scale in cases:
+            for q_len, lengths in ((1, (7, 1103)), (64, (100, 1103))):
+                with self.subTest(q=name, q_len=q_len):
+                    inputs = _gemma4_fp8_kv_inputs(lengths, q_len, 64, seed=3)
+                    q = inputs["q"].sign()
+                    pick = torch.randint(len(mags), q.shape, device="cuda")
+                    q = q * torch.tensor(mags, device="cuda", dtype=q.dtype)[pick]
+                    out, _ = _flash_attn_fwd(
+                        q,
+                        inputs["k"],
+                        inputs["v"],
+                        cu_seqlens_q=inputs["cu_seqlens_q"],
+                        seqused_k=inputs["cache_seqlens"],
+                        max_seqlen_q=q_len,
+                        page_table=inputs["page_table"],
+                        softmax_scale=softmax_scale,
+                        causal=True,
+                        k_descale=inputs["k_descale"],
+                        v_descale=inputs["v_descale"],
+                        num_splits=1,
+                    )
+                    ref = _fp8_kv_reference(inputs, q_len, q=q.float() * softmax_scale)
+                    _assert_fp8_kv_close(out, ref, fp8_mma=True)
+
+    def _two_key_fp8_kv_inputs(self, batch, k0, dtype, page_size):
+        """Two keys per request, k0 and -k0, with V rows of ones and zeros:
+        every output element is the weight of key 0."""
+        inputs = _gemma4_fp8_kv_inputs((2,) * batch, 1, page_size, seed=5)
+        k = torch.zeros(inputs["k"].shape, device="cuda")
+        # Pages hold consecutive tokens of one request: key 0 is its first slot.
+        first = inputs["page_table"][:, 0].long()
+        second = first if page_size > 1 else inputs["page_table"][:, 1].long()
+        k[first, 0], k[second, 1 % page_size] = k0, -k0
+        v = torch.zeros_like(k)
+        v[first, 0] = 1.0
+        inputs["k"], inputs["v"] = k.to(torch.float8_e4m3fn), v.to(torch.float8_e4m3fn)
+        inputs["v_descale"] = torch.ones_like(inputs["v_descale"])
+        inputs["q"] = torch.zeros_like(inputs["q"], dtype=dtype)
+        return inputs
+
+    def _two_key_weight(self, inputs):
+        out, _ = _flash_attn_fwd(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            cu_seqlens_q=inputs["cu_seqlens_q"],
+            seqused_k=inputs["cache_seqlens"],
+            max_seqlen_q=1,
+            page_table=inputs["page_table"],
+            softmax_scale=1.0,
+            causal=True,
+            k_descale=inputs["k_descale"],
+            v_descale=inputs["v_descale"],
+            num_splits=1,
+        )
+        return out.float()
+
+    def test_fp8_kv_cache_adjacent_q_values(self):
+        """FP8 MMA keeps neighbouring bf16 Q values distinct: its e4m3 + e5m2
+        pair is exact for bf16. Q holds a value and the next one below it in
+        dims 0 and 1 against keys (16, -16) and (-16, 16), descaled so the two
+        scores are +1 and -1: a Q pair that merged them would tie the keys at
+        0.5. One request per binade from 2^-6 to 2^8, one mantissa and sign
+        per head. On the cast (page 1) the same holds for fp16."""
+        k0 = torch.zeros(512, device="cuda")
+        k0[0], k0[1] = 16.0, -16.0
+        binades = torch.arange(-6, 9, device="cuda", dtype=torch.float32)
+        heads = torch.arange(32, device="cuda", dtype=torch.float32)
+        for dtype, bits, page_size in ((torch.bfloat16, 7, 64), (torch.float16, 10, 1)):
+            with self.subTest(dtype=dtype):
+                inputs = self._two_key_fp8_kv_inputs(len(binades), k0, dtype, page_size)
+                ulp = torch.exp2(binades - bits)[:, None]
+                # Odd mantissas below 1.5, so the top binade stays under 448.
+                upper = torch.exp2(binades)[:, None] * (
+                    1 + (2 * heads[None, :] + 1) * 2 ** (bits - 7) / 2**bits
+                )
+                sign = torch.where(heads % 2 == 0, 1.0, -1.0)[None, :]
+                q = torch.zeros(len(binades), 32, 512, device="cuda")
+                q[..., 0], q[..., 1] = sign * upper, sign * (upper - ulp)
+                inputs["q"] = q.to(dtype)
+                self.assertTrue(torch.equal(inputs["q"].float(), q))
+                # score = +-16 * ulp * descale = +-1
+                inputs["k_descale"] = (1 / (16 * ulp)).expand(-1, 4).contiguous()
+                weight = self._two_key_weight(inputs)
+                expected = torch.sigmoid(2 * sign).expand(len(binades), -1)
+                torch.testing.assert_close(
+                    weight, expected[..., None].expand_as(weight), atol=0.01, rtol=0
+                )
+
+    def test_fp8_kv_cache_mask_paths_bit_identical(self):
+        """A text request gets the same bits whether it runs alone (causal) or
+        batched with an image request (image mask_mod), as deterministic
+        inference requires: both mask paths reduce QK in the same order."""
+        lengths = (1137, 1100)
+        inputs = _gemma4_fp8_kv_inputs(lengths, 81, 64, seed=7)
+        q = inputs["q"][:100]
+        cu_q = torch.tensor([0, 81, 100], device="cuda", dtype=torch.int32)
+        ranges = torch.full((100, 2), -1, device="cuda", dtype=torch.int32)
+        prefix = lengths[0] - 81
+        ranges[3:48] = torch.tensor([prefix + 3, prefix + 47], device="cuda")
+        common = dict(softmax_scale=1.0, num_splits=1, pack_gqa=False, ver=4)
+        batched = flash_attn_with_kvcache(
+            q,
+            inputs["k"],
+            inputs["v"],
+            page_table=inputs["page_table"],
+            cache_seqlens=inputs["cache_seqlens"],
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=81,
+            causal=False,
+            k_descale=inputs["k_descale"],
+            v_descale=inputs["v_descale"],
+            mask_mod=make_image_mask_mod(-1),
+            aux_tensors=[ranges, cu_q],
+            **common,
+        )
+        alone = flash_attn_with_kvcache(
+            q[81:],
+            inputs["k"],
+            inputs["v"],
+            page_table=inputs["page_table"][1:],
+            cache_seqlens=inputs["cache_seqlens"][1:],
+            cu_seqlens_q=torch.tensor([0, 19], device="cuda", dtype=torch.int32),
+            max_seqlen_q=19,
+            causal=True,
+            k_descale=inputs["k_descale"][1:],
+            v_descale=inputs["v_descale"][1:],
+            **common,
+        )
+        self.assertTrue(torch.equal(batched[81:], alone))
 
     def test_fp8_kv_cache_decode_replays_in_cuda_graph(self):
         """A captured FP8-KV decode reads the cache and descales afresh on replay."""
@@ -1793,9 +2015,7 @@ class TestFlashAttention4SM90(CustomTestCase):
         for name in ("q", "k", "v", "k_descale", "v_descale"):
             inputs[name].copy_(fresh[name])
         graph.replay()
-        torch.testing.assert_close(
-            out.float(), _fp8_kv_reference(inputs, 1), atol=0.01, rtol=0.01
-        )
+        _assert_fp8_kv_close(out, _fp8_kv_reference(inputs, 1), fp8_mma=True)
 
     def test_paged_attention(self):
         cases = (
