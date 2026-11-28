@@ -460,16 +460,12 @@ def _usp_input_all_to_all_packed_qkv(
             ),
         )
     else:
-        packed = torch.empty(
-            (world_size, s_local, h_local, 3 * head_size),
-            dtype=q.dtype,
-            device=q.device,
+        packed = (
+            torch.cat((q, k, v), dim=-1)
+            .view(s_local, world_size, h_local, 3 * head_size)
+            .permute(1, 0, 2, 3)
+            .contiguous()
         )
-        for index, tensor in enumerate((q, k, v)):
-            head_shards = tensor.view(s_local, world_size, h_local, head_size).permute(
-                1, 0, 2, 3
-            )
-            packed[..., index * head_size : (index + 1) * head_size].copy_(head_shards)
 
     packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
     packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
@@ -477,12 +473,25 @@ def _usp_input_all_to_all_packed_qkv(
     return q, k, v
 
 
+def _usp_exchange_prepacked_qkv(
+    packed: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exchange pre-packed ``[world_size, s_local, h_local, 3 * head_size]`` QKV."""
+    world_size, s_local, h_local, width = packed.shape
+    head_size = width // 3
+    received = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    received = received.reshape(s_local * world_size, h_local, width)
+    return received.split(head_size, dim=-1)
+
+
 def ulysses_head_group_pipelined_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    q: torch.Tensor | None,
+    k: torch.Tensor | None,
+    v: torch.Tensor | None,
     attend,
     groups: int,
+    *,
+    prepacked_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Ulysses attention with the collective exchange pipelined over head groups.
 
@@ -494,8 +503,55 @@ def ulysses_head_group_pipelined_attention(
     """
     group = get_sp_group().ulysses_group
     world_size = get_ulysses_parallel_world_size()
-    rows, heads, head_size = q.shape
-    group_heads = heads // (world_size * groups)
+    if prepacked_qkv is not None:
+        if prepacked_qkv.device.type != "npu":
+            raise ValueError("prepacked_qkv is only supported on NPU")
+        _, _, rows, group_heads, width = prepacked_qkv.shape
+        head_size = width // 3
+        heads = world_size * groups * group_heads
+        device = prepacked_qkv.device
+        dtype = prepacked_qkv.dtype
+    else:
+        assert q is not None and k is not None and v is not None
+        rows, heads, head_size = q.shape
+        group_heads = heads // (world_size * groups)
+        device = q.device
+        dtype = q.dtype
+    if device.type == "npu":
+        if prepacked_qkv is not None:
+            packed = prepacked_qkv
+        else:
+            packed = (
+                torch.cat((q, k, v), dim=-1)
+                .view(rows, world_size, groups, group_heads, 3 * head_size)
+                .permute(2, 1, 0, 3, 4)
+                .contiguous()
+            )
+        received = torch.empty_like(packed)
+        exchanges = [
+            dist.all_to_all_single(received[g], packed[g], group=group, async_op=True)
+            for g in range(groups)
+        ]
+        out = torch.empty(
+            (groups, world_size, rows, group_heads, head_size),
+            dtype=dtype,
+            device=device,
+        )
+        for g in range(groups):
+            exchanges[g].wait()
+            group_qkv = received[g].view(world_size * rows, group_heads, 3 * head_size)
+            group_out = attend(*group_qkv.split(head_size, dim=-1))
+            exchanges.append(
+                dist.all_to_all_single(
+                    out[g],
+                    group_out.view(world_size, rows, group_heads, head_size),
+                    group=group,
+                    async_op=True,
+                )
+            )
+        for exchange in exchanges[groups:]:
+            exchange.wait()
+        return out.permute(2, 1, 0, 3, 4).contiguous().view(rows, heads, head_size)
     # pack block w * groups + g holds rank w's heads of group g
     packed = pack_qkv_destination_major(
         q,

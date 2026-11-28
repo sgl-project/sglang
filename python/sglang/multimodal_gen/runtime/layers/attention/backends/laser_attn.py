@@ -5,6 +5,11 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn_triton import (
+    can_use_npu_triton,
+    npu_triton_la_postprocess,
+    npu_triton_la_preprocess_qkv,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -165,10 +170,10 @@ class LaserAttentionImpl(AttentionImpl):
         qseqlen: int,
         head_dim: int,
     ) -> torch.Tensor:
+        attention_out = attention_out[:, :, :qseqlen, :head_dim]
         if dtype != attention_out.dtype:
             attention_out = attention_out.to(dtype)
 
-        attention_out = attention_out[:, :, :qseqlen, :head_dim]
         attention_out = attention_out.transpose(1, 2).contiguous()
         return attention_out
 
@@ -288,6 +293,71 @@ class LaserAttentionImpl(AttentionImpl):
             and bounds[0] == 0
             and bounds[1] == padding_start
         ):
+            if padding_start >= self.min_seqlen and padding_start <= query.shape[0]:
+                head_dim = query.shape[-1]
+                pre_tokens = self.max_token
+                if padding_start % self.seq_len_pad_base != 0:
+                    pre_tokens = (
+                        padding_start // self.seq_len_pad_base + 1
+                    ) * self.seq_len_pad_base - padding_start
+                if (
+                    query.device.type == "npu"
+                    and query.dtype == key.dtype == value.dtype == torch.bfloat16
+                    and head_dim == self.dim_base
+                    and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+                    and can_use_npu_triton(query.device)
+                ):
+                    s_pad = (
+                        (padding_start + self.seqlen_base - 1)
+                        // self.seqlen_base
+                        * self.seqlen_base
+                    )
+                    q_la, k_la, v_la = npu_triton_la_preprocess_qkv(
+                        query,
+                        key,
+                        value,
+                        s_real=padding_start,
+                        s_pad=s_pad,
+                        inv_scale=1.0 / _BF16_LASER_SCALE,
+                    )
+                    _, la_output = self._laser_attention(
+                        q_la,
+                        k_la,
+                        v_la,
+                        q_la.shape[1],
+                        pre_tokens,
+                        self.softmax_scale * _BF16_LASER_SCALE * _BF16_LASER_SCALE,
+                    )
+                    return npu_triton_la_postprocess(
+                        la_output,
+                        s_real=padding_start,
+                        s_total=query.shape[0],
+                        scale=_BF16_LASER_SCALE,
+                    )
+                q_la, k_la, v_la, qk_scale, value_scale = self._la_preprocess_input(
+                    query[:padding_start].unsqueeze(0),
+                    key[:padding_start].unsqueeze(0),
+                    value[:padding_start].unsqueeze(0),
+                    preserve_bf16_range=True,
+                )
+                _, la_output = self._laser_attention(
+                    q_la,
+                    k_la,
+                    v_la,
+                    q_la.shape[1],
+                    pre_tokens,
+                    self.softmax_scale * qk_scale,
+                )
+                output = torch.empty_like(query)
+                output[:padding_start].copy_(
+                    la_output[0, :, :padding_start, :head_dim].transpose(0, 1)
+                )
+                if value_scale != 1.0:
+                    output[:padding_start].mul_(value_scale)
+                if padding_start < query.shape[0]:
+                    output[padding_start:].zero_()
+                return output
+
             segment = self._forward_dense(
                 query[:padding_start].unsqueeze(0),
                 key[:padding_start].unsqueeze(0),

@@ -25,7 +25,8 @@ The public checkpoints are `MiniMaxAI/MiniMax-H3-Image` and its
 Run the commands from the same checkout and Python environment. The picker
 saves the returned image as `generated.png`. These recipes use Linux CUDA and
 a source installation; DGX Spark uses the [ARM64 environment below](#dgx-spark-128-gb),
-and AMD Instinct GPUs use the [ROCm environment below](#amd-instinct-mi300x-mi325x-mi350x-mi355x).
+AMD Instinct GPUs use the [ROCm environment below](#amd-instinct-mi300x-mi325x-mi350x-mi355x),
+and Ascend NPUs use the [Ascend A3 environment below](#ascend-a3).
 
 <Deployment config={config} />
 
@@ -107,6 +108,8 @@ FlashAttention. Keep these precision and attention settings when reproducing
 the release. ROCm has no FA3 build, so on AMD GPUs the DiT runs the same dense
 packed attention through AITER. It is selected automatically and `fa` is
 rejected there. Ring parallelism requires FA; use Ulysses or TP on AMD.
+On Ascend NPUs, pass `--attention-backend laser_attn` for the lowest latency
+(or `fa` if Ring parallelism is required, as LaserAttention rejects `ring_degree > 1`).
 
 On discrete GPUs, Auto keeps all components resident when each GPU has at least
 130 GiB available at startup, as tested on H200, B300, MI325X and MI350X. Otherwise it retains
@@ -181,7 +184,7 @@ streaming. Eager remains the default.
 
 ### Hardware recommendations
 
-The picker provides measured recipes for H200/B300, AMD Instinct, single-card RTX PRO 6000 and DGX Spark,
+The picker provides measured recipes for H200/B300, AMD Instinct, Ascend A3, single-card RTX PRO 6000 and DGX Spark,
 and **Derived** recipes for other listed GPUs. A derived recipe estimates placement and
 parallel layout for the selected GPU count from checkpoint sizes and measured
 H200 memory use. It has no hardware latency measurement or capacity guarantee.
@@ -192,6 +195,7 @@ AdaLN together. Start with 2048 × 2048.
 | --- | --- | --- |
 | B200, GB200, GB300 | 1 GPU | Auto resident; Ulysses as GPU count grows |
 | MI355X / MI350X, MI325X / MI300X | 1 GPU; Ulysses as GPU count grows | Measured Auto resident recipes on 1, 2, 4 and 8 GPUs; Ulysses is faster, TP uses less memory |
+| Ascend A3, 64 GB / NPU | 4 NPUs (`TP2 + Ulysses2`) | Measured resident recipe with encoder fold, online AdaLN precomputation and LaserAttention |
 | H100 / H800, 80 GB | 1 GPU, or 2 for resident serving | Component offload on one; resident Ulysses2 with encoder fold on two |
 | RTX PRO 6000 Blackwell, 96 GB | 1 GPU | Measured resident recipe with AdaLN precomputation; component offload saves memory |
 | DGX Spark, 128 GB shared | 1 GB10 | Measured Auto resident recipe with native AdaLN precomputation; requires at least 106 GiB available |
@@ -240,6 +244,26 @@ python3 -m pip install -e python --no-deps --no-build-isolation
 The image already provides the ROCm builds of PyTorch, AITER and the
 diffusion dependencies, so `--no-deps` keeps them in place. Then run the
 picker's serving and request commands in this environment.
+
+### Ascend A3
+
+Follow the [Ascend NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation)
+before starting the server. Select **Ascend A3** in the picker for measured
+four-NPU recipes (`TP2 + Ulysses2`, `TP4`, and `Ulysses4`) with resident
+placement, encoder fold, online AdaLN precomputation (`--minimax-h3-adaln-online true`)
+and LaserAttention (`--attention-backend laser_attn`).
+
+- **`TP2 + Ulysses2` is the recommended 4-NPU layout**: it achieves the lowest
+  latency across 2K and 4K while keeping peak reserved memory around
+  `37.0–43.0 GiB / NPU` (versus `56.9 GiB / NPU` on `Ulysses4`).
+- **Triton-Ascend fused kernels** activate automatically when `triton`
+  (e.g., `triton_ascend`) is installed in the container, and fall back
+  transparently to PyTorch / `torch_npu` ops otherwise.
+- **LaserAttention** rejects `ring_degree > 1`; use TP and/or Ulysses with
+  `laser_attn`, or switch to `--attention-backend fa` when Ring parallelism is
+  needed.
+- Keep eager execution (the default; eager mode is faster on Ascend A3 because
+  denoising is compute-bound).
 
 ### DGX Spark (128 GB)
 
@@ -317,6 +341,7 @@ Here, 2K is 2048 × 2048 and 4K is 4736 × 3552.
 | 8 × MI350X | Native | 0.490 s | 2.110 s |
 | 4 × MI325X | Native | 0.890 s | 3.680 s |
 | 1 × MI325X | Native | 2.190 s | 10.750 s |
+| 4 × Ascend A3 | Native | 1.949 s | 9.426 s |
 
 In the picker, use **Ulysses2** and encoder **Fold** for two GPUs. Choose **Auto**
 placement for native two-GPU, Spark and AMD recipes, or **Resident** for the other rows.
@@ -587,6 +612,28 @@ The guide's T2I and editing examples match the release reference images
 visually; outputs are not byte-identical to CUDA or across layouts. MI355X and
 MI300X use the same gfx950 and gfx942 recipes and were not measured separately.
 Multiple-reference, exact-quality and quantized AMD workloads remain unmeasured.
+
+### Ascend A3 at 2K and 4K
+
+Four Ascend A3 NPUs (`TP2 + Ulysses2 + laser_attn`, `--encoder-parallel fold`,
+`--component-residency all=resident`, `--minimax-h3-adaln-online true`, eager
+execution, `quality=lossless`, six steps, seed 42, CPU generator, with
+`triton_ascend 3.2.2`):
+
+| Workload | Warm pipeline median | Cold pipeline median | Peak reserved / NPU |
+| --- | --- | --- | --- |
+| T2I, 2048 × 2048 | 1.949 s | 2.082 s | 37.0 GiB |
+| Editing, 2048 × 2048 (1K ref) | 3.049 s | 3.320 s | 40.7 GiB |
+| Editing, 2048 × 2048 (2K ref) | 4.946 s | 6.035 s | 40.7 GiB |
+| Editing, 2048 × 2048 (2 refs) | — | 7.706 s | 41.2 GiB |
+| T2I, 4736 × 3552 | 9.426 s | 9.568 s | 43.0 GiB |
+
+Warm times reuse exact text and visual conditioning caches; cold times run full
+text and reference VAE encoding. All times are server pipeline medians excluding
+HTTP transport, PNG encoding and client saving. For lower memory footprints,
+`--component-residency all=layerwise-offload --minimax-h3-adaln-online true`
+was also verified at `4.35 GiB / NPU` on four NPUs (`TP4`) and `5.69 GiB / NPU`
+on two NPUs (`TP2`).
 
 ### PNG encoding at 4K
 

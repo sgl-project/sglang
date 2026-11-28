@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding import (
     ConditionEncodingStage,
@@ -389,25 +391,28 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
                 batch, plan, server_args, reference_grids=grids
             ).generator
         entries = []
-        for item, image, (latent_h, latent_w) in zip(
-            prepared["images"], vae_images, grids
+        with use_vae_fast_path(
+            self.video_vae, quality_allows(batch.quality, "lossless")
         ):
-            rows = minimax_h3_encode_keyframe_cond_rows(
-                self.video_vae,
-                image,
-                self.vae_arch_config,
-                crop_to_even=original_geometry,
-                generator=generator,
-            )
-            entries.append(
-                {
-                    "rows": rows,
-                    "latent_h": latent_h,
-                    "latent_w": latent_w,
-                    "condition_index": int(item["condition_index"]),
-                    "material_chain": "image.reference_preserve",
-                }
-            )
+            for item, image, (latent_h, latent_w) in zip(
+                prepared["images"], vae_images, grids
+            ):
+                rows = minimax_h3_encode_keyframe_cond_rows(
+                    self.video_vae,
+                    image,
+                    self.vae_arch_config,
+                    crop_to_even=original_geometry,
+                    generator=generator,
+                )
+                entries.append(
+                    {
+                        "rows": rows,
+                        "latent_h": latent_h,
+                        "latent_w": latent_w,
+                        "condition_index": int(item["condition_index"]),
+                        "material_chain": "image.reference_preserve",
+                    }
+                )
         payload = dict(entries[0])  # single-image consumers keep the keys
         payload["images"] = entries
         batch.extra[MINIMAX_H3_REFERENCE_IMAGE_ROWS_EXTRA_KEY] = payload

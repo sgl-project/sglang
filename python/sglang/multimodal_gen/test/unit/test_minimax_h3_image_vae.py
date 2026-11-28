@@ -6,6 +6,8 @@ draws from the global RNG.
 """
 
 import os
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +23,10 @@ from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fas
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3ImageVAE
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
     maybe_optimize_minimax_h3_vae,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import vae_vit
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.base_module import (
+    RotaryEmbeddingND,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
     AutoencoderKLLegacy,
@@ -278,3 +284,183 @@ def test_lossless_decode_distributes_complete_tiles(tmp_path):
         args=((tmp_path / "rendezvous").as_uri(),),
         nprocs=2,
     )
+
+
+def test_vit_decoder_disables_autocast_on_npu(tiny_image, monkeypatch):
+    has_npu = hasattr(torch, "npu") and torch.npu.is_available()
+    orig_autocast = torch.autocast
+    autocast_calls = []
+
+    def spy_autocast(device_type, *args, **kwargs):
+        autocast_calls.append(
+            (device_type, kwargs.get("enabled", True), kwargs.get("dtype"))
+        )
+        if has_npu:
+            return orig_autocast(device_type, *args, **kwargs)
+        return nullcontext()
+
+    monkeypatch.setattr(torch, "autocast", spy_autocast)
+
+    assert isinstance(vae_vit._autocast_disabled(torch.empty(1)), nullcontext)
+    assert autocast_calls == []
+
+    fake_npu_device = SimpleNamespace(type="npu")
+    npu_ctx = vae_vit._autocast_disabled(SimpleNamespace(device=fake_npu_device))
+    assert autocast_calls == [("npu", False, None)]
+    with npu_ctx:
+        pass
+
+    autocast_calls.clear()
+    rope = RotaryEmbeddingND(dim=12, n_dim=3)
+    if has_npu:
+        rope = rope.to("npu")
+        cos, sin = rope(torch.zeros(1, 2, 3, device="npu"))
+        assert cos.shape == (1, 2, 1, 12)
+        assert sin.shape == (1, 2, 1, 12)
+    else:
+
+        class _FakeNpuTensor:
+            def __init__(self, tensor: torch.Tensor):
+                self._t = tensor
+                self.shape = tensor.shape
+                self.dtype = tensor.dtype
+                self.ndim = tensor.ndim
+                self.device = fake_npu_device
+
+            def __getitem__(self, item):
+                return self._t[item]
+
+            def to(self, *args, **kwargs):
+                return self._t
+
+            def unsqueeze(self, dim):
+                return _FakeNpuTensor(self._t.unsqueeze(dim))
+
+            def view(self, *args, **kwargs):
+                return self._t.view(*args, **kwargs)
+
+        orig_inv_freq = rope.inv_freq
+        del rope._buffers["inv_freq"]
+        rope.inv_freq = _FakeNpuTensor(orig_inv_freq)
+        cos, sin = rope(_FakeNpuTensor(torch.zeros(1, 2, 3)))
+        assert cos.shape == (1, 2, 1, 12)
+        assert sin.shape == (1, 2, 1, 12)
+    assert ("npu", False, None) in autocast_calls
+
+    get_dtype_calls = []
+    rotary_dtypes = []
+    orig_get_autocast_dtype = torch.get_autocast_dtype
+    orig_is_autocast_enabled = torch.is_autocast_enabled
+    orig_prepare_rotary = vae_vit.prepare_rotary_pos_emb
+
+    def spy_get_autocast_dtype(device_type):
+        get_dtype_calls.append(device_type)
+        if has_npu:
+            return orig_get_autocast_dtype(device_type)
+        return torch.bfloat16
+
+    def spy_is_autocast_enabled(device_type=None):
+        if has_npu:
+            return orig_is_autocast_enabled(device_type)
+        return device_type == "npu"
+
+    def spy_prepare_rotary(rotary_pos_emb, *, dtype, batch=1):
+        rotary_dtypes.append(dtype)
+        return orig_prepare_rotary(rotary_pos_emb, dtype=dtype, batch=batch)
+
+    monkeypatch.setattr(torch, "get_autocast_dtype", spy_get_autocast_dtype)
+    monkeypatch.setattr(torch, "is_autocast_enabled", spy_is_autocast_enabled)
+    monkeypatch.setattr(vae_vit, "prepare_rotary_pos_emb", spy_prepare_rotary)
+
+    if has_npu:
+        autocast_calls.clear()
+        npu_vae = tiny_image.to("npu")
+        out = npu_vae.decode_image_raw(torch.randn(1, 24, 1, 4, 4, device="npu"))
+        assert out.shape == (1, 3, 64, 64)
+        assert torch.isfinite(out).all()
+        assert ("npu", True, torch.bfloat16) in autocast_calls
+        assert ("npu", False, None) in autocast_calls
+    else:
+        orig_create_token_ids = vae_vit.create_token_ids
+        orig_zeros = torch.zeros
+
+        def fake_create_token_ids(patch_dims, device, dtype, *args, **kwargs):
+            actual_device = torch.device("cpu") if device is fake_npu_device else device
+            return orig_create_token_ids(
+                patch_dims, actual_device, dtype, *args, **kwargs
+            )
+
+        def fake_zeros(*args, **kwargs):
+            if kwargs.get("device") is fake_npu_device:
+                kwargs["device"] = torch.device("cpu")
+            return orig_zeros(*args, **kwargs)
+
+        monkeypatch.setattr(vae_vit, "create_token_ids", fake_create_token_ids)
+        monkeypatch.setattr(torch, "zeros", fake_zeros)
+
+        with torch.inference_mode():
+            out = tiny_image.decoder(_FakeNpuTensor(torch.randn(1, 24, 4, 4)))
+        assert out.shape == (1, 3, 64, 64)
+        assert torch.isfinite(out).all()
+
+    assert "npu" in get_dtype_calls
+    assert rotary_dtypes == [torch.bfloat16]
+
+
+def test_npu_image_vae_conv2d_equiv_and_tile_tasks(tiny_image, monkeypatch):
+    has_npu = hasattr(torch, "npu") and torch.npu.is_available()
+    if has_npu:
+        device = torch.device("npu")
+        vae = tiny_image.to(device).eval()
+        x = torch.randn(2, 3, 1, 32, 32, device=device, dtype=torch.float32)
+        with torch.inference_mode():
+            y_fast = vae.encode(x)
+        with torch.enable_grad():
+            y_ref = vae.quant_conv(vae.encoder(x)).detach()
+        torch.testing.assert_close(y_fast, y_ref, rtol=1e-4, atol=1e-4)
+
+        decode_calls = []
+        encode_calls = []
+
+        def fake_decode(tiles):
+            decode_calls.append(tiles.shape[0])
+            return tiles * 2
+
+        def fake_encode(tiles):
+            encode_calls.append(tiles.shape[0])
+            return tiles + 1
+
+        monkeypatch.setattr(vae, "decode", fake_decode)
+        monkeypatch.setattr(vae, "encode", fake_encode)
+
+        tiles = [torch.full((2, 1, 1, 1), i, device=device) for i in range(40)]
+        indices = list(range(40))
+        with use_vae_fast_path(vae, True):
+            out_dec = vae._run_tile_tasks(tiles, indices, fake_decode)
+            out_enc = vae._run_tile_tasks(tiles, indices, fake_encode)
+        assert decode_calls == [80]
+        assert encode_calls == [16, 16, 16, 16, 16]
+        for actual, tile in zip(out_dec, tiles, strict=True):
+            torch.testing.assert_close(actual, tile * 2, rtol=0, atol=0)
+        for actual, tile in zip(out_enc, tiles, strict=True):
+            torch.testing.assert_close(actual, tile + 1, rtol=0, atol=0)
+
+        encode_calls.clear()
+        vae._run_tile_tasks(tiles, indices, fake_encode)
+        assert encode_calls == [2] * 40
+    else:
+        # CPU check for TemporalIsolatedGroupNorm depth=1 fast path parity.
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.norm import (
+            TemporalIsolatedGroupNorm,
+            _merge_time_to_batch,
+            _split_time_from_batch,
+        )
+
+        gn = TemporalIsolatedGroupNorm(num_groups=8, num_channels=32, eps=1e-6).eval()
+        x = torch.randn(2, 32, 1, 8, 8)
+        with torch.inference_mode():
+            y_fast = gn(x)
+            y_ref = _split_time_from_batch(
+                torch.nn.GroupNorm.forward(gn, _merge_time_to_batch(x)), x.shape[0]
+            )
+        torch.testing.assert_close(y_fast, y_ref, rtol=0, atol=0)

@@ -240,15 +240,18 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
         supported_backends = (None, dense_backend)
         if dense_backend is AttentionBackendEnum.FA:
             supported_backends += (AttentionBackendEnum.FP8_FA_SM120,)
+        if current_platform.is_npu():
+            supported_backends += (AttentionBackendEnum.LASER_ATTN,)
         if selected_backend not in supported_backends:
             raise ValueError(
                 "MiniMax H3 image requires dense FlashAttention "
-                f"(--attention-backend {dense_backend.name.lower()} on this platform); "
-                "CUDA also supports explicit fp8_fa_sm120 attention"
+                f"(--attention-backend {dense_backend.name.lower()} on this platform)"
+                + (" or laser_attn on NPU" if current_platform.is_npu() else "")
+                + "; CUDA also supports explicit fp8_fa_sm120 attention"
             )
-        if (
-            server_args.ring_degree > 1
-            and selected_backend is AttentionBackendEnum.FP8_FA_SM120
+        if server_args.ring_degree > 1 and selected_backend in (
+            AttentionBackendEnum.FP8_FA_SM120,
+            AttentionBackendEnum.LASER_ATTN,
         ):
             raise ValueError(
                 "MiniMax H3 image Ring parallelism requires FlashAttention"

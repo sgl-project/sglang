@@ -31,6 +31,8 @@ class TemporalIsolatedGroupNorm(nn.GroupNorm):
     def forward(self, input, *, silu_pad=False):
         if input.dim() == 5:
             batch, channels, depth, height, width = input.shape
+            if depth == 1 and not silu_pad:
+                return super().forward(input.squeeze(2)).unsqueeze(2)
             input = _merge_time_to_batch(input)
             output = super().forward(input)
             if silu_pad:

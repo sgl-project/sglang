@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # 3D convolution for the MiniMax H3 visual VAE.
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -77,6 +78,47 @@ class BaseConv3d(nn.Conv3d):
         return x
 
     def forward(self, x, *, pre_padded=False):
+        if (
+            not pre_padded
+            and not torch.is_grad_enabled()
+            and x.device.type == "npu"
+            and x.ndim == 5
+            and x.shape[2] == 1
+            and self.dilation[0] == 1
+        ):
+            if sum(self.padding) == 0 and self.kernel_size[0] == 1:
+                return F.conv2d(
+                    x.squeeze(2),
+                    self.weight.squeeze(2),
+                    self.bias,
+                    stride=self.stride[1:],
+                    padding=0,
+                    dilation=self.dilation[1:],
+                    groups=self.groups,
+                ).unsqueeze(2)
+            if sum(self.padding) != 0 and self.causal and self.pad_mode_t == "constant":
+                x2 = x.squeeze(2)
+                if self.padding[1] or self.padding[2]:
+                    x2 = F.pad(
+                        x2,
+                        (
+                            self.padding[2],
+                            self.padding[2],
+                            self.padding[1],
+                            self.padding[1],
+                        ),
+                        mode=self.pad_mode,
+                    )
+                return F.conv2d(
+                    x2,
+                    self.weight[:, :, -1, :, :],
+                    self.bias,
+                    stride=self.stride[1:],
+                    padding=0,
+                    dilation=self.dilation[1:],
+                    groups=self.groups,
+                ).unsqueeze(2)
+
         if sum(self.padding) == 0:
             return super().forward(x)
 
