@@ -631,9 +631,9 @@ class Sampler(nn.Module):
         Used for deterministic sampling with simple cases (no top-k/top-p/min-p).
         Requires sampling_seed to be set in sampling_info.
         """
-        assert sampling_info.sampling_seed is not None, (
-            "sampling_seed is required for sampling from logprobs"
-        )
+        assert (
+            sampling_info.sampling_seed is not None
+        ), "sampling_seed is required for sampling from logprobs"
         sampled_index = multinomial_with_seed(
             logprobs, sampling_info.sampling_seed, positions
         )
@@ -663,9 +663,9 @@ class Sampler(nn.Module):
             else:
                 batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
         else:
-            assert self.use_ascend_backend, (
-                "Only ascend backend supports sampling from logits"
-            )
+            assert (
+                self.use_ascend_backend
+            ), "Only ascend backend supports sampling from logits"
             batch_next_token_ids, filtered_probs = (
                 top_k_top_p_min_p_sampling_from_logits_ascend(
                     logits,
@@ -723,9 +723,9 @@ class Sampler(nn.Module):
     ) -> _SamplingMaskCapture:
         """Capture exported weights without replaying top-k/top-p."""
         capture_rows = sampling_info.sampling_mask_batch_indices
-        assert capture_rows is not None, (
-            "Sampling-mask capture requested without any opted-in batch rows."
-        )
+        assert (
+            capture_rows is not None
+        ), "Sampling-mask capture requested without any opted-in batch rows."
 
         return _SamplingMaskCapture(
             weights=_select_sampling_mask_rows(filtered_probs, capture_rows),
@@ -826,6 +826,45 @@ def top_k_top_p_min_p_filter_sorted_probs_torch(
     if need_min_p_sampling:
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+
+
+def top_k_top_p_filter_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    max_top_k: Optional[int] = None,
+    min_ps: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Unnormalized descending ``(probs_sort, probs_idx)`` after top-k/top-p,
+    and min-p when ``min_ps`` is given.
+
+    max_top_k, when given, must be >= every value in top_ks.
+    """
+    # The top-k mask zeroes every column at rank >= top_k, so the max_top_k
+    # leading columns carry all the mass that survives and sorting only those is
+    # exact. Callers that need a batch-independent tie order pass None.
+    if max_top_k is not None and max_top_k < probs.shape[-1]:
+        probs_sort, probs_idx = torch.topk(probs, k=max_top_k, dim=-1, sorted=True)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    top_k_top_p_min_p_filter_sorted_probs_torch(
+        probs_sort, top_ks, top_ps, min_ps, min_ps is not None
+    )
+    return probs_sort, probs_idx
+
+
+def top_k_top_p_normalize_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    max_top_k: Optional[int] = None,
+    min_ps: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    probs_sort, probs_idx = top_k_top_p_filter_probs_torch(
+        probs, top_ks, top_ps, max_top_k, min_ps
+    )
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    return torch.zeros_like(probs).scatter_(-1, probs_idx, probs_sort)
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(

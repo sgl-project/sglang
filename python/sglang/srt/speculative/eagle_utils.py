@@ -25,6 +25,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
+from sglang.srt.layers.sampler import top_k_top_p_normalize_probs_torch
 from sglang.srt.layers.sampling_renorm import (
     min_p_renorm_prob,
     top_k_renorm_prob,
@@ -32,7 +33,7 @@ from sglang.srt.layers.sampling_renorm import (
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import decode_alloc_targets
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
@@ -682,6 +683,62 @@ def _can_use_sparse_uno_tree_target_sampling(
     )
 
 
+def _build_verify_target_probs(
+    next_token_logits: torch.Tensor,
+    sampling_info,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """Target distribution for rejection sampling, one row per draft token."""
+    target_probs = sampling_softmax(
+        next_token_logits,
+        temperatures=sampling_info.temperatures,
+        rows_per_request=draft_token_num,
+    )  # (bs * num_draft_tokens, vocab_size)
+    maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+    need_top_k = sampling_info.need_top_k_sampling
+    need_top_p = sampling_info.need_top_p_sampling
+    need_min_p = sampling_info.need_min_p_sampling
+    if not (need_top_k or need_top_p or need_min_p):
+        return target_probs
+    if get_exec().kernel.sampling_backend == "pytorch":
+        top_ks = torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0)
+        top_ps = torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0)
+        # Rejection sampling is lossless only against the distribution the
+        # non-speculative sampler draws from, so filter with the same kernel.
+        # The renorm kernels keep every tie at the top-p pivot instead.
+        target_probs = top_k_top_p_normalize_probs_torch(
+            target_probs,
+            top_ks,
+            top_ps,
+            max_top_k=(
+                getattr(sampling_info, "max_top_k", None)
+                if getattr(sampling_info, "sampling_seed", None) is None
+                else None
+            ),
+            min_ps=(
+                torch.repeat_interleave(sampling_info.min_ps, draft_token_num, dim=0)
+                if need_min_p
+                else None
+            ),
+        )
+        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_top_p")
+        return target_probs
+
+    target_probs = _apply_joint_top_k_top_p(
+        target_probs,
+        sampling_info,
+        draft_token_num,
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+    )
+    if need_min_p:
+        target_probs = min_p_renorm_prob(
+            target_probs,
+            torch.repeat_interleave(sampling_info.min_ps, draft_token_num, dim=0),
+        )
+    return target_probs
+
+
 def _apply_joint_top_k_top_p(
     probs: torch.Tensor,
     sampling_info: SamplingBatchInfo,
@@ -1086,26 +1143,9 @@ def _tree_accept(
         else:
             sampling_fn = tree_speculative_sampling_target_only
 
-        target_probs = sampling_softmax(
-            next_token_logits,
-            temperatures=sampling_info.temperatures,
-            rows_per_request=verify_input.draft_token_num,
+        target_probs = _build_verify_target_probs(
+            next_token_logits, sampling_info, verify_input.draft_token_num
         )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        target_probs = _apply_joint_top_k_top_p(
-            target_probs,
-            sampling_info,
-            verify_input.draft_token_num,
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-        )
-        if sampling_info.need_min_p_sampling:
-            target_probs = min_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.min_ps, verify_input.draft_token_num, dim=0
-                ),
-            )
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
