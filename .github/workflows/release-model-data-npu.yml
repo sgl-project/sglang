@@ -1,9 +1,9 @@
 # Key-model performance/accuracy data collection for NPU releases.
 #
-# Runs the curated release cases: multi-node PD cases through the multi-node
-# template. Metrics land in the versioned shared-disk layout
-# (/root/.cache/tests/output/...) consumed by the data dashboard, and are also
-# uploaded as workflow artifacts for direct download.
+# Runs the curated release case: the single-node (Ascend 950/a5) DeepSeek case
+# through the single-node template. Metrics land in the versioned shared-disk
+# layout (/root/.cache/tests/output/...) consumed by the data dashboard, and are
+# also uploaded as workflow artifacts for direct download.
 #
 name: Release Model Data (NPU)
 
@@ -16,10 +16,10 @@ on:
   workflow_dispatch:
     inputs:
       image:
-        description: 'NPU image used by the enabled case(s). Defaults to the Ascend a3 image the multi-node PD case below needs.'
+        description: 'NPU image used by the enabled case. Defaults to the Ascend 950 (a5) image the single-node case below needs.'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050'
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B060'
       use_image_sglang:
         description: "If 'true' (default), the job imports sglang from the image's site-packages. Set 'false' to use the checked-out sglang."
         required: false
@@ -47,116 +47,124 @@ jobs:
           RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d-%H%M)")"
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
 
-  prepare-sgl-router:
-    name: prepare-sgl-router
-    # The test image ships no sgl-router and the pods mount the checkout, so
-    # fetch the aarch64 build once here and hand it to the collect job as the
-    # sgl_router_artifact input, which restores it into sgl-router-bin/ where
-    # run_npu_testcase.sh looks for it.
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download the prebuilt aarch64 sgl-router
-        run: |
-          set -euo pipefail
-          SGL_ROUTER_OBS_URL="https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/sgl-router/bin/sgl-router-aarch64-npu.zip"
-          archive=/tmp/sgl-router-aarch64-npu.zip
-          mkdir -p sgl-router-bin
-          # OBS lives in the same region as the cluster; bypass any image proxy.
-          if command -v curl >/dev/null 2>&1; then
-            ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; curl -fsSL -o "${archive}" "${SGL_ROUTER_OBS_URL}" )
-          elif command -v wget >/dev/null 2>&1; then
-            ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; wget -q -O "${archive}" "${SGL_ROUTER_OBS_URL}" )
-          else
-            echo "Neither curl nor wget is available to download sgl-router"
-            exit 1
-          fi
-          python3 -m zipfile -e "${archive}" sgl-router-bin
-          bin="$(find sgl-router-bin -type f -name 'sgl-router' -print -quit)"
-          if [ -z "${bin}" ]; then
-            echo "sgl-router binary not found in ${archive}"
-            exit 1
-          fi
-          # actions/download-artifact restores this at sgl-router-bin/sgl-router.
-          if [ "${bin}" != "sgl-router-bin/sgl-router" ]; then
-            mv "${bin}" sgl-router-bin/sgl-router
-          fi
-          chmod +x sgl-router-bin/sgl-router
-
-      - name: Upload sgl-router artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: sgl-router-aarch64-npu-obs
-          path: sgl-router-bin/sgl-router
-          if-no-files-found: error
-          retention-days: 1
-
-  # Multi-node PD separation: GLM-5.3-w8a8 with PCP (no PP), PD KV transfer and
-  # L3 store over Mooncake. The case file runs both its test methods (GPQA
-  # accuracy and the GSP L2/L3 hit-rate check).
-  collect-multi-node:
-    name: ${{ matrix.name }}
-    needs: [metadata, prepare-sgl-router]
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        include:
-          - name: test_npu_glm_5_3_w8a8_1p1d_32p_pcp_no_pp_mooncake_l3
-            test_type: accuracy
-            prefill_decode_deployment: separation
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/basic_function/mooncake/test_npu_glm_5_3_w8a8_1p1d_32p_pcp_no_pp_mooncake_l3.py
-    uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
-    with:
-      runner: linux-amd64-cpu-4
-      test_type: ${{ matrix.test_type }}
-      test_config_name: ${{ matrix.name }}
-      prefill_size: ${{ matrix.prefill_size }}
-      decode_size: ${{ matrix.decode_size }}
-      router_size: ${{ matrix.router_size }}
-      test_case: ${{ matrix.test_case }}
-      # workflow_dispatch defaults the image; pull_request runs have no inputs,
-      # so fall back to the a3 image here as well.
-      image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050' }}
-      prefill_decode_deployment: ${{ matrix.prefill_decode_deployment }}
-      container_patches: ${{ matrix.container_patches || '' }}
-      run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
-      use_image_sglang: ${{ inputs.use_image_sglang || 'true' }}
-      test_method: ${{ matrix.test_method || '' }}
-      sgl_router_artifact: sgl-router-aarch64-npu-obs
-    secrets: inherit
-
-  # Single-machine (Ascend 950/a5) collection is disabled. When restoring it,
-  # uncomment this job and add `collect` back to publish.needs.
-  # The case is 4-card DeepSeek-V4-Flash FP8 with DSPARK and L2 host HiCache,
-  # run directly on the runner; the case file runs both its test methods
-  # (GPQA accuracy and the GSP L2 cache hit-rate check).
-  # collect:
-  #   name: test_npu_deepseek_v4_flash_fp8_4p_l2_a5
-  #   needs: [metadata]
-  #   uses: ./.github/workflows/_npu-single-node-test-stage.yml
+  # Multi-node PD collection is disabled. To restore it, uncomment this block
+  # and `collect-multi-node` below (and `prepare-sgl-router`, which only the
+  # multi-node case uses), then comment out the single-node `collect` job and
+  # add `collect-multi-node` back to publish.needs.
+  #
+  # prepare-sgl-router:
+  #   name: prepare-sgl-router
+  #   # The test image ships no sgl-router and the pods mount the checkout, so
+  #   # fetch the aarch64 build once here and hand it to the collect job as the
+  #   # sgl_router_artifact input, which restores it into sgl-router-bin/ where
+  #   # run_npu_testcase.sh looks for it.
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Download the prebuilt aarch64 sgl-router
+  #       run: |
+  #         set -euo pipefail
+  #         SGL_ROUTER_OBS_URL="https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/sgl-router/bin/sgl-router-aarch64-npu.zip"
+  #         archive=/tmp/sgl-router-aarch64-npu.zip
+  #         mkdir -p sgl-router-bin
+  #         # OBS lives in the same region as the cluster; bypass any image proxy.
+  #         if command -v curl >/dev/null 2>&1; then
+  #           ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; curl -fsSL -o "${archive}" "${SGL_ROUTER_OBS_URL}" )
+  #         elif command -v wget >/dev/null 2>&1; then
+  #           ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; wget -q -O "${archive}" "${SGL_ROUTER_OBS_URL}" )
+  #         else
+  #           echo "Neither curl nor wget is available to download sgl-router"
+  #           exit 1
+  #         fi
+  #         python3 -m zipfile -e "${archive}" sgl-router-bin
+  #         bin="$(find sgl-router-bin -type f -name 'sgl-router' -print -quit)"
+  #         if [ -z "${bin}" ]; then
+  #           echo "sgl-router binary not found in ${archive}"
+  #           exit 1
+  #         fi
+  #         # actions/download-artifact restores this at sgl-router-bin/sgl-router.
+  #         if [ "${bin}" != "sgl-router-bin/sgl-router" ]; then
+  #           mv "${bin}" sgl-router-bin/sgl-router
+  #         fi
+  #         chmod +x sgl-router-bin/sgl-router
+  #
+  #     - name: Upload sgl-router artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: sgl-router-aarch64-npu-obs
+  #         path: sgl-router-bin/sgl-router
+  #         if-no-files-found: error
+  #         retention-days: 1
+  #
+  # # Multi-node PD separation: GLM-5.3-w8a8 with PCP (no PP), PD KV transfer
+  # # and L3 store over Mooncake. The case file runs both its test methods (GPQA
+  # # accuracy and the GSP L2/L3 hit-rate check).
+  # collect-multi-node:
+  #   name: ${{ matrix.name }}
+  #   needs: [metadata, prepare-sgl-router]
+  #   strategy:
+  #     fail-fast: false
+  #     max-parallel: 1
+  #     matrix:
+  #       include:
+  #         - name: test_npu_glm_5_3_w8a8_1p1d_32p_pcp_no_pp_mooncake_l3
+  #           test_type: accuracy
+  #           prefill_decode_deployment: separation
+  #           prefill_size: 2
+  #           decode_size: 2
+  #           router_size: 1
+  #           test_case: test/registered/npu/basic_function/mooncake/test_npu_glm_5_3_w8a8_1p1d_32p_pcp_no_pp_mooncake_l3.py
+  #   uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
   #   with:
-  #     runner: linux-amd64-a5-4
-  #     test_type: accuracy
-  #     # test_suite names the persisted output/metrics directory; the case file
-  #     # itself is handed over through test_case.
-  #     test_suite: test_npu_deepseek_v4_flash_fp8_4p_l2_a5
-  #     test_case: test/registered/npu/basic_function/mooncake/test_npu_deepseek_v4_flash_fp8_4p_l2_a5.py
-  #     image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B050' }}
+  #     runner: linux-amd64-cpu-4
+  #     test_type: ${{ matrix.test_type }}
+  #     test_config_name: ${{ matrix.name }}
+  #     prefill_size: ${{ matrix.prefill_size }}
+  #     decode_size: ${{ matrix.decode_size }}
+  #     router_size: ${{ matrix.router_size }}
+  #     test_case: ${{ matrix.test_case }}
+  #     # workflow_dispatch defaults the image; pull_request runs have no inputs,
+  #     # so fall back to the a3 image here as well.
+  #     image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050' }}
+  #     prefill_decode_deployment: ${{ matrix.prefill_decode_deployment }}
+  #     container_patches: ${{ matrix.container_patches || '' }}
   #     run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
   #     use_image_sglang: ${{ inputs.use_image_sglang || 'true' }}
-  #     is_nightly_pipeline_job: true
-  #     upload_metrics_artifact: true
-  #     install_sglang_deps: false
-  #     device_type_for_deps: '950'
-  #     skip_pr_test_health_check: 'true'
+  #     test_method: ${{ matrix.test_method || '' }}
+  #     sgl_router_artifact: sgl-router-aarch64-npu-obs
   #   secrets: inherit
+
+  # Single-machine (Ascend 950/a5) collection.
+  # The case is one 8-card machine with PD separation (4-card prefill + 4-card
+  # decode) for DeepSeek-V4-Flash FP8, KV transferred through Mooncake, run
+  # directly on the runner; the case file runs both its test methods (GPQA
+  # accuracy and the GSP L2 cache hit-rate check).
+  collect:
+    name: test_npu_deepseek_v4_flash_fp8_1p1d_8p_mooncake_a5
+    needs: [metadata]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-amd64-a5-8
+      test_type: accuracy
+      # test_suite names the persisted output/metrics directory; the case file
+      # itself is handed over through test_case.
+      test_suite: test_npu_deepseek_v4_flash_fp8_1p1d_8p_mooncake_a5
+      test_case: test/registered/npu/basic_function/mooncake/test_npu_deepseek_v4_flash_fp8_1p1d_8p_mooncake_a5.py
+      image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B060' }}
+      # The archive's install.sh patches the image's Mooncake transfer engine
+      # (mooncake_transfer_engine_memfabric) before the case runs.
+      container_patches: https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/ci/patch/mooncake_transfer_engine_memfabric-0.3.14-cp312-cp312-manylinux_2_35_aarch64.zip
+      run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
+      use_image_sglang: ${{ inputs.use_image_sglang || 'true' }}
+      is_nightly_pipeline_job: true
+      upload_metrics_artifact: true
+      install_sglang_deps: false
+      device_type_for_deps: '950'
+      skip_pr_test_health_check: 'true'
+    secrets: inherit
 
   publish:
     name: publish-release-data
-    needs: [collect-multi-node]
+    needs: [collect]
     # Publish whatever was collected even if some case failed; skip on cancel.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest

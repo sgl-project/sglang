@@ -27,6 +27,11 @@ on:
         type: string
         description: image for pods
         default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.2.0-a3"
+      container_patches:
+        required: false
+        type: string
+        default: ""
+        description: "Comma separated https URLs of container patch zip archives. Each archive is downloaded and extracted into the workspace, then its install.sh is run inside the container before the test. Empty keeps the image untouched."
       install_sglang_deps:
         required: false
         type: boolean
@@ -113,6 +118,86 @@ jobs:
           # Pin to the event SHA (not the branch name) so every job in this run
           # checks out the same commit even if the branch advances mid-run.
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Prepare container patches
+        id: container_patches
+        if: inputs.container_patches != ''
+        shell: bash
+        env:
+          CONTAINER_PATCHES: ${{ inputs.container_patches }}
+        run: |
+          set -euo pipefail
+          mkdir -p container-patches
+          dirs=""
+          while IFS= read -r url; do
+            url="$(echo "${url}" | tr -d '[:space:]')"
+            if [ -z "${url}" ]; then
+              continue
+            fi
+
+            # Only plain https .zip URLs: the extracted path ends up in an
+            # install.sh lookup, so reject anything with shell metacharacters.
+            if ! echo "${url}" | grep -Eq '^https://[A-Za-z0-9._~:/@%+=-]+\.zip$'; then
+              echo "Invalid container patch url: ${url}"
+              exit 1
+            fi
+
+            slug="$(printf '%s' "${url}" | sha256sum | awk '{print $1}')"
+            dest="container-patches/${slug}"
+            # A repeated URL would otherwise install twice.
+            case ",${dirs}," in
+              *",${dest},"*) continue ;;
+            esac
+            rm -rf "${dest}"
+            mkdir -p "${dest}"
+            archive="/tmp/container-patch-${slug}.zip"
+
+            # OBS lives in the same region as the cluster; bypass any proxy.
+            if command -v curl >/dev/null 2>&1; then
+              ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; curl -fsSL -o "${archive}" "${url}" )
+            elif command -v wget >/dev/null 2>&1; then
+              ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; wget -q -O "${archive}" "${url}" )
+            else
+              echo "Neither curl nor wget is available to download ${url}"
+              exit 1
+            fi
+
+            if command -v python3 >/dev/null 2>&1; then
+              python3 -m zipfile -e "${archive}" "${dest}"
+            else
+              python -m zipfile -e "${archive}" "${dest}"
+            fi
+            if [ -z "$(find "${dest}" -type f -name install.sh -print -quit)" ]; then
+              echo "install.sh not found in ${url}"
+              exit 1
+            fi
+
+            dirs="${dirs:+${dirs},}${dest}"
+          done <<< "$(echo "${CONTAINER_PATCHES}" | tr ',' '\n')"
+          echo "dirs=${dirs}" >> "$GITHUB_OUTPUT"
+          echo "Container patch dirs: ${dirs}"
+
+      - name: Apply container patches
+        if: inputs.container_patches != ''
+        shell: bash
+        env:
+          CONTAINER_PATCH_DIRS: ${{ steps.container_patches.outputs.dirs }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r patch_dir; do
+            patch_dir="$(echo "${patch_dir}" | tr -d '[:space:]')"
+            if [ -z "${patch_dir}" ]; then
+              continue
+            fi
+            install_sh="$(pwd)/${patch_dir}/install.sh"
+            if [ ! -f "${install_sh}" ]; then
+              echo "install.sh not found: ${install_sh}" >&2
+              exit 1
+            fi
+            echo "===== Apply container patch: ${patch_dir} - Begin ====="
+            ( cd "$(dirname "${install_sh}")" && bash ./install.sh )
+            echo "===== Apply container patch: ${patch_dir} - End ====="
+          done <<< "$(echo "${CONTAINER_PATCH_DIRS}" | tr ',' '\n')"
 
       - name: Check PR test health
         uses: actions/github-script@v8
