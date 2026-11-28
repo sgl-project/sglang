@@ -79,7 +79,6 @@ def _qknorm_complex_rope_onepass_kernel(
 def _validate_qknorm_complex_rope(x, weight, rope):
     if not (
         x.is_cuda
-        and torch.version.hip is None
         and x.dtype in (torch.float16, torch.bfloat16)
         and x.ndim == 4
         and x.shape[-1] == 128

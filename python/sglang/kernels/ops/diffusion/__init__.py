@@ -36,6 +36,7 @@ _CUDA = frozenset({CapabilityRequirement.CUDA})
 _CUDA_SM90_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))})
 _CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
+_CUDA_OR_HIP = frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP})
 _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 
 # ---------------------------------------------------------------------------
@@ -274,6 +275,24 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.layernorm_modulate",
+        KernelBackend.TRITON,
+        "norm.gated_residual_layernorm_modulate_triton:layernorm_modulate",
+        _HIP,
+    ),
+    (
+        "diffusion.gated_residual_layernorm_modulate",
+        KernelBackend.TRITON,
+        "norm.gated_residual_layernorm_modulate_triton:gated_residual_layernorm_modulate",
+        _HIP,
+    ),
+    (
+        "diffusion.residual_gate_add",
+        KernelBackend.TRITON,
+        "norm.gated_residual_layernorm_modulate_triton:gated_residual_add",
+        _HIP,
+    ),
+    (
         "diffusion.residual_gate_add",
         KernelBackend.KDA,
         "sglang.kernels.kda_kernels.residual_gate_add_jit:residual_gate_add",
@@ -454,10 +473,16 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.qknorm_complex_rope_strided",
+        KernelBackend.TRITON,
+        "rope.qknorm_complex_rope_strided_triton:qknorm_complex_rope_strided",
+        _HIP,
+    ),
+    (
         "diffusion.complex_rope",
         KernelBackend.TRITON,
         "rope.complex_rope_triton:fused_complex_rope",
-        _CUDA,
+        _CUDA_OR_HIP,
     ),
     (
         "diffusion.hunyuan_qkv_rope_pack",
@@ -870,6 +895,12 @@ _EXPORTS: dict[str, str] = {
     "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
     "fused_complex_rope": "rope.complex_rope_triton",
+    "can_use_qknorm_complex_rope_strided": "rope.qknorm_complex_rope_strided_triton",
+    "qknorm_complex_rope_strided": "rope.qknorm_complex_rope_strided_triton",
+    "can_use_gated_residual_layernorm_modulate": "norm.gated_residual_layernorm_modulate_triton",
+    "gated_residual_add": "norm.gated_residual_layernorm_modulate_triton",
+    "gated_residual_layernorm_modulate": "norm.gated_residual_layernorm_modulate_triton",
+    "layernorm_modulate": "norm.gated_residual_layernorm_modulate_triton",
     "can_use_qknorm_complex_rope_cuda": "rope.qknorm_complex_rope_jit",
     "qknorm_complex_rope_cuda": "rope.qknorm_complex_rope_jit",
     "qknorm_complex_rope_pack_": "rope.qknorm_complex_rope_jit",

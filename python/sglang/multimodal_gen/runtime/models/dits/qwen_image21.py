@@ -20,8 +20,18 @@ from sglang.kernels.ops.diffusion import (
     residual_gate_add_sum2,
     tensors_equal,
 )
+from sglang.kernels.ops.diffusion.norm.gated_residual_layernorm_modulate_triton import (
+    can_use_gated_residual_layernorm_modulate,
+    gated_residual_add,
+    gated_residual_layernorm_modulate,
+    layernorm_modulate,
+)
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
     qknorm_complex_rope_kv,
+)
+from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_strided_triton import (
+    can_use_qknorm_complex_rope_strided,
+    qknorm_complex_rope_strided,
 )
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
     qknorm_complex_rope,
@@ -54,7 +64,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitche
     ConvRotInt8ComfyKitchenLinearMethod,
     comfy_kitchen_swiglu_mlp,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+    request_allows_lossless,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -70,6 +83,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 
 _is_cuda = current_platform.is_cuda()
+_is_rocm = current_platform.is_rocm()
 
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
@@ -148,7 +162,31 @@ def _eager_rope(x, rope):
     return torch.view_as_real(z * rope[None, :, None]).flatten(-2).to(x.dtype)
 
 
+def _rocm_lossless():
+    # The Triton fast paths are not bit-exact on ROCm, so they need the lossless tier.
+    return _is_rocm and not torch.compiler.is_compiling() and request_allows_lossless()
+
+
+def _rope_table_matches(x, rope, half):
+    return (
+        x.ndim == 4
+        and x.is_contiguous()
+        and rope.dtype == torch.complex64
+        and rope.is_contiguous()
+        and rope.device == x.device
+        and rope.shape == (x.shape[1], half)
+    )
+
+
 def apply_rope(x, rope):
+    if (
+        _rocm_lossless()
+        and x.is_cuda
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and x.shape[-1] % 2 == 0
+        and _rope_table_matches(x, rope, x.shape[-1] // 2)
+    ):
+        return fused_complex_rope(x, rope)
     if _is_cuda and x.is_cuda:
         return _ROPE_FUSION.run(
             lambda: fused_complex_rope(x, rope),
@@ -173,6 +211,17 @@ def apply_qk_norm_rope(x, norm, rope):
             lambda: apply_rope(norm(x), rope),
             logger=logger,
         )
+    if _rocm_lossless() and can_use_qknorm_complex_rope_strided(x, norm.weight, rope):
+        return qknorm_complex_rope_strided(x, norm.weight, rope, norm.variance_epsilon)
+    if (
+        _rocm_lossless()
+        and x.is_cuda
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x.shape[-1] == 128
+        and norm.weight.dtype == x.dtype
+        and _rope_table_matches(x, rope, 64)
+    ):
+        return qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon)
     if (
         _is_cuda
         and x.is_cuda
@@ -268,6 +317,8 @@ def projected_residual_gate_add(layer, hidden, residual, gate):
 
 
 def apply_modulation(x, norm, scale):
+    if _rocm_lossless() and can_use_gated_residual_layernorm_modulate(x, scale):
+        return layernorm_modulate(x, scale, norm.eps)
     if x.is_cuda and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1]):
         return _MODULATION_FUSION.run(
             lambda: fused_layernorm_modulate(x, scale.squeeze(1), None, norm.eps),
@@ -275,6 +326,32 @@ def apply_modulation(x, norm, scale):
             logger=logger,
         )
     return norm(x) * (1 + scale)
+
+
+def _fused_gated_residual(residual, update, gate, *per_batch):
+    return (
+        _rocm_lossless()
+        and update.shape == residual.shape
+        and update.is_contiguous()
+        and update.dtype == residual.dtype
+        and can_use_gated_residual_layernorm_modulate(residual, gate, *per_batch)
+    )
+
+
+def gated_residual(residual, update, gate):
+    if _fused_gated_residual(residual, update, gate):
+        return gated_residual_add(residual, update, gate)
+    return residual_gate_add(residual, update, gate)
+
+
+def gated_residual_modulation(residual, update, gate, norm, scale):
+    """``r = residual + update * gate``; returns ``(r, modulated norm of r)``."""
+    if _fused_gated_residual(residual, update, gate, scale):
+        return gated_residual_layernorm_modulate(
+            residual, update, gate, scale, norm.eps
+        )
+    residual = residual_gate_add(residual, update, gate)
+    return residual, apply_modulation(residual, norm, scale)
 
 
 class QwenImage21ZeroCenterRMSNorm(nn.Module):
@@ -372,21 +449,23 @@ class QwenImage21FeedForward(nn.Module):
         parameters so offload can release the storage, as with packed QKV.
         """
         gate, up = self.gate_layer, self.proj
-        if (
-            all(
-                type(layer) is ColumnParallelLinear
-                and isinstance(layer.quant_method, UnquantizedLinearMethod)
-                and layer.bias is None
-                and not layer.gather_output
-                and layer.tp_size == 1
-                and layer.weight.is_cuda
-                and layer.weight.dtype is torch.bfloat16
-                and layer.weight.shape == (12288, 4096)
-                and layer.weight.is_contiguous()
-                for layer in (gate, up)
+        if all(
+            type(layer) is ColumnParallelLinear
+            and isinstance(layer.quant_method, UnquantizedLinearMethod)
+            and layer.bias is None
+            and not layer.gather_output
+            and layer.tp_size == 1
+            and layer.weight.is_cuda
+            and layer.weight.dtype is torch.bfloat16
+            and layer.weight.shape == (12288, 4096)
+            and layer.weight.is_contiguous()
+            for layer in (gate, up)
+        ) and (
+            _is_rocm
+            or (
+                _is_cuda
+                and torch.cuda.get_device_capability(gate.weight.device) == (12, 0)
             )
-            and _is_cuda
-            and torch.cuda.get_device_capability(gate.weight.device) == (12, 0)
         ):
             if _stacked_rows(gate.weight, up.weight) is None:
                 weight = torch.cat([gate.weight.data, up.weight.data], dim=0)
@@ -442,6 +521,26 @@ class QwenImage21FeedForward(nn.Module):
         return module
 
     def forward(self, x, use_packed_bf16=False, project_out=True):
+        if _rocm_lossless():
+            hidden = self._rocm_packed_swiglu(x)
+            if hidden is not None:
+                return self.out(hidden)[0] if project_out else hidden
+        return self._forward(x, use_packed_bf16, project_out)
+
+    def _rocm_packed_swiglu(self, x):
+        """``silu(gate(x)) * up(x)`` as one GEMM over the stacked [gate; up] weight, or None."""
+        if not (
+            can_project_into(self.gate_layer, x)
+            and can_project_into(self.proj, x)
+            and x.device == self.gate_layer.weight.device
+        ):
+            return None
+        weight = _stacked_rows(self.gate_layer.weight, self.proj.weight)
+        if weight is None:
+            return None
+        return fused_packed_silu_mul_bitexact(nn.functional.linear(x, weight))
+
+    def _forward(self, x, use_packed_bf16, project_out):
         # project_out=False returns ``out``'s input; the comfy_kitchen MLP never
         # runs then, since it needs a TP group of one.
         # GEMM width can change rounding. Only use the measured target lengths;
@@ -468,7 +567,7 @@ class QwenImage21FeedForward(nn.Module):
                 x, *packed, self.gate_layer.quant_method.group_size, self.out
             )
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
-        if _is_cuda and gate.dtype is torch.bfloat16:
+        if (_is_cuda or _is_rocm) and gate.dtype is torch.bfloat16:
             hidden = _SILU_MUL_FUSION.run(
                 lambda: fused_silu_mul_bitexact(gate, value),
                 lambda: nn.functional.silu(gate) * value,
@@ -606,6 +705,16 @@ class QwenImage21Attention(nn.Module):
         return module
 
     def project_qkv(self, x):
+        if _rocm_lossless() and x.dim() == 3 and x.shape[0] == 1:
+            weight = self.packed_qkv_weight()
+            if weight is not None and all(
+                can_project_into(layer, x)
+                for layer in (self.to_q, self.to_k, self.to_v)
+            ):
+                qkv = nn.functional.linear(x, weight).unflatten(
+                    -1, (3, self.heads, self.head_dim)
+                )
+                return qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
         k = self.to_k(x)[0].unflatten(-1, (self.heads, self.head_dim))
         v = self.to_v(x)[0].unflatten(-1, (self.heads, self.head_dim))
@@ -800,7 +909,8 @@ class QwenImage21Attention(nn.Module):
                 )
             prefix_output = self.to_out[0](cat_outputs(outputs, dim=1).flatten(2))[0]
             if cache is not None:
-                cache.update(key=kp, value=vp)
+                # V can be a view of the packed Q/K/V projection; the cache keeps only V.
+                cache.update(key=kp, value=vp.contiguous())
         if get_sp_world_size() == 1 and _KV_PACK_CUDA_FUSION.can_attempt_once():
             cuda_packed = self._pack_kv_cuda(q, k, v, rope, kp, vp, k_out, v_out)
             if cuda_packed is not None:
@@ -961,13 +1071,12 @@ class QwenImage21TransformerBlock(nn.Module):
                 gate2,
             )
         else:
-            hidden_states = residual_gate_add(hidden_states, attention, gate1)
-            hidden_states = residual_gate_add(
+            hidden_states, mlp_input = gated_residual_modulation(
+                hidden_states, attention, gate1, self.img_norm2, scale2
+            )
+            hidden_states = gated_residual(
                 hidden_states,
-                self.img_mlp(
-                    apply_modulation(hidden_states, self.img_norm2, scale2),
-                    use_packed_bf16=use_packed_bf16_mlp,
-                ),
+                self.img_mlp(mlp_input, use_packed_bf16=use_packed_bf16_mlp),
                 gate2,
             )
         for state, attention in zip(prefix_states, prefix_attentions, strict=True):
