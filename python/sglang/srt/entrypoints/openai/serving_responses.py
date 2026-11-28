@@ -3607,18 +3607,16 @@ class OpenAIServingResponses(OpenAIServingChat):
             if hasattr(sampling_params, "max_new_tokens") or isinstance(
                 sampling_params, dict
             ):
-                context_len = getattr(
-                    self.tokenizer_manager.model_config, "context_len", 4096
-                )
-                num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
-                remaining_tokens = (
-                    context_len - len(prompt_token_ids) - num_reserved_tokens
+                context_max_new_tokens = (
+                    self.tokenizer_manager.max_req_len
+                    - len(prompt_token_ids)
+                    - self.tokenizer_manager.num_reserved_tokens
                 )
 
                 if isinstance(sampling_params, dict):
-                    sampling_params["max_new_tokens"] = max(remaining_tokens, 1)
+                    sampling_params["max_new_tokens"] = max(context_max_new_tokens, 1)
                 else:
-                    sampling_params.max_new_tokens = max(remaining_tokens, 1)
+                    sampling_params.max_new_tokens = max(context_max_new_tokens, 1)
 
             # Slightly reduce priority for subsequent tool calls
             priority = orig_priority - 1
