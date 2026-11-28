@@ -1037,7 +1037,7 @@ class FlashAttentionBackend(AttentionBackend):
             or self.topk > 1
         ):
             raise ValueError(
-                "fa4 reads only a paged ring on a plain MHA pool with topk 1."
+                "FlashAttention reads only a paged ring on a plain MHA pool with topk 1."
             )
         self._draft_kv_ring = ring
         self._ring_page_cols = (

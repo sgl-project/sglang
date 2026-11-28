@@ -627,6 +627,27 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+### Sliding-window draft KV rings with FA3 and NIXL
+
+On NVIDIA CUDA, a DFlash draft whose layers all use sliding-window attention
+can reuse a per-request KV ring instead of retaining its full history. The
+target KV cache still retains full history. To use the ring with FA3 and NIXL
+PD, set this variable on **both prefill and decode servers**:
+
+```bash
+export SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1
+```
+
+Use `--speculative-draft-attention-backend fa3` and
+`--disaggregation-transfer-backend nixl` on both servers. The ring transfers
+draft KV rows and their window floor independently of target prefix-cache hits.
+MHA drafts require matching prefill/decode attention TP sizes and do not support
+attention DP, CP, or DCP. Do not combine the ring with
+`--speculative-draft-window-size`, unified memory, host KV receive, or
+`--disaggregation-enable-kv-checksum` on NIXL: the checksum does not cover the
+draft ring. The ring remains opt-in and uses the existing draft-ring allocation
+and request-generation lifecycle.
+
 ### DFlash and DFlash2 with DP attention
 
 On NVIDIA CUDA, you can use attention DP with plain DFlash drafts and DFlash2

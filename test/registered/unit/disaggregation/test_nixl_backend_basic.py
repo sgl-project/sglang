@@ -348,6 +348,82 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
         self.assertEqual(agent.initialize_xfer_calls, [])
 
 
+class TestNixlDraftRingTransfer(CustomTestCase):
+    def _manager(self, paged=True):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = StagingFakeAgent()
+        mgr.is_mla_backend = False
+        mgr.enable_unified_memory = False
+        mgr.pp_size = 1
+        mgr.attn_tp_size = 4
+        mgr.prep_handles = {}
+        mgr._prepared_state_plans = {}
+        mgr._state_layout_rejections = {}
+        mgr.kv_args = SimpleNamespace(
+            gpu_id=0,
+            prefill_start_layer=0,
+            kv_data_ptrs=[],
+            draft_kv_ring_paged=paged,
+            state_types=[StateType.DRAFT_RING, StateType.REQUEST_ROW],
+            state_sub_pools=[None, None],
+            state_data_ptrs=[[0x10000, 0x20000], [0x30000]],
+            state_item_lens=[[16, 16], [4]],
+            state_layer_ids=[[], []],
+        )
+        return mgr
+
+    def _send(self, mgr, src_rows, dst_rows, decode_tp_size=4, dst_lens=None):
+        return list(
+            mgr.maybe_send_extra(
+                peer_name="decode",
+                prefill_state_indices=[src_rows, [1]],
+                dst_state_data_ptrs=[[0x40000, 0x50000], [0x60000]],
+                dst_state_indices=[dst_rows, [2]],
+                dst_gpu_id=1,
+                decode_tp_size=decode_tp_size,
+                dst_state_item_lens=dst_lens or [[16, 16], [4]],
+            )
+        )
+
+    def test_wrapped_rows_and_floor_use_each_peers_physical_indices(self):
+        """Neither wrapped ring rows nor the single-buffer floor may be split as MHA KV."""
+        mgr = self._manager()
+        self._send(mgr, [5, 6, 1, 2], [9, 10, 11, 12])
+        ring_src, ring_dst, floor_src, floor_dst = mgr.agent.get_xfer_descs_calls
+        np.testing.assert_array_equal(
+            ring_src[0],
+            [[0x10050, 32, 0], [0x10010, 32, 0], [0x20050, 32, 0], [0x20010, 32, 0]],
+        )
+        np.testing.assert_array_equal(
+            ring_dst[0],
+            [[0x40090, 32, 1], [0x400B0, 32, 1], [0x50090, 32, 1], [0x500B0, 32, 1]],
+        )
+        np.testing.assert_array_equal(floor_src[0], [[0x30004, 4, 0]])
+        np.testing.assert_array_equal(floor_dst[0], [[0x60008, 4, 1]])
+
+    def test_dcp_nonowner_rows_are_not_transferred(self):
+        """A zero at either peer marks a position that rank does not own."""
+        mgr = self._manager(paged=False)
+        self._send(mgr, [0, 17, 0, 19], [20, 0, 22, 23])
+        ring_src, ring_dst = mgr.agent.get_xfer_descs_calls[:2]
+        np.testing.assert_array_equal(ring_src[0], [[0x10130, 16, 0], [0x20130, 16, 0]])
+        np.testing.assert_array_equal(ring_dst[0], [[0x40170, 16, 1], [0x50170, 16, 1]])
+
+    def test_incompatible_mha_layout_does_not_post_a_write(self):
+        for overrides, message in (
+            ({"decode_tp_size": 2}, "same attention TP size"),
+            ({"dst_lens": [[8, 8], [4]]}, "buffer layout mismatch"),
+            ({"dst_rows": [9]}, "State index length mismatch"),
+        ):
+            with self.subTest(overrides=overrides):
+                mgr = self._manager()
+                send_args = {"src_rows": [5, 6], "dst_rows": [9, 10]}
+                send_args.update(overrides)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._send(mgr, **send_args)
+                self.assertEqual(mgr.agent.get_xfer_descs_calls, [])
+
+
 class TestNixlTransferWorker(CustomTestCase):
     def _make_manager(self, room):
         mgr = object.__new__(NixlKVManager)

@@ -43,7 +43,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 
-DFLASH_MHA_RING_DRAFT_BACKENDS = ("trtllm_mha", "fa4")
+DFLASH_MHA_RING_DRAFT_BACKENDS = ("trtllm_mha", "fa3", "fa4")
 
 
 def dflash_dcp_mla_draft_backend() -> str:
@@ -78,7 +78,10 @@ def draft_kv_ring_unsupported_reason(
 ) -> Optional[str]:
     """Why a ring cannot serve this draft, or None. Loads the draft config only
     once the launch flags allow a ring."""
-    if disaggregation_mode != "null" and disaggregation_transfer_backend != "mooncake":
+    if disaggregation_mode != "null" and disaggregation_transfer_backend not in (
+        "mooncake",
+        "nixl",
+    ):
         return (
             f"the {disaggregation_transfer_backend} PD transfer backend does not "
             "send the ring"

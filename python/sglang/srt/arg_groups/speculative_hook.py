@@ -1111,6 +1111,16 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
     if not envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING.get():
         return
     cfg = resolving_view(server_args)
+    if (
+        cfg.disaggregation_mode != "null"
+        and cfg.disaggregation_transfer_backend == "nixl"
+        and cfg.disaggregation_enable_kv_checksum
+    ):
+        raise ValueError(
+            "SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1 with NIXL PD does not support "
+            "--disaggregation-enable-kv-checksum: the checksum excludes draft "
+            "ring rows and their window floor."
+        )
     reason = draft_kv_ring_unsupported_reason(
         lambda: _load_draft_hf_config(cfg),
         draft_backend=cfg.speculative_draft_attention_backend,

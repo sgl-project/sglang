@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from parameterized import parameterized
 
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative import dflash_worker_v2
@@ -13,12 +14,15 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestDFlashDraftGraphEligibility(unittest.TestCase):
-    def test_scheduler_admission_reaches_the_draft_forward_batch(self):
+class TestDFlashDraftGraphEligibility(CustomTestCase):
+    @parameterized.expand([("full_history", False), ("ring", True)])
+    def test_scheduler_admission_reaches_the_draft_forward_batch(self, _, use_ring):
+        """Ring writes must survive target binding without changing graph admission."""
         worker = object.__new__(DFlashWorkerV2)
         worker.device = "cpu"
         worker.block_size = 2
@@ -44,6 +48,8 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
             forward=Mock(side_effect=StopIteration),
         )
         worker.draft_owns_attention = False
+        worker.draft_parallel_layout = None
+        worker._aux_pending = False
         worker._draft_block_ids_buf = None
         worker._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=2, device="cpu"
@@ -54,7 +60,10 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         worker._full_embed_gpu = None
         worker._noise_embed_scale = 1.0
         worker.use_compact_draft_cache = False
-        worker.draft_kv_ring = None
+        ring_locs = torch.tensor([9, 10])
+        worker.draft_kv_ring = (
+            SimpleNamespace(block_locs=lambda *_: ring_locs) if use_ring else None
+        )
         worker.selector = None
         worker.lilicorr = None
         worker._info_dumper = Mock()
@@ -99,6 +108,9 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
             self.assertIs(forward_batch.can_run_decode_cuda_graph, allowed)
             self.assertEqual(forward_batch.forward_mode, ForwardMode.TARGET_VERIFY)
             torch.testing.assert_close(forward_batch.input_ids, torch.tensor([1, 2]))
+            if use_ring:
+                torch.testing.assert_close(forward_batch.out_cache_loc, ring_locs)
+                self.assertIsNone(forward_batch.out_cache_loc_virtual)
         declining.decode_round.assert_called_once_with(
             batch, on_publish=None, grammar_barrier=None
         )

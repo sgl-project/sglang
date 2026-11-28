@@ -69,6 +69,7 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    draft_kv_ring_row_pairs,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
     slice_dsa_tail_dst_ptrs_for_pp,
@@ -3478,6 +3479,46 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     src_keys=src_keys,
                     dst_keys=dst_keys,
                 )
+            elif st in (StateType.DRAFT_RING, StateType.REQUEST_ROW):
+                # PP stages without the draft register empty components.
+                if not src_ptrs or not dst_ptrs:
+                    continue
+                if (
+                    st == StateType.DRAFT_RING
+                    and self.kv_args.draft_kv_ring_paged
+                    and self.attn_tp_size != decode_tp_size
+                ):
+                    raise RuntimeError(
+                        "A DFLASH MHA draft KV ring needs the same attention TP size: "
+                        f"prefill={self.attn_tp_size}, decode={decode_tp_size}"
+                    )
+                if len(src_indices) != len(dst_indices):
+                    raise RuntimeError(
+                        f"State index length mismatch at component {i}: "
+                        f"prefill={len(src_indices)}, dst={len(dst_indices)}"
+                    )
+                if len(src_ptrs) != len(dst_ptrs) or src_lens != dst_lens:
+                    raise RuntimeError(f"{st} draft ring buffer layout mismatch")
+                if st == StateType.DRAFT_RING:
+                    src_indices, dst_indices = draft_kv_ring_row_pairs(
+                        src_indices, dst_indices
+                    )
+                    if not src_indices:
+                        continue
+                h = self._send_kvcache_generic(
+                    peer_name=peer_name,
+                    src_data_ptrs=src_ptrs,
+                    dst_data_ptrs=dst_ptrs,
+                    item_lens=src_lens,
+                    prefill_data_indices=np.array(src_indices, dtype=np.int32),
+                    dst_data_indices=np.array(dst_indices, dtype=np.int32),
+                    dst_gpu_id=dst_gpu_id,
+                    state_type=st,
+                    force_flat=True,
+                    src_layer_ids=src_lids,
+                    dst_layer_ids=dst_lids,
+                    dst_item_lens=dst_lens,
+                )
             elif st == StateType.DSA:
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(
@@ -3537,7 +3578,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 StateType.QSA_COMPRESSED,
                 StateType.SWA_RING,
                 StateType.DSV4_REQUEST_STATE,
-                StateType.REQUEST_ROW,
             ):
                 # QSA state is whole on every rank, so it pairs by state TP.
                 src_tp_size = (
