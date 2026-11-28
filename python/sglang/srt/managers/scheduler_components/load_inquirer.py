@@ -15,6 +15,7 @@ from sglang.srt.managers.load_snapshot import (
     SpeculativeMetrics,
 )
 from sglang.srt.managers.scheduler_components.request_list import ListKind
+from sglang.srt.mem_cache.common import prefill_load_tokens
 from sglang.srt.runtime_context import get_lora, get_parallel
 
 if TYPE_CHECKING:
@@ -89,15 +90,12 @@ class SchedulerLoadInquirer:
         num_tokens = 0
         for req in self.get_waiting_queue():
             if waiting_queue_prefix_matched:
-                matched = req.num_matched_prefix_tokens
-                uncached = max(0, req.seqlen - matched)
+                span = None
                 if self.get_waiting_storage_span is not None:
                     span = self.get_waiting_storage_span(req.cache_request_handle)
-                    if span is not None:
-                        storage_tokens = max(
-                            0, min(span[1], req.seqlen) - max(span[0], matched)
-                        )
-                        uncached -= storage_tokens
+                uncached = prefill_load_tokens(
+                    req.seqlen, req.num_matched_prefix_tokens, span
+                )
             else:
                 # The historical hit rate already includes admitted storage hits.
                 uncached = int(req.seqlen * cache_miss_rate)
