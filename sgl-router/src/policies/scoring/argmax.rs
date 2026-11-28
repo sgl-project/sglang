@@ -52,13 +52,17 @@ impl Selector for Argmax {
             );
             band = (0..workers.len()).collect();
         }
-        let min_load = band
-            .iter()
-            .map(|&i| workers[i].router_inflight_load())
-            .min()?;
-        let tied: Vec<usize> = band
+        // Read each load once: concurrent requests move it, and a second read
+        // could leave no candidate at the minimum.
+        let loads: Vec<(usize, usize)> = band
             .into_iter()
-            .filter(|&i| workers[i].router_inflight_load() == min_load)
+            .map(|i| (i, workers[i].router_inflight_load()))
+            .collect();
+        let min_load = loads.iter().map(|&(_, load)| load).min()?;
+        let tied: Vec<usize> = loads
+            .into_iter()
+            .filter(|&(_, load)| load == min_load)
+            .map(|(i, _)| i)
             .collect();
         let k = self.rotor.fetch_add(1, Ordering::Relaxed) % tied.len();
         Some(tied[k])
@@ -112,5 +116,20 @@ mod tests {
             3,
             "three tied picks must cover all three: {picks:?}"
         );
+    }
+
+    #[test]
+    fn a_pick_survives_loads_that_change_while_it_runs() {
+        let ws = vec![worker("a"), worker("b")];
+        let sel = Argmax::default();
+        // `b` stays loaded, so `a` alone holds the minimum while its load flips.
+        let _loaded = ws[1].load_guard();
+        std::thread::scope(|s| {
+            let picker = s.spawn(|| (0..300_000).all(|_| sel.pick(&ws, &[1.0; 2]).is_some()));
+            while !picker.is_finished() {
+                drop(ws[0].load_guard());
+            }
+            assert!(picker.join().unwrap(), "every pick must find a candidate");
+        });
     }
 }
