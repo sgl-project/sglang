@@ -371,8 +371,25 @@ class SchedulerWeightUpdaterManager:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
+    def _weight_cache_write_rejection(self, op: str) -> Optional[str]:
+        mode = get_model().weight_cache_mode
+        if mode == "off":
+            return None
+        return (
+            f"[weight_cache] {op} is not supported while the weight cache is "
+            f"active (--weight-cache-mode {mode}): model weights are shared "
+            f"with the daemon and every co-attached engine, so writing them in "
+            f"place would corrupt them all. Restart with --weight-cache-mode off "
+            f"to use this operation."
+        )
+
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Open the session: restore in-place-packed weights on the selected runners."""
+        # Engine-wide and rank-uniform, so asked before runners are selected:
+        # a weight-cache engine has no draft runner for a draft selector to check.
+        rejection = self._weight_cache_write_rejection("begin_weight_update")
+        if rejection is not None:
+            return BeginWeightUpdateReqOutput(success=False, message=rejection)
         if self._session is not None:
             return BeginWeightUpdateReqOutput(
                 success=False,
@@ -607,6 +624,11 @@ class SchedulerWeightUpdaterManager:
         return ResumeMemoryOccupationReqOutput()
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
+        # The one action that writes: it overwrites the model's tensors in place.
+        if recv_req.action == "reset_tensors":
+            rejection = self._weight_cache_write_rejection("reset_tensors")
+            if rejection is not None:
+                return CheckWeightsReqOutput(success=False, message=rejection)
         try:
             role_payloads = []
             for role, runner in self._select_runners(recv_req.selector):
