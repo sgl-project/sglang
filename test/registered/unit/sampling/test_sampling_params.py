@@ -553,6 +553,7 @@ class TestSamplingParamsNormalize(CustomTestCase):
             r"(?:.?){30}Z",
             r"a*a*b",
             r"(a*)a*b",
+            r"(a*)*",
             r"a+(?:bc|d+)",
             r"(?:a{1,3}){4}b",
         ]
@@ -578,6 +579,9 @@ class TestSamplingParamsNormalize(CustomTestCase):
             r"(?:a{16}){32}",
             r"(?:){1048575}x",
             r"a{4294967295}",
+            # Issue #52041: 24 bytes, but the nested bounds blow the matcher's
+            # state table. Reject at admission so re.search is never called.
+            r"(?:(?:a*){65535}){65535}",
         ):
             with self.subTest(rejected=pattern):
                 with self.assertRaisesRegex(ValueError, "stop_regex"):

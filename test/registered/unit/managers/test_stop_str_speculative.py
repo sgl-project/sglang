@@ -5,9 +5,12 @@ leaking tokens accepted after it. Drives the real `Req.update_finish_state` with
 a fake tokenizer; pure CPU. Each test guards a distinct branch of
 `_locate_str_stop_finished_len` / `_check_str_based_finish`."""
 
+import re
 import unittest
 from array import array
+from unittest.mock import patch
 
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -144,6 +147,37 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertTrue(req.finished())
         self.assertEqual(req.finished_reason.matched, r"[.!?]\s*$")
         self.assertEqual(req.finished_len, 2)
+
+    def test_stop_regex_memory_error_aborts_request(self):
+        req = _make_req([10, 11, 12, 20, 21], stop_regex=[r"XY"])
+        with patch(
+            "sglang.srt.managers.schedule_batch.re.search",
+            side_effect=MemoryError("mocked match-time exhaustion"),
+        ):
+            req.update_finish_state(new_accepted_len=6)
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIn("XY", req.finished_reason.message)
+
+    def test_stop_regex_memory_error_in_locate_aborts_request(self):
+        # The first search matches. The prefix scan in
+        # _locate_str_stop_finished_len searches again and must abort the
+        # request instead of escaping.
+        req = _make_req([10, 11, 70, 71, 20, 21], stop_regex=[r"XY"])
+
+        def search(pattern, text):
+            if text == "abXY":
+                raise MemoryError("locate scan")
+            return re.search(pattern, text)
+
+        with patch(
+            "sglang.srt.managers.schedule_batch.re.search",
+            side_effect=search,
+        ):
+            req.update_finish_state(new_accepted_len=6)
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIn("XY", req.finished_reason.message)
 
 
 if __name__ == "__main__":

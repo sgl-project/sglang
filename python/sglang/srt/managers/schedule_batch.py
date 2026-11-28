@@ -1351,6 +1351,31 @@ class Req(ReqDllmMixin):
 
         return False
 
+    def _search_stop_regex(self, stop_regex_str: str, text: str):
+        """Match one stop pattern. Abort this request if the regex engine fails.
+
+        Admission (`validate_stop_regex`) is what keeps a pathological pattern
+        out. This is the seatbelt for a pattern that still reaches a search,
+        including the prefix scan in `_locate_str_stop_finished_len`.
+        `MemoryError` is included because a huge repeat table raises it; a
+        kernel SIGKILL during that allocation cannot be caught here.
+        """
+        try:
+            return re.search(stop_regex_str, text)
+        except (re.error, RecursionError, MemoryError) as error:
+            logger.warning(
+                "req %s: stop_regex %r failed (%s); aborting the request",
+                self.rid,
+                stop_regex_str,
+                error,
+            )
+            self.finished_reason = FINISH_ABORT(
+                f"stop_regex {stop_regex_str!r} failed: {error}",
+                HTTPStatus.BAD_REQUEST,
+                "BadRequestError",
+            )
+            return None
+
     def _locate_str_stop_finished_len(
         self,
         new_accepted_len: int,
@@ -1364,7 +1389,7 @@ class Req(ReqDllmMixin):
         def matched(text: str) -> bool:
             if stop_str is not None:
                 return stop_str in text
-            return re.search(stop_regex, text) is not None
+            return self._search_stop_regex(stop_regex, text) is not None
 
         tail_len = self._stop_match_tail_len(new_accepted_len)
         start = len(self.output_ids) - tail_len
@@ -1376,6 +1401,8 @@ class Req(ReqDllmMixin):
         ):
             if matched(self.tokenizer.decode(token_window[:token_count])):
                 return start + token_count
+            if stop_regex is not None and self.finished():
+                return None
 
         if not full_window_matched:
             return None
@@ -1402,27 +1429,9 @@ class Req(ReqDllmMixin):
             # Check stop regex
             if len(self.sampling_params.stop_regex_strs) > 0:
                 for stop_regex_str in self.sampling_params.stop_regex_strs:
-                    # Seatbelt, not validation: patterns are checked at ingress
-                    # (Python's `normalize`, or the rust server's stricter
-                    # `stop_regex_bound`). This runs per decode step on the hot
-                    # path, so an `re.error` escaping here would take the whole
-                    # scheduler down over one malformed request. Fail that request
-                    # instead.
-                    try:
-                        matched = re.search(stop_regex_str, tail_str)
-                    except (re.error, RecursionError) as e:
-                        logger.warning(
-                            "req %s: invalid stop_regex %r (%s); aborting the request",
-                            self.rid,
-                            stop_regex_str,
-                            e,
-                        )
-                        self.finished_reason = FINISH_ABORT(
-                            f"invalid stop_regex {stop_regex_str!r}: {e}",
-                            HTTPStatus.BAD_REQUEST,
-                            "BadRequestError",
-                        )
-                        break
+                    matched = self._search_stop_regex(stop_regex_str, tail_str)
+                    if self.finished():
+                        return True
                     if matched:
                         finished_len = self._locate_str_stop_finished_len(
                             new_accepted_len, stop_regex=stop_regex_str
@@ -1437,6 +1446,8 @@ class Req(ReqDllmMixin):
                         )
                     else:
                         finished_len = None
+                    if self.finished():
+                        return True
                     if finished_len is not None:
                         self.finished_reason = FINISHED_MATCHED_REGEX(
                             matched=stop_regex_str
