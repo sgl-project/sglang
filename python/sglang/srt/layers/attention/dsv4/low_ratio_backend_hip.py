@@ -65,11 +65,16 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+    from sglang.srt.layers.attention.dsv4.v41_indexer import RowShard
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 # fp32 logits scored per candidate-block chunk stay under this many bytes
 _CANDIDATE_SCORE_BUDGET_BYTES = 1 << 30
+# Mean compressed positions per row where the row shard pays; measured on MI355X, 16,384-row
+# calls (TP4: 0.57-0.77x at 4,096, 1.01-1.23x at 12,288; TP2: 0.65x at 12,288, 1.24x at 28,672).
+INDEXER_ROW_SHARD_MIN_CONTEXT = 12288
+INDEXER_ROW_SHARD_MIN_CONTEXT_BELOW_TP4 = 24576
 
 logger = logging.getLogger(__name__)
 
@@ -554,10 +559,12 @@ def low_ratio_index_topk_hip_extend(
     q_lora,
     pos,
     forward_batch: ForwardBatch,
+    row_shard: Optional[RowShard] = None,
 ) -> None:
     """Ragged prefill: the FlyDSL prefill kernel scores every token's visible compressed positions,
     candidate masks are published or applied per request, one paged top-k selects every row.
-    Identity requests are written without scores; an all-identity batch skips the kernel."""
+    Identity requests are written without scores; an all-identity batch skips the kernel.
+    With row_shard, this rank selects its share of the rows and the selections are all-gathered."""
     pool = backend.token_to_kv_pool
     metadata = backend.forward_metadata
     core = metadata.core_metadata
@@ -610,7 +617,7 @@ def low_ratio_index_topk_hip_extend(
         """Identity requests req_lo..req_hi: rows written without scores, None published per request."""
         tok = tok_lo
         for b in range(req_lo, req_hi):
-            t_len, lc = extend_lens_cpu[b], lc_per_req[b]
+            t_len, lc = lens[b], lc_per_req[b]
             rows = slice(tok, tok + t_len)
             tok += t_len
             if lc == 0:
@@ -627,6 +634,7 @@ def low_ratio_index_topk_hip_extend(
             if publish is not None:
                 publish.append(None)
 
+    lens = extend_lens_cpu
     if all(is_identity):
         fill_identity_requests(0, len(extend_lens_cpu), 0)
         if publish is not None:
@@ -727,9 +735,7 @@ def low_ratio_index_topk_hip_extend(
         rows: slice, req_lo, req_hi, group_is_identity, consume_rows, publish
     ):
         rows_per_request = (
-            [rows.stop - rows.start]
-            if req_hi == req_lo + 1
-            else extend_lens_cpu[req_lo:req_hi]
+            [rows.stop - rows.start] if req_hi == req_lo + 1 else lens[req_lo:req_hi]
         )
         if page8 and consume_rows is not None:
             select_rows_page8_consumer(rows, req_lo, rows_per_request, consume_rows)
@@ -753,7 +759,26 @@ def low_ratio_index_topk_hip_extend(
     rows_per_chunk = logits_rows_per_chunk(
         indexer_metadata.page_table, LOW_RATIO_PAGE_TABLE_BUCKET
     )
-    groups = _request_groups(extend_lens_cpu, rows_per_chunk)
+    req_lo0, req_hi0, tok_lo0 = 0, len(extend_lens_cpu), 0
+    if row_shard is not None:
+        shard_rows = row_shard.local_rows(num_tokens)
+        lens, req_lo0, req_hi0, offsets = _clip_requests(extend_lens_cpu, shard_rows)
+        tok_lo0 = shard_rows.start
+        if consume is not None:
+            consume = [
+                c
+                if c is None or lens[b] == extend_lens_cpu[b]
+                else slice_candidate_blocks(c, slice(offsets[b], offsets[b] + lens[b]))
+                for b, c in enumerate(consume)
+            ]
+        if publish is not None:
+            publish = []
+    groups = [
+        (lo + req_lo0, hi + req_lo0, tok_lo + tok_lo0, tok_hi + tok_lo0)
+        for lo, hi, tok_lo, tok_hi in _request_groups(
+            lens[req_lo0:req_hi0], rows_per_chunk
+        )
+    ]
     for req_lo, req_hi, tok_lo, tok_hi in groups:
         group_is_identity = is_identity[req_lo:req_hi]
         if all(group_is_identity):
@@ -789,6 +814,23 @@ def low_ratio_index_topk_hip_extend(
                 pieces.append(piece[0])
         if publish is not None:
             publish.append(cat_candidate_blocks(pieces))
+    if row_shard is not None:
+        publish = _gather_shard(
+            row_shard,
+            shard_rows,
+            req_lo0,
+            page_indices,
+            raw_indices,
+            publish,
+            num_rows=num_tokens,
+            published=[
+                t > 0 and lc > 0 and not ident
+                for t, lc, ident in zip(extend_lens_cpu, lc_per_req, is_identity)
+            ],
+            extend_lens=extend_lens_cpu,
+            topk_blocks=indexer.candidate_topk_blocks,
+            block_size=indexer.candidate_block_size,
+        )
     if publish is not None:
         if page8:
             assert len(publish) == len(extend_lens_cpu), (len(publish), extend_lens_cpu)
@@ -804,6 +846,110 @@ def low_ratio_index_topk_hip_extend(
                         page_size=indexer_metadata.compressed_page_size,
                     )
         backend.candidate_masks = publish
+
+
+def _compressed_positions_seen(n: int, ratio: int) -> int:
+    """sum(q // ratio for q in 1..n): what rows at positions 0..n-1 see in all."""
+    a, b = divmod(n, ratio)
+    return ratio * a * (a - 1) // 2 + a * (b + 1)
+
+
+def indexer_row_shard_pays(
+    *, ratio: int, extend_lens: Sequence[int], seq_lens: Sequence[int], world: int
+) -> bool:
+    """Whether the rows (the last extend_lens of each sequence) see enough compressed context
+    on average for a row shard over world ranks; the lengths are replicated CPU lists."""
+    lens = _as_int_list(extend_lens)
+    seq_lens = _as_int_list(seq_lens)
+    rows = sum(lens)
+    context = sum(
+        _compressed_positions_seen(s, ratio) - _compressed_positions_seen(s - n, ratio)
+        for n, s in zip(lens, seq_lens)
+    )
+    floor = (
+        INDEXER_ROW_SHARD_MIN_CONTEXT
+        if world >= 4
+        else INDEXER_ROW_SHARD_MIN_CONTEXT_BELOW_TP4
+    )
+    return rows > 0 and context >= floor * rows
+
+
+def _clip_requests(
+    extend_lens: List[int], rows: slice
+) -> Tuple[List[int], int, int, List[int]]:
+    """Every request's rows clipped to rows: (lens, first and past-last request with rows,
+    each request's first clipped row relative to its own start)."""
+    starts = list(itertools.accumulate([0, *extend_lens]))
+    lens, offsets = [], []
+    for s, e in zip(starts, starts[1:]):
+        lo, hi = max(s, rows.start), min(e, rows.stop)
+        lens.append(max(0, hi - lo))
+        offsets.append(lo - s)
+    num_reqs = len(extend_lens)
+    req_lo = next((b for b in range(num_reqs) if starts[b + 1] > rows.start), num_reqs)
+    req_hi = next((b for b in range(num_reqs) if starts[b] >= rows.stop), num_reqs)
+    return lens, req_lo, max(req_lo, req_hi), offsets
+
+
+def _gather_shard(
+    row_shard: RowShard,
+    rows: slice,
+    req_lo: int,
+    page_indices: torch.Tensor,
+    raw_indices: Optional[torch.Tensor],
+    local_publish: Optional[List[Optional[CandidateBlocks]]],
+    *,
+    num_rows: int,
+    published: List[bool],
+    extend_lens: List[int],
+    topk_blocks: int,
+    block_size: int,
+) -> Optional[List[Optional[CandidateBlocks]]]:
+    """All-gathers every rank's rows of the selections and, on a source layer, of the candidate
+    blocks (ids, then the compact length); returns the publication of every request.
+    num_rows is the count rows was cut from, padding rows included."""
+    topk = page_indices.shape[1]
+    parts = [page_indices[rows]]
+    if raw_indices is not None:
+        parts.append(raw_indices[rows])
+    if local_publish is not None:
+        cand = page_indices.new_full((rows.stop - rows.start, topk_blocks + 1), -1)
+        starts = list(itertools.accumulate([0, *extend_lens]))
+        for b, c in enumerate(local_publish, start=req_lo):
+            if c is None:
+                continue
+            lo = max(starts[b], rows.start) - rows.start
+            cand[lo : lo + c.ids.shape[0], :topk_blocks] = c.ids
+            cand[lo : lo + c.ids.shape[0], topk_blocks] = c.compact_lens
+        parts.append(cand)
+    local = torch.cat(parts, dim=1)
+    local = torch.nn.functional.pad(
+        local, (0, 0, 0, row_shard.rows_per_rank(num_rows) - local.shape[0]), value=-1
+    )
+    full = row_shard.gather(local, num_rows)
+    page_indices[:num_rows].copy_(full[:, :topk])
+    if raw_indices is not None:
+        raw_indices[:num_rows].copy_(full[:, topk : 2 * topk])
+    if local_publish is None:
+        return None
+    ids = full[:, -topk_blocks - 1 : -1].contiguous()
+    compact_lens = full[:, -1].contiguous()
+    publish, tok = [], 0
+    for t_len, has in zip(extend_lens, published):
+        r = slice(tok, tok + t_len)
+        tok += t_len
+        publish.append(
+            CandidateBlocks(
+                ids=ids[r],
+                compact_lens=compact_lens[r],
+                compact_page_table=torch.zeros_like(compact_lens[r]).unsqueeze(1),
+                compact_page_size=triton.next_power_of_2(topk_blocks * block_size),
+                block_size=block_size,
+            )
+            if has
+            else None
+        )
+    return publish
 
 
 def _select_topk_extend_hip(

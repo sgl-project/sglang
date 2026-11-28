@@ -81,6 +81,7 @@ from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     LowRatioExtendSlots,
     build_low_ratio_decode_workspaces,
     build_low_ratio_extend_k_slots,
+    indexer_row_shard_pays,
     low_ratio_candidate_span,
     low_ratio_decode_rows_are_identity,
     low_ratio_identity_skip_enabled,
@@ -109,6 +110,9 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -907,6 +911,7 @@ class DeepseekV4HipRadixBackend(
     _low_ratio_pair_partners = DeepseekV4AttnBackend._low_ratio_pair_partners
     _low_ratio_write_group = DeepseekV4AttnBackend._low_ratio_write_group
     _low_ratio_compress_fused = DeepseekV4AttnBackend._low_ratio_compress_fused
+    _indexer_row_shard = DeepseekV4AttnBackend._indexer_row_shard
     # MIXED BCG replay regresses ROCm DSV4 DP-attention serving throughput.
     prefer_eager_mixed_prefill_under_dp_attention: bool = True
 
@@ -3515,7 +3520,27 @@ class DeepseekV4HipRadixBackend(
                 forward_batch.seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens_cpu is not None
             ), "the HIP low-ratio prefill indexer needs the batch's CPU lengths"
-            low_ratio_index_topk_hip_extend(self, layer, x, q_lora, pos, forward_batch)
+            # the eager breaks of a prefill graph keep every row on every rank
+            row_shard = (
+                None
+                if is_in_breakable_cuda_graph()
+                else self._indexer_row_shard(layer, num_rows=x.shape[0])
+            )
+            tail = self.forward_metadata.late_layer_tail
+            if row_shard is not None and not indexer_row_shard_pays(
+                ratio=layer.compress_ratio,
+                extend_lens=(
+                    tail.extend_seq_lens_cpu
+                    if tail is not None
+                    else forward_batch.extend_seq_lens_cpu
+                ),
+                seq_lens=forward_batch.seq_lens_cpu,
+                world=row_shard.world,
+            ):
+                row_shard = None
+            low_ratio_index_topk_hip_extend(
+                self, layer, x, q_lora, pos, forward_batch, row_shard=row_shard
+            )
         else:
             raise NotImplementedError(
                 f"low-ratio indexer for {forward_batch.forward_mode} on HIP"
