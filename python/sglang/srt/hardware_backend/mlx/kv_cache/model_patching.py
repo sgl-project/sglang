@@ -50,14 +50,15 @@ def patch_model_attention(model: Any) -> int:
     layer_list, attn_attrs = find_attention_layers(model)
     window_sizes = get_layer_window_sizes(model)
     if not window_sizes and get_container_window_size(model) is not None:
-        # e.g. gemma3-style containers derive per-layer windows from a
-        # pattern instead of ``layer_types``. Prefill masks (delegated to
+        # The container derives per-layer windows some other way than
+        # ``layer_types`` or a gemma3-style pattern. Prefill masks (delegated to
         # the container) honor the window, but batched decode cannot
         # without a per-layer map, so outputs would diverge past the
         # window. Surface it instead of silently splitting semantics.
         logger.warning(
-            "Model %s declares a sliding window but no per-layer "
-            "layer_types map; MLX batched decode will not apply the "
+            "Model %s declares a sliding window but neither a per-layer "
+            "layer_types map nor a gemma3-style sliding_window_pattern; "
+            "MLX batched decode will not apply the "
             "window and long-context output may be incorrect.",
             type(model).__name__,
         )
