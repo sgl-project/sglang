@@ -1539,10 +1539,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         return content_part
 
     @classmethod
-    def _tool_output_for_chat(cls, output: Any) -> Any:
+    def _tool_output_for_chat(
+        cls, output: Any, *, template_tool_names: frozenset[str] = frozenset()
+    ) -> Any:
         """``output`` may be a string or an array of content parts (OpenAI allows
         both). Text-only arrays flatten to a string; arrays with images keep
-        their parts so the chat template renders the images."""
+        their parts so the chat template renders the images. A tool_reference
+        stays only if it names one of ``template_tool_names``, the tools the
+        template receives: GLM templates fail on a reference without tools and
+        render an empty block for a tool they were not given."""
         if not isinstance(output, list):
             return output
         parts = [p for p in output if isinstance(p, dict)]
@@ -1555,7 +1560,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         for part in parts:
             part_type = part.get("type")
             if part_type == "tool_reference":
-                if part.get("name"):
+                if part.get("name") in template_tool_names:
                     chat_parts.append(part)
             elif part_type in _TOOL_OUTPUT_MEDIA_PART_TYPES:
                 media = cls._normalize_response_content_part_for_chat(part)
@@ -1576,10 +1581,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         return chat_parts
 
     @staticmethod
-    def _split_tool_reference_runs(message: dict) -> list[dict]:
+    def _split_tool_reference_runs(message: Any) -> list:
         # GLM templates expand tool_reference parts only at the start of a tool
         # message, so each run of them gets its own message, as in the
         # Anthropic endpoint.
+        if not isinstance(message, dict):
+            return [message]
         content = message.get("content")
         if message.get("role") != "tool" or not isinstance(content, list):
             return [message]
@@ -1590,6 +1597,41 @@ class OpenAIServingResponses(OpenAIServingChat):
                 runs.append([])
             runs[-1].append(part)
         return [{**message, "content": run} for run in runs]
+
+    def _split_tool_reference_messages(self, messages: list) -> list:
+        # Split messages share one tool_call_id, so neither
+        # _canonicalize_tool_message_order nor the template can put them in
+        # tool_calls order afterwards, and the rendered results carry no ids.
+        # A template that orders results gets its run sorted before the split.
+        orders_results = (
+            self.template_manager.jinja_template_may_reorder_tool_results
+            or self.is_minimax_m3
+        )
+        ordered = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            index += 1
+            ordered.append(message)
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            tool_calls = message.get("tool_calls") or []
+            run = []
+            while (
+                index < len(messages)
+                and isinstance(messages[index], dict)
+                and messages[index].get("role") == "tool"
+            ):
+                run.append(messages[index])
+                index += 1
+            if (
+                orders_results
+                and tool_calls
+                and any(len(self._split_tool_reference_runs(m)) > 1 for m in run)
+            ):
+                run = self._sort_tool_message_run(run, tool_calls, sort_text_runs=True)
+            ordered.extend(run)
+        return [part for m in ordered for part in self._split_tool_reference_runs(m)]
 
     @staticmethod
     def _chat_tool_call_message(message: dict, name: Any, arguments: str) -> dict:
@@ -1606,7 +1648,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @classmethod
     def _normalize_response_message_for_chat(
-        cls, message: Any, *, tool_call_parser: Optional[str] = None
+        cls,
+        message: Any,
+        *,
+        tool_call_parser: Optional[str] = None,
+        template_tool_names: frozenset[str] = frozenset(),
     ) -> Any:
         """Convert one Responses-API input item to a chat-completions message."""
         if hasattr(message, "model_dump"):
@@ -1656,7 +1702,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
-                "content": cls._tool_output_for_chat(message.get("output", "")),
+                "content": cls._tool_output_for_chat(
+                    message.get("output", ""),
+                    template_tool_names=template_tool_names,
+                ),
             }
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
@@ -1786,6 +1835,20 @@ class OpenAIServingResponses(OpenAIServingChat):
             history.extend(request.input)
         return history
 
+    def _template_tool_names(self, request: ResponsesRequest) -> frozenset[str]:
+        # Mirrors how _make_request and _process_messages pick the tools the
+        # chat template renders: none for tool_choice="none", only the named
+        # one for a named tool_choice.
+        tool_choice = request.effective_tool_choice()
+        if tool_choice == "none":
+            return frozenset()
+        names = frozenset(
+            tool.function.name for tool in self._response_tools_to_chat_tools(request)
+        )
+        if isinstance(tool_choice, dict):
+            return names & {tool_choice["name"]}
+        return names
+
     def _construct_input_messages(
         self,
         request: ResponsesRequest,
@@ -1802,19 +1865,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                 }
             )
 
+        template_tool_names = self._template_tool_names(request)
         for input_item in self._response_input_history(request):
             if tool_adapter is not None:
                 input_item = tool_adapter.input_item(input_item)
             normalized = self._normalize_response_message_for_chat(
-                input_item, tool_call_parser=self.tool_call_parser
+                input_item,
+                tool_call_parser=self.tool_call_parser,
+                template_tool_names=template_tool_names,
             )
             if normalized is not None:
-                messages.extend(self._split_tool_reference_runs(normalized))
+                messages.append(normalized)
 
         # One Responses-API assistant turn maps to multiple input items
         # (message + function_call(s)); collapse them into one chat message
         # so chat templates render a single assistant block per turn.
         messages = self._merge_consecutive_assistant_messages(messages)
+        messages = self._split_tool_reference_messages(messages)
 
         # Preserve the history prefix when a later instruction is appended.
         if self.supports_inline_system:

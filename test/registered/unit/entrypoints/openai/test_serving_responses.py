@@ -1228,6 +1228,23 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
                         )
 
 
+def _render_glm53_flash(messages, image_data, *, tools):
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            call["function"]["arguments"] = orjson.loads(call["function"]["arguments"])
+    return render_glm53_flash(
+        [
+            process_content_for_template_format(
+                message, "openai", image_data, [], [], []
+            )
+            for message in messages
+        ],
+        tools=tools
+        and [{"type": "function", "function": {"name": t["name"]}} for t in tools],
+        add_generation_prompt=True,
+    )
+
+
 class InputItemNormalizationTestCase(CustomTestCase):
     def test_function_call_becomes_assistant_tool_call(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
@@ -1415,23 +1432,7 @@ class InputItemNormalizationTestCase(CustomTestCase):
         )
         messages = make_serving(is_multimodal=True)._construct_input_messages(request)
         image_data = []
-        for message in messages:
-            for call in message.get("tool_calls") or []:
-                call["function"]["arguments"] = orjson.loads(
-                    call["function"]["arguments"]
-                )
-        prompt = render_glm53_flash(
-            [
-                process_content_for_template_format(
-                    message, "openai", image_data, [], [], []
-                )
-                for message in messages
-            ],
-            tools=[
-                {"type": "function", "function": {"name": t["name"]}} for t in tools
-            ],
-            add_generation_prompt=True,
-        )
+        prompt = _render_glm53_flash(messages, image_data, tools=tools)
 
         # The GLM template renders only the references when a tool message
         # starts with one, so the image needs a tool message of its own.
@@ -1440,6 +1441,120 @@ class InputItemNormalizationTestCase(CustomTestCase):
         self.assertIn("Screenshot captured.", tool_turns)
         self.assertEqual(prompt.count(_IMAGE_TOKENS), len(image_data))
         self.assertEqual(len(image_data), 1)
+
+    def test_split_tool_results_follow_call_order_in_glm(self):
+        tools = [
+            {"type": "function", "name": name, "parameters": {"type": "object"}}
+            for name in ("read_log", "screenshot", "crop")
+        ]
+        request = ResponsesRequest(
+            model="m",
+            tools=tools,
+            input=[
+                {"type": "message", "role": "user", "content": "Check the app."},
+                *[
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": "{}",
+                    }
+                    for call_id, name in (
+                        ("call_a", "read_log"),
+                        ("call_b", "screenshot"),
+                    )
+                ],
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_b",
+                    "output": [
+                        {"type": "tool_reference", "name": "crop"},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,AA",
+                        },
+                    ],
+                },
+                {"type": "function_call_output", "call_id": "call_a", "output": "OK"},
+            ],
+        )
+        serving = make_serving(is_multimodal=True)
+        serving.template_manager.jinja_template_may_reorder_tool_results = True
+        messages = serving._canonicalize_tool_message_order(
+            serving._construct_input_messages(request)
+        )
+        prompt = _render_glm53_flash(messages, [], tools=tools)
+
+        # The rendered results carry no call ids, so call_a's result must come
+        # first, as GLM orders unsplit results by tool_calls.
+        tool_turns = prompt[prompt.index("<|observation|>") :]
+        self.assertLess(
+            tool_turns.index("<tool_response>OK</tool_response>"),
+            tool_turns.index('"name": "crop"'),
+        )
+        self.assertLess(
+            tool_turns.index('"name": "crop"'), tool_turns.index(_IMAGE_TOKENS)
+        )
+
+    def test_tool_reference_to_a_tool_the_template_lacks_drops_out(self):
+        screenshot = {"type": "input_image", "image_url": "data:image/png;base64,AA"}
+        reference = {"type": "tool_reference", "name": "crop"}
+        tools = [
+            {"type": "function", "name": name, "parameters": {"type": "object"}}
+            for name in ("screenshot", "crop")
+        ]
+
+        def make_request(output, **kwargs):
+            return ResponsesRequest(
+                model="m",
+                input=[
+                    {"type": "message", "role": "user", "content": "Look."},
+                    {
+                        "type": "function_call",
+                        "call_id": "call_abc",
+                        "name": "screenshot",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_abc",
+                        "output": output,
+                    },
+                ],
+                **kwargs,
+            )
+
+        serving = make_serving(is_multimodal=True)
+        # Each case with the tools the chat path then gives the template.
+        for kwargs, template_tools in [
+            ({"tools": tools, "tool_choice": "none"}, None),
+            ({}, None),
+            (
+                {
+                    "tools": tools,
+                    "tool_choice": {"type": "function", "name": "screenshot"},
+                },
+                tools[:1],
+            ),
+        ]:
+            with self.subTest(**kwargs):
+                messages = serving._construct_input_messages(
+                    make_request([reference, screenshot], **kwargs)
+                )
+                image_data = []
+                prompt = _render_glm53_flash(messages, image_data, tools=template_tools)
+                tool_turns = prompt[prompt.index("<|observation|>") :]
+                self.assertNotIn("<tools>", tool_turns)
+                self.assertEqual(tool_turns.count(_IMAGE_TOKENS), 1)
+                self.assertEqual(len(image_data), 1)
+
+                with self.assertRaises(_MediaInputValidationError):
+                    serving._construct_input_messages(
+                        make_request(
+                            [reference, {"type": "input_image", "file_id": "f-1"}],
+                            **kwargs,
+                        )
+                    )
 
     def test_tool_output_image_keeps_its_slot_before_a_user_image(self):
         template = (
