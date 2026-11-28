@@ -63,7 +63,6 @@ def fused_complex_rope(x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
     """Rotate contiguous BSHD activations with a shared S×(D/2) complex cache."""
     if not (
         x.is_cuda
-        and torch.version.hip is None
         and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and x.ndim == 4
         and x.numel() > 0
