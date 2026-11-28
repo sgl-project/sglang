@@ -131,7 +131,7 @@ behavior.
 | Shared runtime infrastructure | Cache, CUDA graph, distributed transfer, request utilities, or action-policy helpers can be reused by future models | `runtime/cache/`, `runtime/distributed/`, `runtime/utils/`, `runtime/pipelines_core/stages/` |
 | Model component config | A model component has static architecture config | `configs/models/dits/{model}.py`, `configs/models/vaes/{model}.py` |
 | Model-specific stage | A single stage's runtime semantics cannot be expressed by a native stage or a narrow subclass of one | `runtime/pipelines_core/stages/model_specific_stages/{model}.py` |
-| Encoder, VAE, scheduler | No existing implementation can be reused | `runtime/models/encoders/`, `runtime/models/vaes/`, `runtime/models/schedulers/` |
+| Encoder, VAE, scheduler | No existing SRT or diffusion implementation can be reused ([encoders SRT already implements](#encoders-srt-already-implements)) | `runtime/models/encoders/`, `runtime/models/vaes/`, `runtime/models/schedulers/` |
 
 For a new native architecture, the common minimum is:
 
@@ -142,6 +142,35 @@ For a new native architecture, the common minimum is:
 
 Every extra file should map to model behavior that existing code cannot express
 clearly.
+
+### Encoders SRT already implements
+
+When an encoder's architecture exists under `python/sglang/srt/models/`, reuse
+that class instead of copying it. Kernel, quantization and parallelism work then
+lands once for both LLM serving and diffusion.
+
+- **Language-model text encoders:** subclass the SRT model (for example
+  `Qwen3LLMModel`) and run its layer stack inside
+  `sglang.srt.model_executor.prefill_only.prefill_only(...)`, which publishes a
+  cache-free prefill batch. Route attention through `LocalAttention` so the
+  diffusion attention backends still apply. Keep diffusion-only behavior in a
+  thin adapter: layer truncation, injected features (deepstack), hidden-state
+  readout, the encoder TP group and conditioning-cache keys. See
+  `runtime/models/encoders/qwen3vl_text.py`.
+- **Vision towers:** build the SRT model on the encoder TP group through
+  `EncoderTensorParallelMixin`, as the SigLIP, CLIP and Qwen2.5-VL vision
+  encoders do.
+- **Weights:** map Hugging Face `q/k/v` and `gate/up` names to SRT's fused
+  `qkv_proj` and `gate_up_proj` at load time.
+- **Validation:** compare hidden states with the reference at TP 1 and TP 2
+  (`lossless` bound), and time the encoder in its real regime (short prompts and
+  long multimodal inputs).
+- **CI:** add every SRT file the encoder imports to the diffusion path filter in
+  `.github/workflows/_pr-test-detect-changes.yml`;
+  `scripts/ci/test_diffusion_srt_paths.py` fails when one is missing.
+
+Write a new encoder module only when SRT has no implementation (for example T5).
+Do not add new fallbacks to an in-tree copy; extend the SRT path instead.
 
 For dVLA or other non-image diffusion policies, keep the same ownership rule.
 The policy network, VLM/action expert modules, checkpoint mapping, and
