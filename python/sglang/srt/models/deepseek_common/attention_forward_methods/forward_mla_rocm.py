@@ -611,19 +611,20 @@ class DeepseekMLARocmForwardMixin:
             q = pre["q"].view(-1, self.num_local_heads, self.qk_head_dim)
             latent_cache = pre["latent"]
             k_nope = pre["k_nope"].unsqueeze(1)
-            q_lora = pre["q_lora"]
-            if self.should_run_indexer(prev_topk_indices):
-                topk_indices = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                )
-            else:
-                topk_indices = maybe_capture_indexer_topk(
-                    self.layer_id, prev_topk_indices
-                )
+            if self.use_dsa:
+                q_lora = pre["q_lora"]
+                if self.should_run_indexer(prev_topk_indices):
+                    topk_indices = self.indexer(
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                    )
+                else:
+                    topk_indices = maybe_capture_indexer_topk(
+                        self.layer_id, prev_topk_indices
+                    )
         elif self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
