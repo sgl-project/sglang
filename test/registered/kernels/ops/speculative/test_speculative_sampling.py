@@ -252,6 +252,7 @@ def joint_top_k_top_p_case(request):
         temperatures=torch.ones((1, 1), device="cuda"),
         need_top_k_sampling=True,
         need_top_p_sampling=True,
+        need_min_p_sampling=False,
         top_ks=torch.tensor([4], dtype=torch.int32, device="cuda"),
         top_ps=torch.tensor([0.82], device="cuda"),
     )

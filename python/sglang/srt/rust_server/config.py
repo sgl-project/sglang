@@ -72,6 +72,8 @@ def _build_server_args(
     request_class: Optional[type] = None,
     server_added_custom_params: Tuple[str, ...] = (),
     port_offset: int = 0,
+    vlm_warmup_image_base64: Optional[str] = None,
+    vlm_warmup_prompt: Optional[str] = None,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -180,6 +182,8 @@ def _build_server_args(
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
+        vlm_warmup_image_base64=vlm_warmup_image_base64,
+        vlm_warmup_prompt=vlm_warmup_prompt,
         gc_threshold=get_device().gc_threshold,
         custom_warmups_pending=bool(rust_server_warmup_names(get_serving().warmups)),
         health_generate_headers=dict(health_generate_headers or {}),
@@ -238,6 +242,8 @@ def _build_server_args(
         # endpoints can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
+        max_req_len=scheduler.max_req_len,
+        max_req_input_len=scheduler.max_req_input_len,
         deployment_info=json.dumps(deployment_info),
         launch_server_info=_launch_server_info(scheduler),
         launch_model_info=json.dumps(
@@ -269,6 +275,29 @@ def _build_server_args(
         crash_dump=bool(get_observability().crash_dump_folder),
         server_added_custom_params=list(server_added_custom_params),
     )
+
+
+def vlm_warmup_image_base64(scheduler: Scheduler) -> Optional[str]:
+    """The image of Python's VLM startup warmup (``_execute_server_warmup``),
+    which the Rust server's warmup generates from; ``None`` where Python warms
+    with text, a P/D decode server included, or skips the warmup."""
+    if (
+        not scheduler.model_config.is_multimodal
+        or get_serving().skip_server_warmup
+        or get_serving().skip_tokenizer_init
+        or get_disagg().disaggregation_mode == "decode"
+    ):
+        return None
+    # Lazy: only a multimodal model loads the HTTP server module.
+    from sglang.srt.entrypoints.http_server import (
+        _get_vlm_warmup_image_base64,
+        _is_vlm_warmup_model,
+    )
+
+    model_info = build_model_info_fields(scheduler.model_config, scheduler.server_args)
+    if not _is_vlm_warmup_model(model_info):
+        return None
+    return _get_vlm_warmup_image_base64(model_info)
 
 
 def request_log_settings(
@@ -489,6 +518,7 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     scheduler_info = {
         "status": "ready",
         "max_total_num_tokens": scheduler.max_total_num_tokens,
+        "max_req_len": scheduler.max_req_len,
         "max_req_input_len": scheduler.max_req_input_len,
     }
     info = msgspec_to_builtins(

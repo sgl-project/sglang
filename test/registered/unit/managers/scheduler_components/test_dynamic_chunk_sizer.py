@@ -14,9 +14,22 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDynamicChunkSizerProfiling(CustomTestCase):
-    def _profile(self, *, context, mapping, prefill, base, fail_forward=False):
+    def _profile(
+        self,
+        *,
+        context,
+        mapping,
+        prefill,
+        base,
+        kv_capacity=65536,
+        swa_capacity=None,
+        fail_forward=False,
+    ):
         prepared = []
         live = set()
+        available_capacity = (
+            kv_capacity if swa_capacity is None else min(kv_capacity, swa_capacity)
+        )
         runner = SimpleNamespace(
             model_config=SimpleNamespace(
                 context_len=context, hidden_size=2, dtype=torch.float32
@@ -38,6 +51,8 @@ class TestDynamicChunkSizerProfiling(CustomTestCase):
             req = reqs[0]
 
             def prepare():
+                if req.extend_end > available_capacity:
+                    raise RuntimeError("Synthetic prefill exceeds available KV rows")
                 prepared.append(req.extend_end)
                 live.add(req.rid)
                 req.kv.holds_kv = True
@@ -77,8 +92,11 @@ class TestDynamicChunkSizerProfiling(CustomTestCase):
                 model_runner=runner,
                 model_config=runner.model_config,
                 tree_cache=Mock(),
-                req_to_token_pool=SimpleNamespace(max_context_len=mapping),
-                token_to_kv_pool_allocator=Mock(),
+                req_to_token_pool=SimpleNamespace(row_width=mapping),
+                token_to_kv_pool_allocator=Mock(
+                    owner_available_size=Mock(return_value=kv_capacity),
+                    available_size=Mock(return_value=available_capacity),
+                ),
                 spec_algorithm=Mock(),
                 chunked_prefill_size=base,
                 max_prefill_tokens=prefill,
@@ -116,6 +134,23 @@ class TestDynamicChunkSizerProfiling(CustomTestCase):
                     context=context, mapping=mapping, prefill=prefill, base=base
                 )
                 self.assertEqual(max(lengths), expected_max)
+
+    def test_samples_fit_kv_pool_when_smaller_than_request_mapping(self):
+        lengths = self._profile(
+            context=8192, mapping=8196, prefill=8192, base=4096, kv_capacity=3072
+        )
+        self.assertEqual(max(lengths), 3072)
+
+    def test_samples_fit_swa_pool_when_smaller_than_full_attention_pool(self):
+        lengths = self._profile(
+            context=8192,
+            mapping=8196,
+            prefill=8192,
+            base=4096,
+            kv_capacity=8192,
+            swa_capacity=4096,
+        )
+        self.assertEqual(max(lengths), 4096)
 
     def test_forward_failure_releases_prepared_request(self):
         self._profile(

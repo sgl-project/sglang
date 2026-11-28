@@ -270,6 +270,19 @@ def safetensors_weights_iterator(
     )
 
 
+def mmap_safetensors_to_device(
+    files: list[str],
+    device: torch.device,
+    *,
+    key_filter: Callable[[str], bool] | None = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Upload one CPU mapping at a time; the caller can adopt its device storage."""
+    for name, tensor in safetensors_weights_iterator(
+        files, to_cpu=True, key_filter=key_filter
+    ):
+        yield name, tensor.to(device)
+
+
 def _load_pt_file(bin_file: str, device: str) -> dict:
     """Load a PyTorch checkpoint file with weights_only=True (no pickle execution)."""
     return torch.load(bin_file, map_location=device, weights_only=True)

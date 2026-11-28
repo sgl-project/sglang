@@ -13,10 +13,10 @@ from sglang.srt.hardware_backend.npu.attention.dsv4_prefill_graph import (
     Dsv4PrefillGraphMetadata,
     compress_capacity,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_npu_ci(est_time=1, suite="extra-a-test-npu")
 
 _DUMMY_STATE = 999
 
@@ -44,12 +44,11 @@ def _backend():
     return SimpleNamespace(
         device="cpu",
         page_size=128,
-        max_context_len=4096,
         _dsv4_has_c4=True,
         _dsv4_has_c128=True,
         _dsv4_unique_compress_ratios=[4, 128],
         _dsv4_state_pools_by_ratio={4: pool, 128: pool},
-        req_to_token_pool=SimpleNamespace(c128_page_size=32),
+        req_to_token_pool=SimpleNamespace(c128_page_size=32, row_width=4096),
         _kernel_metadata_from_parts=_kernel_metadata,
         _build_dsv4_prefill_graph_state_table=_state_table,
     )

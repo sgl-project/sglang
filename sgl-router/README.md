@@ -167,6 +167,10 @@ Omitting `--chat-routing` keeps the legacy routing path (default
 `--policy round_robin`). This README and [ARCHITECTURE.md](ARCHITECTURE.md)
 describe `--chat-routing reorg`.
 
+An sgl-model-gateway flag that sgl-router does not define, such as
+`--pd-disaggregation` or `--json-log`, fails at startup with an error that
+names what to use instead or says that the feature is not supported.
+
 ## Routing policies
 
 Each engine group runs one policy, chosen by `--policy` (default `power_of_two`
@@ -342,9 +346,9 @@ and [rerank](REFERENCE.md#rerank).
 
 ### Native gRPC
 
-`--grpc-port` serves the engine's `sglang.runtime.v1.SglangService`. Each RPC is
-routed like its HTTP route and forwarded to the same RPC on the engine's own
-native gRPC port, so engines must run with `--grpc-port` too. See
+`--grpc-port` serves `sglang.api.v1.SglangService/Generate` for a single text
+prompt or token sequence. Requests reach the same RPC on an engine running the
+native Rust server (`SGLANG_RUST_SERVER=1`) with `--grpc-port`. See
 [native gRPC](REFERENCE.md#native-grpc).
 
 ### Bucket file
@@ -395,6 +399,10 @@ unset fields inherit the CLI flags. See
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
   decode only within the same engine version; see
   [PD version groups](REFERENCE.md#pd-version-groups).
+- **Single-token requests on prefill**: `--pd-one-token-on-prefill-only`
+  answers a request for at most one token on the prefill engine alone, with no
+  decode and no KV transfer; see
+  [single-token requests](REFERENCE.md#single-token-requests-on-prefill).
 - **Request body size**: inference routes answer `413` past 32 MiB;
   `SGLANG_ROUTER_MAX_BODY_BYTES=<bytes>` raises the cap for large multimodal
   requests, at the cost of more router memory per in-flight request; see
