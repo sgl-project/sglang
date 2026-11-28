@@ -1,0 +1,1 @@
+{"collection":{"run_id":"0"},"gpu_sku":"mi355x","inference":{"backend":"sglang","runtime_version":"0.5.22.dev20261021+g2815eed49c"},"operator_libs":{"amd_driver":"CPU-structure-only","scope":"CPU structural protocol only"},"schema_version":1}
