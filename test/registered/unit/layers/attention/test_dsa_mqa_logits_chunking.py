@@ -17,6 +17,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from sglang.srt.layers.attention import mqa_logits_utils  # noqa: E402
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool  # noqa: E402
 from sglang.srt.layers.attention.mqa_logits_utils import (  # noqa: E402
     MQA_LOGITS_MAX_BYTES_ROCM,
@@ -111,6 +112,55 @@ def test_kpool_splits_the_query_rows_to_stay_under_the_aiter_cap():
     assert rows_per_call == [3, 3, 2]
     rows = torch.arange(num_q, dtype=torch.float32)
     assert torch.equal(logits, (rows + rows * 10).unsqueeze(1).expand(-1, num_k))
+
+
+def _budget(*, deterministic, free_bytes):
+    """`mqa_logits_budget_bytes` on a stubbed 192 GiB device at
+    mem_fraction_static 0.9, with `free_bytes` reported free; also whether
+    free memory was queried."""
+    total = 192 * 2**30
+    props = types.SimpleNamespace(total_memory=total)
+    device_module = types.SimpleNamespace(get_device_properties=lambda index: props)
+    schedule = types.SimpleNamespace(mem_fraction_static=0.9)
+    exec_config = types.SimpleNamespace(
+        deterministic=types.SimpleNamespace(
+            enable_deterministic_inference=deterministic
+        )
+    )
+    mem_get_info = mock.Mock(return_value=(free_bytes, total))
+    with (
+        mock.patch.object(mqa_logits_utils, "get_device_module", lambda: device_module),
+        mock.patch.object(mqa_logits_utils, "get_schedule", lambda: schedule),
+        mock.patch.object(mqa_logits_utils, "get_exec", lambda: exec_config),
+        mock.patch.object(mqa_logits_utils, "is_xpu", lambda: False),
+        mock.patch.object(mqa_logits_utils, "is_hip", lambda: False),
+        mock.patch.object(torch.cuda, "mem_get_info", mem_get_info),
+    ):
+        budget = mqa_logits_utils.mqa_logits_budget_bytes(
+            device_index=0, allow_sync=True
+        )
+    return budget, mem_get_info.called
+
+
+def test_free_memory_caps_the_budget():
+    roomy, _ = _budget(deterministic=False, free_bytes=64 * 2**30)
+    tight, queried = _budget(deterministic=False, free_bytes=2**20)
+    assert queried
+    assert tight < roomy
+
+
+def test_deterministic_inference_budget_ignores_free_memory():
+    """Free memory changes from run to run; a budget that followed it would
+    change how the indexers split the logits into row chunks, and the logits
+    kernel does not give a row the same result for every chunk size."""
+    results = {
+        _budget(deterministic=True, free_bytes=free)
+        for free in (2**20, 2**30, 64 * 2**30)
+    }
+    assert len(results) == 1
+    ((budget, queried),) = results
+    assert not queried
+    assert budget == _budget(deterministic=False, free_bytes=64 * 2**30)[0]
 
 
 if __name__ == "__main__":
