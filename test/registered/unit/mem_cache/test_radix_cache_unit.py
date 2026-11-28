@@ -1038,6 +1038,490 @@ class TestRadixCache(CustomTestCase):
                 match_len = result.device_prefix_len
                 self.assertEqual(match_len % page_size, 0)
 
+    @staticmethod
+    def _make_paged_cache(
+        page_size: int,
+        *,
+        is_eagle: bool = False,
+        disable: bool = False,
+    ) -> RadixCache:
+        return RadixCache(
+            CacheInitParams(
+                disable=disable,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+                page_size=page_size,
+                is_eagle=is_eagle,
+            )
+        )
+
+    @classmethod
+    def _build_two_edge_paged_cache(
+        cls,
+        page_size: int,
+        *,
+        is_eagle: bool = False,
+        extra_key: str | None = None,
+        cache_salt: str | None = None,
+        add_sibling: bool = False,
+    ) -> tuple[RadixCache, array]:
+        """Build a fresh tree with root -> [0..2p) -> [2p..4p)."""
+        cache = cls._make_paged_cache(page_size, is_eagle=is_eagle)
+        extra = int(is_eagle)
+        tokens = array("q", range(5 * page_size + extra))
+        for length in (2 * page_size, 4 * page_size):
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(
+                        tokens[: length + extra],
+                        extra_key=extra_key,
+                        cache_salt=cache_salt,
+                    ),
+                    value=torch.arange(length, dtype=torch.int64),
+                )
+            )
+        if add_sibling:
+            sibling = array("q", range(1000, 1000 + page_size + extra))
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(
+                        sibling,
+                        extra_key=extra_key,
+                        cache_salt=cache_salt,
+                    ),
+                    value=torch.arange(1000, 1000 + page_size, dtype=torch.int64),
+                )
+            )
+        return cache, tokens
+
+    @staticmethod
+    def _reset_access_times(cache: RadixCache) -> None:
+        stack = [cache.root_node]
+        while stack:
+            node = stack.pop()
+            node.last_access_time = -1.0
+            stack.extend(node.children.values())
+
+    @staticmethod
+    def _touched_value_spans(cache: RadixCache) -> list[tuple[int, int]]:
+        """Return (start, end) value spans for nodes with refreshed access times."""
+        spans = []
+        stack = [cache.root_node]
+        while stack:
+            node = stack.pop()
+            if node.last_access_time > -1.0:
+                if node is cache.root_node:
+                    spans.append((0, 0))
+                else:
+                    start = int(node.value[0])
+                    spans.append((start, start + len(node.value)))
+            stack.extend(node.children.values())
+        return sorted(spans)
+
+    @staticmethod
+    def _paged_raw_lengths(page_size: int, is_eagle: bool) -> list[int]:
+        """Raw token lengths spanning empty, sub-page, exact-page, and split boundaries."""
+        extra = int(is_eagle)
+        logical_lengths = [
+            0,
+            page_size,
+            2 * page_size,
+            3 * page_size,
+            4 * page_size,
+        ]
+        if page_size > 1:
+            logical_lengths.extend(
+                [
+                    page_size - 1,
+                    2 * page_size - 1,
+                    2 * page_size + 1,
+                    3 * page_size - 1,
+                    4 * page_size - 1,
+                    5 * page_size - 1,
+                ]
+            )
+        raw_lengths = {length + extra for length in logical_lengths}
+        # In EAGLE bigram mode, both 0 and 1 raw tokens have logical length 0.
+        raw_lengths.add(0)
+        return sorted(raw_lengths)
+
+    @staticmethod
+    def _make_query_key(
+        tokens: array,
+        raw_len: int,
+        *,
+        use_limit: bool,
+        extra_key: str | None = None,
+        cache_salt: str | None = None,
+    ) -> RadixKey:
+        if use_limit:
+            return RadixKey(
+                tokens, extra_key=extra_key, limit=raw_len, cache_salt=cache_salt
+            )
+        return RadixKey(tokens[:raw_len], extra_key=extra_key, cache_salt=cache_salt)
+
+    def test_paged_match_prefix_matches_page_aligned_key(self):
+        """match_prefix on unaligned keys equals matching the page-aligned key."""
+        for page_size in (1, 4):
+            for is_eagle in (False, True):
+                for use_limit in (False, True):
+                    for raw_len in self._paged_raw_lengths(page_size, is_eagle):
+                        with self.subTest(
+                            page_size=page_size,
+                            is_eagle=is_eagle,
+                            use_limit=use_limit,
+                            raw_len=raw_len,
+                        ):
+                            cache, tokens = self._build_two_edge_paged_cache(
+                                page_size, is_eagle=is_eagle, add_sibling=True
+                            )
+                            ref_cache, _ = self._build_two_edge_paged_cache(
+                                page_size, is_eagle=is_eagle, add_sibling=True
+                            )
+                            self._reset_access_times(cache)
+                            self._reset_access_times(ref_cache)
+
+                            key = self._make_query_key(
+                                tokens, raw_len, use_limit=use_limit
+                            )
+                            ref_key = self._make_query_key(
+                                tokens, raw_len, use_limit=use_limit
+                            )
+                            ref_key, _ = ref_key.maybe_to_bigram_view(is_eagle)
+                            ref_key = ref_key.page_aligned(page_size)
+
+                            result = cache.match_prefix(MatchPrefixParams(key=key))
+                            ref_result = ref_cache.match_prefix(
+                                MatchPrefixParams(key=ref_key)
+                            )
+
+                            logical_len = max(0, raw_len - 1) if is_eagle else raw_len
+                            expected = min(
+                                4 * page_size,
+                                (logical_len // page_size) * page_size,
+                            )
+                            self.assertEqual(result.device_prefix_len, expected)
+                            self.assertEqual(
+                                result.device_prefix_len,
+                                ref_result.device_prefix_len,
+                            )
+                            self.assertTrue(
+                                torch.equal(
+                                    cache.path_device_indices(result.last_device_node),
+                                    torch.arange(expected, dtype=torch.int64),
+                                )
+                            )
+                            self.assertTrue(
+                                torch.equal(
+                                    cache.path_device_indices(result.last_device_node),
+                                    ref_cache.path_device_indices(
+                                        ref_result.last_device_node
+                                    ),
+                                )
+                            )
+                            touched = self._touched_value_spans(cache)
+                            self.assertEqual(
+                                touched, self._touched_value_spans(ref_cache)
+                            )
+                            self.assertEqual(cache.total_size(), ref_cache.total_size())
+                            if expected == 0:
+                                self.assertIs(result.last_device_node, cache.root_node)
+                                self.assertEqual(touched, [])
+                            elif expected == 2 * page_size:
+                                self.assertNotIn(
+                                    (2 * page_size, 4 * page_size), touched
+                                )
+
+    def test_paged_match_prefix_divergence_namespaces_and_disable(self):
+        """Paged lookups handle misses, namespace isolation, and disabled caches."""
+        for is_eagle in (False, True):
+            extra = int(is_eagle)
+            with self.subTest(case="root_miss", is_eagle=is_eagle):
+                cache, tokens = self._build_two_edge_paged_cache(4, is_eagle=is_eagle)
+                self._reset_access_times(cache)
+                root_children = len(cache.root_node.children)
+                for div_idx in (0, 3):
+                    miss = array("q", tokens[: 11 + extra])
+                    miss[div_idx] = -1
+                    res = cache.match_prefix(MatchPrefixParams(key=RadixKey(miss)))
+                    self.assertEqual(res.device_prefix_len, 0)
+                    self.assertIs(res.last_device_node, cache.root_node)
+                    self.assertEqual(len(cache.root_node.children), root_children)
+                    self.assertEqual(self._touched_value_spans(cache), [(0, 0)])
+
+            with self.subTest(case="second_edge_miss", is_eagle=is_eagle):
+                cache, tokens = self._build_two_edge_paged_cache(4, is_eagle=is_eagle)
+                self._reset_access_times(cache)
+                edge1 = next(iter(cache.root_node.children.values()))
+                edge1_children = len(edge1.children)
+                miss = array("q", tokens[: 15 + extra])
+                miss[11] = -1
+                res = cache.match_prefix(MatchPrefixParams(key=RadixKey(miss)))
+                self.assertEqual(res.device_prefix_len, 8)
+                self.assertIs(res.last_device_node, edge1)
+                self.assertEqual(len(edge1.children), edge1_children)
+                self.assertEqual(self._touched_value_spans(cache), [(0, 0), (0, 8)])
+
+            with self.subTest(case="namespaces", is_eagle=is_eagle):
+                cache, tokens = self._build_two_edge_paged_cache(
+                    4,
+                    is_eagle=is_eagle,
+                    extra_key="lora-a",
+                    cache_salt="tenant-a",
+                )
+                hit = cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(
+                            tokens,
+                            extra_key="lora-a",
+                            limit=15 + extra,
+                            cache_salt="tenant-a",
+                        )
+                    )
+                )
+                self.assertEqual(hit.device_prefix_len, 12)
+                self.assertTrue(
+                    torch.equal(
+                        cache.path_device_indices(hit.last_device_node),
+                        torch.arange(12, dtype=torch.int64),
+                    )
+                )
+                for bad_extra, bad_salt in (
+                    ("lora-b", "tenant-a"),
+                    ("lora-a", "tenant-b"),
+                ):
+                    miss = cache.match_prefix(
+                        MatchPrefixParams(
+                            key=RadixKey(
+                                tokens,
+                                extra_key=bad_extra,
+                                limit=15 + extra,
+                                cache_salt=bad_salt,
+                            )
+                        )
+                    )
+                    self.assertEqual(miss.device_prefix_len, 0)
+                    self.assertIs(miss.last_device_node, cache.root_node)
+
+            with self.subTest(case="disable", is_eagle=is_eagle):
+                cache = self._make_paged_cache(4, is_eagle=is_eagle, disable=True)
+                self._reset_access_times(cache)
+                res = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", range(8 + extra))))
+                )
+                self.assertEqual(res.device_prefix_len, 0)
+                self.assertIs(res.last_device_node, cache.root_node)
+                cache.touch_prefix(RadixKey(array("q", range(8 + extra))))
+                self.assertEqual(self._touched_value_spans(cache), [])
+
+    def test_paged_touch_prefix_boundaries_and_fresh_keys(self):
+        """touch_prefix handles fresh unconverted keys across page boundaries."""
+        for page_size in (1, 4):
+            for is_eagle in (False, True):
+                for use_limit in (False, True):
+                    for raw_len in self._paged_raw_lengths(page_size, is_eagle):
+                        with self.subTest(
+                            page_size=page_size,
+                            is_eagle=is_eagle,
+                            use_limit=use_limit,
+                            raw_len=raw_len,
+                        ):
+                            cache, tokens = self._build_two_edge_paged_cache(
+                                page_size, is_eagle=is_eagle, add_sibling=True
+                            )
+                            ref_cache, _ = self._build_two_edge_paged_cache(
+                                page_size, is_eagle=is_eagle, add_sibling=True
+                            )
+                            self._reset_access_times(cache)
+                            self._reset_access_times(ref_cache)
+
+                            # Pass a brand-new key (is_bigram=False) directly to
+                            # touch_prefix without going through match_prefix.
+                            key = self._make_query_key(
+                                tokens, raw_len, use_limit=use_limit
+                            )
+                            ref_key = self._make_query_key(
+                                tokens, raw_len, use_limit=use_limit
+                            )
+                            ref_key, _ = ref_key.maybe_to_bigram_view(is_eagle)
+                            ref_key = ref_key.page_aligned(page_size)
+
+                            cache.touch_prefix(key)
+                            ref_cache.touch_prefix(ref_key)
+
+                            self.assertEqual(key.is_bigram, is_eagle)
+                            touched = self._touched_value_spans(cache)
+                            self.assertEqual(
+                                touched, self._touched_value_spans(ref_cache)
+                            )
+                            self.assertNotIn((1000, 1000 + page_size), touched)
+                            self.assertEqual(cache.total_size(), ref_cache.total_size())
+
+                            logical_len = max(0, raw_len - 1) if is_eagle else raw_len
+                            expected = min(
+                                4 * page_size,
+                                (logical_len // page_size) * page_size,
+                            )
+                            if expected == 0:
+                                self.assertEqual(touched, [])
+                            elif expected == 2 * page_size:
+                                self.assertEqual(touched, [(0, 0), (0, 2 * page_size)])
+                            elif expected == 3 * page_size:
+                                self.assertIn((2 * page_size, 3 * page_size), touched)
+                            elif expected == 4 * page_size:
+                                self.assertEqual(
+                                    touched,
+                                    [
+                                        (0, 0),
+                                        (0, 2 * page_size),
+                                        (2 * page_size, 4 * page_size),
+                                    ],
+                                )
+
+    def test_paged_lookup_and_touch_avoid_key_copies(self):
+        """match_prefix and touch_prefix never call page_aligned or slice the query key."""
+        orig_getitem = RadixKey.__getitem__
+
+        def count_query_slices(cache: RadixCache, fn):
+            tree_buffers = set()
+            stack = [cache.root_node]
+            while stack:
+                node = stack.pop()
+                tree_buffers.add(id(node.key.token_ids))
+                stack.extend(node.children.values())
+            slices = 0
+
+            def spy_getitem(self_key, idx):
+                nonlocal slices
+                if id(self_key.token_ids) not in tree_buffers:
+                    slices += 1
+                return orig_getitem(self_key, idx)
+
+            with (
+                unittest.mock.patch.object(
+                    RadixKey,
+                    "page_aligned",
+                    side_effect=AssertionError(
+                        "lookup/touch must not call page_aligned"
+                    ),
+                ),
+                unittest.mock.patch.object(RadixKey, "__getitem__", spy_getitem),
+            ):
+                return fn(), slices
+
+        def make_tree(
+            page_size: int, edges: tuple[int, ...], is_eagle: bool, tokens: array
+        ):
+            cache = self._make_paged_cache(page_size, is_eagle=is_eagle)
+            for length in edges:
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(tokens[: length + int(is_eagle)]),
+                        value=torch.arange(length, dtype=torch.int64),
+                    )
+                )
+            return cache
+
+        # (name, page_size, edges, logical_len, flip_first, expected_len, expected_touched)
+        scenarios = [
+            ("short_key", 4, (8,), 3, False, 0, []),
+            ("first_page_miss_unaligned", 4, (8, 16), 15, True, 0, [(0, 0)]),
+            ("first_page_miss_aligned", 4, (8, 16), 16, True, 0, [(0, 0)]),
+            ("single_edge_exact", 4, (8,), 8, False, 8, [(0, 0), (0, 8)]),
+            ("single_edge_partial_tail", 4, (8,), 11, False, 8, [(0, 0), (0, 8)]),
+            ("single_edge_split", 4, (8,), 7, False, 4, [(0, 0), (0, 4), (4, 8)]),
+            ("two_edge_exact", 4, (8, 16), 16, False, 16, [(0, 0), (0, 8), (8, 16)]),
+            (
+                "two_edge_partial_tail",
+                4,
+                (8, 16),
+                19,
+                False,
+                16,
+                [(0, 0), (0, 8), (8, 16)],
+            ),
+            (
+                "two_edge_split",
+                4,
+                (8, 16),
+                15,
+                False,
+                12,
+                [(0, 0), (0, 8), (8, 12), (12, 16)],
+            ),
+            (
+                "three_edge_exact",
+                4,
+                (4, 8, 16),
+                16,
+                False,
+                16,
+                [(0, 0), (0, 4), (4, 8), (8, 16)],
+            ),
+            (
+                "ps1_three_edge_exact",
+                1,
+                (4, 8, 16),
+                16,
+                False,
+                16,
+                [(0, 0), (0, 4), (4, 8), (8, 16)],
+            ),
+        ]
+
+        for is_eagle in (False, True):
+            extra = int(is_eagle)
+            tokens = array("q", range(20 + extra))
+            for (
+                name,
+                page_size,
+                edges,
+                logical_len,
+                flip_first,
+                expected_len,
+                expected_touched,
+            ) in scenarios:
+                with self.subTest(case=name, is_eagle=is_eagle):
+                    if flip_first:
+                        q_tokens = array("q", tokens[: logical_len + extra])
+                        q_tokens[0] = -1
+                        make_key = lambda qt=q_tokens: RadixKey(qt)
+                    else:
+                        make_key = lambda n=logical_len + extra: RadixKey(
+                            tokens, limit=n
+                        )
+
+                    match_cache = make_tree(page_size, edges, is_eagle, tokens)
+                    self._reset_access_times(match_cache)
+                    res, match_slices = count_query_slices(
+                        match_cache,
+                        lambda: match_cache.match_prefix(
+                            MatchPrefixParams(key=make_key())
+                        ),
+                    )
+                    self.assertEqual(match_slices, 0)
+                    self.assertEqual(res.device_prefix_len, expected_len)
+                    self.assertTrue(
+                        torch.equal(
+                            match_cache.path_device_indices(res.last_device_node),
+                            torch.arange(expected_len, dtype=torch.int64),
+                        )
+                    )
+                    self.assertEqual(
+                        self._touched_value_spans(match_cache), expected_touched
+                    )
+
+                    touch_cache = make_tree(page_size, edges, is_eagle, tokens)
+                    self._reset_access_times(touch_cache)
+                    _, touch_slices = count_query_slices(
+                        touch_cache,
+                        lambda: touch_cache.touch_prefix(make_key()),
+                    )
+                    self.assertEqual(touch_slices, 0)
+                    self.assertEqual(
+                        self._touched_value_spans(touch_cache), expected_touched
+                    )
+
     def test_advanced_prefix_match_with_node_splits(self):
         """Advanced prefix matching: splits inside nodes and across pages."""
         for page_size in [1, 2]:
