@@ -60,8 +60,8 @@ def test_mha_v4_needs_the_aiter_race_fix(racy):
         assert (backend._load_mha_v4() is None) == racy
 
 
-def test_one_live_sequence_keeps_the_varlen_kernel_off_gfx950():
-    """The batch kernel and the key split were only measured on gfx950."""
+def test_one_live_sequence_keeps_the_varlen_kernel_off_gfx942_and_gfx950():
+    """The batch kernel and the key split were only measured on gfx942 and gfx950."""
     impl = _build(4, 4)
     from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
 
@@ -69,6 +69,7 @@ def test_one_live_sequence_keeps_the_varlen_kernel_off_gfx950():
     q = torch.randn(rows, 4, HEAD_SIZE)
     bounds = (0, rows)
     with (
+        patch.object(backend, "USE_AITER_GFX942", False),
         patch.object(backend, "USE_AITER_GFX95", False),
         patch.object(
             backend.aiter, "flash_attn_varlen_func", lambda **kwargs: kwargs["q"] + 1
@@ -100,8 +101,8 @@ def test_one_live_sequence_matches_the_varlen_kernel(pad):
     )
     from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
 
-    if not backend.USE_AITER_GFX95:
-        pytest.skip("the batch kernel path is gfx950-only")
+    if not (backend.USE_AITER_GFX942 or backend.USE_AITER_GFX95):
+        pytest.skip("the batch kernel path is gfx942 and gfx950 only")
     torch.manual_seed(0)
     total = 4096
     used = total - pad
@@ -136,8 +137,8 @@ def test_tail_rows_with_split_keys_match_one_launch():
     )
     from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
 
-    if not backend.USE_AITER_GFX95:
-        pytest.skip("the key split is gfx950-only")
+    if not (backend.USE_AITER_GFX942 or backend.USE_AITER_GFX95):
+        pytest.skip("the key split is gfx942 and gfx950 only")
     heads, device = 7, torch.device("cuda", torch.cuda.current_device())
     rows = 4 * backend._num_cus(device.index) // heads * 256 + 300
     total = rows + 64
