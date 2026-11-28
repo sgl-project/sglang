@@ -226,7 +226,13 @@ class JetBlock(nn.Module):
             prefix=add_prefix("qkvabz_proj", prefix),
         )
 
-        self.o_proj = RowParallelLinear(total_v_dim, hidden_size, bias=False)
+        self.o_proj = RowParallelLinear(
+            total_v_dim,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
+        )
 
         self.A_log = nn.Parameter(torch.empty(num_heads, dtype=torch.float32))
         self.dt_bias = nn.Parameter(torch.empty(num_heads))
