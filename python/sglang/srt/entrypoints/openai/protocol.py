@@ -2601,7 +2601,7 @@ class RequestResponseMetadata(BaseModel):
 
 @dataclass
 class MessageProcessingResult:
-    prompt: str
+    prompt: Optional[str]
     prompt_ids: Union[str, List[int]]
     image_data: Optional[Any]
     audio_data: Optional[Any]

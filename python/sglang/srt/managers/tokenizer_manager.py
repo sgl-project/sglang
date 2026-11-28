@@ -811,7 +811,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 self.processor = _processor
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
-                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+                # Sets TOKENIZERS_PARALLELISM=false and lets the long-prompt
+                # chat encode still use the pool in this process.
+                from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
+                    disable_tokenizers_parallelism,
+                )
+
+                disable_tokenizers_parallelism()
         else:
             self.mm_processor = self.processor = None
 

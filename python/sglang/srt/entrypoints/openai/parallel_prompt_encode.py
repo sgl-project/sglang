@@ -256,6 +256,61 @@ def split_prompt(text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS):
     return chunks
 
 
+_PARALLELISM_ENV = "TOKENIZERS_PARALLELISM"
+_PARALLELISM_OFF = ("", "0", "false", "off", "no", "n", "f")
+_pool_logged = False
+# PID of the process whose TOKENIZERS_PARALLELISM=false came from SGLang itself
+# (tokenizer manager, multimodal model). A forked child keeps the parent's PID
+# here, so it never forces the pool: its "false" may come from tokenizers'
+# at-fork handler, whose inherited rayon pool has no threads.
+_parallelism_disabled_by_sglang_pid = None
+
+
+def disable_tokenizers_parallelism():
+    """Set TOKENIZERS_PARALLELISM=false for this process, as the tokenizer
+    manager does for multimodal models, and remember that SGLang did it."""
+    global _parallelism_disabled_by_sglang_pid
+    os.environ[_PARALLELISM_ENV] = "false"
+    _parallelism_disabled_by_sglang_pid = os.getpid()
+
+
+def _encode_batch_on_pool(backend, chunks):
+    """encode_batch with the rayon pool on for this call.
+
+    tokenizers reads TOKENIZERS_PARALLELISM on every call. The tokenizer
+    manager sets it to "false" for multimodal models, which makes this module
+    fall back to the serial encode in every tokenizer worker (~1.3 us a
+    token: ~0.35 s of TTFT for a 265k-token agentic prompt). The ids do not
+    depend on the pool. Only in the process that set the variable itself
+    (disable_tokenizers_parallelism); a forked child does not.
+    Opt out: SGLANG_PARALLEL_PROMPT_ENCODE_FORCE_POOL_DISABLE=1.
+    """
+    global _pool_logged
+    prev = os.environ.get(_PARALLELISM_ENV)
+    force = (
+        prev is not None
+        and prev.strip().lower() in _PARALLELISM_OFF
+        and _parallelism_disabled_by_sglang_pid == os.getpid()
+        and not envs.SGLANG_PARALLEL_PROMPT_ENCODE_FORCE_POOL_DISABLE.get()
+    )
+    if not force:
+        return backend.encode_batch(chunks, add_special_tokens=False)
+    if not _pool_logged:
+        _pool_logged = True
+        logger.warning(
+            "parallel_prompt_encode: %s=%s in this process; running long-prompt "
+            "encode_batch on the tokenizers pool (opt out: "
+            "SGLANG_PARALLEL_PROMPT_ENCODE_FORCE_POOL_DISABLE=1)",
+            _PARALLELISM_ENV,
+            prev,
+        )
+    os.environ[_PARALLELISM_ENV] = "true"
+    try:
+        return backend.encode_batch(chunks, add_special_tokens=False)
+    finally:
+        os.environ[_PARALLELISM_ENV] = prev
+
+
 def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``tokenizer.encode(text, **encode_kwargs)``."""
     global _parallel_ok, _parallel_pid
@@ -291,7 +346,7 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     check = _parallel_ok is None
     if check:
         w0, c0 = time.perf_counter(), time.process_time()
-    encodings = backend.encode_batch(chunks, add_special_tokens=False)
+    encodings = _encode_batch_on_pool(backend, chunks)
     if check:
         wall, cpu = time.perf_counter() - w0, time.process_time() - c0
         # Rayon worker CPU adds up well beyond wall time. Serial stays near 1.0;

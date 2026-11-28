@@ -484,6 +484,10 @@ class OpenAIServingChat(OpenAIServingBase):
         self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
             OrderedDict()
         )
+        # Set only around _process_messages in _convert_to_internal_request:
+        # the rendered prompt text of a multimodal request is then decoded
+        # only if it is actually sent (see _engine_prompt).
+        self._defer_prompt_decode = False
         self._doc_splitter = ChatDocSplitter.for_model(
             self, handle_window=super().handle_request
         )
@@ -1270,7 +1274,13 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
-        processed_messages = self._process_messages(request, is_multimodal)
+        self._defer_prompt_decode = (
+            is_multimodal and not envs.SGLANG_CHAT_LAZY_PROMPT_DECODE_DISABLE.get()
+        )
+        try:
+            processed_messages = self._process_messages(request, is_multimodal)
+        finally:
+            self._defer_prompt_decode = False
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -1291,6 +1301,10 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         else:
+            if processed_messages.prompt is None:
+                processed_messages.prompt = self.tokenizer_manager.tokenizer.decode(
+                    processed_messages.prompt_ids
+                )
             prompt_key, prompt_value = self._engine_prompt(
                 processed_messages, is_multimodal
             )
@@ -2242,11 +2256,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 decoded_prompt = None
 
             if is_multimodal:
-                prompt = (
-                    decoded_prompt
-                    if decoded_prompt is not None
-                    else self.tokenizer_manager.tokenizer.decode(prompt_ids)
-                )
+                if decoded_prompt is None and self._defer_prompt_decode:
+                    prompt = None  # decoded in _convert_to_internal_request if sent
+                else:
+                    prompt = (
+                        decoded_prompt
+                        if decoded_prompt is not None
+                        else self.tokenizer_manager.tokenizer.decode(prompt_ids)
+                    )
 
         stop = request.stop
         image_data = image_data if image_data else None
@@ -2340,7 +2357,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
-            if cache_key is not None
+            if cache_key is not None and not self._defer_prompt_decode
             else None
         )
 
