@@ -10,7 +10,7 @@ import torch
 import triton
 
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import get_device_name, is_hip
+from sglang.srt.utils import get_device_name, is_hip, is_sm120
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
@@ -247,7 +247,9 @@ def get_default_config(
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 32,
+            # Unquantized on RTX 5090 (Triton 3.8): K 64 is 1.3x faster than 32
+            # at M 129 to 1024. Neutral on sm86, other cards not measured.
+            "BLOCK_SIZE_K": 64 if dtype is None and is_sm120() else 32,
             "GROUP_SIZE_M": 8,
         }
         # A heuristic: fused marlin works faster with this config for small M
