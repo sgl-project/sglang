@@ -1,3 +1,4 @@
+# Vendored from facebookexperimental/triton third_party/tlx/ops/kernels/fused/qk_norm_rope_kv_cache/gfx950.py at 87abb3f5a (MIT); see kernels/README.md.
 """Attention input preparation on gfx950: q/k head RMSNorm, RoPE, q quantization and the paged FP8 KV cache write.
 
 One program per token reads the token's ``q``, ``k`` and ``v`` rows (column slices of a fused QKV projection) once and

@@ -1,3 +1,4 @@
+# Vendored from facebookexperimental/triton third_party/tlx/ops/_invariance.py at 2e8256a9b (MIT); see kernels/README.md.
 """Bitwise-invariance request types for `tlx.ops`.
 
 `BitwiseInvarianceSpec` names the logical dimensions that may vary across
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from ._catalog import InvalidInput
+from sglang.kernels.jit.utils.tlx_runtime import InvalidInput
 
 __all__ = ["BitwiseInvarianceSpec", "Space", "normalize_space", "gemm_fixed_split_k"]
 
