@@ -771,18 +771,23 @@ def test_multimodal_requires_explicit_enable(tmp_path):
 def test_mxfp8_cache_needs_the_fused_decode_prologue(monkeypatch):
     """SM90 and SM120 decode an MXFP8 cache only through the relative-bias decode
     kernel, so attention without the fused decode prologue fails at construction
-    instead of at its first decode; other caches and FA4's MXFP8 path build as before."""
+    on a worker that decodes; a PD prefill worker, other caches and FA4's MXFP8
+    path build as before."""
     from sglang.srt.models.inkling_common import inkling2_attn
 
-    def build(sm, kv_cache_dtype, fused):
+    def build(sm, kv_cache_dtype, fused, mode="null"):
         model = SimpleNamespace(kv_cache_dtype=kv_cache_dtype)
+        disagg = SimpleNamespace(disaggregation_mode=mode)
         monkeypatch.setattr(inkling2_attn, "get_model", lambda: model)
+        monkeypatch.setattr(inkling2_attn, "get_disagg", lambda: disagg)
         with override_platform(is_sm90=sm == 90, is_sm120=sm == 120, device_sm=sm):
             inkling2_attn._check_mxfp8_decode_prologue(fused)
 
     for sm in (90, 120):
-        with pytest.raises(ValueError, match=f"mxfp8 on SM{sm} needs"):
-            build(sm, "mxfp8", fused=False)
+        for mode in ("null", "decode"):
+            with pytest.raises(ValueError, match=f"mxfp8 on SM{sm} needs"):
+                build(sm, "mxfp8", fused=False, mode=mode)
+        build(sm, "mxfp8", fused=False, mode="prefill")
         build(sm, "mxfp8", fused=True)
         build(sm, "auto", fused=False)
     build(100, "mxfp8", fused=False)

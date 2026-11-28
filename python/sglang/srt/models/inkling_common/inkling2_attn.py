@@ -34,7 +34,12 @@ from sglang.srt.models.inkling_common.attn import (
 )
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
 from sglang.srt.models.inkling_common.sconv import SconvType
-from sglang.srt.runtime_context import get_model, get_parallel, get_platform
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_model,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import get_device_core_count
 
 PADDED_DECODE_MIN_TOKENS = 8
@@ -59,9 +64,10 @@ def wave_fill_splits(tiles, sms, max_splits=128, min_fill=0.9):
 
 def _check_mxfp8_decode_prologue(fused_decode_prologue):
     # SM90 and SM120 decode an MXFP8 cache only through the relative-bias decode
-    # kernel, which runs on the fused decode prologue.
+    # kernel, which runs on the fused decode prologue; a PD prefill worker never decodes.
     if (
         not fused_decode_prologue
+        and get_disagg().disaggregation_mode != "prefill"
         and get_model().kv_cache_dtype == "mxfp8"
         and mxfp8_kv_via_bf16(platform=get_platform())
     ):
