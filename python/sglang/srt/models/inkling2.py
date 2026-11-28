@@ -31,6 +31,9 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+# Registers the expert LoRA wrapper with the LoRA runtime.
+from sglang.srt.models.inkling_common import inkling2_lora  # noqa: F401
 from sglang.srt.models.inkling_common.inkling2_attn import (
     AttentionSources,
     Inkling2Attention,

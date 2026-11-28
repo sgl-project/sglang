@@ -32,7 +32,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
-from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
+from sglang.srt.lora.layers import (
+    BaseLayerWithLoRA,
+    FusedMoEWithLoRA,
+    get_lora_layer,
+    moe_lora_layer_types,
+    shared_outer_expert_layer_types,
+)
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
@@ -188,7 +194,7 @@ class LoRAManager:
             max_num_tokens=max_num_tokens, max_num_requests=max_num_requests
         )
         for module in self.base_model.modules():
-            if isinstance(module, FusedMoEWithLoRA):
+            if isinstance(module, moe_lora_layer_types()):
                 self.lora_backend.init_cuda_graph_moe_buffers(
                     max_bs=max_num_tokens,
                     max_loras=self.max_loras_per_batch,
@@ -618,7 +624,7 @@ class LoRAManager:
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
                 if (
-                    isinstance(module, FusedMoEWithLoRA)
+                    isinstance(module, moe_lora_layer_types())
                     or getattr(module, "is_shared_fused_moe", False)
                 ) and all(
                     x in self.target_modules for x in ["gate_up_proj", "down_proj"]
@@ -729,7 +735,12 @@ class LoRAManager:
         if self._experts_shared_outer_override is not None:
             self.experts_shared_outer_loras = self._experts_shared_outer_override
         else:
-            self.experts_shared_outer_loras = self._detect_shared_outer_loras()
+            # Some routed experts serve only the shared-outer layout, which a server
+            # started before its first adapter cannot detect.
+            self.experts_shared_outer_loras = (
+                self._detect_shared_outer_loras()
+                or self._has_shared_outer_only_experts()
+            )
         if self.experts_shared_outer_loras:
             logger.info(
                 "Shared outer LoRA mode enabled: gate_up lora_A and "
@@ -760,6 +771,10 @@ class LoRAManager:
                     raise RuntimeError(
                         f"Failed to load LoRA adapter {lora_ref.lora_name}: {result.error_message}"
                     )
+
+    def _has_shared_outer_only_experts(self) -> bool:
+        layer_types = shared_outer_expert_layer_types()
+        return any(isinstance(m, layer_types) for m in self.base_model.modules())
 
     def _detect_shared_outer_loras(self) -> bool:
         """Auto-detect shared outer LoRA format from loaded adapter weights.
@@ -1164,9 +1179,10 @@ class LoRAManager:
                 )
                 continue
 
-            if isinstance(module, (FusedMoE, InklingBatchDenseMLP)) and all(
-                x in self.target_modules for x in ["gate_up_proj", "down_proj"]
-            ):
+            if isinstance(
+                module,
+                (FusedMoE, InklingBatchDenseMLP, *shared_outer_expert_layer_types()),
+            ) and all(x in self.target_modules for x in ["gate_up_proj", "down_proj"]):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     # FusedMoE submodules outside the decoder layer hierarchy
@@ -1189,7 +1205,10 @@ class LoRAManager:
                         experts_shared_outer_loras=self.experts_shared_outer_loras,
                         max_lora_rank=self.max_lora_rank,
                     )
-                    lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
+                    if isinstance(lora_module, FusedMoEWithLoRA):
+                        lora_module.lora_use_virtual_experts = (
+                            self.lora_use_virtual_experts
+                        )
                 self.lora_modules[layer_id][module_name] = lora_module
 
         # lora_* quant methods leave execution to the LoRA wrapper; reject
@@ -1221,8 +1240,6 @@ def init_lora_cuda_graph_moe_buffers(
     if lora_manager.lora_backend.name == "triton_v2":
         logger.debug("V2 MoE scratch is allocated during warmup, not reserved here")
         return
-    from sglang.srt.lora.layers import FusedMoEWithLoRA
-
     max_bs = get_exec().graph.cuda_graph_config.decode.max_bs
     max_running_requests = get_schedule().max_running_requests
     if max_running_requests is not None:
@@ -1238,7 +1255,7 @@ def init_lora_cuda_graph_moe_buffers(
         max_tokens *= get_parallel().attn_dp_size
     max_loras = get_lora().max_loras_per_batch
     for module in model.modules():
-        if isinstance(module, FusedMoEWithLoRA):
+        if isinstance(module, moe_lora_layer_types()):
             lora_manager.init_cuda_graph_moe_buffers(
                 max_tokens,
                 max_loras,

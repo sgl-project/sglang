@@ -83,6 +83,13 @@ _ENGINE_TRITON_KERNELS = [
     ("moe.lora_b", "grouped_lora_b", "moe_grouped_lora_b"),
     ("moe.lora_b", "invoke_down_b_into_base", "invoke_down_b_into_base"),
     (
+        "moe.inkling2_routed",
+        "routed_gate_up_delta",
+        "inkling2_routed_gate_up_delta",
+    ),
+    ("moe.inkling2_routed", "routed_down_inner", "inkling2_routed_down_inner"),
+    ("moe.inkling2_routed", "routed_token_rank", "inkling2_routed_token_rank"),
+    (
         "moe.cutedsl.schedule_builder",
         "build_dual_stage_schedules_masked",
         "build_dual_stage_schedules_masked",
