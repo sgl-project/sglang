@@ -114,9 +114,17 @@ class ForwardPassMetrics(
     An idle heartbeat (all zeros, wall_time=0) is emitted when the
     engine transitions from active to idle.
 
-    Field order must match Dynamo's ``ForwardPassMetrics`` in
-    ``dynamo.common.forward_pass_metrics`` — msgspec uses positional
-    encoding so any mismatch silently corrupts data.
+    ``iteration_id`` numbers a step that the attention-DP MLP-sync gather
+    launched on every rank: the ranks' messages for that step carry the same
+    value, so a consumer can combine them. Ids count such steps from 1 within
+    one engine lifetime; a rank that publishes nothing for a step skips its
+    id. It is None on idle heartbeats and on every step the engine does not
+    number (one attention-DP rank, pipeline parallelism, the elastic EP WORLD
+    gather, a skipped gather); None does not mean the ranks ran apart.
+
+    Field names must match Dynamo's ``ForwardPassMetrics`` in
+    ``dynamo.common.forward_pass_metrics``: a message is a msgpack map keyed
+    by field name, so a consumer that predates a field ignores it.
     """
 
     version: int = FPM_VERSION
@@ -126,6 +134,7 @@ class ForwardPassMetrics(
     wall_time: float = 0.0
     scheduled_requests: ScheduledRequestMetrics = ScheduledRequestMetrics()
     queued_requests: QueuedRequestMetrics = QueuedRequestMetrics()
+    iteration_id: Optional[int] = None
 
 
 _encoder = msgspec.msgpack.Encoder()
