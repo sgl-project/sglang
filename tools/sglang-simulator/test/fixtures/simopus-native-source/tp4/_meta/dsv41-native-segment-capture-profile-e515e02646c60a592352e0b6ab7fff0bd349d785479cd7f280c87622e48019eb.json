@@ -1,0 +1,1 @@
+{"component_realization":"global_worker_observer_excluded_v1","decode_graph_backend":"full","fallback_policy":"reject","full_forward_realization":"dsv41_native_forward_v1","graph_batch_policy":"pad_to_capture","graph_capture_batches":[1,2,3,4,5,6,7,8],"kv_page_size":256,"runtime_compatibility_id":"CPU-contract-unqualified","schema_version":1}
