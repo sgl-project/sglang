@@ -139,31 +139,50 @@ class TestDetokenize(CustomTestCase):
         tm = Mock(tokenizer=_tokenizer(), model_config=Mock(vocab_size=len(WORDS)))
         self.serving = OpenAIServingDetokenize(tm)
 
-    def _detokenize(self, tokens, **kwargs):
-        request = DetokenizeRequest(tokens=tokens, **kwargs)
+    def _detokenize(self, tokens, *, skip_special_tokens=True):
+        request = DetokenizeRequest(
+            tokens=tokens, skip_special_tokens=skip_special_tokens
+        )
         return asyncio.run(
             self.serving._handle_non_streaming_request(request, request, None)
         )
 
-    def test_flat_and_batched_tokens(self):
+    def test_response_shape(self):
         for tokens, expected in (
             ([], ""),
             ([[]], [""]),
             (_ids("hi hello"), "hi hello"),
             ([_ids("hi hello")], ["hi hello"]),
-            ([[], _ids("<bos> hi")], ["", "hi"]),
+            ([[], _ids("hi"), _ids("hello")], ["", "hi", "hello"]),
         ):
             with self.subTest(tokens=tokens):
                 self.assertEqual(self._detokenize(tokens).text, expected)
-        self.assertEqual(
-            self._detokenize([_ids("<bos> hi")], skip_special_tokens=False).text,
-            ["<bos> hi"],
-        )
+
+    def test_skip_special_tokens(self):
+        ids = _ids("<bos> hi")
+        for tokens, skipped, kept in (
+            (ids, "hi", "<bos> hi"),
+            ([ids], ["hi"], ["<bos> hi"]),
+        ):
+            with self.subTest(tokens=tokens):
+                self.assertEqual(self._detokenize(tokens).text, skipped)
+                self.assertEqual(
+                    self._detokenize(tokens, skip_special_tokens=False).text, kept
+                )
 
     def test_out_of_vocab_ids_are_rejected(self):
-        for tokens in ([len(WORDS)], [[8], [2**40]]):
+        for tokens, first_invalid in (
+            ([len(WORDS)], len(WORDS)),
+            ([-1, len(WORDS)], -1),
+            ([_ids("hi"), [2**40], [-1]], 2**40),
+        ):
             with self.subTest(tokens=tokens):
-                self.assertEqual(self._detokenize(tokens).status_code, 400)
+                response = self._detokenize(tokens)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(
+                    f"token id {first_invalid} is out of vocabulary",
+                    json.loads(response.body)["message"],
+                )
 
 
 if __name__ == "__main__":

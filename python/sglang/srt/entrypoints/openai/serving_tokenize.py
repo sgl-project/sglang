@@ -158,19 +158,22 @@ class OpenAIServingDetokenize(OpenAIServingBase):
             if not tokens:
                 return DetokenizeResponse(text="")
 
-            # DetokenizeRequest has already parsed the IDs as integers.
-            is_batch = isinstance(tokens[0], list)
-            sequences = tokens if is_batch else [tokens]
-            texts = []
-            for ids in sequences:
-                if (error := self._out_of_vocab_error(ids)) is not None:
+            tokenizer = self.tokenizer_manager.tokenizer
+            skip_special_tokens = request.skip_special_tokens
+            if isinstance(tokens[0], int):
+                if (error := self._out_of_vocab_error(tokens)) is not None:
                     return error
-                text = self.tokenizer_manager.tokenizer.decode(
-                    ids, skip_special_tokens=request.skip_special_tokens
-                )
-                texts.append(text)
+                text = tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
+                return DetokenizeResponse(text=text)
 
-            return DetokenizeResponse(text=texts if is_batch else texts[0])
+            texts = []
+            for row in tokens:
+                if (error := self._out_of_vocab_error(row)) is not None:
+                    return error
+                texts.append(
+                    tokenizer.decode(row, skip_special_tokens=skip_special_tokens)
+                )
+            return DetokenizeResponse(text=texts)
         except Exception as e:
             logger.error("Error during detokenization", exc_info=True)
             if "decode" in str(e).lower():
