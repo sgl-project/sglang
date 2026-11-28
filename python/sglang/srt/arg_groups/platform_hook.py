@@ -67,6 +67,10 @@ def handle_mlu_backends(server_args: Any):
         )
     if cfg.page_size is None:
         declare_resolution(server_args, "handle_mlu_backends", page_size=16)
+    # MLU does not support CustomAllReduce.
+    declare_resolution(
+        server_args, "handle_mlu_backends", disable_custom_all_reduce=True
+    )
 
 
 def handle_mlu_attention_backend_compatibility(server_args: Any):
