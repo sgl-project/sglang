@@ -80,7 +80,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 _is_npu = is_npu()
@@ -2418,11 +2418,11 @@ def _create_global_tcp_store(
     base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
 
     master_ip = os.environ.get("MASTER_ADDR")
-    if not master_ip and allow_dynamic_membership and dist_init_addr:
-        addr = dist_init_addr
-        if addr.startswith("tcp://"):
-            addr = addr[len("tcp://") :]
-        master_ip = addr.rsplit(":", 1)[0]
+    if not master_ip and dist_init_addr:
+        addr = dist_init_addr.removeprefix("tcp://")
+        if "://" not in addr:
+            # Every rank parses the same address, so all of them skip the broadcast below.
+            master_ip = NetworkAddress.parse(addr).host
     if not master_ip:
         logger.warning(
             "Could not determine master IP for global TCPStore. "
