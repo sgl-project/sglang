@@ -1286,7 +1286,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
-            self._track_mamba_state_decode(
+            self.track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
             )
             return (core_attn_out, z) if return_z else core_attn_out
@@ -1315,7 +1315,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
         )
 
-        self._track_mamba_state_decode(
+        self.track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
         )
 

@@ -891,7 +891,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
                 if core_attn_out is not None:
                     layer._k3_onorm_consumed = True
-                    self._track_mamba_state_decode(
+                    self.track_mamba_state_decode(
                         forward_batch,
                         conv_states,
                         ssm_states,
@@ -961,7 +961,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     lower_bound=layer.lower_bound,
                 )
                 layer._k3_onorm_consumed = True
-                self._track_mamba_state_decode(
+                self.track_mamba_state_decode(
                     forward_batch,
                     conv_states,
                     ssm_states,
@@ -1021,7 +1021,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
-            self._track_mamba_state_decode(
+            self.track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
             )
             return core_attn_out
@@ -1045,7 +1045,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             lower_bound=layer.lower_bound,
         )
 
-        self._track_mamba_state_decode(
+        self.track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
         )
 

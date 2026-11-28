@@ -130,6 +130,8 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_parent_token_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        # The conv state shape with the conv window length (kernel size - 1) last,
+        # which extra_buffer conv-state tracking reads; set by each backend.
         self.conv_states_shape: tuple[int, int] = None
         # Constant (== 1) for mamba-like backends; hoisted so the replay path
         # skips the per-cycle method dispatch.
@@ -142,6 +144,43 @@ class MambaAttnBackendBase(AttentionBackend):
             None
             if self.forward_metadata is None
             else self.forward_metadata.mamba_track_indices
+        )
+
+    def extend_track_slots(self, forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+        """extra_buffer: each extend row's track slot, -1 for rows not tracked; None
+        when this forward tracks no row. A tracked row's recurrent state after
+        ``forward_batch.mamba_track_aligned_lens()`` of its new tokens goes there."""
+        if not self.forward_metadata.has_mamba_track_mask:
+            return None
+        return torch.where(
+            forward_batch.mamba_track_mask, self.state_tracking_indices, -1
+        )
+
+    def track_conv_states_extend(
+        self,
+        forward_batch: ForwardBatch,
+        inputs: torch.Tensor,
+        conv_states: torch.Tensor,
+    ) -> None:
+        """extra_buffer: copy each tracked extend row's conv state at its tracked
+        position (the conv window of inputs before it) into its track slot.
+
+        ``inputs`` is ``[num_tokens, dim]``; ``conv_states`` is a layer's conv pool,
+        ``[num_slots, conv_window, dim]``."""
+        md = self.forward_metadata
+        if not md.has_mamba_track_mask:
+            return
+        if md.conv_states_mask_indices is None:
+            if md.mamba_track_mask_indices is None:
+                # nonzero syncs; once per forward, shared by every layer.
+                md.mamba_track_mask_indices = forward_batch.mamba_track_mask.nonzero(
+                    as_tuple=True
+                )[0]
+            md.conv_states_mask_indices = md.mamba_track_indices[
+                md.mamba_track_mask_indices
+            ]
+        conv_states[md.conv_states_mask_indices] = inputs[md.track_conv_indices].to(
+            conv_states.dtype
         )
 
     def forward_state_slots(
@@ -486,6 +525,12 @@ class MambaAttnBackendBase(AttentionBackend):
     ):
         """Flattened input positions of conv states to track during extend (up to
         the last complete chunk boundary, mamba_track_mask rows only)."""
+        if self.conv_states_shape is None:
+            raise ValueError(
+                f"{type(self).__name__} supports the extra_buffer mamba radix cache "
+                "strategy but does not set conv_states_shape (the conv state shape "
+                "with the conv window length last), which conv-state tracking reads"
+            )
         conv_state_len = self.conv_states_shape[-1]
 
         # Shared with the Qwen4-Exp PLE side states so the boundary can never
@@ -1087,7 +1132,7 @@ class MambaAttnBackendBase(AttentionBackend):
             cached = pools
         return cached
 
-    def _track_mamba_state_decode(
+    def track_mamba_state_decode(
         self,
         forward_batch: ForwardBatch,
         conv_states: torch.Tensor,
