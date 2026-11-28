@@ -524,6 +524,25 @@ def _segment_encoder_for(tokenizer):
     return encoder
 
 
+def prebuild_in_background(tokenizer):
+    """Build the tokenizer's plan and segment encoder on a daemon thread, so the
+    first long prompts after startup do not pay for it. A prompt that arrives
+    during the build waits for it under the build lock; if the build fails,
+    the first prompt builds lazily as before. Returns the thread, or None."""
+    if tokenizer is None or not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get():
+        return None
+
+    def build():
+        try:
+            _segment_encoder_for(tokenizer)
+        except Exception:
+            logger.debug("parallel_prompt_encode: prebuild failed", exc_info=True)
+
+    thread = threading.Thread(target=build, name="prompt-encode-prebuild", daemon=True)
+    thread.start()
+    return thread
+
+
 def _usable_segment_encoder(tokenizer, encode_kwargs):
     """The tokenizer's segment encoder, or None where its ids could differ from
     ``tokenizer.encode(text, **encode_kwargs)``."""

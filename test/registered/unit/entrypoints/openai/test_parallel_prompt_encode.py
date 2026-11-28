@@ -795,6 +795,35 @@ class TestPromptSegments(_EncodeCase):
         self.assertIsNotNone(encoders[0])
         self.assertIs(encoders[0], encoders[1])
 
+    def test_prebuild_builds_the_encoder_before_the_first_prompt(self):
+        """The startup prebuild leaves the first long prompt nothing to build."""
+        tokenizer = _tokenizer()
+        thread = ppe.prebuild_in_background(tokenizer)
+        self.assertIsNotNone(thread)
+        thread.join(10)
+        self.assertIsNotNone(ppe._segment_encoders.get(tokenizer))
+        text = "<|user|>" + "hello world " * 40 + "<|assistant|>"
+        with unittest.mock.patch.object(
+            ppe, "_build_plan", side_effect=AssertionError("built on the request")
+        ):
+            self.assertEqual(
+                ppe.encode_prompt_segments(tokenizer, ["<|user|>", text]),
+                tokenizer.encode("<|user|>" + text),
+            )
+
+    def test_prebuild_is_off_with_the_switch_and_swallows_failures(self):
+        tokenizer = _tokenizer()
+        with envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(False):
+            self.assertIsNone(ppe.prebuild_in_background(tokenizer))
+        self.assertIsNone(ppe.prebuild_in_background(None))
+        with unittest.mock.patch.object(
+            ppe, "_build_plan", side_effect=RuntimeError("broken")
+        ):
+            ppe.prebuild_in_background(tokenizer).join(10)
+        # Nothing was kept, so the first prompt builds it as before.
+        self.assertNotIn(tokenizer, ppe._segment_encoders)
+        self.assertIsNotNone(ppe._segment_encoder_for(tokenizer))
+
     def test_distinct_long_texts_encode_concurrently(self):
         """A long text being encoded must not hold off the encode of a different
         long text: cold prompts of distinct conversations encode in parallel."""
