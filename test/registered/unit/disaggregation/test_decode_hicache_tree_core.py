@@ -280,15 +280,22 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
                     self.assertIsNone(prefix)
 
     def test_scheduler_names_hinted_lora_keys_only_where_hints_are_bound(self):
-        """Non-publishing ranks keep LoRA names only for hints a backend reads."""
-        for publishes, hint, consumes, expected in (
-            (True, None, False, True),
-            (False, _HINT, True, True),
-            (False, _HINT, False, False),
-            (False, _EMPTY_HINT, True, False),
-            (False, None, True, False),
+        """Non-publishing ranks keep LoRA names only for hints a backend reads,
+        or on every rank when the storage backend publishes its own residency."""
+        for publishes, storage_publishes, hint, consumes, expected in (
+            (True, False, None, False, True),
+            (False, True, None, False, True),
+            (False, False, _HINT, True, True),
+            (False, False, _HINT, False, False),
+            (False, False, _EMPTY_HINT, True, False),
+            (False, False, None, True, False),
         ):
-            with self.subTest(publishes=publishes, hint=hint, consumes=consumes):
+            with self.subTest(
+                publishes=publishes,
+                storage_publishes=storage_publishes,
+                hint=hint,
+                consumes=consumes,
+            ):
                 names = Mock()
                 tree_cache = SimpleNamespace(
                     forwards_kv_hints=lambda: consumes,
@@ -299,7 +306,8 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
                 )
                 scheduler = SimpleNamespace(
                     kv_events_publisher=SimpleNamespace(
-                        enable_kv_cache_events=publishes
+                        enable_kv_cache_events=publishes,
+                        storage_publishes_kv_events=storage_publishes,
                     ),
                     tree_cache=tree_cache,
                     kv_event_lora_names=names,
