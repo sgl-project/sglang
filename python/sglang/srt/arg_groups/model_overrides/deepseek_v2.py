@@ -23,8 +23,21 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     platform = get_platform()
     if cfg.enable_hierarchical_cache and not platform.is_hip:
         raise ValueError("DSA DCP supports HiCache only on ROCm.")
-    if cfg.disaggregation_mode != "null" and not platform.is_npu:
-        raise ValueError("DSA DCP does not support PD disaggregation.")
+    # Preserve main's NPU support and ROCm standalone HiCache behavior.
+    # The additional ROCm PD path requires DCP1 prefill and no HiCache.
+    if (
+        cfg.disaggregation_mode != "null"
+        and not platform.is_npu
+        and not (
+            cfg.disaggregation_mode == "decode"
+            and platform.is_hip
+            and not cfg.enable_hierarchical_cache
+        )
+    ):
+        raise ValueError(
+            "DSA DCP with PD disaggregation is supported only as a DCP1 prefill "
+            "feeding a ROCm DCP decode without HiCache, or on NPU."
+        )
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
     # NPU has its own DSA DCP attention path; these split backends are CUDA/ROCm.
