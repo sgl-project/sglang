@@ -2250,6 +2250,9 @@ class Envs:
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
+    # HIP eager prefill, TP > 1, whole hash columns per rank: all-gather each rank's
+    # own fp8 rows instead of all-reducing zero-filled bf16 rows (bitwise the same).
+    SGLANG_OPT_HIP_ENGRAM_ALL_GATHER = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

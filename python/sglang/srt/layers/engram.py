@@ -87,7 +87,13 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils import (
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    log_info_on_rank0,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1396,6 +1402,24 @@ class EngramEmbedding(nn.Module):
             )
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
+        # Needs whole hash columns per rank: the hash puts each column's ids in its
+        # own subtable, so a rank's share of every token's rows is its k columns.
+        self._all_gather_columns = (
+            _is_hip
+            and envs.SGLANG_OPT_HIP_ENGRAM_ALL_GATHER.get()
+            and self.tp_size > 1
+            and self._cols_per_rank is not None
+            and self.peer is None
+            and self.host_table is None
+            # The payload holds fp8 rows of dim bytes; MXFP4 keeps the all-reduce.
+            and not self.mxfp4
+        )
+        if self._all_gather_columns:
+            log_info_on_rank0(
+                logger,
+                f"Engram layer {layer_id}: eager prefill all-gathers the fp8 rows of "
+                f"{self._cols_per_rank} hash columns per rank",
+            )
 
     def _init_host_table(
         self, num_embeddings: int, dim: int, layer_id: int, replication: str
@@ -1509,6 +1533,14 @@ class EngramEmbedding(nn.Module):
             return self._lookup(all_indices)[start : start + local_rows]
         if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
+        if (
+            self._all_gather_columns
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not torch.cuda.is_current_stream_capturing()
+            and not is_in_breakable_cuda_graph()
+        ):
+            return self._all_gather_lookup(indices)
         return self._lookup(indices)
 
     def dequant_staged(
@@ -1559,6 +1591,56 @@ class EngramEmbedding(nn.Module):
             )
             return values
         return tensor_model_parallel_all_reduce(values)
+
+    def _all_gather_lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        # Every rank all-gathers its own columns' stored fp8 rows and scales, then
+        # dequantizes all of them with the all-reduce lookup's kernel: bitwise the same.
+        if indices.shape[0] == 0:
+            return self.new_rows(indices)
+        parallel = get_parallel()
+        k, world, num_tokens = self._cols_per_rank, self.tp_size, indices.shape[0]
+        n, scale_dim = num_tokens * k, self.dim // FP8_BLOCK_SIZE
+        # A rank's payload: its n fp8 rows, then their scales padded to whole rows.
+        span = n + (n * scale_dim + self.dim - 1) // self.dim
+        start = parallel.tp_rank * k
+        local = indices.flatten(1)[:, start : start + k].reshape(-1) - self.row_start
+        payload = torch.empty(
+            (span, self.dim), dtype=torch.uint8, device=indices.device
+        )
+        torch.index_select(self.weight.view(torch.uint8), 0, local, out=payload[:n])
+        torch.index_select(
+            self.scale.view(torch.uint8),
+            0,
+            local,
+            out=payload[n:].view(-1)[: n * scale_dim].view(n, scale_dim),
+        )
+        gathered = payload.new_empty((world * span, self.dim))
+        parallel.tp_group.all_gather_into_tensor(gathered, payload)
+        # The kernel reads a row's scales at the row's own index: lay the ranks'
+        # scales out like their rows.
+        scales = payload.new_empty((world, span, scale_dim))
+        scales[:, :n] = gathered.view(world, -1)[
+            :, n * self.dim : n * (self.dim + scale_dim)
+        ].view(world, n, scale_dim)
+        # [source rank, token, its columns] -> [token, columns in rank order]
+        arange = functools.partial(
+            torch.arange, dtype=torch.int32, device=indices.device
+        )
+        ids = (
+            arange(world).view(1, -1, 1) * span
+            + arange(num_tokens).view(-1, 1, 1) * k
+            + arange(k)
+        ).flatten()
+        out = self.new_rows(indices)
+        engram_gather(
+            weight_ptr=gathered.data_ptr(),
+            scale_ptr=scales.data_ptr(),
+            ids=ids,
+            out=out.view(-1, self.dim),
+            dim=self.dim,
+            block_size=FP8_BLOCK_SIZE,
+        )
+        return out
 
     def new_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """An uninitialized output for the rows of ``indices``."""
