@@ -490,10 +490,11 @@ pub(crate) fn chat_sampling(
     parallel_tool_calls: Option<bool>,
     server_args: &ServerArgs,
 ) -> Result<SamplingParams, String> {
-    let mut sampling = chat_sampling_params(
+    let sampling = chat_sampling_params(
         request,
         &defaults.with_model_defaults(&server_args.model_config.default_sampling_params),
     )?;
+    let mut sampling = super::fill_typed_sampling_defaults(sampling, server_args, true)?;
     apply_tool_constraint(
         &mut sampling,
         parser,
@@ -542,6 +543,9 @@ pub(crate) struct SamplingDefaults {
     /// `--sampling-defaults openai` (the Python dump is then empty).
     temperature: Option<f64>,
     top_p: Option<f64>,
+    top_k: Option<i64>,
+    min_p: Option<f64>,
+    repetition_penalty: Option<f64>,
     /// OpenAI terminal defaults for chat completions.
     fallback_temperature: f64,
     fallback_top_p: f64,
@@ -552,6 +556,9 @@ impl SamplingDefaults {
     pub(crate) const CHAT: SamplingDefaults = SamplingDefaults {
         temperature: None,
         top_p: None,
+        top_k: None,
+        min_p: None,
+        repetition_penalty: None,
         fallback_temperature: 1.0,
         fallback_top_p: 1.0,
     };
@@ -567,6 +574,9 @@ impl SamplingDefaults {
     pub(super) fn with_model_defaults(mut self, model: &DefaultSamplingParams) -> SamplingDefaults {
         self.temperature = model.temperature;
         self.top_p = model.top_p;
+        self.top_k = model.top_k;
+        self.min_p = model.min_p;
+        self.repetition_penalty = model.repetition_penalty;
         self
     }
 }
@@ -618,6 +628,9 @@ pub(super) fn chat_sampling_params(
             .map(f64::from)
             .or(defaults.top_p)
             .unwrap_or(defaults.fallback_top_p),
+        top_k: defaults.top_k.unwrap_or(-1),
+        min_p: defaults.min_p.unwrap_or(0.0),
+        repetition_penalty: defaults.repetition_penalty.unwrap_or(1.0),
         frequency_penalty: request.frequency_penalty.unwrap_or(0.0) as f64,
         presence_penalty: request.presence_penalty.unwrap_or(0.0) as f64,
         n: 1,
