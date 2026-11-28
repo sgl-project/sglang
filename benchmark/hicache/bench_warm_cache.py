@@ -235,8 +235,9 @@ def build_prompts(
 
     prompts: List[Dict[str, Any]] = []
     for _ in range(num_prompts):
-        suffix = gen_token_ids(vocab_ids, suffix_len, rng)
-        input_ids = shared_prefix + suffix
+        input_ids = shared_prefix
+        if suffix_len:
+            input_ids = shared_prefix + gen_token_ids(vocab_ids, suffix_len, rng)
         prompts.append({"input_ids": input_ids, "prompt_len": len(input_ids)})
 
     return prompts
@@ -502,8 +503,10 @@ async def benchmark_shared_prefix_pct(
 
     if prefix_len > 0:
         print(f"Warming shared prefix only ({prefix_len} tokens) ...")
+        first_ids = prompts[0]["input_ids"]
         await warm_shared_prefix(
-            api_url=api_url, shared_prefix_ids=prompts[0]["input_ids"][:prefix_len]
+            api_url=api_url,
+            shared_prefix_ids=first_ids[:prefix_len] if suffix_len else first_ids,
         )
 
     print(f"Sending requests (max_concurrency={args.max_concurrency}) ...")
