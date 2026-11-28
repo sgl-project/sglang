@@ -6,6 +6,7 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils.custom_op import register_custom_op
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
@@ -39,6 +40,40 @@ elif is_xpu():
     from sglang.srt.hardware_backend.xpu.kernels.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
+
+
+def _gdn_packed_decode(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+) -> None:
+    fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=initial_state,
+        out=out,
+        ssm_state_indices=ssm_state_indices,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+
+# Custom op for torch.compile, which then mutates the state in place, no pool
+# clone. Eager callers use the function above directly.
+_gdn_packed_decode_op = register_custom_op(
+    _gdn_packed_decode,
+    op_name="gdn_packed_decode",
+    mutates_args=["initial_state", "out"],
+)
 
 
 class TritonGDNKernel(LinearAttnKernelBase):
@@ -129,7 +164,12 @@ class TritonGDNKernel(LinearAttnKernelBase):
             )
             return out.transpose(0, 1)
 
-        fused_recurrent_gated_delta_rule_packed_decode(
+        packed_decode = (
+            _gdn_packed_decode_op
+            if torch.compiler.is_compiling()
+            else _gdn_packed_decode
+        )
+        packed_decode(
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
@@ -139,7 +179,6 @@ class TritonGDNKernel(LinearAttnKernelBase):
             initial_state=ssm_states,
             out=out,
             ssm_state_indices=cache_indices,
-            use_qk_l2norm_in_kernel=True,
         )
 
         # Convert [B, 1, HV, V] → [1, B, HV, V] to match existing output
