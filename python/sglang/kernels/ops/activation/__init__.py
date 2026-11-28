@@ -111,10 +111,11 @@ def situ_and_mul(
     out: Optional[torch.Tensor],
     beta: float,
     linear_beta: Optional[float],
+    cast: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     from .kimi_k3_situ_and_mul import situ_and_mul as impl
 
-    return impl(input, out, beta, linear_beta)
+    return impl(input, out, beta, linear_beta, cast)
 
 
 __all__ = [
@@ -211,5 +212,17 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.activation.silu_and_mul_block_quant:silu_and_mul_block_quant_two_group",
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+_SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
+register_kernel(
+    KernelSpec(
+        op="activation.inkling2_nvfp4_swiglu_quant_bf16_lowm_sm120",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.activation.inkling2_swiglu_quant_lowm_sm120:"
+            "nvfp4_swiglu_quant_bf16_lowm"
+        ),
+        capabilities=_SM12X,
     )
 )

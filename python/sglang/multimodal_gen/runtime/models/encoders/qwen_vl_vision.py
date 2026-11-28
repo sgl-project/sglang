@@ -12,8 +12,11 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.linear import (
+    LinearParallelGroup,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 
 logger = init_logger(__name__)
 
@@ -66,10 +69,9 @@ class QwenVLVisionAttention(nn.Module):
         prefix: str,
         model_name: str,
         quant_config: Any = None,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
-        parallel = get_parallel()
-        self.num_heads = config.num_heads // parallel.tp_size
         self.head_dim = config.hidden_size // config.num_heads
         self.scaling = self.head_dim**-0.5
         self.qkv_proj = QKVParallelLinear(
@@ -79,15 +81,16 @@ class QwenVLVisionAttention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
-            parallel_group="tp",
+            parallel_group=parallel_group,
         )
+        self.num_heads = self.qkv_proj.num_heads
         self.proj = RowParallelLinear(
             input_size=config.hidden_size,
             output_size=config.hidden_size,
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.proj",
-            parallel_group="tp",
+            parallel_group=parallel_group,
         )
 
         backend = get_attn_backend(self.head_dim, torch.get_default_dtype())

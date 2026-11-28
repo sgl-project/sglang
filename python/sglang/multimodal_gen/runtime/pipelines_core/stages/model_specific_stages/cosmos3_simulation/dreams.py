@@ -33,12 +33,14 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsUnifiedActionContract,
     load_unified_normalizer,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
+    CosmosDreamsKVCache,
     CosmosDreamsTransformer,
     HistoryKV,
     KVPair,
@@ -46,6 +48,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -61,7 +64,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.frustum import (
     FrustumHistorySelector,
-    SelectedHistory,
     describe_selection,
     resolve_frustum_selector,
 )
@@ -570,13 +572,13 @@ def _bounded_append(
 
 
 def append_kv_history(
-    history: list[KVPair] | None,
+    history: list[KVPair] | CosmosDreamsKVCache | None,
     current_kv: list[KVPair],
     *,
     tokens_per_frame: int,
     sink_frames: int,
     window_frames: int | None,
-) -> list[KVPair]:
+) -> list[KVPair] | CosmosDreamsKVCache:
     """Append committed K/V per layer, keeping ``sink`` + latest ``window`` frames.
 
     ``window_frames=None`` keeps everything (no eviction).
@@ -607,6 +609,9 @@ def append_kv_history(
             "Cosmos-Dreams K/V layer count changed within a rollout: "
             f"history={len(history)}, current={len(current_kv)}."
         )
+    if isinstance(history, CosmosDreamsKVCache):
+        history.commit(current_kv[0][0].shape[1])
+        return history
     if window_frames is None:
         return [
             (
@@ -851,8 +856,11 @@ class CausalDecodeQueue:
     then ``finish`` concatenates the completed frames.
     """
 
-    def __init__(self, vae: Any, *, device: torch.device) -> None:
+    def __init__(
+        self, vae: Any, *, device: torch.device, quality: str = "exact"
+    ) -> None:
         self.vae = vae
+        self.fast_path = quality_allows(quality, "lossless")
         self.device = device
         self.stream = torch.cuda.Stream(device=device)
         self.outputs: list[torch.Tensor] = []
@@ -887,7 +895,11 @@ class CausalDecodeQueue:
         self.stream.wait_stream(torch.cuda.current_stream(self.device))
         latents = latents.detach()
         latents.record_stream(self.stream)
-        with torch.cuda.stream(self.stream), torch.no_grad():
+        with (
+            torch.cuda.stream(self.stream),
+            torch.no_grad(),
+            use_vae_fast_path(self.vae, self.fast_path),
+        ):
             video = self.vae.causal_decode(self._denormalize(latents))
             host = torch.empty(
                 video.shape, dtype=video.dtype, device="cpu", pin_memory=True
@@ -1227,8 +1239,28 @@ def run_fixed_step_sde(
     **forward_kwargs: Any,
 ) -> torch.Tensor:
     """Fixed-step SDE denoising of one chunk; history K/V is read but never written."""
+    sigmas = list(t_list)
     scheduler.set_shift(1.0)
-    scheduler.set_timesteps(sigmas=list(t_list), device=noise.device)
+    scheduler.set_timesteps(sigmas=sigmas, device=noise.device)
+    config = scheduler.config
+    if (
+        sigmas
+        and type(scheduler) is FlowMatchEulerDiscreteScheduler
+        and not (
+            config.shift_terminal
+            or config.use_karras_sigmas
+            or config.use_exponential_sigmas
+            or config.use_beta_sigmas
+            or config.invert_sigmas
+        )
+    ):
+        # With unit shift, we can check the first timestep on the host. Match
+        # the scheduler's FP32 rounding and keep its lookup for duplicate steps.
+        timesteps = np.asarray(sigmas, dtype=np.float32) * np.float32(
+            config.num_train_timesteps
+        )
+        if np.count_nonzero(timesteps == timesteps[0]) == 1:
+            scheduler.set_begin_index(0)
     latents = noise.float()
     for step_index, timestep in enumerate(scheduler.timesteps):
         with set_forward_context(
@@ -1256,39 +1288,23 @@ def run_fixed_step_sde(
     return latents.to(dtype)
 
 
-def _history_view(
-    archive: list[KVPair] | None,
-    frame_ids: list[int] | None,
-    tokens_per_frame: int,
-) -> HistoryKV | None:
-    """What a forward pass attends to: the archive itself without retrieval,
-    otherwise the selected frames (None when nothing is selected yet)."""
-    if frame_ids is None:
-        return archive
-    if archive is None:
-        return None
-    return SelectedHistory(
-        archive, frame_ids=frame_ids, tokens_per_frame=tokens_per_frame
-    )
-
-
 def commit_clean_kv(
     transformer: CosmosDreamsTransformer,
     latent: torch.Tensor,
     *,
-    history: list[KVPair] | None,
+    history: list[KVPair] | CosmosDreamsKVCache | None,
     dtype: torch.dtype,
     tokens_per_frame: int,
     sink_frames: int,
     window_frames: int | None,
-    read_history: HistoryKV | None = None,
+    archive: CosmosDreamsKVCache | None = None,
     forward_batch: Req | None = None,
     **forward_kwargs: Any,
-) -> list[KVPair]:
+) -> list[KVPair] | CosmosDreamsKVCache:
     """Clean-refresh ``latent`` (timestep 0, no time embedding) and commit its K/V.
 
-    The pass attends to ``history`` unless ``read_history`` narrows it (frustum
-    retrieval); the new K/V is always appended to ``history``.
+    Frustum also copies the clean frames to its complete archive. Selected
+    history stays in the working set for the rest of the chunk.
     """
     with set_forward_context(
         current_timestep=0, attn_metadata=None, forward_batch=forward_batch
@@ -1296,10 +1312,18 @@ def commit_clean_kv(
         output = transformer(
             latent.to(dtype),
             torch.zeros(1, device=latent.device, dtype=torch.float32),
-            history_kv=history if read_history is None else read_history,
+            history_kv=history,
             condition_vision=True,
             **forward_kwargs,
         )
+    if archive is not None:
+        # The current K/V alias the working buffer until its next commit.
+        current_tokens = latent.shape[2] * tokens_per_frame
+        for index, (key, value) in enumerate(output.current_kv):
+            dest_k, dest_v = archive.attention_buffer(index, current_tokens)
+            dest_k[:, -current_tokens:].copy_(key)
+            dest_v[:, -current_tokens:].copy_(value)
+        archive.commit(current_tokens)
     return append_kv_history(
         history,
         output.current_kv,
@@ -1324,6 +1348,7 @@ class _RolloutContext(msgspec.Struct):
     dtype: torch.dtype
     forward_batch: Req | None = None
     row_domain_ids: torch.Tensor | None = None
+    denoise_runner: Any = None
 
     def chunk_domain_ids(
         self, frame_start: int, frame_end: int, action_count: int
@@ -1409,16 +1434,50 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 batch.latents = self._rollout(batch)
         return batch
 
-    def _decode_queue(self, device: torch.device) -> "CausalDecodeQueue | None":
+    def _runner_for_batch(self, batch, device):
+        args = self.server_args
+        if (
+            not args.enable_breakable_cuda_graph
+            or not self.transformer.can_capture_denoise
+            or args.num_gpus != 1
+            or device.type != "cuda"
+            or args.should_start_component_on_cpu("transformer")
+            or args.dit_layerwise_offload
+            or batch.sampling_params.quality != "lossless"
+        ):
+            return None
+        if self.transformer.denoise_runner is None and batch.is_warmup:
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+                DiffusionBreakableCudaGraphRunner,
+            )
+
+            self.transformer.denoise_runner = DiffusionBreakableCudaGraphRunner(
+                self.transformer.denoise_blocks, device
+            )
+        return self.transformer.denoise_runner
+
+    def drop_breakable_cuda_graphs(self, reason: str) -> None:
+        self.transformer.release_cuda_graphs(reason)
+
+    def _decode_queue(
+        self, device: torch.device, *, quality: str = "exact"
+    ) -> "CausalDecodeQueue | None":
         if (
             not self.overlap_vae_decode
             or device.type != "cuda"
             or self.server_args.should_start_component_on_cpu("vae")
         ):
             return None
-        return CausalDecodeQueue(self.vae, device=device)
+        return CausalDecodeQueue(self.vae, device=device, quality=quality)
 
     def _rollout(self, batch: Req) -> torch.Tensor:
+        target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
+        full_history = self.profile.history_mode == HISTORY_MODE_FULL
+        if full_history and target_frame > self.profile.window_frames:
+            raise ValueError(
+                "Cosmos-Dreams full history must retain the entire rollout; "
+                f"raise history_max_frames to cover {batch.num_frames} pixel frames."
+            )
         manifest = self.manifest
         device = get_local_torch_device()
         text_kv, _ = self.transformer.encode_und_kv(
@@ -1441,10 +1500,10 @@ class CosmosDreamsRolloutStage(PipelineStage):
             device=device,
             dtype=torch.bfloat16,
             forward_batch=batch,
+            denoise_runner=self._runner_for_batch(batch, device),
             row_domain_ids=None if row_domain_ids is None else row_domain_ids.to("cpu"),
         )
         rows: torch.Tensor | None = batch.extra[EXTRA_ACTION_ROWS]
-        target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
         seed = batch.seed
         if not isinstance(seed, int):
             raise ValueError(
@@ -1457,10 +1516,41 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 "the oldest committed frames are evicted from the K/V history once it fills."
             )
         selector: FrustumHistorySelector | None = batch.extra[EXTRA_FRUSTUM_SELECTOR]
-        history: list[KVPair] | None = None
+        history: list[KVPair] | CosmosDreamsKVCache | None = None
+        archive = None
+        if self.profile.window_frames is not None and target_frame > 1:
+            # Full reserves all committed frames; the final latent has no commit,
+            # so the request capacity stays below this window and needs no scratch.
+            history = CosmosDreamsKVCache(
+                text_kv,
+                tokens_per_frame=context.tokens_per_frame,
+                sink_frames=0 if full_history else self.profile.sink_frames,
+                window_frames=target_frame
+                if full_history
+                else self.profile.window_frames,
+                max_current_frames=min(manifest.chunk_size, target_frame),
+                max_history_frames=target_frame - 1,
+            )
+            if selector is not None:
+                archive = history
+                current_frames = min(manifest.chunk_size, target_frame)
+                selected_frames = min(target_frame - 1, sum(selector.sizes))
+                # Leave room for this chunk's clean frames without eviction.
+                history = CosmosDreamsKVCache(
+                    text_kv,
+                    tokens_per_frame=context.tokens_per_frame,
+                    sink_frames=0,
+                    window_frames=selected_frames + current_frames + 1,
+                    max_current_frames=current_frames,
+                    max_history_frames=selected_frames + current_frames,
+                )
         latents: list[torch.Tensor] = []
-        decode_queue = self._decode_queue(device)
-        with decode_queue or nullcontext():
+        decode_queue = self._decode_queue(device, quality=batch.sampling_params.quality)
+        with (
+            archive if archive is not None else nullcontext(),
+            history if isinstance(history, CosmosDreamsKVCache) else nullcontext(),
+            decode_queue or nullcontext(),
+        ):
             next_frame = 0
             if batch.image_latent is not None:
                 initial_latent = batch.image_latent.to(
@@ -1470,16 +1560,17 @@ class CosmosDreamsRolloutStage(PipelineStage):
                     rows, frame_start=0, frame_end=1, context=context
                 )
                 if target_frame > 1:
-                    history = self._commit_clean_frame(
+                    history = self._commit_clean_chunk(
                         context,
                         history,
                         initial_latent,
                         frame_idx=0,
                         action=action,
-                        null_action=bool(null_indexes),
+                        null_indexes=null_indexes,
                         domain_ids=context.chunk_domain_ids(
                             0, 1, manifest.action_tokens_per_frame
                         ),
+                        archive=archive,
                     )
                 latents.append(initial_latent)
                 if decode_queue is not None:
@@ -1518,43 +1609,64 @@ class CosmosDreamsRolloutStage(PipelineStage):
                     if selector is None
                     else selector.select(chunk_start, chunk_end)
                 )
+                if archive is not None:
+                    history.load_selected(archive, selected, context.tokens_per_frame)
                 clean_chunk = self._denoise_chunk(
                     context,
                     noise,
                     seed=seed,
-                    history=_history_view(history, selected, context.tokens_per_frame),
+                    history=history,
                     frame_start=chunk_start,
                     action=action,
                     null_indexes=null_indexes,
                     domain_ids=chunk_domains,
                 )
-                for local_idx, frame_idx in iter_clean_commit_frames(
-                    chunk_start, chunk_end, target_frame=target_frame
-                ):
-                    # The framewise refresh also sees the chunk's already-committed frames.
-                    read_history = (
-                        None
-                        if selected is None
-                        else _history_view(
-                            history,
-                            selected + list(range(chunk_start, frame_idx)),
-                            context.tokens_per_frame,
-                        )
+                clean_count = max(0, min(chunk_end, target_frame - 1) - chunk_start)
+                if (
+                    clean_count
+                    and not null_indexes
+                    and (
+                        not isinstance(history, CosmosDreamsKVCache)
+                        or clean_count * context.tokens_per_frame
+                        <= history.window_tokens
                     )
-                    history = self._commit_clean_frame(
+                ):
+                    history = self._commit_clean_chunk(
                         context,
                         history,
-                        clean_chunk[:, :, local_idx : local_idx + 1],
-                        frame_idx=frame_idx,
-                        action=action[
-                            :, local_idx * action_count : (local_idx + 1) * action_count
-                        ],
-                        null_action=local_idx in null_indexes,
-                        domain_ids=frame_domain_ids(
-                            chunk_domains, local_idx, action_count
+                        clean_chunk[:, :, :clean_count],
+                        frame_idx=chunk_start,
+                        action=action[:, : clean_count * action_count],
+                        null_indexes=(),
+                        domain_ids=(
+                            chunk_domains
+                            if chunk_domains.ndim == 1
+                            else chunk_domains[:, : clean_count * action_count]
                         ),
-                        read_history=read_history,
+                        archive=archive,
                     )
+                else:
+                    # Null actions use single-frame RoPE. A clean batch wider
+                    # than the cache window also needs framewise commits.
+                    for local_idx, frame_idx in iter_clean_commit_frames(
+                        chunk_start, chunk_end, target_frame=target_frame
+                    ):
+                        history = self._commit_clean_chunk(
+                            context,
+                            history,
+                            clean_chunk[:, :, local_idx : local_idx + 1],
+                            frame_idx=frame_idx,
+                            action=action[
+                                :,
+                                local_idx * action_count : (local_idx + 1)
+                                * action_count,
+                            ],
+                            null_indexes=(0,) if local_idx in null_indexes else (),
+                            domain_ids=frame_domain_ids(
+                                chunk_domains, local_idx, action_count
+                            ),
+                            archive=archive,
+                        )
                 latents.append(clean_chunk)
                 if decode_queue is not None:
                     decode_queue.submit(clean_chunk)
@@ -1614,6 +1726,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             frame_start=frame_start,
             dtype=context.dtype,
             forward_batch=context.forward_batch,
+            denoise_runner=context.denoise_runner,
             text_kv=context.text_kv,
             fps=context.fps,
             action_latents=action,
@@ -1622,19 +1735,49 @@ class CosmosDreamsRolloutStage(PipelineStage):
             null_action_frame_indexes=null_indexes,
         )
 
-    def _commit_clean_frame(
+    def _commit_clean_chunk(
         self,
         context: _RolloutContext,
-        history: list[KVPair] | None,
+        history: list[KVPair] | CosmosDreamsKVCache | None,
         latent: torch.Tensor,
         *,
         frame_idx: int,
         action: torch.Tensor,
-        null_action: bool,
+        null_indexes: tuple[int, ...],
         domain_ids: torch.Tensor | None = None,
-        read_history: HistoryKV | None = None,
-    ) -> list[KVPair]:
-        """Refresh one clean frame (timestep 0, no time embedding) and commit its K/V."""
+        archive: CosmosDreamsKVCache | None = None,
+    ) -> list[KVPair] | CosmosDreamsKVCache:
+        """Batch clean projections while preserving per-frame attention and eviction."""
+        clean_frame_ranges = None
+        if latent.shape[2] > 1:
+            tokens = context.tokens_per_frame
+            text_tokens = context.text_kv[0][0].shape[1]
+            if isinstance(history, CosmosDreamsKVCache):
+                history_frames = history.history_tokens // tokens
+                sink = history.sink_tokens // tokens
+                window = history.window_tokens // tokens
+            else:
+                history_frames = (
+                    0 if history is None else history[0][0].shape[1] // tokens
+                )
+                sink, window = self.profile.sink_frames, self.profile.window_frames
+            ranges = []
+            for frame in range(latent.shape[2]):
+                past = history_frames + frame
+                sink_end = min(sink, past)
+                window_start = (
+                    max(sink_end, past - window) if window is not None else sink_end
+                )
+                # Token offsets in [text | history | current chunk]. The window
+                # advances per frame, exactly as in sequential clean commits.
+                ranges.append(
+                    (
+                        text_tokens + sink_end * tokens,
+                        text_tokens + window_start * tokens,
+                        text_tokens + (past + 1) * tokens,
+                    )
+                )
+            clean_frame_ranges = tuple(ranges)
         return commit_clean_kv(
             self.transformer,
             latent,
@@ -1643,12 +1786,13 @@ class CosmosDreamsRolloutStage(PipelineStage):
             tokens_per_frame=context.tokens_per_frame,
             sink_frames=self.profile.sink_frames,
             window_frames=self.profile.window_frames,
-            read_history=read_history,
+            archive=archive,
             forward_batch=context.forward_batch,
             text_kv=context.text_kv,
             frame_start=frame_idx,
             fps=context.fps,
             action_latents=action,
             action_domain_ids=context.domain_ids if domain_ids is None else domain_ids,
-            null_action_frame_indexes=(0,) if null_action else (),
+            null_action_frame_indexes=null_indexes,
+            clean_frame_ranges=clean_frame_ranges,
         )

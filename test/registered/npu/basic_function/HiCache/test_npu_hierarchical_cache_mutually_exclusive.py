@@ -33,7 +33,8 @@ class TestNpuHierarchicalCacheMutuallyExclusive(CustomTestCase):
         other_args = [
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--mem-fraction-static",
             0.8,
             "--tp-size",

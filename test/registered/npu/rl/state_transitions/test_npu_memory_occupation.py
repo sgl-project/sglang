@@ -32,7 +32,8 @@ PROMPTS = (
 MEMORY_ARGS = (
     "--attention-backend",
     "ascend",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--disable-overlap-schedule",
     "--mem-fraction-static",
     "0.45",

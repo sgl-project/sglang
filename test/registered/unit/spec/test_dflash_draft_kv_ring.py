@@ -39,7 +39,8 @@ SWA_MHA_DRAFT = {
 
 
 @contextlib.contextmanager
-def _switch(value=None):
+def _switch(value=True):
+    """``value=None`` leaves the switch unset, so its default applies."""
     with SWITCH.override(True if value is None else value):
         if value is None:
             SWITCH.clear()
@@ -71,7 +72,15 @@ class TestResolveDraftKVRing(CustomTestCase):
             _resolve_dflash_draft_kv_ring(args)
         return resolution_result(args, "speculative_dflash_draft_kv_ring")
 
-    def test_on_by_default_for_a_sliding_mla_draft(self):
+    def _assert_rejected(self, args, draft_cfg=SWA_MLA_DRAFT):
+        with self.assertRaisesRegex(ValueError, "SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1"):
+            self._resolve(args, draft_cfg=draft_cfg)
+
+    def test_off_by_default_without_loading_the_draft(self):
+        with _switch(None):
+            self.assertFalse(self._resolve(_args(), draft_cfg=None))
+
+    def test_on_for_a_sliding_mla_draft(self):
         for backend in ("cutedsl_mla", "trtllm_mla"):
             with self.subTest(backend=backend), _switch():
                 args = _args(speculative_draft_attention_backend=backend)
@@ -84,7 +93,7 @@ class TestResolveDraftKVRing(CustomTestCase):
             )
             self.assertTrue(self._resolve(args))
 
-    def test_off_by_launch_flags_without_loading_the_draft(self):
+    def test_rejected_by_launch_flags_without_loading_the_draft(self):
         cases = {
             "prefill over nixl": _args(
                 disaggregation_mode="prefill", disaggregation_transfer_backend="nixl"
@@ -98,9 +107,9 @@ class TestResolveDraftKVRing(CustomTestCase):
         }
         for name, args in cases.items():
             with self.subTest(name), _switch():
-                self.assertFalse(self._resolve(args, draft_cfg=None))
+                self._assert_rejected(args, draft_cfg=None)
 
-    def test_off_for_drafts_it_does_not_fit(self):
+    def test_rejected_for_drafts_it_does_not_fit(self):
         cases = {
             "mixed": dict(
                 SWA_MLA_DRAFT,
@@ -110,23 +119,16 @@ class TestResolveDraftKVRing(CustomTestCase):
         }
         for name, draft_cfg in cases.items():
             with self.subTest(name), _switch():
-                self.assertFalse(self._resolve(_args(), draft_cfg=draft_cfg))
+                self._assert_rejected(_args(), draft_cfg=draft_cfg)
 
-    def test_off_under_dcp_when_the_draft_does_not_run_dcp(self):
+    def test_rejected_under_dcp_when_the_draft_does_not_run_dcp(self):
         # Ascend drafts run without DCP, so their rows are not DCP-collapsed.
         with (
             _switch(),
             patch("sglang.srt.configs.model_config.is_npu", return_value=True),
         ):
-            self.assertFalse(self._resolve(_args(dcp_size=8)))
+            self._assert_rejected(_args(dcp_size=8))
             self.assertTrue(self._resolve(_args(dcp_size=1)))
-
-    def test_explicit_on_where_not_served_is_an_error(self):
-        with _switch(True), self.assertRaises(ValueError):
-            args = _args(
-                disaggregation_mode="prefill", disaggregation_transfer_backend="nixl"
-            )
-            self._resolve(args, draft_cfg=None)
 
     def test_explicit_off_is_kept(self):
         with _switch(False):
@@ -143,6 +145,14 @@ class TestResolveMHADraftKVRing(CustomTestCase):
     def _resolve(self, args, draft_cfg=SWA_MHA_DRAFT, cuda=True) -> bool:
         with patch.object(current_platform, "is_cuda", return_value=cuda):
             return TestResolveDraftKVRing._resolve(self, args, draft_cfg=draft_cfg)
+
+    def _assert_rejected(self, args, draft_cfg=SWA_MHA_DRAFT, cuda=True):
+        with self.assertRaisesRegex(ValueError, "SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1"):
+            self._resolve(args, draft_cfg=draft_cfg, cuda=cuda)
+
+    def test_off_by_default(self):
+        with _switch(None):
+            self.assertFalse(self._resolve(_mha_args(), draft_cfg=None))
 
     def test_on_for_a_sliding_mha_draft_on_trtllm_mha_and_fa4(self):
         cases = {
@@ -161,7 +171,7 @@ class TestResolveMHADraftKVRing(CustomTestCase):
             with self.subTest(name), _switch():
                 self.assertTrue(self._resolve(args))
 
-    def test_mha_off_by_launch_flags_without_loading_the_draft(self):
+    def test_mha_rejected_by_launch_flags_without_loading_the_draft(self):
         cases = {
             "dcp": _mha_args(dcp_size=8),
             "attn cp": _mha_args(attn_cp_size=2),
@@ -171,11 +181,11 @@ class TestResolveMHADraftKVRing(CustomTestCase):
         }
         for name, args in cases.items():
             with self.subTest(name), _switch():
-                self.assertFalse(self._resolve(args, draft_cfg=None))
+                self._assert_rejected(args, draft_cfg=None)
         with self.subTest("not cuda"), _switch():
-            self.assertFalse(self._resolve(_mha_args(), draft_cfg=None, cuda=False))
+            self._assert_rejected(_mha_args(), draft_cfg=None, cuda=False)
 
-    def test_mha_off_for_drafts_it_does_not_fit(self):
+    def test_mha_rejected_for_drafts_it_does_not_fit(self):
         cases = {
             "mixed": dict(
                 SWA_MHA_DRAFT,
@@ -185,7 +195,7 @@ class TestResolveMHADraftKVRing(CustomTestCase):
         }
         for name, draft_cfg in cases.items():
             with self.subTest(name), _switch():
-                self.assertFalse(self._resolve(_mha_args(), draft_cfg=draft_cfg))
+                self._assert_rejected(_mha_args(), draft_cfg=draft_cfg)
 
 
 WINDOW_LEFT = 1023
@@ -240,7 +250,7 @@ class TestDraftKVRingLayout(CustomTestCase):
 
     def test_the_floor_resets_when_the_slot_is_allocated_again(self):
         pool = ReqToTokenPool(
-            size=3, max_context_len=8, device="cpu", enable_memory_saver=False
+            size=3, row_width=8, device="cpu", enable_memory_saver=False
         )
         ring = _ring(1)
         slot = pool.alloc_rows(1)[0]

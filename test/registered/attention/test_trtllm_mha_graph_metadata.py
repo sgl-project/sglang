@@ -46,7 +46,9 @@ def _routed(pool):
 
 @pytest.fixture
 def make_xqa_backend(monkeypatch):
-    def parent_init(self, *args, **kwargs):
+    def parent_init(self, model_runner, *args, **kwargs):
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = model_runner.req_to_token_pool.row_width
         self.kv_cache_quant_method = SimpleNamespace(
             resolve_attention_access=lambda *args: SimpleNamespace(
                 kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN
@@ -91,7 +93,7 @@ def make_xqa_backend(monkeypatch):
             kv_cache_dtype=torch.bfloat16,
             dtype=torch.bfloat16,
             page_size=32,
-            req_to_token_pool=SimpleNamespace(size=4, req_to_token=None),
+            req_to_token_pool=SimpleNamespace(size=4, row_width=128, req_to_token=None),
             device="cpu",
             max_running_requests=4,
             model=SimpleNamespace(modules=lambda: []),
@@ -513,7 +515,7 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
 
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
     backend.device = torch.device("cpu")
-    backend.max_context_len = 1024
+    backend.max_kv_len = 1024
     backend.page_size = PAGE_SIZE
     backend.max_num_pages = 8
     backend.req_to_token = torch.zeros(4, 1024, dtype=torch.int32)
@@ -675,13 +677,15 @@ def _move_every_page(v2p, replay):
     v2p[1:] = torch.arange(1, v2p.numel()) + 1000 * replay
 
 
-def _assert_reads_only_current_pages(backend, v2p, bs=2):
+def _assert_reads_only_current_pages(backend, v2p, bs=2, page_table=None):
     metadata = backend.forward_metadata
+    if page_table is None:
+        page_table = metadata.page_table
     for row, length in enumerate(metadata.cache_seqlens_int32[:bs].tolist()):
         pages = -(-length // PAGE_SIZE)
         first_tokens = backend.req_to_token[row, : pages * PAGE_SIZE : PAGE_SIZE]
         expected = v2p[first_tokens.long() // PAGE_SIZE].to(torch.int32)
-        stale = (metadata.page_table[row, :pages] != expected).nonzero().flatten()
+        stale = (page_table[row, :pages] != expected).nonzero().flatten()
         assert stale.numel() == 0, (
             f"row {row} reads {length} tokens ({pages} pages), but page-table "
             f"columns {stale.tolist()} hold another replay's pages"
@@ -863,28 +867,37 @@ def _eager_batch(seq_lens, forward_mode, spec_info=None, tokens_per_req=1):
     )
 
 
-def test_unified_eager_table_must_be_packed():
+@pytest.mark.parametrize("kind", [IdSpaceKind.FULL, IdSpaceKind.SLIDING_WINDOW])
+def test_unified_eager_packs_a_table_a_graph_reader_built(kind):
     """XQA and fmha_v2 index a page table as packed rows (row length = width,
-    strides ignored). A plan whose table an earlier captured reader had built in
-    its own wider buffer hands a graphs-off reader a strided view, which they
-    would misread for every row after the first."""
+    strides ignored). A captured reader that built the plan's table first built
+    it in place, as a view into its own wider buffer; a graphs-off reader of the
+    same plan gets that table packed, or it would misread every row after the
+    first."""
     backend = _make_backend_for_hook_test()
     v2p = _translate_through_a_moving_page_map(backend)
     _move_every_page(v2p, 1)
+    window_v2p = v2p + 5000
     runner_ids = backend.runner_ids
-
-    forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
-    runner_ids.bind_own_plan(forward_batch)
-    backend.init_forward_metadata(forward_batch)
-    assert backend.forward_metadata.page_table.is_contiguous()
-    _assert_reads_only_current_pages(backend, v2p)
+    runner_ids._spaces[IdSpaceKind.SLIDING_WINDOW] = IdSpace(
+        key=(IdSpaceKind.SLIDING_WINDOW, "test"), read_v2p=window_v2p
+    )
 
     forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
     runner_ids.bind_own_plan(forward_batch)
     captured = torch.zeros((8, backend.max_num_pages), dtype=torch.int32)
-    runner_ids.copy_page_table(forward_batch.iteration_ids, out=captured[:2])
-    with pytest.raises(AssertionError, match="packed rows"):
-        backend.init_forward_metadata(forward_batch)
+    runner_ids.copy_page_table(forward_batch.iteration_ids, out=captured[:2], kind=kind)
+    backend.init_forward_metadata(forward_batch)
+
+    metadata = backend.forward_metadata
+    for table, table_v2p in (
+        (metadata.page_table, v2p),
+        (metadata.swa_page_table, window_v2p),
+    ):
+        assert table.is_contiguous()
+        _assert_reads_only_current_pages(backend, table_v2p, page_table=table)
+    built = metadata.page_table if kind == IdSpaceKind.FULL else metadata.swa_page_table
+    assert torch.equal(built, captured[:2, : built.shape[1]])
 
 
 def _bind_iteration_plan(runner_ids, forward_batch, window=4):
@@ -1016,10 +1029,9 @@ def test_hybrid_wrappers_forward_in_graph_hook():
             SimpleNamespace(
                 kv_cache_dtype=torch.bfloat16,
                 token_to_kv_pool=None,
-                req_to_token_pool=None,
+                req_to_token_pool=SimpleNamespace(row_width=2048),
                 runner_ids=None,
                 server_args=SimpleNamespace(speculative_attention_mode="decode"),
-                model_config=SimpleNamespace(context_len=2048),
             ),
             prefill_backend=make_fake("prefill", calls),
             decode_backend=make_fake("decode", calls),

@@ -21,26 +21,11 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     unwrap_write_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 # mapping on device memory, host memory and memory allocator
 
 
 logger = logging.getLogger(__name__)
-
-# sgl_kernel.kvcacheio is only available in CUDA/ROCm/XPU sgl-kernel builds (not MPS/NPU/CPU).
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-_is_xpu = is_xpu()
-if _is_cuda or _is_hip or _is_xpu:
-    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
-else:
-
-    def transfer_kv_all_layer_mla(*args, **kwargs):
-        raise RuntimeError(
-            "HiSparse device KV transfer requires sgl_kernel.kvcacheio "
-            "(CUDA/ROCm/XPU). It is not available on this backend."
-        )
 
 
 class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool):
@@ -219,7 +204,6 @@ class HiSparseMHAMainPool(HiSparseDevicePoolMappingMixin, MHATokenToKVPool):
         )
         self.full_to_hisparse_device_index_mapping: Optional[torch.Tensor] = None
         self.bytes_per_token_k = head_num * head_dim * self.store_dtype.itemsize
-        self.bytes_per_token_v = head_num * self.v_head_dim * self.store_dtype.itemsize
 
     def _translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_hisparse_device_index_mapping is not None

@@ -26,6 +26,13 @@ register_npu_ci(est_time=9, suite="extra-a-test-npu")
 # kernel discovery during import, so temporarily force the platform probe to
 # report CPU while loading the modules under test.
 sys.modules.setdefault("sgl_kernel_npu", types.ModuleType("sgl_kernel_npu"))
+_sgl_operators = types.ModuleType("sgl_kernel_npu.operators")
+_sgl_attention = types.ModuleType("sgl_kernel_npu.operators.attention")
+# dsa_dcp imports the public operator at module load; the real function needs
+# the NPU extension, so the tests patch this placeholder per case.
+_sgl_attention.sparse_flash_attention = None
+sys.modules.setdefault("sgl_kernel_npu.operators", _sgl_operators)
+sys.modules.setdefault("sgl_kernel_npu.operators.attention", _sgl_attention)
 sys.modules.setdefault("torch_npu", MagicMock(name="torch_npu"))
 import sglang.srt.utils as _utils  # noqa: E402
 from sglang.srt.utils import device as _device_utils  # noqa: E402
@@ -36,6 +43,7 @@ _device_utils.is_npu = lambda: False
 _utils.is_npu = _device_utils.is_npu
 try:
     from sglang.srt import runtime_context as rc
+    from sglang.srt.hardware_backend.npu.attention import dsa_dcp as _dsa_dcp
     from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
         forward_dcp_sparse_attention,
     )
@@ -262,12 +270,7 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
         q, rope, k_nope, k_rope, topk = self._inputs()
         batch = SimpleNamespace(forward_mode=_Mode(False))
         metadata = self._metadata()
-        with patch.object(
-            torch.ops.npu,
-            "sgl_sparse_flash_attention",
-            self.fake_op,
-            create=True,
-        ):
+        with patch.object(_dsa_dcp, "sparse_flash_attention", self.fake_op):
             out, lse = forward_dcp_sparse_attention(
                 q_nope=q,
                 q_rope=rope,
@@ -297,12 +300,7 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
         q, rope, k_nope, k_rope, topk = self._inputs(rows)
         batch = SimpleNamespace(forward_mode=_Mode(True))
         metadata = self._metadata(rows=rows)
-        with patch.object(
-            torch.ops.npu,
-            "sgl_sparse_flash_attention",
-            self.fake_op,
-            create=True,
-        ):
+        with patch.object(_dsa_dcp, "sparse_flash_attention", self.fake_op):
             forward_dcp_sparse_attention(
                 q_nope=q,
                 q_rope=rope,
@@ -468,12 +466,15 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
         pool.v_buffer = [torch.empty(4, 8, 1, 1)]
         pool.dcp_size = 4
         pool.is_draft_worker = False
-        pool.dsa_kv_cache_store_fp8 = False
+        pool.dsa_kv_cache_store_c8 = False
         pool.index_head_dim = 2
         pool.page_size = 8
         pool.index_page_size = 8
         pool.index_k_buffer = [torch.empty(4, 8, 1, 2)]
         pool.index_k_scale_buffer = [torch.empty(4, 8, 1)]
+        pool.start_layer = 0
+        pool.layer_num = 1
+        pool.indexer_layer_ids = (0,)
 
         ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
         buffers = (
