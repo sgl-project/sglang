@@ -252,25 +252,25 @@ fn namespace_field(value: &Value) -> Result<Option<String>, ()> {
 ///
 /// Each `/generate` prompt and `n` sample is its own engine request: input and output
 /// counts sum over them, while the sequence counts bound the longest.
-pub(super) struct PreparedRequest {
+pub(crate) struct PreparedRequest {
     /// Engine endpoint the request is forwarded to.
-    pub(super) path: &'static str,
-    pub(super) model: ModelId,
+    pub(crate) path: &'static str,
+    pub(crate) model: ModelId,
     pub(super) streaming: bool,
     /// Output budget, for decode KV; unknown if any prompt leaves it unset.
-    pub(super) output_tokens: Option<u64>,
-    pub(super) body: Bytes,
-    pub(super) tokens: Option<RequestTokens>,
+    pub(crate) output_tokens: Option<u64>,
+    pub(crate) body: Bytes,
+    pub(crate) tokens: Option<RequestTokens>,
     /// The engine KV namespace `tokens` are cached under.
-    pub(super) cache_namespace: CacheNamespace,
+    pub(crate) cache_namespace: CacheNamespace,
     /// Token count for routing/load accounting; estimated from body size when unavailable.
-    pub(super) input_token_count: usize,
+    pub(crate) input_token_count: usize,
     /// The longest prompt, for bucket and context checks.
-    pub(super) sequence_token_count: usize,
+    pub(crate) sequence_token_count: usize,
     /// The longest prompt plus its own output budget.
-    pub(super) expected_peak_sequence_tokens: Option<u64>,
-    pub(super) caller_set_rid: bool,
-    pub(super) fans_out: bool,
+    pub(crate) expected_peak_sequence_tokens: Option<u64>,
+    pub(crate) caller_set_rid: bool,
+    pub(crate) fans_out: bool,
     /// Media items of chat `messages`, `/generate` or typed `Generate` media
     /// fields, or multimodal embeddings and rerank inputs, for the access log.
     pub(super) media: MediaCounts,
@@ -282,11 +282,11 @@ pub(super) struct PreparedRequest {
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
     /// Turns the engine's `/generate` response back into the OpenAI one.
-    pub(super) responder: Option<Responder>,
+    pub(crate) responder: Option<Responder>,
     /// A non-streaming, single-sample native `/generate` asking for logprobs:
     /// under PD only prefill computes the prompt, so its input logprobs go into
     /// decode's response.
-    pub(super) merges_input_logprobs: bool,
+    pub(crate) merges_input_logprobs: bool,
 }
 
 impl Preprocessor {
@@ -622,7 +622,7 @@ impl Preprocessor {
 
 impl PreparedRequest {
     /// Defaults the sampling contract adds, for a typed request's fields.
-    pub(super) fn sampling_defaults(&self) -> Vec<(SamplingField, f64)> {
+    pub(crate) fn sampling_defaults(&self) -> Vec<(SamplingField, f64)> {
         let defaults = self.sampling_defaults.iter();
         defaults
             .filter_map(|(field, value)| Some((*field, value.as_f64()?)))
@@ -658,11 +658,11 @@ impl PreparedRequest {
 
     /// Whether the engine endpoint honors a routed DP rank; embeddings, classify
     /// and rerank take none.
-    pub(super) fn accepts_dp_rank(&self) -> bool {
+    pub(crate) fn accepts_dp_rank(&self) -> bool {
         !matches!(self.path, EMBEDDINGS_PATH | CLASSIFY_PATH | RERANK_PATH)
     }
 
-    pub(super) fn engine_rid(&self) -> Option<String> {
+    pub(crate) fn engine_rid(&self) -> Option<String> {
         // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs.
         // PD shares the minted ID, but only decode arms abort-on-drop.
         if self.caller_set_rid || self.fans_out {
@@ -673,7 +673,7 @@ impl PreparedRequest {
 
     /// The engine body for one dispatch attempt; each attempt brings its own
     /// bootstrap fields and rid.
-    pub(super) fn outgoing_body(
+    pub(crate) fn outgoing_body(
         &mut self,
         metrics: &MetricsRegistry,
         bootstrap: Option<&BootstrapFields>,
@@ -1139,19 +1139,19 @@ fn estimate_prefill_tokens(bytes: usize) -> usize {
 }
 
 /// The engine stores bootstrap rooms as signed int64 values.
-pub(super) fn generate_room_id() -> u64 {
+pub(crate) fn generate_room_id() -> u64 {
     rand::random::<u64>() & (i64::MAX as u64)
 }
 
 /// A room with `room % dp_ranks == rank`, which is how decode finds the prefill rank.
-pub(super) fn generate_room_id_for_rank(rank: u32, dp_ranks: u32) -> u64 {
+pub(crate) fn generate_room_id_for_rank(rank: u32, dp_ranks: u32) -> u64 {
     let dp_ranks = u64::from(dp_ranks);
     (generate_room_id() >> 1) / dp_ranks * dp_ranks + u64::from(rank)
 }
 
 /// Append JSON-encoded `fields` before the closing brace, so they win over
 /// earlier values of the same keys.
-pub(super) fn append_fields(body: &Bytes, fields: &[(&str, String)]) -> Option<Bytes> {
+pub(crate) fn append_fields(body: &Bytes, fields: &[(&str, String)]) -> Option<Bytes> {
     let open = body.iter().position(|&b| b == b'{')?;
     let close = body.iter().rposition(|&b| b == b'}')?;
     if close <= open {
