@@ -16,7 +16,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd")
 
 
 @unittest.skipUnless(torch.version.hip, "ROCm attention backend")
@@ -45,7 +45,7 @@ class TestAsmContextPrefillGatherIndices(CustomTestCase):
             qo_indptr=None,
             kv_last_page_len=None,
             max_q_len=1,
-            max_kv_len=max(seq_lens),
+            batch_max_kv_len=max(seq_lens),
         )
         backend = types.SimpleNamespace(forward_metadata=fm)
         fb = types.SimpleNamespace(

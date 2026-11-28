@@ -64,6 +64,7 @@ def _storage(windows):
             state_slots=0,
             max_running_requests=3,
             context_len=64,
+            req_to_token_row_width=64,
             alignment=1,
         ),
     )
@@ -74,7 +75,6 @@ def _storage(windows):
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=3,
-        model_context_len=64,
         lazy_compaction=True,
     )
     return build_kv_storage(plan, sized, ctx)
@@ -254,7 +254,7 @@ class TestStateEntryAgreement(CustomTestCase):
             with self.assertRaisesRegex(
                 RuntimeError,
                 f"only the {role} server registers a DFLASH draft KV ring.*"
-                f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0 on the {role} server",
+                f"unset SGLANG_ENABLE_DFLASH_DRAFT_KV_RING on the {role} server",
             ):
                 check_state_wire(prefill, decode)
         # Any other difference keeps the generic message.

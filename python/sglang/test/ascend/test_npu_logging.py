@@ -75,7 +75,8 @@ class TestNPULoggingBase(CustomTestCase):
             "0.8",
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--log-requests",
         ]
         cls.out_log_file_obj = tempfile.NamedTemporaryFile(

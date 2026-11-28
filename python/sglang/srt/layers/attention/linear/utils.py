@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.log_utils import rank0_log
-
-if TYPE_CHECKING:
-    pass
 
 
 def pp_spec_stable_rows_enabled() -> bool:
@@ -23,10 +20,12 @@ class LinearAttnKernelBackend(Enum):
     NV_CUTEDSL = "nv_cutedsl"
     FLASHINFER = "flashinfer"
     FLASHKDA = "flashkda"
+    FLYDSL = "flydsl"
     NVIDIA_KDA = "nvidia_kda"
     PTX_KDA = "ptx_kda"
     HELION = "helion"
     INTEL_XPU = "intel_xpu"
+    AITER = "aiter"
     CUSTOM = "custom"
 
     @classmethod
@@ -48,6 +47,9 @@ class LinearAttnKernelBackend(Enum):
     def is_flashkda(self):
         return self == LinearAttnKernelBackend.FLASHKDA
 
+    def is_flydsl(self):
+        return self == LinearAttnKernelBackend.FLYDSL
+
     def is_nvidia_kda(self):
         return self == LinearAttnKernelBackend.NVIDIA_KDA
 
@@ -59,6 +61,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_intel_xpu(self):
         return self == LinearAttnKernelBackend.INTEL_XPU
+
+    def is_aiter(self):
+        return self == LinearAttnKernelBackend.AITER
 
     def is_custom(self):
         return self == LinearAttnKernelBackend.CUSTOM
@@ -120,9 +125,26 @@ def select_verify_intermediate_state_indices(
 
     import torch
 
+    # A callable `valid` is evaluated only here, so per-layer callers launch no
+    # mask kernel when stable rows are off.
+    if callable(valid):
+        valid = valid()
     req_rows = req_pool_indices[: valid.shape[0]]
     return torch.where(valid, req_rows, torch.full_like(req_rows, pool_size)).to(
         torch.int32
+    )
+
+
+def max_verify_batch_size(pool_size: int) -> int:
+    from sglang.srt.layers.dp_attention import (
+        get_cuda_graph_max_batch_size,
+        get_eager_max_batch_size,
+    )
+
+    return max(
+        pool_size,
+        get_eager_max_batch_size(pool_size),
+        get_cuda_graph_max_batch_size(pool_size),
     )
 
 
@@ -143,16 +165,7 @@ def build_verify_intermediate_state_indices(pool_size: int, device):
     """
     import torch
 
-    from sglang.srt.layers.dp_attention import (
-        get_cuda_graph_max_batch_size,
-        get_eager_max_batch_size,
-    )
-
-    padded_bs = max(
-        pool_size,
-        get_eager_max_batch_size(pool_size),
-        get_cuda_graph_max_batch_size(pool_size),
-    )
+    padded_bs = max_verify_batch_size(pool_size)
     indices = torch.arange(pool_size, dtype=torch.int32, device=device)
     if padded_bs > pool_size:
         indices = torch.cat(

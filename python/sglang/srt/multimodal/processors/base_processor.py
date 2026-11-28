@@ -259,7 +259,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
 
         processor_config = MultimodalProcessorConfig(
             image_processor_backend=get_mm().image_processor_backend,
-            disable_fast_image_processor=get_mm().disable_fast_image_processor,
             mm_process_config=get_mm().mm_process_config,
             # A processor built without the feature pool runs its calls synchronously.
             mm_processor_worker_num=(
@@ -273,6 +272,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             media_url_max_file_size_mb=get_mm().media_url_max_file_size_mb,
             media_url_timeout=get_mm().media_url_timeout,
             allow_local_media_files=get_mm().allow_local_media_files,
+            allow_private_media_hosts=get_mm().allow_private_media_hosts,
         )
         MultimodalProcessorMixin._initialize_processor(
             self, hf_config, _processor, processor_config=processor_config

@@ -144,6 +144,8 @@ def install(pipeline):
     if (
         not {"_modulate_gate", "MINIMAX_H3_NORM_MODULATE"}
         <= set(block.forward.__func__.__code__.co_names)
+        or "MINIMAX_H3_NORM_MODULATE"
+        not in block._fuses_gate_norm2.__func__.__code__.co_names
         or "fused_inplace_qknorm_rope"
         not in block.attn._attend.__func__.__code__.co_names
     ):
@@ -156,16 +158,17 @@ def install(pipeline):
 
     model._embed = types.MethodType(embedding, model)
     for block in model.blocks:
-        bind_with_globals(
-            block,
-            "forward",
-            {
-                "_modulate_gate": comfy_gate,
-                "MINIMAX_H3_NORM_MODULATE": types.SimpleNamespace(
-                    is_enabled=lambda _: False
-                ),
-            },
-        )
+        for method in ("forward", "_fuses_gate_norm2"):
+            bind_with_globals(
+                block,
+                method,
+                {
+                    "_modulate_gate": comfy_gate,
+                    "MINIMAX_H3_NORM_MODULATE": types.SimpleNamespace(
+                        is_enabled=lambda _: False
+                    ),
+                },
+            )
         bind_with_globals(
             block.attn, "_attend", {"fused_inplace_qknorm_rope": comfy_rope}
         )

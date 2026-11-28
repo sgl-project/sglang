@@ -112,12 +112,13 @@ def _call_server_info_with(
     internal_states: list[dict] | None = None,
     config_updates: dict | None = None,
     scheduler_info: dict | None = None,
+    supports_inline_system: bool = False,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
     Bypasses the FastAPI HTTP layer (no TestClient): the handler is an
-    `async def` that reads module-level `_global_state`, so wiring a
-    `SimpleNamespace` stub via `set_global_state` and awaiting the
+    `async def` that reads module-level `_global_state` and the request's
+    chat handler, so wiring `SimpleNamespace` stubs for both and awaiting the
     coroutine directly is enough to exercise the handler logic without
     booting a model server.
 
@@ -133,7 +134,7 @@ def _call_server_info_with(
 
     tokenizer_manager = _stub_tokenizer_manager(server_args, _fake_internal_state)
     if scheduler_info is None:
-        scheduler_info = {"max_req_input_len": 1024}
+        scheduler_info = {"max_req_len": 1030, "max_req_input_len": 1024}
     stub_state = SimpleNamespace(
         tokenizer_manager=tokenizer_manager,
         scheduler_info=scheduler_info,
@@ -147,7 +148,11 @@ def _call_server_info_with(
         published = True
         tokenizer_manager.record_config_updates("test", **config_updates)
     try:
-        return asyncio.run(http_server.server_info())
+        chat = SimpleNamespace(supports_inline_system=supports_inline_system)
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(openai_serving_chat=chat))
+        )
+        return asyncio.run(http_server.server_info(request))
     finally:
         # Restore so a later test in the same process isn't surprised.
         http_server._global_state = prior_state
@@ -177,7 +182,10 @@ class TestServerInfoTransportParity(CustomTestCase):
             "--api-key sk-api --admin-api-ke=sk-api admin"
         )
         scheduler = SimpleNamespace(
-            server_args=args, max_total_num_tokens=2048, max_req_input_len=1024
+            server_args=args,
+            max_total_num_tokens=2048,
+            max_req_len=1030,
+            max_req_input_len=1024,
         )
         info = rust_config._launch_server_info(scheduler)
         for secret in ("sk-api", 'admin"', "old-admin"):
@@ -207,7 +215,13 @@ class TestServerInfoTransportParity(CustomTestCase):
                 # Every transport below reports the same fields.
                 for name in secrets:
                     self.assertEqual(http_info[name], "<redacted>")
-                for field in ("startup_time", "internal_states", "version", "frontend"):
+                for field in (
+                    "startup_time",
+                    "internal_states",
+                    "version",
+                    "frontend",
+                    "supports_inline_system",
+                ):
                     self.assertIn(field, http_info)
                     http_info.pop(field)
 
@@ -215,7 +229,7 @@ class TestServerInfoTransportParity(CustomTestCase):
                 bridge.tokenizer_manager = SimpleNamespace(
                     server_args=args, mm_processor=None
                 )
-                bridge.scheduler_info = {"max_req_input_len": 1024}
+                bridge.scheduler_info = {"max_req_len": 1030, "max_req_input_len": 1024}
                 leader = json.loads(bridge.get_server_info())
                 # Only the leader serves requests, so only it lists media inputs.
                 self.assertEqual(leader.pop("grpc_features"), [])
@@ -224,7 +238,10 @@ class TestServerInfoTransportParity(CustomTestCase):
                 # The embedded Rust server's launch-time fields, which stamp
                 # the init info the scheduler handshake carries for Python.
                 scheduler = SimpleNamespace(
-                    server_args=args, max_total_num_tokens=2048, max_req_input_len=1024
+                    server_args=args,
+                    max_total_num_tokens=2048,
+                    max_req_len=1030,
+                    max_req_input_len=1024,
                 )
                 rust_launch = json.loads(rust_config._launch_server_info(scheduler))
                 self.assertEqual(rust_launch.pop("status"), "ready")
@@ -251,8 +268,6 @@ class TestServerInfoTransportParity(CustomTestCase):
                         return_value=SimpleNamespace(
                             host="127.0.0.1",
                             grpc_port=50051,
-                            smg_grpc_mode=False,
-                            grpc_mode=False,
                         ),
                     ),
                     patch("sglang.srt.rust_extensions.load_rust_extension") as load,
@@ -277,8 +292,6 @@ class TestServerInfoTransportParity(CustomTestCase):
                 return_value=SimpleNamespace(
                     host="127.0.0.1",
                     grpc_port=50051,
-                    smg_grpc_mode=False,
-                    grpc_mode=False,
                 ),
             ),
             patch("sglang.srt.rust_extensions.load_rust_extension") as load,
@@ -369,7 +382,7 @@ class TestModelInfoTransportParity(CustomTestCase):
             weight_version="v1",
             load_format="dummy",
             reasoning_parser="deepseek-r1",
-            tool_call_parser="qwen25",
+            tool_call_parser="qwen",
             disaggregation_mode="decode",
         )
         architectures = ["TestForCausalLM"]
@@ -420,6 +433,8 @@ class TestModelInfoTransportParity(CustomTestCase):
             rust_server_tokenizer_path=lambda: "/loaded-tokenizer",
             tokenizer=None,
             max_total_num_tokens=1024,
+            max_req_len=1024,
+            max_req_input_len=1018,
             load_snapshot_writer=None,
             rust_server_endpoints=[
                 {"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}
@@ -841,6 +856,15 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         self.assertIn("internal_states", info)
         self.assertIn("version", info)
         self.assertEqual(info["frontend"], "python")
+
+    def test_supports_inline_system_is_what_messages_acts_on(self):
+        # sgl-router's /v1/messages keeps an inline system turn in place on this
+        # value; a constant would send one to a template that rejects it.
+        for value in (True, False):
+            info = _call_server_info_with(
+                ServerArgs(model_path="dummy"), supports_inline_system=value
+            )
+            self.assertIs(info["supports_inline_system"], value)
 
     def test_kv_events_config_raw_field_still_surfaced(self):
         # The new structured `kv_events` block sits alongside the

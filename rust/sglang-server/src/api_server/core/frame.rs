@@ -33,8 +33,12 @@ pub(crate) struct CoreOutput {
     /// The launch weight version, which frames report until a terminal one's
     /// spans name the last; stamped by the core call.
     pub(crate) weight_version: Option<Arc<str>>,
-    /// This listener's data-parallel rank; stamped by the core call.
+    /// This listener's data-parallel rank, `None` without data parallelism;
+    /// stamped by the core call.
     pub(crate) dp_rank: Option<u32>,
+    /// The prompt's final token ids, when the request asked for them;
+    /// stamped by the core call.
+    pub(crate) prompt_token_ids: Option<Arc<[i64]>>,
     pub(crate) text: String,
     pub(crate) completion_tokens: u64,
     pub(crate) stop_token_trimmed: bool,
@@ -63,6 +67,7 @@ impl From<ChunkEvent> for CoreOutput {
             reasoning_tokens,
             weight_version: None,
             dp_rank: None,
+            prompt_token_ids: None,
             text,
             completion_tokens,
             stop_token_trimmed,
@@ -88,22 +93,62 @@ impl CoreOutput {
     /// cumulative result, so the fold itself lives at their shared semantic
     /// boundary rather than in either wire adapter.
     pub(crate) fn append_delta(&mut self, delta: &Self) {
-        self.text.push_str(&delta.text);
-        self.token_ids.extend_from_slice(&delta.token_ids);
+        self.fold(DeltaFields {
+            text: &delta.text,
+            token_ids: &delta.token_ids,
+            finish_reason: delta.finish_reason.as_ref(),
+            prompt_tokens: delta.prompt_tokens,
+            cached_tokens: delta.cached_tokens,
+            reasoning_tokens: delta.reasoning_tokens,
+            weight_version: delta.weight_version.as_ref(),
+            dp_rank: delta.dp_rank,
+            prompt_token_ids: delta.prompt_token_ids.as_ref(),
+            completion_tokens: delta.completion_tokens,
+            stop_token_trimmed: delta.stop_token_trimmed,
+            extras: delta.extras.as_deref(),
+        });
+    }
+
+    /// [`Self::append_delta`] of a runtime chunk as converted and stamped
+    /// with the listener's `dp_rank` (it carries no weight version or prompt
+    /// ids), read in place instead of copied first.
+    pub(crate) fn append_chunk(&mut self, chunk: &ChunkEvent, dp_rank: Option<u32>) {
+        self.fold(DeltaFields {
+            text: &chunk.text,
+            token_ids: &chunk.token_ids,
+            finish_reason: chunk.finish_reason.as_ref(),
+            prompt_tokens: chunk.prompt_tokens,
+            cached_tokens: chunk.cached_tokens,
+            reasoning_tokens: chunk.reasoning_tokens,
+            weight_version: None,
+            dp_rank,
+            prompt_token_ids: None,
+            completion_tokens: chunk.completion_tokens,
+            stop_token_trimmed: chunk.stop_token_trimmed,
+            extras: chunk.extras.as_deref(),
+        });
+    }
+
+    fn fold(&mut self, delta: DeltaFields<'_>) {
+        self.text.push_str(delta.text);
+        self.token_ids.extend_from_slice(delta.token_ids);
         self.completion_tokens += delta.completion_tokens;
         self.prompt_tokens = delta.prompt_tokens;
         self.cached_tokens = delta.cached_tokens;
         self.reasoning_tokens = delta.reasoning_tokens;
         self.dp_rank = delta.dp_rank;
-        if delta.finish_reason.is_some() {
-            self.finish_reason = delta.finish_reason.clone();
+        if let Some(finish_reason) = delta.finish_reason {
+            self.finish_reason = Some(finish_reason.clone());
             self.stop_token_trimmed = delta.stop_token_trimmed;
         }
-        if delta.weight_version.is_some() {
-            self.weight_version = delta.weight_version.clone();
+        if let Some(weight_version) = delta.weight_version {
+            self.weight_version = Some(weight_version.clone());
+        }
+        if let Some(prompt_token_ids) = delta.prompt_token_ids {
+            self.prompt_token_ids = Some(prompt_token_ids.clone());
         }
 
-        let Some(delta_extras) = delta.extras.as_deref() else {
+        let Some(delta_extras) = delta.extras else {
             return;
         };
         let extras = self
@@ -211,6 +256,23 @@ impl CoreOutput {
     }
 }
 
+/// What [`CoreOutput::append_delta`] reads of a delta, borrowed from either
+/// a [`CoreOutput`] or a [`ChunkEvent`].
+struct DeltaFields<'a> {
+    text: &'a str,
+    token_ids: &'a [i64],
+    finish_reason: Option<&'a FinishReason>,
+    prompt_tokens: u32,
+    cached_tokens: u32,
+    reasoning_tokens: u64,
+    weight_version: Option<&'a Arc<str>>,
+    dp_rank: Option<u32>,
+    prompt_token_ids: Option<&'a Arc<[i64]>>,
+    completion_tokens: u64,
+    stop_token_trimmed: bool,
+    extras: Option<&'a ChunkExtras>,
+}
+
 /// Semantic result of a deep core health check.
 ///
 /// Expected lifecycle states are values rather than transport errors so each
@@ -284,12 +346,15 @@ impl CoreOutput {
         api::GenerateResponse {
             text: self.text,
             meta_info,
-            // Omitted while empty (a text-only frame).
-            output_ids: (!self.token_ids.is_empty()).then_some(api::TokenIds {
+            // Always present, as in Python's output dict: an empty list on a
+            // frame without tokens (a zero-token finish, a text-only delta).
+            output_ids: Some(api::TokenIds {
                 ids: self.token_ids,
             }),
             index,
-            prompt_token_ids: None,
+            prompt_token_ids: self
+                .prompt_token_ids
+                .map(|ids| api::TokenIds { ids: ids.to_vec() }),
         }
     }
 
@@ -495,9 +560,15 @@ fn finish_reason(reason: &FinishReason) -> api::FinishReason {
         FinishReason::Known(FinishKind::Stop { matched }) => Kind::Stop(api::FinishStop {
             matched: matched.as_ref().map(matched_value),
         }),
-        FinishReason::Known(FinishKind::Length { length }) => {
-            Kind::Length(api::FinishLength { length: *length })
-        }
+        FinishReason::Known(FinishKind::Length {
+            length,
+            ignored_stop,
+        }) => Kind::Length(api::FinishLength {
+            length: *length,
+            ignored_stop: ignored_stop.as_deref().map(|stop| api::IgnoredStop {
+                position: stop.position,
+            }),
+        }),
         FinishReason::Known(FinishKind::Abort(abort)) => Kind::Abort(Box::new(api::FinishAbort {
             message: abort.message.clone(),
             status_code: abort.status_code.map(u32::from),
@@ -761,6 +832,47 @@ mod tests {
             .unwrap()
             .remove("cached_tokens_details");
         assert_eq!(aborted_keys, abort["meta_info"]);
+    }
+
+    /// `output_ids` is on every frame, as Python's `/generate` output dict
+    /// always carries it: an empty list for a frame without tokens (a
+    /// zero-token finish, such as a `max_new_tokens: 0` scoring read, or a
+    /// text-only delta), so clients that require the key keep working.
+    #[test]
+    fn output_ids_stay_on_a_frame_without_tokens() {
+        let finished = CoreOutput {
+            finish_reason: serde_json::from_value(
+                serde_json::json!({"type": "length", "length": 0}),
+            )
+            .expect("finish reason must parse"),
+            prompt_tokens: 3,
+            ..Default::default()
+        };
+        let frame = finished.frame("rid", None, Some(0.25));
+        assert_eq!(frame.output_ids, Some(api::TokenIds { ids: Vec::new() }));
+        let body = json(&frame);
+        assert_eq!(body["output_ids"], serde_json::json!([]));
+        assert_eq!(
+            body.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["text", "meta_info", "output_ids"]
+        );
+
+        let text_only = CoreOutput {
+            text: "a".into(),
+            ..Default::default()
+        };
+        let body = json(&text_only.frame("rid", Some(1), None));
+        assert_eq!(body["output_ids"], serde_json::json!([]));
+        assert_eq!(body["index"], 1);
+
+        let with_tokens = CoreOutput {
+            token_ids: vec![4, 5],
+            ..Default::default()
+        };
+        assert_eq!(
+            json(&with_tokens.frame("rid", None, None))["output_ids"],
+            serde_json::json!([4, 5])
+        );
     }
 
     /// A trimmed stop token stays in the accumulated `token_ids` but out of the

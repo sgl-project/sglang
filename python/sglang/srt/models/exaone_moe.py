@@ -16,7 +16,6 @@
 # Adapted from the vLLM version of EXAONE-MoE model
 """Inference-only ExaoneMoE model compatible with HuggingFace weights."""
 
-import logging
 from collections.abc import Iterable
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -65,8 +64,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import LazyValue, is_cuda
-
-logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 
@@ -541,8 +538,6 @@ class ExaoneMoEDecoderLayer(nn.Module):
 
 
 class ExaoneMoEModel(nn.Module):
-    fall_back_to_pt_during_load = False
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -816,14 +811,11 @@ class ExaoneMoEForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

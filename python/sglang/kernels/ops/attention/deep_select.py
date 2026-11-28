@@ -14,6 +14,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
     parallel_compile,
 )
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -21,6 +22,9 @@ if TYPE_CHECKING:
 # NOTE: see the comments in `entry.cuh`
 _INPUT_STRIDE_ALIGNMENT_BYTES = 128
 _OUTPUT_STRIDE_ALIGNMENT_BYTES = 32
+# Largest batch the opt-in multi-wave cluster path takes (SGLANG_DEEP_SELECT_MULTIWAVE):
+# measured to win on long-tailed rows up to 510 rows (DSV4.1 decode indexer, top-512).
+_MULTIWAVE_MAX_ROWS = 512
 _CLUSTER_MAX_TOPK = 1024
 _CLUSTER_MIN_VOCAB_SIZE = 16384
 
@@ -207,9 +211,16 @@ def is_deep_select_supported() -> bool:
 
 
 class _CachedModuleDispatch:
-    def __init__(self, mods: list[Module], rows: list[int], fallback: Module):
+    def __init__(
+        self,
+        mods: list[Module],
+        rows: list[int],
+        fallback: Module,
+        multiwave: Optional[Module] = None,
+    ):
         self._clusters = tuple(zip(rows, mods, strict=True))
         self._fallback = fallback
+        self._multiwave = multiwave
 
     def __call__(self, rows: int, vocab_size: int):
         # NOTE: deficiency: cluster + sorted_index supports up to 1M context
@@ -217,6 +228,9 @@ class _CachedModuleDispatch:
             for max_rows, module in self._clusters:
                 if rows <= max_rows:
                     return module
+            # Opt-in: several waves of one cluster tier instead of the one-CTA-per-row fallback.
+            if self._multiwave is not None and rows <= _MULTIWAVE_MAX_ROWS:
+                return self._multiwave
         return self._fallback
 
 
@@ -248,7 +262,12 @@ def _precompile(
         )
         for bucket, cluster_size in jobs
     )
-    return _CachedModuleDispatch(modules[1:], rows, modules[0])
+    # Tiers are in increasing rows per wave, so the last one runs the most rows
+    # at once. The env is read once per signature: later changes have no effect.
+    multiwave = (
+        modules[-1] if rows and envs.SGLANG_DEEP_SELECT_MULTIWAVE.get() else None
+    )
+    return _CachedModuleDispatch(modules[1:], rows, modules[0], multiwave)
 
 
 def topk(

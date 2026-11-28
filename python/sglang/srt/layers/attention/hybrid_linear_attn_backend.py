@@ -256,9 +256,11 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_batch.req_pool_indices[:bs]
             ).to(dtype=torch.int32)
         if forward_batch.mamba_track_indices is not None:
+            # Kept int64 when translated: every layer's track writes index the pool
+            # with these, and indexing with an int32 tensor casts it to int64 each time.
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
-            )
+            ).to(torch.int64)
         # Resolve the tracked-row selection once per forward
         cpu_track_metadata = self._has_cpu_prefill_track_metadata(forward_batch)
         if cpu_track_metadata:
@@ -509,7 +511,8 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
-        return indices.clamp(0, query_start_loc[-1] - 1)
+        # A tensor bound: a 0-dim CUDA tensor passed as a Python scalar syncs the host.
+        return torch.minimum(indices.clamp(min=0), query_start_loc[-1] - 1)
 
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
@@ -1358,7 +1361,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
         self.runner_ids = full_attn_backend.runner_ids
-        self.max_context_len = getattr(full_attn_backend, "max_context_len", None)
         self.needs_cpu_seq_lens = (
             full_attn_backend.needs_cpu_seq_lens
             or linear_attn_backend.needs_cpu_seq_lens
@@ -1389,6 +1391,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         # wrapper since split backends are wrapped once (#31439); the full-attn
         # side owns the KV cache, so its dtype is authoritative.
         return self.full_attn_backend.data_type
+
+    @property
+    def plans_padded_extend_rows(self) -> bool:
+        return self.full_attn_backend.plans_padded_extend_rows
 
     @property
     def supports_ragged_verify_graph(self) -> bool:

@@ -297,7 +297,7 @@ class MockKDAModelRunner(ModelRunner):
             size=pool_batch_size,
             mamba_size=pool_batch_size,
             mamba_spec_state_size=pool_batch_size,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
             cache_params=cache_params,

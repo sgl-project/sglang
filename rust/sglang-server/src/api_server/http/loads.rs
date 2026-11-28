@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::app::AppState;
+use super::auth::DeclaredRoute;
 use super::native_api::native_error;
 
 /// The file header, Python's `HEADER_STRUCT` (`<4sHHI`): magic, version,
@@ -72,6 +73,10 @@ const CORE: &[(&str, Zero)] = &[
     ("utilization", Zero::Float),
     ("total_prefill_uncached_tokens", Zero::Int),
     ("total_prefill_busy_us", Zero::Int),
+    ("total_storage_prefetch_hit_tokens", Zero::Null),
+    ("total_storage_prefetch_unfulfilled_tokens", Zero::Null),
+    ("total_backuped_tokens", Zero::Null),
+    ("total_backup_dropped_tokens", Zero::Null),
     ("decode_moments", Zero::Null),
 ];
 
@@ -125,6 +130,8 @@ const SECTIONS: &[Section] = &[
             ("decode_retracted_queue_reqs", Some(Zero::Int)),
             ("kv_transfer_speed_gb_s", Some(Zero::Float)),
             ("kv_transfer_latency_ms", Some(Zero::Float)),
+            ("decode_host_pool_blocked", Some(Zero::Int)),
+            ("decode_host_staged_landed_reqs", Some(Zero::Int)),
         ],
     },
     Section {
@@ -144,7 +151,7 @@ const SECTIONS: &[Section] = &[
 const VALID_INCLUDES: &[&str] = &["all", "core", "disagg", "lora", "memory", "queues", "spec"];
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/v1/loads", get(loads))
+    Router::new().declared_route("/v1/loads", get(loads))
 }
 
 #[derive(Deserialize)]
@@ -345,6 +352,12 @@ fn json(value: &rmpv::Value) -> Option<Value> {
         rmpv::Value::F64(x) => Value::from(*x),
         rmpv::Value::String(s) => Value::from(s.as_str()?),
         rmpv::Value::Array(items) => Value::Array(items.iter().map(json).collect::<Option<_>>()?),
+        rmpv::Value::Map(entries) => Value::Object(
+            entries
+                .iter()
+                .map(|(key, value)| Some((key.as_str()?.to_owned(), json(value)?)))
+                .collect::<Option<_>>()?,
+        ),
         _ => return None,
     })
 }
