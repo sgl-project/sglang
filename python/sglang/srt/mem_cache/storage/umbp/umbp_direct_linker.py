@@ -391,13 +391,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             page_keys, transfer
         )
         entry = self.pools[transfer.name]
-        # One key names one stored object, and a packed entry stores a whole
-        # page as one object regardless of how many components it has.
-        entries_per_page = 1 if entry.packed else len(entry.components)
-        if multiplier != entries_per_page:
+        # One key names one stored object.
+        if multiplier != entry.objects_per_page:
             raise ValueError(
                 f"UMBP pool {transfer.name} produced {multiplier} keys per page "
-                f"but its layout yields {entries_per_page} objects per page "
+                f"but its layout yields {entry.objects_per_page} objects per page "
                 f"(packed={entry.packed}, components={len(entry.components)})."
             )
         # No layer suffix: one object per page (or per page component) holds
@@ -405,8 +403,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return component_keys, multiplier
 
     def _page_exists(self, page_keys: list[str], transfer: PoolTransfer) -> list[bool]:
-        entry = self.pools[transfer.name]
-        objects_per_page = 1 if entry.packed else len(entry.components)
+        objects_per_page = self.pools[transfer.name].objects_per_page
         max_objects = CHUNK_PAGES * self.num_layers
         pages_per_call = max(1, max_objects // objects_per_page)
 
@@ -532,25 +529,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         cpu_indices: dict[int, torch.Tensor] = {}
         for name, transfers in grouped.items():
             entry = self.pools[name]
-            entries_per_page = 1 if entry.packed else len(entry.components)
+            entries_per_page = entry.objects_per_page
             keys: list[str] = []
             locations: list[int] = []
             for transfer in transfers:
-                page_keys = list(transfer.keys or [])
-                transfer_keys, multiplier = self._object_keys_for_pages(
-                    page_keys, transfer
+                transfer_keys, _ = self._object_keys_for_pages(
+                    list(transfer.keys or []), transfer
                 )
-                if multiplier != entries_per_page:
-                    raise ValueError(
-                        f"UMBP pool {name} emits {multiplier} keys per page but "
-                        f"its layout yields {entries_per_page} objects per page "
-                        f"(packed={entry.packed})."
-                    )
-                if len(transfer_keys) != len(page_keys) * entries_per_page:
-                    raise ValueError(
-                        f"UMBP pool {name} key count mismatch: "
-                        f"keys={len(transfer_keys)} pages={len(page_keys)}."
-                    )
                 keys.extend(transfer_keys)
                 indices = transfer.host_indices
                 if indices is None:
@@ -738,15 +723,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         rows = np.asarray(plan.locations, dtype=np.int64)
         if not rows.size:
             return [], [], []
-        expected = len(rows) * plan.entries_per_page
-        if expected != len(plan.keys):
-            # One object per key, so a mismatch means pointers would be paired
-            # with the wrong objects rather than anything failing loudly.
-            raise ValueError(
-                f"UMBP pool {plan.name} has {len(plan.keys)} keys for "
-                f"{len(rows)} rows at {plan.entries_per_page} per page."
-            )
-
         if self.pools[plan.name].packed:
             # One object per page, its ranges running (layer, component).
             flat = [item for layer_items in items for item in layer_items]

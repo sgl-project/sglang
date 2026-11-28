@@ -81,6 +81,11 @@ class DevicePoolEntry:
                 offset += size
             self._component_offsets.append(offsets)
 
+    @property
+    def objects_per_page(self) -> int:
+        # A packed entry stores a whole page as one object.
+        return 1 if self.packed else len(self.components)
+
     def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
         return self.kv_buffer
 
