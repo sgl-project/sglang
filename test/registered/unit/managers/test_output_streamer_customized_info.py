@@ -3,6 +3,7 @@ import pickle
 import time
 import unittest
 from array import array
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -17,6 +18,7 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskStatus,
 )
 from sglang.srt.managers import io_struct
+from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.incremental_detokenize import DetokenizeState
 from sglang.srt.managers.io_struct import (
     DetokenizeReleaseReq,
@@ -970,6 +972,93 @@ class TestOutputStreamerStreamInterval(unittest.TestCase):
                     accumulator.accept(req=req)
                     sent.append(len(accumulator.output_ids_flat))
                 self.assertEqual(sent, expected)
+
+
+class _CharTokenizer:
+    """Token id i decodes to chr(i), so text offsets equal token offsets."""
+
+    eos_token_id = None
+    additional_stop_token_ids = None
+
+    def encode(self, text, **kwargs):
+        return [ord(c) for c in text]
+
+    def decode(self, ids, **kwargs):
+        return "".join(map(chr, ids))
+
+
+class TestOutputStreamerStopStrHold(unittest.TestCase):
+    """A stop string that straddles a forced intermediate output of a
+    non-streaming request must not leak into the returned text."""
+
+    def setUp(self):
+        _enter_streamer_scope(self)
+
+    def _client_text(self, filler_len, stop_str, stream):
+        tokenizer = _CharTokenizer()
+        sampling_params = SamplingParams(
+            max_new_tokens=200, stop=[stop_str], skip_special_tokens=False
+        )
+        sampling_params.normalize(tokenizer)
+        req = Req("r", "", array("q", range(7)), sampling_params, stream=stream)
+        req.tokenizer = tokenizer
+        trim = partial(
+            DetokenizerManager.trim_matched_stop,
+            SimpleNamespace(is_tool_call_parser_gpt_oss=False, tool_close_token_ids=()),
+        )
+        state, text = None, ""
+        for token in [ord("a")] * filler_len + [ord(c) for c in stop_str]:
+            req.output_ids.append(token)
+            req.update_finish_state()
+            accumulator = _accumulator()
+            accumulator.default_force_stream_interval = 50
+            accumulator.accept(req=req)
+            if not accumulator.rids:
+                continue
+            [header] = accumulator.detokenize_headers
+            if header is not None:
+                state = DetokenizeState.from_header(header=header, vocab_size=None)
+            state.append_row(
+                rid=req.rid,
+                output_ids=list(accumulator.output_ids_flat),
+                completion_tokens=accumulator.completion_tokens[0],
+                is_beam=False,
+                vocab_size=None,
+            )
+            [finished_reason] = accumulator.finished_reasons
+            read_ids, surr_ids = state.decode_inputs(
+                finished_reason=finished_reason, trim_matched_stop=trim
+            )
+            text += state.step(
+                read_text=tokenizer.decode(read_ids),
+                surr_text=tokenizer.decode(surr_ids),
+                finished_reason=finished_reason,
+                trim_matched_stop=trim,
+            )
+        self.assertTrue(req.finished())
+        return text
+
+    def test_stop_str_across_forced_output_does_not_leak(self):
+        # The forced output lands after token 50, inside the stop string.
+        for split in range(1, 4):
+            for stream in (False, True):
+                with self.subTest(split=split, stream=stream):
+                    self.assertEqual(
+                        self._client_text(50 - split, "\nzzz", stream),
+                        "a" * (50 - split),
+                    )
+
+    def test_forced_output_without_stop_prefix_still_goes_out(self):
+        tokenizer = _CharTokenizer()
+        sampling_params = SamplingParams(max_new_tokens=200, stop=["\nzzz"])
+        sampling_params.normalize(tokenizer)
+        req = Req("r", "", array("q", range(7)), sampling_params, stream=False)
+        req.tokenizer = tokenizer
+        req.output_ids.extend([ord("a")] * 50)
+        accumulator = _accumulator()
+        accumulator.default_force_stream_interval = 50
+        accumulator.accept(req=req)
+        self.assertEqual(accumulator.rids, ["r"])
 
 
 _IPC_ROUND_TRIPS = {
