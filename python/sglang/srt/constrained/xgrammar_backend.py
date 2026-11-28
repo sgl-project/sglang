@@ -61,6 +61,8 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
+# Older xgrammar releases (e.g. the 0.1.33 pinned for Intel XPU) cannot compile Lark.
+_XGRAMMAR_SUPPORTS_LARK = hasattr(GrammarCompiler, "compile_lark")
 
 
 def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
@@ -73,6 +75,26 @@ def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
         dtype=bitmask_dtype,
         pin_memory=is_pin_memory_available(),
     )
+
+
+def _apply_token_bitmask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+    if logits.device.type in {"cuda", "xpu", "musa"}:
+        if _is_hip:
+            apply_token_bitmask_inplace_cuda(logits, vocab_mask)
+        else:
+            apply_token_bitmask_inplace_triton(logits, vocab_mask)
+    elif logits.device.type == "npu":
+        from sgl_kernel_npu.operators.sampler import apply_token_bitmask
+
+        apply_token_bitmask(logits, vocab_mask)
+    elif logits.device.type == "cpu":
+        # Used by the MLX backend, which builds its additive mask rows
+        # on the CPU before inserting them into the lazy graph.
+        from xgrammar import apply_token_bitmask_inplace
+
+        apply_token_bitmask_inplace(logits, vocab_mask, backend="cpu")
+    else:
+        raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
 
 class XGrammarGrammar(BaseGrammarObject):
@@ -145,23 +167,7 @@ class XGrammarGrammar(BaseGrammarObject):
         return vocab_mask.to(device, non_blocking=True)
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if logits.device.type in {"cuda", "xpu", "musa"}:
-            if _is_hip:
-                apply_token_bitmask_inplace_cuda(logits, vocab_mask)
-            else:
-                apply_token_bitmask_inplace_triton(logits, vocab_mask)
-        elif logits.device.type == "npu":
-            from sgl_kernel_npu.operators.sampler import apply_token_bitmask
-
-            apply_token_bitmask(logits, vocab_mask)
-        elif logits.device.type == "cpu":
-            # Used by the MLX backend, which builds its additive mask rows
-            # on the CPU before inserting them into the lazy graph.
-            from xgrammar import apply_token_bitmask_inplace
-
-            apply_token_bitmask_inplace(logits, vocab_mask, backend="cpu")
-        else:
-            raise RuntimeError(f"Unsupported device: {logits.device.type}")
+        _apply_token_bitmask(logits, vocab_mask)
 
     def copy(self):
         matcher = GrammarMatcher(
@@ -296,17 +302,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if logits.device.type in {"cuda", "xpu", "musa"}:
-            if _is_hip:
-                apply_token_bitmask_inplace_cuda(logits, vocab_mask)
-            else:
-                apply_token_bitmask_inplace_triton(logits, vocab_mask)
-        elif logits.device.type == "npu":
-            from sgl_kernel_npu.operators.sampler import apply_token_bitmask
-
-            apply_token_bitmask(logits, vocab_mask)
-        else:
-            raise RuntimeError(f"Unsupported device: {logits.device.type}")
+        _apply_token_bitmask(logits, vocab_mask)
 
     @staticmethod
     def set_token_filter(
@@ -407,10 +403,24 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
         try:
             ctx = self.grammar_compiler.compile_grammar(key_string)
-        except RuntimeError as e:
-            logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
-            return InvalidGrammarObject(str(e))
-        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
+            dispatch_type = "ebnf"
+        except RuntimeError as ebnf_error:
+            if not _XGRAMMAR_SUPPORTS_LARK:
+                logger.error(f"Hit invalid ebnf: {key_string=}, {ebnf_error=}")
+                return InvalidGrammarObject(str(ebnf_error))
+            try:
+                ctx = self.grammar_compiler.compile_lark(key_string)
+                dispatch_type = "lark"
+            except RuntimeError as lark_error:
+                error_message = (
+                    f"Failed to compile grammar as EBNF ({ebnf_error}) "
+                    f"or Lark ({lark_error})"
+                )
+                logger.error(f"Hit invalid grammar: {key_string=}, {error_message}")
+                return InvalidGrammarObject(error_message)
+        return self._from_context(
+            ctx, key_string, GrammarStats(dispatch_type=dispatch_type)
+        )
 
     def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         try:

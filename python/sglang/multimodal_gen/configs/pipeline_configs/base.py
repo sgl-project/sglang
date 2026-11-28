@@ -235,6 +235,18 @@ class PipelineConfig:
         # return the model-specific config for optimal deployment setting
         return ModelDeploymentConfig()
 
+    def extra_dit_components(self, server_args: Any) -> tuple[str, ...]:
+        """DiTs this deployment loads next to the checkpoint's ``transformer``
+        that model_index.json does not list, for the automatic memory policy."""
+        del server_args
+        return ()
+
+    def unloaded_checkpoint_components(self, server_args: Any) -> tuple[str, ...]:
+        """model_index.json components this deployment does not load, for the
+        automatic memory policy."""
+        del server_args
+        return ()
+
     def get_supported_task_types(self) -> tuple[ModelTaskType, ...]:
         """Return the tasks implemented by this configured pipeline.
 
@@ -425,6 +437,11 @@ class PipelineConfig:
 
     def slice_noise_pred(self, noise, latents):
         return noise
+
+    def batch_cfg_branch_kwargs(self, cond_kwargs, uncond_kwargs):
+        """DiT kwargs that run the [cond, uncond] CFG branches as one batch-2
+        forward, or None when the model cannot batch them."""
+        return None
 
     def adjust_num_frames(self, num_frames, *, log_adjustment: bool = True):
         return num_frames

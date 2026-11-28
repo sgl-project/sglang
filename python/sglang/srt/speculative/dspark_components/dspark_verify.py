@@ -45,16 +45,11 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
-from sglang.srt.sampling.sampling_batch_info import (
-    adjusts_logits,
-    need_truncated_sampling,
-)
+from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import (
-    apply_dflash_verify_logits_adjustments,
-    build_speculative_verify_target_probs,
-)
+from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
     DeferredDraftKVStore,
 )
@@ -62,10 +57,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResu
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
-from sglang.srt.speculative.dspark_components.dspark_planner import (
-    VerifyWindow,
-    apply_logits_adjustments_strided,
-)
+from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -110,12 +102,6 @@ def draft_folds_static_commit(
         and draft.key == target.key
         and target.write is None
     )
-
-
-def verify_logits_adjustments_are_noop(sampling_info, *, has_grammar: bool) -> bool:
-    if sampling_info is None:
-        return not has_grammar
-    return not adjusts_logits(sampling_info, has_grammar=has_grammar)
 
 
 class TargetVerifyResult(msgspec.Struct, frozen=True):
@@ -198,6 +184,7 @@ class TargetVerifyExecutor:
         target_logits: Optional[torch.Tensor],
         draft_block: DraftBlockResult,
         sampling_info,
+        route: VerifyRoute,
         draft_input: DFlashDraftInputV2,
         layout: Optional[RaggedVerifyLayout],
         prefix_lens: torch.Tensor,
@@ -219,6 +206,7 @@ class TargetVerifyExecutor:
             target_logits=target_logits,
             draft_block=draft_block,
             sampling_info=sampling_info,
+            route=route,
             draft_input=draft_input,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
@@ -308,11 +296,12 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        if not _is_npu:
+            verify_forward_batch.mark_forward_metadata_ready()
         self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True if not _is_npu else None,
         )
 
     def run_non_compact(
@@ -322,7 +311,6 @@ class TargetVerifyExecutor:
         draft_input: DFlashDraftInputV2,
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
-        sampling_info,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -353,22 +341,12 @@ class TargetVerifyExecutor:
                 batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
                 batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
-        result = self._forward_prepared_verify(
+        return self._forward_prepared_verify(
             batch=batch,
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
-
-        if sampling_info is not None:
-            apply_dflash_verify_logits_adjustments(
-                next_token_logits=result.logits_output.next_token_logits,
-                sampling_info=sampling_info,
-                draft_token_num=verify_w,
-                verify_tokens=verify_ids_2d,
-            )
-
-        return result
 
     def _forward_prepared_verify(
         self,
@@ -388,11 +366,12 @@ class TargetVerifyExecutor:
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
+        if not _is_npu:
+            verify_forward_batch.mark_forward_metadata_ready()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True if not _is_npu else None,
         )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
@@ -453,7 +432,6 @@ class TargetVerifyExecutor:
         batch: ScheduleBatch,
         layout: RaggedVerifyLayout,
         ragged_window: RaggedVerifyWindow,
-        sampling_info,
         iteration_ids,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
@@ -498,21 +476,14 @@ class TargetVerifyExecutor:
         draft_tokens: torch.Tensor,
         bs: int,
         device: str,
-        sampling_info,
         verify_window: VerifyWindow,
         inject_gate: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         stride = self.verify_num_draft_tokens
         full_block = layout.is_full_block(stride)
-        # [bs, stride] block input tokens, the anchor then the drafts; built only
-        # where read: a full block's verify ids, or the penalties.
-        verify_ids_2d = None
-        if full_block or (
-            sampling_info is not None and sampling_info.step_penalties is not None
-        ):
-            verify_ids_2d = torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
         if full_block:
             # Nothing to pack: the verify rows are the verify window.
+            verify_ids_2d = torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
             ragged_window = RaggedVerifyWindow(
                 positions=verify_window.positions_2d.reshape(-1),
                 verify_cache_loc=verify_window.verify_cache_loc,
@@ -536,7 +507,6 @@ class TargetVerifyExecutor:
             batch=batch,
             layout=layout,
             ragged_window=ragged_window,
-            sampling_info=sampling_info,
             iteration_ids=verify_window.iteration_ids,
         )
         logits_output = target_verify.logits_output
@@ -573,12 +543,6 @@ class TargetVerifyExecutor:
                     fill_value=0.0,
                     verify_num_draft_tokens=stride,
                 )
-        apply_logits_adjustments_strided(
-            next_token_logits=strided_logits,
-            sampling_info=sampling_info,
-            verify_num_draft_tokens=stride,
-            verify_tokens=verify_ids_2d,
-        )
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided
         return target_verify, hidden_strided
@@ -1272,8 +1236,8 @@ def sample_simulated_bonus(
     seed: int,
 ) -> torch.Tensor:
     """The bonus token at the (simulated) correct_len row, drawn from the target
-    distribution the sampling accept uses: temperature, then top-k / top-p."""
-    if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
+    distribution the sampling accept uses: temperature, then top-k / top-p / min-p."""
+    if need_truncated_sampling(sampling_info):
         probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits.index_select(
                 0, _simulated_rows(correct_len, verify_num_draft_tokens)
@@ -1304,7 +1268,7 @@ def _simulated_rows(correct_len: torch.Tensor, rows_per_request: int) -> torch.T
 
 
 def _accepts_on_shards(
-    draft_block: DraftBlockResult, sampling_info, block_verification: bool
+    draft_block: DraftBlockResult, route: VerifyRoute, block_verification: bool
 ) -> bool:
     # The sharded accept is a Triton chain rule on temperature-only target
     # probabilities; block verification and truncated sampling need the whole vocab.
@@ -1314,7 +1278,7 @@ def _accepts_on_shards(
         shard is not None
         and not getattr(draft_block, "greedy_draft", False)
         and not block_verification
-        and not need_truncated_sampling(sampling_info)
+        and not route.need_truncated_sampling
     )
 
 
@@ -1341,14 +1305,14 @@ def _note_blockwise_rejection() -> None:
 
 def _blockwise_rejection_applies(
     *,
-    sampling_info,
+    route: VerifyRoute,
     rejection_noise: Optional[RejectionNoise],
     block_verification: bool,
 ) -> bool:
     return (
         rejection_noise is not None
         and not block_verification
-        and not need_truncated_sampling(sampling_info)
+        and not route.need_truncated_sampling
     )
 
 
@@ -1378,6 +1342,7 @@ def accept_draft_tokens(
     target_logits: torch.Tensor,
     draft_block: DraftBlockResult,
     sampling_info,
+    route: VerifyRoute,
     draft_input: DFlashDraftInputV2,
     gamma: int,
     verify_num_draft_tokens: int,
@@ -1395,7 +1360,7 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
-    if _accepts_on_shards(draft_block, sampling_info, block_verification):
+    if _accepts_on_shards(draft_block, route, block_verification):
         # Block-wise rejection scans the whole draft vocab. This kernel is the
         # same chain rule and reads the draft logits on the local shard.
         shard = draft_block.vocab_shard
@@ -1412,7 +1377,7 @@ def accept_draft_tokens(
             verify_lens=cutoff_verify_lens,
         )
     elif _blockwise_rejection_applies(
-        sampling_info=sampling_info,
+        route=route,
         rejection_noise=rejection_noise,
         block_verification=block_verification,
     ):

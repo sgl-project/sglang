@@ -28,7 +28,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.kernels.ops.communication.ipc_a2a import load_ipc_a2a_sync
-from sglang.kernels.ops.diffusion import copy_head_groups
+from sglang.kernels.ops.diffusion import copy_head_groups, prebuild_copy_head_groups
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     _Unsupported,
@@ -437,6 +437,8 @@ class IpcA2AMultiState:
         # call shapes -> the plan they resolve to, None when they cannot
         # pipeline; repeated calls skip straight to the answer
         self.plans = {}
+        # (dtype, row width) of the head-group copies already compiled
+        self.prebuilt = set()
         # dtype -> the _PipelinePool every pipelined call of that dtype uses
         self.pools = {}
         # ("pipeline", plan, dtype) -> its _PipelineSlots
@@ -1051,6 +1053,23 @@ class IpcA2AMultiState:
             return self._first_sight(check, merged, reference)
         return merged
 
+    def _prebuild_group_copies(self, plan: _PipelinePlan, dtype) -> None:
+        """Compile the head-group copy for every group count these heads can
+        pipeline with: a shorter sequence picks fewer groups, so wider rows,
+        which the warm-up may not meet (Ulysses 4: one width first met by a
+        request)."""
+        counts = {plan.groups} if plan.groups > 0 else set(_AUTO_PIPELINE_GROUPS)
+        widths = {
+            h // (plan.world * n) * plan.head_dim
+            for h in plan.heads
+            for n in counts
+            if h % (plan.world * n) == 0
+        }
+        new = {w for w in widths if (dtype, w) not in self.prebuilt}
+        if new:
+            prebuild_copy_head_groups(new, dtype, torch.cuda.current_device())
+            self.prebuilt.update((dtype, w) for w in new)
+
     def _plan(self, q, k, v, replicated, replicated_first, groups, filled):
         """The plan these shapes pipeline with, or None; rank-independent."""
         world = self.world
@@ -1080,6 +1099,7 @@ class IpcA2AMultiState:
             world=world,
             groups=groups,
         )
+        self._prebuild_group_copies(plan, q.dtype)
         if groups < 0:
             plan = dataclasses.replace(plan, groups=_auto_pipeline_groups(plan))
         if not plan.groups or any(h % (world * plan.groups) for h in plan.heads):

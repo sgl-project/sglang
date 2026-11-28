@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
 )
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 from sglang.srt.utils.common import human_readable_int
 
 
@@ -78,11 +79,12 @@ class Schedule(msgspec.Struct):
         int,
         Arg(
             help=(
-                "The maximum number of tokens in a prefill batch. The real bound "
-                "will be the maximum of this value and the model's maximum "
-                "context length." + f"\n\n{human_readable_int.__doc__}"
+                "The maximum number of tokens in a prefill batch. Automatically "
+                "raised to at least the resolved chunked prefill size."
+                + f"\n\n{human_readable_int.__doc__}"
             ),
             type_parser=human_readable_int,
+            resolvable=True,
         ),
     ] = 16384
     prefill_max_requests: A[
@@ -233,9 +235,14 @@ class Schedule(msgspec.Struct):
         ),
     ] = False
     num_continuous_decode_steps: A[
-        int,
-        "Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time.",
-    ] = 1
+        Optional[int],
+        Arg(
+            help="Deprecated. Has no effect.",
+            action=DeprecatedAction,
+            action_kwargs={"nargs": None, "type": int},
+            resolvable=True,
+        ),
+    ] = None
     scheduler_recv_interval: A[
         int,
         "The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this.",

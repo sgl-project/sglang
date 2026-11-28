@@ -82,16 +82,17 @@ jobs:
   unit-test-coverage:
     name: Unit Test Code Coverage
     runs-on: 1-gpu-h100
-    # ~6 min install + ~22 min of tests, and the suite keeps growing
+    # The editable install builds the Rust extensions from scratch (8 to 10+
+    # min, by runner), then ~32 min of tests, and the suite keeps growing
     # (7.7k collected items in Aug, 11k now).
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain + protoc
         # Editable install of sglang triggers `build_rust` for the bundled
-        # native gRPC extension (rust/sglang-grpc). The 1-gpu-h100 runner
+        # Rust extensions (rust/sglang-mm, rust/sglang-server). The 1-gpu-h100 runner
         # image has no Rust toolchain by default, which is why this job has
         # been failing on every scheduled run. Use the same helper that
         # ci_install_dependency.sh uses so the install path matches the
@@ -101,7 +102,7 @@ jobs:
           echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
 
       - name: Install dependencies
-        timeout-minutes: 10
+        timeout-minutes: 25
         # Keep this unpinned resolve out of /opt/sglang-ci-py*, which gated jobs reuse;
         # `python3 -m uv` runs the uv just upgraded, not an older one on PATH.
         run: |

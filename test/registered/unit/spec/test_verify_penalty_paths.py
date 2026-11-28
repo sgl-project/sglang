@@ -4,12 +4,13 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.penalties import PenaltyStatusPool
+from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative import dflash_utils, eagle_utils
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+from sglang.srt.speculative import eagle_utils
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.sampling_test_utils import build_step_penalties
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -17,7 +18,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 VOCAB_SIZE = 16
 
 
-class _StopAfterPenalties(Exception):
+class _Stop(Exception):
     pass
 
 
@@ -33,7 +34,7 @@ def _step(num_reqs):
     pool = PenaltyStatusPool(VOCAB_SIZE, "cpu")
     pool.alloc(reqs)
     pool.reset_history(reqs)
-    return StepPenalties.build(reqs, pool)
+    return build_step_penalties(reqs, pool)
 
 
 def _sampling_info(bs):
@@ -55,6 +56,16 @@ def _sampling_info(bs):
 def _row_counts(logits, tokens):
     """Each row's count of `tokens`, read back from a frequency penalty of 1."""
     return (-logits[:, tokens]).round().long().tolist()
+
+
+def _verify(batch, grammar_mask=None):
+    return VerifyStep(
+        batch=batch,
+        route=VerifyRoute(adjusts_logits=True, need_truncated_sampling=False),
+        watermark=None,
+        watermark_full_mask=True,
+        grammar_mask=grammar_mask,
+    )
 
 
 class TestVerifyPenaltyPaths(CustomTestCase):
@@ -81,55 +92,74 @@ class TestVerifyPenaltyPaths(CustomTestCase):
 
         def apply_then_stop(*args, **kwargs):
             apply_verify(*args, **kwargs)
-            raise _StopAfterPenalties
+            raise _Stop
 
         with patch.object(step, "apply_verify", side_effect=apply_then_stop):
-            with self.assertRaises(_StopAfterPenalties):
-                eagle_utils.eagle_sample(verify_input, batch, logits_output)
+            with self.assertRaises(_Stop):
+                eagle_utils.eagle_sample(verify_input, _verify(batch), logits_output)
 
         self.assertEqual(
             _row_counts(logits_output.next_token_logits, [5, 6, 9]),
             [[0, 0, 0], [1, 0, 0], [0, 1, 0], [2, 0, 0]],
         )
 
-    def test_dflash_block_verify_applies_the_custom_processor_last(self):
-        """Decoding's order: penalties, grammar mask, logit bias, custom processor."""
+    def test_eagle_sample_adjusts_in_decoding_order_per_request_tree(self):
         bs, width = 2, 3
         verify_tokens = torch.tensor([[9, 5, 5], [9, 6, 5]])
-        banned = torch.zeros(bs, VOCAB_SIZE, dtype=torch.bool)
-        banned[0, 4] = banned[1, 6] = True
-        info = _sampling_info(bs)
-        info.step_penalties = _step(bs)
-        info.grammar_mask = SimpleNamespace(
+        next_child = torch.tensor([[1, 2, -1]] * bs)
+        next_sibling = torch.full((bs, width), -1)
+        banned = torch.zeros(bs * width, VOCAB_SIZE, dtype=torch.bool)
+        banned[:width, 4] = banned[width:, 6] = True
+        grammar_mask = SimpleNamespace(
             apply=lambda t: t.masked_fill_(banned, float("-inf"))
         )
+        info = _sampling_info(bs)
+        info.step_penalties = _step(bs)
         generator = torch.Generator().manual_seed(0)
         info.logit_bias = torch.randn(bs, VOCAB_SIZE, generator=generator)
-        info.has_custom_logit_processor = True
         logits = (torch.randn(bs * width, VOCAB_SIZE, generator=generator) * 4).to(
             torch.bfloat16
         )
 
         expected = logits.clone()
-        info.step_penalties.apply_verify(expected, verify_tokens)
-        by_request = expected.view(bs, width, VOCAB_SIZE)
-        by_request.masked_fill_(banned[:, None, :], float("-inf"))
-        by_request.add_(info.logit_bias[:, None, :])
+        info.step_penalties.apply_verify(
+            expected, verify_tokens, next_child=next_child, next_sibling=next_sibling
+        )
+        expected.masked_fill_(banned, float("-inf"))
+        expected.view(bs, width, VOCAB_SIZE).add_(info.logit_bias[:, None, :])
+
+        def processor(logits, custom_params):
+            seen.append((logits.clone(), custom_params))
+            raise _Stop
 
         seen = []
-        with patch.object(
-            dflash_utils,
-            "apply_custom_logit_processor",
-            side_effect=lambda t, *_, **__: seen.append(t.clone()),
-        ):
-            apply_dflash_verify_logits_adjustments(
-                next_token_logits=logits,
-                sampling_info=info,
-                draft_token_num=width,
-                verify_tokens=verify_tokens,
+        info.has_custom_logit_processor = True
+        info.custom_params = [{"req": 0}, {"req": 1}]
+        info.custom_logit_processor = {
+            0: ProcessorEntry(processor=processor, rows=[1], indices=torch.tensor([1]))
+        }
+        verify_input = SimpleNamespace(
+            draft_token_num=width,
+            draft_token=verify_tokens.reshape(-1),
+            retrieve_next_token=next_child,
+            retrieve_next_sibling=next_sibling,
+        )
+        batch = SimpleNamespace(
+            device="cpu",
+            seq_lens=torch.tensor([4, 4]),
+            sampling_info=info,
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+        )
+        logits_output = SimpleNamespace(
+            next_token_logits=logits, next_token_logits_vocab_shard=None
+        )
+        with self.assertRaises(_Stop):
+            eagle_utils.eagle_sample(
+                verify_input, _verify(batch, grammar_mask), logits_output
             )
         self.assertEqual(len(seen), 1)
-        self.assertTrue(torch.equal(seen[0], expected))
+        self.assertTrue(torch.equal(seen[0][0], expected[width:]))
+        self.assertEqual(seen[0][1], [{"req": 1}] * width)
 
 
 if __name__ == "__main__":

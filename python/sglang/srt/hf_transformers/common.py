@@ -42,6 +42,7 @@ from sglang.srt.configs.all_configs import (
     FalconH1Config,
     FalconMambaConfig,
     FlintConfig,
+    GigaChat4Config,
     GigaChat35Config,
     Glm5NextConfig,
     Glm5NextTextConfig,
@@ -102,7 +103,11 @@ from sglang.srt.configs.all_configs import (
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.deepseek_v41 import DEEPSEEK_V41_CONFIG_CLASSES
-from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2ModelConfig
+from sglang.srt.configs.inkling2 import (
+    Inkling2LoopMMConfig,
+    Inkling2MMConfig,
+    Inkling2ModelConfig,
+)
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
@@ -156,6 +161,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         FalconMambaConfig,
         Mamba2Config,
         MambaConfig,
+        GigaChat4Config,
         GigaChat35Config,
         GraniteMoeHybridConfig,
         HYV4Config,
@@ -192,6 +198,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MiniCPMV4_7Config,
         InklingModelConfig,
         Inkling2MMConfig,
+        Inkling2LoopMMConfig,
         Inkling2ModelConfig,
         InklingAudioConfig,
         InklingVisionConfig,
@@ -351,6 +358,7 @@ for _cosmos3_edge_config_cls in (
 def download_from_hf(
     model_path: str,
     allow_patterns: Optional[Union[str, list]] = None,
+    revision: Optional[str] = None,
 ):
     if os.path.exists(model_path):
         return model_path
@@ -358,7 +366,9 @@ def download_from_hf(
     if not allow_patterns:
         allow_patterns = ["*.json", "*.bin", "*.model"]
 
-    return snapshot_download(model_path, allow_patterns=allow_patterns)
+    return snapshot_download(
+        model_path, allow_patterns=allow_patterns, revision=revision
+    )
 
 
 def resolve_runai_obj_uri(model_name_or_path: str) -> str:
@@ -671,7 +681,7 @@ def _override_v_head_dim_if_zero(config: PretrainedConfig, patch: int = 128) -> 
 
 
 # ---------------------------------------------------------------------------
-# Context length / generation config / sparse attention
+# Context length / generation config
 # ---------------------------------------------------------------------------
 
 # Models don't use the same configuration key for determining the maximum

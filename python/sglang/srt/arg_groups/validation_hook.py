@@ -20,7 +20,11 @@ from sglang.srt.arg_groups.choices import (
     WATERMARK_ALGORITHM_CHOICES,
     removed_choice_message,
 )
-from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
+from sglang.srt.arg_groups.model_override_base import (
+    ep_offset_joiner_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
     declare_resolution,
@@ -125,6 +129,7 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "ssl_keyfile_password",
     "enable_ssl_refresh",
     "allowed_media_domains",
+    "allow_private_media_hosts",
     # The Rust media fetcher caps a download at this field's default, 64 MiB.
     "media_url_max_file_size_mb",
     "enable_trace",
@@ -289,8 +294,8 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
-    # Check parallel size constraints
-    if cfg.ep_join_mode != "scale":
+    # Check parallel size constraints (offset joiners run per-cohort tp_size).
+    if not ep_offset_joiner_of(cfg):
         assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (
             "tp_size must be divisible by number of nodes"
         )
@@ -994,6 +999,11 @@ def validate_removed_options(server_args: Any):
     The CLI rejects a removed value while parsing; this covers the Python API.
     """
     cfg = resolving_view(server_args)
+    if cfg.num_continuous_decode_steps is not None:
+        logger.warning("num_continuous_decode_steps is deprecated and has no effect.")
+        declare_resolution(
+            server_args, "validate_removed_options", num_continuous_decode_steps=None
+        )
     for field in REMOVED_CHOICES:
         message = removed_choice_message(field, getattr(cfg, field))
         if message is not None:
