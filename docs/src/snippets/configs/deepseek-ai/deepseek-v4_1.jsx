@@ -17,11 +17,12 @@ export const config = {
 
   latencyPercentile: "P50",
 
-  supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x", "rtxpro6000"],
+  supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x", "rtxpro6000", "a3", "a5"],
 
   // RTX PRO 6000 (SM120, Blackwell workstation) is not in the shared catalog.
   hardware: [
     { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
+    { id: "a5", label: "Ascend A5", vram: "96GB", vendor: "ascend" },
   ],
 
   variants: [
@@ -30,9 +31,11 @@ export const config = {
   ],
   quantizations: [
     { id: "fp4", label: "FP4" },
+    { id: "w8a8", label: "W8A8" },
   ],
   strategies: [
     { id: "low-latency", label: "Low-Latency" },
+    { id: "balanced", label: "Balanced" },
     { id: "high-throughput", label: "High-Throughput" },
   ],
   nodesOptions: [
@@ -42,19 +45,26 @@ export const config = {
   modelNames: {
     "flash|fp4": "deepseek-ai/DeepSeek-V4.1-Flash",
     "flash-1017|fp4": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "flash-1017|w8a8": "Eco-Tech/DeepSeek-V4.1-Flash-1017-w8a8",
   },
 
   placeholders: {
     HOST_IP:   { target: "command", label: "Bind host",         default: "0.0.0.0"         },
     PORT:      { target: "command", label: "Bind port",         default: "30000"           },
     HF_TOKEN:  { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
+    A3_MODEL_PATH: { target: "command", label: "A3 model path", default: "/path/to/DeepSeek-V4.1-Flash-1017-w8a8", showWhen: (s) => s.hw === "a3" },
+    MODEL_PATH: { target: "command", label: "A5 model path", default: "/path/to/dsv4.1-1017", showWhen: (s) => s.hw === "a5" },
+    NODE0_IP: { target: "command", label: "A5 node IP", default: "<node-ip>", showWhen: (s) => s.hw === "a5" },
+    NODE_RANK: { target: "command", label: "A5 node rank", default: "0", showWhen: (s) => s.hw === "a5" },
+    HCCL_INTERFACE: { target: "command", label: "A5 HCCL interface", default: "lo", showWhen: (s) => s.hw === "a5" },
+    GLOO_INTERFACE: { target: "command", label: "A5 GLOO interface", default: "data0.3001", showWhen: (s) => s.hw === "a5" },
     CURL_HOST: { target: "curl",    label: "Server host",       default: "localhost"       },
     CURL_PORT: { target: "curl",    label: "Server port",       default: "30000"           },
   },
 
-  curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
+  curl: (sel) => `curl http://{{CURL_HOST}}:${sel.hw === "a3" ? "8001" : "{{CURL_PORT}}"}/v1/chat/completions \\
 -H 'Content-Type: application/json' \\
--d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
+-d '{ "model": "${sel.hw === "a5" ? "dsv4" : sel.hw === "a3" ? "{{A3_MODEL_PATH}}" : "{{MODEL_NAME}}"}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
   dockerImages: {
     h200:  "lmsysorg/sglang:latest",
@@ -66,6 +76,24 @@ export const config = {
     rtxpro6000: "lmsysorg/sglang:nightly-dev-20261119-6b374a55",
   },
 
+  // Initialize the Ascend environment before launching on A5.
+  pythonSetupCommand: (sel) => sel.hw === "a5"
+    ? `source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh &&
+source /usr/local/Ascend/nnal/atb/set_env.sh &&
+if [[ -f /usr/local/memfabric_hybrid/set_env.sh ]]; then source /usr/local/memfabric_hybrid/set_env.sh; fi`
+    : "",
+  pythonCommand: (sel) => sel.hw === "a3" || sel.hw === "a5"
+    ? "python3 -m sglang.launch_server"
+    : "sglang serve",
+  pythonCommandNote: (sel) => sel.hw === "a3" || sel.hw === "a5"
+    ? {
+        text: "For Ascend NPU launch details, see",
+        label: "DeepSeek-V4.1-Flash Hardware guide →",
+        href: "/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v4.1_flash",
+      }
+    : null,
+  runModes: (sel) => sel.hw === "a3" || sel.hw === "a5" ? ["python"] : ["python", "docker"],
+
   github: {
     cookbookModel: "deepseek-ai/deepseek-v4.1",
   },
@@ -74,22 +102,22 @@ export const config = {
 
     attention: {
       knobs: [
-        { id: "tp", label: "TP", values: [null, 2, 4, 8] },
+        { id: "tp", label: "TP", values: [null, 2, 4, 8], showWhen: (s) => s.hw !== "a5" },
       ],
     },
 
     // No backend chooser: `flashinfer_mxfp4` is selected automatically and is the
     // only MoE runner this model has run on. EP tracks TP.
     moe: {
-      ep: { label: "EP", values: [null, 1, 4, 8] },
+      ep: { label: "EP", values: [null, 1, 4, 8], showWhen: (s) => s.hw !== "a5" },
     },
 
     // Both parsers default to None; without them the DSML tool-call block and the
     // thinking block arrive as raw text inside `content`.
     parsers: {
       items: [
-        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser auto" },
-        { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser auto" },
+        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser auto", showWhen: (s) => s.hw !== "a5" },
+        { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser auto", showWhen: (s) => s.hw !== "a5" },
       ],
     },
 
@@ -99,8 +127,12 @@ export const config = {
       options: [
         { id: "current", label: "Inherited from base" },
         { id: "off",     label: "Off (greedy)" },
-        { id: "dspark",  label: "DSpark",
+        { id: "dspark", label: "DSpark", showWhen: (s) => s.hw !== "a5",
           flags: ["--speculative-algorithm DSPARK", "--speculative-dspark-block-size 5"] },
+        { id: "dspark-a5", label: "DSpark (Ascend)", showWhen: (s) => s.hw === "a5",
+          flags: ["--speculative-algorithm DSPARK", "--speculative-draft-attention-backend ascend",
+            "--speculative-num-draft-tokens 6", "--speculative-dspark-block-size 5"],
+          env: ["SGLANG_ENABLE_SPEC_V2=1", "SGLANG_RAGGED_VERIFY_MODE=static", "SGLANG_DSPARK_FAST_KERNEL=0"] },
       ],
     },
 
@@ -132,7 +164,7 @@ export const config = {
     // GPU → CPU KV offload (L2 only; no storage tier). Hidden on MI355X: not
     // validated on ROCm for this model yet.
     hicache: {
-      excludesHw: ["mi355x"],
+      excludesHw: ["mi355x", "a5"],
       writePolicies: [
         { id: "auto",                    label: "Auto" },
         { id: "write_through",           label: "Write-through" },
@@ -680,6 +712,103 @@ export const config = {
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
+      ],
+    },
+    // ---------- Ascend A5: single node, 8 NPUs, TP8 + DP8. ----------
+    {
+      match: { hw: "a3", variant: "flash-1017", quant: "w8a8", strategy: "balanced", nodes: "single" },
+      nnodes: 1,
+      verified: false,
+      verificationStatus: "in-progress",
+      flags: [
+        "--model-path {{A3_MODEL_PATH}}",
+        "--page-size 128",
+        "--tp-size 16",
+        "--trust-remote-code",
+        "--attention-backend dsv4",
+        "--device npu",
+        "--watchdog-timeout 9000",
+        "--host 0.0.0.0",
+        "--port 8001",
+        "--mem-fraction-static 0.96",
+        "--max-running-requests 16",
+        "--chunked-prefill-size 4096",
+        "--max-prefill-tokens 131072",
+        "--kv-cache-dtype auto",
+        "--enable-dp-lm-head",
+        "--cuda-graph-bs-decode 1 2",
+        "--disable-radix-cache",
+        "--attn-dp-size 8",
+        "--reasoning-parser deepseek-v4",
+        "--language-model-only",
+        `--json-model-override-args '{"architectures": ["DeepseekV4ForCausalLM"], "quantization_config": null}'`,
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path {{A3_MODEL_PATH}}",
+        "--speculative-draft-model-quantization modelslim",
+        "--speculative-draft-kv-cache-dtype bf16",
+        "--speculative-dspark-block-size 5",
+      ],
+    },
+    {
+      match: { hw: "a5", variant: "flash-1017", quant: "fp4", strategy: "balanced", nodes: "single" },
+      nnodes: 1,
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "HCCL_OP_EXPANSION_MODE=AIV",
+        "HCCL_SOCKET_IFNAME={{HCCL_INTERFACE}}",
+        "GLOO_SOCKET_IFNAME={{GLOO_INTERFACE}}",
+        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        "STREAMS_PER_DEVICE=32",
+        "SGLANG_SET_CPU_AFFINITY=1",
+        "TASK_QUEUE_ENABLE=1",
+        "INF_NAN_MODE_FORCE_DISABLE=1",
+        "SGLANG_DEFAULT_THINKING=1",
+        "HCCL_BUFFSIZE=400",
+        "DEEPEP_HCCL_BUFFSIZE=1800",
+        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
+        "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1",
+        "DEEPEP_NORMAL_LONG_SEQ_ROUND=16",
+        "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048",
+        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=150",
+        "SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False",
+        "SGLANG_DSV4_FP4_EXPERTS=True",
+        "SGLANG_OPT_FUSE_WQA_WKV=0",
+        "SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch",
+        "SGLANG_OPT_USE_FUSED_HASH_TOPK=False",
+        "SGLANG_OPT_USE_TILELANG_MHC_PRE=False",
+        "SGLANG_OPT_DEEPGEMM_HC_PRENORM=False",
+        "SGLANG_OPT_USE_TILELANG_MHC_POST=False",
+        "SGLANG_OPT_FP8_WO_A_GEMM=False",
+      ],
+      flags: [
+        "--nnodes 1",
+        "--node-rank {{NODE_RANK}}",
+        "--dist-init-addr {{NODE0_IP}}:5567",
+        "--model-path {{MODEL_PATH}}",
+        "--served-model-name dsv4",
+        "--host 0.0.0.0",
+        "--port 30000",
+        "--tp-size 8",
+        "--page-size 128",
+        "--trust-remote-code",
+        "--attention-backend dsv4",
+        "--device npu",
+        "--attn-dp-size 8",
+        "--enable-dp-lm-head",
+        "--watchdog-timeout 9000",
+        "--max-running-requests 200",
+        "--mem-fraction-static 0.83",
+        "--max-prefill-tokens 131072",
+        "--chunked-prefill-size 131072",
+        "--kv-cache-dtype auto",
+        `--json-model-override-args '{"architectures": ["DeepseekV4ForCausalLM"]}'`,
+        "--reasoning-parser deepseek-v4",
+        "--language-model-only",
+        "--moe-a2a-backend deepep",
+        "--deepep-mode auto",
+        "--enable-metrics",
+        "--cuda-graph-bs-decode 1 2 4 8 16 25",
       ],
     },
   ],

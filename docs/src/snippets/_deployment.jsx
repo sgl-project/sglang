@@ -97,7 +97,10 @@
 //   dockerMounts       optional — additional `-v` mount specs, as an array or
 //                      `(selection) => array`
 //   dockerRunCommand   optional — command placed after the image and before
-//                      generated server flags; string or `(selection) => string`
+//                      generated server flags; string or
+//                      `(selection, env) => string`
+//   pythonCommand      optional — command used in Python mode; string or
+//                      `(selection) => string`; defaults to `sglang serve`
 //   runModes           optional — command output tabs to show (`python` and/or
 //                      `docker`), as an array or `(selection) => array`;
 //                      defaults to both, in that order
@@ -177,7 +180,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     // counts feed the docker `--device` list (`npuDevices`).
     npu: [
       { id: "a3", label: "A3 Series",        vram: "64GB/die", npuDevices: 16 },
-      { id: "a5", label: "950PR/DT Series",  vram: "128GB",    npuDevices: 8  },
+      { id: "a5", label: "950PR/DT Series",  vram: "128GB / 96GB",    npuDevices: 8  },
     ],
   };
 
@@ -898,7 +901,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         || di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const dockerRunCommand = typeof config.dockerRunCommand === "function"
-        ? config.dockerRunCommand(sel)
+        ? config.dockerRunCommand(sel, cellEnv)
         : (config.dockerRunCommand || "sglang serve");
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
@@ -1007,7 +1010,14 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     } else {
       const flagBlock = flags.map((f) => "  " + f).join(" \\\n");
       const envBlock = cellEnv.length ? cellEnv.join(" \\\n") + " \\\n" : "";
-      cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
+      const pythonSetupCommand = typeof config.pythonSetupCommand === "function"
+        ? config.pythonSetupCommand(sel)
+        : (config.pythonSetupCommand || "");
+      const pythonCommand = typeof config.pythonCommand === "function"
+        ? config.pythonCommand(sel)
+        : (config.pythonCommand || "sglang serve");
+      const setupBlock = pythonSetupCommand ? `${pythonSetupCommand} &&\n` : "";
+      cmd = `${setupBlock}${envBlock}${pythonCommand} \\\n${flagBlock}`;
     }
 
     const hintLines = [
@@ -2729,6 +2739,35 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         )}
         </div>
       </div>
+      {activeRunMode === "python" && config.pythonCommandNote && (() => {
+        const note = typeof config.pythonCommandNote === "function"
+          ? config.pythonCommandNote(sel)
+          : config.pythonCommandNote;
+        return note ? (
+          <div role="note" style={{
+            padding: "6px 12px",
+            fontSize: "12px",
+            color: isDark ? "#9ca3af" : "#6b7280",
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            whiteSpace: "nowrap",
+          }}>
+            <strong style={{ color: isDark ? "#e5e7eb" : "#111827" }}>
+              {note.text}
+            </strong>{" "}
+            <a href={note.href} style={{
+              color: isDark ? "#FDBA74" : "#C2410C",
+              fontWeight: 600,
+              textDecoration: "underline",
+              textUnderlineOffset: "2px",
+              textDecorationColor: "currentColor",
+            }}>
+              {note.label}
+            </a>
+          </div>
+        ) : null;
+      })()}
 
       {/* Benchmark card (only with a `benchmarks` prop + matched cell). */}
       {benchmarks && cell && renderBenchmarkCard(benchEntry)}
