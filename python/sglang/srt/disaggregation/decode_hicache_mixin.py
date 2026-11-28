@@ -228,9 +228,6 @@ class DecodeHiCacheTransferMixin:
         if pm.l3_storage_hit_length > 0:
             if not self.tree_cache.check_prefetch_progress(dr.req.cache_request_handle):
                 return False
-            dr.req.storage_hit_length, dr.req.storage_hit_start = (
-                self.tree_cache.pop_prefetch_loaded_span(dr.req.cache_request_handle)
-            )
 
         # The transfer suffix is already allocated: rematch only promised tokens,
         # without overwriting the request's preallocation state or lock receipt.
@@ -252,7 +249,7 @@ class DecodeHiCacheTransferMixin:
         owned_node = dr.req.last_node
         try:
             dr.req.last_node = rematch.last_device_node
-            loaded_len, restored_node = self.tree_cache.init_load_back(
+            loaded = self.tree_cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=rematch.best_match_node,
                     host_hit_length=rematch.host_hit_length,
@@ -261,6 +258,15 @@ class DecodeHiCacheTransferMixin:
             )
         finally:
             dr.req.last_node = owned_node
+        if loaded is None:
+            # The anchor's previous load-back is still in flight; retry next tick.
+            return False
+        # Consume the L3 span only once load-back is queued, not on deferred retries.
+        if pm.l3_storage_hit_length > 0:
+            dr.req.storage_hit_length, dr.req.storage_hit_start = (
+                self.tree_cache.pop_prefetch_loaded_span(dr.req.cache_request_handle)
+            )
+        loaded_len, restored_node = loaded
         # Failback: total coverage < required prefix means device alloc likely failed.
         if rematch.device_prefix_len + loaded_len < pm.decode_prefix_len:
             logger.warning(
