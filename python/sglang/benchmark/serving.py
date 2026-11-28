@@ -1914,6 +1914,7 @@ async def benchmark(
             "p90_itl_ms": metrics.p90_itl_ms,
             "p95_itl_ms": metrics.p95_itl_ms,
             "p99_itl_ms": metrics.p99_itl_ms,
+            "max_itl_ms": float(metrics.max_itl_ms),
             "concurrency": metrics.concurrency,
             "accept_length": accept_length,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
