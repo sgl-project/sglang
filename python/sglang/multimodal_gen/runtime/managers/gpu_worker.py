@@ -107,6 +107,7 @@ from sglang.multimodal_gen.runtime.realtime.video import (
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.device_errors import (
+    is_out_of_memory_error,
     is_unrecoverable_device_error,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -905,7 +906,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         except Exception as e:
             if (
                 forward_failed
-                and isinstance(e, _oom_exceptions())
+                and is_out_of_memory_error(e)
                 and get_replica_group().world_size > 1
             ):
                 # Other ranks may still be inside this forward's collectives.

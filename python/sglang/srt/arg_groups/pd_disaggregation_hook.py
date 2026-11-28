@@ -54,6 +54,14 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 server_args, "handle_pd_disaggregation", optimistic_prefill_attempts=1
             )
 
+    # Resolved in every mode: a server can switch to decode at runtime.
+    if cfg.disaggregation_decode_first_token_stream is None:
+        declare_resolution(
+            server_args,
+            "handle_pd_disaggregation",
+            disaggregation_decode_first_token_stream="first_decode",
+        )
+
     if cfg.disaggregation_mode == "prefill" and cfg.dcp_size > 1:
         logger.warning(
             "DCP on a PD prefill server is supported when prefill and decode "

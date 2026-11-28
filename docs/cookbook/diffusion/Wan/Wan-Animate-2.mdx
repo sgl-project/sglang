@@ -1,6 +1,5 @@
 ---
 title: Wan-Animate-2
-tag: NEW
 description: Run Wan-Animate-2 character animation (reference image + reference video) with SGLang Diffusion, with the base or the distilled checkpoint.
 metatags:
     description: "Deploy and use the Wan2.2-Animate-2 14B character-animation model (base and distilled checkpoints) with SGLang Diffusion: reference-image + reference-video conditioning, single-expert native pipeline, config-file and /v1/videos invocation, and multi-GPU presets."

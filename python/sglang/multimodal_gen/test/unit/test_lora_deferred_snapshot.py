@@ -7,10 +7,7 @@ import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.layers.lora import linear as lora_linear
-from sglang.multimodal_gen.runtime.layers.lora.linear import (
-    LinearWithLoRA,
-    wrap_with_lora_layer,
-)
+from sglang.multimodal_gen.runtime.layers.lora.linear import wrap_with_lora_layer
 from sglang.multimodal_gen.runtime.managers.memory_managers import component_manager
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HostPinBudget,
@@ -27,20 +24,17 @@ def test_dynamic_lora_takes_no_snapshot_and_merge_restores_base(device, monkeypa
     monkeypatch.setattr(lora_linear, "_snapshot_pin_budget", lambda: budget)
     base = torch.nn.Linear(8, 16, bias=False, dtype=torch.bfloat16).to(device)
     original = base.weight.detach().clone()
-    if device == "cpu":
-        layer = LinearWithLoRA(base, lora_rank=2, lora_alpha=2, defer_snapshot=True)
-    else:
-        layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2)
-    assert layer._cpu_weight is None
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2)
+    assert layer.cpu_weight is None
 
     A = torch.randn(2, 8, dtype=torch.bfloat16, device=device)
     B = torch.randn(16, 2, dtype=torch.bfloat16, device=device)
     layer.set_lora_weights(A, B, clear_existing=True, merge_weights=False)
-    assert layer._cpu_weight is None
+    assert layer.cpu_weight is None
 
     layer.set_lora_weights(A, B, clear_existing=True, merge_weights=True)
     assert layer.merged
-    assert layer._cpu_weight is not None
+    assert layer.cpu_weight is not None
     assert layer.cpu_weight.device.type == "cpu"
     if device == "cuda":
         # Pinned, so the unmerge restore is a fast host-to-device copy.
@@ -51,13 +45,14 @@ def test_dynamic_lora_takes_no_snapshot_and_merge_restores_base(device, monkeypa
     torch.testing.assert_close(base.weight.float(), expected, rtol=2e-2, atol=2e-2)
 
     layer.unmerge_lora_weights()
+    assert layer.cpu_weight is None
     torch.testing.assert_close(base.weight, original, rtol=0, atol=0)
 
 
-def test_cpu_layer_still_snapshots_at_wrap():
+def test_cpu_layer_defers_snapshot_until_merge():
     base = torch.nn.Linear(4, 4, bias=False)
     layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2)
-    assert layer._cpu_weight is not None
+    assert layer.cpu_weight is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -75,6 +70,7 @@ def test_snapshot_stays_pageable_without_pin_allowance(budget, monkeypatch):
     assert not layer.cpu_weight.is_pinned()
     assert budget is None or budget.committed_bytes == 0
     layer.unmerge_lora_weights()
+    assert layer.cpu_weight is None
     torch.testing.assert_close(base.weight, original, rtol=0, atol=0)
 
 

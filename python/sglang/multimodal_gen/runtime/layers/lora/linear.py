@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context_or_none,
+    request_allows,
     request_allows_lossless,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
@@ -87,11 +88,25 @@ def _lora_compute_dtype(x: torch.Tensor, lora_dtype: torch.dtype) -> torch.dtype
     An fp16 adapter on bf16/fp32 activations computes in the activations'
     dtype (the autocast dtype under autocast, e.g. Wan), as a bf16 adapter
     would: cast to fp16, DiT activations beyond 65504 overflow to inf and the
-    output turns into NaN (a black image). Other adapters compute in their own
-    dtype, as before.
+    output turns into NaN (a black image).
+
+    An fp32 adapter on 16-bit activations computes in their dtype at
+    quality="high", exactly as the same adapter saved in that dtype would
+    (e.g. the fp32 and bf16 files of a Lightning LoRA); in fp32 its matmuls
+    miss the tensor cores and cast every activation. Rounding the factors to
+    16 bits loses precision, so "exact" and "lossless" keep fp32. Other
+    adapters compute in their own dtype, as before.
     """
-    if lora_dtype != torch.float16 or x.dtype == torch.float16:
-        return lora_dtype
+    if lora_dtype == torch.float16 and x.dtype != torch.float16:
+        return _activation_dtype(x)
+    if lora_dtype == torch.float32 and request_allows("high"):
+        activation_dtype = _activation_dtype(x)
+        if activation_dtype in (torch.bfloat16, torch.float16):
+            return activation_dtype
+    return lora_dtype
+
+
+def _activation_dtype(x: torch.Tensor) -> torch.dtype:
     if torch.is_autocast_enabled(x.device.type):
         return torch.get_autocast_dtype(x.device.type)
     return x.dtype
@@ -160,32 +175,14 @@ class BaseLayerWithLoRA(nn.Module):
         base_layer: nn.Module,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-        defer_snapshot: bool = False,
     ):
         super().__init__()
         self.base_layer: nn.Module = base_layer
 
         self.merged: bool = False
-        # Immutable base-weight snapshot; `to("cpu")` may alias CPU storage.
-        # Use `clone()` so in-place merge updates cannot mutate this backup.
-        # With snapshot_base=False the snapshot is a zero-copy view instead:
-        # valid only while every merge on this layer is a copy-merge (the
-        # merged-store path), which never writes the base storage. H3's DiT
-        # backup alone is 38 GB of anonymous memory under clone().
-        # defer_snapshot=True takes no snapshot until something first needs
-        # one (an in-place merge, or a read of cpu_weight): dynamic LoRA never
-        # writes the base, so a device-resident DiT skips a host copy of all
-        # its weights.
-        self._cpu_weight: torch.Tensor | None = None
-        if defer_snapshot:
-            self._base_is_view = False
-        elif snapshot_base:
-            self.cpu_weight = base_layer.weight.detach().to("cpu").clone()
-            self._base_is_view = False
-        else:
-            self.cpu_weight = base_layer.weight.detach()
-            self._base_is_view = True
+        # Only a merged layer needs a restore target. Even a detached view here
+        # would keep the old storage alive when offload rebinds the parameter.
+        self.cpu_weight: torch.Tensor | None = None
         # indicates adapter weights don't contain this layer
         # (which shouldn't normally happen, but we want to separate it from the case of erroneous merging)
         # Default to True to prevent using uninitialized weights; set to False when weights are loaded
@@ -586,39 +583,6 @@ class BaseLayerWithLoRA(nn.Module):
             return packed, torch.device("cpu")
         return weight, weight.device
 
-    @property
-    def cpu_weight(self) -> torch.Tensor:
-        if self._cpu_weight is None:
-            # Deferred snapshot: the base has not been written yet.
-            self._cpu_weight = _host_snapshot(self.base_layer.weight.detach())
-        return self._cpu_weight
-
-    @cpu_weight.setter
-    def cpu_weight(self, value: torch.Tensor) -> None:
-        self._cpu_weight = value
-
-    def _ensure_base_snapshot_owned(self) -> None:
-        """An in-place merge is about to write the base storage; take a
-        deferred snapshot, or if the snapshot is a zero-copy view into it,
-        materialize the clone now."""
-        if self._cpu_weight is None:
-            self.cpu_weight  # noqa: B018 - takes the deferred snapshot
-            return
-        if self._base_is_view:
-            self.cpu_weight = self.cpu_weight.to("cpu", copy=True)
-            self._base_is_view = False
-
-    def _restores_to_device_tensor(self) -> bool:
-        """Whether write_dense_weight copies the snapshot into a dense
-        accelerator weight (no offload store or packed CPU view)."""
-        weight = self.base_layer.weight
-        return (
-            weight.device.type not in ("cpu", "meta")
-            and weight.numel() > 1
-            and getattr(self.base_layer, "_packed_weight_cpu", None) is None
-            and getattr(self.base_layer, "_offload_root", None) is None
-        )
-
     @torch.no_grad()
     def _merge_lora_into_data(
         self,
@@ -761,7 +725,6 @@ class BaseLayerWithLoRA(nn.Module):
         self.weight.data = merged
         self.merged = True
         self.cpu_weight = base_view.detach()
-        self._base_is_view = True
 
     @torch.no_grad()
     def merge_lora_weights(self, strength: float | None = None) -> None:
@@ -792,11 +755,6 @@ class BaseLayerWithLoRA(nn.Module):
         if self.disable_lora:
             return
 
-        if self.merged:
-            self.unmerge_lora_weights()
-        # Only layers actually merged need a snapshot of the mutable backing store.
-        self._ensure_base_snapshot_owned()
-
         lora_list = self._active_lora_list()
         if not lora_list:
             raise ValueError("LoRA weights not set. Please set them first.")
@@ -808,6 +766,16 @@ class BaseLayerWithLoRA(nn.Module):
             )
 
         merge_in_fp32 = self._should_merge_in_fp32(lora_list)
+
+        if self.merged:
+            # Reuse the restore target across strength changes; do not copy the
+            # base from the device again just to re-merge the same layer.
+            self._restore_base_weight()
+        src = self.base_layer.weight
+        if not isinstance(src, DTensor):
+            src, _ = self._materialized_weight_src()
+        if self.cpu_weight is None:
+            self.cpu_weight = _host_snapshot(src.detach())
 
         if isinstance(self.base_layer.weight, DTensor):
             mesh = self.base_layer.weight.data.device_mesh
@@ -861,7 +829,6 @@ class BaseLayerWithLoRA(nn.Module):
                 offload_policy=offload_policy,
             )
         else:
-            src, _ = self._materialized_weight_src()
             data = src.to(get_local_torch_device())
             self._merge_from_device_data(data, lora_list, merge_in_fp32)
             return
@@ -896,23 +863,23 @@ class BaseLayerWithLoRA(nn.Module):
                 "LoRA weights not merged. Please merge them first before unmerging."
             )
 
-        # avoid precision loss
+        self._restore_base_weight()
+        self.cpu_weight = None
+
+    def _restore_base_weight(self) -> None:
+        assert self.cpu_weight is not None
         if isinstance(self.base_layer.weight, DTensor):
             device = self.base_layer.weight.data.device
             old_weight = self.base_layer.weight
             new_weight_data = self._as_mutable_tensor(
-                self.cpu_weight.to(device, non_blocking=True)
+                self.cpu_weight.to(device, non_blocking=True, copy=True)
             )
             self.base_layer.weight = nn.Parameter(new_weight_data)
             del old_weight
         else:
             # Update the offload backing store too, not a transient GPU placeholder.
-            # A copy keeps inference-tensor rebinding from aliasing the snapshot;
-            # a dense accelerator weight gets a fresh device tensor from the
-            # host-to-device copy, so the snapshot needs no host clone first.
-            restored = self.cpu_weight
-            if not self._restores_to_device_tensor():
-                restored = restored.clone()
+            # A copy keeps inference-tensor rebinding from aliasing the snapshot.
+            restored = self.cpu_weight.clone()
             write_dense_weight(self.base_layer, self._as_mutable_tensor(restored))
 
         self.merged = False
@@ -921,10 +888,7 @@ class BaseLayerWithLoRA(nn.Module):
     def commit_merged_as_base(self) -> None:
         """Promote the currently merged weights to the permanent base.
 
-        Re-snapshots ``cpu_weight`` so the merged weights become the restore
-        target and resets adapter bookkeeping (``merged=False``). A later dynamic
-        ``set_lora_weights`` then adds its delta on top of the merged base instead
-        of unmerging it.
+        Drop the old restore target. A future merge will snapshot this new base.
         """
         if not self.merged:
             return
@@ -933,16 +897,7 @@ class BaseLayerWithLoRA(nn.Module):
                 "A LoRA with a constant output offset cannot be committed as a "
                 "weight-only base."
             )
-        weight = self.base_layer.weight
-        if isinstance(weight, DTensor):
-            weight = weight.to_local()
-        else:
-            # Under layerwise offload the parameter is a (1,) placeholder; the
-            # merged weight lives in the manager's CPU view.
-            weight, _ = self._materialized_weight_src()
-        # clone(): to("cpu") may alias storage; we must not mutate this backup.
-        self.cpu_weight = weight.detach().to("cpu").clone()
-        self._base_is_view = False
+        self.cpu_weight = None
         self.merged = False
         self.disable_lora = True
         self.lora_weights_list = []
@@ -955,18 +910,6 @@ class BaseLayerWithLoRA(nn.Module):
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
-    def __init__(
-        self,
-        base_layer: ColumnParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-        defer_snapshot: bool = False,
-    ) -> None:
-        super().__init__(
-            base_layer, lora_rank, lora_alpha, snapshot_base, defer_snapshot
-        )
-
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
 
@@ -1170,14 +1113,6 @@ def _host_snapshot(weight: torch.Tensor) -> torch.Tensor:
     return weight.to("cpu", copy=True)
 
 
-def _use_owned_base_snapshot(
-    snapshot_base: bool, device_type: str, numel: int | None = None
-) -> bool:
-    if numel is not None and numel <= 1:
-        return snapshot_base
-    return snapshot_base or device_type not in ("cpu", "meta")
-
-
 class WeightOnlyFP8LinearWithLoRA(LinearWithLoRA):
     """
     Dynamic-only LoRA wrapper for storage-only FP8 linear layers.
@@ -1215,7 +1150,6 @@ def wrap_with_lora_layer(
     layer: nn.Module,
     lora_rank: int | None = None,
     lora_alpha: int | None = None,
-    snapshot_base: bool = True,
 ) -> BaseLayerWithLoRA | None:
     """
     transform the given layer to its corresponding LoRA layer
@@ -1234,21 +1168,7 @@ def wrap_with_lora_layer(
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # type: ignore[arg-type]
-            device_type = layer.weight.device.type
-            numel = layer.weight.numel()
-            effective_snapshot_base = _use_owned_base_snapshot(
-                snapshot_base, device_type, numel
-            )
-            ret = lora_layer_type(
-                layer,
-                lora_rank=lora_rank,
-                lora_alpha=lora_alpha,
-                snapshot_base=effective_snapshot_base,
-                # A device-resident weight's owned snapshot is a host copy;
-                # take it only if the layer is ever merged in place.
-                defer_snapshot=device_type not in ("cpu", "meta") and numel > 1,
-            )
-            return ret
+            return lora_layer_type(layer, lora_rank=lora_rank, lora_alpha=lora_alpha)
     return None
 
 
