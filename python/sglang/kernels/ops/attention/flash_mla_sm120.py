@@ -31,6 +31,9 @@ _is_hip = is_hip()
 _GLM_DSA_MODEL_ARCHS = (
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",
+    # GLM-5.3-Flash (glm5_next) takes the same DSA + flash_mla_sm120 path.
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN",
 )
 
 # Page layout constants for DSv4-Flash (MODEL1):

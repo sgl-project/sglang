@@ -717,7 +717,13 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     declared: Dict[str, Any] = {}
     model_arch = hf_config.architectures[0]
     is_glm_sm12_fp8 = (
-        model_arch == "GlmMoeDsaForCausalLM"
+        model_arch
+        in (
+            "GlmMoeDsaForCausalLM",
+            # GLM-5.3-Flash takes the same DSA + flash_mla_sm120 path; keep this
+            # in sync with _GLM_DSA_MODEL_ARCHS in flash_mla_sm120.py.
+            "Glm5NextForConditionalGeneration",
+        )
         and major == 12
         and kv_cache_dtype == "fp8_e4m3"
         and not get_platform().is_hip

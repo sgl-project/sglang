@@ -3335,13 +3335,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             override_platform(is_hip=False),
             patch("torch.cuda.get_device_capability", return_value=(12, 0)),
         ):
-            self.assertEqual(
-                _dsa_split_backend_resolution(_view(arch="GlmMoeDsaForCausalLM")),
-                {
-                    "dsa_prefill_backend": "flashinfer_sparse_mla",
-                    "dsa_decode_backend": "flashinfer_sparse_mla",
-                },
-            )
+            # GLM-5.3-Flash shares the DSA + flash_mla_sm120 path with GLM-5.2,
+            # so both arches must auto-select the same SM120 backend.
+            for arch in ("GlmMoeDsaForCausalLM", "Glm5NextForConditionalGeneration"):
+                with self.subTest(arch=arch):
+                    self.assertEqual(
+                        _dsa_split_backend_resolution(_view(arch=arch)),
+                        {
+                            "dsa_prefill_backend": "flashinfer_sparse_mla",
+                            "dsa_decode_backend": "flashinfer_sparse_mla",
+                        },
+                    )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             override_platform(is_npu=False),

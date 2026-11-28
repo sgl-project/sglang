@@ -50,16 +50,20 @@ class DeepseekSparseAttnBackendKPoolMixin:
             and not self.dsa_kv_cache_store_fp8
         ):
             return
+        # flashinfer_sparse_mla is the SM120 stand-in for the trtllm DSA path:
+        # it forwards the full kpool index tensor to the same
+        # trtllm_batch_decode_with_kv_cache_mla entry, so the appended tail
+        # columns reach the kernel without being dropped.
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or dsa_impl in ("fa3", "tilelang", "trtllm", "flashinfer_sparse_mla")
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend."
+            "currently only supported by the FA3/TileLang/TRTLLM/"
+            f"FlashInfer-sparse-MLA DSA {phase} backend."
         )
 
     def _resolve_kpool_tail_backend(

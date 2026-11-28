@@ -3082,6 +3082,7 @@ class DeepseekSparseAttnBackend(
                 seq_lens=metadata.dsa_cache_seqlens_int32,
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                pad_topk_width=True,
             )
         elif dsa_impl == "flashmla_kv":
             if (
@@ -3963,12 +3964,31 @@ class DeepseekSparseAttnBackend(
         seq_lens: torch.Tensor,
         sm_scale: float,
         skip_softmax_threshold_scale_factor: float | None,
+        pad_topk_width: bool = False,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             flashinfer_sparse_mla_forward,
         )
 
         assert self.workspace_buffer is not None
+        # FlashInfer's SM120 prefill kernels require a 64-aligned top-k width,
+        # while decode accepts unaligned widths directly. With index_kpool > 1
+        # the kpool plan widens top-k to index_topk + index_kpool - 1 (2051 for
+        # GLM-5.3-Flash: 2048 + 3), which prefill rejects unless padded.
+        # Pad only on the prefill path (pad_topk_width=True) to a multiple of
+        # 128 (2176, matching FlashInfer's glm53_nope calibrated width) with -1
+        # sentinels so decode CUDA graphs neither pay extra top-k width nor
+        # alias the mutable grow-only _q8kv8_topk_pad_buf. When capturing a
+        # prefill CUDA graph (e.g. BCG), use a graph-private F.pad tensor
+        # instead of the shared grow-only buffer.
+        if pad_topk_width and page_table_1.shape[-1] % 128 != 0:
+            if page_table_1.is_cuda and torch.cuda.is_current_stream_capturing():
+                pad_cols = 128 - (page_table_1.shape[-1] % 128)
+                page_table_1 = torch.nn.functional.pad(
+                    page_table_1, (0, pad_cols), value=-1
+                )
+            else:
+                page_table_1 = self._pad_topk_width_buffered(page_table_1, multiple=128)
         return flashinfer_sparse_mla_forward(
             q=q_all,
             kv_cache=kv_cache,
