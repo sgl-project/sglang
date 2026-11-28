@@ -394,5 +394,47 @@ def test_fnc_stream_reasoning_off_skipped_think_recovers_content() -> None:
     assert content == "bare answer"
 
 
+_QUOTED_MARKER_ANSWERS = [
+    f"quote {RESPONSE_OPEN} opener",
+    f"quote {RESPONSE_CLOSE} closer",
+    f'{{"w": "a{RESPONSE_CLOSE}b"}}',
+]
+
+
+@pytest.mark.parametrize("answer", _QUOTED_MARKER_ANSWERS)
+@pytest.mark.parametrize(
+    "tail", [f"{RESPONSE_CLOSE}{MESSAGE_CLOSE}", RESPONSE_CLOSE, ""]
+)
+@pytest.mark.parametrize("chunk_size", [1, 3, None])
+@pytest.mark.parametrize("stream_reasoning", [False, True])
+def test_quoted_markers_stay_in_the_answer(
+    answer: str, tail: str, chunk_size: int | None, stream_reasoning: bool
+) -> None:
+    """Markers quoted inside a response are answer text, streamed or not; a
+    quoted closer must not end the answer early."""
+    text = f"deep{THINK_CLOSE}{RESPONSE_OPEN}{answer}{tail}"
+    result = KimiK3Detector(force_reasoning=True).detect_and_parse(text)
+    assert (result.reasoning_text, result.normal_text) == ("deep", answer)
+
+    detector = KimiK3Detector(force_reasoning=True, stream_reasoning=stream_reasoning)
+    chunks = [text] if chunk_size is None else _chunks(text, chunk_size)
+    reasoning, content = _stream(detector, chunks)
+    end = detector.finish()
+    assert reasoning + end.reasoning_text == "deep"
+    assert content + end.normal_text == answer
+
+
+@pytest.mark.parametrize("chunk_size", [1, None])
+def test_streaming_closer_cut_off_at_the_end_does_not_leak(
+    chunk_size: int | None,
+) -> None:
+    """max_tokens inside the message closer leaves no marker in the content."""
+    text = f"deep{THINK_CLOSE}{RESPONSE_OPEN}the answer{RESPONSE_CLOSE}<|close|>mess"
+    detector = KimiK3Detector(force_reasoning=True)
+    chunks = [text] if chunk_size is None else _chunks(text, chunk_size)
+    _, content = _stream(detector, chunks)
+    assert content + detector.finish().normal_text == "the answer"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

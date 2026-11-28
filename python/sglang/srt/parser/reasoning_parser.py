@@ -16,7 +16,9 @@ from sglang.srt.function_call.kimik3_format import (
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_OPEN,
+    closing_markers_len,
     partial_suffix_len,
+    resolve_closers,
     strip_partial_marker_suffix,
     strip_response_wrappers,
 )
@@ -797,6 +799,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         self._streamed_reasoning: list[str] = []
         self.replayed_reasoning_chars = 0
         self._discard_delayed_think_close = False
+        self._response_opened = False
 
     def _clean_content(self, text: str) -> str:
         tools_idx = text.find(TOOLS_OPEN)
@@ -967,6 +970,15 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         streamed_chars = sum(map(len, self._streamed_reasoning))
         self._streamed_reasoning.clear()
         if not self._force_nonempty_content:
+            if not self._in_reasoning and not self._tools_passthrough:
+                # Closers held at the end of the answer close its channel.
+                tail, self._buffer = self._buffer, ""
+                tail = tail[: len(tail) - closing_markers_len(tail)]
+                return StreamingParseResult(
+                    normal_text=self._unwrap_response(
+                        resolve_closers(strip_partial_marker_suffix(tail))[0]
+                    )
+                )
             return super().finish()
         text, self._stream_text = self._stream_text, ""
         if self._in_reasoning and self._is_skipped_think_answer(text):
@@ -1010,25 +1022,35 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             self._buffer = buf[len(emit) :]
             head = emit[:tools_idx]
             tail = emit[tools_idx:]
-            for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
-                head = head.replace(marker, "")
+            head = self._unwrap_response(resolve_closers(head)[0])
             if self._discard_delayed_think_close:
                 head = head.replace(self.think_end_token, "")
                 tail = tail.replace(self.think_end_token, "")
             self._tools_passthrough = True
             return head + tail
 
-        markers = [RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE, TOOLS_OPEN]
+        markers = [RESPONSE_OPEN, TOOLS_OPEN]
         if self._discard_delayed_think_close:
             markers.append(self.think_end_token)
-        holdback = partial_suffix_len(buf, markers)
+        # Closers are held until the stream shows whether more of the answer
+        # follows them; only then are they known to be quoted text.
+        holdback = max(partial_suffix_len(buf, markers), closing_markers_len(buf))
         emit = buf[: len(buf) - holdback] if holdback else buf
         self._buffer = buf[len(emit) :]
-        for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
-            emit = emit.replace(marker, "")
+        emit = self._unwrap_response(resolve_closers(emit)[0])
         if self._discard_delayed_think_close:
             emit = emit.replace(self.think_end_token, "")
         return emit
+
+    def _unwrap_response(self, text: str) -> str:
+        # Only the first opener is the channel's; later ones are answer text.
+        if self._response_opened:
+            return text
+        head, opener, answer = text.partition(RESPONSE_OPEN)
+        if not opener:
+            return text
+        self._response_opened = True
+        return head + answer
 
 
 class Glm45Detector(BaseReasoningFormatDetector):
