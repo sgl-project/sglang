@@ -1821,9 +1821,9 @@ class LowRatioCompressAscendBackendMixin:
         if mode is None or not mode.is_target_verify():
             return forward_batch.seq_lens.to(torch.int64)
         bs = int(forward_batch.batch_size)
-        exact = getattr(self.forward_metadata, "dsv41_verify_kv_lens", None)
-        if exact is not None:
-            return exact[:bs].to(torch.int64)
+        verify_kv_lens = getattr(self.forward_metadata, "dsv41_verify_kv_lens", None)
+        if verify_kv_lens is not None:
+            return verify_kv_lens[:bs].to(torch.int64)
         final_cpu = getattr(self.forward_metadata, "seq_lens_cpu_int", None)
         if final_cpu is not None and 0 < bs <= int(final_cpu.numel()):
             return final_cpu[:bs].to(
@@ -3475,7 +3475,8 @@ class DeepseekV4AscendAttnBackend(
             and is_npu_arch35()
         )
         if metadata.dsv41_device_verify and not self.is_draft_worker:
-            # QLI needs zero for padding. The attention kernel clamps KV to one.
+            # The captured QLI reads this buffer on every replay. Padding rows
+            # must stay zero here even when attention clamps their length to one.
             metadata.dsv41_verify_kv_lens = metadata.actual_seq_lengths_kv.clone()
 
         metadata.swa_page_table = self.graph_metadata["swa_page_table"][:bs, :]
@@ -3880,9 +3881,9 @@ class DeepseekV4AscendAttnBackend(
             attn_seq_lens = torch.where(
                 valid_verify_rows, final_seq_lens, ctx.live_seq_lens
             )
-            exact = getattr(fm, "dsv41_verify_kv_lens", None)
-            if exact is not None:
-                exact.copy_(attn_seq_lens)
+            verify_kv_lens = getattr(fm, "dsv41_verify_kv_lens", None)
+            if verify_kv_lens is not None:
+                verify_kv_lens.copy_(attn_seq_lens)
             if getattr(fm, "dsv41_device_verify", False) and ctx.mirrorless:
                 fm.seq_lens_cpu_int = None
             else:
