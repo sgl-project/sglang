@@ -37,15 +37,20 @@ def list_files(
     prefix = "/".join(parts[1:])
     bucket_name = parts[0]
 
-    objects = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
-    paths = [obj["Key"] for obj in objects.get("Contents", [])]
-
-    paths = filter_ignore(paths, ["*/"])
-    if allow_pattern is not None:
-        paths = filter_allow(paths, allow_pattern)
-
-    if ignore_pattern is not None:
-        paths = filter_ignore(paths, ignore_pattern)
+    # list_objects_v2 returns at most 1000 keys per request; use the
+    # paginator so that larger listings are retrieved completely instead
+    # of being silently truncated. Patterns are applied per page so that
+    # non-matching keys are dropped before they accumulate in memory.
+    paginator = s3.get_paginator("list_objects_v2")
+    paths: list[str] = []
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+        page_keys = [obj["Key"] for obj in page.get("Contents", [])]
+        page_keys = filter_ignore(page_keys, patterns=["*/"])
+        if allow_pattern is not None:
+            page_keys = filter_allow(page_keys, allow_pattern)
+        if ignore_pattern is not None:
+            page_keys = filter_ignore(page_keys, ignore_pattern)
+        paths.extend(page_keys)
 
     return bucket_name, prefix, paths
 
