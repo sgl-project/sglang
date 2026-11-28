@@ -743,6 +743,7 @@ def _fused_moe_kernel_sequence(
             topk_ids,
         )
 
+    down_block_shape = w2_block_shape or block_shape
     use_native_fused_fp8_tail = (
         not is_batch_invariant_mode_enabled()
         and not fuse_swiglu_interleaved
@@ -761,10 +762,31 @@ def _fused_moe_kernel_sequence(
         and 128 < N // 2 < 256
         and (N // 2) % 16 == 0
     )
+    use_fused_swiglu_clamp_fp8_quant = (
+        not is_batch_invariant_mode_enabled()
+        and not fuse_swiglu_interleaved
+        and activation == "silu"
+        and is_gated
+        and gemm1_alpha is None
+        and gemm1_limit is None
+        and swiglu_limit is not None
+        and not filter_expert
+        and _is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and use_fp8_w8a8
+        and down_block_shape is not None
+        and len(down_block_shape) == 2
+        and down_block_shape[1] in (16, 32, 64, 128, 256)
+        and (N // 2) % down_block_shape[1] == 0
+        and a2_scale is None
+        and hooks is None
+        and intermediate_cache1.data_ptr() % 32 == 0
+        and (N * intermediate_cache1.element_size()) % 32 == 0
+    )
     if not fuse_swiglu_interleaved:
         intermediate_cache2 = (
             None
-            if use_native_fused_fp8_tail
+            if (use_native_fused_fp8_tail or use_fused_swiglu_clamp_fp8_quant)
             else torch.empty(
                 (total_tokens, N // 2),
                 device=hidden_states.device,
@@ -829,9 +851,10 @@ def _fused_moe_kernel_sequence(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
         elif swiglu_limit is not None:
-            # DeepSeek V4: swiglu clamp before silu_and_mul.
+            # DeepSeek V4 / GLM-5.3-Flash: swiglu clamp before silu_and_mul.
             # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
-            #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
+            #   fusion=True: clamp fused into act_and_mul_triton, silu_and_mul_clamp,
+            #                or directly into per_token_group_quant for block-FP8 MoE.
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
@@ -839,41 +862,59 @@ def _fused_moe_kernel_sequence(
                 "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
             )
 
-            swiglu_limit_for_triton: Optional[float] = None
-            swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
-
-            if filter_expert:
-                swiglu_limit_for_triton = swiglu_limit
-            else:
-                assert _is_cuda or _is_xpu, (
-                    "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
+            if use_fused_swiglu_clamp_fp8_quant:
+                use_sorted = (
+                    down_moe_use_tma and (N // 2) != down_block_shape[1]
                 )
-                swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
+                intermediate_cache2, a2_scale = per_token_group_quant(
+                    intermediate_cache1.view(-1, N),
+                    group_size=down_block_shape[1],
+                    fuse_silu_and_mul=True,
+                    swiglu_limit=float(swiglu_limit),
+                    sorted_token_ids=sorted_token_ids if use_sorted else None,
+                    num_tokens_post_padded=(
+                        num_tokens_post_padded if use_sorted else None
+                    ),
+                    num_valid_tokens=topk_ids.numel() if use_sorted else 0,
+                )
+            else:
+                swiglu_limit_for_triton: Optional[float] = None
+                swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
 
-            if not filter_expert:
-                if swiglu_limit_for_silu_and_mul_clamp is not None:
-                    from sglang.kernels.ops.activation.silu_and_mul_clamp import (
-                        silu_and_mul_clamp,
+                if filter_expert:
+                    swiglu_limit_for_triton = swiglu_limit
+                else:
+                    assert _is_cuda or _is_xpu, (
+                        "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
                     )
+                    swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
 
-                    silu_and_mul_clamp(
+                if not filter_expert:
+                    if swiglu_limit_for_silu_and_mul_clamp is not None:
+                        from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+                            silu_and_mul_clamp,
+                        )
+
+                        silu_and_mul_clamp(
+                            intermediate_cache1.view(-1, N),
+                            intermediate_cache2,
+                            swiglu_limit_for_silu_and_mul_clamp,
+                        )
+                    else:
+                        silu_and_mul(
+                            intermediate_cache1.view(-1, N), intermediate_cache2
+                        )
+                else:
+                    act_and_mul_triton(
                         intermediate_cache1.view(-1, N),
                         intermediate_cache2,
-                        swiglu_limit_for_silu_and_mul_clamp,
+                        config,
+                        topk_ids,
+                        expert_ids,
+                        down_moe_use_tma,
+                        activation,
+                        swiglu_limit=swiglu_limit_for_triton,
                     )
-                else:
-                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                act_and_mul_triton(
-                    intermediate_cache1.view(-1, N),
-                    intermediate_cache2,
-                    config,
-                    topk_ids,
-                    expert_ids,
-                    down_moe_use_tma,
-                    activation,
-                    swiglu_limit=swiglu_limit_for_triton,
-                )
         elif _is_cuda or _is_hip or _is_xpu:
             silu_and_mul(
                 intermediate_cache1.view(-1, N), intermediate_cache2, **row_filter
@@ -958,7 +999,6 @@ def _fused_moe_kernel_sequence(
         out_slice = out_hidden_states
         out_slice.zero_()
 
-    down_block_shape = w2_block_shape or block_shape
     if (
         _is_cuda
         and down_moe_use_tma

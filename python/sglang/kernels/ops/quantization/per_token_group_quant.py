@@ -36,6 +36,7 @@ def _jit_module(
     use_pdl: bool,
     sorted_layout: bool = False,
     silu_and_mul_mode: str = "legacy",
+    apply_swiglu_limit: bool = False,
 ) -> Module:
     assert in_dtype in _SUPPORTED_INPUT_DTYPES
     assert out_dtype in _SUPPORTED_OUTPUT_DTYPES
@@ -54,7 +55,22 @@ def _jit_module(
             "dense mode requires flat or masked BF16/FP16 SiLU+mul, FP8 output and "
             "group_size=128"
         )
-    # Only the dense variants add a flag; legacy launcher arguments stay intact.
+    if apply_swiglu_limit and not (
+        fuse_silu_and_mul
+        and in_dtype == torch.bfloat16
+        and not dense
+        and not masked_layout
+    ):
+        raise ValueError(
+            "swiglu_limit requires flat or sorted BF16 fused SiLU+mul in legacy mode"
+        )
+    # Only the dense/clamped variants add trailing flags; legacy launcher arguments stay intact.
+    if apply_swiglu_limit:
+        extra_flags = [True] if sorted_layout else [False, True]
+    elif dense:
+        extra_flags = [True]
+    else:
+        extra_flags = []
     trait_args = make_cpp_args(
         in_dtype,
         out_dtype,
@@ -65,17 +81,18 @@ def _jit_module(
         aligned,
         fuse_silu_and_mul,
         use_pdl,
-        *([True] if dense else []),
+        *extra_flags,
     )
     assert not (masked_layout and sorted_layout)
     layout = "masked" if masked_layout else ("sorted" if sorted_layout else "flat")
     launcher = f"PerTokenGroupQuant{layout.capitalize()}Kernel"
+    entry = "run_clamped" if apply_swiglu_limit else "run"
     return load_jit(
         "per_token_group_quant",
         *trait_args,
         layout,
         cuda_files=["gemm/per_token_group_quant.cuh"],
-        cuda_wrappers=[("per_token_group_quant", f"{launcher}<{trait_args}>::run")],
+        cuda_wrappers=[("per_token_group_quant", f"{launcher}<{trait_args}>::{entry}")],
         extra_cuda_cflags=get_activation_cuda_cflags()
         if dense
         else ["--use_fast_math"],
@@ -118,6 +135,7 @@ def _per_token_group_quant_custom_op(
     num_tokens_post_padded: Optional[torch.Tensor] = None,
     num_valid_tokens: int = 0,
     silu_and_mul_mode: str = "legacy",
+    swiglu_limit: Optional[float] = None,
 ) -> None:
     if (
         scale_ue8m0
@@ -153,6 +171,7 @@ def _per_token_group_quant_custom_op(
             return
     num_groups = output_q.shape[-1] // group_size
     row_major, aligned = _infer_scale_layout(output_s, scale_ue8m0, num_groups)
+    apply_swiglu_limit = swiglu_limit is not None
     module = _jit_module(
         input.dtype,
         output_q.dtype,
@@ -166,20 +185,34 @@ def _per_token_group_quant_custom_op(
         is_arch_support_pdl(),
         sorted_token_ids is not None,
         silu_and_mul_mode,
+        apply_swiglu_limit,
     )
     if masked_m is not None:
         module.per_token_group_quant(
             input, output_q, output_s, masked_m, int(expected_m or -1)
         )
     elif sorted_token_ids is not None:
-        module.per_token_group_quant(
-            input,
-            output_q,
-            output_s,
-            sorted_token_ids,
-            num_tokens_post_padded,
-            num_valid_tokens,
-        )
+        if apply_swiglu_limit:
+            module.per_token_group_quant(
+                input,
+                output_q,
+                output_s,
+                sorted_token_ids,
+                num_tokens_post_padded,
+                num_valid_tokens,
+                float(swiglu_limit),
+            )
+        else:
+            module.per_token_group_quant(
+                input,
+                output_q,
+                output_s,
+                sorted_token_ids,
+                num_tokens_post_padded,
+                num_valid_tokens,
+            )
+    elif apply_swiglu_limit:
+        module.per_token_group_quant(input, output_q, output_s, float(swiglu_limit))
     else:
         module.per_token_group_quant(input, output_q, output_s)
 
@@ -242,6 +275,7 @@ def per_token_group_quant(
     num_tokens_post_padded: Optional[torch.Tensor] = None,
     num_valid_tokens: int = 0,
     silu_and_mul_mode: Literal["legacy", "dense"] = "legacy",
+    swiglu_limit: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token-group quantization. Returns ``(output_q, output_s)``.
 
@@ -314,5 +348,6 @@ def per_token_group_quant(
         num_tokens_post_padded=num_tokens_post_padded,
         num_valid_tokens=num_valid_tokens,
         silu_and_mul_mode=silu_and_mul_mode,
+        swiglu_limit=swiglu_limit,
     )
     return output_q, output_s
