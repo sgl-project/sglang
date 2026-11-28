@@ -62,7 +62,7 @@ from sglang.srt.beam_search.output import (
     build_beam_search_out,
     try_build_beam_search_out_dict,
 )
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import ModelConfig, is_score_and_pool_model
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.mode import DisaggregationMode
@@ -1820,6 +1820,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # would ignore them.
         if obj.sampling_params.get("max_new_tokens") != 0:
             raise ValueError("token_indices_to_pool requires max_new_tokens=0.")
+        if isinstance(obj, EmbeddingReqInput):
+            architectures = self.model_config.hf_config.architectures or []
+            if not is_score_and_pool_model(architectures):
+                raise ValueError(
+                    "token_indices_to_pool requires a model that pools per position "
+                    f"(score_and_pool); model architecture(s) {architectures} pool a "
+                    "single vector and ignore the positions."
+                )
         if input_ids is not None:
             seq_len = len(input_ids)
         elif obj.input_embeds is not None:
