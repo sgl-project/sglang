@@ -38,8 +38,10 @@ def cake_softmax(logits: torch.Tensor) -> torch.Tensor:
     return get_kernel("sampling.softmax", KernelBackend.CAKE)(logits)
 
 
-# The JIT softmax's config model is fit on the SM100 family only.
-_JIT_SOFTMAX_CAPABILITY = CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 10))
+# The JIT softmax's config model is fit on the SM100 family; on SM90 it picks
+# configs from the same device queries and beats the torch fallback at every
+# measured shape.
+_JIT_SOFTMAX_CAPABILITY = CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(10, 10))
 
 register_kernel(
     KernelSpec(

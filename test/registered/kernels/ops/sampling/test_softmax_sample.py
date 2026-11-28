@@ -9,11 +9,13 @@ import torch
 from sglang.kernels.arch import current_arch
 from sglang.test.ci.ci_register import register_cuda_ci
 
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not current_arch().is_sm(10),
-    reason="the JIT softmax runs on the SM100 family only",
+    not torch.cuda.is_available()
+    or not (current_arch().is_sm(9) or current_arch().is_sm(10)),
+    reason="the JIT softmax runs on SM90 and the SM100 family only",
 )
 
 SEED = 0x5EED1234ABCD
