@@ -1363,6 +1363,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         return {k: ed[k] for k in keys if ed.get(k) is not None}
 
+    def _pool_query_keys(
+        self,
+        keys: List[str],
+        transfer: PoolTransfer,
+        pool_suffixes: Optional[Mapping[str, Sequence[str]]],
+    ) -> tuple[List[str], int]:
+        if pool_suffixes is None:
+            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                keys, transfer
+            )
+        else:
+            suffixes = pool_suffixes[transfer.name]
+            key_multiplier = len(suffixes)
+            component_keys = [key + suffix for key in keys for suffix in suffixes]
+        return self._tag_keys(component_keys), key_multiplier
+
     def batch_exists_v2(
         self,
         keys: List[str],
@@ -1395,15 +1411,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         prepared = []
         all_component_keys = []
         for transfer in pool_transfers or []:
-            if pool_suffixes is None:
-                component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                    keys, transfer
-                )
-            else:
-                suffixes = pool_suffixes[transfer.name]
-                key_multiplier = len(suffixes)
-                component_keys = [key + suffix for key in keys for suffix in suffixes]
-            component_keys = self._tag_keys(component_keys)
+            component_keys, key_multiplier = self._pool_query_keys(
+                keys=keys, transfer=transfer, pool_suffixes=pool_suffixes
+            )
             start = len(all_component_keys)
             all_component_keys.extend(component_keys)
             prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
