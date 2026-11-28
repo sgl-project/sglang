@@ -424,6 +424,22 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         with self.assertRaises(ValueError):
             module._build_custom_block_adapter(transformer)
 
+    def test_cache_config_has_separate_cfg_follows_runtime(self):
+        for has_separate_cfg in (False, True):
+            with self.subTest(has_separate_cfg=has_separate_cfg):
+                module = _import_module_with_stub()
+                transformer = _make_transformer("QwenImageTransformer2DModel")
+                config = module.CacheDitConfig(enabled=True, num_inference_steps=8)
+
+                module.enable_cache_on_transformer(
+                    transformer, config, has_separate_cfg=has_separate_cfg
+                )
+
+                cache_config = module.cache_dit.enable_calls[0]["cache_config"]
+                self.assertIs(
+                    cache_config.kwargs["enable_separate_cfg"], has_separate_cfg
+                )
+
     def test_has_separate_cfg_follows_runtime(self):
         # No model pins the mode; has_separate_cfg always follows the run's CFG mode
         # (Krea-2 Raw -> True, Krea-2 Turbo -> False).

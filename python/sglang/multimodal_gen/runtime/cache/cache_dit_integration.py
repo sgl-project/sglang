@@ -587,6 +587,7 @@ def enable_cache_on_transformer(
 
     # Build cache config (including SCM fields if provided)
     cache_config = DBCacheConfig(
+        enable_separate_cfg=has_separate_cfg,
         num_inference_steps=config.num_inference_steps,
         Fn_compute_blocks=config.Fn_compute_blocks,
         Bn_compute_blocks=config.Bn_compute_blocks,
