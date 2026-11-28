@@ -116,6 +116,19 @@ class TestStartProfile(CustomTestCase):
 
         self._check_non_empty_profile_dir()
 
+    def test_start_profile_by_stage_without_num_steps(self):
+        """profile_by_stage must initialize counters without num_steps.
+
+        A wall-clock caller passes profile_by_stage=true and stops with
+        /stop_profile; it must not crash on the first prefill/decode batch.
+        """
+        self._start_profile(profile_by_stage=True, profile_stages=["prefill"])
+        self._post_request()
+
+        response = admin_post(f"{DEFAULT_URL_FOR_TEST}/stop_profile")
+        self.assertEqual(response.status_code, 200)
+        self._check_non_empty_profile_dir()
+
     def test_start_profile_4_refusals(self):
         """A stop with nothing running, and a deferred (start_step) start while
         a profile runs, are refused with the scheduler's error surfaced as a
