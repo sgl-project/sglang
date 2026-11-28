@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
@@ -75,6 +75,15 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="kvcache.set_kv_buffer_tiled_fp8",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.kvcache.cache_move:set_kv_buffer_tiled_fp8",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
 
 register_kernel(
     KernelSpec(

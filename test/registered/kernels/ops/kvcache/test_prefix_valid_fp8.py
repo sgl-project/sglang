@@ -1,16 +1,26 @@
-"""Numerical and masking regressions for fused prefix-valid FP8 commits."""
+"""Numerical and masking regressions for fused FP8 KV stores and prefix-valid commits."""
 
 import unittest
+from contextlib import contextmanager
+from unittest.mock import patch
 
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
-from sglang.srt.mem_cache.memory_pool import _set_kv_buffer_prefix_valid_impl_fp8
+from sglang.srt.mem_cache import memory_pool
+from sglang.srt.mem_cache.memory_pool import (
+    _set_kv_buffer_prefix_valid_impl_fp8,
+    _try_set_kv_buffer_fp8,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kernels.prefix_valid import assert_prefix_commit, make_kv_cache
+from sglang.test.kernels.prefix_valid import (
+    assert_bytes_equal,
+    assert_prefix_commit,
+    make_kv_cache,
+)
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: ROCm's E4M3FNUZ pointer inference and conversion differ from CUDA.
 register_amd_ci(est_time=25, stage="base-a-jit-kernel-unit", runner_config="amd")
 
@@ -144,6 +154,161 @@ class TestPrefixValidFp8Kernel(CustomTestCase):
                                 k_scale_is_tensor=kind == "gpu",
                                 v_scale_is_tensor=kind == "gpu",
                             )
+
+
+def _store(k, v, k_cache, v_cache, loc, k_scale, v_scale):
+    return _try_set_kv_buffer_fp8(
+        k, v, k_cache, v_cache, loc, k_scale, v_scale, k.shape[-1], k_cache.shape[0]
+    )
+
+
+def _scale(value):
+    return torch.tensor(value, dtype=torch.float32, device=DEVICE)
+
+
+@contextmanager
+def _assert_store(k, v, k_cache, v_cache, loc, k_scale, v_scale):
+    # Use the ordinary writer's div_ -> cast oracle, without the prefix-valid
+    # oracle's explicit clamp (the ROCm eager cast has different overflow behavior).
+    before = (k.clone(), v.clone())
+    expected = []
+    valid = loc != 0
+    for source, cache, scale in zip(before, (k_cache, v_cache), (k_scale, v_scale)):
+        value = source.clone()
+        if scale is not None:
+            value.div_(scale)
+        target = cache.contiguous().view(torch.uint8).clone()
+        target[loc[valid]] = value.to(cache.dtype).view(torch.uint8)[valid]
+        expected.append(target)
+    yield
+    for label, actual, reference in zip(
+        ("K cache", "V cache", "K input", "V input"),
+        (k_cache, v_cache, k, v),
+        (*expected, *before),
+    ):
+        assert_bytes_equal(actual, reference, label)
+
+
+class TestSetKvBufferFp8Kernel(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        if not memory_pool._triton_fp8_supported():
+            self.skipTest("Ordinary fused E4M3 stores require CUDA SM89+")
+
+    def test_matches_eager_bytes(self):
+        """Check rounding/overflow, layouts, empty writes and padding together;
+        the oracle also checks every untouched slot and both source tensors."""
+        scale_forms = {
+            "none": (None, None),
+            # Not exact in BF16 or FP16, so the divisor rounding is exercised.
+            "host": (0.1, 1.3),
+            "device": (_scale(0.1), _scale(1.3)),
+            "unit_host": (1.0, 1.0),
+            "k_only_host": (0.1, None),
+            "v_only_host": (None, 1.3),
+            "k_only_device": (_scale(0.1), None),
+            "v_only_device": (None, _scale(1.3)),
+        }
+        for dtype in SOURCE_DTYPES:
+            # Every BF16/FP16 pattern; for FP32 also probe either side of ties.
+            bits = torch.arange(65536, dtype=torch.int32, device=DEVICE).to(torch.int16)
+            values = bits.view(torch.float16 if dtype == torch.float32 else dtype).to(
+                dtype
+            )
+            if dtype == torch.float32:
+                inf = torch.full_like(values, float("inf"))
+                values = torch.cat(
+                    (
+                        values,
+                        torch.nextafter(values, -inf),
+                        torch.nextafter(values, inf),
+                    )
+                )
+            for row_dim, strided, empty in (
+                (256, False, True),
+                (63, True, False),
+                (256, False, False),
+                (1030, True, False),
+            ):
+                rows = 0 if empty else (values.numel() + row_dim - 1) // row_dim + 1
+                k = values[
+                    torch.arange(rows * row_dim, device=DEVICE) % values.numel()
+                ].view(rows, 1, row_dim)
+                source = torch.cat((k, k.flip(-1)), dim=1)
+                k, v = source[:, :1], source[:, 1:]
+                if not strided:
+                    k, v = k.contiguous(), v.contiguous()
+                loc = torch.arange(rows, 0, -1, device=DEVICE)
+                if rows:
+                    # Extra row is padding; all value patterns remain covered.
+                    loc[-1] = 0
+                for form, scales in scale_forms.items():
+                    with self.subTest(
+                        dtype=dtype, row_dim=row_dim, empty=empty, scales=form
+                    ):
+                        k_cache, v_cache = make_kv_cache(rows + 3, row_dim)
+                        with _assert_store(k, v, k_cache, v_cache, loc, *scales):
+                            self.assertTrue(
+                                _store(k, v, k_cache, v_cache, loc, *scales)
+                            )
+
+    def test_graph_replay_reads_current_scales_and_locations(self):
+        """Absent K/V scales are independent; a device scale initially equal to
+        one must still be read when it changes during graph replay."""
+        k = torch.randn((4, 1, 128), dtype=torch.bfloat16, device=DEVICE)
+        v = torch.randn_like(k)
+        loc = torch.tensor([1, 4, 0, 0], device=DEVICE)
+        for k_scale, v_scale in (
+            (None, None),
+            (None, _scale(1.0)),
+            (_scale(1.0), None),
+            (_scale(1.0), _scale(1.0)),
+        ):
+            with self.subTest(k_scale=k_scale, v_scale=v_scale):
+                k_cache, v_cache = make_kv_cache(16, 128)
+                loc.copy_(torch.tensor([1, 4, 0, 0], device=DEVICE))
+                _store(k, v, k_cache, v_cache, loc, k_scale, v_scale)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    _store(k, v, k_cache, v_cache, loc, k_scale, v_scale)
+                for destinations, ks, vs in (
+                    ([7, 0, 2, 9], 0.3, 0.7),
+                    ([0] * 4, 1.3, 0.1),
+                ):
+                    loc.copy_(torch.tensor(destinations, device=DEVICE))
+                    if k_scale is not None:
+                        k_scale.fill_(ks)
+                    if v_scale is not None:
+                        v_scale.fill_(vs)
+                    k.normal_()
+                    v.normal_()
+                    with _assert_store(k, v, k_cache, v_cache, loc, k_scale, v_scale):
+                        graph.replay()
+
+    def test_declines_scales_and_devices_it_does_not_take(self):
+        """A per-channel, non-fp32 or off-device scale, a CPU pool and a GPU
+        below SM89 report False and write nothing, so the eager path still runs."""
+        row_dim = 64
+        cases = {
+            "per_channel": (DEVICE, torch.full((row_dim,), 0.5, device=DEVICE), True),
+            "fp64": (DEVICE, _scale(0.5).double(), True),
+            "off_device": (DEVICE, torch.tensor(0.5), True),
+            "cpu_pool": ("cpu", None, True),
+            "pre_sm89": (DEVICE, None, False),
+        }
+        for name, (device, k_scale, supported) in cases.items():
+            with (
+                self.subTest(case=name),
+                patch.object(memory_pool, "_triton_fp8_supported", lambda: supported),
+            ):
+                k = torch.randn((2, 1, row_dim), dtype=torch.bfloat16, device=device)
+                v = torch.randn_like(k)
+                k_cache, v_cache = make_kv_cache(8, row_dim, device=device)
+                before = (k_cache.clone(), v_cache.clone())
+                loc = torch.tensor([2, 5], device=device)
+                self.assertFalse(_store(k, v, k_cache, v_cache, loc, k_scale, None))
+                assert_bytes_equal(k_cache, before[0], "K cache")
+                assert_bytes_equal(v_cache, before[1], "V cache")
 
 
 if __name__ == "__main__":

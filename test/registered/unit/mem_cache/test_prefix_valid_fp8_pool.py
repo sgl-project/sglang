@@ -1,4 +1,4 @@
-"""Pool dispatch and real DFLASH initialization for FP8 prefix commits."""
+"""Pool dispatch for FP8 KV stores and prefix commits, and real DFLASH initialization."""
 
 import unittest
 from types import SimpleNamespace
@@ -7,12 +7,17 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
-from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, _resolve_fused_scale
+from sglang.srt.mem_cache.memory_pool import (
+    KVWriteLoc,
+    MHATokenToKVPool,
+    _resolve_fused_scale,
+    _triton_fp8_supported,
+)
 from sglang.srt.utils.device import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.prefix_valid import (
@@ -23,8 +28,8 @@ from sglang.test.kernels.prefix_valid import (
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import arena_of
 
-# Preserve the original GPU lanes; the kernel file retains the other 25 seconds.
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+# Preserve the original GPU lanes; the kernel file holds the other 35 seconds.
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: loaded FP8 scales are doubled for ROCm's E4M3FNUZ format.
 register_amd_ci(est_time=15, stage="base-a-jit-kernel-unit", runner_config="amd")
 
@@ -350,6 +355,114 @@ class TestPrefixValidFp8Pool(CustomTestCase):
             assert_bytes_equal(
                 buffer[untouched], original[untouched], f"{label} uncommitted slots"
             )
+
+
+def _make_store_pools(row_dim, v_row_dim, dtype=fp8_dtype):
+    plain = MHATokenToKVPool(
+        size=8,
+        page_size=1,
+        head_num=1,
+        head_dim=row_dim,
+        v_head_dim=v_row_dim,
+        dtype=dtype,
+        layer_num=2,
+        device=DEVICE,
+        enable_memory_saver=False,
+        kv_cache_layout="nhd",
+    )
+    # An arena needs one band growing from each end; the view writes to "full".
+    spec, peer = (
+        MHASubPoolSpec(
+            name=name,
+            layer_num=2,
+            head_num=1,
+            head_dim=row_dim,
+            v_head_dim=v_row_dim,
+            store_dtype=torch.uint8,
+            kv_cache_dtype=dtype,
+            grow_direction=grow,
+        )
+        for name, grow in (("full", "down"), ("swa", "up"))
+    )
+    arena = arena_of(
+        [spec, peer],
+        total_bytes=16 * (spec.entry_bytes() + peer.entry_bytes()),
+        device=DEVICE,
+        page_size=1,
+    )
+    view = MHAView(
+        arena=arena,
+        spec=arena.spec("full"),
+        page_size=1,
+        model_layer_ids=(0, 1),
+        enable_alt_stream=False,
+    )
+    return {"plain": plain, "view": view}
+
+
+class TestFp8StorePoolDispatch(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        if not _triton_fp8_supported():
+            self.skipTest("Ordinary fused E4M3 stores require CUDA SM89+")
+
+    def test_store_dispatch_and_preservation(self):
+        """Check real pools, layer overrides and arena neighbors. Asymmetric
+        rows and E5M2 retain eager mutation/overflow behavior."""
+        loc = torch.tensor([2, 5, 0], device=DEVICE)
+        lengths = torch.tensor([1, 1, 0], dtype=torch.int32, device=DEVICE)
+        scales = (
+            torch.tensor(0.375, device=DEVICE),
+            torch.tensor(1.75, device=DEVICE),
+        )
+        for v_row_dim, dtype, fused in (
+            (128, fp8_dtype, True),
+            (64, fp8_dtype, False),
+            (128, torch.float8_e5m2, False),
+        ):
+            for name, pool in _make_store_pools(128, v_row_dim, dtype).items():
+                with self.subTest(pool=name, v_row_dim=v_row_dim, dtype=dtype):
+                    k = torch.randn((3, 1, 128), dtype=torch.bfloat16, device=DEVICE)
+                    v = torch.randn(
+                        (3, 1, v_row_dim), dtype=torch.bfloat16, device=DEVICE
+                    )
+                    k[0, 0, 0], v[0, 0, 0] = 1e6, -1e6  # E5M2 must produce infinities.
+                    if name == "view":
+                        arena = pool._arena
+                        arena.raw.fill_(0x5A)
+                        before = arena.raw.clone()
+                        untouched = torch.ones_like(arena.raw, dtype=torch.bool)
+                        for buffer in (pool.k_buffer[1], pool.v_buffer[1]):
+                            offset = buffer.data_ptr() - arena.raw.data_ptr()
+                            row_bytes = buffer[0].numel() * buffer.element_size()
+                            for slot in (2, 5):
+                                start = (
+                                    offset
+                                    + slot * buffer.stride(0) * buffer.element_size()
+                                )
+                                untouched[start : start + row_bytes] = False
+                    with assert_prefix_commit(
+                        k,
+                        v,
+                        pool.get_key_buffer(1),
+                        pool.get_value_buffer(1),
+                        loc.view(-1, 1),
+                        lengths,
+                        *scales,
+                        inputs_mutated=not fused,
+                    ):
+                        pool.set_kv_buffer(
+                            SimpleNamespace(layer_id=0),
+                            KVWriteLoc(loc, physical=True),
+                            k,
+                            v,
+                            *scales,
+                            layer_id_override=1,
+                        )
+                    if name == "view":
+                        assert_bytes_equal(
+                            arena.raw[untouched], before[untouched], "other arena bytes"
+                        )
 
 
 class TestDflashFp8PrefixCommit(CustomTestCase):
