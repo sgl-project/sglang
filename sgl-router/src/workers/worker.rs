@@ -53,6 +53,8 @@ pub struct EngineProfile {
     pub grpc_port: Option<u16>,
     /// The engine's chat template renders a system message after the first.
     pub supports_inline_system: bool,
+    /// A prefill engine answers a request for at most one token with no decode.
+    pub prefill_answers_alone: bool,
 }
 
 impl From<WireProtocol> for EngineProfile {
@@ -63,6 +65,7 @@ impl From<WireProtocol> for EngineProfile {
             openai: None,
             grpc_port: None,
             supports_inline_system: false,
+            prefill_answers_alone: false,
         }
     }
 }
@@ -264,6 +267,7 @@ pub struct Worker {
     dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
     supports_inline_system: bool,
+    prefill_answers_alone: bool,
 }
 
 impl Worker {
@@ -285,6 +289,7 @@ impl Worker {
             openai,
             grpc_port,
             supports_inline_system,
+            prefill_answers_alone,
         } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -316,6 +321,7 @@ impl Worker {
             dp_rank_turn: AtomicUsize::new(0),
             openai,
             supports_inline_system,
+            prefill_answers_alone,
         }
     }
 
@@ -325,6 +331,12 @@ impl Worker {
 
     pub fn supports_inline_system(&self) -> bool {
         self.supports_inline_system
+    }
+
+    /// Whether this prefill engine answers a request for at most one token by
+    /// itself, as reported by its `/server_info`.
+    pub fn prefill_answers_alone(&self) -> bool {
+        self.prefill_answers_alone
     }
 
     pub fn services(&self) -> BTreeSet<String> {

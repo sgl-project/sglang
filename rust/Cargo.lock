@@ -4082,25 +4082,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sglang-grpc"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "prost-types",
- "pyo3",
- "serde_json",
- "sglang-runtime-v1-types",
- "tokenizers 0.21.4",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "sglang-mm"
 version = "0.1.0"
 dependencies = [
@@ -4142,16 +4123,6 @@ dependencies = [
  "tokenizers 0.23.2",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "sglang-runtime-v1-types"
-version = "0.1.0"
-dependencies = [
- "prost",
- "prost-types",
- "tonic",
- "tonic-prost",
 ]
 
 [[package]]

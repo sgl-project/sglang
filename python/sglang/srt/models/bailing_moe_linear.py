@@ -916,6 +916,8 @@ class BailingMoELinearForCausalLM(nn.Module):
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "gate_up_proj": ["gate_proj", "up_proj"],
+        # Both attention variants load qkv_proj from one query_key_value.
+        "attention.qkv_proj": ["attention.query_key_value"],
     }
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(

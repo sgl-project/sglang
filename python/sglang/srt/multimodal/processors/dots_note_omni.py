@@ -371,7 +371,6 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
         self,
         input_text: list[int] | str,
         request_obj: GenerateReqInput,
-        max_req_input_len: int,
         *args,
         image_data: list | None = None,
         audio_data: list | None = None,
@@ -546,11 +545,6 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
             item.set_pad_value()
             mm_items.append(item)
 
-        if len(input_ids) > max_req_input_len:
-            raise ValueError(
-                "Dots note omni expanded prompt is too long: "
-                f"{len(input_ids)} > {max_req_input_len}"
-            )
         padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
             input_ids, mm_items
         )

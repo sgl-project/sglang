@@ -142,9 +142,12 @@ longer required.
 
 Run one explicit quality or BCG comparator with `--quality {exact,lossless,high}` and
 `--breakable-cuda-graph`. BCG and `torch.compile` are intentionally mutually
-exclusive in this helper. A lossless/high+BCG command is only a compatibility probe:
-it is invalid if request-scoped DiT fusions mount after the lossless warmup
-graphs were captured. When a preset has explicit width and height, the helper
+exclusive in this helper. Warmup captures graphs only at its own quality level,
+so the helper warms up a BCG run at that run's `--quality` through
+`--warmup-sampling-params`; a request at any other level has no captured graph
+and runs eager. A lossless/high+BCG command is still only a compatibility probe:
+capture can fail with that level's fusions mounted, and the output can differ
+from eager. When a preset has explicit width and height, the helper
 declares that same `--warmup-resolutions` value automatically. Video presets
 with an explicit frame count also declare the matching `--warmup-num-frames`:
 
@@ -162,8 +165,8 @@ Eager/BCG/BCG/Eager at `exact`, then the same sequence at `lossless` and
 `high`, while holding one GPU set and one isolated checkpoint cache. The
 lossless/high+BCG cells test
 whether the combination is actually supported; do not average them when the
-runtime rejects the combination or the helper detects a late quality-fusion
-mount. The helper hashes every generated image, video, audio, or 3D mesh
+runtime rejects the combination or the request's quality has no captured
+graph. The helper hashes every generated image, video, audio, or 3D mesh
 artifact. It first requires the two Eager rows at each quality to agree, then
 rejects any BCG row whose hash differs from that Eager reference. Cleanup occurs
 only after all twelve runs, including on failure or interruption:
@@ -183,8 +186,8 @@ Before starting, confirm the chosen GPU set has no foreign process and remains
 unchanged through every run boundary. The helper rejects a BCG row unless its
 log contains `[Diffusion BCG] captured` and contains none of: support-gate
 disable, capture failure, `serving signature MISSED`, a message that no graph
-will be captured, or a request-scoped quality-gated DiT fusion mounted after
-capture. Do not average rejected rows with valid results.
+will be captured, or `has no captured breakable CUDA graphs` for the request's
+quality. Do not average rejected rows with valid results.
 
 BCG signatures include more than width and height. The helper maps an explicit
 video request frame count to `--warmup-num-frames`, while
@@ -825,7 +828,7 @@ This skill intentionally stops here. It tells you whether you are looking at:
 - [ ] fixed-shape baseline perf dump saved
 - [ ] fixed-shape new perf dump saved
 - [ ] quality/BCG applicability matrix attempted on one GPU set
-- [ ] BCG rows show capture and no disable/failure/signature-miss/late-quality-fusion marker
+- [ ] BCG rows show capture and no disable/failure/signature-miss/no-captured-graph marker
 - [ ] request shape, seed, steps, guidance, topology, residency, and synchronized stage profiling match
 - [ ] `compare_perf.py` table generated
 - [ ] one representative `torch.profiler` trace saved
