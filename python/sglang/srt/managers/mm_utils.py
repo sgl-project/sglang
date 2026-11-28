@@ -7,13 +7,12 @@ import hashlib
 import logging
 import mmap
 import os
-import pickle
 import sys
 from abc import abstractmethod
 from array import array
 from collections import defaultdict
-from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from multiprocessing import resource_tracker, shared_memory
+from typing import Callable, Dict, List, Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -26,6 +25,7 @@ from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    unwrap_object_fields_from_pickle,
 )
 
 # Preserve the existing initialization import for downstream callers.
@@ -41,10 +41,7 @@ from sglang.srt.managers.req_types import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.cache.digest import structured_digest
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.multimodal.transport import (
-    TensorTransportMode,
-    determine_tensor_transport_mode,
-)
+from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -59,11 +56,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
-
-# NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
-# to ensure consistent logging behavior across the codebase. This prevents issues with log
-# propagation that can cause some log messages (like 'server is fired up') to not appear
-# in the console when multimodal support is enabled.
 
 _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
@@ -118,125 +110,6 @@ def try_add_to_buffer(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         return result
     else:
         return tensor
-
-
-class TransportProxyTensor(torch.Tensor):
-    """
-    A convenient torch.Tensor subclass that carries extra metadata and supports
-    efficient inter-process communications
-    """
-
-    @staticmethod
-    def __new__(
-        cls,
-        data: torch.Tensor,
-        name: Optional[str] = None,
-        fields: Optional[Dict[str, Any]] = None,
-        transport_mode: TensorTransportMode = "default",
-        *args,
-        **kwargs,
-    ):
-
-        if not isinstance(data, torch.Tensor):
-            raise TypeError(
-                f"Input 'data' must be a torch.Tensor, but got {type(data)}"
-            )
-
-        instance = data.as_subclass(cls)
-
-        instance._metadata = {
-            "name": name,
-            "fields": fields if fields is not None else {},
-            "transport_mode": transport_mode,
-        }
-
-        return instance
-
-    def __getstate__(self):
-        """
-        Called during pickling. Implements the serialization logic.
-        """
-        # acquire all serialize metadata from _metadata
-        state = {
-            "metadata": self._metadata,
-            "tensor_data": None,
-            "ipc_extra": None,
-        }
-        transport_mode = self._metadata.get("transport_mode", "default")
-
-        if transport_mode == "cuda_ipc" and self.is_cuda:
-            try:
-                storage = self.untyped_storage()
-                handle = storage._share_cuda_()
-
-                state["ipc_extra"] = {
-                    "handle": handle,
-                    "shape": self.shape,
-                    "dtype": self.dtype,
-                    "stride": self.stride(),
-                    "device_index": self.device.index,
-                    "storage_offset": self.storage_offset(),
-                }
-                state["tensor_data"] = None
-            except Exception:
-                # Failed to get CUDA IPC handle (possibly tp). Falling back to default transport.
-                state["metadata"]["transport_mode"] = "default"
-                state["tensor_data"] = self.as_subclass(torch.Tensor)
-        else:
-            state["metadata"]["transport_mode"] = "default"
-            state["tensor_data"] = self.as_subclass(torch.Tensor)
-
-        return state
-
-    def __setstate__(self, state: Dict[str, Any]):
-        """
-        Called during unpickling. Implements the deserialization logic.
-        """
-        self._metadata = state["metadata"]
-
-        transport_mode = self._metadata.get("transport_mode", "default")
-
-        if transport_mode == "cuda_ipc" and state["ipc_extra"] is not None:
-            ipc_extra = state["ipc_extra"]
-            handle, shape, dtype, stride, source_device_index, s_offset = (
-                ipc_extra["handle"],
-                ipc_extra["shape"],
-                ipc_extra["dtype"],
-                ipc_extra["stride"],
-                ipc_extra["device_index"],
-                ipc_extra["storage_offset"],
-            )
-
-            try:
-                target_device = torch.device(f"cuda:{source_device_index}")
-                with torch.cuda.device(target_device):
-                    storage = torch.UntypedStorage._new_shared_cuda(*handle)
-                    reconstructed_tensor = torch.empty(
-                        0, dtype=dtype, device=target_device
-                    ).set_(storage, storage_offset=s_offset, size=shape, stride=stride)
-                    self.set_(reconstructed_tensor)
-            except Exception as e:
-                print(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
-                raise e
-
-        elif state["tensor_data"] is not None:
-            self.set_(state["tensor_data"])
-        else:
-            raise pickle.UnpicklingError(
-                "Invalid state for TransportProxyTensor: no tensor data found."
-            )
-
-    @property
-    def name(self) -> Optional[str]:
-        return self._metadata.get("name")
-
-    @property
-    def fields(self) -> Dict[str, Any]:
-        return self._metadata.get("fields", {})
-
-    @property
-    def transport_mode(self) -> TensorTransportMode:
-        return self._metadata.get("transport_mode", "default")
 
 
 def duplicate_pad_mm_input_ids(
@@ -1422,16 +1295,13 @@ class ShmPointerMMData:
         self.dtype = tensor.dtype
         self.precomputed_hash = precomputed_hash
         nbytes = tensor.numel() * tensor.element_size()
+        if shared_memory._USE_POSIX:
+            self._create_posix_segment(tensor, nbytes)
+            return
         shm = shared_memory.SharedMemory(
             create=True, size=nbytes, name=make_shm_name("mm")
         )
         try:
-            if sys.platform == "linux":
-                # SharedMemory only ftruncates the segment, so tmpfs pages are
-                # allocated lazily at write time; if /dev/shm fills up mid-copy
-                # the process is killed with SIGBUS. Reserving the pages up
-                # front turns exhaustion into a catchable OSError (ENOSPC).
-                os.posix_fallocate(shm._fd, 0, nbytes)
             dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
             dst.copy_(tensor.view(torch.uint8).reshape(-1))
         except BaseException:
@@ -1440,6 +1310,56 @@ class ShmPointerMMData:
             raise
         self.shm_name = shm.name
         shm.close()
+
+    def _create_posix_segment(self, tensor: torch.Tensor, nbytes: int) -> None:
+        if nbytes <= 0:
+            raise ValueError("Shared memory features must not be empty")
+        self.shm_name = make_shm_name("mm")
+        name = f"/{self.shm_name}"
+        resource_tracker.ensure_running()
+        fd = shared_memory._posixshmem.shm_open(
+            name, os.O_CREAT | os.O_EXCL | os.O_RDWR, mode=0o600
+        )
+        mapping = None
+        dst = None
+        registered = False
+        try:
+            resource_tracker.register(name, "shared_memory")
+            registered = True
+            os.ftruncate(fd, nbytes)
+            if sys.platform == "linux":
+                # SharedMemory only ftruncates the segment, so tmpfs pages are
+                # allocated lazily at write time; if /dev/shm fills up mid-copy
+                # the process is killed with SIGBUS. Reserving the pages up
+                # front turns exhaustion into a catchable OSError (ENOSPC).
+                os.posix_fallocate(fd, 0, nbytes)
+            mapping = mmap.mmap(fd, nbytes)
+            dst = torch.frombuffer(mapping, dtype=torch.uint8)
+            dst.copy_(tensor.view(torch.uint8).reshape(-1))
+            dst = None
+            mapping.close()
+            mapping = None
+            os.close(fd)
+            fd = -1
+        except BaseException:
+            try:
+                shared_memory._posixshmem.shm_unlink(name)
+            except FileNotFoundError:
+                pass
+            if registered:
+                resource_tracker.unregister(name, "shared_memory")
+            raise
+        finally:
+            dst = None
+            if mapping is not None:
+                try:
+                    mapping.close()
+                except Exception:
+                    logger.warning(
+                        "Failed to close a multimodal SHM mapping", exc_info=True
+                    )
+            if fd >= 0:
+                os.close(fd)
 
     def __getstate__(self):
         return {
@@ -1510,6 +1430,24 @@ class ShmPointerMMData:
         handle = self._shm_handle
         self._shm_handle = None
         self.tensor = None
+        if handle is None and shared_memory._USE_POSIX:
+            # shm_unlink needs no new descriptor, including after a receiver
+            # failed to open the segment at its file-descriptor limit.
+            name = f"/{self.shm_name.lstrip('/')}"
+            try:
+                shared_memory._posixshmem.shm_unlink(name)
+                # A failed open may not register this name in an independent
+                # receiver's tracker. Its registry is a set, so ensure membership
+                # before removing the successfully unlinked name.
+                resource_tracker.register(name, "shared_memory")
+                resource_tracker.unregister(name, "shared_memory")
+            except FileNotFoundError:
+                pass  # Only the rank that unlinks unregisters the name.
+            except OSError:
+                logger.warning(
+                    "Failed to unlink a multimodal SHM segment", exc_info=True
+                )
+            return
         if handle is None:
             try:
                 handle = shared_memory.SharedMemory(name=self.shm_name)
@@ -1595,12 +1533,23 @@ def _compact_inline_tensors(value, memo=None):
     return value
 
 
-def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+def _wrap_shm_or_inline(
+    tensor: torch.Tensor,
+    precomputed_hash: Optional[int] = None,
+    pending_handles: Optional[list] = None,
+):
     """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
     transport when shared memory cannot be allocated, e.g. /dev/shm is full
     under a burst of multimodal requests."""
     try:
-        return ShmPointerMMData(tensor, precomputed_hash=precomputed_hash)
+        pointer = ShmPointerMMData(tensor, precomputed_hash=precomputed_hash)
+        if pending_handles is not None:
+            try:
+                pending_handles.append(pointer)
+            except BaseException:
+                pointer.close_and_unlink()
+                raise
+        return pointer
     except OSError as e:
         print_warning_once(
             f"Failed to allocate shared memory for multimodal feature transport "
@@ -1610,7 +1559,11 @@ def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = 
         return _compact_inline_tensors(tensor)
 
 
-def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
+def _wrap_tensor_or_list(
+    value,
+    precomputed_hash: Optional[int] = None,
+    pending_handles: Optional[list] = None,
+):
     """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData.
 
     ``precomputed_hash`` is only forwarded for the single-tensor case.
@@ -1618,10 +1571,16 @@ def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
     so per-element hashes are not applicable.
     """
     if isinstance(value, torch.Tensor) and value.is_cpu:
-        return _wrap_shm_or_inline(value, precomputed_hash=precomputed_hash)
+        return _wrap_shm_or_inline(
+            value, precomputed_hash=precomputed_hash, pending_handles=pending_handles
+        )
     elif isinstance(value, (list, tuple)):
         wrapped = [
-            (_wrap_shm_or_inline(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
+            (
+                _wrap_shm_or_inline(t, pending_handles=pending_handles)
+                if isinstance(t, torch.Tensor) and t.is_cpu
+                else t
+            )
             for t in value
         ]
         return type(value)(wrapped) if isinstance(value, tuple) else wrapped
@@ -1657,7 +1616,7 @@ def _placeholder_crop(tensor: torch.Tensor) -> torch.Tensor:
 _SHM_MODEL_DATA_MIN_BYTES = 1 << 20
 
 
-def _wrap_model_specific_data(item) -> None:
+def _wrap_model_specific_data(item, pending_handles: Optional[list] = None) -> None:
     """Wrap large ``model_specific_data`` tensors, in a fresh dict.
 
     The dict is replaced rather than mutated: ``copy.copy`` on an item shares
@@ -1679,12 +1638,12 @@ def _wrap_model_specific_data(item) -> None:
         if placeholder and key == "images_crop":
             wrapped[key] = _placeholder_crop(value)
         else:
-            wrapped[key] = _wrap_shm_or_inline(value)
+            wrapped[key] = _wrap_shm_or_inline(value, pending_handles=pending_handles)
     if wrapped is not None:
         item.model_specific_data = wrapped
 
 
-def wrap_shm_features(obj):
+def wrap_shm_features(obj, *, pending_handles: Optional[list] = None):
     """
     Wrap multimodal features in SHM pointers, or compact inline CPU storage.
     """
@@ -1701,14 +1660,20 @@ def wrap_shm_features(obj):
             item_hash = item.hash
             if item.feature is not None:
                 item.feature = (
-                    _wrap_tensor_or_list(item.feature, precomputed_hash=item_hash)
+                    _wrap_tensor_or_list(
+                        item.feature,
+                        precomputed_hash=item_hash,
+                        pending_handles=pending_handles,
+                    )
                     if use_shm
                     else _compact_inline_tensors(item.feature, inline_memo)
                 )
             if item.precomputed_embeddings is not None:
                 item.precomputed_embeddings = (
                     _wrap_tensor_or_list(
-                        item.precomputed_embeddings, precomputed_hash=item_hash
+                        item.precomputed_embeddings,
+                        precomputed_hash=item_hash,
+                        pending_handles=pending_handles,
                     )
                     if use_shm
                     else _compact_inline_tensors(
@@ -1716,7 +1681,7 @@ def wrap_shm_features(obj):
                     )
                 )
             if wrap_model_data:
-                _wrap_model_specific_data(item)
+                _wrap_model_specific_data(item, pending_handles=pending_handles)
             # Compact remaining inline tensors after the optional SHM wrapping.
             # SHM pointers and shape-only placeholder crops stay unchanged.
             item.model_specific_data = _compact_inline_tensors(
@@ -1774,6 +1739,8 @@ def discard_shm_features(obj) -> None:
         return
     if not isinstance(obj.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)):
         return
+    if isinstance(obj.mm_inputs, MultimodalProcessorOutput):
+        obj.mm_inputs = unwrap_object_fields_from_pickle(obj.mm_inputs)
     for item in obj.mm_inputs.mm_items:
         _discard_tensor_or_list(item.feature)
         _discard_tensor_or_list(item.precomputed_embeddings)

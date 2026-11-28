@@ -5,7 +5,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 import torch
@@ -48,7 +48,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.mem_cache.allocation_sizing import (
     get_mamba_tracking_slots,
-    get_req_to_token_extra_context_len,
+    get_req_to_token_row_width,
 )
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -476,6 +476,7 @@ class KVCacheConfigurator:
                 draft_model_config=aux.draft_model_config,
                 draft_num_layers=aux.dflash_draft_num_layers,
                 attn_tp_size=self.draft_attn_tp_size,
+                algo_label="DFLASH" if self.spec_algorithm.is_dflash() else None,
             )
             self.dflash_draft_loc_space_scale = draft_loc_space_scale(
                 hf_config=aux.draft_model_config.hf_config,
@@ -1261,7 +1262,7 @@ class KVCacheConfigurator:
             raise RuntimeError("unified storage must be sized before construction")
         from sglang.srt.mem_cache.kv.decl import StateLifetime
 
-        extra_max_context_len, decode_pre_alloc_size = self._unified_request_rows(
+        decode_pre_alloc_size = self._unified_pre_alloc_rows(
             has_state=StateLifetime in self._unified_plan.lifetime_types()
         )
         storage = build_kv_storage(
@@ -1284,8 +1285,6 @@ class KVCacheConfigurator:
                 ),
                 head_dim=self.model_config.head_dim,
                 max_num_reqs=sizes.max_running_requests,
-                model_context_len=self.model_config.context_len,
-                extra_max_context_len=extra_max_context_len,
                 state_cache_params=(
                     self.mambaish_config.mamba2_cache_params if has_state else None
                 ),
@@ -1303,23 +1302,20 @@ class KVCacheConfigurator:
         )
         return storage
 
-    def _unified_request_rows(self, *, has_state: bool) -> Tuple[int, int]:
-        """The request table's row headroom beyond the model context, and the
-        rows a decode node hands to PREALLOCATED transfers on top of the
-        running set, by the rules the static request pools follow."""
+    def _unified_pre_alloc_rows(self, *, has_state: bool) -> int:
+        """The request table's rows a decode node hands to PREALLOCATED
+        transfers on top of the running set, by the rules the static request
+        pools follow."""
         disagg = get_disagg()
         if has_state:
-            extra_max_context_len = 4
-            draft_tokens = max_speculative_num_draft_tokens()
-            if draft_tokens is not None:
-                extra_max_context_len += draft_tokens
             pre_alloc_size = (
                 disagg.disaggregation_decode_extra_slots
                 if disagg.disaggregation_mode == "decode"
                 else 0
             )
-            return extra_max_context_len, pre_alloc_size
-        return get_req_to_token_extra_context_len(), self._req_pool_pre_alloc_size()
+        else:
+            pre_alloc_size = self._req_pool_pre_alloc_size()
+        return pre_alloc_size
 
     def _unified_swa_head_geometry(self) -> _UnifiedSWAHeadGeometry:
         """Head geometry of a hybrid-SWA host's full and SWA sub-pools."""
@@ -1490,6 +1486,7 @@ class KVCacheConfigurator:
             is_dflash=self.spec_algorithm.is_dflash_family(),
             speculative_draft_attention_backend=draft_backend,
             speculative_draft_kv_cache_dtype=draft_kv_cache_dtype,
+            model_config=aux.draft_model_config,
         )
         decision = place_fused_draft(
             profile=profile,
@@ -1629,7 +1626,9 @@ class KVCacheConfigurator:
         return 0
 
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
-        extra_max_context_len = get_req_to_token_extra_context_len()
+        req_to_token_row_width = get_req_to_token_row_width(
+            self.model_config.context_len
+        )
 
         disagg = get_disagg()
         if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
@@ -1637,23 +1636,23 @@ class KVCacheConfigurator:
             if self.mambaish_config:
                 return self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
-                    extra_max_context_len=extra_max_context_len,
+                    req_to_token_row_width=req_to_token_row_width,
                     pre_alloc_size=pre_alloc_size,
                 )
             return self._build_decode_req_pool(
                 max_num_reqs=max_num_reqs,
-                extra_max_context_len=extra_max_context_len,
+                req_to_token_row_width=req_to_token_row_width,
                 pre_alloc_size=pre_alloc_size,
             )
 
         if self.mambaish_config:
             return self._build_hybrid_req_pool(
                 max_num_reqs=max_num_reqs,
-                extra_max_context_len=extra_max_context_len,
+                req_to_token_row_width=req_to_token_row_width,
             )
         return self._build_default_req_pool(
             max_num_reqs=max_num_reqs,
-            extra_max_context_len=extra_max_context_len,
+            req_to_token_row_width=req_to_token_row_width,
         )
 
     def _get_mamba_layer_ids_for_req_pool(self) -> list:
@@ -1692,16 +1691,17 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        extra_max_context_len: int,
+        req_to_token_row_width: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
         from sglang.srt.disaggregation.decode import (
             HybridMambaDecodeReqToTokenPool,
         )
+        from sglang.srt.layers.attention.linear.utils import max_verify_batch_size
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            row_width=req_to_token_row_width,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
@@ -1731,6 +1731,7 @@ class KVCacheConfigurator:
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
+            max_verify_batch_size=max_verify_batch_size(max_num_reqs),
         )
         return req_to_token_pool
 
@@ -1738,7 +1739,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        extra_max_context_len: int,
+        req_to_token_row_width: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
         if _is_npu and is_deepseek_v4(self.model_config.hf_config):
@@ -1750,7 +1751,7 @@ class KVCacheConfigurator:
 
         req_to_token_pool = DecodeReqToTokenPool(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            row_width=req_to_token_row_width,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
@@ -1761,13 +1762,13 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        extra_max_context_len: int,
+        req_to_token_row_width: int,
     ) -> ReqToTokenPool:
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            row_width=req_to_token_row_width,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
@@ -1808,7 +1809,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        extra_max_context_len: int,
+        req_to_token_row_width: int,
     ) -> ReqToTokenPool:
         # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
         # swa/c4/c128/c{4,128}_state tables; others stay on the stock one.
@@ -1822,7 +1823,7 @@ class KVCacheConfigurator:
 
         req_to_token_pool = req_to_token_pool_cls(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            row_width=req_to_token_row_width,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
         )
@@ -2376,10 +2377,12 @@ class KVCacheConfigurator:
         max_running_requests: int,
         is_dsa_model: bool,
     ) -> KVCache:
+        from sglang.srt.hardware_backend.npu.kv_capability import (
+            resolve_npu_kv_capability,
+        )
         from sglang.srt.hardware_backend.npu.memory_pool_npu import (
             NPUMLATokenToKVPool,
         )
-        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
         from sglang.srt.mem_cache.kv_cache_dtype import resolve_indexer_quant_mode
 
         # NPU mirror of the GPU DSA cache layer split: under prefill CP, swap
@@ -2398,7 +2401,6 @@ class KVCacheConfigurator:
             index_size = max_total_num_tokens
         else:
             index_size = max_total_num_tokens * dcp_size
-        is_arch35 = is_npu_arch35()
         # Shared layers never access the indexer; pool sizing uses the same gate
         # so the saved indexer memory can be used for additional KV tokens.
         use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
@@ -2414,8 +2416,10 @@ class KVCacheConfigurator:
                 )
                 if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
             )
-        use_dsa_fp8_kv_cache_storage = (
-            self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
+        # Only the DSA layout has a packed record; dense MLA and ModelSlim KV
+        # pools keep their own layouts.
+        kv_capability = (
+            resolve_npu_kv_capability(self.kv_cache_dtype) if is_dsa_model else None
         )
         dsa_pool_kwargs = {}
         if is_dsa_model and get_dsa_index_kpool(self.model_config.hf_config) > 1:
@@ -2436,6 +2440,47 @@ class KVCacheConfigurator:
                     ]
                 ),
             }
+        if kv_capability is not None and not kv_capability.supported:
+            requested = self.kv_cache_dtype_str or self.server_args.kv_cache_dtype
+            raise ValueError(
+                f"--kv-cache-dtype {requested} is not supported: "
+                f"{kv_capability.unsupported_reason}"
+            )
+        main_kv_packed = kv_capability is not None and kv_capability.main_kv_packed
+        if main_kv_packed and envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+            # The sparse KV offload reads the main KV as separate unquantized
+            # latent and rope buffers; it has no packed-record path.
+            requested = self.kv_cache_dtype_str or self.server_args.kv_cache_dtype
+            raise ValueError(
+                f"--kv-cache-dtype {requested} stores the DSA MLA KV as a packed "
+                "quantized record, which SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD "
+                "cannot read. Disable it or use --kv-cache-dtype bf16."
+            )
+        if (
+            main_kv_packed
+            and self.kv_cache_dtype == torch.int8
+            and dcp_size > 1
+            and not self.is_draft_worker
+        ):
+            # DCP sparse attention reads the packed record through
+            # kv_quant_sparse_flash_attention, which is wired for fp8_e4m3 on
+            # arch35 only; the INT8 record has no DCP read path yet.
+            raise ValueError(
+                "--kv-cache-dtype int8 is not supported with --dcp-size > 1. "
+                "Disable DCP or use --kv-cache-dtype bf16."
+            )
+        if (
+            main_kv_packed
+            and self.kv_cache_dtype == torch.int8
+            and dsa_cp_layer_shard_rank is not None
+        ):
+            # The layer-split pool allocates its indexer cache in the main KV
+            # store dtype; the INT8 record keeps a BF16 indexer.
+            raise ValueError(
+                "--kv-cache-dtype int8 is not supported with "
+                "--enable-dsa-cache-layer-split. Disable the layer split or use "
+                "--kv-cache-dtype bf16."
+            )
         pool_cls = NPUMLATokenToKVPool
         pool_kwargs = {}
         if dsa_cp_layer_shard_rank is not None:
@@ -2454,15 +2499,15 @@ class KVCacheConfigurator:
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
             index_size=index_size,
-            index_page_size=get_schedule().page_size,
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=(
                 calculate_mla_kv_cache_dim(
                     model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
                 )
-                if use_dsa_fp8_kv_cache_storage
+                if main_kv_packed
                 else None
             ),
+            kv_capability=kv_capability,
             is_draft_worker=self.is_draft_worker,
             indexer_quant_mode=resolve_indexer_quant_mode(
                 self.server_args.indexer_kv_cache_dtype, self.kv_cache_dtype
@@ -3309,10 +3354,11 @@ class KVCacheConfigurator:
         # measured against an understated free-memory figure and the pool can be
         # sized orders of magnitude too small while GPU memory sits idle.
         gc.collect()
+        solo_join = get_exec().moe.is_ep_offset_joiner  # No WORLD peers to poll.
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_parallel().launch_world_size > 1,
+            distributed=not solo_join and get_parallel().launch_world_size > 1,
             cpu_group=get_parallel().world_group.cpu_group,
         )
 
@@ -3422,7 +3468,7 @@ class KVCacheConfigurator:
         # Apply user-specified upper bound
         if user_limit is not None:
             if user_limit > token_capacity:
-                logging.warning(
+                logger.warning(
                     f"max_total_tokens={user_limit} is larger than the profiled value "
                     f"{token_capacity}. Use the profiled value instead."
                 )
@@ -3596,13 +3642,15 @@ class KVCacheConfigurator:
 
         has_state = StateLifetime in self._unified_plan.lifetime_types()
         has_window = WindowLifetime in self._unified_plan.lifetime_types()
-        extra_context, pre_alloc = self._unified_request_rows(has_state=has_state)
+        pre_alloc = self._unified_pre_alloc_rows(has_state=has_state)
         ratio = schedule.mamba_full_memory_ratio
         requested = schedule.max_running_requests
         inp = KVSizingInputs(
             budget_bytes=budget_bytes,
             context_len=self.model_config.context_len,
-            extra_context_len=extra_context,
+            req_to_token_row_width=get_req_to_token_row_width(
+                self.model_config.context_len
+            ),
             pre_alloc_rows=pre_alloc,
             max_running_requests=None
             if requested is None
@@ -3900,7 +3948,6 @@ def calculate_mla_kv_cache_dim(
     *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
 ) -> int:
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
-    kv_cache_dtype = kv_cache_dtype
     kv_lora_rank = model_config.kv_lora_rank
     qk_rope_head_dim = model_config.qk_rope_head_dim
     kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
@@ -3960,7 +4007,9 @@ def calculate_mla_kv_cache_dim(
     quant_block_size = DSATokenToKVPool.quant_block_size
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
     # (excluding TRTLLM and HIP raw-layout kernels).
-    if kv_cache_dtype == torch.float8_e4m3fn:
+    # An int8 KV cache is only accepted for DSA on non-arch35 Ascend NPUs,
+    # where it is always the packed record.
+    if kv_cache_dtype in (torch.float8_e4m3fn, torch.int8):
         assert kv_lora_rank % quant_block_size == 0, (
             f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
         )

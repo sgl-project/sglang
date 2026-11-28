@@ -103,16 +103,16 @@ def triton_mla_block_tables(
     *,
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
-    max_kv_len: int,
+    batch_max_kv_len: int,
     page_size: int,
 ) -> torch.Tensor:
-    """[bs, cdiv(max_kv_len, block)] kernel block ids of each request.
+    """[bs, cdiv(batch_max_kv_len, block)] kernel block ids of each request.
 
     The paged allocator keeps a page's slots contiguous from a multiple of
     page_size, so each block-aligned slot divided by the block size is a block id.
     """
     block = triton_mla_block_size(page_size)
-    return req_to_token[req_pool_indices, :max_kv_len:block] // block
+    return req_to_token[req_pool_indices, :batch_max_kv_len:block] // block
 
 
 def aiter_triton_mla_decode(

@@ -10,13 +10,15 @@ that add it themselves.
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
     ColumnParallelLinearWithLoRA,
@@ -149,6 +151,33 @@ def test_fp16_adapter_keeps_activations_beyond_the_fp16_range(quality, stacked):
     assert torch.equal(actual, bf16_copy)
 
 
+@pytest.mark.parametrize("stacked", [False, True])
+def test_fp32_adapter_computes_as_its_bf16_copy_only_at_high(stacked):
+    # Lightning LoRAs ship fp32 and bf16 files of the same weights. At "high"
+    # the fp32 file computes in the activations' dtype, i.e. exactly as the
+    # bf16 file; "exact" and "lossless" keep the fp32 operands.
+    a, b = _adapter(stacked, torch.float32)
+    fp32_layer = _layer(a, b, alpha=RANK, strength=1.0)
+    bf16_layer = _layer(a.bfloat16(), b.bfloat16(), alpha=RANK, strength=1.0)
+    x = _activations(TOKENS, IN_DIM, seed=6).to(torch.bfloat16)
+    results = {}
+    for quality in ("exact", "lossless", "high"):
+        with torch.inference_mode(), set_forward_context(0, None, _batch(quality)):
+            out = fp32_layer.base_layer(x)
+            results[quality] = (
+                fp32_layer._add_lora_delta(out.clone(), x, 1.0),
+                bf16_layer._add_lora_delta(out.clone(), x, 1.0),
+                out,
+            )
+    actual, bf16_copy, _ = results["high"]
+    assert torch.equal(actual, bf16_copy)
+    for quality in ("exact", "lossless"):
+        kept, bf16_copy, out = results[quality]
+        assert not torch.equal(kept, bf16_copy)
+        expected = out.float() + _compute_lora_delta(x.float(), a.float(), b.float())
+        torch.testing.assert_close(kept.float(), expected, rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("adapter_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("stacked", [False, True])
 def test_lossless_delta_under_bf16_autocast_with_a_non_bf16_adapter(
@@ -257,26 +286,18 @@ def test_row_parallel_bias_moves_into_the_gemm_only_above_exact():
     )
 
 
-class _ColumnLinear(nn.Module):
+class _ColumnLinear(MergedColumnParallelLinear):
     """The ColumnParallelLinear surface the LoRA wrapper reads, at TP 1."""
 
     def __init__(self, output_sizes: list[int]):
-        super().__init__()
+        tp_group = MagicMock(spec=dist.ProcessGroup)
+        tp_group.rank.return_value = 0
+        tp_group.size.return_value = 1
+        super().__init__(IN_DIM, output_sizes, bias=False, tp_group=tp_group)
         g = torch.Generator().manual_seed(6)
         self.weight = nn.Parameter(
             torch.randn(sum(output_sizes), IN_DIM, generator=g) * 0.05
         )
-        self.bias = None
-        self.output_sizes = output_sizes
-        self.output_partition_sizes = output_sizes
-        self.skip_bias_add = False
-        self.gather_output = False
-        self.quant_method = SimpleNamespace(
-            apply=lambda layer, x, bias=None: F.linear(x, layer.weight, bias)
-        )
-
-    def forward(self, x):
-        return F.linear(x, self.weight), None
 
 
 def _column_layer(
