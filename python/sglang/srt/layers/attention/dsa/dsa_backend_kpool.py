@@ -5,6 +5,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.layers.attention.dsa.kpool_backend import (
+    kpool_tail_backends,
+    resolve_kpool_tail_backend,
+)
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     init_kpool_extend_metadata,
     init_kpool_write_plan,
@@ -40,26 +44,26 @@ class DeepseekSparseAttnBackendKPoolMixin:
         dsa_impl: _DSA_IMPL_T,
         phase: str,
     ) -> None:
-        # q8 prefill consumes the tail columns as ragged ids, like the history
-        # picks. Only over a bf16 or raw NoPE fp8 pool: gathering packed fp8
-        # rows through KPool tail columns is untested, so that combination keeps
-        # the guard.
-        if (
-            dsa_impl == "flashmla_sparse_q8"
-            and phase == "prefill"
-            and not self.dsa_kv_cache_store_fp8
-        ):
+        if topk_indices is None or self.dsa_index_kpool <= 1:
             return
-        if (
-            topk_indices is None
-            or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
-        ):
+        bf16_kv = self.kv_cache_dtype == torch.bfloat16
+        supported = kpool_tail_backends(
+            phase,
+            bf16_kv=bf16_kv,
+            device_capability=self.device_capability,
+            raw_fp8_nope=(
+                not bf16_kv
+                and not self.dsa_kv_cache_store_fp8
+                and self.kv_lora_rank == 512
+                and self.qk_rope_head_dim == 0
+            ),
+        )
+        if dsa_impl in supported:
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend."
+            f"unsupported by {dsa_impl} during {phase}. Supported backends: "
+            f"{', '.join(supported)}."
         )
 
     def _resolve_kpool_tail_backend(
@@ -67,17 +71,13 @@ class DeepseekSparseAttnBackendKPoolMixin:
         topk_indices: Optional[torch.Tensor],
         dsa_impl: _DSA_IMPL_T,
     ) -> _DSA_IMPL_T:
-        if (
-            topk_indices is None
-            or self.dsa_index_kpool <= 1
-            or dsa_impl != "flashmla_sparse"
-        ):
+        if topk_indices is None or self.dsa_index_kpool <= 1:
             return dsa_impl
-        if self.device_sm_major >= 10:
-            return "trtllm"
-        if self.device_sm_major == 9:
-            return "fa3"
-        return dsa_impl
+        return resolve_kpool_tail_backend(
+            dsa_impl,
+            self.device_capability,
+            packed_fp8=self.dsa_kv_cache_store_fp8,
+        )
 
     def _kpool_index_page_size(self) -> int:
         return self.token_to_kv_pool.index_page_size
