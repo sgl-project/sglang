@@ -22,6 +22,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import msgspec
 import torch
 
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -853,7 +854,7 @@ class TestTriFactorySizing(_PoolTestCase):
             swa_max_total_num_tokens=32,
             max_mamba_cache_size=20,
             model_context_len=16,
-            extra_max_context_len=4,
+            req_to_token_row_width=20,
             max_num_reqs=4,
             enable_memory_saver=False,
             enable_mamba_extra_buffer=False,
@@ -921,7 +922,7 @@ class TestTriFactorySizing(_PoolTestCase):
     def test_mamba_lazy_checkpoint_cleanup(self):
         from types import SimpleNamespace
 
-        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.runtime_context import get_parallel, get_schedule
 
         for tri_pool in (False, True):
             for lazy in (False, True):
@@ -968,8 +969,8 @@ class TestTriFactorySizing(_PoolTestCase):
                             # Spec off: no draft region to fuse.
                             _fused_draft_decision=lambda: None,
                             _fused_draft_for_pool_factory=lambda decision: None,
-                            _unified_request_rows=lambda *, has_state: (
-                                cfg.KVCacheConfigurator._unified_request_rows(
+                            _unified_pre_alloc_rows=lambda *, has_state: (
+                                cfg.KVCacheConfigurator._unified_pre_alloc_rows(
                                     configurator, has_state=has_state
                                 )
                             ),
@@ -988,6 +989,7 @@ class TestTriFactorySizing(_PoolTestCase):
                         # either top-level flag forwarding must break cleanup.
                         with (
                             get_parallel().override(attn_dcp_size=1, attn_tp_size=1),
+                            get_schedule().override(page_size=1),
                             patch.object(
                                 cfg,
                                 "get_exec",
@@ -1045,7 +1047,14 @@ class TestTriFactorySizing(_PoolTestCase):
                                 )
                             ).token_to_kv_pool_allocator.storage
                             configurator._unified_plan = planned.plan
-                            configurator._unified_sized = planned.sized
+                            # The runner's table rows are the model context plus
+                            # headroom wide, not the factory's 20.
+                            configurator._unified_sized = msgspec.structs.replace(
+                                planned.sized,
+                                req_to_token_row_width=cfg.get_req_to_token_row_width(
+                                    model.context_len
+                                ),
+                            )
                             storage = cfg.KVCacheConfigurator._init_unified_pools(
                                 configurator,
                                 sizes=SimpleNamespace(
@@ -1145,6 +1154,136 @@ class TestTriFactorySizing(_PoolTestCase):
                     for req, pos in zip(reqs, positions)
                 ]
                 self.assertEqual(gathered.tolist(), item_reads)
+
+    def _state_pool(self, *, lazy, slots):
+        from sglang.srt.runtime_context import get_parallel
+
+        kw = self._factory_kwargs(
+            enable_mamba_extra_buffer=True,
+            enable_mamba_extra_buffer_lazy=lazy,
+            disable_overlap_schedule=False,
+            max_mamba_cache_size=slots,
+        )
+        with get_parallel().override(attn_dcp_size=1):
+            bundle = build_test_unified_pools(**kw)
+        return bundle.req_to_token_pool, bundle.token_to_kv_pool_allocator
+
+    def test_a_prefill_takes_every_state_and_tracking_slot_in_one_bind(self):
+        """A batch's state slots and every request's ping-pong tracking slots
+        come from one take of the state band, which binds them in one launch;
+        lazy buffers keep the -1 sentinel past their first slot."""
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+        for lazy in (False, True):
+            with self.subTest(lazy=lazy):
+                pool, allocator = self._state_pool(lazy=lazy, slots=16)
+                state = allocator.state
+                n = pool.mamba_initial_tracking_slots
+                reqs = [SimpleNamespace(kv=ReqKvInfo()) for _ in range(3)]
+                with patch.object(
+                    state.slots, "_take", wraps=state.slots._take
+                ) as take:
+                    rows = acquire_rows(pool, state, reqs)
+                self.assertEqual(
+                    [c.args for c in take.call_args_list], [(3 * (1 + n),)]
+                )
+                mapping = pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+                buffers = [req.kv.mamba_ping_pong_track_buffer for req in reqs]
+                self.assertEqual(mapping[rows].tolist(), [b.tolist() for b in buffers])
+                for buf in buffers:
+                    self.assertEqual(int((buf == -1).sum()), 1 if lazy else 0)
+                held = {int(req.kv.mamba_pool_idx) for req in reqs} | {
+                    v for b in buffers for v in b.tolist() if v != -1
+                }
+                self.assertEqual(len(held), 3 * (1 + n))
+                self.assertTrue(
+                    bool((state.slots.translate(torch.tensor(sorted(held))) >= 0).all())
+                )
+
+    def test_a_short_prefill_hands_out_no_slot(self):
+        """Slots for one request and a half: the second request's shortfall
+        leaves every slot and row where it was, the first request's included."""
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
+
+        pool, allocator = self._state_pool(lazy=False, slots=16)
+        state = allocator.state
+        per_request = 1 + pool.mamba_initial_tracking_slots
+        filler = []
+        while (slot := state.slots.alloc(1)) is not None:
+            filler.append(slot)
+        state.slots.free(torch.cat(filler[: per_request + 1]))
+        available = state.slots.available_size()
+        rows_free = pool.available_size()
+        reqs = [SimpleNamespace(kv=ReqKvInfo()) for _ in range(2)]
+        with self.assertRaises(StateSlotsExhausted):
+            acquire_rows(pool, state, reqs)
+        self.assertEqual(state.slots.available_size(), available)
+        self.assertEqual(pool.available_size(), rows_free)
+        for req in reqs:
+            self.assertIsNone(req.kv.mamba_pool_idx)
+            self.assertIsNone(req.kv.mamba_ping_pong_track_buffer)
+
+    def test_a_retire_batch_unbinds_the_state_band_once(self):
+        """Inside the allocator's free group a retire batch's state and
+        tracking slots go back in one unbind of the state band at the group's
+        end, except the tracking slot the prefix cache keeps."""
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+        for lazy in (False, True):
+            with self.subTest(lazy=lazy):
+                pool, allocator = self._state_pool(lazy=lazy, slots=16)
+                state = allocator.state
+                band = allocator.mamba_allocator
+                available = state.slots.available_size()
+                reqs = [SimpleNamespace(kv=ReqKvInfo()) for _ in range(3)]
+                acquire_rows(pool, state, reqs)
+                kept = reqs[0].kv.mamba_ping_pong_track_buffer[0:1].clone()
+                unbinds = band._stats_n_free_lazy
+                allocator.free_group_begin()
+                state.release(pool, reqs[0], 0)
+                for req in reqs[1:]:
+                    state.release(pool, req)
+                self.assertEqual(band._stats_n_free_lazy, unbinds)
+                allocator.free_group_end()
+                self.assertEqual(band._stats_n_free_lazy, unbinds + 1)
+                self.assertEqual(state.slots.available_size(), available - 1)
+                self.assertGreaterEqual(int(state.slots.translate(kept)), 0)
+                state.slots.free(kept)
+                for req in reqs:
+                    pool.free(req)
+
+    def test_state_slots_freed_in_a_group_give_room_to_any_take(self):
+        """The bands share the arena, so the state slots a retire batch frees
+        inside the allocator's free group give their bytes back to a state or
+        token take or a capacity read of any band before the group ends, as a
+        free outside the group does."""
+        outcomes = {}
+        for grouped in (False, True):
+            pool, allocator = self._state_pool(lazy=False, slots=16)
+            state = allocator.state
+            full = allocator.full_attn_allocator.sub_pool_name
+            page = allocator.page_size
+            slots = []
+            while (slot := state.slots.alloc(1)) is not None:
+                slots.append(slot)
+            while allocator.alloc(page) is not None:
+                pass
+            self.assertFalse(allocator.units_fit({full: 1}))
+            if grouped:
+                allocator.free_group_begin()
+            state.slots.free(torch.cat(slots))
+            fits = allocator.units_fit({full: 1})
+            state_taken = state.slots.alloc(1) is not None
+            taken = 0
+            while allocator.alloc(page) is not None:
+                taken += 1
+            if grouped:
+                allocator.free_group_end()
+            outcomes[grouped] = (fits, state_taken, taken)
+        self.assertTrue(outcomes[False][0] and outcomes[False][1])
+        self.assertGreater(outcomes[False][2], 0)
+        self.assertEqual(outcomes[True], outcomes[False])
 
     def test_budget_sizing_and_boot_signature(self):
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
@@ -1249,6 +1388,7 @@ class TestTriFactorySizing(_PoolTestCase):
                 **self._factory_kwargs(
                     unified_total_bytes=1024,  # << ctx * e_f alone
                     model_context_len=100_000,
+                    req_to_token_row_width=100_004,
                     sliding_window_size=64,
                 )
             )

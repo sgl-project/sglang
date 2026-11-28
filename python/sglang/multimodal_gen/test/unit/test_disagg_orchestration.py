@@ -12,6 +12,7 @@ import pytest
 import torch
 import zmq
 
+from sglang.multimodal_gen.configs.sample.wan import WanT2V_1_3B_SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation import orchestrator
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import DiffusionServer
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -33,6 +34,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
     [
         None,
         "pickle",
+        "unsafe_pickle",
         "empty",
         "batch",
         "invalid_id",
@@ -76,6 +78,7 @@ def test_pipeline_transfer_and_slot_reuse(
     for holder in holders:
         holder.close()
     server = DiffusionServer(
+        sampling_params_cls=WanT2V_1_3B_SamplingParams,
         frontend_endpoint=frontend,
         encoder_work_endpoints=[] if split else [endpoints[RoleType.ENCODER]],
         denoiser_work_endpoints=[endpoints[RoleType.DENOISER]],
@@ -141,7 +144,7 @@ def test_pipeline_transfer_and_slot_reuse(
             time.sleep(0.01)
         client = socket(zmq.REQ)
         client.connect(frontend)
-        if fault in ("pickle", "empty", "batch", "invalid_id"):
+        if fault in ("pickle", "unsafe_pickle", "empty", "batch", "invalid_id"):
             payload = (
                 b"invalid pickle"
                 if fault == "pickle"
@@ -155,16 +158,36 @@ def test_pipeline_transfer_and_slot_reuse(
                 invalid = Req(request_id="invalid")
                 invalid.request_id = []
                 payload = pickle.dumps([invalid])
+            if fault == "unsafe_pickle":
+                payload = pickle.dumps(eval)
             client.send(payload)
-            assert client.recv_pyobj().error
+            error = client.recv_pyobj().error
+            assert error
+            if fault == "unsafe_pickle":
+                assert "Blocked unsafe global" in error
             assert server._thread.is_alive()
         reference = tmp_path / "head-only.png"
         reference.write_bytes(b"head-local image upload")
         for iteration in range(3 if split else 2):
             request_id = str(iteration)
-            image_path = [str(reference)] if iteration else None
+            image_path = (
+                [
+                    str(reference),
+                    "data:image/png;base64," + "A" * 1024,
+                    "https://example.com/reference.png",
+                ]
+                if iteration
+                else None
+            )
             client.send_pyobj(
-                [Req(request_id=request_id, prompt="test", image_path=image_path)]
+                [
+                    Req(
+                        sampling_params=WanT2V_1_3B_SamplingParams(),
+                        request_id=request_id,
+                        prompt="test",
+                        image_path=image_path,
+                    )
+                ]
             )
             req = pickle.loads(work[roles[0]].recv_multipart()[-1])[0]
             if fault == "duplicate" and iteration == 0:
@@ -178,6 +201,7 @@ def test_pipeline_transfer_and_slot_reuse(
                     base64.b64decode(req.image_path[0].split(",", 1)[1])
                     == reference.read_bytes()
                 )
+                assert req.image_path[1:] == image_path[1:]
             fail_image = split and iteration == 2
             fail_role = fault == "role_error" and iteration == 0
             active_roles = [

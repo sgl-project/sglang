@@ -2,8 +2,9 @@
 
 torch pin_memory buffers are only reachable by the SDMA engine; AIV kernels
 (e.g. kv_exchange) can only de-reference host VAs that were mapped into the
-device VA space first.  SGLANG_HICACHE_HOST_MEM_BACKEND selects the backend
-(a NpuHostMemoryBackend subclass resolved by get_host_memory_backend()):
+device VA space first. SGLANG_HICACHE_HOST_MEM_BACKEND selects the backend
+(a NpuHostMemoryBackend subclass resolved by get_host_memory_backend()); ACL
+is used when the variable is unset:
 
 - ``memfabric`` (MemfabricHostMemoryBackend): a MemFabric ``Offload``
   instance owns the host pool; ``pool.initialize`` reserves and
@@ -12,10 +13,11 @@ device VA space first.  SGLANG_HICACHE_HOST_MEM_BACKEND selects the backend
   L2<->L1 IO uses the AIV kv_exchange kernel.
 - ``acl`` (AclHostMemoryBackend): standard CANN runtime registration
   (aclrtHostRegister with ACL_HOST_REGISTER_MAPPED, see the kernel-side
-  ``host_memory`` module).  Plain pageable host tensors are allocated
-  with torch.empty and registered so the AIV kv_exchange kernel can
-  resolve their device pointers. The kernel-side auto routing sends every
-  transfer to the AIV operator.
+  ``host_memory`` module).  Host blocks come from the shared mmap
+  allocator (alloc_mmap), so SGLANG_HUGEPAGE_SIZE (2MB/1GB hugetlb
+  pages) applies to the host pool; blocks are registered so the AIV
+  kv_exchange kernel can resolve their device pointers. The kernel-side
+  auto routing sends every transfer to the AIV operator.
 
 ascendc_io_enabled() gates the AIV IO path and is true for both backends.
 """
@@ -26,11 +28,14 @@ import logging
 import math
 import os
 from collections.abc import Mapping
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_npu
 
@@ -42,9 +47,9 @@ logger = logging.getLogger(__name__)
 _MEMFABRIC_GB = 1024**3
 
 
-def host_memory_backend() -> str | None:
-    """Return 'memfabric' | 'acl' | None from SGLANG_HICACHE_HOST_MEM_BACKEND."""
-    return os.environ.get("SGLANG_HICACHE_HOST_MEM_BACKEND", "").lower() or None
+def host_memory_backend() -> str:
+    """Use ACL by default; honor an explicitly selected host-memory backend."""
+    return (os.environ.get("SGLANG_HICACHE_HOST_MEM_BACKEND") or "acl").lower()
 
 
 def memfabric_host_memory_enabled() -> bool:
@@ -53,8 +58,19 @@ def memfabric_host_memory_enabled() -> bool:
 
 
 def acl_host_memory_enabled() -> bool:
-    """aclrtHostRegister backs the host pool (pageable torch.empty blocks)."""
+    """aclrtHostRegister backs the host pool (mmap-backed host blocks)."""
     return host_memory_backend() == "acl"
+
+
+@lru_cache(maxsize=1)
+def _log_acl_mmap_host_pool() -> None:
+    configured = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
+    pages = configured if configured in ("2MB", "1GB") else "4KB"
+    logger.info(
+        "[HiCache] acl host pool via mmap allocator, page size %s "
+        "(hugetlb blocks fall back to 4KB on failure)",
+        pages,
+    )
 
 
 def ascendc_io_enabled() -> bool:
@@ -152,7 +168,7 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
 
         total_bytes is the combined byte size of all buffers the calling
         host pool is about to allocate (ultimately derived from
-        --hicache-size / --hicache-ratio).  The entity is sized by the first
+        --hicache-size / --hicache-ratio). The entity is sized by the first
         declaration; later host pools in the same process must fit into
         what is left.
         """
@@ -174,7 +190,7 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
             # LOCAL scene requires alloc_size == reserve_size.
             config.alloc_size = total_bytes
             config.scene = offload.Scene.LOCAL
-            config.flags = 0
+            config.executor = offload.Executor.AICPU
             ret = self._pool.initialize(config)
             if ret != 0:
                 self._pool = None
@@ -239,10 +255,12 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
 
 
 class AclHostMemoryBackend(NpuHostMemoryBackend):
-    """Pageable torch.empty blocks registered with aclrtHostRegister.
+    """mmap-backed host blocks registered with aclrtHostRegister.
 
-    Standard CANN runtime registration: plain pageable host pages are
-    mapped into the device VA space by aclrtHostRegister(ACL_HOST_REGISTER_MAPPED)
+    Standard CANN runtime registration: host blocks allocated by the
+    shared mmap allocator (alloc_mmap, honoring SGLANG_HUGEPAGE_SIZE
+    hugetlb pages with a prefaulted plain-mmap fallback) are mapped into
+    the device VA space by aclrtHostRegister(ACL_HOST_REGISTER_MAPPED)
     inside the kernel-side ``host_memory`` module.  There is no
     pre-reserved entity and nothing to declare up front, so ensure_capacity
     stays the inherited no-op; the kernel-side host_memory table resolves
@@ -270,8 +288,15 @@ class AclHostMemoryBackend(NpuHostMemoryBackend):
         pin_memory: bool,
         allocator: None,
     ) -> torch.Tensor:
-        """Allocate one pageable host block and map it for NPU access."""
-        tensor = torch.empty(list(dims), dtype=dtype)
+        """Allocate one mmap-backed host block and map it for NPU access.
+
+        Memory comes from alloc_mmap, so SGLANG_HUGEPAGE_SIZE selects
+        2MB/1GB hugetlb pages (prefaulted 4KB mmap when unset or on
+        allocation failure); the registration path is identical for
+        every page size.
+        """
+        _log_acl_mmap_host_pool()
+        tensor = alloc_mmap(tuple(dims), dtype)
         self._register_block(tensor)
         return tensor
 
@@ -282,10 +307,8 @@ _backend: NpuHostMemoryBackend | None = None
 def get_host_memory_backend() -> NpuHostMemoryBackend | None:
     """Return the backend selected by SGLANG_HICACHE_HOST_MEM_BACKEND.
 
-    Returns None when no registered-host-memory backend is configured;
-    callers then fall back to plain pinned memory.  The instance is cached,
-    so the selection and the MemFabric entity state are process-wide
-    singletons.
+    ACL is the default. The instance is cached, so the selection and the
+    MemFabric entity state are process-wide singletons.
     """
     global _backend
     if _backend is None:
@@ -304,9 +327,12 @@ def reserve_mla_split_host_memory(
     k_width: int,
     v_width: int,
     dtype: torch.dtype,
+    v_dtype: torch.dtype,
     buffers: MLASplitBuffers,
 ) -> None:
     """Reserve the split MLA host buffers before allocating them."""
+    if not is_npu():
+        return
     backend = get_host_memory_backend()
     if backend is None:
         return
@@ -315,13 +341,22 @@ def reserve_mla_split_host_memory(
     num_kv_rows = num_tokens * num_layers
     total_bytes = num_kv_rows * k_width * dtype.itemsize
     if v_width > 0:
-        total_bytes += num_kv_rows * v_width * dtype.itemsize
+        total_bytes += num_kv_rows * v_width * v_dtype.itemsize
 
-    num_indexer_rows = num_tokens * len(buffers.index_layer_indices)
+    # GLM-5.3-Flash index_kpool > 1 packs Indexer pages compressed
+    # (index_page_size < page_size).
+    num_index_tokens = (
+        num_pages * buffers.index_k.shape[2]
+        if buffers.index_k is not None
+        else num_tokens
+    )
+    num_indexer_rows = num_index_tokens * len(buffers.index_layer_indices)
     if buffers.index_k is not None:
-        total_bytes += num_indexer_rows * buffers.index_width * dtype.itemsize
+        total_bytes += (
+            num_indexer_rows * buffers.index_width * buffers.index_k.dtype.itemsize
+        )
     if buffers.index_scales is not None:
-        total_bytes += num_indexer_rows * 4  # Host scales are FP32.
+        total_bytes += num_indexer_rows * buffers.index_scales.dtype.itemsize
 
     backend.ensure_capacity(total_bytes, torch.npu.current_device())
 

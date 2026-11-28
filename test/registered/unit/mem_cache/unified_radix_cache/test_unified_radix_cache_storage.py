@@ -95,7 +95,7 @@ def _window_hit(req):
 
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=28, suite="base-b-test-1-gpu-small-amd")
 
 
 # About 0.15 s on a 2 GHz GPU, far longer than any admission step.
@@ -159,6 +159,8 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(
                 matched_prefix_tokens,
                 pool_transfers,
                 assume_stored=False,
+                *,
+                storage_read_metadata=None,
             ):
                 self.prefetch_args = (
                     handle,
@@ -810,6 +812,78 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cache.sanity_check()
         cons.sanity_check()
 
+    def _storage_hit_after_cold_sibling(
+        self, storage_dir, shared, tail_pages, unpublished
+    ) -> int:
+        """A stored prompt, then two cold engines whose prompts leave it at
+        ``shared``: the first recomputes and stores its own prompt, and the
+        second's storage hit is returned. The first finishes in its prefill
+        step, or, ``unpublished``, keeps its chunks private until it completes."""
+        self._produce_buffer_l3(
+            storage_dir, shared + self._make_seq(20_000, tail_pages)
+        )
+
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
+        cons.tree_core.write_through_threshold = 1
+        prompt = shared + self._make_seq(30_000, tail_pages)
+        req, _ = self._make_inflight_req(
+            cons, cons_alloc, cons_rtp, prompt, allocated=True
+        )
+        handle = CacheRequestHandle(req.rid, 0)
+        cons.prefetch_from_storage(
+            handle, cons.root_node_handle(), array("q", prompt), None, None
+        )
+        self._run_prefetch_to_completion(cons, handle)
+        # Storage holds the shared Full KV, but no window ends inside it.
+        self.assertFalse(cons.buffer_pipeline.has_staged(handle))
+        match = cons.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prompt)), req=req)
+        )
+        self.assertEqual(match.device_prefix_len, 0)
+        req.swa_branching_seqlen = match.swa_branching_seqlen
+        # The branch ends a node at ``shared``; the whole prompt is cached either way.
+        if unpublished:
+            cons.advance_unpublished_req(req)
+        finish_req(cons, req, len(prompt))
+        self.assertEqual(match_prefix(cons, prompt).device_prefix_len, len(prompt))
+        self._drain_buffer_writes(cons)
+        cons.sanity_check()
+
+        late, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+        late_prompt = shared + self._make_seq(40_000, tail_pages)
+        late_handle = CacheRequestHandle("late", 0)
+        late.prefetch_from_storage(
+            late_handle, late.root_node_handle(), array("q", late_prompt), None, None
+        )
+        self._run_prefetch_to_completion(late, late_handle)
+        late.sanity_check()
+        return match_prefix(late, late_prompt).device_prefix_len
+
+    @requires_hicache
+    @requires_swa
+    def test_buffer_only_storage_swa_gap_stores_missing_window(self):
+        """A prompt leaving a stored prompt mid-node finds its Full KV in
+        storage with no SWA window at that point. The engine that recomputes
+        it stores the window, so the next such prompt restores the shared prefix."""
+        page = self.cfg.page_size
+        sw_pages = (self.cfg.sliding_window_size + page - 1) // page
+        shared_pages = 2 * sw_pages
+        # Longer than two windows, so no stored window reaches the shared end.
+        tail_pages = 2 * sw_pages + 2
+        if 2 * (shared_pages + tail_pages) * page > self.cfg.kv_size:
+            self.skipTest("prompts do not fit the device pool")
+        shared = self._make_seq(1, shared_pages)
+
+        for unpublished in (False, True):
+            with (
+                self.subTest(unpublished=unpublished),
+                envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.override(True),
+            ):
+                hit = self._storage_hit_after_cold_sibling(
+                    self._make_storage_dir(), shared, tail_pages, unpublished
+                )
+                self.assertEqual(hit, len(shared))
+
     @requires_hicache
     def test_buffer_only_write_path_roundtrip(self):
         """Write path end to end: admission -> D2H staging -> storage write
@@ -1016,6 +1090,34 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cache.sanity_check()
 
     @requires_hicache
+    def test_buffer_only_reattach_backs_up_to_the_new_backend(self):
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            self._make_storage_dir()
+        )
+        seq = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = match_prefix(cache, seq).last_device_node
+        self._buffer_backup_and_wait(cache, leaf)
+
+        detached, message = cache.detach_storage_backend()
+        self.assertTrue(detached, message)
+        with envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(
+            self._make_storage_dir()
+        ):
+            attached, message = cache.attach_storage_backend("file")
+        self.assertTrue(attached, message)
+
+        page_hashes = self._all_page_hashes(cache, leaf)
+        transfers = aux_storage_key_transfers(cache, leaf)
+        self.assertEqual(self._storage_exists_count(cache, page_hashes, transfers), 0)
+        self._buffer_backup_and_wait(cache, leaf)
+        self.assertEqual(
+            self._storage_exists_count(cache, page_hashes, transfers),
+            len(page_hashes),
+        )
+        cache.sanity_check()
+
+    @requires_hicache
     def test_buffer_only_split_intent_writes_every_piece(self):
         storage_dir = self._make_storage_dir()
         cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
@@ -1069,6 +1171,53 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self._drain_buffer_writes(cache)
         self.assertEqual(
             self._storage_exists_count(cache, span_hashes, aux_keys), len(span_hashes)
+        )
+        cache.sanity_check()
+
+    def test_buffer_only_child_of_a_split_in_flight_node_is_written(self):
+        storage_dir = self._make_storage_dir()
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            storage_dir
+        )
+        pipeline = cache.buffer_pipeline
+        controller = cache.cache_controller
+        ps = self.cfg.page_size
+
+        seq = self._buffer_swa_seq(min_pages=4)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = match_prefix(cache, seq).last_device_node
+        chain = self._path_chain(cache, leaf)
+        write_backup(cache, leaf)
+        pipeline.flush_pending_writes()
+        for ack in controller.ack_write_queue:
+            ack.finish_event.synchronize()
+        # D2H done: the chain's storage writes are submitted, their acks not drained.
+        cache.writing_check(finish_count=len(controller.ack_write_queue))
+        self.assertTrue(pipeline.ongoing_backup)
+
+        end = len(seq)
+        for node in reversed(chain):
+            node_len = node_key_length(cache, node)
+            if node_len >= 2 * ps:
+                break
+            end -= node_len
+        else:
+            self.fail("no node of two pages to split")
+        child_seq = seq[: end - node_len + ps] + self._make_seq(9000, 2)
+        self._insert(cache, allocator, req_to_token_pool, child_seq)
+        child = match_prefix(cache, child_seq).last_device_node
+        # The split head is a new node; its pages ride the original node's write.
+        self.assertNotIn(node_parent(cache, child), chain)
+
+        write_backup(cache, child)
+        self.assertIn(child, pipeline.inflight_backup_node_ids)
+        self._drain_buffer_writes(cache)
+        child_hashes = self._all_page_hashes(cache, child)
+        self.assertEqual(
+            self._storage_exists_count(
+                cache, child_hashes, aux_storage_key_transfers(cache, child)
+            ),
+            len(child_hashes),
         )
         cache.sanity_check()
 
@@ -3154,6 +3303,91 @@ class TestUnifiedRadixPrefetchCorruption(
         )
         cache.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
             completed_tokens, "dropped"
+        )
+
+        cache.sanity_check()
+
+    def test_prefetch_over_already_cached_span_reports_already_cached(self):
+        """A span another request cached during the read is freed as a duplicate
+        and reported; only the new tail is credited as loaded from storage."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = mock.Mock()
+
+        parent_id = self._insert_device(
+            cache, allocator, list(range(1, 1 + 3 * self.ps))
+        )
+        self.assertGreater(write_backup(cache, parent_id), 0)
+        # Another request lands the first two pages of the span on host first.
+        cached_id = self._attach_host_child(cache, parent_id, start_token=1000)
+        self.assertIsNotNone(cached_id)
+        cached_tokens = 2 * self.ps
+
+        prefetch_key = RadixKey(
+            array("q", list(range(1000, 1000 + 3 * self.ps)))
+        ).page_aligned(self.ps)
+        completed_tokens = len(prefetch_key)
+        host_indices = cache.cache_controller.mem_pool_host.alloc(completed_tokens)
+        self.assertIsNotNone(host_indices)
+        host_used = cache.cache_controller.mem_pool_host.size - (
+            cache.cache_controller.mem_pool_host.available_size()
+        )
+
+        operation = mock.Mock()
+        operation.host_indices = host_indices
+        operation.completed_tokens = completed_tokens
+        operation.storage_start = 0
+        operation.pool_storage_result = PoolTransferResult(
+            kv_hit_pages=completed_tokens // self.ps, extra_pool_hit_pages={}
+        )
+        anchor_lock_params = cache.inc_host_lock_ref(parent_id).to_dec_params()
+        req_id = CacheRequestHandle("already-cached", 0)
+        operation.handle = req_id
+        operation.request_id = req_id.rid
+        cache.ongoing_prefetch[req_id] = _OngoingPrefetch(
+            parent_id,
+            prefetch_key,
+            host_indices,
+            operation,
+            anchor_lock_params,
+            {},
+        )
+        cache._record_storage_prefetch_hit(req_id, completed_tokens)
+        cache.cache_controller.prefetch_tokens_occupied = completed_tokens
+        hashes = [f"h{i}" for i in range(completed_tokens // self.ps)]
+        operation.hash_value = hashes
+
+        with (
+            mock.patch.object(cache, "_can_terminate_prefetch", return_value=True),
+            mock.patch.object(
+                cache,
+                "_check_hybrid_prefetch_result",
+                return_value=completed_tokens,
+            ),
+            mock.patch.object(
+                cache.cache_controller,
+                "terminate_prefetch",
+                return_value=(completed_tokens, hashes),
+            ),
+            mock.patch.object(operation, "is_terminated", return_value=False),
+        ):
+            self.assertTrue(cache.check_prefetch_progress(req_id))
+
+        self.assertEqual(
+            cache.pop_prefetch_loaded_tokens(req_id), completed_tokens - cached_tokens
+        )
+        # The duplicate head goes back to the host pool; the tail stays in the tree.
+        self.assertEqual(
+            cache.cache_controller.mem_pool_host.size
+            - cache.cache_controller.mem_pool_host.available_size(),
+            host_used - cached_tokens,
+        )
+        cache.storage_metrics_collector.log_prefetched_tokens.assert_called_once_with(
+            completed_tokens
+        )
+        cache.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
+            cached_tokens, "already_cached"
         )
 
         cache.sanity_check()

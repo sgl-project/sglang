@@ -6,12 +6,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sglang.srt import runtime_context as rc  # noqa: E402
 from sglang.srt.disaggregation import role_switch  # noqa: E402
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.prefill_busy_clock import (  # noqa: E402
+    PrefillBusyClock,
+)
 from sglang.srt.managers.scheduler_components.request_list import (  # noqa: E402
     IndexedReqList,
     ListKind,
@@ -21,6 +25,8 @@ from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+
+SECOND_NS = 1_000_000_000
 
 
 class TestHandlePdRoleSwitch(unittest.TestCase):
@@ -53,11 +59,14 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.teardown_disaggregation = teardown_patcher.start()
         self.addCleanup(teardown_patcher.stop)
         s.init_disaggregation = MagicMock()
+        s.gc_freezer = MagicMock()
         s._sync_disaggregation_mode_to_subcomponents = MagicMock()
         s._event_loop_should_restart = False
         s._pd_role_switch_in_progress = False
         s._pd_role_switch_unhealthy = False
         s.tp_worker = MagicMock()
+        s.metrics_reporter = SimpleNamespace(prefill_busy_clock=PrefillBusyClock())
+        s.total_prefill_busy_us = 0
         return s
 
     def test_preflight_checks_graph_headroom_without_releasing_resources(self):
@@ -238,8 +247,76 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
         s.tp_worker.ensure_decode_cuda_graphs.assert_called_once()
+        s.gc_freezer.on_cache_reset.assert_called_once()
         # The in-progress guard is released after a successful flip.
         self.assertFalse(s._pd_role_switch_in_progress)
+
+    def test_flip_keeps_the_published_prefill_busy_time_continuous(self):
+        s = self._scheduler(DisaggregationMode.DECODE)
+        # Like the real rebuild, re-read the flipped role from the context.
+        s.init_disaggregation = MagicMock(
+            side_effect=lambda: setattr(
+                s,
+                "disaggregation_mode",
+                DisaggregationMode(rc.get_disagg().disaggregation_mode),
+            )
+        )
+        s.total_prefill_busy_us = 7
+        clock = s.metrics_reporter.prefill_busy_clock
+        # An hour of decode work runs the clock, which a decode engine does not publish.
+        clock.mark_busy(0)
+        published = []
+
+        def at(now_s):
+            return patch(
+                "sglang.srt.managers.scheduler.time.monotonic_ns",
+                return_value=now_s * SECOND_NS,
+            )
+
+        def flip(new_role):
+            out = Scheduler.handle_pd_role_switch(
+                s, PdRoleSwitchReqInput(new_role=new_role)
+            )
+            self.assertTrue(out.success, out.message)
+
+        with at(3600):
+            published.append(s._get_total_prefill_busy_us())
+            flip("prefill")
+            published.append(s._get_total_prefill_busy_us())
+        clock.mark_busy(3601 * SECOND_NS)
+        with at(3602):
+            published.append(s._get_total_prefill_busy_us())
+            flip("decode")
+            published.append(s._get_total_prefill_busy_us())
+        with at(4000):
+            published.append(s._get_total_prefill_busy_us())
+            flip("prefill")
+            published.append(s._get_total_prefill_busy_us())
+
+        self.assertEqual(published, [7, 7, 1_000_007, 1_000_007, 1_000_007, 1_000_007])
+
+    def test_failed_rebuild_keeps_the_published_prefill_busy_time(self):
+        s = self._scheduler(DisaggregationMode.DECODE)
+
+        def assign_role_then_fail():
+            s.disaggregation_mode = DisaggregationMode(
+                rc.get_disagg().disaggregation_mode
+            )
+            raise RuntimeError("rebuild failed")
+
+        s.init_disaggregation = MagicMock(side_effect=assign_role_then_fail)
+        s.total_prefill_busy_us = 7
+        # An hour of decode work runs the clock, which a decode engine does not publish.
+        s.metrics_reporter.prefill_busy_clock.mark_busy(0)
+        with patch(
+            "sglang.srt.managers.scheduler.time.monotonic_ns",
+            return_value=3600 * SECOND_NS,
+        ):
+            out = Scheduler.handle_pd_role_switch(
+                s, PdRoleSwitchReqInput(new_role="prefill")
+            )
+            self.assertFalse(out.success)
+            self.assertEqual(s._get_total_prefill_busy_us(), 7)
 
     def test_flip_to_prefill_skips_decode_graph_capture(self):
         s = self._scheduler(DisaggregationMode.DECODE)
@@ -251,6 +328,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.init_disaggregation.assert_called_once()
         # Flipping to prefill must not capture decode graphs.
         s.tp_worker.ensure_decode_cuda_graphs.assert_not_called()
+        s.gc_freezer.on_cache_reset.assert_called_once()
         self.assertTrue(s._event_loop_should_restart)
 
     def test_rejected_when_switch_in_progress(self):
@@ -499,7 +577,8 @@ class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
         m._socket_lock = threading.Lock()
         m._socket_cache = {}
         m._monitor_cache = {}
-        m.engine = MagicMock()
+        m.transport = MagicMock()
+        m.request_status = MagicMock(spec=PPConsensusStore)
         # Built from KVArgs' own annotations: teardown walks several ptr/len
         # pairs, and hardcoding them here goes stale every time one is added.
         from sglang.srt.disaggregation.base.conn import KVArgs
@@ -523,6 +602,7 @@ class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
         self.assertEqual(m._worker_threads, [])
         self.assertEqual(m.transfer_queues, [])
         self.assertEqual(m.executors, [])
+        m.request_status.close.assert_called_once_with()
 
 
 @unittest.skipUnless(_HAS_MOONCAKE, "mooncake not importable in this environment")
