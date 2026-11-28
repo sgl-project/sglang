@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import copy
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from typing import Iterable, List, Optional, Tuple
 
 import msgspec
@@ -27,7 +28,11 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    get_moe_ascend_ops_config,
+    get_num_fused_shared_experts,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import (
     remap_dspark_weight_name_npu,
@@ -66,6 +71,7 @@ from sglang.srt.models.dspark import (
     project_through_lm_head,
 )
 from sglang.srt.runtime_context import (
+    get_flags,
     get_parallel,
     get_platform,
 )
@@ -569,6 +575,46 @@ def _dspark_stage_config(config: DeepSeekV4Config) -> DeepSeekV4Config:
     return stage_config
 
 
+@contextmanager
+def _dspark_stage_moe_scope(config: DeepSeekV4Config):
+    if not (_is_npu and is_npu_arch35() and get_moe_a2a_backend().is_ascend_ops()):
+        yield
+        return
+
+    modes = get_moe_ascend_ops_config()
+    draft = _dspark_stage_config(config)
+    if not modes.uses_fused_op or (
+        draft.n_routed_experts == config.n_routed_experts
+        and draft.num_experts_per_tok == config.num_experts_per_tok
+    ):
+        yield
+        return
+
+    # MegaMoE shares its symmetric buffer by EP group. Construct the draft's
+    # dispatchers with their own phase modes before they initialize fused_op.
+    draft_modes = replace(
+        modes,
+        prefill="alltoallv" if modes.prefill == "fused_op" else modes.prefill,
+        decode="low_latency" if modes.decode == "fused_op" else modes.decode,
+    )
+    logger.info(
+        "DSpark draft uses AscendOps prefill=%s and decode=%s "
+        "(draft experts/top-k %d/%d, target %d/%d)",
+        draft_modes.prefill,
+        draft_modes.decode,
+        draft.n_routed_experts,
+        draft.num_experts_per_tok,
+        config.n_routed_experts,
+        config.num_experts_per_tok,
+    )
+    moe = get_flags().moe
+    moe.moe_ascend_ops_config = draft_modes
+    try:
+        yield
+    finally:
+        moe.moe_ascend_ops_config = modes
+
+
 class DSparkV4StageMixin:
     def __init__(
         self,
@@ -771,9 +817,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             else None
         )
         with (
-            layer_stack(final_read=hc_boundary.FinalRead())
-            if _is_cuda
-            else nullcontext()
+            _dspark_stage_moe_scope(config),
+            (
+                layer_stack(final_read=hc_boundary.FinalRead())
+                if _is_cuda
+                else nullcontext()
+            ),
         ):
             self.stages = nn.ModuleList(
                 [
