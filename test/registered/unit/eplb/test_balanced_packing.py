@@ -9,6 +9,7 @@ import unittest
 import torch
 
 from sglang.srt.eplb.eplb_algorithms.deepseek import balanced_packing
+from sglang.srt.eplb.eplb_algorithms.deepseek_vec import pack_groups
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -187,6 +188,26 @@ def _reference_balanced_packing(weight, num_packs):
         torch.tensor(pack_index_list, dtype=torch.int64),
         torch.tensor(rank_in_pack_list, dtype=torch.int64),
     )
+
+
+class TestPackGroups(CustomTestCase):
+    """Tests for pack_groups(tokens_per_group, num_nodes) in deepseek_vec."""
+
+    def test_slots_unique_and_consistent_with_balanced_packing(self):
+        torch.manual_seed(0)
+        for num_layers, num_groups, num_nodes in [(3, 8, 2), (4, 64, 8), (2, 16, 4)]:
+            groups_per_rank = num_groups // num_nodes
+            weight = torch.randint(1, 10000, (num_layers, num_groups)).float()
+            group_perm = pack_groups(weight, num_nodes=num_nodes)
+            pack_index, rank_in_pack = balanced_packing(weight, num_packs=num_nodes)
+            expected = pack_index * groups_per_rank + rank_in_pack
+            self.assertEqual(group_perm.dtype, torch.int64)
+            self.assertEqual(group_perm.device.type, "cpu")
+            self.assertTrue(torch.equal(group_perm, expected))
+            for layer in range(num_layers):
+                self.assertEqual(
+                    sorted(group_perm[layer].tolist()), list(range(num_groups))
+                )
 
 
 if __name__ == "__main__":
