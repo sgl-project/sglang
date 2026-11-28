@@ -445,6 +445,10 @@ class AITerImpl(AttentionImpl):
     Implementation of attention using AITemplate.
     """
 
+    @classmethod
+    def has_native_varlen_kernel(cls) -> bool:
+        return True
+
     def __init__(
         self,
         num_heads: int,
@@ -601,11 +605,14 @@ class AITerImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        cu_seqlens_k: torch.Tensor | None = None,
+        max_seqlen_k: int | None = None,
     ) -> torch.Tensor:
         used = None
         # gfx950 only: the batch kernels and the key split were measured there;
-        # other architectures keep the varlen kernel
-        if USE_AITER_GFX95 and cu_seqlens_host is not None:
+        # other architectures keep the varlen kernel. The batch kernels take
+        # the query bounds for the keys too, so separate key bounds skip them.
+        if USE_AITER_GFX95 and cu_seqlens_host is not None and cu_seqlens_k is None:
             if tuple(cu_seqlens_host) == (0, query.shape[0]):
                 used = query.shape[0]
             elif self.packed_trailing_padding:
@@ -648,14 +655,20 @@ class AITerImpl(AttentionImpl):
         attention_func = aiter.flash_attn_varlen_func
 
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
+        if cu_seqlens_k is None:
+            cu_seqlens_k = cu_seqlens
+        else:
+            cu_seqlens_k = cu_seqlens_k.to(
+                device=query.device, dtype=torch.int32
+            ).contiguous()
         output = attention_func(
             q=query.contiguous(),
             k=key.contiguous(),
             v=value.contiguous(),
             cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+            max_seqlen_k=max_seqlen if max_seqlen_k is None else max_seqlen_k,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
             how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
