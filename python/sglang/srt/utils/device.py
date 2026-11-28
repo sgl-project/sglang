@@ -490,9 +490,16 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        used_memory = torch.xpu.memory_allocated(gpu_id)
-        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
+        # TODO(XPU): Use `free_gpu_memory, _ = torch.xpu.mem_get_info(gpu_id)` directly
+        # once `torch.xpu.mem_get_info` is reliable across all XPU platforms/drivers
+        # (pytorch/pytorch#157989, #161381, #194576).
+        try:
+            free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
+        except (RuntimeError, AttributeError):
+            total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
+            free_gpu_memory = total_gpu_memory
+        allocator_free = max(0, total_gpu_memory - torch.xpu.memory_reserved(gpu_id))
+        free_gpu_memory = min(free_gpu_memory, allocator_free)
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()

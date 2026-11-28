@@ -16,12 +16,13 @@ from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMetadata,
     merge_state_v2_wrapper,
 )
+from sglang.srt.layers.attention.graph_variants import SeqLenBucketGraphVariants
 from sglang.srt.layers.attention.local_attention import (
     LocalAttentionMetadata,
     make_local_attention_virtual_batches,
 )
 from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
-from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -35,7 +36,6 @@ from sglang.srt.runtime_context import (
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import (
@@ -146,6 +146,69 @@ def _check_page_size_1_graph_compat(*, use_mla: bool, graphs_disabled: bool) -> 
         )
 
 
+def _decode_layer_shapes(model_runner: ModelRunner) -> tuple[tuple[int, int], ...]:
+    """Return unique (v_head_dim, sliding_window_size) pairs across decoder layers."""
+    model = getattr(model_runner, "model", None)
+    if isinstance(model, torch.nn.Module):
+        shapes = {
+            (
+                m.v_head_dim,
+                -1 if m.sliding_window_size is None else m.sliding_window_size,
+            )
+            for m in model.modules()
+            if isinstance(m, RadixAttention)
+            and not m.is_cross_attention
+            and m.attn_type == AttentionType.DECODER
+        }
+        if shapes:
+            return tuple(sorted(shapes))
+
+    mc = model_runner.model_config
+    v_dim = getattr(mc, "v_head_dim", None) or getattr(mc, "head_dim", 0) or 0
+    sw = getattr(model_runner, "sliding_window_size", None)
+    sw_val = -1 if sw is None else sw
+    if getattr(model_runner, "is_hybrid_swa", False):
+        swa_v_dim = (
+            getattr(mc, "swa_v_head_dim", None)
+            or getattr(mc, "swa_head_dim", 0)
+            or v_dim
+        )
+        return ((v_dim, -1), (swa_v_dim, sw_val))
+    return ((v_dim, sw_val),)
+
+
+def _decode_context_tier_limits(
+    max_context_len: int,
+    page_size: int,
+    layer_shapes: tuple[tuple[int, int], ...] = ((0, -1),),
+) -> tuple[tuple[str, int], ...]:
+    """Return ascending (label, max_seq_len_k) tiers before the 'long' fallback.
+
+    Mirrors the XPU FlashAttention decode split heuristic (flash_attentionXe20.cpp):
+    - effective_blocks <= 32 and head_size_v < 512: single-stage FmhaDecodeRunner
+      (num_splits = 1).
+    - effective_blocks > 32: two-stage FmhaSplitDecodeRunner + ReduceSplitK
+      (num_splits = min(num_splits, parallel_), already saturated past 32 blocks).
+
+    Captures a 'short' tier at 32 * page_size iff at least one decoder layer with
+    v_head_dim < 512 has an effective context bound exceeding 32 * page_size.
+
+    TODO(XPU): Sink per-architecture split heuristics into sgl-kernel-xpu and
+    query tier limits via a kernel API instead of duplicating rules here.
+    """
+    min_blocks_to_split = 32
+    always_split_head_size_v = 512
+    split_threshold = min_blocks_to_split * page_size
+
+    has_splittable_layer = any(
+        v_head_dim < always_split_head_size_v
+        and (min(max_context_len, sw + 1) if sw >= 0 else max_context_len)
+        > split_threshold
+        for v_head_dim, sw in layer_shapes
+    )
+    return (("short", split_threshold),) if has_splittable_layer else ()
+
+
 class XPUAttentionBackend(AttentionBackend):
     """XPU FlashAttention backend, currently based on FlashAttentionBackend, will be refactored later.
 
@@ -154,6 +217,8 @@ class XPUAttentionBackend(AttentionBackend):
     - Speculative Decoding support
     - XPU Graph support, see https://github.com/pytorch/pytorch/issues/162143
     """
+
+    supports_prefill_cuda_graph_max_context_size: bool = True
 
     def __init__(
         self,
@@ -192,8 +257,10 @@ class XPUAttentionBackend(AttentionBackend):
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self._decode_layer_shapes = _decode_layer_shapes(model_runner)
         self.skip_prefill = skip_prefill
         self.is_hybrid_swa = model_runner.is_hybrid_swa
+        self._full_cg_prefill_context_len: Optional[int] = None
         self.use_sliding_window_kv_pool = (
             model_runner.token_to_kv_pool.layer_router.routes_to(
                 IdSpaceKind.SLIDING_WINDOW
@@ -861,12 +928,14 @@ class XPUAttentionBackend(AttentionBackend):
             cu_seqlens_q = local_metadata.local_query_start_loc
             cache_seqlens = local_metadata.local_seqused_k
             max_seqlen_q = local_metadata.local_max_query_len
+            max_seqlen_k = int(getattr(local_metadata, "local_max_seq_len", 0) or 0)
         elif is_hybrid_swa and metadata.swa_spec_metadata is not None:
             swa_spec_metadata = metadata.swa_spec_metadata
             page_table = swa_spec_metadata.page_table
             cu_seqlens_q = swa_spec_metadata.cu_seqlens_q
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
+            max_seqlen_k = int(getattr(swa_spec_metadata, "max_seq_len_k", 0) or 0)
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
         else:
             page_table = metadata.page_table
@@ -880,6 +949,7 @@ class XPUAttentionBackend(AttentionBackend):
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
+            max_seqlen_k = int(getattr(metadata, "max_seq_len_k", 0) or 0)
             cu_seqlens_k = metadata.cu_seqlens_k
 
         # Use Flash Attention for prefill
@@ -917,6 +987,7 @@ class XPUAttentionBackend(AttentionBackend):
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
+                max_seqlen_k = int(getattr(metadata, "encoder_max_seq_len_k", 0) or 0)
                 window_size = (-1, -1)
 
             # Gemma-3 multimodal: prepare_attn_masks set bidirectional_block_ids (per
@@ -959,6 +1030,7 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k_new=None,
                 max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
                 softmax_scale=layer.scaling,
                 causal=causal_arg,
                 window_size=window_size,
@@ -1546,6 +1618,7 @@ class XPUAttentionBackend(AttentionBackend):
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
+                encoder_max_k = int(getattr(metadata, "encoder_max_seq_len_k", 0) or 0)
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1555,6 +1628,7 @@ class XPUAttentionBackend(AttentionBackend):
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     cu_seqlens_k_new=None,
                     max_seqlen_q=1,
+                    max_seqlen_k=encoder_max_k,
                     softmax_scale=layer.scaling,
                     causal=False,
                     window_size=(-1, -1),
@@ -1565,6 +1639,9 @@ class XPUAttentionBackend(AttentionBackend):
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
+                local_max_k = int(
+                    getattr(local_attn_metadata, "local_max_seq_len", 0) or 0
+                )
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1574,6 +1651,7 @@ class XPUAttentionBackend(AttentionBackend):
                     cu_seqlens_q=local_attn_metadata.local_query_start_loc,
                     cu_seqlens_k_new=None,
                     max_seqlen_q=local_attn_metadata.local_max_query_len,
+                    max_seqlen_k=local_max_k,
                     softmax_scale=layer.scaling,
                     causal=True,
                     window_size=(-1, -1),
@@ -1607,6 +1685,7 @@ class XPUAttentionBackend(AttentionBackend):
                 )
 
                 # Default: single-token self-attention
+                max_k = int(getattr(metadata, "max_seq_len_k", 0) or 0)
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
@@ -1616,6 +1695,7 @@ class XPUAttentionBackend(AttentionBackend):
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     cu_seqlens_k_new=None,
                     max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_k,
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
@@ -1688,6 +1768,37 @@ class XPUAttentionBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
+
+    def _get_decode_tier_limits(self) -> tuple[tuple[str, int], ...]:
+        return _decode_context_tier_limits(
+            self.max_kv_len,
+            self.page_size,
+            getattr(self, "_decode_layer_shapes", ((0, -1),)),
+        )
+
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[SeqLenBucketGraphVariants]:
+        """XPU context-aware decode graph variants aligned with FlashAttention split rules."""
+        # MLA decode currently pins num_kv_splits=1 (matching eager),
+        # encoder-decoder graphs are disabled, and non-zero num_splits bypasses
+        # kernel split heuristics; in all these cases multi-tier graphs are skipped.
+        if (
+            capture_forward_mode != ForwardMode.DECODE
+            or captured_req_width != 1
+            or getattr(self, "is_encoder_decoder", False)
+            or getattr(self, "use_mla", False)
+            or getattr(self, "num_splits", 0) != 0
+        ):
+            return None
+
+        limits = self._get_decode_tier_limits()
+        if not limits:
+            return None
+        return SeqLenBucketGraphVariants(
+            graph_limits=limits,
+            fallback_label="long",
+        )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Pre-allocate fixed-size tensors reused across XPU graph captures."""
@@ -1921,6 +2032,17 @@ class XPUAttentionBackend(AttentionBackend):
             )
             metadata.swa_out_cache_loc = swa_out_cache_loc[:n]
 
+        if in_capture:
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                get_capture_attention_variant,
+            )
+
+            variant = get_capture_attention_variant()
+            tier_dict = dict(self._get_decode_tier_limits())
+            if variant is not None and variant != "long" and variant not in tier_dict:
+                raise ValueError(f"Unknown XPU decode graph variant {variant!r}")
+            metadata.max_seq_len_k = tier_dict.get(variant, self.max_kv_len)
+
         self.forward_metadata = metadata
 
     def _set_decode_page_metadata(
@@ -1977,7 +2099,7 @@ class XPUAttentionBackend(AttentionBackend):
         - cu_seqlens_q gets its own buffer (never aliased to cu_seqlens_k,
           unlike eager no-prefix path) so prefix replays stay correct;
         - max_seq_len_q / max_seq_len_k are baked at capture as upper bounds
-          (num_tokens in this bucket / max_kv_len): the kernel reads real
+          (num_tokens in this bucket / effective_context_len): the kernel reads real
           work extents from the cu_seqlens / cache_seqlens device buffers;
         - page_table is page-granularity (one column per `page_size` tokens),
           converted from the token-granularity req_to_token table via strided
@@ -1989,23 +2111,49 @@ class XPUAttentionBackend(AttentionBackend):
                 "Full prefill graph does not support models with "
                 f"attention_chunk_size ({self.attention_chunk_size})."
             )
-        if in_capture and getattr(self, "full_cg_prefill_metadata", None) is None:
+        max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
+        if max_seq_len_override is not None and max_seq_len_override > 0:
+            effective_context_len = min(max_seq_len_override, self.max_kv_len)
+            max_num_pages = (
+                effective_context_len + self.page_size - 1
+            ) // self.page_size
+        else:
+            effective_context_len = self.max_kv_len
+            max_num_pages = self.max_num_pages
+        existing_metadata = getattr(self, "full_cg_prefill_metadata", None)
+        if (
+            in_capture
+            and existing_metadata is not None
+            and (
+                getattr(self, "_full_cg_prefill_context_len", None)
+                != effective_context_len
+                or existing_metadata.page_table.shape[0] != bs
+            )
+        ):
+            raise ValueError(
+                "XPU full prefill graph captures must use one fixed "
+                "max_seq_len_override and request slot count (batch size); "
+                "increasing or changing them after capture would invalidate "
+                "metadata addresses held by earlier graphs."
+            )
+        if in_capture and existing_metadata is None:
             device = forward_batch.seq_lens.device
             m = FlashAttentionMetadata()
             m.cache_seqlens_int32 = torch.zeros((bs,), dtype=torch.int32, device=device)
             m.cu_seqlens_q = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             m.cu_seqlens_k = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             m.page_table = torch.zeros(
-                (bs, self.max_num_pages), dtype=torch.int32, device=device
+                (bs, max_num_pages), dtype=torch.int32, device=device
             )
             self.full_cg_prefill_metadata = m
+            self._full_cg_prefill_context_len = effective_context_len
             self.full_cg_prefill_strided_indices = torch.arange(
-                0, self.max_kv_len, self.page_size, device=device
+                0, effective_context_len, self.page_size, device=device
             )
             if self.use_sliding_window_kv_pool:
                 assert forward_batch.out_cache_loc is not None
                 m.swa_page_table = torch.zeros(
-                    (bs, self.max_num_pages), dtype=torch.int32, device=device
+                    (bs, max_num_pages), dtype=torch.int32, device=device
                 )
                 self.full_cg_prefill_swa_out_cache_loc = torch.zeros(
                     (forward_batch.out_cache_loc.shape[0],),
@@ -2030,7 +2178,13 @@ class XPUAttentionBackend(AttentionBackend):
         else:
             max_seq_len_k = int(seq_lens[:bs].max().item())
 
+        captured_limit = getattr(self, "_full_cg_prefill_context_len", None)
         if max_seq_len_k > 0:
+            if captured_limit is not None and max_seq_len_k > captured_limit:
+                raise ValueError(
+                    f"Replay max_seq_len_k ({max_seq_len_k}) exceeds captured "
+                    f"full-CG prefill context limit ({captured_limit})."
+                )
             num_pages = (max_seq_len_k + self.page_size - 1) // self.page_size
             valid_mask = (
                 self.full_cg_prefill_strided_indices[:num_pages][None, :]
@@ -2091,7 +2245,7 @@ class XPUAttentionBackend(AttentionBackend):
         if in_capture:
             # Baked into the captured kernel launches; upper bounds only.
             m.max_seq_len_q = forward_batch.positions.numel()
-            m.max_seq_len_k = self.max_kv_len
+            m.max_seq_len_k = effective_context_len
         self.forward_metadata = m
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
