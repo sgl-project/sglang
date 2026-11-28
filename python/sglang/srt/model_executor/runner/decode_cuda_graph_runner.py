@@ -1226,6 +1226,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_cpu = [num_tokens] * dp_capacity_for(self.num_dp_ranks)
 
         if global_num_tokens_cpu is not None:
+            if registry.has_slot("moe_dp_valid_counts"):
+                _slot("moe_dp_valid_counts").fill_(num_tokens)
             global_dp_buffer_len = sum(global_num_tokens_cpu)
             num_tokens_tensor = torch.tensor(
                 global_num_tokens_cpu, dtype=torch.int32, device=input_ids.device
@@ -1285,6 +1287,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return_logprob=False,
             positions=positions,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+            moe_dp_valid_counts=(
+                _slot("moe_dp_valid_counts")
+                if registry.has_slot("moe_dp_valid_counts")
+                else None
+            ),
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(
                 global_num_tokens_cpu
@@ -1534,6 +1541,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         num_tokens,
                         forward_batch.dp_padding_mode.is_max_len(),
                         forward_batch.global_num_tokens_cpu,
+                        moe_dp_valid_counts=forward_batch.moe_dp_valid_counts,
                     )
                     set_is_extend_in_batch(False)
 

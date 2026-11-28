@@ -31,7 +31,12 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_schedule,
+    get_spec,
     max_prefill_buffer_tokens,
+)
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
 )
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.device import is_sm120
@@ -578,6 +583,27 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
     # new keyword at all on the existing W4A16/MXFP8 paths, so those paths keep
     # working with SGLang's currently pinned release.
     humming_kwargs = {"use_wfp4afp8_humming": True} if use_wfp4afp8_humming else {}
+    parallel = get_parallel()
+    if (
+        use_wfp4afp8_humming
+        and get_spec().speculative_algorithm == "DSPARK"
+        and get_spec().speculative_num_draft_tokens == 6
+        and read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+        and not envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
+        and torch.cuda.get_device_capability(x.device) == (9, 0)
+        and parallel.tp_size == parallel.attn_dp_size == parallel.moe_ep_size == 8
+        and parallel.attn_tp_size == parallel.attn_cp_size == 1
+        and runner_config.moe_tp_size == 1
+        and runner_config.moe_ep_size == 8
+        and x.shape[1] == 5120
+        and topk_ids.shape[1] == 6
+        and quant_info.w13_weight.shape[0] == 48
+    ):
+        # The API below fixes cluster_size=1, min_latency=False, all-to-all=False.
+        # CUTLASS range-checks global -1 IDs and non-fused finalization skips them.
+        from sglang.srt.layers.dp_attention import copy_mask_dp_moe_padding
+
+        topk_ids = copy_mask_dp_moe_padding(topk_ids)
     with use_symmetric_memory(
         get_parallel().tp_group, disabled=not is_allocation_symmetric()
     ):
