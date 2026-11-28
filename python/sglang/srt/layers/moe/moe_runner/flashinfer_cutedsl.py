@@ -436,6 +436,13 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     # v1 only: SBO down-GEMM overlap args.
     down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
 
+    # v1 per-token NVFP4 dispatch only: GEMM1 fuses SwiGLU, so W13 rows are
+    # interleaved in 64-row up/gate blocks with the up projection first.
+    # w1_alpha_up dequantizes the up rows and swiglu_params holds
+    # (alpha, beta, limit) of gate * sigmoid(alpha * gate) * (up + beta).
+    w1_alpha_up: Optional[torch.Tensor] = None
+    swiglu_params: Optional[tuple[float, float, float]] = None
+
 
 @register_fused_func("none", "flashinfer_cutedsl")
 def fused_experts_none_to_flashinfer_cutedsl_fp4(
@@ -642,14 +649,28 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
     ), (
         f"CuteDSL masked MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
     )
-    assert runner_config.swiglu_limit is None, (
-        f"CuteDSL masked MoE does not support swiglu_limit, got {runner_config.swiglu_limit}."
-    )
     assert not runner_config.apply_router_weight_on_input, (
         "apply_router_weight_on_input is not supported for Flashinfer"
     )
+    assert runner_config.swiglu_limit is None, (
+        f"CuteDSL masked MoE does not support swiglu_limit, got {runner_config.swiglu_limit}."
+    )
+    if dispatch_output.per_token_scale is None:
+        assert (
+            runner_config.gemm1_clamp_limit is None
+            and runner_config.gemm1_alpha is None
+            and runner_config.gemm1_beta is None
+        ), (
+            "CuteDSL masked MoE only supports gemm1_clamp_limit/gemm1_alpha/gemm1_beta "
+            "with per-token NVFP4 dispatch, got "
+            f"gemm1_clamp_limit={runner_config.gemm1_clamp_limit}, "
+            f"gemm1_alpha={runner_config.gemm1_alpha}, "
+            f"gemm1_beta={runner_config.gemm1_beta}."
+        )
 
-    hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    masked_m = dispatch_output.masked_m
 
     # flashinfer_cutedsl_moe_masked reinterprets scales as float8_e4m3fn.
     # Same-dtype .view is a no-op; only wider dtypes (e.g. int32-packed
@@ -681,6 +702,9 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
         w2_alpha=quant_info.w2_alpha,
         masked_m=masked_m,
         activation=runner_config.activation,
+        per_token_scale=dispatch_output.per_token_scale,
+        w1_alpha_up=quant_info.w1_alpha_up,
+        swiglu_params=quant_info.swiglu_params,
         **(
             dict(
                 down_sm_count=overlap.num_sms,

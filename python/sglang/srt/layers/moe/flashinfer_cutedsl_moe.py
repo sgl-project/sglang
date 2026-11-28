@@ -1,3 +1,5 @@
+import inspect
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -6,6 +8,24 @@ from flashinfer import (
     silu_and_mul_scaled_nvfp4_experts_quantize,
 )
 from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
+
+_HAS_MASKED_GEMM_FUSED_SWIGLU_PARAMS = all(
+    name in inspect.signature(grouped_gemm_nt_masked).parameters
+    for name in (
+        "activation_type",
+        "a_per_token_scale",
+        "out_scale",
+        "out_global_scale",
+    )
+)
+
+
+@lru_cache(maxsize=None)
+def supports_masked_gemm_fused_swiglu(device: torch.device) -> bool:
+    """Whether grouped_gemm_nt_masked can fuse SwiGLU and NVFP4 output on `device`."""
+    return _HAS_MASKED_GEMM_FUSED_SWIGLU_PARAMS and torch.cuda.get_device_capability(
+        device
+    ) in ((10, 0), (10, 3))
 
 
 def get_cute_dtype(input: torch.Tensor) -> str:
@@ -21,7 +41,7 @@ def get_cute_dtype(input: torch.Tensor) -> str:
 
 def flashinfer_cutedsl_moe_masked(
     hidden_states: tuple[torch.Tensor, Optional[torch.Tensor]],
-    input_global_scale: torch.Tensor,
+    input_global_scale: Optional[torch.Tensor],
     w1: torch.Tensor,
     w1_blockscale: torch.Tensor,
     w1_alpha,
@@ -34,6 +54,9 @@ def flashinfer_cutedsl_moe_masked(
     down_signals: Optional[torch.Tensor] = None,
     down_start_event: Optional[torch.cuda.Event] = None,
     activation: str = "silu",
+    per_token_scale: Optional[torch.Tensor] = None,
+    w1_alpha_up: Optional[torch.Tensor] = None,
+    swiglu_params: Optional[tuple[float, float, float]] = None,
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -42,7 +65,9 @@ def flashinfer_cutedsl_moe_masked(
     Args:
         hidden_states: Either of the following case
             * tuple[torch.Tensor, None]: [num_experts, m, k], bf16, None means no quant
-            * tuple[torch.Tensor, torch.Tensor]: [num_experts, m, k // 2], uint8, [num_experts, m, k // 16], float8_e4m3fn
+            * tuple[torch.Tensor, torch.Tensor]: [m, k // 2, num_experts] (or
+              [num_experts, m, k // 2] when per_token_scale is set), uint8, and
+              block scales in float8_e4m3fn
         input_global_scale (torch.Tensor): (l,)
         w1 (torch.Tensor): fp4 weights, [l, 2 * n, k // 2], uint8
         w1_blockscale (torch.Tensor): blockscale factors, e4m3,
@@ -52,6 +77,9 @@ def flashinfer_cutedsl_moe_masked(
         w2_blockscale (torch.Tensor): blockscale factors, e4m3,
         w2_alpha (torch.Tensor): (l,)
         masked_m (torch.Tensor): Masked dimension indices
+        per_token_scale (torch.Tensor): Optional [l, m] float32 per-row scale
+            for pre-quantized per-token NVFP4 dispatch; enables the fused
+            SwiGLU + NVFP4 output GEMM1 epilogue.
 
     Notes:
         - Assumes max(masked_m) == m.
@@ -82,7 +110,14 @@ def flashinfer_cutedsl_moe_masked(
     # === Assertions on shapes ===
     n = w2.shape[-1] * 2  # intermediate dimension
 
-    if hidden_states[1] is not None:
+    if per_token_scale is not None:
+        assert hidden_states[1] is not None
+        a_q = hidden_states[0].view(torch.uint8)
+        a_q_sf = hidden_states[1].view(torch.float8_e4m3fn)
+        num_experts, m, k_by_2 = a_q.shape
+        k = k_by_2 * 2
+        a_q = a_q.permute(1, 2, 0)
+    elif hidden_states[1] is not None:
         a_q = hidden_states[0].view(torch.uint8)
         a_q_sf = hidden_states[1].view(torch.float8_e4m3fn)
         m, k_by_2, num_experts = a_q.shape
@@ -135,11 +170,6 @@ def flashinfer_cutedsl_moe_masked(
         f"w2_alpha must be (l,), got {w2_alpha.shape}"
     )
 
-    # TODO(kaixih@nvidia): dtype should be based on inputs.
-    gateup_output = torch.empty(
-        (num_experts, m, gemm1_out_dim), dtype=torch.bfloat16, device=a_q.device
-    )
-    gateup_output = gateup_output.permute(1, 2, 0)  # requirement of kernel
     sf_vec_size = 16
     assert a_q_sf.dtype == torch.float8_e4m3fn
     assert a_q.dtype == torch.uint8
@@ -147,37 +177,76 @@ def flashinfer_cutedsl_moe_masked(
     sf_dtype = "float8_e4m3fn"
     c_dtype = "bfloat16"
 
-    # Gemm1
-    grouped_gemm_nt_masked(
-        (a_q, a_q_sf),
-        (w1.permute(1, 2, 0), w1_blockscale),
-        gateup_output,
-        masked_m,
-        ab_dtype=ab_dtype,
-        sf_dtype=sf_dtype,
-        c_dtype=c_dtype,
-        sf_vec_size=sf_vec_size,
-        alpha=w1_alpha.view(1, 1, num_experts),
-        alpha_dtype=get_cute_dtype(w1_alpha),
-    )  # in logical [m, n, l]
+    if per_token_scale is not None:
+        from flashinfer import ActivationType
 
-    # Activation + NVFP4 quantization of the GEMM2 input.
-    if gated:
-        # Fused silu(gate) * up + quantize; halves 2*n -> n.
-        diq, diq_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
-            gateup_output.permute(2, 0, 1),
-            masked_m,
-            a2_global_scale,
+        assert gated and w1_alpha_up is not None and swiglu_params is not None
+        swiglu_alpha, swiglu_beta, swiglu_limit = swiglu_params
+        diq = torch.empty(
+            (num_experts, m, n // 2), dtype=torch.uint8, device=a_q.device
         )
+        diq_sf = torch.empty(
+            (num_experts, (m + 127) // 128, n // (sf_vec_size * 4), 32, 4, 4),
+            dtype=torch.float8_e4m3fn,
+            device=a_q.device,
+        )
+        grouped_gemm_nt_masked(
+            (a_q, a_q_sf),
+            (w1.permute(1, 2, 0), w1_blockscale),
+            diq.permute(1, 2, 0),
+            masked_m,
+            ab_dtype=ab_dtype,
+            sf_dtype=sf_dtype,
+            c_dtype="float4_e2m1fn",
+            sf_vec_size=sf_vec_size,
+            alpha=w1_alpha,
+            alpha_dtype=get_cute_dtype(w1_alpha),
+            alpha_up=w1_alpha_up,
+            a_per_token_scale=per_token_scale,
+            activation_type=ActivationType.Swiglu,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            out_scale=diq_sf,
+            out_global_scale=a2_global_scale,
+        )
+        diq = diq.permute(1, 2, 0)
+        diq_sf = diq_sf.permute(3, 4, 1, 5, 2, 0)
     else:
-        # Non-gated relu^2: relu(x)^2 elementwise (no halving), then grouped
-        # NVFP4 quantize. scaled_fp4_grouped_quantize needs a per-expert (l,)
-        # global scale, so broadcast a scalar if one was supplied.
-        act = torch.relu(gateup_output.permute(2, 0, 1)).square().contiguous()
-        a2_gs = a2_global_scale
-        if a2_gs.numel() == 1:
-            a2_gs = a2_gs.expand(num_experts).contiguous()
-        diq, diq_sf = scaled_fp4_grouped_quantize(act, masked_m, a2_gs)
+        # TODO(kaixih@nvidia): dtype should be based on inputs.
+        gateup_output = torch.empty(
+            (num_experts, m, gemm1_out_dim), dtype=torch.bfloat16, device=a_q.device
+        ).permute(1, 2, 0)
+        grouped_gemm_nt_masked(
+            (a_q, a_q_sf),
+            (w1.permute(1, 2, 0), w1_blockscale),
+            gateup_output,
+            masked_m,
+            ab_dtype=ab_dtype,
+            sf_dtype=sf_dtype,
+            c_dtype=c_dtype,
+            sf_vec_size=sf_vec_size,
+            alpha=w1_alpha.view(1, 1, num_experts),
+            alpha_dtype=get_cute_dtype(w1_alpha),
+        )  # in logical [m, n, l]
+
+        # Activation + NVFP4 quantization of the GEMM2 input.
+        if gated:
+            # Fused silu(gate) * up + quantize; halves 2*n -> n.
+            diq, diq_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
+                gateup_output.permute(2, 0, 1),
+                masked_m,
+                a2_global_scale,
+            )
+        else:
+            # Non-gated relu^2: relu(x)^2 elementwise (no halving), then grouped
+            # NVFP4 quantize. scaled_fp4_grouped_quantize needs a per-expert (l,)
+            # global scale, so broadcast a scalar if one was supplied.
+            act = torch.relu(gateup_output.permute(2, 0, 1)).square().contiguous()
+            a2_gs = a2_global_scale
+            if a2_gs.numel() == 1:
+                a2_gs = a2_gs.expand(num_experts).contiguous()
+            diq, diq_sf = scaled_fp4_grouped_quantize(act, masked_m, a2_gs)
 
     if down_start_event is not None:
         down_start_event.record()

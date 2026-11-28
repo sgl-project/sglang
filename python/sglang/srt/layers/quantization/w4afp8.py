@@ -342,9 +342,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: DeepEPMoE,
         dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
-        hidden_states, hidden_scales, topk_ids, _, masked_m, expected_m = (
-            dispatch_output
-        )
+        hidden_scales = dispatch_output.hidden_states_scale
 
         if hidden_scales is None:
             raise RuntimeError(
@@ -357,14 +355,14 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         )
 
         output = cutlass_w4a8_moe_deepep_ll(
-            hidden_states,
+            dispatch_output.hidden_states,
             hidden_scales,
             layer.w13_weight,
             layer.w2_weight,
             layer.w13_weight_scale_inv,
             layer.w2_weight_scale_inv,
-            topk_ids,
-            masked_m,
+            dispatch_output.topk_ids,
+            dispatch_output.masked_m,
             layer.quant_method.a_strides1,
             layer.quant_method.b_strides1,
             layer.quant_method.c_strides1,
@@ -378,7 +376,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.quant_method.problem_sizes2,
             layer.w13_input_scale,
             layer.w2_input_scale,
-            expected_m=expected_m,
+            expected_m=dispatch_output.expected_m,
         )
 
         return output

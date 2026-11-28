@@ -594,20 +594,12 @@ def pre_permute_deepep_ll_to_ascend(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> AscendRunnerInput:
-    (
-        hidden_states,
-        hidden_states_scale,
-        topk_ids,
-        topk_weights,
-        group_list,
-        _,
-    ) = dispatch_output
-    group_list = group_list.to(torch.int64)
-    running_state["topk_ids"] = topk_ids
-    running_state["topk_weights"] = topk_weights
+    group_list = dispatch_output.masked_m.to(torch.int64)
+    running_state["topk_ids"] = dispatch_output.topk_ids
+    running_state["topk_weights"] = dispatch_output.topk_weights
     return AscendRunnerInput(
-        hidden_states=hidden_states,
-        hidden_states_scale=hidden_states_scale,
+        hidden_states=dispatch_output.hidden_states,
+        hidden_states_scale=dispatch_output.hidden_states_scale,
         expert_tokens=group_list,
         group_list_type=1,
     )

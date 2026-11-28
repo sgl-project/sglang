@@ -107,10 +107,11 @@ def handle_moe_kernel_config(server_args: Any):
     if view.moe_runner_backend == "flashinfer_cutedsl":
         # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
         assert (
-            view.quantization in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online"]
+            view.quantization
+            in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online", "minimax_m3_nvfp4"]
             or model_config_of(server_args).nvfp4_moe_meta is not None
         ), (
-            f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', or hybrid NVFP4 models."
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', 'minimax_m3_nvfp4', or hybrid NVFP4 models."
         )
         assert view.ep_size in [
             1,
@@ -133,6 +134,18 @@ def handle_moe_kernel_config(server_args: Any):
                 "flashinfer_cutedsl per-token NVFP4 activation requires "
                 "moe_a2a_backend='none' or 'flashinfer_nvlink_one_sided'."
             )
+        if view.quantization == "minimax_m3_nvfp4":
+            if view.moe_a2a_backend != "deepep":
+                raise ValueError(
+                    "MiniMax-M3 NVFP4 on flashinfer_cutedsl requires "
+                    "--moe-a2a-backend deepep."
+                )
+            if cfg.deepep_dispatcher_output_dtype not in ("auto", "nvfp4"):
+                raise ValueError(
+                    "MiniMax-M3 NVFP4 on flashinfer_cutedsl dispatches per-token "
+                    "NVFP4 activations; --deepep-dispatcher-output-dtype must be "
+                    "auto or nvfp4."
+                )
 
     if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
         assert view.quantization in [
