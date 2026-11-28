@@ -1224,10 +1224,15 @@ def calculate_metrics(
                 current_time += itl_value
                 token_times.append(current_time)
 
+            # A streaming chunk can bundle multiple tokens (e.g., under
+            # speculative decoding), so weight each chunk by the request's
+            # mean tokens per chunk, matching steady_state.py.
+            tokens_per_chunk = output.output_len / len(token_times)
+
             for token_time in token_times:
                 second_bucket = int(token_time - min_start_time)
                 if 0 <= second_bucket < duration_seconds:
-                    tokens_per_second[second_bucket] += 1
+                    tokens_per_second[second_bucket] += tokens_per_chunk
 
             request_start_second = int(output.start_time - min_start_time)
             request_end_second = int(
