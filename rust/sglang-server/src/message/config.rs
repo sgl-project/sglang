@@ -1122,6 +1122,8 @@ impl DefaultSamplingParams {
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
 pub struct MmSpec {
+    /// Only enabled for the grid-only P/D experiment with decode KV caching off.
+    pub metadata_only_decode: bool,
     /// Park feature buffers in POSIX shm rather than inline. Set by the Python
     /// launcher (`RustMmProcessor._use_feature_shm`) exactly when the scheduler
     /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
@@ -1148,6 +1150,7 @@ impl MmSpec {
         image_mean,
         image_std,
         resample,
+        metadata_only_decode = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
@@ -1162,6 +1165,7 @@ impl MmSpec {
         image_mean: [f32; 3],
         image_std: [f32; 3],
         resample: MmResample,
+        metadata_only_decode: bool,
     ) -> Self {
         use sglang_processor::dynamo_multimodal::models::qwen_vl::QwenVlSpec;
         use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
@@ -1181,6 +1185,7 @@ impl MmSpec {
         Self {
             feature_shm,
             pipeline,
+            metadata_only_decode,
         }
     }
 }

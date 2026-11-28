@@ -76,18 +76,20 @@ pub fn string_list_or_list(v: api::StringListOrList) -> Option<OneOrMany<Vec<Str
     })
 }
 
-/// A media item: a bare source, or a ref whose `url` must be present. proto3
-/// strings carry no presence, so an object without `url` decodes as an empty
-/// one and is rejected here (Python's `load_image` fails on it the same way).
+/// A media item: a bare source, a ref with a URL, or a grid-only ref. The MM
+/// processor accepts the last form only on an enabled P/D decode worker.
+/// proto3 strings carry no presence, so a missing URL decodes as an empty one.
 pub fn media_item(item: api::MediaItem) -> Result<MmItem, Error> {
     use api::media_item::Value;
     match item.value {
-        // Only `url` and the hints a Rust processor reads reach the MM
-        // pipeline; the rest serve model families it does not run (Python's
-        // `load_image` reduces an item to `.url` the same way).
-        Some(Value::Ref(r)) if !r.url.is_empty() => Ok(MmItem::Ref {
+        // Retain the source and hints consumed by the Rust pipeline, including
+        // the geometry needed to process a decode request without media bytes.
+        Some(Value::Ref(r)) if !r.url.is_empty() || r.image_grid_thw.is_some() => Ok(MmItem::Ref {
             url: r.url,
             hints: MediaHints {
+                image_grid_thw: r
+                    .image_grid_thw
+                    .map(|grid| grid.rows.into_iter().map(|row| row.items).collect()),
                 fps: r.fps,
                 detail: r.detail,
                 max_frames: r.max_frames,
@@ -457,6 +459,7 @@ mod tests {
                     detail: Some("high".into()),
                     max_frames: Some(16),
                     max_tokens_per_frame: Some(64),
+                    ..Default::default()
                 },
             })
         );
