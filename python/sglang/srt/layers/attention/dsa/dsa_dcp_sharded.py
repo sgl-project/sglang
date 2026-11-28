@@ -61,6 +61,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import print_info_once
 
@@ -523,21 +524,89 @@ def dcp_local_topk(
     return dcp_localize_compact(slots, out_len)[0]
 
 
+# Leave room for comm.py's SM100 word-copy threshold when bounding the
+# receive buffer and its reordered copy.
+_DCP_GATHER_CHUNK_BYTES = 128 * 1024**2
+
+
+def _dcp_gather_chunk_lengths(seq_lens: list[int], *, dcp_size: int, chunk_slots: int):
+    lengths = []
+    slots_left = chunk_slots
+    for length in seq_lens:
+        while length:
+            # Split a request only on a complete rank cycle, so the next
+            # chunk starts at rank 0 just like a new request.
+            take = min(length, slots_left * dcp_size)
+            lengths.append(take)
+            length -= take
+            slots_left -= (take + dcp_size - 1) // dcp_size
+            if slots_left == 0:
+                yield lengths
+                lengths = []
+                slots_left = chunk_slots
+    if lengths:
+        yield lengths
+
+
 def dcp_gather_request_rows(
-    local_rows: torch.Tensor, seq_lens_cpu: torch.Tensor
+    local_rows: torch.Tensor, seq_lens_cpu: torch.Tensor, *, page_size: int = 1
 ) -> torch.Tensor:
     """Prefill: every request's cache rows from all ranks, in position order.
 
     ``local_rows``: [sum of this rank's shares, W] uint8, request by request
-    in local position order. Returns [sum(seq_lens), W]: request after
-    request, the rows of positions 0..seq_len-1 (the layout of the ragged
-    top-k indices).
+    in local position order. Returns positions 0..seq_len-1 of each request
+    in order (the ragged top-k layout), zero-padded to whole ``page_size`` pages.
     """
-    if get_platform().is_gfx95:
+    platform = get_platform()
+    if platform.is_gfx95:
         from sglang.srt.layers.attention.dsa import dsa_dcp_sharded_hip
 
-        return dsa_dcp_sharded_hip.dcp_gather_request_rows(local_rows, seq_lens_cpu)
-    return all_gather_kv_cache_for_dcp(local_rows, local_rows[:, :0], seq_lens_cpu)
+        return dsa_dcp_sharded_hip.dcp_gather_request_rows(
+            local_rows, seq_lens_cpu, page_size=page_size
+        )
+
+    parallel = get_parallel()
+    if platform.is_cuda and parallel.dcp_enabled:
+        dcp_size = parallel.dcp_size
+        seq_lens = seq_lens_cpu.tolist()
+        total_rows = sum(seq_lens)
+        if total_rows == 0:
+            return local_rows[:0].contiguous()
+        padded_slots = sum((length + dcp_size - 1) // dcp_size for length in seq_lens)
+        slot_bytes = dcp_size * local_rows.shape[1] * local_rows.element_size()
+        max_slots = max(1, _DCP_GATHER_CHUNK_BYTES // slot_bytes)
+        if padded_slots > max_slots:
+            # Rank-uniform metadata selects the same collectives on every rank.
+            # With the final output live, a receive and its reordered copy
+            # together should take no more space than one full receive.
+            chunk_slots = min(max_slots, padded_slots // 2)
+            pad = -total_rows % page_size
+            output = local_rows.new_empty((total_rows + pad, local_rows.shape[1]))
+            local_start = output_start = 0
+            for lengths in _dcp_gather_chunk_lengths(
+                seq_lens, dcp_size=dcp_size, chunk_slots=chunk_slots
+            ):
+                lens_cpu = seq_lens_cpu.new_tensor(lengths)
+                local_count = int(
+                    get_dcp_lens(lens_cpu, dcp_size, parallel.dcp_rank).sum()
+                )
+                local_chunk = local_rows[local_start : local_start + local_count]
+                chunk_rows = sum(lengths)
+                output[output_start : output_start + chunk_rows].copy_(
+                    all_gather_kv_cache_for_dcp(
+                        local_chunk, local_chunk[:, :0], lens_cpu
+                    )
+                )
+                local_start += local_count
+                output_start += chunk_rows
+            output[total_rows:].zero_()
+            return output
+
+    gathered = all_gather_kv_cache_for_dcp(local_rows, local_rows[:, :0], seq_lens_cpu)
+    pad = -gathered.shape[0] % page_size
+    if pad:
+        gathered = torch.cat([gathered, gathered.new_zeros(pad, gathered.shape[1])])
+    return gathered
 
 
 class DcpFusedTopK:

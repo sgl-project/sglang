@@ -1549,11 +1549,10 @@ class DeepseekSparseAttnBackend(
             )
         rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
         gathered = dcp_gather_request_rows(
-            rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
+            rows[metadata.dcp_local_kv_rows],
+            forward_batch.seq_lens_cpu,
+            page_size=self.physical_page_size,
         )
-        pad = -gathered.shape[0] % self.physical_page_size
-        if pad:
-            gathered = torch.cat([gathered, gathered.new_zeros(pad, gathered.shape[1])])
         return gathered.view(kv_cache.dtype)
 
     def _read_v2p(self) -> Optional[torch.Tensor]:
