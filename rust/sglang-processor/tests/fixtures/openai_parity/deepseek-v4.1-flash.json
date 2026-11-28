@@ -3545,6 +3545,163 @@
           }
         }
       }
+    },
+    {
+      "name": "chat_length_split_char",
+      "endpoint": "chat",
+      "synthetic": true,
+      "request": {
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "messages": [{"role": "user", "content": "Describe the light reactions."}],
+        "max_tokens": 8,
+        "temperature": 0
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "Electrons pass through the cytochrome b�",
+          "output_ids": [31717, 12404, 2281, 1407, 270, 98296, 291, 26558],
+          "meta_info": {
+            "id": "r",
+            "prompt_tokens": 9,
+            "weight_version": "default",
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "finish_reason": {"type": "length", "length": 8},
+            "completion_tokens": 8
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [0, 128803, 72188, 270, 2900, 14429, 16, 128804, 128822],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 8},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": []
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "r",
+          "object": "chat.completion",
+          "created": 1793774002,
+          "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "Electrons pass through the cytochrome b",
+                "reasoning_content": null
+              },
+              "logprobs": null,
+              "finish_reason": "length",
+              "matched_stop": null
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 9,
+            "total_tokens": 17,
+            "completion_tokens": 8,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 0,
+            "completion_tokens_details": null
+          },
+          "metadata": {"weight_version": "default"}
+        }
+      }
+    },
+    {
+      "name": "chat_length_split_char_stream",
+      "endpoint": "chat",
+      "synthetic": true,
+      "request": {
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "messages": [{"role": "user", "content": "Describe the light reactions."}],
+        "max_tokens": 8,
+        "temperature": 0,
+        "stream": true
+      },
+      "engine": {
+        "status": 200,
+        "frames": [
+          {"text": "Electrons pass through", "output_ids": [31717, 12404, 2281, 1407], "meta_info": {"id": "r", "prompt_tokens": 9, "weight_version": "default", "reasoning_tokens": 0, "cached_tokens": 0, "finish_reason": null, "completion_tokens": 4}},
+          {"text": " the cytochrome b�", "output_ids": [270, 98296, 291, 26558], "meta_info": {"finish_reason": {"type": "length", "length": 8}, "completion_tokens": 8}}
+        ]
+      },
+      "generate": {
+        "input_ids": [0, 128803, 72188, 270, 2900, 14429, 16, 128804, 128822],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 8},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "stream": true,
+        "modalities": []
+      },
+      "openai": {
+        "events": [
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Electrons pass through"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " the cytochrome b"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "length", "matched_stop": null}]},
+          "[DONE]"
+        ]
+      }
+    },
+    {
+      "name": "chat_length_split_char_stream_per_token",
+      "endpoint": "chat",
+      "synthetic": true,
+      "request": {
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "messages": [{"role": "user", "content": "Describe the light reactions."}],
+        "max_tokens": 8,
+        "temperature": 0,
+        "stream": true
+      },
+      "engine": {
+        "status": 200,
+        "frames": [
+          {"text": "Elect", "output_ids": [31717], "meta_info": {"id": "r", "prompt_tokens": 9, "weight_version": "default", "reasoning_tokens": 0, "cached_tokens": 0, "finish_reason": null, "completion_tokens": 1}},
+          {"text": "rons", "output_ids": [12404], "meta_info": {"finish_reason": null, "completion_tokens": 2}},
+          {"text": " pass", "output_ids": [2281], "meta_info": {"finish_reason": null, "completion_tokens": 3}},
+          {"text": " through", "output_ids": [1407], "meta_info": {"finish_reason": null, "completion_tokens": 4}},
+          {"text": " the", "output_ids": [270], "meta_info": {"finish_reason": null, "completion_tokens": 5}},
+          {"text": " cytochrome", "output_ids": [98296], "meta_info": {"finish_reason": null, "completion_tokens": 6}},
+          {"text": " b", "output_ids": [291], "meta_info": {"finish_reason": null, "completion_tokens": 7}},
+          {"text": "�", "output_ids": [26558], "meta_info": {"finish_reason": {"type": "length", "length": 8}, "completion_tokens": 8}}
+        ]
+      },
+      "generate": {
+        "input_ids": [0, 128803, 72188, 270, 2900, 14429, 16, 128804, 128822],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 8},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "stream": true,
+        "modalities": []
+      },
+      "openai": {
+        "events": [
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Elect"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "rons"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " pass"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " through"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " the"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " cytochrome"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " b"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1793774003, "model": "deepseek-ai/DeepSeek-V4.1-Flash", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "length", "matched_stop": null}]},
+          "[DONE]"
+        ]
+      }
     }
   ],
   "chat_model": {"context_length": 1048576, "generation_config": {}, "chat_encoding_spec": "dsv41"},
