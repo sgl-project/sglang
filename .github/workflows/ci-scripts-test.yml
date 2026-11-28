@@ -7,6 +7,7 @@ on:
       - ".github/workflows/pr-test.yml"
       - ".github/workflows/pr-gate.yml"
       - ".github/workflows/ci-scripts-test.yml"
+      - ".github/workflows/ci-command-status.yml"
 
 permissions:
   contents: read
@@ -30,3 +31,4 @@ jobs:
       - name: Run tests
         run: |
           python -m unittest discover -s scripts/ci -p 'test_diffusion_rust_gate.py' -v
+          python -m unittest discover -s scripts/ci/utils -p 'test_update_ci_command_status.py' -v
