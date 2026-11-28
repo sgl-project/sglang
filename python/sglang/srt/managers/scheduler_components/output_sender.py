@@ -2,12 +2,23 @@ from typing import Optional, Union
 
 import zmq
 
-from sglang.srt.managers.io_struct import BaseBatchReq, BaseReq, sock_send
+from sglang.srt.managers.delivery_clock import sock_send_with_timestamp
+from sglang.srt.managers.io_struct import (
+    BaseBatchReq,
+    BaseReq,
+    sock_send,
+)
 
 
 class SenderWrapper:
-    def __init__(self, socket: zmq.Socket):
+    def __init__(
+        self,
+        socket: zmq.Socket,
+        *,
+        clock_domain: Optional[bytes] = None,
+    ):
         self.socket = socket
+        self.clock_domain = clock_domain
 
     def send_output(
         self,
@@ -26,4 +37,9 @@ class SenderWrapper:
             # Scheduler Req is not a BaseReq but carries the same return route.
             output.http_worker_ipc = http_worker_ipc
 
-        sock_send(self.socket, output)
+        if self.clock_domain is not None:
+            sock_send_with_timestamp(
+                self.socket, output, clock_domain=self.clock_domain
+            )
+        else:
+            sock_send(self.socket, output)

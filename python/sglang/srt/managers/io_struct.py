@@ -3043,6 +3043,12 @@ def msgpack_decode(data: bytes) -> Any:
     return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
 
 
+def encode_ipc_payload(obj: Any) -> bytes:
+    if _USE_PICKLE_IPC:
+        return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    return msgpack_encode(obj)
+
+
 def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0):
     """Return enqueue completion for async sockets; sync sockets return None."""
     if _USE_PICKLE_IPC:

@@ -186,6 +186,7 @@ def _make_router(targets_by_rid=None) -> MultiDetokenizerRouter:
     router = MultiDetokenizerRouter.__new__(MultiDetokenizerRouter)
     router.ipc_name_list = ["detok-a", "detok-b"]
     router.num_workers = 2
+    router.delivery_seconds = None
     router._pick = (targets_by_rid or {}).__getitem__
     return router
 
@@ -258,6 +259,9 @@ class TestMultiTokenizerMixin(CustomTestCase):
 
                 self.assertEqual(
                     mocks["start_cpu_monitor_thread"].call_count, 1 if enabled else 0
+                )
+                mocks["MultiDetokenizerRouter"].assert_called_once_with(
+                    [], None, enable_metrics=enabled
                 )
 
     def test_tokenizer_router_loop_failure_kills_the_server(self):
