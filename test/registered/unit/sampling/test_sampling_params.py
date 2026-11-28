@@ -290,6 +290,70 @@ class TestSamplingParamsVerify(CustomTestCase):
             sp.verify(self.VOCAB_SIZE)
 
 
+class TestSamplingParamsCustomParams(CustomTestCase):
+
+    VOCAB_SIZE = 32000
+
+    def _make(self, **kwargs):
+        """Helper: create SamplingParams with safe defaults, override with kwargs."""
+        defaults = dict(temperature=1.0, top_p=1.0, top_k=10, min_p=0.0)
+        defaults.update(kwargs)
+        return SamplingParams(**defaults)
+
+    def test_custom_params_none_valid(self):
+        """custom_params=None (the default) passes verify()."""
+        self._make().verify(self.VOCAB_SIZE)
+
+    def test_custom_params_scalar_values_valid(self):
+        """Scalar values (bool/int/float/str/None) are accepted."""
+        sp = self._make(
+            custom_params={
+                "a": 1,
+                "b": 1.5,
+                "c": "x",
+                "d": True,
+                "e": None,
+            }
+        )
+        sp.verify(self.VOCAB_SIZE)
+
+    def test_custom_params_list_and_dict_values_valid(self):
+        """Lists of scalars and dicts of scalars are accepted (one nesting level)."""
+        sp = self._make(
+            custom_params={"list": [1, "a", None], "dict": {"k": 2.0}}
+        )
+        sp.verify(self.VOCAB_SIZE)
+
+    def test_custom_params_nested_dict_value_valid(self):
+        """A dict of scalars is a valid CustomParamValue value."""
+        sp = self._make(custom_params={"a": {"b": 1}})
+        sp.verify(self.VOCAB_SIZE)
+
+    def test_custom_params_not_a_dict_raises(self):
+        """A non-dict custom_params (list/str/int) must be rejected with 400-level ValueError."""
+        for bad in ([1], "x", 7):
+            with self.assertRaises(ValueError):
+                self._make(custom_params=bad).verify(self.VOCAB_SIZE)
+
+    def test_custom_params_deeply_nested_value_raises(self):
+        """Values nested deeper than CustomParamValue allowed crash the scheduler; reject them."""
+        sp = self._make(custom_params={"a": {"b": {"c": 1}}})
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_custom_params_list_of_dicts_raises(self):
+        """Lists containing dicts are not valid CustomParamValue; reject them."""
+        sp = self._make(custom_params={"a": [{"b": 1}]})
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_custom_params_dict_of_lists_raises(self):
+        """Dicts containing lists are one level too deep; reject them."""
+        sp = self._make(custom_params={"deep": {"a": [1, 2]}})
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+
 class TestSamplingParamsNormalize(CustomTestCase):
 
     def _mock_tokenizer(self, encode_map=None):

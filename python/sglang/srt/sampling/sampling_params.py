@@ -72,6 +72,53 @@ def raise_if_tokenizer_required(
         )
 
 
+def _validate_custom_params(custom_params):
+    """Validate custom_params is None or Dict[str, CustomParamValue].
+
+    A value must be a JSON scalar, a list of scalars, or a dict of scalars
+    (one level of nesting only). Anything deeper (e.g. {"a": {"b": {"c": 1}}})
+    or a non-dict root (lists, strings, numbers) passes unvalidated otherwise and
+    crashes the scheduler with msgspec.ValidationError (msgpack IPC) or
+    AttributeError (pickle IPC + logit processors calling .get()).
+    """
+    if custom_params is None:
+        return
+
+    def _validate_value(value, path):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return
+        if isinstance(value, list):
+            for i, item in enumerate(value):
+                if item is not None and not isinstance(item, (bool, int, float, str)):
+                    raise ValueError(
+                        f"custom_params values must be scalars, lists of scalars, or "
+                        f"dicts of scalars, got {type(item).__name__} at {path}[{i}]."
+                    )
+            return
+        if isinstance(value, dict):
+            for k, item in value.items():
+                if item is not None and not isinstance(item, (bool, int, float, str)):
+                    raise ValueError(
+                        f"custom_params values must be scalars, lists of scalars, or "
+                        f"dicts of scalars, got {type(item).__name__} at "
+                        f"{path}[{k!r}]."
+                    )
+            return
+        raise ValueError(
+            f"custom_params values must be scalars, lists of scalars, or dicts of "
+            f"scalars, got {type(value).__name__} at {path}."
+        )
+
+    if not isinstance(custom_params, dict):
+        raise ValueError(
+            f"custom_params must be an object of key-value pairs, got "
+            f"{type(custom_params).__name__}."
+        )
+
+    for key, value in custom_params.items():
+        _validate_value(value, f"custom_params[{key!r}]")
+
+
 class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     """
     The sampling parameters.
@@ -221,6 +268,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
+
+        _validate_custom_params(self.custom_params)
 
         grammars = [
             self.json_schema,
