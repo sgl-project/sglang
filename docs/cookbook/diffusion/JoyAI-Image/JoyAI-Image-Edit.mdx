@@ -1,6 +1,5 @@
 ---
 title: JoyAI-Image-Edit
-tag: NEW
 description: "Deploy JoyAI-Image-Edit with SGLang Diffusion for instruction-guided and spatial image editing."
 metatags:
     description: "Serve JoyAI-Image-Edit for instruction-guided image editing, object moves, rotations, and camera changes with SGLang Diffusion."
