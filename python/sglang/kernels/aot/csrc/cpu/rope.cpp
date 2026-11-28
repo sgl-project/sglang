@@ -457,6 +457,16 @@ void apply_rotary_pos_emb_cpu(
   CHECK_EQ(key.scalar_type(), input_dtype);
   CHECK_EQ(sin.scalar_type(), cos.scalar_type());
 
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
+  CHECK_DIM(3, key);
+  CHECK_EQ(key.size(0), num_tokens);
+  CHECK_EQ(key.size(2), head_size);
+  CHECK_EQ(key.scalar_type(), input_dtype);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
+  CHECK_INPUT_SHAPE_DTYPE<false>(cos, {num_tokens, head_size}, cos.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<false>(sin, {num_tokens, head_size}, sin.scalar_type());
+  CHECK_EQ(cos.scalar_type(), sin.scalar_type());
+
   const int64_t head_size = query.size(-1);
   TORCH_CHECK(head_size % 2 == 0, "head_size must be even");
   CHECK_EQ(key.size(-1), head_size);
