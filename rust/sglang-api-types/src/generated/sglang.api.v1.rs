@@ -1485,14 +1485,15 @@ pub struct CachedTokensDetails {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {
-    /// JSON key order is FIELD-NUMBER order: text, meta_info, then the
-    /// conditionally-present output_ids and index — matching frame_value's
+    /// JSON key order is FIELD-NUMBER order: text, meta_info, then output_ids
+    /// and the conditionally-present index — matching frame_value's
     /// insertion order byte-for-byte.
     #[prost(string, tag = "1")]
     pub text: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub meta_info: ::core::option::Option<GenerateMetaInfo>,
-    /// Omitted while empty (a text-only frame).
+    /// Set on every frame, as Python's output_ids is: empty when the frame
+    /// carries no tokens (a zero-token finish, a text-only delta).
     #[prost(message, optional, tag = "3")]
     pub output_ids: ::core::option::Option<TokenIds>,
     /// Batch position; only on batch responses/frames.

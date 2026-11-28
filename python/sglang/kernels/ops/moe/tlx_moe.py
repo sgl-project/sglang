@@ -1,3 +1,4 @@
+# Vendored from facebookexperimental/triton third_party/tlx/ops/kernels/moe/gfx950.py at 2e8256a9b (MIT); see kernels/README.md.
 """BF16 routed MoE on gfx950, built on the shared ``tlx.ops.mm`` register core.
 
 One call runs: local-expert block alignment, the stage-1 gate/up dual-B GEMM with fused SiLU
@@ -13,7 +14,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-from sglang.kernels.tlx_ops.kernels.mm.gfx950 import _register_matmul_core
+from sglang.kernels.ops.gemm.tlx_mm import _register_matmul_core
 
 # Tuned on MI355X (gfx950) under HIP graph replay. Through ~3.5k tokens every tier streams expert weights
 # once, so B loads bypass L2 (.cg) to keep it for the gathered activations.

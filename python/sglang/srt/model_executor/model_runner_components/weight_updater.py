@@ -402,12 +402,23 @@ class WeightUpdater:
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
 
-        # The payload lists one entry per deployment TP rank. An
-        # attention-owning draft records its narrowed rank at init, so read the
-        # deployment rank here, on the scheduler thread outside any draft scope.
-        tp_rank = get_parallel().tp_rank
+        # The payload lists one entry per engine rank. An attention-owning
+        # draft records its narrowed rank at init, so read the deployment rank
+        # here, on the scheduler thread outside any draft scope.
+        parallel = get_parallel()
+        copies = parallel.tp_size * parallel.pp_size
+        for name, tensor in named_tensors:
+            if (
+                isinstance(tensor, LocalSerializedTensor)
+                and len(tensor.values) != copies
+            ):
+                return False, (
+                    f"{name}: expected one serialized copy per engine rank "
+                    f"({copies}), got {len(tensor.values)}"
+                )
+        rank = _engine_rank()
         named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=tp_rank, device=infered_device))
+            (name, _unwrap_tensor(tensor, rank=rank, device=infered_device))
             for name, tensor in named_tensors
         ]
         if load_format == "direct":
@@ -513,9 +524,14 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
         default_weight_loader(params_dict[name], tensor)
 
 
-def _unwrap_tensor(tensor, tp_rank, device):
+def _engine_rank():
+    parallel = get_parallel()
+    return parallel.tp_size * parallel.pp_rank + parallel.tp_rank
+
+
+def _unwrap_tensor(tensor, rank, device):
     if isinstance(tensor, LocalSerializedTensor):
-        tensor = tensor.get(tp_rank)
+        tensor = tensor.get(rank)
     return tensor.to(device)
 
 
@@ -523,10 +539,10 @@ def unwrap_local_serialized_tensors(named_tensors, device: str):
     if not any(isinstance(t, LocalSerializedTensor) for _, t in named_tensors):
         return named_tensors
     monkey_patch_torch_reductions()
-    tp_rank = get_parallel().tp_rank
+    rank = _engine_rank()
     current_device = torch.get_device_module(device).current_device()
     return [
-        (name, _unwrap_tensor(tensor, tp_rank=tp_rank, device=current_device))
+        (name, _unwrap_tensor(tensor, rank=rank, device=current_device))
         for name, tensor in named_tensors
     ]
 
@@ -534,7 +550,8 @@ def unwrap_local_serialized_tensors(named_tensors, device: str):
 @dataclass
 class LocalSerializedTensor:
     """torch.Tensor that gets serialized by MultiprocessingSerializer (which only serializes a pointer and not the data).
-    The i-th element in the list corresponds to i-th rank's GPU."""
+    The i-th element in the list is the copy for engine rank i
+    (tp_size * pp_rank + tp_rank)."""
 
     values: List[bytes]
 
