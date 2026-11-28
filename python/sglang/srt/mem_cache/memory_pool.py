@@ -4501,8 +4501,9 @@ class HybridLinearKVPool(KVCache):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
         if self.use_mla and _is_npu and layer_ids:
-            data_ptrs, _, _ = self.get_contiguous_buf_infos()
-            return layer_ids * (len(data_ptrs) // len(layer_ids))
+            # The child numbers compact full-attention layers; transfer peers
+            # pair entries by model layer, including owned-only CP shards.
+            return [layer_ids[i] for i in self.full_kv_pool.get_kv_layer_ids()]
         return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):
@@ -4659,6 +4660,9 @@ class HybridLinearKVPool(KVCache):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
         dcp_kv_mask: Optional[torch.Tensor] = None,
+        *,
+        cp_gathered_full: bool = False,
+        cp_gathered_chunk: bool = False,
     ):
         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
         # unified pool's pre-translated PHYSICAL loc (None for a static pool, where
@@ -4684,11 +4688,20 @@ class HybridLinearKVPool(KVCache):
             # MLA pools whose set_kv_buffer takes no layer_id_override (the
             # FP4 and NPU ones) address the layer by `layer.layer_id`.
             with self._transfer_id_context(layer):
+                cp_kwargs = (
+                    dict(
+                        cp_gathered_full=cp_gathered_full,
+                        cp_gathered_chunk=cp_gathered_chunk,
+                    )
+                    if cp_gathered_full or cp_gathered_chunk
+                    else {}
+                )
                 self.full_kv_pool.set_kv_buffer(
                     layer,
                     write_loc,
                     cache_k,
                     cache_v,
+                    **cp_kwargs,
                 )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

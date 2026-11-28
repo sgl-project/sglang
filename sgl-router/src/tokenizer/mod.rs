@@ -251,9 +251,18 @@ impl TokenizerRegistry {
             .ok();
         match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
-                let formatter = formatter
+                let mut formatter = formatter
                     .with_defaults(&m.default_chat_template_kwargs)
                     .with_prompt_affixes(me.prompt_affixes.as_ref());
+                // The processor encodes DeepSeek prompts with HF `tokenizers`. The
+                // router's tokenizer beats it only with the L1 cache (a new turn
+                // re-encodes only its new segments) or fastokens; HF without L1
+                // would swap one HF encode for another.
+                let router_encoder_helps = me.stats.l1_state() == stats::L1State::Active
+                    || me.stats.backend() == stats::EncodeBackend::Fast;
+                if let Some(tokenizer) = me.get(&m.id).filter(|_| router_encoder_helps) {
+                    formatter = formatter.with_router_tokenizer(&tokenizer);
+                }
                 me.chat_model.always_thinks = formatter.always_thinks();
                 me.chat_model.reasoning_toggle =
                     formatter
@@ -955,6 +964,69 @@ mod tests {
         assert!(
             ticked_after < took / 2,
             "timer task waited {ticked_after:?} while the encode took {took:?}"
+        );
+    }
+
+    /// A DeepSeek-V4.1 checkpoint's tokenizer files, with its real merges cut
+    /// to a trained prefix (see `tests/scripts/generate_deepseek_v41_mini.py`).
+    const DEEPSEEK_V41_MINI: &str = "tests/fixtures/deepseek_v41_mini/tokenizer.json";
+
+    /// The router's tokenizer takes DeepSeek encodes over from the processor's HF
+    /// one only where it is faster: with the L1 cache, or on fastokens. Every
+    /// setting yields the same ids.
+    #[test]
+    fn deepseek_encodes_on_the_router_tokenizer_with_l1_or_fast() {
+        use crate::config::TokenizerBackend::{Fast, Hf};
+        let request = serde_json::json!({"messages": [
+            {"role": "user", "content": "<｜User｜> 你好，世界 123456 'ſ 🚀"},
+        ]});
+        let mut ids = Vec::new();
+        for (backend, l1_cache_mb, routed) in [
+            (Hf, 0, false),
+            (Hf, 64, true),
+            (Fast, 0, true),
+            (Fast, 64, true),
+        ] {
+            let mut cfg = cfg();
+            cfg.model.tokenizer_path = Some(DEEPSEEK_V41_MINI.into());
+            cfg.model.tokenizer.backend = backend;
+            cfg.model.tokenizer.l1_cache_mb = l1_cache_mb;
+            let registry = TokenizerRegistry::load_from_config(&cfg).unwrap();
+            let entry = registry
+                .formatters
+                .get("tiny")
+                .expect("a DeepSeek formatter");
+            assert_eq!(
+                entry.formatter.encodes_with_router_tokenizer(),
+                routed,
+                "{backend:?} l1={l1_cache_mb}"
+            );
+            ids.push(registry.encode_chat("tiny", &request).expect("prompt ids"));
+        }
+        assert!(ids.windows(2).all(|w| w[0] == w[1]), "{ids:?}");
+    }
+
+    /// A DeepSeek-V4.1 checkpoint loaded with the L1 cache encodes its chats
+    /// through the router's tokenizer, so a follow-up turn reuses the earlier
+    /// turns' segments instead of re-encoding the conversation.
+    #[test]
+    fn deepseek_chats_encode_through_the_l1_cache() {
+        let mut cfg = cfg();
+        cfg.model.tokenizer_path = Some(DEEPSEEK_V41_MINI.into());
+        cfg.model.tokenizer.l1_cache_mb = 64;
+        let registry = TokenizerRegistry::load_from_config(&cfg).unwrap();
+        let long = "a message long enough for the segment cache ".repeat(8);
+        let mut messages = vec![serde_json::json!({"role": "user", "content": long})];
+        let first = serde_json::json!({"messages": messages.clone()});
+        registry.encode_chat_for_routing("tiny", &first).unwrap();
+        let (cached, _) = registry.stats().l1_tokens();
+        messages.push(serde_json::json!({"role": "assistant", "content": long}));
+        messages.push(serde_json::json!({"role": "user", "content": "and then?"}));
+        let next = serde_json::json!({"messages": messages});
+        registry.encode_chat_for_routing("tiny", &next).unwrap();
+        assert!(
+            registry.stats().l1_tokens().0 > cached,
+            "the second turn must reuse the first turn's segments"
         );
     }
 }

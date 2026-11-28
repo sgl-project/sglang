@@ -1,6 +1,5 @@
 ---
 title: Hunyuan3D-2
-tag: NEW
 description: "Deploy Hunyuan3D-2 with SGLang Diffusion to generate textured or shape-only 3D meshes from an image."
 metatags:
     description: "Serve Hunyuan3D-2 for image-to-3D mesh generation, with optional texture painting, using SGLang Diffusion."

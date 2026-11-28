@@ -16,10 +16,10 @@ import torch
 # accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.
 import sglang.srt.hf_transformers  # noqa: F401
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_npu_ci(est_time=6, suite="extra-a-test-npu")
 
 for _name in (
     "torch_npu",
@@ -960,6 +960,7 @@ class TestInt8MainKvIndexer(_MockedNpuOpsTestCase):
                 block_tables=torch.zeros(2, 4, dtype=torch.int32),
             ),
             is_draft_worker=False,
+            use_decode_indexer_request_shard=False,
         )
         with (
             patch.object(

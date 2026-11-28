@@ -77,6 +77,7 @@
   "/stop_expert_distribution_record": "admin_force",
   "/stop_profile": "admin_force",
   "/tokenize": "normal",
+  "/unified-cache/external-linker": "admin_force",
   "/unload_lora_adapter": "admin_force",
   "/update_weight_version": "admin_force",
   "/update_weights_from_disk": "admin_force",

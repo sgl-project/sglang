@@ -20,10 +20,10 @@ from sglang.srt.layers.cp.interleave import (
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_npu_ci(est_time=10, suite="extra-a-test-npu")
 
 
 class _Projection(torch.nn.Linear):
@@ -156,6 +156,7 @@ class TestKimiK31PrefillCP(CustomTestCase):
         module = self.attention
         backend = module.AscendAttnBackend.__new__(module.AscendAttnBackend)
         backend.use_dsa = True
+        backend.use_decode_indexer_request_shard = False
         backend.forward_metadata = module.ForwardMetadata(
             seq_lens_cpu_int=torch.tensor([7, 3], dtype=torch.int32),
             block_tables=torch.tensor([[10], [20]], dtype=torch.int32),
@@ -207,7 +208,16 @@ class TestKimiK31PrefillCP(CustomTestCase):
 
         with ExitStack() as stack:
             stack.enter_context(
-                get_parallel().override(attn_cp_rank=1, dcp_enabled=False)
+                get_parallel().override(
+                    tp_size=2,
+                    tp_rank=1,
+                    attn_tp_size=1,
+                    attn_dp_size=1,
+                    attn_cp_size=2,
+                    attn_cp_rank=1,
+                    moe_tp_size=2,
+                    dcp_enabled=False,
+                )
             )
             for name, value in (
                 ("get_attn_backend", exposed_backend),

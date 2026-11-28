@@ -15,7 +15,7 @@ built=()
 # Same suffix set across modules, or one ABI's Rust-server tests silently skip.
 expected_suffixes=""
 mkdir -p rust-ext-staging/rust_extensions
-for module in server grpc multimodal; do
+for module in server multimodal; do
     found=(python/sglang/srt/rust_extensions/_"${module}"*.so)
     if [ ${#found[@]} -eq 0 ]; then
         echo "::error::no extension module found for ${module}"
