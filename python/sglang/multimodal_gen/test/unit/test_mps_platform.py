@@ -138,7 +138,9 @@ class TestMpsPlatformMemory(unittest.TestCase):
                 recommended=36 * _GIB,
                 driver_allocated=16 * _GIB,
             )
-            self.assertEqual(MpsPlatform.get_available_gpu_memory(empty_cache=True), 20.0)
+            self.assertEqual(
+                MpsPlatform.get_available_gpu_memory(empty_cache=True), 20.0
+            )
             mocks.empty_cache.assert_called_once_with()
 
             mocks.empty_cache.reset_mock()
@@ -154,7 +156,9 @@ class TestMpsPlatformMemory(unittest.TestCase):
                 self.assertIs(group, cpu_group)
                 tensor.fill_(12 * _GIB)
 
-            with patch.object(dist, "all_reduce", side_effect=_fake_all_reduce) as mock_ar:
+            with patch.object(
+                dist, "all_reduce", side_effect=_fake_all_reduce
+            ) as mock_ar:
                 reduced = MpsPlatform.get_available_gpu_memory(
                     distributed=True,
                     empty_cache=False,
