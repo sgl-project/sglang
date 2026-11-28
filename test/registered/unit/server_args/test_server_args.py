@@ -5528,7 +5528,8 @@ class TestSchedulingArgValidation(CustomTestCase):
     previously failed late or silently: a negative preemption threshold
     livelocks same-priority requests; a non-positive queue limit rejects
     every request — crashing the scheduler under priority scheduling on
-    max() over an empty waiting queue; a non-positive running limit never
+    max() over an empty waiting queue (colocated serving only: the flag
+    is ignored in PD disaggregation); a non-positive running limit never
     admits a request, so the server idles silently."""
 
     def check(self, **kwargs):
@@ -5573,6 +5574,14 @@ class TestSchedulingArgValidation(CustomTestCase):
 
     def test_positive_max_queued_requests_is_accepted(self):
         self.check(enable_priority_scheduling=True, max_queued_requests=1)
+
+    def test_non_positive_max_queued_requests_is_accepted_in_disaggregation(self):
+        # The flag is ignored in PD disaggregation — its help text says so,
+        # and the only consumer, the queue-limit abort, runs solely
+        # colocated — so any value passes there.
+        for mode in ("prefill", "decode"):
+            with self.subTest(disaggregation_mode=mode):
+                self.check(disaggregation_mode=mode, max_queued_requests=0)
 
     def test_non_positive_max_running_requests_is_rejected(self):
         for max_running_requests in (0, -1):

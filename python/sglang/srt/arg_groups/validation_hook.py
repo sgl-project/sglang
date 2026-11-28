@@ -465,8 +465,15 @@ def check_server_args(server_args: Any):
         )
     # 0 or a negative value rejects every request, and with priority
     # scheduling the first request crashes the scheduler taking max() over
-    # an empty waiting queue. None (unset) means no limit.
-    if cfg.max_queued_requests is not None and cfg.max_queued_requests <= 0:
+    # an empty waiting queue. None (unset) means no limit. The flag is
+    # ignored in PD disaggregation — its help text says so, and the only
+    # consumer, the queue-limit abort, runs solely colocated — so validate
+    # colocated serving only.
+    if (
+        cfg.max_queued_requests is not None
+        and cfg.max_queued_requests <= 0
+        and cfg.disaggregation_mode == "null"
+    ):
         raise ValueError(
             "--max-queued-requests must be positive when set, got "
             f"{cfg.max_queued_requests}. Omit the flag for no limit."
