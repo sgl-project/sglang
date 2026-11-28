@@ -5593,40 +5593,6 @@ class TestSchedulingArgValidation(CustomTestCase):
         self.check(max_running_requests=1)
 
 
-class TestRadixEvictionPolicyPriorityArgs(CustomTestCase):
-    """--radix-eviction-policy priority without priority scheduling silently
-    degrades to LRU (every request has the same eviction key), so an explicit
-    choice is rejected; model-profiled defaults (Qwen3-VL sets the policy for
-    the shared-prefix boost) leave the explicitly-set flag False and pass."""
-
-    def test_explicit_priority_eviction_requires_priority_scheduling(self):
-        with self.assertRaisesRegex(
-            ValueError, "radix-eviction-policy priority requires"
-        ):
-            handle_cache_compatibility(
-                ServerArgs(
-                    model_path="dummy",
-                    radix_eviction_policy="priority",
-                    _radix_eviction_policy_explicitly_set=True,
-                )
-            )
-
-    def test_priority_eviction_with_priority_scheduling_is_accepted(self):
-        handle_cache_compatibility(
-            ServerArgs(
-                model_path="dummy",
-                radix_eviction_policy="priority",
-                enable_priority_scheduling=True,
-                _radix_eviction_policy_explicitly_set=True,
-            )
-        )
-
-    def test_model_defaulted_priority_eviction_is_exempt(self):
-        handle_cache_compatibility(
-            ServerArgs(model_path="dummy", radix_eviction_policy="priority")
-        )
-
-
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
     """A decode graph that can capture a collective must not run with NCCL's
     graph buffer registration: the registered graph-pool temporaries alias

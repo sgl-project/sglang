@@ -447,22 +447,6 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disaggregation-decode-retraction-backup=host_pool requires "
             "--disable-priority-preemption when priority scheduling is enabled."
         )
-    if (
-        cfg.radix_eviction_policy == "priority"
-        and cfg._radix_eviction_policy_explicitly_set
-        and not cfg.enable_priority_scheduling
-    ):
-        # Without priority scheduling, requests carry no priority, every tree
-        # node gets the same eviction key, and the policy silently degrades
-        # to LRU. Model-profiled defaults (Qwen3-VL sets the policy for the
-        # shared-prefix boost without priority scheduling) leave the
-        # explicitly-set flag False and are exempt.
-        raise ValueError(
-            "--radix-eviction-policy priority requires "
-            "--enable-priority-scheduling. Without it, requests carry no "
-            "priority, every tree node gets the same eviction key, and the "
-            "policy silently degrades to LRU."
-        )
     if cfg.radix_eviction_policy == "tlru":
         tlru_config = cfg.radix_eviction_policy_config or {}
         threshold = tlru_config.get("threshold", 0)
