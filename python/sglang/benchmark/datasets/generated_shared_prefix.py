@@ -306,11 +306,11 @@ def sample_generated_shared_prefix_requests(
         turn_questions = questions[src_g][src_p]
         first_question = turn_questions[0]
         if input_ids:
-            # The client only reads prompt IDs. Sharing the list also lets pickle
-            # store the prefix once per group.
-            full_prompt = (
-                system_prompt + first_question if first_question else system_prompt
-            )
+            if first_question:
+                full_prompt = system_prompt + first_question
+            else:
+                # The client only reads these IDs, so rows can share the group's list.
+                full_prompt = system_prompt
             prompt_len = len(full_prompt)
         else:
             first_turn = f"{system_prompt}\n\n{first_question}"
