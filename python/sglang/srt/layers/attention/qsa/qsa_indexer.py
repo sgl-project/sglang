@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.qsa.mqa import (
     qsa_mqa_prefill,
     qsa_mqa_prefill_relative,
 )
+from sglang.srt.layers.attention.qsa.tp_shard import qsa_all_to_all
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
     cp_materialize_global_token_order,
@@ -442,6 +443,8 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths_for_rows: torch.Tensor,
         max_row_keys: Optional[int] = None,
+        *,
+        defer_expansion: bool = False,
     ) -> torch.Tensor:
         """Top-k token selection for packed prefill rows.
 
@@ -454,7 +457,12 @@ class QSAIndexer(MultiPlatformOp):
         the row's start either way."""
         rows = q.shape[0]
         output = torch.empty(
-            (rows, self.token_topk + self.compress_ratio - 1),
+            (
+                rows,
+                self.block_topk
+                if defer_expansion
+                else self.token_topk + self.compress_ratio - 1,
+            ),
             dtype=torch.int32,
             device=q.device,
         )
@@ -513,16 +521,69 @@ class QSAIndexer(MultiPlatformOp):
                     row_ends[chunk_slice],
                     topk=self.block_topk,
                 )
-            selected = expand_qsa_block_indices(
-                block_indices,
-                query_positions[chunk_slice],
-                sequence_lengths_for_rows[chunk_slice],
-                compress_ratio=self.compress_ratio,
-                token_topk=self.token_topk,
-            )
+            selected = block_indices
+            if not defer_expansion:
+                selected = expand_qsa_block_indices(
+                    block_indices,
+                    query_positions[chunk_slice],
+                    sequence_lengths_for_rows[chunk_slice],
+                    compress_ratio=self.compress_ratio,
+                    token_topk=self.token_topk,
+                )
             output[chunk_slice].copy_(selected)
             del logits, block_indices, selected
         return output
+
+    def select_prefill_tokens_tp(self, q, logical_positions, metadata, layout):
+        """Score one contiguous query shard against the replicated compressed K."""
+        shard_rows = layout.rows_per_rank
+        local = layout.indexer_slice
+        request_ids = metadata.get_token_to_batch_idx()
+        local_request_ids = request_ids[local]
+        local_positions = logical_positions[local]
+        keys, starts, ends, lengths = metadata.get_prefill_mqa_inputs(
+            self.layer_id, local_positions, query_sequence_ids=local_request_ids
+        )
+        local_blocks = self.select_prefill_tokens(
+            q[local],
+            keys,
+            starts,
+            ends,
+            local_positions,
+            lengths.index_select(0, local_request_ids.long()),
+            defer_expansion=True,
+        )
+        peer_blocks = None
+        if layout.num_kv_groups > 1:
+            if local_blocks.shape[0] != shard_rows:
+                padded = local_blocks.new_full((shard_rows, self.block_topk), -1)
+                padded[: local_blocks.shape[0]].copy_(local_blocks)
+                local_blocks = padded
+            send_blocks = (
+                local_blocks.expand(layout.num_kv_groups - 1, -1, -1)
+                .flatten(0, 1)
+                .contiguous()
+            )
+            peer_blocks = qsa_all_to_all(send_blocks, layout.peer_splits)
+        attn_rows = layout.attention_slice
+        request_ids = request_ids[attn_rows]
+        logical_positions = logical_positions[attn_rows]
+        if not request_ids.numel():
+            return local_blocks.new_empty(
+                (0, self.token_topk + self.compress_ratio - 1)
+            )
+        if peer_blocks is not None:
+            # A2A returns peer shards in KV-group order with the local group omitted.
+            peers = peer_blocks.split(shard_rows)
+            group = layout.kv_group
+            local_blocks = torch.cat(peers[:group] + (local_blocks,) + peers[group:])
+        return expand_qsa_block_indices(
+            local_blocks[: request_ids.numel()],
+            logical_positions,
+            lengths.index_select(0, request_ids.long()),
+            compress_ratio=self.compress_ratio,
+            token_topk=self.token_topk,
+        )
 
     def select_decode_tokens(
         self,
@@ -776,6 +837,12 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
+            )
+
+        layout = indexer_metadata.prefill_tp_layout
+        if layout is not None:
+            return self.select_prefill_tokens_tp(
+                q, logical_positions, indexer_metadata, layout
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
