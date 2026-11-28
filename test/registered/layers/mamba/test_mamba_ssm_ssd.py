@@ -3,7 +3,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=17, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=34, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=34, suite="base-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
 
@@ -22,6 +22,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     _ssm_slots_contiguous,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
+from sglang.srt.mem_cache.layout.token_major import (
+    build_mamba_entry_views,
+    mamba_entry_bytes,
+)
 from sglang.srt.utils import get_device
 from sglang.srt.utils.device import is_hip
 from sglang.utils import is_in_ci
@@ -972,12 +976,78 @@ def test_pool_mode_survives_autotuning_its_first_call():
     assert torch.equal(new_pool, ref_pool)
 
 
-def test_strided_pool_is_not_in_pool_mode():
+def test_pool_mode_needs_contiguous_slots():
     pool = torch.zeros(4, POOL_N_HEADS, 64, 128)
     assert _ssm_slots_contiguous(pool)
     assert _ssm_slots_contiguous(torch.zeros(2, 4, POOL_N_HEADS, 64, 128)[1])
+    # The page-major envelope pads between slots, not inside one.
+    _, envelope_pool = _page_major_layer_pool(pool, torch.float32, device="cpu")
+    assert _ssm_slots_contiguous(envelope_pool)
     assert not _ssm_slots_contiguous(pool.transpose(2, 3))
     assert not _ssm_slots_contiguous(torch.zeros(4, POOL_N_HEADS, 64, 256)[..., :128])
+
+
+# Conv rows of one Mamba layer in the envelope; any shape that keeps itemsizes aligned.
+ENVELOPE_CONV_SHAPE = (96, 3)
+
+
+def _page_major_layer_pool(pool, view_dtype, device, seed=0):
+    """Layer 1 of a 2-layer page-major envelope (``--enable-page-major-kv-layout``),
+    holding ``pool``'s values; every other envelope byte is random."""
+    shape = dict(
+        layer_num=2,
+        conv_state_shapes=[ENVELOPE_CONV_SHAPE],
+        conv_dtype=torch.bfloat16,
+        temporal_state_shape=tuple(pool.shape[1:]),
+    )
+    entry = mamba_entry_bytes(**shape, temporal_dtype=pool.dtype)
+    gen = torch.Generator(device=device).manual_seed(seed)
+    raw = torch.randint(
+        0,
+        256,
+        (pool.shape[0] * entry,),
+        dtype=torch.uint8,
+        generator=gen,
+        device=device,
+    )
+    _, temporal = build_mamba_entry_views(
+        raw, **shape, temporal_dtype=view_dtype, max_slots=pool.shape[0]
+    )
+    if view_dtype == pool.dtype:
+        temporal[1].copy_(pool)
+    return raw, temporal[1]
+
+
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_pool_mode_on_page_major_envelope_writes_only_its_slots(pool_dtype):
+    """The page-major envelope selects pool mode; the SSD kernels must then write the
+    same bytes as the old path, and no envelope byte outside the written slots."""
+    if get_device() != "cuda" or is_hip():
+        pytest.skip("Pool-mode cases are verified on CUDA only")
+    c = _pool_case(
+        (300, 500, 128, 1000), 128, 64, 128, pool_dtype, [True, False] * 2, seed=5
+    )
+    raws = {}
+    for in_pool in (False, True):
+        raw, layer_pool = _page_major_layer_pool(c["pool"], pool_dtype, get_device())
+        assert _ssm_slots_contiguous(layer_pool)
+        before = raw.clone()
+        _run_pool_case(c, layer_pool, in_pool=in_pool)
+        raws[in_pool] = raw
+    assert torch.equal(raws[True], raws[False])
+
+    # Mark the bytes of every slot either path writes, through a same-width integer view.
+    written = torch.cat(
+        [c["slots"].long(), c["recompute_dst"].long(), c["final_dst"].long()]
+    )
+    mark, mark_pool = _page_major_layer_pool(
+        c["pool"], {4: torch.int32, 2: torch.int16}[pool_dtype.itemsize], get_device()
+    )
+    mark.zero_()
+    mark_pool[written] = -1
+    untouched = mark == 0
+    assert not torch.equal(raws[True], before)
+    assert torch.equal(raws[True][untouched], before[untouched])
 
 
 if __name__ == "__main__":
