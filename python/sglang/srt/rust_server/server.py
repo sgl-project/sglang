@@ -60,6 +60,7 @@ from sglang.srt.rust_server.config import (
     _frontend_cpu_key,
     _frontend_cpu_share,
     _partition_cores,
+    vlm_warmup_image_base64,
 )
 from sglang.srt.rust_server.multimodal import (
     MM_TRANSPORT_STATS,
@@ -283,6 +284,13 @@ class RustServer:
         it. A subclass may return ``None``, no limit, which the scheduler
         clamps to what the context window leaves after the prompt."""
         return SamplingParams().max_new_tokens
+
+    @classmethod
+    def _vlm_warmup_prompt(cls, scheduler: Scheduler) -> Optional[str]:
+        """The VLM startup warmup's prompt, for a chat template the Rust
+        server cannot render itself; ``None`` lets it render the warmup
+        message with the served template."""
+        return None
 
     @classmethod
     def _server_kwargs(cls, scheduler: Scheduler) -> Dict[str, Any]:
@@ -519,6 +527,7 @@ class RustServer:
             else None
         )
 
+        warmup_image = vlm_warmup_image_base64(scheduler)
         extension = cls._load_extension()
         server = extension.Server(
             _build_server_args(
@@ -529,6 +538,10 @@ class RustServer:
                 request_class=cls._request_input_class(),
                 server_added_custom_params=cls._server_added_custom_params(),
                 port_offset=port_offset,
+                vlm_warmup_image_base64=warmup_image,
+                vlm_warmup_prompt=(
+                    cls._vlm_warmup_prompt(scheduler) if warmup_image else None
+                ),
             ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,

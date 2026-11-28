@@ -234,9 +234,6 @@ jobs:
           docker exec -w /sglang-checkout "${CONTAINER_NAME}" git fetch origin '+refs/tags/*:refs/tags/*' --force
           docker exec -w /sglang-checkout/python "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache .
           docker exec "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
-          if [[ "${XPU_CI_UNTRUSTED}" != "1" ]]; then
-            docker exec "${CONTAINER_NAME}" /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
-          fi
 
       - name: Install checkpoint-engine extra (optional; tests skip if unavailable)
         continue-on-error: true
@@ -368,9 +365,6 @@ jobs:
           docker exec -w /sglang-checkout "${CONTAINER_NAME}" git fetch origin '+refs/tags/*:refs/tags/*' --force
           docker exec -w /sglang-checkout/python "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache .
           docker exec "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
-          if [[ "${XPU_CI_UNTRUSTED}" != "1" ]]; then
-            docker exec "${CONTAINER_NAME}" /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
-          fi
 
       - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 60

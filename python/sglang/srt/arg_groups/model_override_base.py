@@ -308,6 +308,23 @@ def _forces_eagle_topk_one(speculative_algorithm: str) -> bool:
     return str(speculative_algorithm).upper() == SpeculativeAlgorithm.DFLASH.name
 
 
+def flashinfer_fa2_serves_head_dims(model_config) -> bool:
+    """Whether FlashInfer's FA2 prefill handles every (qk, vo) head-dim pair.
+
+    FA2 needs both dims to be multiples of 64, and a vo dim above 256 to be a
+    multiple of 256. Other dims read out of bounds or return wrong results, and
+    FlashInfer 0.7.5 rejects them in plan() (flashinfer-ai/flashinfer#4312).
+    """
+    pairs = (
+        (model_config.head_dim, model_config.v_head_dim),
+        (model_config.swa_head_dim, model_config.swa_v_head_dim),
+    )
+    return all(
+        qk % 64 == 0 and vo % 64 == 0 and (vo <= 256 or vo % 256 == 0)
+        for qk, vo in pairs
+    )
+
+
 def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_config):
     """
     Auto select the fastest attention backend.
@@ -316,7 +333,8 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
         1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
         1.2 Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1.
            Note: trtllm_mha does not support SM120, which will fall back to flashinfer.
-        1.3 In other cases, we will use flashinfer if available, otherwise use triton.
+        1.3 In other cases, we will use flashinfer if available and its FA2 prefill
+            handles the model's head dims, otherwise use triton.
     2. Models with MLA Architecture and using FA3
         2.1 We will use FA3 backend on hopper.
         2.2 We will use Flashinfer backend on blackwell.
@@ -367,7 +385,17 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
         else:
             # FlashInfer does not support attention sinks.
             if get_platform().has_flashinfer and not model_config.has_attention_sinks:
-                return "flashinfer"
+                if flashinfer_fa2_serves_head_dims(model_config):
+                    return "flashinfer"
+                logger.info(
+                    "FlashInfer FA2 prefill does not support head_dim=%s "
+                    "(v_head_dim=%s, swa_head_dim=%s, swa_v_head_dim=%s); "
+                    "using triton.",
+                    model_config.head_dim,
+                    model_config.v_head_dim,
+                    model_config.swa_head_dim,
+                    model_config.swa_v_head_dim,
+                )
             return "triton"
     else:
         # MLA architecture

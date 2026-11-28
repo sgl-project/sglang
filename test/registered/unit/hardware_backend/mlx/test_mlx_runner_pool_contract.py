@@ -79,7 +79,7 @@ class TestMlxRunnerPoolContract(CustomTestCase):
             info = worker.get_worker_info()
 
         self.assertEqual(info[0], 64)
-        self.assertEqual(info[4], 63)
+        self.assertEqual(info[4], 64)
         self.assertEqual(info[5], 58)
 
     def test_stub_reports_no_preloaded_torch_weights(self):

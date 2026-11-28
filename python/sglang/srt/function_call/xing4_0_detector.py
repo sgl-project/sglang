@@ -15,6 +15,7 @@ import re
 from typing import Any, Dict, List, Mapping, Sequence
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -86,18 +87,19 @@ def _deserialize(value: str) -> Any:
     return value
 
 
-def _json_arguments(value: str) -> Dict[str, Any]:
-    parsed = _deserialize(value)
-    if not isinstance(parsed, Mapping):
-        return {}
+def _mapping_arguments(parsed: Mapping) -> Dict[str, Any]:
     arguments = parsed.get("arguments", parsed.get("parameters", parsed))
     if isinstance(arguments, Mapping):
         return dict(arguments)
     return {}
 
 
-def _split_payload(payload: str, tools: Sequence[Tool]) -> tuple[str, str, str]:
-    """Split payload into (tool_name, params_text, json_text).
+def _split_payload(payload: str, tools: Sequence[Tool]) -> tuple[str, str, Any]:
+    """Split payload into (tool_name, params_text, parsed_json).
+
+    JSON payloads are deserialized once here and returned as the third
+    element (``None`` when the payload carries no JSON), so callers never
+    re-parse the same text.
 
     Handles three formats:
     1. Pure JSON: ``{"name": "func", "arguments": {...}}``
@@ -107,32 +109,39 @@ def _split_payload(payload: str, tools: Sequence[Tool]) -> tuple[str, str, str]:
     payload = payload.strip()
     param_pos = payload.find(PARAM_KEY_START_TOKEN)
     if param_pos != -1:
-        return payload[:param_pos].strip(), payload[param_pos:], ""
+        return payload[:param_pos].strip(), payload[param_pos:], None
 
     # Pure JSON: extract tool name from the "name" field.
     if payload.startswith("{"):
-        return "", "", payload
+        return "", "", _deserialize(payload)
 
     for tool_name in _iter_tool_names(tools):
         if payload == tool_name:
-            return tool_name, "", ""
+            return tool_name, "", None
         if payload.startswith(tool_name):
             rest = payload[len(tool_name) :].strip()
             if rest.startswith("{"):
-                return tool_name, "", rest
+                return tool_name, "", _deserialize(rest)
 
-    return payload, "", ""
+    # Name + JSON for tools not declared in `tools` (forwarded as-is).
+    brace_pos = payload.find("{")
+    if brace_pos > 0:
+        candidate_name = payload[:brace_pos].strip()
+        parsed = _deserialize(payload[brace_pos:])
+        if candidate_name and isinstance(parsed, Mapping):
+            return candidate_name, "", parsed
+
+    return payload, "", None
 
 
 def _parse_payload(payload: str, tools: Sequence[Tool]) -> tuple[str, Dict[str, Any]]:
-    tool_name, params_text, json_text = _split_payload(payload, tools)
-    arguments = _json_arguments(json_text) if json_text else {}
+    tool_name, params_text, parsed = _split_payload(payload, tools)
+    arguments = _mapping_arguments(parsed) if isinstance(parsed, Mapping) else {}
 
     # Pure JSON format: extract tool name from the JSON object.
-    if not tool_name and json_text:
-        parsed = _deserialize(json_text)
-        if isinstance(parsed, Mapping):
-            tool_name = parsed.get("name", "") or ""
+    if not tool_name and isinstance(parsed, Mapping):
+        raw_name = parsed.get("name")
+        tool_name = raw_name.strip() if isinstance(raw_name, str) else ""
 
     for key, value in PARAM_REGEX.findall(params_text):
         arg_key = key.strip()
@@ -169,6 +178,7 @@ class Xing4_0Detector(BaseFormatDetector):
         self.bot_token = TOOL_START_TOKEN
         self.eot_token = TOOL_END_TOKEN
         self._buffer = ""
+        self._tool_indices = None
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -179,18 +189,25 @@ class Xing4_0Detector(BaseFormatDetector):
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
-        tool_indices = self._get_tool_indices(tools)
+        if self._tool_indices is None:
+            self._tool_indices = self._get_tool_indices(tools)
+        tool_indices = self._tool_indices
         calls: List[ToolCallItem] = []
 
         try:
             for match in TOOL_CALL_REGEX.finditer(text):
                 tool_name, arguments = _parse_payload(match.group(1), tools)
-                if not tool_name or tool_name not in tool_indices:
-                    logger.warning("Xing4_0Detector: unknown tool '%s'", tool_name)
+                if not tool_name:
                     continue
+                if tool_name not in tool_indices:
+                    logger.warning(
+                        "Model attempted to call undefined function: %s", tool_name
+                    )
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        continue
                 calls.append(
                     ToolCallItem(
-                        tool_index=tool_indices[tool_name],
+                        tool_index=len(calls),
                         name=tool_name,
                         parameters=json.dumps(arguments, ensure_ascii=False),
                     )
@@ -207,7 +224,6 @@ class Xing4_0Detector(BaseFormatDetector):
         self._buffer += new_text
         content = ""
         calls: List[ToolCallItem] = []
-        tool_indices = self._get_tool_indices(tools)
 
         while True:
             start_idx = self._buffer.find(self.bot_token)
@@ -231,10 +247,10 @@ class Xing4_0Detector(BaseFormatDetector):
             tool_text = self._buffer[:end_pos]
             extracted = self.detect_and_parse(tool_text, tools)
 
-            if not extracted.calls:
-                content += tool_text
-            else:
-                calls.extend(extracted.calls)
+            for call in extracted.calls:
+                self.current_tool_id += 1
+                call.tool_index = self.current_tool_id
+                calls.append(call)
 
             self._buffer = self._buffer[end_pos:]
 

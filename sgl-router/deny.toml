@@ -15,6 +15,10 @@ ignore = [
     # shim that re-exports webpki-roots 1.x, locked at the fixed 1.0.10; it
     # bundles no roots of its own. Drop once ureq 2 leaves the tree.
     { id = "RUSTSEC-2026-0381", reason = "0.26.11 re-exports the patched webpki-roots 1.0.10" },
+    # kube-client 0.96: the flaw is in the `openssl-tls` connector, which is not
+    # compiled; kube uses its default `rustls-tls` and no openssl is in the tree.
+    # Drop once kube is upgraded to >=4.2.1.
+    { id = "RUSTSEC-2026-0600", reason = "openssl-tls connector not compiled; kube uses rustls-tls" },
 ]
 
 [licenses]

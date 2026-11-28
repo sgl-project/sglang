@@ -14,7 +14,6 @@ from test_prefill_memory_budget import (
 
 from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.managers.schedule_policy import PrefillAdder
-from sglang.srt.mem_cache.allocation_sizing import add_spec_decode_headroom_pages
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
 )
@@ -28,6 +27,7 @@ from sglang.srt.mem_cache.kv.alloc.demand import KVDemand, WindowRetirement
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.runtime_context import reset_context
+from sglang.srt.speculative.dflash_info_v2 import _add_prealloc_pages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
@@ -261,10 +261,10 @@ class TestSpeculativeHeadroomAsksADemand(CustomTestCase):
         )
         aligned = -(-need // page) * page
         with patch(
-            "sglang.srt.mem_cache.allocation_sizing.get_spec_decode_reserve",
+            "sglang.srt.speculative.dflash_info_v2.get_decode_ahead",
             return_value=0,
         ):
-            return add_spec_decode_headroom_pages(batch, [aligned], page)
+            return _add_prealloc_pages(batch, [aligned], page)
 
     def test_headroom_only_where_its_pages_fit(self):
         allocator = build_swa_pool(page_size=4)

@@ -7,7 +7,8 @@ import torch
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,7 +72,15 @@ class TestVerifyPenaltyCommit(CustomTestCase):
 
     def _commit(self, accept):
         watermark = Mock()
-        commit_verify_accept(_info(self.reqs, self.pool), accept, watermark=watermark)
+        batch = SimpleNamespace(
+            sampling_info=_info(self.reqs, self.pool), return_logprob=False
+        )
+        VerifyStep(
+            batch=batch,
+            route=VerifyRoute(adjusts_logits=True, need_truncated_sampling=False),
+            watermark=watermark,
+            watermark_full_mask=False,
+        ).commit(accept, logits_output=None)
         watermark.commit.assert_called_once_with(accept)
         torch.testing.assert_close(self._counts(), self._expected([[4, 4], [], [5]]))
 
