@@ -317,9 +317,12 @@ def sample_generated_shared_prefix_requests(
             if not first_question:
                 prefix_only_turns[sampled_g] = (first_turn, prompt_len)
 
-        full_prompt = (
-            first_turn if num_turns == 1 else [first_turn, *turn_questions[1:]]
-        )
+        if num_turns == 1:
+            full_prompt = first_turn
+        else:
+            # The statistics below still need the questions without the system prefix.
+            full_prompt = turn_questions.copy()
+            full_prompt[0] = first_turn
         output_len_val = int(output_lens[src_g, src_p])
 
         input_requests.append(
