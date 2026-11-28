@@ -2,12 +2,14 @@
 Unit tests for Engine.get_all_child_pids().
 
 Verifies that launching an Engine exposes the PIDs of all child processes
-(schedulers, detokenizer) and that those PIDs correspond to live processes.
+(schedulers, detokenizer) and that those PIDs correspond to live processes. It also checks that the GC is frozen after startup and
+unfrozen by shutdown().
 
 Usage:
     python -m unittest test_engine_child_pids -v
 """
 
+import gc
 import os
 import unittest
 
@@ -27,6 +29,7 @@ register_amd_ci(est_time=75, stage="base-b", runner_config="1-gpu-small-amd")
 class TestEngineChildPids(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        gc.unfreeze()
         cls.engine = sgl.Engine(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             random_seed=42,
@@ -35,6 +38,10 @@ class TestEngineChildPids(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         cls.engine.shutdown()
+        try:
+            assert gc.get_freeze_count() == 0, "shutdown() left the GC frozen"
+        finally:
+            gc.unfreeze()
 
     def test_get_all_child_pids_returns_live_pids(self):
         pids = self.engine.get_all_child_pids()
@@ -74,6 +81,9 @@ class TestEngineChildPids(CustomTestCase):
             len(set(pids)),
             f"Duplicate PIDs found: {pids}",
         )
+
+    def test_startup_heap_is_frozen(self):
+        self.assertGreater(gc.get_freeze_count(), 0)
 
 
 if __name__ == "__main__":
