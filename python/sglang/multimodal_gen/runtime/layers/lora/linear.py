@@ -877,10 +877,19 @@ class BaseLayerWithLoRA(nn.Module):
             self.base_layer.weight = nn.Parameter(new_weight_data)
             del old_weight
         else:
-            # Update the offload backing store too, not a transient GPU placeholder.
-            # A copy keeps inference-tensor rebinding from aliasing the snapshot.
-            restored = self.cpu_weight.clone()
-            write_dense_weight(self.base_layer, self._as_mutable_tensor(restored))
+            # Move resident weights directly from the snapshot to the device;
+            # cloning on CPU first can exhaust the worker's host headroom.
+            # CPU/offload restores still need owned storage so inference-tensor
+            # rebinding cannot alias a snapshot retained across strength changes.
+            target = getattr(self.base_layer, "_packed_weight_cpu", None)
+            if target is None:
+                target = self.base_layer.weight
+            # Allocate a mutable restore tensor directly, even during inference.
+            with torch.inference_mode(False):
+                restored = self.cpu_weight.to(
+                    target.device, non_blocking=True, copy=True
+                )
+            write_dense_weight(self.base_layer, restored)
 
         self.merged = False
 

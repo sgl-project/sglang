@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_leaves
 
 from sglang.multimodal_gen.runtime.layers.lora import linear as lora_linear
 from sglang.multimodal_gen.runtime.layers.lora.linear import wrap_with_lora_layer
@@ -14,6 +16,76 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
 )
 
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
+
+class _HostAllocationRecorder(TorchDispatchMode):
+    def __init__(self, snapshot):
+        super().__init__()
+        self.storages = {snapshot.untyped_storage()._cdata}
+        self.allocated_bytes = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        result = func(*args, **(kwargs or {}))
+        for tensor in tree_leaves(result):
+            if isinstance(tensor, torch.Tensor) and tensor.device.type == "cpu":
+                storage = tensor.untyped_storage()
+                if storage._cdata not in self.storages:
+                    self.storages.add(storage._cdata)
+                    self.allocated_bytes += storage.nbytes()
+        return result
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("inference_mode", [False, True])
+@pytest.mark.parametrize("pin_snapshot", [False, True])
+@torch.no_grad()
+def test_cuda_unmerge_needs_no_extra_host_storage(
+    inference_mode, pin_snapshot, monkeypatch
+):
+    """Unmerge must work with only the original host snapshot in memory.
+
+    Cloning it before the device transfer can OOM even though restoring the
+    existing CUDA weight needs no additional host storage.
+    """
+    budget = HostPinBudget(available_bytes=1 << 20, reserve_bytes=0)
+    monkeypatch.setattr(
+        lora_linear, "_snapshot_pin_budget", lambda: budget if pin_snapshot else None
+    )
+    with torch.inference_mode(inference_mode):
+        base = torch.nn.Linear(8, 16, bias=False, device="cuda")
+        original = base.weight.detach().clone()
+        layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2)
+        layer.set_lora_weights(
+            torch.ones(2, 8, device="cuda"),
+            torch.ones(16, 2, device="cuda"),
+            merge_weights=True,
+        )
+        snapshot = layer.cpu_weight
+        assert snapshot.is_pinned() == pin_snapshot
+        with _HostAllocationRecorder(snapshot) as allocations:
+            layer.unmerge_lora_weights()
+
+    assert allocations.allocated_bytes == 0
+    assert layer.cpu_weight is None
+    assert not layer.merged
+    assert not base.weight.is_inference()
+    torch.testing.assert_close(base.weight, original, rtol=0, atol=0)
+
+
+@torch.no_grad()
+def test_cpu_inference_restore_does_not_alias_cached_snapshot():
+    """Rebinding an inference weight must not let later merges write a cached base."""
+    original = torch.randn(16, 8)
+    snapshot = original.clone()
+    with torch.inference_mode():
+        base = torch.nn.Linear(8, 16, bias=False)
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2)
+    layer.install_merged_weight(base.weight.detach(), snapshot)
+
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(base.weight, original, rtol=0, atol=0)
+    base.weight.data.add_(1)
+    torch.testing.assert_close(snapshot, original, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("device", _DEVICES)
