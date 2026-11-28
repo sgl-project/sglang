@@ -132,7 +132,10 @@ from sglang.srt.hf_transformers import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
-from sglang.srt.layers.attention.mis_swa_guard import validate_swa_mis_delimiters
+from sglang.srt.layers.attention.mis_swa_guard import (
+    aggregate_min_positive_swa_window,
+    validate_swa_mis_delimiters,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_mlp_sync
@@ -1309,7 +1312,7 @@ class Scheduler(
         attn_backend = getattr(
             getattr(self.tp_worker, "model_runner", None), "attn_backend", None
         )
-        self.min_positive_swa_window = (
+        local_min_positive_swa_window = (
             attn_backend.resolve_min_positive_swa_window()
             if attn_backend is not None
             and hasattr(attn_backend, "resolve_min_positive_swa_window")
@@ -1343,6 +1346,9 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_parallel().pp_group
         self.world_group = get_parallel().world_group
+        self.min_positive_swa_window = self._sync_min_positive_swa_window_across_pp(
+            local_min_positive_swa_window
+        )
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # Entry rank is the local rank 0 in that group. Use the CPU (gloo) group to
@@ -4085,6 +4091,21 @@ class Scheduler(
         logger.error(f"{error_msg}, {req.rid=}")
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
         self.request_retirer.retire_unadmitted(req)
+
+    def _sync_min_positive_swa_window_across_pp(
+        self, local_window: Optional[int]
+    ) -> Optional[int]:
+        """Agree on the strictest SWA window across PP stages so admission matches."""
+        if (
+            not get_exec().features.enable_mis
+            or get_parallel().pp_size <= 1
+            or self.pp_group is None
+            or getattr(self.pp_group, "world_size", 1) <= 1
+        ):
+            return local_window
+        return aggregate_min_positive_swa_window(
+            windows=self.pp_group.all_gather_object(local_window)
+        )
 
     def _abort_if_invalid_mis_swa(self, *, req: Req) -> bool:
         """Reject an --enable-mis request whose logical span exceeds SWA capacity."""

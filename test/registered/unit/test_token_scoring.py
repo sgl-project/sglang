@@ -495,6 +495,82 @@ class TestSWAMultiItemScoringIngressGuard(CustomTestCase):
         self.assertEqual(merge_scheduler_swa_windows(infos=infos), 31)
         self.assertTrue(all(info["min_positive_swa_window"] == 31 for info in infos))
 
+    def test_scheduler_syncs_swa_window_across_pp_stages_and_rejects_uniformly(self):
+        # Stage 0 holds sliding-window layers (window=31); stage 1 holds only
+        # full-attention layers (local_window=None). Both must agree on 31 at
+        # startup so neither stage queues an overflowing direct request.
+        stage0_pp_group = SimpleNamespace(
+            world_size=2,
+            all_gather_object=MagicMock(return_value=[31, None]),
+        )
+        stage1_pp_group = SimpleNamespace(
+            world_size=2,
+            all_gather_object=MagicMock(return_value=[31, None]),
+        )
+
+        publish(ServerArgs(model_path="dummy", enable_mis=True, pp_size=2), role="test")
+        stage0 = self._make_intake_scheduler(min_positive_swa_window=None)
+        stage0.pp_group = stage0_pp_group
+        stage1 = self._make_intake_scheduler(min_positive_swa_window=None)
+        stage1.pp_group = stage1_pp_group
+
+        stage0.min_positive_swa_window = stage0._sync_min_positive_swa_window_across_pp(
+            31
+        )
+        stage1.min_positive_swa_window = stage1._sync_min_positive_swa_window_across_pp(
+            None
+        )
+        self.assertEqual(stage0.min_positive_swa_window, 31)
+        self.assertEqual(stage1.min_positive_swa_window, 31)
+        stage0_pp_group.all_gather_object.assert_called_once_with(31)
+        stage1_pp_group.all_gather_object.assert_called_once_with(None)
+
+        for method_name in ("handle_generate_request", "handle_embedding_request"):
+            for stage_name, scheduler in (("stage0", stage0), ("stage1", stage1)):
+                with self.subTest(entrypoint=method_name, stage=stage_name):
+                    scheduler._add_request_to_queue.reset_mock()
+                    scheduler.output_streamer.stream_output.reset_mock()
+                    bad_req = self._make_tokenized_intake_req(
+                        input_ids=list(range(35)), delimiters=[32, 34]
+                    )
+                    getattr(scheduler, method_name)(bad_req)
+                    scheduler._add_request_to_queue.assert_not_called()
+                    scheduler.output_streamer.stream_output.assert_called_once()
+                    retired_req = (
+                        scheduler.output_streamer.stream_output.call_args.args[0][0]
+                    )
+                    self.assertTrue(retired_req.finished())
+                    self.assertEqual(
+                        retired_req.finished_reason.status_code, HTTPStatus.BAD_REQUEST
+                    )
+
+        # No collective should run when enable_mis=False or pp_size == 1.
+        for label, server_args, local_win in (
+            (
+                "enable_mis_false",
+                ServerArgs(model_path="dummy", enable_mis=False, pp_size=2),
+                31,
+            ),
+            (
+                "pp_size_1",
+                ServerArgs(model_path="dummy", enable_mis=True, pp_size=1),
+                None,
+            ),
+        ):
+            with self.subTest(skip_sync=label):
+                publish(server_args, role="test")
+                stub_pp = SimpleNamespace(
+                    world_size=server_args.pp_size,
+                    all_gather_object=MagicMock(),
+                )
+                sched = self._make_intake_scheduler(min_positive_swa_window=None)
+                sched.pp_group = stub_pp
+                self.assertEqual(
+                    sched._sync_min_positive_swa_window_across_pp(local_win),
+                    local_win,
+                )
+                stub_pp.all_gather_object.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
