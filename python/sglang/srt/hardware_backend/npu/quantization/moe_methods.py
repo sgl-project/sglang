@@ -5,7 +5,10 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.hardware_backend.npu.utils import (
+    get_grouped_matmul_swiglu_quant,
+    npu_format_cast,
+)
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
 if TYPE_CHECKING:
@@ -594,6 +597,27 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
         super().__init__(quant_config=None)
         self.matmul = GroupedMatmul()
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
+
+    def apply_fused_gmm1_swiglu(
+        self,
+        quant_info,
+        hidden_states,
+        expert_tokens,
+        pertoken_scale,
+        group_list_type,
+        swiglu_limit,
+    ):
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+        group_list = expert_tokens.cumsum(0) if group_list_type == 1 else expert_tokens
+        return get_grouped_matmul_swiglu_quant()(
+            hidden_states,
+            quant_info.w13_weight,
+            quant_info.w13_weight_scale,
+            pertoken_scale,
+            group_list,
+            swiglu_limit or 0.0,
+        )
 
     @staticmethod
     def maybe_process_fuseep_weights(layer: torch.nn.Module) -> bool:

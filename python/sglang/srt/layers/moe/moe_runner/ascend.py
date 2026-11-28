@@ -37,7 +37,10 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8MXFP4MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import (
+    get_grouped_matmul_swiglu_quant,
+    is_npu_arch35,
+)
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -58,6 +61,28 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     if isinstance(kernel, NPUMXFP8MoEMethod):
         return True
     return kernel.use_fused_gmm1
+
+
+def _uses_fused_int8_gmm1(kernel, config, quant_info, x, group_list_type):
+    if (
+        not isinstance(kernel, NPUW8A8Int8MoEMethod)
+        or config.activation != "silu"
+        or not config.is_gated
+        or config.gemm1_alpha is not None
+        or config.gemm1_clamp_limit is not None
+        or config.use_tp_all_gather_activation
+        or (config.swiglu_limit is not None and config.swiglu_limit <= 0)
+        or x.ndim != 2
+        or x.shape[0] == 0
+        or x.dtype not in (torch.int8, torch.bfloat16)
+        or group_list_type not in (0, 1)
+        or kernel._get_bias_args(quant_info, "w13")
+    ):
+        return False
+    return (
+        get_grouped_matmul_swiglu_quant() is not None
+        and torch.ops.npu.get_npu_format(quant_info.w13_weight) == 29
+    )
 
 
 def _reshape_received_scale(received_scale: torch.Tensor) -> torch.Tensor:
@@ -269,7 +294,18 @@ class AscendRunnerCore(MoeRunnerCore):
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if _uses_fused_gmm1(w13_kernel, self.config):
+        if _uses_fused_int8_gmm1(
+            w13_kernel, self.config, quant_info, x, group_list_type
+        ):
+            hidden_states, pertoken_scale = w13_kernel.apply_fused_gmm1_swiglu(
+                quant_info,
+                x,
+                expert_tokens,
+                pertoken_scale=runner_input.hidden_states_scale,
+                group_list_type=group_list_type,
+                swiglu_limit=self.config.swiglu_limit,
+            )
+        elif _uses_fused_gmm1(w13_kernel, self.config):
             # --- w13 projection + activation, fused into one kernel ---
             # The fused gmm1 returns activations already requantised for gmm2,
             # so there is no separate activation step to run.

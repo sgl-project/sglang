@@ -36,6 +36,23 @@ def _is_npu_arch(arch: int) -> bool:
 
 
 @functools.lru_cache(maxsize=1)
+def get_grouped_matmul_swiglu_quant() -> Optional[Callable]:
+    """Return the installed INT8 NZ GMM/SwiGLU/quant operator when supported."""
+    if not is_npu_arch22():
+        return None
+    import sgl_kernel_npu
+
+    if not any(
+        "sgl_grouped_matmul_swiglu_quant" in item["ops"]
+        for item in getattr(sgl_kernel_npu, "_manifest", {}).get("third_party", ())
+    ):
+        return None
+    from sgl_kernel_npu.operators.moe import grouped_matmul_swiglu_quant
+
+    return grouped_matmul_swiglu_quant
+
+
+@functools.lru_cache(maxsize=1)
 def is_npu_arch22() -> bool:
     """Whether the runtime is on NPU architecture 22 (Atlas A2/A3)."""
     return _is_npu_arch(2201)
