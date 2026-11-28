@@ -98,7 +98,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.dual_variant_lora_adapters: list[tuple[str, str, str]] = []
         super().__init__(*args, **kwargs)
         if self.dual_variant_lora_adapters:
-            self.convert_to_lora_layers(snapshot_base=False)
+            self.convert_to_lora_layers()
             for nickname, target, path in self.dual_variant_lora_adapters:
                 self.set_lora(
                     nickname,

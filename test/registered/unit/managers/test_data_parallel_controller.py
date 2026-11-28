@@ -286,7 +286,7 @@ class TestInitInfoReply(CustomTestCase):
 
     def test_router_l3_layout_is_forwarded_only_when_a_scheduler_reports_it(self):
         """The reply holds only the keys the controller names, so it must name this one."""
-        info = {"max_total_num_tokens": 64, "max_req_input_len": 32}
+        info = {"max_total_num_tokens": 64, "max_req_len": 38, "max_req_input_len": 32}
         reporting = {**info, "router_l3_layout": "layout-a"}
         self.assertEqual(
             self._reply(reporting, reporting)["router_l3_layout"], "layout-a"
