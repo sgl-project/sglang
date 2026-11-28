@@ -3,7 +3,9 @@
 
 import contextlib
 import ctypes
+import functools
 import gc
+import importlib.metadata
 import os
 import signal
 import sys
@@ -70,6 +72,17 @@ def use_thread_lock_for_tqdm() -> None:
     from tqdm import tqdm
 
     tqdm.set_lock(threading.RLock())
+
+
+def cache_package_distributions() -> None:
+    """Build importlib's import-name to distribution mapping once per process.
+
+    transformers and diffusers each build it while they import, and the standard
+    library checks that every file of every installed distribution exists.
+    """
+    importlib.metadata.packages_distributions = functools.cache(
+        importlib.metadata.packages_distributions
+    )
 
 
 _full_gc_lock = threading.Lock()
