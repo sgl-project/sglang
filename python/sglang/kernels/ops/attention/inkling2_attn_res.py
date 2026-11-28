@@ -10,6 +10,7 @@ import torch
 from cutlass import Float32, Int32, Int64, const_expr, range_constexpr
 from cutlass.cute.arch.nvvm_wrappers import warp_reduction
 from cutlass.cute.runtime import make_fake_compact_tensor
+from cutlass.experimental import primitives as prims
 
 from sglang.kernels.ops.attention.flash_attn.cute.copy_utils import (
     store_shared_remote_fp32x4,
@@ -21,6 +22,26 @@ from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     fmul_rn_f32,
     torch_to_cute_dtype,
 )
+
+
+@cute.jit
+def _mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int32) -> None:
+    """Wait on a barrier that the peer CTA's ``st.async`` completes.
+
+    The peer's ``complete_tx`` releases at cluster scope; the default CTA-scope
+    wait does not synchronize with it, so the reads of the delivered slots
+    would be unordered against the peer's stores. A relaxed cluster-scope
+    try-wait followed by ``fence.acquire.sync_restrict::shared::cluster.cluster``
+    orders them.
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr,
+        phase,
+        scope=prims.MBarrierScope.CLUSTER,
+        order=prims.MemOrder.RELAXED,
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 class AttnResFwdKernel:
@@ -587,7 +608,7 @@ class AttnResFwdKernel:
                             peer_rank,
                         )
                 if tidx < N * (self.N_Q + 1):
-                    cute.arch.mbarrier_wait(xchg_mbar_ptr, Int32(0))
+                    _mbarrier_wait_acquire_cluster(xchg_mbar_ptr, Int32(0))
                 cute.arch.barrier(
                     barrier_id=1, number_of_threads=self.num_compute_threads
                 )

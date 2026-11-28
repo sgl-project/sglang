@@ -25,6 +25,7 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = 227 * 1024
@@ -289,6 +290,26 @@ def _store_shared_remote_v4(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+@cute.jit
+def _mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int32) -> None:
+    """Wait on a barrier that peer CTAs complete with ``_store_shared_remote_v4``.
+
+    The peers' ``st.async`` complete-tx releases at cluster scope; the default
+    CTA-scope wait does not synchronize with it, so the owner's reads of the
+    mailbox would be unordered against the peers' stores. A relaxed
+    cluster-scope try-wait followed by
+    ``fence.acquire.sync_restrict::shared::cluster.cluster`` orders them.
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr,
+        phase,
+        scope=prims.MBarrierScope.CLUSTER,
+        order=prims.MemOrder.RELAXED,
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 #: Rank that gathers partials and stores the output.
@@ -850,7 +871,7 @@ class SplitKDenseGemmKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                _mbarrier_wait_acquire_cluster(bar_reduce, Int32(0))
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (
