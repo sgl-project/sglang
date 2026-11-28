@@ -262,12 +262,14 @@ class FusedKVMaterializeHelper:
         head_dim: int,
         device: torch.device,
         max_position_hint: Optional[int] = None,
+        on_workspace_reset: Optional[Callable[[], None]] = None,
     ):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.rotary_emb = rotary_emb
         self.n_layers = len(layers)
         self.device = device
+        self._on_workspace_reset = on_workspace_reset
         self.kv_size = self.num_kv_heads * self.head_dim
         self.layer_out_dim = 2 * self.kv_size
 
@@ -377,21 +379,46 @@ class FusedKVMaterializeHelper:
         ):
             return
 
-        new_capacity = max(1, total_ctx)
-        if self._workspace_capacity > 0:
-            new_capacity = max(new_capacity, self._workspace_capacity * 2)
+        had_workspace = (
+            self._workspace_capacity > 0
+            or self._proj_workspace is not None
+            or self._k_workspace is not None
+            or self._v_workspace is not None
+        )
+        on_workspace_reset = getattr(self, "_on_workspace_reset", None)
+        if had_workspace and on_workspace_reset is not None:
+            on_workspace_reset()
 
-        self._proj_workspace = torch.empty(
+        prev_capacity = (
+            self._workspace_capacity if self._workspace_dtype == dtype else 0
+        )
+
+        self._proj_workspace = None
+        self._k_workspace = None
+        self._v_workspace = None
+        self._workspace_capacity = 0
+        self._workspace_dtype = None
+
+        aligned_ctx = ((max(1, total_ctx) + 255) // 256) * 256
+        if prev_capacity > 0 and aligned_ctx <= 8192:
+            new_capacity = min(8192, max(aligned_ctx, prev_capacity * 2))
+        else:
+            new_capacity = aligned_ctx
+
+        proj_workspace = torch.empty(
             (new_capacity, self.n_layers * self.layer_out_dim),
             dtype=dtype,
             device=self.device,
         )
-        self._k_workspace = torch.empty(
+        k_workspace = torch.empty(
             (self.n_layers, new_capacity, self.num_kv_heads, self.head_dim),
             dtype=dtype,
             device=self.device,
         )
-        self._v_workspace = torch.empty_like(self._k_workspace)
+        v_workspace = torch.empty_like(k_workspace)
+        self._proj_workspace = proj_workspace
+        self._k_workspace = k_workspace
+        self._v_workspace = v_workspace
         self._workspace_capacity = new_capacity
         self._workspace_dtype = dtype
 
