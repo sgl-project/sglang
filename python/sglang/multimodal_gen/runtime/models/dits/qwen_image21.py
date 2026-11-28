@@ -18,6 +18,8 @@ from sglang.kernels.ops.diffusion import (
     qknorm_complex_rope_pack_,
     residual_gate_add,
     residual_gate_add_sum2,
+    rmsnorm_npu_onepass,
+    silu_mul_npu,
     tensors_equal,
 )
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
@@ -70,6 +72,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 
 _is_cuda = current_platform.is_cuda()
+_is_npu = current_platform.is_npu()
 
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
@@ -89,6 +92,7 @@ _QKV_PACK_FUSION = BitExactFusionGate(
     "Qwen-Image 2.1 packed Q/K/V projection written into the packed QKV buffer"
 )
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
+_QK_NORM_NPU_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm on NPU")
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -181,6 +185,16 @@ def apply_qk_norm_rope(x, norm, rope):
     ):
         return _QK_ROPE_FUSION.run(
             lambda: qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon),
+            lambda: apply_rope(norm(x), rope),
+            logger=logger,
+        )
+    if _is_npu and x.is_npu and x.dtype in (torch.float16, torch.bfloat16):
+        # The operator ships in a separately installed wheel; run() retires this
+        # site instead of failing the request when that wheel predates it.
+        return _QK_NORM_NPU_FUSION.run(
+            lambda: apply_rope(
+                rmsnorm_npu_onepass(x, norm.weight, norm.variance_epsilon), rope
+            ),
             lambda: apply_rope(norm(x), rope),
             logger=logger,
         )
@@ -471,6 +485,13 @@ class QwenImage21FeedForward(nn.Module):
         if _is_cuda and gate.dtype is torch.bfloat16:
             hidden = _SILU_MUL_FUSION.run(
                 lambda: fused_silu_mul_bitexact(gate, value),
+                lambda: nn.functional.silu(gate) * value,
+                logger=logger,
+            )
+        elif _is_npu and gate.is_npu and gate.dtype is torch.bfloat16:
+            # Same optional wheel as the Q/K site; run() retires it on absence.
+            hidden = _SILU_MUL_FUSION.run(
+                lambda: silu_mul_npu(gate, value),
                 lambda: nn.functional.silu(gate) * value,
                 logger=logger,
             )

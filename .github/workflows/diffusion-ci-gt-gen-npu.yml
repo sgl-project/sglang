@@ -115,6 +115,11 @@ jobs:
         run: |
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
 
+      - name: Prefetch image-edit inputs
+        env:
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: python3 scripts/ci/utils/diffusion/prefetch_input_image.py
+
       - name: Generate outputs
         env:
           CASE_IDS: ${{ inputs.case_ids }}
@@ -180,6 +185,11 @@ jobs:
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
+
+      - name: Prefetch image-edit inputs
+        env:
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: python3 scripts/ci/utils/diffusion/prefetch_input_image.py
 
       - name: Generate outputs
         env:
