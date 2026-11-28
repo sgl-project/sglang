@@ -599,6 +599,38 @@ class TestFailureDisplayBudget:
         assert compute_tensor_info(t, include_percentiles=False).stats.percentiles == {}
         assert 50 in compute_tensor_info(t, include_percentiles=True).stats.percentiles
 
+    def test_failing_tensor_computes_diff_once_and_forwards_seq_dim_to_downcast(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failing comparison within budget evaluates calc_rel_diff once per diff and forwards seq_dim to diff_downcast."""
+        import sglang.srt.debug_utils.comparator.tensor_comparator.comparator as comp_mod
+
+        orig_calc_rel_diff = comp_mod.calc_rel_diff
+        calls = 0
+
+        def counting_calc_rel_diff(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            nonlocal calls
+            calls += 1
+            return orig_calc_rel_diff(x, y)
+
+        monkeypatch.setattr(comp_mod, "calc_rel_diff", counting_calc_rel_diff)
+
+        x = torch.zeros(4, 8, dtype=torch.float32)
+        y = torch.ones(4, 8, dtype=torch.bfloat16)
+        info = compare_tensor_pair(
+            x_baseline=x,
+            x_target=y,
+            name="fail_once",
+            seq_dim=0,
+            failure_display_budget=FailureDisplayBudget(max_detail=5),
+        )
+        # 1 call for primary diff + 1 call for diff_downcast (previously 2 + 1 = 3)
+        assert calls == 2
+        assert info.diff is not None and 50 in info.diff.abs_diff_percentiles
+        assert info.diff_downcast is not None
+        assert info.diff_downcast.per_token_rel_diff is not None
+        assert len(info.diff_downcast.per_token_rel_diff) == 4
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
