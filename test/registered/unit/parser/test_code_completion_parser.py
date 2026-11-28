@@ -115,6 +115,54 @@ class TestGenerateCompletionPromptFromRequest(CustomTestCase):
             )
             self.assertEqual(result, expected)
 
+    def test_unset_suffix_returns_prompt_directly(self):
+        """Test that a request without a suffix (None) bypasses FIM formatting."""
+        with patch(
+            "sglang.srt.parser.code_completion_parser.completion_template_name",
+            "deepseek_coder",
+        ):
+            request = CompletionRequest(prompt="just code")
+            self.assertIsNone(request.suffix)
+            result = generate_completion_prompt_from_request(request)
+            self.assertEqual(result, "just code")
+
+    def test_unset_suffix_keeps_list_prompt(self):
+        """Test that a batched prompt without a suffix is returned unchanged."""
+        with patch(
+            "sglang.srt.parser.code_completion_parser.completion_template_name",
+            "deepseek_coder",
+        ):
+            request = CompletionRequest(prompt=["a", "b"])
+            result = generate_completion_prompt_from_request(request)
+            self.assertEqual(result, ["a", "b"])
+
+    def test_list_prompt_formats_each_prompt(self):
+        """Test that each prompt in a batch gets its own FIM formatting."""
+        with patch(
+            "sglang.srt.parser.code_completion_parser.completion_template_name",
+            "deepseek_coder",
+        ):
+            request = CompletionRequest(prompt=["a", "b"], suffix="s")
+            result = generate_completion_prompt_from_request(request)
+            t = completion_templates["deepseek_coder"]
+            expected = [
+                f"{t.fim_begin_token}{p}{t.fim_middle_token}s{t.fim_end_token}"
+                for p in ("a", "b")
+            ]
+            self.assertEqual(result, expected)
+
+    def test_token_ids_prompt_with_suffix_raises(self):
+        """Test that token-id prompts with a suffix are rejected, not stringified."""
+        with patch(
+            "sglang.srt.parser.code_completion_parser.completion_template_name",
+            "deepseek_coder",
+        ):
+            for prompt in ([1, 2, 3], [[1, 2], [3, 4]]):
+                with self.subTest(prompt=prompt):
+                    request = CompletionRequest(prompt=prompt, suffix="s")
+                    with self.assertRaises(ValueError):
+                        generate_completion_prompt_from_request(request)
+
 
 class TestSetCompletionTemplate(CustomTestCase):
     def test_set_only_once(self):
