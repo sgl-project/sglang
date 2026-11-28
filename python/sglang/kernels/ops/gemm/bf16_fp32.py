@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx1250_supported
 
 _linear_bf16_fp32_algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
 _HPC_GEMM_WEIGHT_CACHE_ATTR = "_sglang_bf16xfp32_weight_cache"
@@ -16,6 +17,7 @@ _HPC_GEMM_WEIGHT_SCALE = 1.0 / 256.0
 # Set at model init, never lazily, so all ranks agree; see
 # mark_hpc_bf16xfp32_gemm_enabled.
 _hpc_gemm_enabled = False
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 @functools.cache
@@ -109,6 +111,15 @@ def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return torch.mm(x.float(), y.float().t())
 
 
+@functools.cache
+def _get_aiter_tgemm():
+    try:
+        from aiter.tuned_gemm import tgemm
+    except ImportError:
+        return None
+    return tgemm
+
+
 def _linear_bf16_fp32_hpc(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -154,5 +165,8 @@ def linear_bf16_fp32(
         z = torch.empty(x.size(0), y.size(0), dtype=torch.float32, device=x.device)
         deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, y, z)
         return z
-    else:
-        return _linear_bf16_fp32_cublas(x, y)
+    elif _is_gfx1250_supported and envs.SGLANG_USE_AITER.get():
+        tgemm = _get_aiter_tgemm()
+        if tgemm is not None:
+            return tgemm.mm(x, y, None, otype=torch.float32)
+    return _linear_bf16_fp32_cublas(x, y)
