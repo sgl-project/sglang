@@ -4250,12 +4250,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_existence_cache.pool(PoolName.MAMBA).invalidate_beyond(
                 superseded, 0
             )
-        result = getattr(operation, "pool_storage_result", None)
         if (
             superseded
             and not short
-            and result is not None
-            and result.extra_pool_hit_pages.get(PoolName.MAMBA, 0) > 0
+            and operation.pool_storage_result.extra_pool_hit_pages.get(
+                PoolName.MAMBA, 0
+            )
+            > 0
         ):
             self.mamba_storage_retention.remover.submit(
                 self.cache_controller.storage_backend, superseded

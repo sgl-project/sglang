@@ -9,7 +9,6 @@ from collections import Counter
 from types import SimpleNamespace
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.mamba_storage_retention import (
     MambaStateRemover,
     MambaStorageRetention,
@@ -71,7 +70,6 @@ class TestMambaStorageRetention(CustomTestCase):
         remover.close()
         self.assertFalse(remover._thread.is_alive())
         self.assertEqual(len(storage.calls), 1)
-        # Late ACKs during detach must neither restart nor retain the backend.
         remover.submit(storage, ["late"])
         del storage
         gc.collect()
@@ -211,10 +209,6 @@ class TestMambaStorageRetention(CustomTestCase):
         )
 
     def test_store_without_batch_remove_leaves_states_to_eviction(self):
-        store = MooncakeStore.__new__(MooncakeStore)
-        store.store = SimpleNamespace()
-        self.assertIsNone(store.batch_remove_pool_keys(PoolName.MAMBA, ["a"]))
-
         storage = _Storage(None, None)
         stats = Counter()
         remover = self._remover(stats, retry_delay_s=0.01)

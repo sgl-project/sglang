@@ -913,7 +913,7 @@ class UnifiedCacheLinkerWrapper:
         try:
             queued = self.cache_linker.offload(
                 transfers,
-                session_id=getattr(cache, "insert_session_id", None),
+                session_id=cache.insert_session_id,
                 **kwargs,
             )
         except BaseException:

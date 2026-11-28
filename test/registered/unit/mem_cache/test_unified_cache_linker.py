@@ -233,6 +233,7 @@ def _cache_for_wrapper(**kwargs):
         "pp_size": 1,
         "pp_group": None,
         "metrics_collector": None,
+        "insert_session_id": None,
     }
     defaults.update(kwargs)
     # The stand-in's window slots, as a tree with these slots reports them.
