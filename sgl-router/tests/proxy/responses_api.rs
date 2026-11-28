@@ -220,6 +220,30 @@ async fn router_side_rejections_are_structured() {
 }
 
 #[tokio::test]
+async fn reply_without_a_choice_is_502() {
+    let mock = MockWorker::start_returning_error(
+        StatusCode::OK,
+        json!({"id": "c", "object": "chat.completion", "choices": [],
+               "usage": {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1}}),
+    )
+    .await;
+    let (status, _, body) = post(
+        build_ctx(mock.url.clone()),
+        "/v1/responses",
+        json!({"model": MODEL, "input": "x"}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["type"], "server_error");
+}
+
+#[tokio::test]
 async fn truncated_upstream_reply_is_502() {
     let mock = MockWorker::start_returning_partial_body(
         StatusCode::OK,
