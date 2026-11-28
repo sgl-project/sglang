@@ -5,10 +5,12 @@ import copy
 import io
 import json
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from safetensors.torch import load, save
 from torch import nn
@@ -31,13 +33,21 @@ from sglang.srt.models.inkling2 import (
 )
 from sglang.srt.models.inkling2_vision import Inkling2VisionEncoder
 from sglang.srt.models.inkling_common import inkling2_moe as moe
+from sglang.srt.models.inkling_common.inkling2_attn import (
+    SLICED_QKVR_MIN_TOKENS,
+    AttentionSources,
+    Inkling2Attention,
+)
 from sglang.srt.multimodal.inkling2 import Inkling2ImageProcessor
 from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.parser.inkling_renderer import render_inkling_messages
 from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID
+from sglang.srt.runtime_context import SpawnRanks, override_platform, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.device import is_host_cpu_arm64
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.inkling2_test_utils import precision_group
+from sglang.test.parallel_groups import publish
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 register_cuda_ci(est_time=37, stage="base-c", runner_config="4-gpu-gb300")
@@ -794,6 +804,7 @@ def test_project_sources_gates_3src_gemv_to_captured_decode_and_verify(monkeypat
     nn.Module.__init__(attn)
     attn.split_sizes = split_sizes
     attn.qkvr = _StubQKVR()
+    monkeypatch.setattr(inkling2_attn, "MergedColumnParallelLinear", _StubQKVR)
     monkeypatch.setattr(attn, "_can_use_qkvr_fast_path", lambda: True)
     monkeypatch.setattr(
         inkling2_attn, "get_platform", lambda: SimpleNamespace(is_sm120=True)
@@ -829,6 +840,556 @@ def test_project_sources_gates_3src_gemv_to_captured_decode_and_verify(monkeypat
             calls.clear()
             attn._project_sources(sources, mode)
             assert calls == ["gemv_3src"], f"captured {mode} should use 3-source GEMV"
+
+
+@contextmanager
+def _qkvr_target(
+    *,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    q_bias: bool = False,
+    d_rel: int = 1,
+):
+    config = Inkling2ModelConfig(
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        d_rel=d_rel,
+        rel_extent=16,
+        sliding_window_size=16,
+        q_bias=q_bias,
+        o_bias=False,
+        local_layer_ids=[],
+        n_layers_per_attn_res_block=1,
+        n_routed_experts=2,
+        num_experts_per_tok=1,
+    )
+    reset_context()
+    try:
+        publish(
+            ServerArgs(model_path="dummy", device="cpu", tp_size=tp_size),
+            role="test",
+            ranks=SpawnRanks(world_rank=tp_rank),
+        )
+        with (
+            override_platform(is_sm120=False, is_sm90=False),
+            set_default_torch_dtype(torch.float32),
+        ):
+            attn = Inkling2Attention(
+                config, layer_id=0, is_local=False, prefix="llm.layers.0.attn"
+            )
+        target = Inkling2ForConditionalGeneration.__new__(
+            Inkling2ForConditionalGeneration
+        )
+        nn.Module.__init__(target)
+        target.visual, target.quant_config = None, None
+        target.llm = nn.Module()
+        layer = nn.Module()
+        layer.attn = nn.Module()
+        layer.attn.qkvr = attn.qkvr
+        target.llm.layers = nn.ModuleList([layer])
+        yield target, attn
+    finally:
+        reset_context()
+
+
+def _dyadic(shape, *, seed: int, denom: float):
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randint(-7, 8, shape, generator=gen, dtype=torch.float32) / denom
+
+
+def _raw_qkvr_tensors(*, d_rel: int = 1, seed: int = 0):
+    specs = (
+        ("wq_du", 16),
+        ("wk_dv", 8),
+        ("wv_dv", 8),
+        ("wr_du", 4 * d_rel),
+        ("gate_attn", 16),
+        ("attn_sink_proj", 4),
+    )
+    weights = {
+        name: _dyadic((rows, 16), seed=seed + i + 1, denom=4.0)
+        for i, (name, rows) in enumerate(specs)
+    }
+    biases = {
+        name: _dyadic((rows,), seed=seed + 100 + i + 1, denom=8.0)
+        for i, (name, rows) in enumerate(specs)
+    }
+    return specs, weights, biases
+
+
+def _reference_project_sources(
+    sources, specs, weights, biases, *, tp_rank: int, tp_size: int, active_biases
+):
+    src_by_proj = {
+        "wq_du": sources.q,
+        "wk_dv": sources.k,
+        "wv_dv": sources.v,
+        "wr_du": sources.q,
+        "gate_attn": sources.q,
+        "attn_sink_proj": sources.q,
+    }
+    expected = []
+    for name, _ in specs:
+        w_rank = weights[name].chunk(tp_size, dim=0)[tp_rank]
+        b_rank = (
+            biases[name].chunk(tp_size, dim=0)[tp_rank]
+            if name in active_biases
+            else None
+        )
+        expected.append(F.linear(src_by_proj[name], w_rank, b_rank))
+    return tuple(expected)
+
+
+def _named_qkvr_entries(specs, weights, biases, *, q_bias: bool):
+    entries = [
+        (f"model.llm.layers.0.attn.{name}.weight", weights[name]) for name, _ in specs
+    ]
+    if q_bias:
+        entries.append(("model.llm.layers.0.attn.wq_du.bias", biases["wq_du"]))
+    return entries
+
+
+def _legacy_packed_qkvr_entries(
+    specs,
+    weights,
+    biases,
+    *,
+    q_bias: bool,
+    pad_rows: int = 0,
+    q_bias_only: bool = False,
+):
+    packed_w = torch.cat([weights[name] for name, _ in specs], dim=0)
+    if pad_rows:
+        packed_w = torch.cat(
+            [packed_w, torch.full((pad_rows, packed_w.shape[1]), 99.0)], dim=0
+        )
+    entries = [("model.llm.layers.0.attn.qkvr.weight", packed_w)]
+    if q_bias:
+        if q_bias_only:
+            packed_b = biases["wq_du"]
+        else:
+            packed_b = torch.cat([biases[name] for name, _ in specs], dim=0)
+            if pad_rows:
+                packed_b = torch.cat([packed_b, torch.full((pad_rows,), 99.0)], dim=0)
+        entries.append(("model.llm.layers.0.attn.qkvr.bias", packed_b))
+    return entries
+
+
+def _assert_project_sources_matches(
+    attn,
+    sources,
+    specs,
+    weights,
+    biases,
+    *,
+    tp_rank: int,
+    tp_size: int,
+    local_stride: int,
+    active_biases,
+):
+    with override_platform(is_sm120=False), torch.inference_mode():
+        actual = attn._project_sources(sources)
+        expected = _reference_project_sources(
+            sources,
+            specs,
+            weights,
+            biases,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            active_biases=active_biases,
+        )
+    assert all(t.stride() == (local_stride, 1) for t in actual)
+    for got, want in zip(actual, expected, strict=True):
+        assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize(
+    "tp_size,d_rel,checkpoint_format,q_bias",
+    [
+        (1, 1, "named", False),
+        (1, 1, "named", True),
+        (2, 1, "named", True),
+        (2, 1, "legacy_unpadded", False),
+        (1, 1, "legacy_unpadded", True),
+        (2, 1, "legacy_unpadded", True),
+        (2, 1, "legacy_padded", True),
+        (2, 4, "legacy_tp1_padded", True),
+        (1, 1, "legacy_tp2_padded", True),
+    ],
+)
+def test_qkvr_load_and_project_sources_matches_per_projection_linear(
+    tp_size, d_rel, checkpoint_format, q_bias
+):
+    specs, weights, biases = _raw_qkvr_tensors(d_rel=d_rel, seed=11)
+    sum_6 = sum(rows for _, rows in specs)
+    local_sum = sum_6 // tp_size
+    local_pad = -local_sum % 8
+    local_stride = local_sum + local_pad
+    if checkpoint_format == "named":
+        entries = _named_qkvr_entries(specs, weights, biases, q_bias=q_bias)
+        active_biases = {"wq_du"} if q_bias else set()
+    else:
+        pad_rows = (
+            0
+            if checkpoint_format == "legacy_unpadded"
+            else -sum_6 % 8
+            if checkpoint_format == "legacy_tp1_padded"
+            else 2 * (-(sum_6 // 2) % 8)
+            if checkpoint_format == "legacy_tp2_padded"
+            else local_pad * tp_size
+        )
+        entries = _legacy_packed_qkvr_entries(
+            specs, weights, biases, q_bias=q_bias, pad_rows=pad_rows
+        )
+        active_biases = {name for name, _ in specs} if q_bias else set()
+
+    expected_loaded = {"llm.layers.0.attn.qkvr.weight"} | (
+        {"llm.layers.0.attn.qkvr.bias"} if q_bias else set()
+    )
+    xq = _dyadic((5, 16), seed=501, denom=2.0)
+    xk = _dyadic((5, 16), seed=502, denom=2.0)
+    xv = _dyadic((5, 16), seed=503, denom=2.0)
+    empty = torch.empty((0, 16), dtype=torch.float32)
+
+    for tp_rank in range(tp_size):
+        with _qkvr_target(
+            tp_rank=tp_rank, tp_size=tp_size, q_bias=q_bias, d_rel=d_rel
+        ) as (target, attn):
+            assert target.load_weights(entries) == expected_loaded
+            if local_pad:
+                assert not attn.qkvr.weight[-local_pad:].any()
+                if q_bias:
+                    assert not attn.qkvr.bias[-local_pad:].any()
+
+            for sources in (
+                AttentionSources(xq, xk, xv),
+                AttentionSources(xq, xq, xq),
+                AttentionSources(xq, xq, xv),
+                AttentionSources(empty, empty.clone(), empty.clone()),
+            ):
+                _assert_project_sources_matches(
+                    attn,
+                    sources,
+                    specs,
+                    weights,
+                    biases,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                    local_stride=local_stride,
+                    active_biases=active_biases,
+                )
+
+            if q_bias and checkpoint_format == "legacy_unpadded":
+                w_ptr, b_ptr = attn.qkvr.weight.data_ptr(), attn.qkvr.bias.data_ptr()
+                sources = AttentionSources(xq, xk, xv)
+                _, w2, b2 = _raw_qkvr_tensors(d_rel=d_rel, seed=211)
+                target.load_weights(_named_qkvr_entries(specs, w2, b2, q_bias=True))
+                assert attn.qkvr.weight.data_ptr() == w_ptr
+                assert attn.qkvr.bias.data_ptr() == b_ptr
+                _assert_project_sources_matches(
+                    attn,
+                    sources,
+                    specs,
+                    w2,
+                    b2,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                    local_stride=local_stride,
+                    active_biases={"wq_du"},
+                )
+                target.load_weights(entries)
+                _, w3, b3 = _raw_qkvr_tensors(d_rel=d_rel, seed=311)
+                target.load_weights(
+                    _legacy_packed_qkvr_entries(
+                        specs, w3, b3, q_bias=True, q_bias_only=True
+                    )
+                )
+                assert attn.qkvr.bias.data_ptr() == b_ptr
+                _assert_project_sources_matches(
+                    attn,
+                    sources,
+                    specs,
+                    w3,
+                    b3,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                    local_stride=local_stride,
+                    active_biases={"wq_du"},
+                )
+
+
+def test_qkvr_load_weights_rejects_invalid_and_mixed_checkpoints():
+    """Malformed qkvr checkpoints fail loudly instead of silently padding."""
+    specs, weights, biases = _raw_qkvr_tensors(d_rel=1, seed=31)
+    named = _named_qkvr_entries(specs, weights, biases, q_bias=False)
+    packed = _legacy_packed_qkvr_entries(specs, weights, biases, q_bias=False)
+    sum_6 = packed[0][1].shape[0]
+    q_full = weights["wq_du"].shape[0]
+    qkvr_w = "model.llm.layers.0.attn.qkvr.weight"
+    wq_w = "model.llm.layers.0.attn.wq_du.weight"
+
+    for bad_entries, match in (
+        ([named[0], packed[0]], "mixes packed and unpacked"),
+        ([packed[0], named[0]], "mixes packed and unpacked"),
+        ([packed[0], packed[0]], "Repeated checkpoint tensor"),
+        ([named[0], named[0]], "Repeated checkpoint tensor"),
+        (named[:-1], "Missing checkpoint tensors"),
+        ([(qkvr_w, torch.tensor(0.0))], "expected ndim"),
+        ([(qkvr_w, torch.zeros(sum_6, 15))], "expected ndim"),
+        ([(qkvr_w, torch.zeros(sum_6 - 1, 16))], "unexpected packed qkvr rows"),
+        ([(wq_w, torch.zeros(q_full - 1, 16))], "expected shape"),
+        ([(wq_w, torch.zeros(q_full, 15))], "expected shape"),
+    ):
+        with _qkvr_target(tp_rank=0, tp_size=2, q_bias=False) as (target, _):
+            with pytest.raises(ValueError, match=match):
+                target.load_weights(bad_entries)
+
+    with _qkvr_target(tp_rank=0, tp_size=2, q_bias=True) as (target, _):
+        with pytest.raises(ValueError, match="Missing checkpoint tensors"):
+            target.load_weights(
+                [*named, ("model.llm.layers.0.attn.wk_dv.bias", biases["wk_dv"])]
+            )
+
+    with _qkvr_target(tp_rank=0, tp_size=2, q_bias=True) as (target, _):
+        with pytest.raises(ValueError, match="expected shape"):
+            target.load_weights(
+                [
+                    *named,
+                    ("model.llm.layers.0.attn.wq_du.bias", torch.zeros(q_full - 1)),
+                ]
+            )
+
+    with _qkvr_target(tp_rank=0, tp_size=1, q_bias=False, d_rel=4) as (target, _):
+        with pytest.raises(ValueError, match="unexpected packed qkvr rows"):
+            target.load_weights([(qkvr_w, torch.zeros(96, 16))])
+
+
+def _assert_cuda_3slice_prefill(target, attn, specs, biases, monkeypatch):
+    int_weights = {
+        name: torch.randint(
+            -2,
+            3,
+            (rows, 16),
+            generator=torch.Generator().manual_seed(700 + i),
+            dtype=torch.float32,
+        )
+        for i, (name, rows) in enumerate(specs)
+    }
+    target.load_weights(_named_qkvr_entries(specs, int_weights, biases, q_bias=False))
+    attn.to(device="cuda", dtype=torch.bfloat16)
+    w_cuda = attn.qkvr.weight
+    m_min = SLICED_QKVR_MIN_TOKENS
+    xq_c = torch.randint(
+        -1, 2, (m_min, 16), generator=torch.Generator().manual_seed(710)
+    ).to(device="cuda", dtype=torch.bfloat16)
+    xk_c = torch.randint(
+        -1, 2, (m_min, 16), generator=torch.Generator().manual_seed(711)
+    ).to(device="cuda", dtype=torch.bfloat16)
+    xv_c = torch.randint(
+        -1, 2, (m_min, 16), generator=torch.Generator().manual_seed(712)
+    ).to(device="cuda", dtype=torch.bfloat16)
+    src_min = AttentionSources(xq_c, xk_c, xv_c)
+    src_below = AttentionSources(
+        xq_c[: m_min - 1], xk_c[: m_min - 1], xv_c[: m_min - 1]
+    )
+
+    def _fail_forward(*args, **kwargs):
+        raise AssertionError("must use sliced prefill")
+
+    with torch.inference_mode():
+        assert attn._can_use_qkvr_fast_path()
+        handle = nn.modules.module.register_module_forward_hook(lambda m, i, o: o)
+        try:
+            assert not attn._can_use_qkvr_fast_path()
+        finally:
+            handle.remove()
+        assert attn._can_slice_qkvr_prefill(
+            sources=src_min, weight=w_cuda, bias=None, v_lo=4, q_lo=8
+        )
+        assert not attn._can_slice_qkvr_prefill(
+            sources=src_below, weight=w_cuda, bias=None, v_lo=4, q_lo=8
+        )
+        assert not attn._can_slice_qkvr_prefill(
+            sources=src_min,
+            weight=w_cuda,
+            bias=torch.zeros(w_cuda.shape[0], device="cuda", dtype=torch.bfloat16),
+            v_lo=4,
+            q_lo=8,
+        )
+        assert not attn._can_slice_qkvr_prefill(
+            sources=AttentionSources(xq_c.t().contiguous().t(), xk_c, xv_c),
+            weight=w_cuda,
+            bias=None,
+            v_lo=4,
+            q_lo=8,
+        )
+        assert not attn._can_slice_qkvr_prefill(
+            sources=AttentionSources(xq_c[:1].expand(m_min, 16), xk_c, xv_c),
+            weight=w_cuda,
+            bias=None,
+            v_lo=4,
+            q_lo=8,
+        )
+        with torch.autocast("cuda", dtype=torch.float16):
+            assert not attn._can_slice_qkvr_prefill(
+                sources=src_min, weight=w_cuda, bias=None, v_lo=4, q_lo=8
+            )
+        with override_platform(is_sm120=True), monkeypatch.context() as mp:
+            mp.setattr(attn.qkvr, "forward", _fail_forward)
+            actual = attn._project_sources(src_min)
+        w_cuda_ref = {
+            name: w.to(device="cuda", dtype=torch.bfloat16)
+            for name, w in int_weights.items()
+        }
+        expected = _reference_project_sources(
+            src_min,
+            specs,
+            w_cuda_ref,
+            biases,
+            tp_rank=1,
+            tp_size=2,
+            active_biases=set(),
+        )
+        assert all(t.stride() == (w_cuda.shape[0], 1) for t in actual)
+        for got, want in zip(actual, expected, strict=True):
+            assert torch.equal(got, want)
+    with torch.enable_grad():
+        assert not attn._can_slice_qkvr_prefill(
+            sources=AttentionSources(xq_c.clone().requires_grad_(True), xk_c, xv_c),
+            weight=w_cuda,
+            bias=None,
+            v_lo=4,
+            q_lo=8,
+        )
+
+
+def test_qkvr_3slice_prefill_parity_and_guards(monkeypatch):
+    specs, weights, biases = _raw_qkvr_tensors(d_rel=1, seed=41)
+    entries = _named_qkvr_entries(specs, weights, biases, q_bias=False)
+    with _qkvr_target(tp_rank=1, tp_size=2, q_bias=False) as (target, attn):
+        target.load_weights(entries)
+        sources = AttentionSources(
+            _dyadic((5, 20), seed=601, denom=2.0)[:, :16],
+            _dyadic((5, 20), seed=611, denom=2.0)[:, :16],
+            _dyadic((5, 20), seed=621, denom=2.0)[:, :16],
+        )
+        with torch.inference_mode():
+            projected = attn._project_qkvr_3src_sliced(
+                sources=sources, weight=attn.qkvr.weight, v_lo=4, q_lo=8
+            )
+            actual = attn._split_qkvr(projected)
+            expected = _reference_project_sources(
+                sources,
+                specs,
+                weights,
+                biases,
+                tp_rank=1,
+                tp_size=2,
+                active_biases=set(),
+            )
+        assert all(t.stride() == (projected.shape[1], 1) for t in actual)
+        for got, want in zip(actual, expected, strict=True):
+            assert torch.equal(got, want)
+
+        cpu_src = AttentionSources(
+            torch.zeros((SLICED_QKVR_MIN_TOKENS, 16), dtype=torch.bfloat16),
+            torch.zeros((SLICED_QKVR_MIN_TOKENS, 16), dtype=torch.bfloat16),
+            torch.zeros((SLICED_QKVR_MIN_TOKENS, 16), dtype=torch.bfloat16),
+        )
+        assert not attn._can_slice_qkvr_prefill(
+            sources=cpu_src,
+            weight=attn.qkvr.weight.to(torch.bfloat16),
+            bias=None,
+            v_lo=4,
+            q_lo=8,
+        )
+
+        if torch.cuda.is_available():
+            _assert_cuda_3slice_prefill(target, attn, specs, biases, monkeypatch)
+
+
+def test_sharded_state_loader_distinguishes_inkling2_qkvr_layout(tmp_path, monkeypatch):
+    """sharded_state tags new kvqr dumps and rejects pre-change dumps cleanly."""
+    from safetensors.torch import safe_open, save_file
+
+    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.model_loader import loader as loader_mod
+    from sglang.srt.model_loader.loader import ShardedStateLoader
+
+    monkeypatch.setattr(loader_mod, "_checkpoint_shard_rank", lambda: 0)
+    monkeypatch.setattr(loader_mod, "_get_quantization_config", lambda *_: None)
+    monkeypatch.setattr(loader_mod, "post_load_weights", lambda *_: None)
+
+    specs, weights, biases = _raw_qkvr_tensors(d_rel=1, seed=53)
+    entries = _named_qkvr_entries(specs, weights, biases, q_bias=False)
+
+    new_dir = tmp_path / "new_sharded"
+    new_dir.mkdir()
+    with _qkvr_target(tp_rank=0, tp_size=1, q_bias=False) as (target, attn):
+        target.load_weights(entries)
+        target.llm.layers[0].attn = attn
+        expected_weight = attn.qkvr.weight.detach().clone()
+        ShardedStateLoader.save_model(target, str(new_dir), max_size=2500)
+
+    shard_files = sorted(new_dir.glob("*.safetensors"))
+    assert len(shard_files) >= 2
+    for shard in shard_files:
+        with safe_open(str(shard), framework="pt") as f:
+            assert f.metadata() == {"inkling2_qkvr_layout": "kvqr"}
+
+    loader = ShardedStateLoader(LoadConfig(load_format="sharded_state"))
+    device_cfg = SimpleNamespace(device="cpu")
+
+    with _qkvr_target(tp_rank=0, tp_size=1, q_bias=False) as (reloaded, reloaded_attn):
+        reloaded.llm.layers[0].attn = reloaded_attn
+        reloaded_attn.qkvr.weight.data.zero_()
+        monkeypatch.setattr(loader_mod, "_initialize_model", lambda *_: reloaded)
+        model_cfg = SimpleNamespace(
+            model_path=str(new_dir), revision=None, dtype=torch.float32
+        )
+        loader.load_model(model_config=model_cfg, device_config=device_cfg)
+        assert torch.equal(reloaded_attn.qkvr.weight, expected_weight)
+
+    legacy_dir = tmp_path / "legacy_sharded"
+    legacy_dir.mkdir()
+    with _qkvr_target(tp_rank=0, tp_size=1, q_bias=False) as (target, attn):
+        target.load_weights(entries)
+        target.llm.layers[0].attn = attn
+        legacy_state = ShardedStateLoader._filter_subtensors(target.state_dict())
+        save_file(
+            legacy_state,
+            str(legacy_dir / ShardedStateLoader.DEFAULT_PATTERN.format(rank=0, part=0)),
+        )
+
+    with _qkvr_target(tp_rank=0, tp_size=1, q_bias=False) as (reloaded, reloaded_attn):
+        reloaded.llm.layers[0].attn = reloaded_attn
+        monkeypatch.setattr(loader_mod, "_initialize_model", lambda *_: reloaded)
+        model_cfg = SimpleNamespace(
+            model_path=str(legacy_dir), revision=None, dtype=torch.float32
+        )
+        with pytest.raises(ValueError, match="save_sharded_model"):
+            loader.load_model(model_config=model_cfg, device_config=device_cfg)
+
+    plain_dir = tmp_path / "plain_sharded"
+    plain_dir.mkdir()
+    plain_src = nn.Linear(8, 8, bias=False)
+    ShardedStateLoader.save_model(plain_src, str(plain_dir))
+    plain_file = plain_dir / ShardedStateLoader.DEFAULT_PATTERN.format(rank=0, part=0)
+    with safe_open(str(plain_file), framework="pt") as f:
+        assert f.metadata() is None
+    plain_dst = nn.Linear(8, 8, bias=False)
+    plain_dst.weight.data.zero_()
+    monkeypatch.setattr(loader_mod, "_initialize_model", lambda *_: plain_dst)
+    loader.load_model(
+        model_config=SimpleNamespace(
+            model_path=str(plain_dir), revision=None, dtype=torch.float32
+        ),
+        device_config=device_cfg,
+    )
+    assert torch.equal(plain_dst.weight, plain_src.weight)
 
 
 if __name__ == "__main__":
