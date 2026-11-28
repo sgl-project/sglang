@@ -312,12 +312,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         is only enabled within each individual image group (same-item
         tokens), not across items, and only for checkpoints with
         ``use_bidirectional_attention == "vision"``; E2B/E4B keep it causal.
+        Triton and XPU scope image attention to sliding-window layers when
+        ``sliding_layers_only`` (HF Gemma 4 keeps full-attention layers causal;
+        DiffusionGemma does not). FA4 layer scoping is not handled here yet.
         Triton and FA4 use causal attention for image spans split across chunks.
-        XPU passes Gemma 3's per-token image-block ids to the sgl-kernel-xpu
-        prefill, on sliding-window layers only when ``sliding_layers_only`` (HF
-        Gemma 4 keeps full-attention layers causal; DiffusionGemma does not).
-        That mask has no sliding-window variant, so sliding layers keep causal
-        image attention once the KV length exceeds the window.
+        XPU passes Gemma 3's per-token image-block ids to sgl-kernel-xpu. That
+        mask has no sliding-window variant, so sliding layers keep causal image
+        attention once the KV length exceeds the window.
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
@@ -462,6 +463,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 bidirectional_attn_mask_indptr
             )
             prefill_backend.forward_metadata.custom_mask = bidirectional_attn_masks
+            prefill_backend.forward_metadata.custom_mask_sliding_layers_only = (
+                sliding_layers_only
+            )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vt = self.vision_tower
