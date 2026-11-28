@@ -777,6 +777,49 @@ class TestGenerateChatConv(CustomTestCase):
         conv = generate_chat_conv(request, "chatml")
         self.assertEqual(conv.system_message, "System text")
 
+    def test_system_message_multi_part_text(self):
+        """Test system message with multiple text parts is concatenated."""
+        request = self._make_request(
+            [
+                ChatCompletionMessageGenericParam(
+                    role="system",
+                    content=[
+                        ChatCompletionMessageContentTextPart(
+                            type="text", text="You are "
+                        ),
+                        ChatCompletionMessageContentTextPart(
+                            type="text", text="helpful."
+                        ),
+                    ],
+                ),
+                ChatCompletionMessageUserParam(role="user", content="Hi"),
+            ]
+        )
+        conv = generate_chat_conv(request, "chatml")
+        self.assertEqual(conv.system_message, "You are helpful.")
+
+    def test_system_message_mixed_parts_raises(self):
+        """Test that system message mixing text and non-text parts raises."""
+        request = self._make_request(
+            [
+                ChatCompletionMessageGenericParam(
+                    role="system",
+                    content=[
+                        ChatCompletionMessageContentTextPart(type="text", text="Hi"),
+                        ChatCompletionMessageContentImagePart(
+                            type="image_url",
+                            image_url=ChatCompletionMessageContentImageURL(
+                                url="http://example.com/img.jpg"
+                            ),
+                        ),
+                    ],
+                ),
+                ChatCompletionMessageUserParam(role="user", content="Hi"),
+            ]
+        )
+        with self.assertRaises(ValueError):
+            generate_chat_conv(request, "chatml")
+
     def test_system_message_invalid_list_raises(self):
         """Test that system message with non-text content raises ValueError."""
         request = self._make_request(
@@ -829,6 +872,46 @@ class TestGenerateChatConv(CustomTestCase):
         )
         conv = generate_chat_conv(request, "chatml")
         self.assertEqual(conv.messages[1][1], "Hello!")
+
+    def test_assistant_message_multi_part_text(self):
+        """Test assistant message with multiple text parts is concatenated."""
+        request = self._make_request(
+            [
+                ChatCompletionMessageUserParam(role="user", content="Hi"),
+                ChatCompletionMessageGenericParam(
+                    role="assistant",
+                    content=[
+                        ChatCompletionMessageContentTextPart(type="text", text="Hel"),
+                        ChatCompletionMessageContentTextPart(type="text", text="lo!"),
+                    ],
+                ),
+                ChatCompletionMessageUserParam(role="user", content="How are you?"),
+            ]
+        )
+        conv = generate_chat_conv(request, "chatml")
+        self.assertEqual(conv.messages[1][1], "Hello!")
+
+    def test_assistant_mixed_parts_raises(self):
+        """Test that assistant message mixing text and non-text parts raises."""
+        request = self._make_request(
+            [
+                ChatCompletionMessageUserParam(role="user", content="Hi"),
+                ChatCompletionMessageGenericParam(
+                    role="assistant",
+                    content=[
+                        ChatCompletionMessageContentTextPart(type="text", text="Hi"),
+                        ChatCompletionMessageContentImagePart(
+                            type="image_url",
+                            image_url=ChatCompletionMessageContentImageURL(
+                                url="http://example.com/img.jpg"
+                            ),
+                        ),
+                    ],
+                ),
+            ]
+        )
+        with self.assertRaises(ValueError):
+            generate_chat_conv(request, "chatml")
 
     def test_assistant_invalid_list_raises(self):
         """Test that assistant message with non-text content raises ValueError."""
