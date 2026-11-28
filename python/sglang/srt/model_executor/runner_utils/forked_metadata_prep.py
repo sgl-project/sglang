@@ -1,5 +1,5 @@
 """The DSpark draft graph's in-graph metadata prep forked onto a side stream
-(SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK): embedding and the first layer's
+(the draft metadata prep fork): embedding and the first layer's
 pre-attention run meanwhile, and the first draft attention joins it before it
 stores KV or reads the attention metadata."""
 

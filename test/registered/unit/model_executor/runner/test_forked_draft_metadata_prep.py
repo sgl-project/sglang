@@ -1,4 +1,4 @@
-"""SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK: the draft graph's in-graph metadata prep
+"""The draft graph's in-graph metadata prep
 runs on a side stream and the first draft KV store joins it, before anything reads
 the metadata it builds."""
 

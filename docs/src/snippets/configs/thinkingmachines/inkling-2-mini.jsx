@@ -436,9 +436,6 @@ sgl-eval run gsm8k \\
       verified: true,
       env: [
         "SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL=1",
-        "SGLANG_OPT_DSV41_DSPARK_MID_FOLD=1",
-        "SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE=1",
-        "SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS=1",
       ],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -485,9 +482,6 @@ sgl-eval run gsm8k \\
       verified: true,
       env: [
         "SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL=1",
-        "SGLANG_OPT_DSV41_DSPARK_MID_FOLD=1",
-        "SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE=1",
-        "SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS=1",
       ],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -538,9 +532,6 @@ sgl-eval run gsm8k \\
       env: [
         "MAX_JOBS=4",
         "SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL=1",
-        "SGLANG_OPT_DSV41_DSPARK_MID_FOLD=1",
-        "SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE=1",
-        "SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS=1",
       ],
       flags: [
         "--model-path {{MODEL_NAME}}",

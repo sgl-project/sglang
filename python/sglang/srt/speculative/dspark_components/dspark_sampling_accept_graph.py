@@ -1,5 +1,4 @@
-"""CUDA graphs of the temperature-sampling verify accept of static DSpark decode steps
-(SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH).
+"""CUDA graphs of the temperature-sampling verify accept of static DSpark decode steps.
 
 The static verify graph folds only the greedy accept (DsparkVerifyEpilogue). On an
 all-sampled step the rest ran eagerly after the replay: the draft and target softmax,
