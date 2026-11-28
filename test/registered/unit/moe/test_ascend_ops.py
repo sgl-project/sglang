@@ -322,6 +322,31 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
 
         self.assertIsNone(get_forward().ascend_allgather_row_sizes)
 
+    # A captured segment cannot exchange row counts on the device; every rank
+    # runs the capture bucket, so the local count stands for the whole group.
+    # DP attention with attn-TP slicing (8 shards of 1024 split 4 ways) is the
+    # layout the batch helper cannot describe without a model-published flag.
+    def test_allgather_capture_falls_back_to_local_rows(self):
+        module = "sglang.srt.layers.moe.token_dispatcher.ascend_ops"
+        dispatcher = self._dispatcher_for_quant_mode()
+        batch = SimpleNamespace(global_num_tokens_padded_cpu=[1024] * 8)
+        with (
+            prefill_graph_scope(full_graph=False),
+            get_forward().scoped(forward_batch=batch, ascend_allgather_row_sizes=None),
+            get_parallel().override(
+                tp_size=32, attn_cp_size=1, attn_dp_size=8, attn_tp_size=4
+            ),
+            patch(f"{module}.dist.get_world_size", return_value=32),
+            patch(f"{module}.dist.get_rank", return_value=13),
+            patch(f"{module}.dist.all_gather") as exchange,
+        ):
+            row_sizes = dispatcher._resolve_allgather_row_sizes(
+                256, None, torch.device("cpu")
+            )
+
+        exchange.assert_not_called()
+        self.assertEqual(row_sizes, [256] * 32)
+
     def test_allgather_unpermute_passes_gmm_output_directly(self):
         """The vendor op must receive the original rows and dtype."""
         hidden = torch.tensor([[2.0], [4.0]], dtype=torch.bfloat16)

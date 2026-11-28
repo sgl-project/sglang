@@ -563,6 +563,11 @@ class AscendOpsDispatcher(BaseDispatcher):
                     use_cp=is_cp_active(batch),
                     use_tp_attn_a2a_scatter=forward.moe_input_attn_tp_sliced,
                 )
+        if row_sizes is None and is_in_prefill_graph_scope():
+            # A captured segment cannot read the group's counts back from the
+            # device. Capture gives every rank the same per-rank row count, so
+            # the local count stands for the whole group.
+            row_sizes = [local_rows] * dist.get_world_size(group)
         # Use the same branch on every rank. A local mismatch is an invariant
         # violation, so it cannot switch this rank to a different collective.
         if row_sizes is None or len(row_sizes) != dist.get_world_size(group):
