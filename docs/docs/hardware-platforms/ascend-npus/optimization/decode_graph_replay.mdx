@@ -1,0 +1,141 @@
+---
+title: "Verify decode graph replay"
+metatags:
+  description: "Run an eager control on Ascend, check which decode batches replay an NPU graph, and inspect a serving trace."
+---
+
+Run the same requests with and without an NPU graph to check generated token IDs, identify the decode batches that replay, and find them on the device timeline. This walkthrough uses a dense causal language model on one NPU with tensor parallelism set to one.
+
+## Start an eager control
+
+Use an Ascend SGLang environment compatible with your device and mount a local copy of `Qwen/Qwen2.5-0.5B-Instruct` inside it. For the official A3 container and driver mounts, follow the [Ascend quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start). Run the commands in Bash inside the environment. Use a second shell in the same environment for requests.
+
+In the server shell, set `MODEL_PATH` to the mounted directory. Export the same `SGLANG_ADMIN_API_KEY` in both shells before launching. Pass it explicitly as `--admin-api-key` so the B105 image also protects the profiling endpoint.
+
+```bash
+export MODEL_PATH=/models/Qwen2.5-0.5B-Instruct
+export SGLANG_TORCH_PROFILER_DIR=/tmp/sglang-decode-profile
+: "${SGLANG_ADMIN_API_KEY:?export the same admin key in both shells before launching}"
+
+python -m pip show sglang torch torch-npu | grep -E '^(Name|Version):'
+python -m sglang.launch_server --help > /tmp/sglang-serve-help.txt
+grep -E -- 'cuda-graph-bs-decode|disable-(decode|prefill)-cuda-graph' /tmp/sglang-serve-help.txt
+
+common=(--model-path "$MODEL_PATH" --device npu --attention-backend ascend
+        --tp-size 1 --admin-api-key "$SGLANG_ADMIN_API_KEY" --dtype bfloat16 --context-length 512 --mem-fraction-static 0.35
+        --host 127.0.0.1 --port 30000 --decode-log-interval 1)
+eager=(--disable-decode-cuda-graph --disable-prefill-cuda-graph)
+replay=(--cuda-graph-bs-decode 1 2 4)
+
+python -m sglang.launch_server "${common[@]}" "${eager[@]}" 2>&1 | tee /tmp/sglang-eager.log
+```
+
+These options apply to the B105 A3 image and current builds with the listed flags. The buckets count concurrent decode requests. Setting the log interval to one makes each step visible during this short check.
+
+## Compare generated tokens and replay decisions
+
+Wait until `curl -fsS http://127.0.0.1:30000/health` succeeds in the client shell. Define this function there. It sends three different-length prompts together and saves the generated **token IDs** in input order. Greedy sampling and a fixed output length make it easy to locate the first difference.
+
+```bash
+check_tokens() {
+    python - "$1" <<'PY'
+import json
+import sys
+from urllib.request import Request, urlopen
+
+prompts = [
+    "The capital of France is",
+    "One plus one equals",
+    "A rainbow has many colors, including",
+]
+payload = {
+    "text": prompts,
+    "return_logprob": True,
+    "sampling_params": {"temperature": 0, "max_new_tokens": 12, "ignore_eos": True},
+}
+request = Request("http://127.0.0.1:30000/generate",
+                  data=json.dumps(payload).encode(),
+                  headers={"Content-Type": "application/json"})
+with urlopen(request, timeout=120) as response:
+    rows = json.load(response)
+ids = [[entry[1] for entry in row["meta_info"]["output_token_logprobs"]] for row in rows]
+assert len(ids) == len(prompts) and all(len(row) == 12 for row in ids), ids
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    print(json.dumps(ids), file=output)
+PY
+}
+check_tokens /tmp/sglang-eager-ids.json
+```
+
+Stop the eager server with Ctrl+C. In the **same server shell**, start the graph run. Keep the model, dtype and other settings identical.
+
+```bash
+python -m sglang.launch_server "${common[@]}" "${replay[@]}" 2>&1 | tee /tmp/sglang-graph.log
+```
+
+After the health check succeeds, run these commands in the client shell:
+
+```bash
+check_tokens /tmp/sglang-graph-ids.json && \
+    diff -u /tmp/sglang-eager-ids.json /tmp/sglang-graph-ids.json
+for mode in eager graph; do
+    grep -i 'decode batch' "/tmp/sglang-$mode.log" | tail -n 4
+done
+```
+
+An empty diff means greedy token IDs matched for all three prompts. Read the **decode** rows for the request count and graph flag. Recent builds report `npu graph: False` for the control and `npu graph: True` for eligible graph-mode batches. The startup capture messages tell you which graphs were built. The per-batch flag tells you which path served the request. A client batch can span multiple scheduler steps, so use the logged request count when checking a padding case.
+
+## How capture, padding and graph updates fit together
+
+At startup the full decode runner warms up each eligible capture size, then records the forward pass into a `torch.npu.NPUGraph`. During serving it copies new token IDs, positions and other live inputs into reusable buffers. The recorded operators can keep the same tensor addresses as the contents change.
+
+| Scheduled decode batch | With capture sizes 1, 2 and 4 |
+| --- | --- |
+| 2 requests | Select the two-row graph when other runner conditions are met. |
+| 3 requests, padding enabled | Select the four-row graph and return results for the three live rows. |
+| 3 requests, `--disable-cuda-graph-padding` | Use eager decode because there is no three-row capture. |
+| More than 4 requests | Use eager decode for this batch. Other eligible batches can still replay. |
+
+To test the missing three-row bucket, restart the graph server with `--disable-cuda-graph-padding` appended, then repeat `check_tokens`. Check that the three-request decode rows switch to eager while single-request decode can still replay. Restore the padded configuration for the profiling example.
+
+**A sequence can grow inside the same graph.** On dense decode paths that use Ascend fused infer attention with host-side KV lengths, the runner supplies fresh lengths for the live rows at each step. For example, three live lengths of 20, 35 and 51 become `[20, 35, 51, 0]` for a four-row capture. On the next ordinary decode step they become `[21, 36, 52, 0]` if all three requests stay active. SGLang calls `graph.update(cpu_update_input=...)` for the captured attention inputs and replays the graph. The backend coordinates the update with replay so a later update cannot overwrite lengths still in use. SGLang manages these updates for requests sent to `/generate`.
+
+**When adapting a model**, keep captured tensor storage and shapes stable within a bucket, move device-to-host reads and data-dependent Python branches outside the captured forward, and check the attention operator's input contract. The common fused infer attention path updates `actual_seq_lengths_kv`. Some V2 operators use `actual_seq_kvlen`. Attention implementations that read lengths entirely on the device can replay without this host update. Speculative decoding has separate length handling. Test unequal prompt lengths and partially filled buckets against eager output after changing the attention path. See the [NPU graph backend](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py) and [Torch NPU graph constraints](https://github.com/Ascend/pytorch/blob/4da0cef3a973d43aafabf4955983d0d6041edcfd/docs/en/developer_notes/npugraph.md).
+
+These examples keep prefill eager. On builds that support breakable NPU prefill graphs, the prefill size counts aggregate input tokens. Check model and backend support separately before enabling prefill capture.
+
+## Profile steady-state decode
+
+Leave the graph server running. In the client shell, arm a four-step CPU and device trace, then request 24 output tokens. The serving API calls the device activity `GPU` on Ascend as well. The output directory belongs to the **server** process.
+
+```bash
+curl -fsS -X POST http://127.0.0.1:30000/start_profile \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY:?set the server admin key}" \
+  -H 'Content-Type: application/json' \
+  -d '{"activities":["CPU","GPU"],"start_step":2,"num_steps":4,"output_dir":"/tmp/sglang-decode-profile/serving"}'
+curl -fsS http://127.0.0.1:30000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Give a short explanation of gravity.","sampling_params":{"temperature":0,"max_new_tokens":24,"ignore_eos":true}}'
+```
+
+Allow the profiler to finish exporting the four scheduler steps. In the server environment, locate the parsed trace:
+
+```bash
+find /tmp/sglang-decode-profile/serving -name trace_view.json -size +0c
+```
+
+Choose the timestamped worker directory from this run's server log and open its `ASCEND_PROFILER_OUTPUT/trace_view.json` in MindStudio Insight. Select a decode interval after prefill. Correlate host-side graph execution (for example, `aclmdlRIExecuteAsync` on CANN versions that expose it) with work on the device streams. Compare with a trace collected from the eager control in a separate output directory when you need to attribute a launch gap. To inspect startup capture, add `--enable-profile-cuda-graph` to the graph server launch. The B105 image puts that trace under `$SGLANG_TORCH_PROFILER_DIR/graph_capture_profile/`. See [Ascend performance profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling).
+
+On a single A3 NPU with `Qwen2.5-0.5B-Instruct` in BF16 (SGLang `0.5.21+npu`, torch-npu `2.10.0.post6`, CANN `9.1.0`), all 36 generated token IDs matched. All 12 logged three-request decode steps used the graph with padding and ran eagerly with padding disabled. Both runs matched the eager control. The separate serving trace contained three `AscendCL@aclmdlRIExecuteAsync` calls and 72 pairs of `AscendCL@aclmdlRICaptureTaskUpdateBegin` and `AscendCL@aclmdlRICaptureTaskUpdateEnd` events. Event names and counts depend on the model, runtime and capture window.
+
+## Interpret unexpected results
+
+| Observation | Next check |
+| --- | --- |
+| The server captures graphs, but a decode row reports eager | Read the active request count and check the largest capture, exact-size padding policy, and whether the model's forward mode is eligible. |
+| Outputs diverge at a later token in a padded batch | Compare token IDs one prompt at a time and then as a batch. Check first-token alignment, the KV lengths for each active row, and how padded rows are masked. |
+| Capture exhausts device memory | Start with one small decode bucket, confirm it serves requests, then add the sizes your workload uses. Each additional capture can consume memory and startup time. |
+| Profiling returns HTTP 401/403 or produces no parsed trace | Check that both shells use the same server admin key, that the server can write the output directory, and that enough scheduler steps ran to close the window. |
+| Measuring a speedup | Turn profiling off, restore the normal decode logging interval, and warm up both configurations equally. Hold input/output lengths, concurrency, cache conditions and seed fixed. Compare output tokens/s and time per output token across repeated runs. The token check above measures correctness. |
+
+Use [parameter tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning) when selecting a larger set of capture sizes and [performance testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing) to measure a representative workload.
