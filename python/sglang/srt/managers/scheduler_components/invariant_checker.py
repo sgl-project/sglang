@@ -83,7 +83,7 @@ class SchedulerInvariantChecker:
     get_skip_idle_pool_checks: Callable[[], bool] = field(default=lambda: False)
     reporter: FailureReporter = field(default_factory=FailureReporter)
     # Requests that have not both exited and sent their final output; an ended
-    # one leaves at the next idle check.
+    # one leaves at the next idle check or admission.
     unended: Set[Req] = field(default_factory=set)
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
@@ -704,15 +704,21 @@ class SchedulerInvariantChecker:
         """Record that `req`, now kept by the scheduler, owes a final output and
         an exit through the retirer."""
         if envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            # A scheduler under sustained load never idles: drop the ended
+            # requests here too, or the set keeps every request it has seen.
+            self._drop_ended()
             self.unended.add(req)
+
+    def _drop_ended(self) -> None:
+        self.unended = {
+            req for req in self.unended if req.send_via is None or req.exit_via is None
+        }
 
     def _check_ended_requests(self) -> None:
         """At idle, every request the scheduler kept is in a list (held, parked,
         deferred, offloading) or has sent its final output and exited through
         the retirer."""
-        self.unended = {
-            req for req in self.unended if req.send_via is None or req.exit_via is None
-        }
+        self._drop_ended()
         listed = {req for reqs in self.get_request_lists().values() for req in reqs}
         unlisted = self.unended - listed
         self._raise_if_any(
