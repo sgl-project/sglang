@@ -1,5 +1,6 @@
 """Regression tests for the sglang.lang frontend, run against stub backends."""
 
+import asyncio
 import contextlib
 import copy
 import json
@@ -130,6 +131,75 @@ class TestHttpRequestCustomCA(_StubServerTestCase):
                     self.url, json={}, stream=stream, verify=self.ca_path
                 )
                 self.assertEqual(res.status_code, 200)
+
+
+class _StreamingServerHandler(_SglangServerHandler):
+    """Streams `server.pieces` from /generate in the configured output mode."""
+
+    def do_GET(self):  # noqa: N802
+        if self.path == "/server_info" and self.server.incremental is not None:
+            self._reply(200, {"incremental_streaming_output": self.server.incremental})
+        else:
+            super().do_GET()
+
+    def do_POST(self):  # noqa: N802
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        pieces = self.server.pieces
+        if self.server.incremental:
+            texts = pieces
+        else:
+            texts = ["".join(pieces[: i + 1]) for i in range(len(pieces))]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(_sse([{"text": text, "meta_info": {}} for text in texts]))
+
+
+class TestRuntimeStreamingOutputModes(_StubServerTestCase):
+    """A streaming client must receive the whole generation, whether or not the
+    server runs with --incremental-streaming-output."""
+
+    PIECES = ["Hello", " world", ", this", " is", " SGLang"]
+
+    def setUp(self):
+        super().setUp()
+        self.server.RequestHandlerClass = _StreamingServerHandler
+        self.server.pieces = self.PIECES
+
+    def test_streaming_gen_returns_the_whole_text(self):
+        @sgl.function
+        def program(s):
+            s += "Q: hi\nA:"
+            s += sgl.gen("answer")
+
+        # None stands for a server that has no /server_info route.
+        for incremental in (False, True, None):
+            with self.subTest(incremental=incremental):
+                self.server.incremental = incremental
+                state = program.run(backend=RuntimeEndpoint(self.base_url), stream=True)
+                chunks = list(state.text_iter("answer"))
+                state.sync()
+
+                self.assertIsNone(state.error())
+                self.assertEqual("".join(chunks), "".join(self.PIECES))
+                self.assertEqual(state["answer"], "".join(self.PIECES))
+
+    def test_async_generate_returns_the_whole_text(self):
+        async def collect(runtime):
+            return [chunk async for chunk in runtime.async_generate("hi")]
+
+        for incremental in (False, True):
+            with self.subTest(incremental=incremental):
+                self.server.incremental = incremental
+                runtime = Runtime.__new__(Runtime)
+                runtime.pid = None
+                runtime.generate_url = self.base_url + "/generate"
+                runtime.server_args = SimpleNamespace(
+                    skip_tokenizer_init=False,
+                    incremental_streaming_output=incremental,
+                )
+
+                self.assertEqual(asyncio.run(collect(runtime)), self.PIECES)
 
 
 _USAGE = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}

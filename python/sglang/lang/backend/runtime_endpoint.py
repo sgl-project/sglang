@@ -3,6 +3,7 @@ import json
 import multiprocessing
 import time
 import warnings
+from functools import cached_property
 from typing import Dict, List, Optional, Union
 
 import aiohttp
@@ -56,6 +57,19 @@ class RuntimeEndpoint(BaseBackend):
             self.chat_template = get_chat_template_by_model_path(
                 self.model_info["model_path"]
             )
+
+    @cached_property
+    def _incremental_streaming_output(self) -> bool:
+        res = http_request(
+            self.base_url + "/server_info",
+            api_key=self.api_key,
+            verify=self.verify,
+        )
+        # Without the route there is no setting to read; assume the default.
+        if res.status_code == 404:
+            return False
+        self._assert_success(res)
+        return res.json().get("incremental_streaming_output", False)
 
     def get_model_name(self):
         return self.model_info["model_path"]
@@ -224,6 +238,7 @@ class RuntimeEndpoint(BaseBackend):
 
         data["stream"] = True
         self._add_images(s, data)
+        incremental = self._incremental_streaming_output
 
         res = http_request(
             self.base_url + "/generate",
@@ -241,7 +256,7 @@ class RuntimeEndpoint(BaseBackend):
                 if chunk == "data: [DONE]":
                     break
                 data = json.loads(chunk[5:].strip("\n"))
-                chunk_text = data["text"][pos:]
+                chunk_text = data["text"] if incremental else data["text"][pos:]
                 meta_info = data["meta_info"]
                 pos += len(chunk_text)
                 yield chunk_text, meta_info
@@ -499,6 +514,7 @@ class Runtime:
                 "stream": True,
                 "session_id": session_id,
             }
+        incremental = self.server_args.incremental_streaming_output
         pos = 0
 
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
@@ -516,7 +532,7 @@ class Runtime:
                             return
                         data = json.loads(event[5:])
                         if "text" in data:
-                            cur = data["text"][pos:]
+                            cur = data["text"] if incremental else data["text"][pos:]
                             if cur:
                                 yield cur
                             pos += len(cur)
