@@ -26,6 +26,7 @@ from sglang.srt.layers.quantization.unquant import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -134,6 +135,12 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
         return quant_method.apply(lm_head, hidden, None)
     weight = lm_head.weight
     dtype = get_spec().speculative_dspark_lm_head_dtype
+    if dtype in (None, "mxfp8"):
+        mxfp8_logits = current_platform.maybe_project_mxfp8_lm_head(
+            hidden, lm_head, is_draft=True, force=(dtype == "mxfp8")
+        )
+        if mxfp8_logits is not None:
+            return mxfp8_logits
     if dtype is not None and weight.is_floating_point() and hidden.shape[0] > 0:
         if dtype == "fp8" and weight.shape[-1] % 16 == 0:
             return _fp8_lm_head_matmul(hidden, lm_head)

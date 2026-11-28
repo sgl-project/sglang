@@ -82,6 +82,36 @@ class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
     def get_dispatch_key_name(self) -> str:
         return "npu"
 
+    def post_load_model(self, model: torch.nn.Module) -> None:
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            npu_arch35_post_load_model,
+        )
+
+        npu_arch35_post_load_model(model, is_draft=False)
+
+    def post_load_draft_model(self, model: torch.nn.Module) -> None:
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            npu_arch35_post_load_model,
+        )
+
+        npu_arch35_post_load_model(model, is_draft=True)
+
+    def maybe_project_mxfp8_lm_head(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: torch.nn.Module,
+        *,
+        is_draft: bool = True,
+        force: bool = False,
+    ) -> Optional[torch.Tensor]:
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            npu_arch35_maybe_project_mxfp8_lm_head,
+        )
+
+        return npu_arch35_maybe_project_mxfp8_lm_head(
+            hidden_states, lm_head, is_draft=is_draft, force=force
+        )
+
     def on_destroy_model_parallel(self) -> None:
         from sglang.srt.hardware_backend.npu.moe.mega_moe import (
             destroy_mega_moe_buffers,

@@ -1422,6 +1422,8 @@ class ModelRunner:
         self.loader = loaded.loader
         self.model = loaded.model
         current_platform.post_load_model(self.model)
+        if self.is_draft_worker:
+            current_platform.post_load_draft_model(self.model)
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (

@@ -31,9 +31,7 @@ from sglang.kernels.ops.activation.softcap import (
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
-from sglang.kernels.ops.activation.softcap import (
-    softcap_to_float32_logits,
-)
+from sglang.kernels.ops.activation.softcap import softcap_to_float32_logits
 from sglang.kernels.ops.sampling.softcap_row_argmax import (
     merge_row_argmax_shards,
     softcap_row_argmax,
@@ -67,6 +65,7 @@ from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
 from sglang.srt.managers.req_types import TokenIdRows
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
     get_exec,
@@ -1487,6 +1486,22 @@ class LogitsProcessor(nn.Module):
                 )
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
+            elif (
+                mxfp8_logits := current_platform.maybe_project_mxfp8_lm_head(
+                    hidden_states,
+                    lm_head,
+                    is_draft=getattr(self, "_is_draft_lm_head", False),
+                )
+            ) is not None:
+                if (
+                    out is not None
+                    and out.dtype == mxfp8_logits.dtype
+                    and out.shape == mxfp8_logits.shape
+                ):
+                    out.copy_(mxfp8_logits)
+                    logits = out
+                else:
+                    logits = mxfp8_logits
             else:
                 lhs = hidden_states.to(lm_head.weight.dtype)
                 if out is not None and out.dtype == lm_head.weight.dtype:

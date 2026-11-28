@@ -61,6 +61,7 @@ from sglang.srt.models.utils import (
     bind_or_assign,
     keeps_no_quant_config,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
@@ -173,6 +174,14 @@ def _project_candidate_logits(
             and weight.dtype == torch.bfloat16
         ):
             return bf16_gemm_dispatch(h, weight[:num_org], None)
+        if (
+            mxfp8_logits := current_platform.maybe_project_mxfp8_lm_head(
+                h, lm_head, is_draft=True
+            )
+        ) is not None:
+            if mxfp8_logits.shape[-1] > num_org:
+                mxfp8_logits[:, num_org:] = float("-inf")
+            return mxfp8_logits
         return torch.matmul(h, weight[:num_org].T)
     # A packed weight can't be row-sliced to the org vocab like the dense path,
     # and flashinfer's radix top-k only reads dense rows (a crop view would be
@@ -889,12 +898,41 @@ class DFlashMLP(nn.Module):
             and isinstance(self.gate_up_proj.quant_method, UnquantizedLinearMethod)
             and tuple(self.gate_up_proj.weight.shape) in _GFX950_HIPBLASLT_WEIGHTS
         )
+        self._enable_npu_swiglu_mx_quant: Optional[bool] = None
+
+    def _can_run_npu_swiglu_mx_quant(self, gate_up: torch.Tensor) -> bool:
+        if not _is_npu:
+            return False
+        if self._enable_npu_swiglu_mx_quant is None:
+            enabled = False
+            if (
+                isinstance(self.act_fn, SiluAndMul)
+                and _npu_mxfp8_fusion_enabled()
+                and hasattr(getattr(torch.ops, "npu", None), "npu_swiglu_mx_quant")
+                and _is_npu_mxfp8_linear(self.down_proj)
+            ):
+                enabled = True
+            self._enable_npu_swiglu_mx_quant = enabled
+        return (
+            self._enable_npu_swiglu_mx_quant
+            and gate_up.ndim == 2
+            and gate_up.dtype in (torch.bfloat16, torch.float16)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.gate_up_on_hipblaslt and x.shape[0] in _GFX950_HIPBLASLT_ROWS:
             gate_up = F.linear(x, self.gate_up_proj.weight)
         else:
             gate_up, _ = self.gate_up_proj(x)
+        if self._can_run_npu_swiglu_mx_quant(gate_up):
+            qx, xs = torch.ops.npu.npu_swiglu_mx_quant(
+                gate_up,
+                activate_dim=-1,
+                activate_left=True,
+                dst_type=torch.float8_e4m3fn,
+            )
+            x, _ = self.down_proj((qx, xs))
+            return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -1043,6 +1081,59 @@ class DFlashGroupedConv(nn.Module):
         return norm(self.finish(hidden_states, coefficients), residual)
 
 
+def _npu_mxfp8_fusion_enabled() -> bool:
+    env_var = getattr(envs, "SGLANG_NPU_ENABLE_MXFP8_FUSION", None)
+    return True if env_var is None else bool(env_var.get())
+
+
+def _is_npu_mxfp8_linear(linear: Optional[nn.Module]) -> bool:
+    qm = getattr(linear, "quant_method", None)
+    if qm is None:
+        return False
+    w8a8_fn = getattr(qm, "w8a8_block_fp8_linear", None)
+    return (
+        getattr(w8a8_fn, "__name__", "") == "npu_w8a8_mxfp8_linear"
+        or qm.__class__.__name__ == "NPUMXFP8LinearMethod"
+    )
+
+
+def _can_fuse_npu_norm_mxfp8(
+    norm: nn.Module, linear: Optional[nn.Module], conv: Optional[nn.Module]
+) -> bool:
+    npu_ops = getattr(torch.ops, "npu", None)
+    return (
+        _is_npu
+        and conv is None
+        and _npu_mxfp8_fusion_enabled()
+        and hasattr(npu_ops, "npu_rms_norm_dynamic_mx_quant")
+        and hasattr(npu_ops, "npu_add_rms_norm_dynamic_mx_quant")
+        and isinstance(norm, (RMSNorm, GemmaRMSNorm))
+        and getattr(norm, "has_weight", True)
+        and not getattr(norm, "fp32_residual", False)
+        and not getattr(norm, "cast_x_before_out_mul", False)
+        and getattr(norm, "override_orig_dtype", None) is None
+        and getattr(norm, "variance_size_override", None) is None
+        and _is_npu_mxfp8_linear(linear)
+    )
+
+
+def _run_npu_norm_mx_quant(
+    norm: nn.Module, x: torch.Tensor, residual: Optional[torch.Tensor]
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    w = norm.gemma_weight if isinstance(norm, GemmaRMSNorm) else norm.weight
+    if w.dtype != x.dtype:
+        w = w.to(x.dtype)
+    if residual is None:
+        qx, xs, _ = torch.ops.npu.npu_rms_norm_dynamic_mx_quant(
+            x, w, epsilon=norm.variance_epsilon, dst_type=torch.float8_e4m3fn
+        )
+        return (qx, xs), x
+    qx, residual, xs, _ = torch.ops.npu.npu_add_rms_norm_dynamic_mx_quant(
+        residual, x, w, epsilon=norm.variance_epsilon, dst_type=torch.float8_e4m3fn
+    )
+    return (qx, xs), residual
+
+
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
@@ -1079,6 +1170,31 @@ class DFlashDecoderLayer(nn.Module):
 
         self.attention_conv = attention_conv
         self.mlp_conv = mlp_conv
+        self._fuse_attn_norm_mxfp8: Optional[bool] = None
+        self._fuse_ffn_norm_mxfp8: Optional[bool] = None
+
+    def _fuse_norm_ok(self, kind: str, x: torch.Tensor) -> bool:
+        if not _is_npu or x.ndim != 2 or x.dtype not in (torch.bfloat16, torch.float16):
+            return False
+        if kind == "attn":
+            if self._fuse_attn_norm_mxfp8 is None:
+                self._fuse_attn_norm_mxfp8 = type(
+                    self.self_attn
+                ) is DFlashAttention and _can_fuse_npu_norm_mxfp8(
+                    self.input_layernorm,
+                    getattr(self.self_attn, "qkv_proj", None),
+                    self.attention_conv,
+                )
+            return self._fuse_attn_norm_mxfp8
+        if self._fuse_ffn_norm_mxfp8 is None:
+            self._fuse_ffn_norm_mxfp8 = isinstance(
+                self.mlp, DFlashMLP
+            ) and _can_fuse_npu_norm_mxfp8(
+                self.post_attention_layernorm,
+                getattr(self.mlp, "gate_up_proj", None),
+                self.mlp_conv,
+            )
+        return self._fuse_ffn_norm_mxfp8
 
     def forward(
         self,
@@ -1104,15 +1220,18 @@ class DFlashDecoderLayer(nn.Module):
                 residual = hidden_states
             return hidden_states, residual, None
 
-        # Pre-norm attention with fused residual+norm when possible (Qwen3-style).
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        elif input_conv is not None:
+        if input_conv is not None and residual is not None:
             conv, coefficients = input_conv
             hidden_states, residual = conv.finish_add_norm(
                 hidden_states, coefficients, residual, self.input_layernorm
             )
+        elif self._fuse_norm_ok("attn", hidden_states):
+            hidden_states, residual = _run_npu_norm_mx_quant(
+                self.input_layernorm, hidden_states, residual
+            )
+        elif residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
@@ -1129,6 +1248,14 @@ class DFlashDecoderLayer(nn.Module):
         if attention_kernel is not None and self.post_self_attn_layernorm is None:
             hidden_states, residual = self.attention_conv.finish_add_norm(
                 attn_out, attention_kernel, residual, self.post_attention_layernorm
+            )
+        elif (
+            attention_kernel is None
+            and self.post_self_attn_layernorm is None
+            and self._fuse_norm_ok("ffn", attn_out)
+        ):
+            hidden_states, residual = _run_npu_norm_mx_quant(
+                self.post_attention_layernorm, attn_out, residual
             )
         else:
             if attention_kernel is not None:
@@ -1375,6 +1502,12 @@ class DFlashDraftModel(nn.Module):
             and self.fc.out_features % get_parallel().tp_size == 0
         ):
             projected = self._project_target_hidden_tp(target_hidden)
+        elif getattr(self.fc, "_npu_arch35_mxfp8_cache", None) is not None:
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                npu_arch35_online_mxfp8_matmul,
+            )
+
+            projected = npu_arch35_online_mxfp8_matmul(target_hidden, self.fc)
         else:
             projected = self.fc(target_hidden)
         return self.hidden_norm(projected)
