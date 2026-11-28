@@ -115,20 +115,16 @@ impl CacheAwarePolicy {
         })
     }
 
-    /// `remembered`: the prompt has a remembered media placement, so the
-    /// absolute token floor applies to none of its matches. The floor counts
-    /// routing tokens, and the image KV and vision encoding the placement
-    /// stands for are not among them, so even a short image chat keeps its
-    /// worker; its tied peers stay candidates too, so the pressure guard has
-    /// an alternative when that worker is materially more loaded. The ratio
-    /// floor still applies.
+    /// A media preference can route short image prompts: the text token count
+    /// does not represent vision work. Keep peers available to the pressure
+    /// guard and continue to enforce the minimum match ratio.
     fn passes_cache_gate(
         &self,
         input_tokens: u64,
         matched_prefix_tokens: u64,
-        remembered: bool,
+        media_preferred: bool,
     ) -> bool {
-        (remembered
+        (media_preferred
             || self
                 .config
                 .cache_affinity_min_matched_tokens
