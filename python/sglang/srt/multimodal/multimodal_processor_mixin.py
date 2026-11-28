@@ -29,6 +29,18 @@ def _tokenizer_of(processor):
     return processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
 
+# Mirrors move_feature_to_cpu; the token-space processor shares this mixin
+# without importing the serving feature transport.
+def _move_tensors_to_cpu(value):
+    if isinstance(value, torch.Tensor):
+        return value.to("cpu")
+    if isinstance(value, list):
+        return [_move_tensors_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_tensors_to_cpu(v) for v in value)
+    return value
+
+
 class MultimodalProcessorMixin:
     """Share media loading and preprocessing resources across training and serving."""
 
@@ -176,18 +188,15 @@ class MultimodalProcessorMixin:
             yield
 
     def _move_processor_output_to_cpu(self, result):
-        # Deferred: the hash is computed on the GPU tensor first, and
-        # _precompute_hashes_before_cpu_transfer moves it down afterwards.
-        if (
-            not self.keep_mm_features_on_device
-            and not self.precompute_hash_before_cpu_transfer
-        ):
-            # move feature tensors to cpu
-            for feature_name in self.FEATURE_NAMES:
-                if feature_name in result and isinstance(
-                    result[feature_name], torch.Tensor
-                ):
-                    result[feature_name] = result[feature_name].to("cpu")
+        if self.keep_mm_features_on_device:
+            return
+
+        for name, value in result.items():
+            # Features are hashed on the GPU first;
+            # _precompute_hashes_before_cpu_transfer copies them afterwards.
+            if self.precompute_hash_before_cpu_transfer and name in self.FEATURE_NAMES:
+                continue
+            result[name] = _move_tensors_to_cpu(value)
 
     @classmethod
     def _load_single_item(
