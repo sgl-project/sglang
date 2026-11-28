@@ -940,6 +940,55 @@ class TestLayerRunnerDispatch(CustomTestCase):
         topk.bind_runner_backend(MoeRunnerBackend.FLASHINFER_TRTLLM)
         self.assertEqual(topk.topk_config.output_format, TopKOutputFormat.STANDARD)
 
+    def test_map_topk_ids_triton_dispatch_guards(self):
+        from sglang.srt.layers.moe.token_dispatcher import standard as standard_mod
+
+        class _FakeCudaTensor(torch.Tensor):
+            @property
+            def is_cuda(self):
+                return True
+
+        fake_ids = torch.tensor([[0, 2, -1]], dtype=torch.int32).as_subclass(
+            _FakeCudaTensor
+        )
+        mapping = torch.tensor([-1, -1, 0], dtype=torch.int32).as_subclass(
+            _FakeCudaTensor
+        )
+        expected = torch.tensor([[-1, 0, -1]], dtype=torch.int32)
+        non_contig_ids = torch.tensor(
+            [[0, 99, 2, 99, -1, 99]], dtype=torch.int32
+        )[:, ::2].as_subclass(_FakeCudaTensor)
+
+        with patch.object(
+            standard_mod, "map_topk_ids_to_local_experts", return_value=expected
+        ) as mock_triton:
+            with patch.object(standard_mod, "_is_cuda", False):
+                out_eager = standard_mod._map_topk_ids_to_local_experts(
+                    fake_ids, mapping
+                )
+            mock_triton.assert_not_called()
+            self.assertTrue(
+                torch.equal(out_eager.as_subclass(torch.Tensor), expected)
+            )
+
+            with patch.object(standard_mod, "_is_cuda", True):
+                out_non_contig = standard_mod._map_topk_ids_to_local_experts(
+                    non_contig_ids, mapping
+                )
+            mock_triton.assert_not_called()
+            self.assertTrue(
+                torch.equal(out_non_contig.as_subclass(torch.Tensor), expected)
+            )
+
+            with patch.object(standard_mod, "_is_cuda", True):
+                out_triton = standard_mod._map_topk_ids_to_local_experts(
+                    fake_ids, mapping
+                )
+            mock_triton.assert_called_once_with(
+                topk_ids=fake_ids, local_expert_mapping=mapping
+            )
+            self.assertTrue(torch.equal(out_triton, expected))
+
 
 if __name__ == "__main__":
     import pytest

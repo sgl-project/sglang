@@ -448,3 +448,11 @@ for _fn in (
         )
     )
 del _fn
+register_kernel(
+    KernelSpec(
+        op="moe.map_topk_ids_to_local_experts",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.map_local_experts:map_topk_ids_to_local_experts",
+        capabilities=CUDA_ONLY,
+    )
+)
