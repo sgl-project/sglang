@@ -34,13 +34,14 @@ from sglang.srt.environ import envs
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_mm,
     get_model,
     get_parallel,
     get_serving,
     process_model_config,
 )
-from sglang.srt.utils import logger
+from sglang.srt.utils import kill_itself_when_parent_died, logger
 
 from .common import (
     AutoConfig,
@@ -102,8 +103,12 @@ def load_scheduler_tokenizer(*, is_multimodal: bool):
 
 
 def _prewarm_in_subprocess(
-    staging_dir, tokenizer_opts, processor_opts, has_python_frontend
+    staging_dir, tokenizer_opts, processor_opts, load_standalone_tokenizer
 ):
+    kill_itself_when_parent_died()
+    # The parent may already have died before the watchdog was installed.
+    if not multiprocessing.parent_process().is_alive():
+        return
     # spawn inherits sys.path. Prefer staged packages even when the launcher
     # has already imported the checkpoint's AutoConfig from the shared cache.
     dynamic_module_utils.HF_MODULES_CACHE = staging_dir
@@ -111,74 +116,101 @@ def _prewarm_in_subprocess(
     load_plugins()
     if processor_opts is not None:
         get_processor(**tokenizer_opts, **processor_opts)
-    if processor_opts is None or has_python_frontend:
+    if load_standalone_tokenizer:
         # Python detokenizers load a standalone tokenizer even for MM models.
         get_tokenizer(**tokenizer_opts)
 
 
-def maybe_prewarm_local_hf_modules():
-    """Populate the shared HF modules cache before local tokenizer readers start."""
+def maybe_prewarm_local_hf_modules(*, prewarm_scheduler_nodes=None):
+    """Work around transformers#50843 before concurrent local module readers start."""
     try:
+        if not get_model().trust_remote_code:
+            return
         serving = get_serving()
         parallel = get_parallel()
+        skip_tokenizer = serving.skip_tokenizer_init
+        warm_remote_nodes = prewarm_scheduler_nodes is not None and not skip_tokenizer
         has_python_frontend = (
             parallel.node_rank == 0 and not envs.SGLANG_RUST_SERVER.get()
         )
-        if (
-            serving.skip_tokenizer_init
-            or not get_model().trust_remote_code
-            or not Path(serving.tokenizer_path).is_dir()
-            or (
+        if skip_tokenizer:
+            # Only concurrent Python MM tokenizer workers still load a processor.
+            if (
                 not has_python_frontend
-                and parallel.tp_size * parallel.pp_size * parallel.dp_size
-                <= parallel.nnodes
-            )
+                or serving.tokenizer_worker_num <= 1
+                or get_disagg().language_model_only
+            ):
+                return
+        elif (
+            not warm_remote_nodes
+            and not has_python_frontend
+            and parallel.tp_size * parallel.pp_size * parallel.dp_size
+            <= parallel.nnodes
         ):
             return
 
-        # huggingface/transformers#50843: even at TP=1 the Python frontend
-        # and scheduler can race to copy/import the same local module.
-        cache = Path(dynamic_module_utils.HF_MODULES_CACHE)
-        cache.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=cache) as staging:
-            # Unpickling ServerArgs can import a custom config before staging
-            # is active. Send only the resolved loader arguments across spawn.
-            tokenizer_opts, processor_opts = _tokenizer_load_options(
-                process_model_config().is_multimodal
+        # A Ray scheduler can see an absolute checkpoint mount absent on the driver.
+        path = Path(serving.tokenizer_path)
+        if not path.is_dir() and not (warm_remote_nodes and path.is_absolute()):
+            return
+        is_multimodal = process_model_config().is_multimodal
+        if skip_tokenizer and not is_multimodal:
+            return
+        tokenizer_opts, processor_opts = _tokenizer_load_options(is_multimodal)
+        if warm_remote_nodes:
+            prewarm_scheduler_nodes(tokenizer_opts, processor_opts, has_python_frontend)
+        else:
+            # At TP=1 the Python frontend and scheduler can still race.
+            load_standalone = not skip_tokenizer and (
+                processor_opts is None or has_python_frontend
             )
-            proc = multiprocessing.get_context("spawn").Process(
-                target=_prewarm_in_subprocess,
-                args=(staging, tokenizer_opts, processor_opts, has_python_frontend),
-            )
-            proc.start()
-            try:
-                proc.join()
-                if proc.exitcode != 0:
-                    raise RuntimeError(
-                        f"Tokenizer prewarm process exited with {proc.exitcode}"
-                    )
-            finally:
-                if proc.is_alive():
-                    proc.terminate()
-                    proc.join()
-                proc.close()
-
-            # Stage on the same filesystem so readers see only complete files.
-            # HF creates empty package initializers without replacing existing ones.
-            for source in Path(staging).rglob("*.py"):
-                target = cache / source.relative_to(staging)
-                if target.exists() and (
-                    (source.name == "__init__.py" and source.stat().st_size == 0)
-                    or filecmp.cmp(source, target, shallow=False)
-                ):
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                source.replace(target)
+            prewarm_hf_modules_on_node(tokenizer_opts, processor_opts, load_standalone)
     except Exception:
         logger.warning(
             "Could not prewarm the HF modules cache. Continuing with scheduler startup.",
             exc_info=True,
         )
+
+
+def prewarm_hf_modules_on_node(
+    tokenizer_opts, processor_opts, load_standalone_tokenizer
+):
+    """Stage imports on this node before publishing complete files to its HF cache."""
+    if not Path(tokenizer_opts["tokenizer_name"]).is_dir():
+        return
+    cache = Path(dynamic_module_utils.HF_MODULES_CACHE)
+    cache.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=cache) as staging:
+        # Only resolved loader arguments cross spawn: unpickling ServerArgs
+        # could import a custom config before staging is active.
+        proc = multiprocessing.get_context("spawn").Process(
+            target=_prewarm_in_subprocess,
+            args=(staging, tokenizer_opts, processor_opts, load_standalone_tokenizer),
+        )
+        proc.start()
+        try:
+            proc.join()
+            if proc.exitcode != 0:
+                raise RuntimeError(
+                    f"Tokenizer prewarm process exited with {proc.exitcode}"
+                )
+        finally:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join()
+            proc.close()
+
+        # Stage on the same filesystem so readers see only complete files.
+        # HF creates empty package initializers without replacing existing ones.
+        for source in Path(staging).rglob("*.py"):
+            target = cache / source.relative_to(staging)
+            if target.exists() and (
+                (source.name == "__init__.py" and source.stat().st_size == 0)
+                or filecmp.cmp(source, target, shallow=False)
+            ):
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(target)
 
 
 def _normalize_image_processor_backend(

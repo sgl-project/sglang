@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
+from functools import partial
 from typing import Callable, List, Optional
 
 import ray
@@ -31,6 +32,10 @@ from sglang.srt.entrypoints.engine import (
     _calculate_rank_ranges,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers.processor import (
+    maybe_prewarm_local_hf_modules,
+    prewarm_hf_modules_on_node,
+)
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.runtime_context import (
@@ -182,6 +187,45 @@ def _validate_custom_placement_group(pg: PlacementGroup, world_size: int) -> Non
         )
 
 
+def _prewarm_scheduler_nodes(
+    pg, bundle_for_node, world_size, tokenizer_opts, processor_opts, has_python_frontend
+):
+    """Warm each scheduler node once and include the driver's Python frontend."""
+    indices = (
+        bundle_for_node
+        if bundle_for_node is not None
+        else _resolve_bundle_indices(pg, world_size)
+    )
+    nodes = ray.util.placement_group_table(pg)["bundles_to_node_id"]
+    driver = ray.get_runtime_context().get_node_id()
+    # Several bundles can share one physical node and its HF cache.
+    bundles_by_node = {nodes[i]: i for i in indices}
+    driver_hosts_scheduler = bundles_by_node.pop(driver, None) is not None
+    remote_prewarm = ray.remote(num_cpus=0, max_retries=0)(prewarm_hf_modules_on_node)
+    pending = []
+    try:
+        for bundle in bundles_by_node.values():
+            task = remote_prewarm.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg, placement_group_bundle_index=bundle
+                )
+            )
+            pending.append(
+                task.remote(tokenizer_opts, processor_opts, processor_opts is None)
+            )
+        if driver_hosts_scheduler or has_python_frontend:
+            prewarm_hf_modules_on_node(
+                tokenizer_opts,
+                processor_opts,
+                processor_opts is None or has_python_frontend,
+            )
+    finally:
+        if pending:
+            # Wait for every node even if one task failed.
+            ray.wait(pending, num_returns=len(pending))
+            ray.get(pending)
+
+
 def _create_scheduler_actor(
     pg: PlacementGroup,
     bundle_idx: int,
@@ -317,6 +361,12 @@ class RayEngine(Engine):
             indices_str = envs.SGLANG_RAY_BUNDLE_INDICES.get()
             rank0_bundle_idx = int(indices_str.split(",")[0]) if indices_str else 0
             rank0_node_ip = _get_bundle_node_ip(pg, rank0_bundle_idx)
+
+        maybe_prewarm_local_hf_modules(
+            prewarm_scheduler_nodes=partial(
+                _prewarm_scheduler_nodes, pg, bundle_for_node, world_size
+            )
+        )
 
         if get_parallel().num_dp_ranks == 1:
             dist_init_addr = f"{rank0_node_ip}:{port_args.nccl_port}"
