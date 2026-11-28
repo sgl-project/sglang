@@ -1,13 +1,12 @@
-"""Correctness test for the K3 MNNVL fused all-reduce (ar_fusion) kernels.
+"""Correctness test for the K3 MNNVL fused all-reduce kernels.
 
-Compares the 1shot multicast-push and the in-place low-SM NVLS 2shot pull
-(with and without the fused residual) against
-NCCL, bit-exact on small-int bf16 inputs; the fused-RMSNorm pull against a
-torch reference; the pull tuning knobs (num_blocks, unroll) on sizes whose
-shard split is uneven; plus a CUDA-graph capture/replay pass and a mixed
-stress loop exercising the push phase double-buffering and the pull
-semaphore window cycling. On SM100, it also checks FlashInfer's MNNVL
-deferred-MoE finalize against EP-local ``-1`` route indices.
+Compares K3's plain all-reduce, ``nvlink_comm``'s 1-shot push and in-place NVLS
+2-shot pull (with and without the fused residual), against NCCL, bit-exact on small-int bf16 inputs; the fused-RMSNorm push and pull
+(``fused_all_reduce.push`` / ``fused_all_reduce.pull`` at K3's latent width)
+against a torch reference; the pull tuning knobs on sizes whose shard split is
+uneven; plus a stress loop exercising the push phase double-buffering. On
+SM100, it also checks FlashInfer's MNNVL deferred-MoE finalize against
+EP-local ``-1`` route indices.
 
 Usage::
 
@@ -26,7 +25,7 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once, get_ci_test_range
-from sglang.kernels.ops.communication import all_reduce_residual as all_reduce
+from sglang.kernels.ops.communication import fused_all_reduce, kimi_k3_comm, nvlink_comm
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
@@ -47,6 +46,7 @@ register_cuda_ci(
 H = 7168  # Kimi-K3 hidden size; the kernels are tuned/used at multiples of it
 NORM_DIM = 3584  # latent width; the norm buffer is [N, NORM_DIM] + [N, 2*NORM_DIM]
 MB = 1024 * 1024
+PUSH_CLUSTER_SIZE = 7  # one row per 7 CTAs of 64 threads, as K3 dispatches it
 
 PUSH_BS = [1, 2, 8, 32, 128]
 PULL_BS = [1, 8, 64, 1024, 4096]
@@ -54,9 +54,36 @@ PUSH_BS = get_ci_test_range(PUSH_BS, [1, 32, 128])
 PULL_BS = get_ci_test_range(PULL_BS, [1, 64, 4096])
 
 
+def _rows(t):
+    """nvlink_comm's [tokens, hidden] view: K3 rows where they divide, else 16-byte rows."""
+    if t is None:
+        return None
+    return t.view(-1, 3584) if t.numel() % 3584 == 0 else t.view(-1, 8)
+
+
+def _push_res(comm, x, residual):
+    """In place: ``x = allreduce(x) [+ residual]``, 1-shot push (K3's small-message path)."""
+    nvlink_comm.all_reduce_push(comm.obj, _rows(x), _rows(x), _rows(residual))
+
+
+def _pull_res(comm, x, residual, mc, *, num_blocks=0, unroll=4):
+    """In place on symmetric ``x`` (multicast VA ``mc``): NVLS 2-shot fused_all_reduce.pull."""
+    nvlink_comm.all_reduce_pull(
+        comm.obj,
+        _rows(x),
+        _rows(x),
+        _rows(residual),
+        in_mc_ptr=mc,
+        out_mc_ptr=mc,
+        num_unroll=unroll,
+        num_blocks_hint=num_blocks,
+    )
+
+
 def _precompile(num_gpus):
     for ws in num_gpus:
-        all_reduce._jit_module(ws)
+        nvlink_comm._jit_push_module(torch.bfloat16, ws)
+    nvlink_comm._jit_pull_module(torch.bfloat16, 4)
 
 
 @cache_once
@@ -110,7 +137,7 @@ def _init_comm() -> CustomAllReduceV2:
     )
     if comm.disabled or not comm.has_multicast:
         raise RuntimeError("ar_fusion requires CustomAllReduceV2 with multicast")
-    all_reduce.register_comm(lambda: comm.obj, world_size=comm.world_size)
+    kimi_k3_comm.register_comm(lambda: comm.obj, world_size=comm.world_size)
     register_comm_cleanup(comm)
     return comm
 
@@ -166,12 +193,11 @@ def _assert_norm_close(x: torch.Tensor, ref: torch.Tensor, num_norm_rows: int):
 @torch.inference_mode()
 def test_ar_fusion_push(bs: int, use_residual: bool):
     comm = _init_comm()
-    world = comm.world_size
     n = bs * H
     x = _int_input(n, bs, per_rank=True)
     residual = _int_input(n, bs + 7, per_rank=False) if use_residual else None
     ref = _nccl_ref(x, residual)
-    all_reduce.all_reduce_push_res(world, x, residual)
+    _push_res(comm, x, residual)
     torch.cuda.synchronize()
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
@@ -181,14 +207,13 @@ def test_ar_fusion_push(bs: int, use_residual: bool):
 @torch.inference_mode()
 def test_ar_fusion_pull_2shot(bs: int, use_residual: bool):
     comm = _init_comm()
-    world = comm.world_size
     buf, mc = _init_pool_buf()
     n = bs * H
     x = buf[:n]
     x.copy_(_int_input(n, bs + 13, per_rank=True))
     residual = _int_input(n, bs + 17, per_rank=False) if use_residual else None
     ref = _nccl_ref(x, residual)
-    all_reduce.all_reduce_pull_res(world, x, residual, input_mc_ptr=mc)
+    _pull_res(comm, x, residual, mc)
     torch.cuda.synchronize()
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
@@ -200,16 +225,13 @@ def test_ar_fusion_pull_tuning_grid(num_blocks: int, unroll: int):
     """Every (num_blocks, unroll) combination must agree with NCCL on a size
     whose 16B-vector count is not divisible by the world size (uneven shards)
     and whose per-thread range leaves an unrolled-loop tail."""
-    _init_comm()
-    world = dist.get_world_size()
+    comm = _init_comm()
     buf, mc = _init_pool_buf()
     n = (3 * H + 7) * 8  # 21511 vecs: % 8 ranks != 0, small vs blocks*512*unroll
     x = buf[:n]
     x.copy_(_int_input(n, num_blocks * 10 + unroll, per_rank=True))
     ref = _nccl_ref(x, None)
-    all_reduce.all_reduce_pull_res(
-        world, x, None, input_mc_ptr=mc, num_blocks=num_blocks, unroll=unroll
-    )
+    _pull_res(comm, x, None, mc, num_blocks=num_blocks, unroll=unroll)
     torch.cuda.synchronize()
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
@@ -218,16 +240,22 @@ def test_ar_fusion_pull_tuning_grid(num_blocks: int, unroll: int):
 @pytest.mark.parametrize("rows_per_token", [3, 1])  # [N|2N] MoE buf / latent-only
 @torch.inference_mode()
 def test_ar_fusion_pull_norm(num_tokens: int, rows_per_token: int):
-    _init_comm()
-    world = dist.get_world_size()
+    comm = _init_comm()
     buf, mc = _init_pool_buf()
     n = num_tokens * rows_per_token * NORM_DIM
     x = buf[:n]
     x.copy_(_int_input(n, num_tokens + 23 + rows_per_token, per_rank=True))
     weight = _int_input(NORM_DIM, 29, per_rank=False) + 1  # small positive ints
     ref = _norm_ref(_nccl_ref(x, None), num_tokens, weight, eps=1e-6)
-    all_reduce.all_reduce_pull_norm(
-        world, x, weight, 1e-6, num_norm_rows=num_tokens, input_mc_ptr=mc
+    fused_all_reduce.pull.all_reduce_norm_prefix(
+        comm.obj,
+        x,
+        mc,
+        weight,
+        1e-6,
+        num_norm_rows=num_tokens,
+        num_blocks=8,
+        rows_per_group=2,
     )
     torch.cuda.synchronize()
     _assert_norm_close(x, ref, num_tokens)
@@ -241,12 +269,18 @@ def test_ar_fusion_push_norm(num_tokens: int, rows_per_token: int):
     an explicit num_norm_rows, on both the MoE-buffer and latent-only row
     layouts."""
     comm = _init_comm()
-    world = comm.world_size
     n = num_tokens * rows_per_token * NORM_DIM
     x = _int_input(n, num_tokens + 41 + rows_per_token, per_rank=True)
     weight = _int_input(NORM_DIM, 43, per_rank=False) + 1
     ref = _norm_ref(_nccl_ref(x, None), num_tokens, weight, eps=1e-6)
-    all_reduce.all_reduce_push_norm(world, x, weight, 1e-6, num_norm_rows=num_tokens)
+    fused_all_reduce.push.all_reduce_norm_prefix(
+        comm.obj,
+        x,
+        weight,
+        1e-6,
+        num_norm_rows=num_tokens,
+        cluster_size=PUSH_CLUSTER_SIZE,
+    )
     torch.cuda.synchronize()
     _assert_norm_close(x, ref, num_tokens)
 
@@ -395,15 +429,14 @@ def test_flashinfer_ep_finalize_skips_nonlocal_routes(m: int):
 @torch.inference_mode()
 def test_ar_fusion_finalize_push_norm(bs: int, w_dtype: torch.dtype):
     comm = _init_comm()
-    world = comm.world_size
     eps = 1e-6
     gemm2, idx, weights = _build_permuted_layout(bs, seed=bs + 23, w_dtype=w_dtype)
     g = torch.Generator(device="cpu").manual_seed(77)
     norm_w = (torch.rand(NORM_DIM, generator=g) + 0.5).to(torch.bfloat16).to(_device())
     ref = _finalize_norm_ref(gemm2, idx, weights, norm_w, eps)
     out = torch.empty(bs, NORM_DIM, dtype=torch.bfloat16, device=_device())
-    all_reduce.finalize_all_reduce_push_norm(
-        world, out, gemm2, idx, weights, norm_w, eps
+    fused_all_reduce.push.moe_finalize_all_reduce_norm(
+        comm.obj, out, gemm2, idx, weights, norm_w, eps, cluster_size=PUSH_CLUSTER_SIZE
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
@@ -414,7 +447,6 @@ def test_ar_fusion_finalize_push_norm_stress():
     """Back-to-back fused calls interleaved with plain pushes exercise the
     shared push-workspace phase double-buffering across kernel variants."""
     comm = _init_comm()
-    world = comm.world_size
     eps = 1e-5
     g = torch.Generator(device="cpu").manual_seed(78)
     norm_w = (torch.rand(NORM_DIM, generator=g) + 0.5).to(torch.bfloat16).to(_device())
@@ -428,13 +460,20 @@ def test_ar_fusion_finalize_push_norm_stress():
         )
         ref = _finalize_norm_ref(gemm2, idx, weights, norm_w, eps)
         out = torch.empty(bs, NORM_DIM, dtype=torch.bfloat16, device=_device())
-        all_reduce.finalize_all_reduce_push_norm(
-            world, out, gemm2, idx, weights, norm_w, eps
+        fused_all_reduce.push.moe_finalize_all_reduce_norm(
+            comm.obj,
+            out,
+            gemm2,
+            idx,
+            weights,
+            norm_w,
+            eps,
+            cluster_size=PUSH_CLUSTER_SIZE,
         )
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         x = _int_input(bs * H, 8000 + it, per_rank=True)
         ref2 = _nccl_ref(x, None)
-        all_reduce.all_reduce_push_res(world, x, None)
+        _push_res(comm, x, None)
         torch.testing.assert_close(x, ref2, atol=0, rtol=0)
 
 
@@ -445,7 +484,6 @@ def test_ar_fusion_finalize_push_norm_extended(num_tokens: int, w_dtype: torch.d
     """Deferred MoE finalize + 1shot push AR + RMSNorm across the full 2 MB V2
     push slot window (M = 74..292)."""
     comm = _init_comm()
-    world = comm.world_size
     eps = 1e-6
     g = torch.Generator(device="cpu").manual_seed(777 + num_tokens)
     norm_w = (torch.rand(NORM_DIM, generator=g) + 0.5).to(torch.bfloat16).to(_device())
@@ -454,38 +492,38 @@ def test_ar_fusion_finalize_push_norm_extended(num_tokens: int, w_dtype: torch.d
     )
     ref = _finalize_norm_ref(gemm2, idx, weights, norm_w, eps)
     out = torch.empty(num_tokens, NORM_DIM, dtype=torch.bfloat16, device=_device())
-    all_reduce.finalize_all_reduce_push_norm(
-        world, out, gemm2, idx, weights, norm_w, eps
+    fused_all_reduce.push.moe_finalize_all_reduce_norm(
+        comm.obj, out, gemm2, idx, weights, norm_w, eps, cluster_size=PUSH_CLUSTER_SIZE
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("num_blocks", [1, 4, 16])
-@pytest.mark.parametrize("unroll", [4, 8])
+@pytest.mark.parametrize("rows_per_group", [1, 2, 8])
 @torch.inference_mode()
-def test_ar_fusion_pull_norm_tuning_grid(num_blocks: int, unroll: int):
-    """Every (num_blocks, unroll) combination must agree on a token count
-    whose row count is not divisible by the world size (uneven row shards)
-    and not by unroll (partial last row group per block)."""
-    _init_comm()
-    world = dist.get_world_size()
+def test_ar_fusion_pull_norm_tuning_grid(num_blocks: int, rows_per_group: int):
+    """Every (num_blocks, rows_per_group) combination must agree on a token
+    count whose row count is not divisible by the world size (uneven row
+    shards) and not by rows_per_group (tail rows after the full groups)."""
+    comm = _init_comm()
     buf, mc = _init_pool_buf()
-    num_tokens = 13  # 39 rows: % 8 ranks != 0, per-rank rows < num_blocks*unroll
+    # 39 rows: not a multiple of 8 ranks, fewer per rank than num_blocks * rows_per_group
+    num_tokens = 13
     n = num_tokens * 3 * NORM_DIM
     x = buf[:n]
-    x.copy_(_int_input(n, 500 + num_blocks * 10 + unroll, per_rank=True))
+    x.copy_(_int_input(n, 500 + num_blocks * 10 + rows_per_group, per_rank=True))
     weight = _int_input(NORM_DIM, 31, per_rank=False) + 1
     ref = _norm_ref(_nccl_ref(x, None), num_tokens, weight, eps=1e-6)
-    all_reduce.all_reduce_pull_norm(
-        world,
+    fused_all_reduce.pull.all_reduce_norm_prefix(
+        comm.obj,
         x,
+        mc,
         weight,
         1e-6,
         num_norm_rows=num_tokens,
-        input_mc_ptr=mc,
         num_blocks=num_blocks,
-        unroll=unroll,
+        rows_per_group=rows_per_group,
     )
     torch.cuda.synchronize()
     _assert_norm_close(x, ref, num_tokens)
@@ -496,28 +534,24 @@ def test_ar_fusion_stress_mixed():
     """Back-to-back mixed calls exercise the push phase double-buffering and
     the pull semaphore window cycling (with varying grids)."""
     comm = _init_comm()
-    world = comm.world_size
     buf, mc = _init_pool_buf()
     for it in range(32):
         n = (1, 8, 64)[it % 3] * H
         num_blocks = (1, 2, 4, 8)[it % 4]
         x = _int_input(n, 3000 + it, per_rank=True)
         ref = _nccl_ref(x, None)
-        all_reduce.all_reduce_push_res(world, x, None)
+        _push_res(comm, x, None)
         torch.testing.assert_close(x, ref, atol=0, rtol=0)
         y = buf[:n]
         y.copy_(_int_input(n, 4000 + it, per_rank=True))
         ref2 = _nccl_ref(y, None)
-        all_reduce.all_reduce_pull_res(
-            world, y, None, input_mc_ptr=mc, num_blocks=num_blocks
-        )
+        _pull_res(comm, y, None, mc, num_blocks=num_blocks)
         torch.testing.assert_close(y, ref2, atol=0, rtol=0)
 
 
 @torch.inference_mode()
 def test_ar_fusion_graph_capture():
     comm = _init_comm()
-    world = comm.world_size
     buf, mc = _init_pool_buf()
     cpu_group = _init_world()
     n = 64 * H
@@ -528,9 +562,9 @@ def test_ar_fusion_graph_capture():
     gz, mc_z = buf[n : 2 * n], mc + n * buf.element_size()
 
     def _run_all():
-        all_reduce.all_reduce_push_res(world, gx, gres)
-        all_reduce.all_reduce_pull_res(world, gy, gres, input_mc_ptr=mc_y)
-        all_reduce.all_reduce_pull_res(world, gz, gres, input_mc_ptr=mc_z)
+        _push_res(comm, gx, gres)
+        _pull_res(comm, gy, gres, mc_y)
+        _pull_res(comm, gz, gres, mc_z)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())

@@ -47,7 +47,13 @@ _BUILDS_STAGES = (
 # norm and completes the shared experts' sum beside it.
 _COMPLETES_OWN_SUM = {
     "kimi_k3.py": frozenset(
-        {"_reduce_latent", "_reduce_shared", "_reduce_latent_and_shared"}
+        {
+            "_reduce_latent",
+            "_reduce_shared",
+            "_reduce_latent_and_shared",
+            # The fused MoE forward completes its sum inside the K3 fused all-reduce kernels.
+            "_forward_fused",
+        }
     ),
 }
 

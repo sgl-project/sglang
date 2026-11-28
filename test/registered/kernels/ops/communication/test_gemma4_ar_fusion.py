@@ -21,8 +21,11 @@ from torch._C._distributed_c10d import _SymmetricMemory
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
-from sglang.kernels.ops.communication import gemma4_ar_fusion
+from sglang.kernels.ops.communication import fused_all_reduce
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
+from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
+    get_all_reduce_config,
+)
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -46,7 +49,7 @@ pytestmark = pytest.mark.skipif(
 
 HIDDENS = [5376, 4096]  # Gemma-4 31B, and one more block width
 EPS = 1e-6
-GROUP = gemma4_ar_fusion.GROUP
+GROUP = fusion_glue.GROUP
 MAX_ROWS = 1024
 # fewer rows than ranks, trailing ranks owning none (5 at TP4, 9 at TP8), ragged
 # shards, and a full barrier-plane grid
@@ -92,7 +95,6 @@ def _init():
         max_push_blocks=0,
     )
     assert not comm.disabled and comm.has_multicast, "needs NVLink multicast"
-    gemma4_ar_fusion.register_comm(lambda: comm.obj, world_size=comm.world_size)
     register_comm_cleanup(comm)
     global _stock_comm  # the stock all-reduce the decode-graph test interleaves
     _stock_comm = comm
@@ -128,16 +130,60 @@ def _rmsnorm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + EPS) * w.float()
 
 
-def _reference(partials, residual, w_a, w_b, scalar, round_a):
-    """The unfused path in fp32 with its bf16 rounding points (see Params.round_a)."""
+def _reference(partials, residual, w_a, w_b, scalar):
+    """Hugging Face's layer in fp32 with its bf16 rounding points; no scalar on
+    the attention site."""
     x = torch.stack([p.float() for p in partials]).sum(0)
-    a = _rmsnorm(x, w_a)
-    if round_a:
-        a = a.bfloat16().float()
-    r = (a + residual.float()) * scalar.float()
-    stream = r if round_a else r.bfloat16().float()
-    y = _rmsnorm(stream, w_b).bfloat16().float()
-    return r.bfloat16(), y
+    a = _rmsnorm(x, w_a).bfloat16()
+    r = (a.float() + residual.float()).bfloat16()
+    if scalar is not None:
+        r = (r.float() * scalar.bfloat16().float()).bfloat16()
+    y = _rmsnorm(r.float(), w_b).bfloat16().float()
+    return r, y
+
+
+def _site(bufs, num_tokens, scales, residual, w_a, w_b, scalar, row0, rows):
+    """One fused site over ``bufs`` (partial, out, scales), at the model's grid;
+    ``scales`` is the scale view at the scale buffer's base."""
+    partial, out, scales_buf = bufs
+    fused_all_reduce.pull.all_reduce_norm_residual_norm_quant(
+        _stock_comm.obj,
+        partial.tensor[:num_tokens],
+        partial.mc,
+        residual,
+        w_a,
+        w_b,
+        scalar,
+        EPS,
+        out.tensor[:num_tokens],
+        out.mc,
+        scales,
+        scales_buf.mc,
+        row0=row0,
+        rows=rows,
+        num_blocks=get_all_reduce_config(_stock_comm.world_size).num_pull_blocks,
+        rows_per_group=1,
+    )
+
+
+def _final(partial, num_tokens, residual, w_a, scalar, row0, rows):
+    """The last layer's site, in place on the partial buffer."""
+    staged = partial.tensor[:num_tokens]
+    fused_all_reduce.pull.all_reduce_norm_residual(
+        _stock_comm.obj,
+        staged,
+        partial.mc,
+        residual,
+        w_a,
+        scalar,
+        EPS,
+        staged,
+        partial.mc,
+        row0=row0,
+        rows=rows,
+        num_blocks=get_all_reduce_config(_stock_comm.world_size).num_pull_blocks,
+        rows_per_group=1,
+    )
 
 
 def _inputs(rows: int, hidden: int, seed: int):
@@ -159,12 +205,13 @@ def _scales_view(scales_buf, rows: int, layout: str) -> torch.Tensor:
 
 @pytest.mark.parametrize("hidden", HIDDENS)
 @pytest.mark.parametrize("rows", ROWS)
-@pytest.mark.parametrize("round_a", [True, False])
+@pytest.mark.parametrize("use_scalar", [False, True])  # attention / MLP site
 @pytest.mark.parametrize("layout", ["row", "col"])
-def test_site(hidden: int, rows: int, round_a: bool, layout: str):
+def test_site(hidden: int, rows: int, use_scalar: bool, layout: str):
     coord = _init()
     partial_buf, out_buf, scales_buf = _buffers(hidden)
     residual_all, w_a, w_b, scalar = _inputs(rows, hidden, 0)
+    scalar = scalar if use_scalar else None
     partial = torch.randn(rows, hidden, device="cuda").bfloat16() * (coord.rank + 1) / 4
     row0, mine = _rows(rows, coord.rank, coord.world_size)
     residual = residual_all[row0 : row0 + mine].clone()
@@ -173,29 +220,11 @@ def test_site(hidden: int, rows: int, round_a: bool, layout: str):
     if layout == "col":  # DeepGEMM's layout, at the base the multicast VA maps
         assert scales_view.stride() == (1, (rows + 3) // 4 * 4)
         assert scales_view.data_ptr() == scales_buf.tensor.data_ptr()
-    gemma4_ar_fusion.site(
-        partial_buf.tensor[:rows],
-        partial_buf.mc,
-        out_buf.tensor[:rows],
-        out_buf.mc,
-        scales_view,
-        scales_buf.mc,
-        residual,
-        w_a,
-        w_b,
-        scalar,
-        EPS,
-        row0,
-        mine,
-        round_a,
-        world_size=coord.world_size,
-    )
+    _site(_buffers(hidden), rows, scales_view, residual, w_a, w_b, scalar, row0, mine)
     torch.cuda.synchronize()
     out, scales = out_buf.tensor[:rows].clone(), scales_view.contiguous()
 
-    ref_res, ref_y = _reference(
-        _gather(partial), residual_all, w_a, w_b, scalar, round_a
-    )
+    ref_res, ref_y = _reference(_gather(partial), residual_all, w_a, w_b, scalar)
     # gather before any assert: a rank that fails alone would hang its peers
     all_out, all_scales = _gather(out), _gather(scales)
     # this rank's residual rows, then every rank's view of the quantized rows
@@ -225,22 +254,10 @@ def test_final(hidden: int, rows: int):
     residual = residual_all[row0 : row0 + mine].clone()
     staged = partial_buf.tensor[:rows]
     staged.copy_(partial)
-    gemma4_ar_fusion.final(
-        staged,
-        partial_buf.mc,
-        staged,
-        partial_buf.mc,
-        residual,
-        w_a,
-        scalar,
-        EPS,
-        row0,
-        mine,
-        world_size=coord.world_size,
-    )
+    _final(partial_buf, rows, residual, w_a, scalar, row0, mine)
     torch.cuda.synchronize()
     out = staged.clone()
-    ref_res, _ = _reference(_gather(partial), residual_all, w_a, w_a, scalar, False)
+    ref_res, _ = _reference(_gather(partial), residual_all, w_a, w_a, scalar)
     all_out = _gather(out)
     torch.testing.assert_close(out.float(), ref_res.float(), rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(residual, out[row0 : row0 + mine])
@@ -282,26 +299,20 @@ def test_site_reads_a_gemm_written_partial(rows: int):
         written = deepgemm_w8a8_block_fp8_linear_with_fallback(**gemm, output=staged)
     wrote_in_place = written.data_ptr() == staged.data_ptr()
     same_as_gemm = torch.equal(staged, partial)
-    gemma4_ar_fusion.site(
-        staged,
-        partial_buf.mc,
-        out_buf.tensor[:rows],
-        out_buf.mc,
+    _site(
+        _buffers(hidden),
+        rows,
         scales_buf.tensor[:rows],
-        scales_buf.mc,
         residual,
         w_a,
         w_b,
-        scalar,
-        EPS,
+        None,
         row0,
         mine,
-        True,
-        world_size=coord.world_size,
     )
     torch.cuda.synchronize()
     out, scales = out_buf.tensor[:rows].clone(), scales_buf.tensor[:rows].clone()
-    ref_res, ref_y = _reference(_gather(partial), residual_all, w_a, w_b, scalar, True)
+    ref_res, ref_y = _reference(_gather(partial), residual_all, w_a, w_b, None)
     # gather before any assert: a rank that fails alone would hang its peers
     all_out = _gather(out)
     assert wrote_in_place and same_as_gemm
@@ -358,28 +369,20 @@ def test_decode_graphs_replay_with_stock_all_reduce():
         row0, mine = _rows(bs, rank, world_size)
         st["side"] = comm.custom_all_reduce(st["small"])
         outs = []
-        for i, (round_a, w_a, w_b, s) in enumerate(
-            ((True, w[0], w[1], torch.ones_like(scalar)), (False, w[2], w[3], scalar))
-        ):
+        for i, (w_a, w_b, s) in enumerate(((w[0], w[1], None), (w[2], w[3], scalar))):
             if i == 1 and rank == (bs + 1) % world_size:
                 torch.cuda._sleep(delay)  # a peer arrives one barrier late
             partial_buf.tensor[:bs].copy_(st["p"][i])  # o_proj / down_proj output
-            gemma4_ar_fusion.site(
-                partial_buf.tensor[:bs],
-                partial_buf.mc,
-                out_buf.tensor[:bs],
-                out_buf.mc,
+            _site(
+                _buffers(hidden),
+                bs,
                 _scales_view(scales_buf, bs, "col"),  # the model's layout
-                scales_buf.mc,
                 st["res"],
                 w_a,
                 w_b,
                 s,
-                EPS,
                 row0,
                 mine,
-                round_a,
-                world_size=world_size,
             )
             # the next GEMM consumes them before the next site overwrites the buffers
             outs.append(
@@ -389,19 +392,7 @@ def test_decode_graphs_replay_with_stock_all_reduce():
                 )
             )
         partial_buf.tensor[:bs].copy_(st["p"][2])
-        gemma4_ar_fusion.final(
-            partial_buf.tensor[:bs],
-            partial_buf.mc,
-            partial_buf.tensor[:bs],
-            partial_buf.mc,
-            st["res"],
-            w[4],
-            scalar,
-            EPS,
-            row0,
-            mine,
-            world_size=world_size,
-        )
+        _final(partial_buf, bs, st["res"], w[4], scalar, row0, mine)
         st["outs"], st["final"] = outs, partial_buf.tensor[:bs].clone()
 
     def static(bs):
@@ -455,11 +446,9 @@ def test_decode_graphs_replay_with_stock_all_reduce():
         p = [_gather(x) for x in [small] + partials]  # every rank's inputs
         side_ref = torch.stack([t.float() for t in p[0]]).sum(0)
         # the layer in fp32: attention site, MLP site, final site
-        res, a = _reference(
-            p[1], residual_all, w[0], w[1], torch.ones_like(scalar), True
-        )
-        res, y = _reference(p[2], res, w[2], w[3], scalar, False)
-        final, _ = _reference(p[3], res, w[4], w[4], scalar, False)
+        res, a = _reference(p[1], residual_all, w[0], w[1], None)
+        res, y = _reference(p[2], res, w[2], w[3], scalar)
+        final, _ = _reference(p[3], res, w[4], w[4], scalar)
         fused = [o.clone() for pair in st["outs"] for o in pair] + [st["final"].clone()]
         # gather before any assert: a rank that fails alone would hang its peers
         gathered = [_gather(t) for t in fused]
