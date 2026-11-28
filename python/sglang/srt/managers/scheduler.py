@@ -6809,10 +6809,11 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req
-                reason = recv_req.finished_reason
                 if recv_req.rid != chunked_req.rid:
-                    # Matched by prefix only: the reason belongs to another request.
-                    reason = None
+                    # Matched by prefix only: the reason belongs to another
+                    # request, so keep whatever this one already recorded.
+                    return
+                reason = recv_req.finished_reason
                 self._pending_chunked_abort_reason = reason and FINISH_ABORT(
                     message=reason.get("message"),
                     status_code=reason.get("status_code"),

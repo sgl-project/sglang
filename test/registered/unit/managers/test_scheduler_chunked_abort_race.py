@@ -180,6 +180,30 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         (abort_req, _), _ = sched.ipc_channels.send_to_tokenizer.send_output.call_args
         self.assertIsNone(abort_req.finished_reason)
 
+    def test_prefix_match_keeps_the_chunked_reqs_own_timeout(self):
+        """`job_10` and `job_1` time out together: `job_10` keeps its own 503
+        whichever abort is handled first."""
+        for order in (("job_10", "job_1"), ("job_1", "job_10")):
+            with self.subTest(order=order):
+                req = _FakeReq("job_10")
+                sched = _make_scheduler(None, chunked_req=req, running_reqs=[])
+
+                for rid in order:
+                    sched.abort_request(_timeout_abort(rid))
+                with (
+                    patch.object(sched.request_retirer, "_detach"),
+                    patch.object(retirer_mod, "release_kv_cache"),
+                ):
+                    sched.process_pending_chunked_abort()
+
+                self.assertEqual(req.finished_reason.status_code, 503)
+                (abort_req, _), _ = (
+                    sched.ipc_channels.send_to_tokenizer.send_output.call_args
+                )
+                self.assertEqual(
+                    abort_req.finished_reason, req.finished_reason.to_json()
+                )
+
     def test_client_abort_of_chunked_req_sends_no_reason(self):
         """A client abort has no reason; the tokenizer writes its own message."""
         req = _FakeReq("client_gone")
