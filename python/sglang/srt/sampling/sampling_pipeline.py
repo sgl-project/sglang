@@ -327,12 +327,10 @@ class VerifyStep(msgspec.Struct):
         """Build the stages' per-row inputs from `tree`, the verify tree's host
         copy, which the worker builds when `needs_verify_tree`: the grammar mask,
         the custom logit processors' row prefixes, and `first_row_only_reqs`.
-        Each verify worker calls it once after the target verify launches, so
-        the host work overlaps the forward. `logits_output` gives the grammar
-        mask its device. Under overlap the previous step's result is still
-        queued; `barrier` advances the grammar FSM over its tokens and returns
-        them per request, as result processing will append them to
-        req.output_ids."""
+        Call it after the target verify launches, so the host work overlaps the
+        forward. Under overlap the previous step's result is still queued;
+        `barrier` advances the grammar FSM over its tokens and returns them per
+        request, as result processing will append them to req.output_ids."""
         if tree is None:
             return
         # Lazy: spec_utils imports the scheduler stack.
