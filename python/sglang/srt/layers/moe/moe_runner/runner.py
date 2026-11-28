@@ -128,6 +128,17 @@ class MoeRunner:
             self.runner_core = None  # FlashInfer CuteDSL only supports fused path
         elif runner_backend.is_flashinfer_cutlass():
             self.runner_core = None  # FlashInfer CUTLASS only supports fused path
+        elif runner_backend.is_flashinfer_cutile():
+            if lora_enabled:
+                raise NotImplementedError(
+                    "FlashInfer cuTile MoE does not support LoRA because it requires a fused path."
+                )
+            self.runner_core = None  # FlashInfer cuTile only supports fused path
+            # Import here (not at module top, to avoid a circular import) to
+            # register the flashinfer_cutile fused func before the pool lookup.
+            from sglang.srt.layers.moe.moe_runner import (  # noqa: F401
+                flashinfer_cutile,
+            )
         elif runner_backend.is_flashinfer_mxfp4():
             self.runner_core = None  # FlashInfer MXFP4 only supports fused path
             # Import flashinfer_cutlass here (not at module top, to avoid a circular
