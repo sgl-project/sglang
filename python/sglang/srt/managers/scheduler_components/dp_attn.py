@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -425,6 +426,24 @@ def _local_decode_cuda_graph_vote(
     )
 
 
+def _decode_conversion_view(batch: ScheduleBatch) -> Optional[SimpleNamespace]:
+    """The fields a backend's prefill-graph vote reads, as
+    `convert_decode_to_extend` will set them: every request is a 1-token extend
+    whose prefix is `seq_len - 1`. None when the sequence lengths are not known
+    on the host."""
+    seq_lens_cpu = batch.seq_lens_cpu
+    if seq_lens_cpu is None:
+        return None
+    bs = batch.batch_size()
+    return SimpleNamespace(
+        reqs=batch.reqs,
+        extend_lens=[1] * bs,
+        prefix_lens=[seq_len - 1 for seq_len in seq_lens_cpu[:bs].tolist()],
+        extend_logprob_start_lens=[0] * bs,
+        return_logprob=False,
+    )
+
+
 def _local_prefill_cuda_graph_vote(
     *,
     local_batch: Optional[ScheduleBatch],
@@ -491,12 +510,17 @@ def _local_prefill_cuda_graph_vote(
     if not isinstance(prefill_graph_runner, PrefillCudaGraphRunner):
         return False
     backend_vote = prefill_graph_runner._backend_vote_prefill_cuda_graph
-    if (
-        mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
-        and backend_vote is not None
-        and not backend_vote(local_batch)
-    ):
-        return False
+    if backend_vote is not None:
+        # A decode batch is judged as the 1-token extend it will be converted to,
+        # so this rank cannot fall back to eager after the sync while a peer
+        # replays the graph.
+        backend_batch = (
+            local_batch
+            if mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            else _decode_conversion_view(local_batch)
+        )
+        if backend_batch is None or not backend_vote(backend_batch):
+            return False
     return prefill_graph_runner.can_replay_locally(
         batch_size=local_batch.batch_size(),
         num_tokens=num_tokens,

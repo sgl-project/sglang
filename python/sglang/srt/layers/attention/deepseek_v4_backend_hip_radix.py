@@ -135,6 +135,10 @@ logger = logging.getLogger(__name__)
 _DSPARK_DRAFT_RAW_METADATA = envs.SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA.get()
 
 SWA_WINDOW = 128
+# HIP prefill graphs do not capture DecoderReplayTail.run_in_prefill_graph.
+# With decoder SWA bounded replay, the late layers then run on every extend row.
+# Above this many rows the graph is slower than an eager prefill that keeps the tail.
+_HIP_PREFILL_GRAPH_MAX_EXTEND_TOKENS = 2048
 DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
@@ -896,9 +900,38 @@ class DeepseekV4HipRadixBackend(
     write_tail_source_kv = DeepseekV4AttnBackend.write_tail_source_kv
     # No two-level candidates on HIP: the ratio-1/2 sources stay one eager break.
     low_ratio_prefill_graph = False
+
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
-    can_run_prefill_cuda_graph = DeepseekV4AttnBackend.can_run_prefill_cuda_graph
+    def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        # The runner already rejects a sequence past the prefill graph limit.
+        # The HIP graph has no SWA tail, so a long batch stays eager.
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
+            return True
+        return self._hip_prefill_graph_rows_fit(
+            forward_batch.extend_seq_lens_cpu, forward_batch.extend_prefix_lens_cpu
+        )
+
+    def _hip_prefill_graph_rows_fit(self, extend_lens, prefix_lens) -> bool:
+        # The graph check and the DP vote both use this rule, so no DP rank
+        # replays the graph while a peer runs the step eagerly.
+        if not self.enable_decoder_swa_bounded_replay:
+            return True
+        if (
+            extend_lens is not None
+            and sum(extend_lens) > _HIP_PREFILL_GRAPH_MAX_EXTEND_TOKENS
+        ):
+            return False
+        # A prefix hit can replay late-layer rows that the eager prefill never wrote.
+        if prefix_lens is not None and any(prefix_lens):
+            return False
+        return True
+
+    def vote_prefill_cuda_graph(self, batch):
+        # HIP had no DP vote before, so ranks could disagree on the graph.
+        return self._hip_prefill_graph_rows_fit(batch.extend_lens, batch.prefix_lens)
+
     _prefill_graph_seq_limit = DeepseekV4AttnBackend._prefill_graph_seq_limit
     _low_ratio_in_prefill_graph = DeepseekV4AttnBackend._low_ratio_in_prefill_graph
     _low_ratio_compress = DeepseekV4AttnBackend._low_ratio_compress
@@ -2209,6 +2242,15 @@ class DeepseekV4HipRadixBackend(
     def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
         if not self.enable_decoder_swa_bounded_replay or self.is_draft_worker:
             return None
+        runner = getattr(self.model_runner, "prefill_cuda_graph_runner", None)
+        if (
+            runner is not None
+            and forward_batch.input_ids is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and runner.can_run_graph(forward_batch)
+        ):
+            # This graph does not build the SWA tail, so the late layers run every row.
+            return int(forward_batch.input_ids.shape[0])
         return late_layer_num_tokens(forward_batch, dspark=self.is_dspark)
 
     def _init_forward_metadata_prefill_from_batch(
@@ -2394,6 +2436,8 @@ class DeepseekV4HipRadixBackend(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
         self._opus_prefill_state = None
+        # The tail's rows are batch-sized, so the captured segments cannot hold them.
+        self.tail_forward_metadata = None
         if not self.low_ratios:
             self.forward_metadata = self._build_forward_metadata(
                 forward_batch,
@@ -2441,6 +2485,7 @@ class DeepseekV4HipRadixBackend(
         static_forward_batch: Optional[ForwardBatch] = None,
     ) -> None:
         self._opus_prefill_state = None
+        self.tail_forward_metadata = None
         if not self.low_ratios:
             replay_batch = (
                 static_forward_batch
