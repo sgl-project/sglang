@@ -163,6 +163,9 @@ def _layout_npu_arch35_e4m3_weights(
         # Older torch_npu builds return [out, in//32]; reshape to 3D.
         w_scale = w_scale.reshape(w_scale.shape[0], w_scale.shape[1] // 2, 2)
     layer.weight_scale_inv.data = w_scale.transpose(0, 1)
+    # Drain per-layer async requant ops so CachingHostAllocator recycles pinned
+    # scalar host buffers instead of accumulating across all layers until OOM.
+    torch.npu.synchronize()
 
 
 def _layout_npu_arch35_ue8m0_weights(

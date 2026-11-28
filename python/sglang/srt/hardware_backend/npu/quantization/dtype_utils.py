@@ -90,22 +90,36 @@ def _decode_fp32_mxfp_scale(scale: torch.Tensor) -> torch.Tensor:
     return e8m0
 
 
+_E4M3FN_FP32_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_e4m3fn_fp32_lut(device: torch.device) -> torch.Tensor:
+    lut = _E4M3FN_FP32_LUT_CACHE.get(device)
+    if lut is None:
+        bits = torch.arange(256, dtype=torch.int32)
+        sign = torch.where(bits >= 0x80, -1.0, 1.0)
+        e = ((bits >> 3) & 0xF).to(torch.float32)
+        m = (bits & 0x7).to(torch.float32)
+        mag = torch.where(
+            e == 0.0,
+            m * (1.0 / 512.0),  # subnormal: m * 2^-9
+            (1.0 + m / 8.0) * torch.pow(2.0, e - 7.0),
+        )
+        # e4m3fn reserves S.1111.111 for NaN (no infinities); max finite is 448.
+        mag = torch.where((e == 15.0) & (m == 7.0), float("nan"), mag)
+        lut = (sign * mag).to(device)
+        _E4M3FN_FP32_LUT_CACHE[device] = lut
+    return lut
+
+
 def _dequant_e4m3fn_to_float32(u8: torch.Tensor) -> torch.Tensor:
-    """Decode float8_e4m3fn payload bytes to FP32 by explicit bit layout.
+    """Decode float8_e4m3fn payload bytes to FP32 via a cached 256-entry LUT.
 
     Direct ``.to(torch.float32)`` on NPU fp8 tensors fails on some CANN builds
-    (aclnnInplaceCopy error 561103), so decode manually. Only used at
-    weight-load time, where the extra elementwise ops are irrelevant.
+    (aclnnInplaceCopy error 561103), and per-chunk scalar bit-ops trigger
+    thousands of pinned host allocations in CachingHostAllocator during 27B
+    load-time requantization. A single 256-entry table lookup is bit-exact,
+    faster, and allocates no scalar host buffers.
     """
-    bits = u8.view(torch.uint8).to(torch.int32)
-    sign = torch.where(bits >= 0x80, -1.0, 1.0)
-    e = ((bits >> 3) & 0xF).to(torch.float32)
-    m = (bits & 0x7).to(torch.float32)
-    mag = torch.where(
-        e == 0.0,
-        m * (1.0 / 512.0),  # subnormal: m * 2^-9
-        (1.0 + m / 8.0) * torch.pow(2.0, e - 7.0),
-    )
-    # e4m3fn reserves S.1111.111 for NaN (no infinities); max finite is 448.
-    mag = torch.where((e == 15.0) & (m == 7.0), float("nan"), mag)
-    return sign * mag
+    lut = _get_e4m3fn_fp32_lut(u8.device)
+    return lut[u8.view(torch.uint8).to(torch.int64)]

@@ -209,7 +209,7 @@ def _draft_step(
     # The fused kernel has no vocab mask, and softcap rounding can tie its argmax.
     if (
         logits_out is None
-        and len(prev_tokens) == 1
+        and MarkovGreedyStep.prefers_over_sample(len(prev_tokens))
         and markov_head.step_vocab_limit is None
         and markov_head.step_softcap is None
     ):

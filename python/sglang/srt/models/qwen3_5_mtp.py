@@ -42,7 +42,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
-    get_spec,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
@@ -72,8 +71,6 @@ def _mtp_quant_config(quant_config):
         and quant_config.is_checkpoint_nvfp4_serialized
     ):
         return None
-    if is_npu() and get_spec().speculative_draft_model_quantization is None:
-        return None
     # Some Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module
     # entirely in bf16, listing every `mtp.*` layer under the quantization
     # exclude list. Skip quantization for those so linear/MoE weight loaders
@@ -94,23 +91,32 @@ def _mtp_quant_config(quant_config):
         if mtp_excludes and any("mlp.experts" in layer for layer in mtp_excludes):
             return None
     # ModelSlim (NPU) ships the MTP module of an otherwise-quantized checkpoint
-    # in bf16: every `mtp.*` entry in quant_model_description.json is "FLOAT".
+    # in bf16 when every `mtp.*` entry in quant_model_description.json is "FLOAT"
+    # (or `mtp.*` entries are omitted while target weights are described).
     # Drop the quant config so the whole draft model -- not just the layers that
     # individually fall back -- takes the unquantized path, including the bf16
     # MoE dispatch overrides in Qwen3_5ForCausalLMMTP.forward().
     if quant_config and quant_config.get_name() == "modelslim":
-        quant_description = getattr(quant_config, "quant_description", {})
-        mtp_schemes = [
-            value
-            for key, value in quant_description.items()
-            if isinstance(key, str) and key.startswith("mtp.")
-        ]
-        if mtp_schemes and all(scheme == "FLOAT" for scheme in mtp_schemes):
-            logger.info_once(
-                "ModelSlim checkpoint stores the MTP module unquantized; "
-                "loading the draft model in bf16."
+        quant_description = getattr(quant_config, "quant_description", None)
+        if isinstance(quant_description, dict):
+            mtp_schemes = [
+                value
+                for key, value in quant_description.items()
+                if isinstance(key, str)
+                and key.startswith(("mtp.", "model.mtp.", "language_model.mtp."))
+            ]
+            has_weight_entries = any(
+                isinstance(key, str) and key.endswith(".weight")
+                for key in quant_description
             )
-            return None
+            if (mtp_schemes and all(scheme == "FLOAT" for scheme in mtp_schemes)) or (
+                not mtp_schemes and has_weight_entries
+            ):
+                logger.info_once(
+                    "ModelSlim checkpoint stores the MTP module unquantized; "
+                    "loading the draft model in bf16."
+                )
+                return None
     return quant_config
 
 

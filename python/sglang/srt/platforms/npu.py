@@ -79,6 +79,9 @@ class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
     def get_default_attention_backend(self) -> str:
         return "ascend"
 
+    def get_default_speculative_draft_attention_backend(self, algorithm: str) -> str:
+        return "ascend"
+
     def get_dispatch_key_name(self) -> str:
         return "npu"
 

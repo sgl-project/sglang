@@ -15,7 +15,8 @@ from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
-from sglang.srt.runtime_context import attention_backends, get_platform, get_spec
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -44,10 +45,15 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
     back to the platform default, with a warning when ``algo_label`` names the
     caller.
     """
-    # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
-    platform_fallback = (
-        "triton" if (get_platform().is_xpu or torch.version.hip) else "flashinfer"
-    )
+    # FlashInfer is CUDA-only; delegate platform default to current_platform.
+    try:
+        platform_fallback = (
+            current_platform.get_default_speculative_draft_attention_backend(
+                algo_label or ""
+            )
+        )
+    except NotImplementedError:
+        platform_fallback = "flashinfer"
     draft_backend = get_spec().speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends()

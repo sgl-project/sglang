@@ -99,3 +99,6 @@ class XpuSRTPlatform(XpuDeviceMixin, SRTPlatform):
         graph_capture=True,
         piecewise_graph=True,
     )
+
+    def get_default_speculative_draft_attention_backend(self, algorithm: str) -> str:
+        return "triton"
