@@ -201,6 +201,7 @@ _PARAM_END = "</parameter>"
 _FUNCTION_END = "</invoke>"
 _MAX_NULL_WORD = max(map(len, NULL_WORDS))
 _NULLABLE_STRING_TYPES = STRING_TYPES | {"null"}
+_PARAM_CHUNK_SIZE = 4096
 
 
 def _json_string_body(text: str) -> str:
@@ -245,6 +246,7 @@ class Ernie5_5Detector(BaseFormatDetector):
         self._args: Dict[str, Any] = {}
         self._param: Optional[str] = None
         self._param_raw = ""
+        self._param_parts: List[str] = []
         self._param_is_string = False
         # Value chars already sent; None until a string value is quoted.
         self._param_sent: Optional[int] = None
@@ -372,11 +374,21 @@ class Ernie5_5Detector(BaseFormatDetector):
         if not ends:
             if self._param_is_string:
                 self._stream_string_value(calls)
+            elif len(raw) >= _PARAM_CHUNK_SIZE:
+                # Non-string values are emitted only when complete. Keep only
+                # the possible split end tag in the search buffer, so a large
+                # object/array is not copied in full on every increment.
+                # Coalesce small increments to bound the list/string overhead.
+                self._param_parts.append(raw[: -self._max_end_prefix])
+                self._param_raw = raw[-self._max_end_prefix :]
             return False
         end, tag = min(ends)
         # Only </parameter> belongs to the value; the others close more.
         self._buf = raw[end + len(tag) :] if tag == _PARAM_END else raw[end:]
-        value = raw[:end].rstrip("\n")
+        if self._param_parts:
+            value = "".join(self._param_parts + [raw[:end]]).rstrip("\n")
+        else:
+            value = raw[:end].rstrip("\n")
         if self._param_sent is None:
             converted = self._parse_parameter(
                 self._invoke_name, self._param, value, tools
@@ -391,6 +403,7 @@ class Ernie5_5Detector(BaseFormatDetector):
             converted = value
             self._emit(calls, _json_string_body(value[self._param_sent :]) + '"')
         self._args[self._param] = converted
+        self._param_parts.clear()
         self._param, self._param_raw = None, ""
         return True
 
