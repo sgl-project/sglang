@@ -204,11 +204,16 @@ def launch_canary_write_kernel(
         )
 
     if use_torch_reference(canary_buf.device):
-        from sglang.kernels.ops.kv_canary.write_ref import (
-            launch_canary_write_kernel_torch_reference,
-        )
+        if canary_buf.device.type == "xpu":
+            from sglang.kernels.ops.kv_canary._tensor_fallback import (
+                launch_canary_write_kernel_tensor_fallback as launch,
+            )
+        else:
+            from sglang.kernels.ops.kv_canary.write_ref import (
+                launch_canary_write_kernel_torch_reference as launch,
+            )
 
-        launch_canary_write_kernel_torch_reference(
+        launch(
             context=context,
             plan=plan,
             input_ids=input_ids,
