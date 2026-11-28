@@ -121,9 +121,8 @@ class PaddingPolicy(Enum):
                     zeros) wrote. Caller is responsible for proving
                     safety.
     FILL_ONCE     — Fill the whole buffer to ``pad_value`` once at alloc;
-                    never reset per iter (e.g. ``encoder_lens`` init to
-                    ``encoder_len_fill_value``, copied head-only with the
-                    tail kept).
+                    never reset per iter (copied head-only with the tail
+                    kept).
     """
 
     KEEP_PAD = "keep_pad"
@@ -621,6 +620,9 @@ def build_decode_registry(
     each replay:
 
       - ``seq_lens`` / ``seq_lens_cpu`` -> FILL_SENTINEL(seq_len_fill_value)
+      - ``encoder_lens`` -> FILL_SENTINEL(encoder_len_fill_value): the replay
+        view's host mirror (``encoder_lens_cpu``) pads with the same value, so
+        host-side attention plans match this buffer without reading it back.
       - ``req_pool_indices`` / ``out_cache_loc`` / ``mamba_track_*`` -> ZERO
       - ``positions`` / ``mrope_positions`` -> ZERO: the flashinfer verify-path
         plan reads the padded tail, so leaving stale out-of-range values there
@@ -719,15 +721,15 @@ def build_decode_registry(
             )
         )
     if is_encoder_decoder:
-        # Initialized once to encoder_len_fill_value, copied head-only, never
-        # reset per iter — matching the legacy DecodeInputBuffers behavior.
+        # Reset the padded tail every replay, not left to an earlier batch, so it
+        # equals the host mirror build_replay_fb_view pads with the same value.
         slots.append(
             GraphSlot(
                 "encoder_lens",
                 _bs,
                 encoder_lens_dtype,
                 axis="bs",
-                padding_policy=PaddingPolicy.FILL_ONCE,
+                padding_policy=PaddingPolicy.FILL_SENTINEL,
                 pad_value=encoder_len_fill_value,
             )
         )

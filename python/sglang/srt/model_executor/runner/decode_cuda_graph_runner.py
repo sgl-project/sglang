@@ -187,6 +187,27 @@ def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -
     return ragged_verify_compact_enabled()
 
 
+def _replay_encoder_lens_cpu(
+    *,
+    forward_batch: ForwardBatch,
+    bs: int,
+    raw_bs: int,
+    encoder_len_fill_value: Optional[int],
+) -> Optional[list[int]]:
+    """Host mirror of the replay buffer's encoder_lens[:bs], or None if unknown;
+    the registry resets its padded tail to encoder_len_fill_value."""
+    if encoder_len_fill_value is None:
+        return None
+    encoder_lens_cpu = forward_batch.encoder_lens_cpu
+    if (
+        encoder_lens_cpu is None
+        or forward_batch.encoder_lens is None
+        or len(encoder_lens_cpu) != raw_bs
+    ):
+        return None
+    return list(encoder_lens_cpu) + [encoder_len_fill_value] * (bs - raw_bs)
+
+
 def build_replay_fb_view(
     forward_batch: ForwardBatch,
     buffers: DecodeInputBuffers,
@@ -197,6 +218,7 @@ def build_replay_fb_view(
     seq_len_fill_value: int,
     capture_forward_mode: ForwardMode,
     is_encoder_decoder: bool,
+    encoder_len_fill_value: Optional[int] = None,
 ) -> SimpleNamespace:
     """Construct a ForwardBatch-like view for backend replay-side init.
 
@@ -210,6 +232,9 @@ def build_replay_fb_view(
     bucket / dispatch decisions); actual_forward_mode is the
     runtime mode (may be IDLE while the captured graph targets DECODE
     — DSV4's replay metadata prep uses this for IDLE substitution).
+
+    With encoder_len_fill_value (what the registry writes into padded rows), the
+    view also carries encoder_lens_cpu, a host mirror of encoder_lens[:bs].
 
     Subsumes the _replay_forward_batch side channel that DSV4 used to
     read out-of-band before the init_forward_metadata 3-method ABC.
@@ -235,6 +260,16 @@ def build_replay_fb_view(
         max_seq_len_host=forward_batch.max_seq_len_host,
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
+        encoder_lens_cpu=(
+            _replay_encoder_lens_cpu(
+                forward_batch=forward_batch,
+                bs=bs,
+                raw_bs=raw_bs,
+                encoder_len_fill_value=encoder_len_fill_value,
+            )
+            if is_encoder_decoder
+            else None
+        ),
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
         iteration_ids=forward_batch.iteration_ids,
@@ -963,6 +998,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         return max(request_counts)
 
+    @staticmethod
+    def _all_encoder_lens_positive(forward_batch: ForwardBatch) -> bool:
+        # Read the host lengths: truth-testing torch.all() on the device
+        # tensor is a device-to-host sync on every decode step.
+        encoder_lens_cpu = forward_batch.encoder_lens_cpu
+        if encoder_lens_cpu is not None:
+            return all(encoder_len > 0 for encoder_len in encoder_lens_cpu)
+        return bool(torch.all(forward_batch.encoder_lens > 0))
+
     def maybe_init_uocr_graph_io(self, model_runner: ModelRunner) -> None:
         """Relay Unlimited-OCR v2 decode tokens through the captured graphs."""
         greedy_graph = model_runner.uocr_greedy_graph
@@ -1046,7 +1090,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
         # because the full_text_row_masked_out_mask tensor will always be ones
         is_encoder_lens_supported = (
-            torch.all(forward_batch.encoder_lens > 0)
+            self._all_encoder_lens_positive(forward_batch)
             if self.is_encoder_decoder
             else True
         )
@@ -1088,7 +1132,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         is_encoder_lens_supported = (
-            torch.all(forward_batch.encoder_lens > 0)
+            self._all_encoder_lens_positive(forward_batch)
             if self.is_encoder_decoder
             else True
         )
@@ -1944,6 +1988,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             seq_len_fill_value=self.seq_len_fill_value,
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
+            encoder_len_fill_value=self.encoder_len_fill_value,
         )
         if (
             self.model_runner.lora_manager is not None
