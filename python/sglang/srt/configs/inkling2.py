@@ -9,6 +9,15 @@ INKLING2_ARCHS = (
     "Inkling2ForConditionalGeneration",
     "Inkling2LoopForConditionalGeneration",
 )
+# Checkpoint attention projections fused into the served qkvr, in slice order.
+INKLING2_QKVR_PROJECTIONS = (
+    "wq_du",
+    "wk_dv",
+    "wv_dv",
+    "wr_du",
+    "gate_attn",
+    "attn_sink_proj",
+)
 
 
 class Inkling2LoopConfig(TypedDict):
