@@ -11,6 +11,8 @@ from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2ModelConfig
 from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
     MultimemAllGatherer,
 )
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
@@ -353,9 +355,9 @@ class Inkling2CausalLLM(nn.Module):
             return hidden
         state = Inkling2AttnResState(self.attn_res, hidden)
         if self.config.loop_config is None:
-            for i, layer in enumerate(self.layers):
+            for i in range(len(self.layers)):
                 self._capture(captures, i, state)
-                layer(state, positions, forward_batch)
+                self._run_layer(i, state, positions, forward_batch)
         else:
             state = self._run_loop(state, positions, forward_batch, captures)
         hidden = self.norm(state.compute_output())
@@ -385,6 +387,12 @@ class Inkling2CausalLLM(nn.Module):
         if captures is not None and visit in self.layers_to_capture:
             captures.append(state.partial.to(self.lm_head.weight.dtype))
 
+    def _run_layer(self, layer_id, state, positions, forward_batch, **kwargs):
+        # A looped core layer records every pass under its own layer id, since the
+        # expert placement is per physical layer.
+        with get_global_expert_distribution_recorder().with_current_layer(layer_id):
+            self.layers[layer_id](state, positions, forward_batch, **kwargs)
+
     def _run_loop(self, state, positions, forward_batch, captures):
         """Prelude once, the core num_passes times, then the coda once.
 
@@ -393,9 +401,9 @@ class Inkling2CausalLLM(nn.Module):
         """
         core = self.config.loop_core_layers
         num_passes = self.config.loop_config["num_passes"]
-        for i, layer in enumerate(self.layers[: core.start]):
+        for i in range(core.start):
             self._capture(captures, i, state)
-            layer(state, positions, forward_batch)
+            self._run_layer(i, state, positions, forward_batch)
         prelude_partial, prelude_blocks = state.partial, list(state.blocks)
         messages = None
         for pass_idx in range(num_passes):
@@ -406,9 +414,10 @@ class Inkling2CausalLLM(nn.Module):
                     self.attn_res, prelude_partial, list(prelude_blocks)
                 )
             first_visit = core.start + pass_idx * len(core)
-            for offset, layer in enumerate(self.layers[core.start : core.stop]):
+            for offset in range(len(core)):
                 self._capture(captures, first_visit + offset, state)
-                layer(
+                self._run_layer(
+                    core.start + offset,
                     state,
                     positions,
                     forward_batch,
@@ -416,15 +425,22 @@ class Inkling2CausalLLM(nn.Module):
                     messages=messages,
                 )
         coda_first_visit = core.start + num_passes * len(core)
-        for offset, layer in enumerate(self.layers[core.stop :]):
+        for offset in range(len(self.layers) - core.stop):
             self._capture(captures, coda_first_visit + offset, state)
-            layer(state, positions, forward_batch)
+            self._run_layer(core.stop + offset, state, positions, forward_batch)
         return state
 
 
 class Inkling2ForConditionalGeneration(nn.Module):
     fall_back_to_pt_during_load = False
     allow_patterns_overrides = ["model*.safetensors"]
+
+    @staticmethod
+    def get_model_config_for_expert_location(config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.text_config.num_hidden_layers,
+            num_logical_experts=config.text_config.n_routed_experts,
+        )
 
     def __init__(self, config: Inkling2MMConfig, quant_config=None, prefix: str = ""):
         super().__init__()
