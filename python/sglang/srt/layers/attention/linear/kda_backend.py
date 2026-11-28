@@ -332,11 +332,7 @@ class KDAKernelDispatcher:
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if (
-            lower_bound is not None
-            and not isinstance(self.decode_kernel, TritonKDAKernel)
-            and not getattr(self.decode_kernel, "supports_safe_gate_decode", False)
-        ):
+        if lower_bound is not None and not self.decode_kernel.supports_safe_gate_decode:
             raise NotImplementedError(
                 "lower_bound (safe gate) decode is not supported by "
                 f"{self.decode_kernel.__class__.__name__}."

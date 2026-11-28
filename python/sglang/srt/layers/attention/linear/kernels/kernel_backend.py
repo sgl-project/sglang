@@ -28,6 +28,8 @@ class LinearAttnKernelBase(ABC):
     # unwritten and corrupts prefix-cache restores. Kernels that reject
     # tracked batches loudly (NotImplementedError) keep the default False.
     supports_track_state_snapshot: bool = False
+    # True when decode() applies the safe gate (lower_bound).
+    supports_safe_gate_decode: bool = False
 
     # True when extend() reads and writes each slot's recurrent state at the
     # pool's own slot pitch, so an envelope-strided pool needs no packed copy.

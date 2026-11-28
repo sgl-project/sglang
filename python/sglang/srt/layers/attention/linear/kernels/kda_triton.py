@@ -34,6 +34,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     supports_packed_decode_safe_gate: bool = is_cuda()
     supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
     supports_track_state_snapshot: bool = True
+    supports_safe_gate_decode: bool = True
 
     def packed_decode(
         self,
