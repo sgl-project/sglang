@@ -1,12 +1,15 @@
 """Unit tests for DeepSeekV32Detector DSML streaming — no server, no model loading."""
 
+import json
 import unittest
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 
@@ -416,6 +419,59 @@ class TestDeepSeekV32Streaming(unittest.TestCase):
         self.assertEqual(first.normal_text, "Checking.")
         self.assertEqual(first.calls, [])
         self.assertEqual(second.normal_text, " tail")
+
+
+class TestDeepSeekV32StringArguments(CustomTestCase):
+    """A string parameter's value is verbatim in DSML, the way DeepSeek's
+    encoding_dsv32.py / encoding_dsv4.py write and parse it."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="write_file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                    },
+                ),
+            )
+        ]
+        self.content = "  def f():\n    return 1\n"
+
+    def _output(self, detector):
+        dsml = detector.dsml_token
+        param = f"{dsml}{detector.parameter_tag_name}"
+        return (
+            f"{detector.bot_token}\n"
+            f'<{dsml}{detector.invoke_tag_name} name="write_file">\n'
+            f'<{param} name="path" string="true">f.py</{param}>\n'
+            f'<{param} name="content" string="true">{self.content}</{param}>\n'
+            f"{detector.invoke_end_token}\n{detector.eot_token}"
+        )
+
+    def test_string_values_keep_whitespace(self):
+        for detector_cls in (DeepSeekV32Detector, DeepSeekV4Detector):
+            with self.subTest(detector=detector_cls.__name__):
+                output = self._output(detector_cls())
+                calls = detector_cls().detect_and_parse(output, self.tools).calls
+                self.assertEqual(
+                    json.loads(calls[0].parameters),
+                    {"path": "f.py", "content": self.content},
+                )
+
+                detector = detector_cls()
+                arguments = ""
+                for char in output:
+                    result = detector.parse_streaming_increment(char, self.tools)
+                    arguments += "".join(c.parameters or "" for c in result.calls)
+                self.assertEqual(
+                    json.loads(arguments), {"path": "f.py", "content": self.content}
+                )
 
 
 if __name__ == "__main__":
